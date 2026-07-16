@@ -104,8 +104,9 @@ pub(super) fn emit_accepted(
 // zero/absent window into a compress-to-zero (F3).
 #[cfg(test)]
 mod send_budget_tests {
-    use super::super::compress::compression_trigger;
+    use super::super::compress::{compression_trigger, CompressionTriggerLimits};
     use super::{initial_send_budget, num_ctx_input_ceiling};
+    use crate::CompactionTriggerPolicy;
 
     /// THE B6 first-turn hole: a fresh capability cache (no `max_ok_input`,
     /// no `safe_context`) used to mean NO budget at all even though the
@@ -118,8 +119,20 @@ mod send_budget_tests {
         // The measured B6 shape: ~41k estimated tokens, 3 messages, no
         // count/token thresholds in reach — pre-fix this returned None and
         // the request sailed into the 4k window with zero events.
-        let trigger = compression_trigger(3, 41_355, 39_900, 40, None, budget, 1_432)
-            .expect("the ceiling must fire the trigger on the first turn");
+        let trigger = compression_trigger(
+            3,
+            41_355,
+            39_900,
+            CompressionTriggerLimits {
+                count_threshold: 40,
+                token_threshold: None,
+                send_budget: budget,
+                tool_tokens: 1_432,
+                policy: CompactionTriggerPolicy::HeadroomAware,
+                has_authoritative_headroom: true,
+            },
+        )
+        .expect("the ceiling must fire the trigger on the first turn");
         assert!(trigger.hard_budget, "a real token budget, not a soft halve");
         assert_eq!(
             trigger.budget,
@@ -152,7 +165,19 @@ mod send_budget_tests {
         );
         // And with no budget at all, the trigger stays silent regardless of size.
         assert_eq!(
-            compression_trigger(3, 41_355, 39_900, 40, None, None, 1_432),
+            compression_trigger(
+                3,
+                41_355,
+                39_900,
+                CompressionTriggerLimits {
+                    count_threshold: 40,
+                    token_threshold: None,
+                    send_budget: None,
+                    tool_tokens: 1_432,
+                    policy: CompactionTriggerPolicy::HeadroomAware,
+                    has_authoritative_headroom: false,
+                },
+            ),
             None
         );
     }
@@ -235,10 +260,14 @@ mod send_budget_tests {
             3,
             current_real,
             9_000,
-            40,
-            None,
-            Some(send_budget),
-            tool_tokens_real,
+            CompressionTriggerLimits {
+                count_threshold: 40,
+                token_threshold: None,
+                send_budget: Some(send_budget),
+                tool_tokens: tool_tokens_real,
+                policy: CompactionTriggerPolicy::HeadroomAware,
+                has_authoritative_headroom: true,
+            },
         )
         .expect("over-budget context fires the guard");
         assert!(trigger.hard_budget);

@@ -96,11 +96,17 @@ mod markdown {
         }
     }
 }
+mod artifact_hooks;
+mod artifact_read;
 mod mcp;
 mod memory_fetch;
 mod note_sink;
 mod observation;
 mod permissions;
+// PR5: deterministic prompt-comprehension intake owns the turn disposition,
+// bounded clarification manifest, and content-free model projection.
+mod prompt_intake;
+mod prompt_read;
 mod recall;
 // #1004: the `render_report` tool — present collected findings as a rendered
 // Markdown document in the plain scroller (the missing "present" affordance a
@@ -131,9 +137,19 @@ mod trim;
 mod untrusted;
 mod warmup;
 
+pub use artifact_hooks::{
+    record_manual_compaction_checkpoint, record_memory_compaction_checkpoint,
+    record_observed_head_transition, record_prompt_comprehension_manifest,
+    record_retry_revert_file, record_turn_outcome,
+};
+pub use artifact_read::{
+    artifact_read_tool_definition, ArtifactPage, ArtifactReadContext, ArtifactReadRecord,
+    ArtifactSource, PromptArtifactSink, SessionArtifactStore, StoreArtifactStore,
+};
 pub use compress::{
-    compress_user_initiated, CompressCounters, CompressState, ManualCompressOutcome, SummarizeFn,
-    SummarizeFuture, Summarizer, CONTINUATION_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
+    compress_user_initiated, compress_user_initiated_for_task, CompressCounters, CompressState,
+    ManualCompressOutcome, SummarizeFn, SummarizeFuture, Summarizer, CONTINUATION_PREFIX,
+    SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
@@ -152,6 +168,14 @@ pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
+pub use prompt_intake::{
+    AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, PromptComprehensionManifest,
+    PromptDisposition, PromptIntake,
+};
+pub use prompt_read::{
+    prompt_read_tool_definition, PromptReadContext, PromptSource, SessionPromptSource,
+    SessionPromptStore, StorePromptSource,
+};
 pub use scheduled::{
     plan_block, plan_reseat_pointer, PlanSnapshot, SessionStepLedger, Step, StepLedger, StepStatus,
 };
@@ -225,9 +249,11 @@ pub use permissions::{
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use tools::{
-    execute_tool, execute_tool_with_offload, filter_advertised_tools, full_access_requested,
-    in_plan_phase, ocap_disabled, persona_tool_allowed, plan_phase_clamp, set_max_output_tokens,
-    set_output_head_tokens, tool_definitions, venv_cmd_prefix,
+    execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
+    execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
+    filter_tools_for_disposition, full_access_requested, in_plan_phase, ocap_disabled,
+    persona_tool_allowed, plan_phase_clamp, set_max_output_tokens, set_output_head_tokens,
+    tool_definitions, venv_cmd_prefix,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -237,7 +263,10 @@ pub use untrusted::wrap_untrusted;
 pub use warmup::warmup_if_cold;
 
 use crate::retry::{with_backoff_notify, RetryPolicy};
-use compress::{compress, compression_trigger, CompressAction, CompressRequest};
+use compress::{
+    compress, compression_trigger, CompressAction, CompressRequest, CompressTrigger,
+    CompressionTriggerLimits,
+};
 use crossterm::{
     execute,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
@@ -253,7 +282,7 @@ use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
 use trim::{
     estimate_request_tokens, estimate_tokens, estimate_value_tokens, merge_round_usage,
-    ollama_usage, openai_usage, PromptTracker,
+    ollama_usage, openai_usage, protected_prompt_head_len, PromptTracker,
 };
 
 /// Retry policy for TUI inference calls: more patient than the hosted-API
@@ -262,6 +291,131 @@ use trim::{
 /// All thresholds are overridable via the standard `NEWT_HTTP_*` env vars.
 fn tui_retry_policy() -> RetryPolicy {
     RetryPolicy::for_local_inference()
+}
+
+/// Tightest whole-request ceiling that carries authoritative semantics for
+/// this turn. A proven-good high-water mark by itself is deliberately not a
+/// ceiling; configured token thresholds and believed/declared windows are.
+fn authoritative_request_budget(
+    send_budget: Option<usize>,
+    send_budget_authoritative: bool,
+    token_threshold: Option<usize>,
+) -> Option<usize> {
+    let send = send_budget_authoritative
+        .then_some(send_budget)
+        .flatten()
+        .filter(|budget| *budget > 0);
+    match (send, token_threshold.filter(|budget| *budget > 0)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Refuse before inference when the compression-immune system/card/exact-user
+/// head, newest live user presentation, and advertised schemas cannot fit an
+/// authoritative model budget. The live presentation intentionally remains at
+/// the transcript tail so normal multi-turn ordering is preserved; counting
+/// only the protected recovery copy would under-price every prompt by one full
+/// copy and permit an over-window dispatch. Exact prompt text is never
+/// truncated to manufacture a dispatchable request.
+fn preflight_irreducible_request(
+    messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
+    let head = protected_prompt_head_len(messages, prompt_read::ACTIVE_PROMPT_PREFIX);
+    let newest_live_user = messages[head..]
+        .iter()
+        .rev()
+        .find(|message| message["role"].as_str() == Some("user"));
+    let estimated = estimate_request_tokens(&messages[..head], tools, estimation)
+        + newest_live_user
+            .map(|message| estimate_value_tokens(message, estimation))
+            .unwrap_or(0);
+    let required = calibrate_up(estimated, calibration);
+    if required > budget {
+        anyhow::bail!(
+            "the exact active prompt, live user presentation, and required request scaffolding \
+             need ~{required} input \
+             tokens (including advertised tool schemas), which cannot fit model `{model}`'s \
+             authoritative {budget}-token input budget; refusing before inference dispatch — \
+             the operator prompt was not truncated"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse any Chat-style dispatch when its complete dynamic message list plus
+/// the schemas currently advertised on that request no longer fit an
+/// authoritative budget. Count trimming alone is not a token bound: one fresh
+/// tool or prompt-read result can be larger than the entire window.
+fn preflight_full_message_request(
+    messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
+    let required = calibrate_up(
+        estimate_request_tokens(messages, tools, estimation),
+        calibration,
+    );
+    if required > budget {
+        anyhow::bail!(
+            "the complete inference request needs ~{required} input tokens, which cannot fit \
+             model `{model}`'s authoritative {budget}-token input budget; refusing before \
+             inference dispatch — the exact operator prompt and tool results were not truncated"
+        );
+    }
+    Ok(())
+}
+
+fn preflight_responses_request(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
+    let instructions_tokens = instructions
+        .map(|text| {
+            estimate_value_tokens(
+                &serde_json::json!({"role": "system", "content": text}),
+                estimation,
+            )
+        })
+        .unwrap_or(0);
+    let input_tokens = estimate_tokens(input, estimation);
+    let tool_tokens = tools
+        .map(|tools| estimate_value_tokens(&serde_json::Value::Array(tools.to_vec()), estimation))
+        .unwrap_or(0);
+    let required = calibrate_up(
+        instructions_tokens + input_tokens + tool_tokens,
+        calibration,
+    );
+    if required > budget {
+        anyhow::bail!(
+            "the Responses request needs ~{required} input tokens, which cannot fit model \
+             `{model}`'s authoritative {budget}-token input budget; refusing before inference \
+             dispatch — the exact operator prompt and function outputs were not truncated"
+        );
+    }
+    Ok(())
 }
 
 /// Hook recovering a hard context-window 400:
@@ -370,6 +524,16 @@ pub struct ChatCtx<'a> {
     /// rescue, workflow repair steering, and pending-plan pushes for the
     /// session; factual-correction nudges are unaffected. Default `true`.
     pub action_nudges: bool,
+    /// Validated prompt-comprehension disposition for this turn. The loop
+    /// advertises only the corresponding catalog and lets only `Act` retain
+    /// execution-pressure nudges; the dispatcher remains the final authority
+    /// boundary for fabricated tool names.
+    pub prompt_disposition: PromptDisposition,
+    /// The resolved prompt-comprehension manifest for this turn, when the
+    /// caller owns an intake boundary. It is borrowed only to place its
+    /// content-free model card inside the protected active-prompt card;
+    /// headless compatibility callers can leave it `None`.
+    pub prompt_intake: Option<&'a PromptIntake>,
     /// Max lines of tool output shown inline (from `[tui].tool_output_lines`,
     /// default 20). Resolved once per turn and threaded to `execute_tool` so
     /// the tool loop never re-reads config from disk.
@@ -396,6 +560,11 @@ pub struct ChatCtx<'a> {
     /// Message list size at which the agent trims the middle of the in-flight
     /// conversation to prevent context overflow mid-turn.
     pub mid_loop_trim_threshold: usize,
+    /// Policy deciding whether the message-count guard alone may trigger a
+    /// compaction while an authoritative input ceiling is known. Resolved from
+    /// `[context].compaction_trigger_policy` by the interactive caller;
+    /// headless callers use the safe `headroom_aware` default.
+    pub compaction_trigger_policy: crate::CompactionTriggerPolicy,
     /// Estimated-token threshold that also triggers a mid-loop trim, regardless
     /// of message count. Guards against a single huge tool result blowing past
     /// the context window in one round (from `[tui].mid_loop_trim_tokens`).
@@ -782,6 +951,44 @@ pub async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    chat_complete_with_prompt(ctx, None, None, mcp).await
+}
+
+/// Provenance-aware variant of [`chat_complete`]. Callers with a durable
+/// receipt and conversation-fenced resolver pass them here; legacy/headless
+/// callers retain source compatibility through [`chat_complete`] and receive
+/// one stable in-memory receipt synthesized for the turn.
+pub async fn chat_complete_with_prompt(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    chat_complete_with_prompt_and_artifacts(
+        ctx,
+        turn_prompt_context,
+        prompt_source,
+        None,
+        None,
+        mcp,
+    )
+    .await
+}
+
+/// Prompt- and artifact-aware variant used by the interactive harness.
+///
+/// The separate source/sink arguments keep legacy embedders source-compatible
+/// while letting persistent and ephemeral TUI sessions expose the same
+/// append-only artifact surface. Both implementations are bound to the active
+/// conversation before they reach this function.
+pub async fn chat_complete_with_prompt_and_artifacts(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    artifact_source: Option<&dyn artifact_read::ArtifactSource>,
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     // OpenAI-compatible endpoints speak a different wire format (request,
     // tool_calls, and usage shapes all differ), so they get their own loop.
     if ctx.kind == crate::BackendKind::Openai {
@@ -789,9 +996,25 @@ pub async fn chat_complete(
         // (gpt-5-codex et al., served only there); the default stays on
         // /v1/chat/completions.
         if responses_api_selected() {
-            return openai_responses_complete(ctx, mcp).await;
+            return openai_responses_complete_with_prompt_and_artifacts(
+                ctx,
+                turn_prompt_context,
+                prompt_source,
+                artifact_source,
+                artifact_sink,
+                mcp,
+            )
+            .await;
         }
-        return openai_chat_complete(ctx, mcp).await;
+        return openai_chat_complete_with_prompt_and_artifacts(
+            ctx,
+            turn_prompt_context,
+            prompt_source,
+            artifact_source,
+            artifact_sink,
+            mcp,
+        )
+        .await;
     }
     // Step 25.4 (#568): capture the markdown decision before `ctx` is consumed
     // by the destructure (the destructures ignore it via `markdown: _`).
@@ -820,6 +1043,8 @@ pub async fn chat_complete(
         workflow_grace_rounds,
         narration_nudge_cap,
         action_nudges,
+        prompt_disposition,
+        prompt_intake,
         tool_output_lines,
         debug,
         trace,
@@ -827,6 +1052,7 @@ pub async fn chat_complete(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold,
+        compaction_trigger_policy,
         mid_loop_trim_tokens,
         max_ok_input,
         build_check_cmd,
@@ -854,6 +1080,10 @@ pub async fn chat_complete(
         git_tool,
         crew_runner,
     } = ctx;
+    // Explain / Research / Ask turns may still use bounded read-only tools, but
+    // must never inherit the harness's execution-pressure repairs.
+    let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
     let mut local_compress_state = CompressState::new();
@@ -904,6 +1134,24 @@ pub async fn chat_complete(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+    let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
+        crate::TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        )
+    });
+    let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
+    let prompt_context =
+        prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
+    let artifact_context = turn_prompt_context
+        .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
+    let active_task = prompt_context.active_text();
+    if let Some(intake) = prompt_intake {
+        prompt_read::ensure_active_prompt_card_with_intake(&mut messages, prompt_context, intake);
+    } else {
+        prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
+    }
 
     // In-band memory nudge (Step 19.3): after `[memory] note_nudge_interval`
     // user turns with zero organic save_note use, append a one-line reminder
@@ -964,6 +1212,7 @@ pub async fn chat_complete(
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
+    let tools = filter_tools_for_disposition(tools, prompt_disposition);
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
     // tool-schema overhead converts to real-token space once — the schema
@@ -971,6 +1220,14 @@ pub async fn chat_complete(
     // from is real-token currency.
     let cal = sanitize_estimate_ratio(estimate_ratio);
     let tool_tokens_real = calibrate_up(tool_tokens, cal);
+    preflight_irreducible_request(
+        &messages,
+        Some(&tools),
+        authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens),
+        cal,
+        estimation,
+        model,
+    )?;
     // Animate the in-place "thinking…/compressing…" status line only on a TTY
     // with streaming enabled (never in a pipe / `newt worker`). Constant for the
     // turn — both the compression and probe waits reuse it.
@@ -1004,14 +1261,7 @@ pub async fn chat_complete(
     // invited action. A question or acknowledgment gets none — narration IS
     // the deliverable, and pressuring a model answering a question is how the
     // "I'm genuinely finished" defense loop (#1158) gets seeded.
-    let action_turn = action_nudges
-        && messages
-            .iter()
-            .rev()
-            .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
-            .and_then(|m| m["content"].as_str())
-            .map(crate::classifiers::user_turn_invites_action)
-            .unwrap_or(true);
+    let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
     // The matching workflow's round-cap grace horizon override, resolved once
@@ -1042,6 +1292,9 @@ pub async fn chat_complete(
     'round_loop: for round in 0..hard_tool_rounds {
         if round >= current_tool_round_limit {
             if workflow_grace_active {
+                break;
+            }
+            if !action_nudges {
                 break;
             }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
@@ -1086,7 +1339,7 @@ pub async fn chat_complete(
         // 8/12 under drift). Compact + gated to multi-step in-progress plans.
         // Supersedes the env-gated NEWT_RESEAT_PLAN experiment that #629 carried
         // to main by accident.
-        if round > 0 {
+        if round > 0 && action_nudges {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
@@ -1102,7 +1355,7 @@ pub async fn chat_complete(
         // "endless exploration → empty response" failure mode seen with some
         // local models (e.g. nemotron3:33b).
         const READ_ONLY_NUDGE_AFTER: usize = 3;
-        if read_only_rounds >= READ_ONLY_NUDGE_AFTER {
+        if action_nudges && read_only_rounds >= READ_ONLY_NUDGE_AFTER {
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             // Sustained read-only exploration on a task that classifies as a
             // diagnose/fix workflow is exactly the shape `crew`/`team`
@@ -1141,14 +1394,28 @@ pub async fn chat_complete(
             // (F1); `current` (schema/template-inclusive) still drives the
             // token triggers.
             let message_tokens = estimate_tokens(&messages, estimation);
+            // A learned `max_ok_input` alone is a proven-good floor, not a
+            // context-window ceiling. Only a configured token cap or a
+            // budget backed by a known/recovered window suppresses a
+            // count-only compaction under the default policy.
+            let has_authoritative_headroom = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            )
+            .is_some();
             if let Some(trigger) = compression_trigger(
                 messages.len(),
                 current,
                 message_tokens,
-                mid_loop_trim_threshold,
-                mid_loop_trim_tokens,
-                send_budget,
-                tool_tokens_real,
+                CompressionTriggerLimits {
+                    count_threshold: mid_loop_trim_threshold,
+                    token_threshold: mid_loop_trim_tokens,
+                    send_budget,
+                    tool_tokens: tool_tokens_real,
+                    policy: compaction_trigger_policy,
+                    has_authoritative_headroom,
+                },
             ) {
                 // A hard trigger's budget is real-token currency; the
                 // pipeline measures and reclaims in chars/4 — convert once
@@ -1178,7 +1445,7 @@ pub async fn chat_complete(
                                 messages: &messages,
                                 budget: pipeline_budget,
                                 max_messages: trigger.max_messages,
-                                task,
+                                task: active_task,
                                 hard_budget: trigger.hard_budget,
                                 authoritative: token_fired || send_budget_authoritative,
                                 focus: None,
@@ -1216,10 +1483,10 @@ pub async fn chat_complete(
                 }
                 if outcome.fired {
                     // N2: a hard-budget compression whose assembled result is
-                    // still over budget says so — the dispatch proceeds (the
-                    // cw-400/overflow recovery bounds it), but visibly. The
-                    // comparison is in the SAME (chars/4) currency the
-                    // pipeline measured `tokens_after` in (Phase 20 §2.3).
+                    // still over budget says so before the full-request
+                    // preflight below refuses its dispatch. The comparison is
+                    // in the SAME (chars/4) currency the pipeline measured
+                    // `tokens_after` in (Phase 20 §2.3).
                     let suffix = if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
                         ", still over budget"
                     } else {
@@ -1251,18 +1518,53 @@ pub async fn chat_complete(
                         &mut narration_nudges,
                         outcome.action,
                         step_ledger,
-                        task,
+                        prompt_context,
                         round > 0,
+                        action_nudges,
+                    );
+                    // Persist provenance only after the transformed working
+                    // set and its continuation have been installed.
+                    record_compaction_artifact(
+                        artifact_sink,
+                        artifact_context,
+                        outcome.action,
+                        outcome.tokens_before,
+                        outcome.tokens_after,
+                        pipeline_budget,
+                        round,
+                        trigger.primary_cause.artifact_reason(),
+                        Some(&trigger),
+                        send_budget_authoritative,
+                        color,
                     );
                 }
             }
         }
 
+        // Compression is best-effort; an irreducible fresh result (including
+        // spill-exempt prompt_read output) may remain larger than the window.
+        // Re-price the exact request after every compression/nudge and refuse
+        // before the wire rather than relying on a backend 400 or silent head
+        // truncation. Only schemas actually advertised on this request count.
+        preflight_full_message_request(
+            &messages,
+            tools_supported.then_some(&tools),
+            authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            ),
+            cal,
+            estimation,
+            model,
+        )?;
+
         // Phase 20 §2.2: chars/4 estimate of EXACTLY the request about to be
         // dispatched (the message list as sent, plus tool schemas) — paired
         // with the backend's reported prompt size in the `Accepted`
         // observation so the caller can learn the calibration ratio.
-        let round_est_raw = estimate_request_tokens(&messages, Some(&tools), estimation);
+        let round_est_raw =
+            estimate_request_tokens(&messages, tools_supported.then_some(&tools), estimation);
 
         // Tool-call rounds: stream:false (fast, just JSON).
         // Final text round: stream:true so the user sees tokens arrive.
@@ -1402,7 +1704,7 @@ pub async fn chat_complete(
                                     cal,
                                 ),
                                 max_messages: None,
-                                task,
+                                task: active_task,
                                 hard_budget: true,
                                 authoritative: true,
                                 focus: None,
@@ -1429,8 +1731,22 @@ pub async fn chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
-                                task,
+                                prompt_context,
                                 round > 0,
+                                action_nudges,
+                            );
+                            record_compaction_artifact(
+                                artifact_sink,
+                                artifact_context,
+                                outcome.action,
+                                outcome.tokens_before,
+                                outcome.tokens_after,
+                                calibrate_down(new_budget.saturating_sub(tool_tokens_real), cal),
+                                round,
+                                "context_window_400",
+                                None,
+                                false,
+                                color,
                             );
                         }
                         cw_retries += 1;
@@ -1570,7 +1886,7 @@ pub async fn chat_complete(
                             .flatten();
                         let plan_nudge_hint =
                             combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
-                        if round + 1 < current_tool_round_limit {
+                        if action_nudges && round + 1 < current_tool_round_limit {
                             if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                                 Some(&nudge_classification),
                                 content,
@@ -1597,7 +1913,8 @@ pub async fn chat_complete(
                                 continue 'round_loop;
                             }
                         }
-                        if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
+                        if action_nudges
+                            && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
                             && round + 1 < current_tool_round_limit
                         {
                             if let Some(nudge) = pending_plan_completion_nudge(
@@ -1629,6 +1946,7 @@ pub async fn chat_complete(
                         }
                         if stale_file_nudges < STALE_FILE_NUDGE_CAP
                             && round + 1 < current_tool_round_limit
+                            && action_nudges
                             && looks_like_unverified_stale_file_blocker(content)
                         {
                             if debug {
@@ -1961,7 +2279,7 @@ pub async fn chat_complete(
                                 messages: &messages,
                                 budget: target,
                                 max_messages: None,
-                                task,
+                                task: active_task,
                                 hard_budget: true,
                                 // A suspected silent overflow is a real failure
                                 // signal — refuse semantics apply (Step 20.3).
@@ -1986,8 +2304,22 @@ pub async fn chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
-                                task,
+                                prompt_context,
                                 round > 0,
+                                action_nudges,
+                            );
+                            record_compaction_artifact(
+                                artifact_sink,
+                                artifact_context,
+                                outcome.action,
+                                outcome.tokens_before,
+                                outcome.tokens_after,
+                                target,
+                                round,
+                                "silent_overflow_recovery",
+                                None,
+                                false,
+                                color,
                             );
                         } else {
                             // N1: the retry must differ from the request that
@@ -2002,8 +2334,23 @@ pub async fn chat_complete(
                                 },
                             );
                             if fallback.chars_reclaimed > 0 {
+                                let tokens_before = estimate_tokens(&messages, estimation);
+                                let tokens_after = estimate_tokens(&fallback.messages, estimation);
                                 messages = fallback.messages;
                                 prompt_tracker.invalidate();
+                                record_compaction_artifact(
+                                    artifact_sink,
+                                    artifact_context,
+                                    CompressAction::Pruned,
+                                    tokens_before,
+                                    tokens_after,
+                                    target,
+                                    round,
+                                    "silent_overflow_structural_fallback",
+                                    None,
+                                    false,
+                                    color,
+                                );
                             }
                         }
                         accumulated_usage = merged;
@@ -2178,7 +2525,7 @@ pub async fn chat_complete(
                 // host-exec timeout ceiling. `is_cancelled` between rounds still
                 // catches the abandoned turn; this closes the *during-a-tool*
                 // window that a foreground child on the tty used to wedge.
-                let dispatch = execute_tool_with_offload(
+                let dispatch = execute_tool_with_offload_and_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
@@ -2195,6 +2542,9 @@ pub async fn chat_complete(
                         .map(|s| &mut *s as &mut dyn NoteSink),
                     recall_source,
                     memory_source,
+                    Some(prompt_context),
+                    artifact_context,
+                    artifact_sink,
                     // #263 prompted grants — same reborrow pattern as note_sink.
                     permission_gate
                         .as_deref_mut()
@@ -2212,6 +2562,7 @@ pub async fn chat_complete(
                     tool_offload,
                     spill_store,
                     persona_tools,
+                    prompt_disposition,
                 );
                 // If the turn was cancelled mid-tool, `cancellable` returns
                 // None and the dispatch future above is already dropped (its
@@ -2284,7 +2635,8 @@ pub async fn chat_complete(
     // Reached the round cap. Trim the bloated message list so the final
     // summary request doesn't overflow the model's context window, then
     // make ONE tools-disabled completion so the user gets a real partial answer.
-    let trimmed = trim_for_summary(&messages, 2, 6);
+    let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
+    let trimmed = trim_for_summary(&messages, protected_head, 6);
     // Step 27.5: salvage the plan/state ledger + the failed-call count so the
     // summary reflects progress and the fallback advice is honest.
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
@@ -2299,6 +2651,14 @@ pub async fn chat_complete(
             wasted_calls: repeat_calls.total_failures(),
             progress,
             observed: observed_paths.into_vec(),
+            request_budget: authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            ),
+            calibration: cal,
+            estimation,
+            ollama_num_ctx: num_ctx,
         },
     )
     .await?;
@@ -2875,6 +3235,8 @@ fn is_read_only_tool(name: &str) -> bool {
             | "use_skill"
             | "save_note"
             | "recall"
+            | "prompt_read"
+            | "artifact_read"
     )
 }
 
@@ -2897,7 +3259,10 @@ fn maybe_offload_tool_result(
     tool_offload: bool,
     spill_store: Option<&dyn spill::SpillStore>,
 ) -> String {
-    if matches!(name, "run_command" | "lifecycle") {
+    if matches!(
+        name,
+        "run_command" | "lifecycle" | "prompt_read" | "artifact_read"
+    ) {
         result
     } else {
         spill::maybe_offload(result, tool_offload, spill_store)
@@ -2910,6 +3275,42 @@ fn meaningful_workflow_progress(name: &str, result: &str) -> bool {
         "write_file" => result.starts_with("wrote ") || result.starts_with("✓ wrote "),
         "edit_file" => edit_result_changed_file(result),
         _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_compaction_artifact(
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    artifact_context: Option<artifact_read::ArtifactReadContext<'_>>,
+    action: CompressAction,
+    tokens_before: usize,
+    tokens_after: usize,
+    budget: usize,
+    round: usize,
+    reason: &str,
+    trigger: Option<&CompressTrigger>,
+    send_budget_authoritative: bool,
+    color: bool,
+) {
+    let (Some(sink), Some(context)) = (artifact_sink, artifact_context) else {
+        return;
+    };
+    if let Err(error) = artifact_hooks::record_compaction_checkpoint(
+        sink,
+        context,
+        action,
+        tokens_before,
+        tokens_after,
+        budget,
+        round,
+        reason,
+        trigger,
+        send_budget_authoritative,
+    ) {
+        print_harness_notice(
+            &format!("warning: failed to record compaction artifact: {error}"),
+            color,
+        );
     }
 }
 
@@ -3051,7 +3452,7 @@ fn narration_action_nudge() -> String {
 /// active task reliably (#1163, 2026-07-16 multi-turn repro).
 fn post_compaction_continuation(
     step_ledger: Option<&dyn scheduled::StepLedger>,
-    task: &str,
+    prompt_context: prompt_read::PromptReadContext<'_>,
 ) -> String {
     // #1163 (F): re-inject the FULL plan verbatim — every step with its
     // status — not just the active one. The corporate-box repro showed the
@@ -3069,18 +3470,30 @@ fn post_compaction_continuation(
             )
         })
         .unwrap_or_default();
-    // Quote the operator's instruction so the model re-anchors on what was
-    // ACTUALLY asked, not a summary-derived paraphrase. Bounded so a huge
-    // paste can't itself blow the budget.
-    let instruction_clause = if task.trim().is_empty() {
-        String::new()
-    } else {
-        let quoted: String = task.chars().take(400).collect();
-        format!(" The operator's instruction for this turn was: \"{quoted}\" — keep executing THAT, exactly.")
-    };
+    // The exact prompt is already protected in the active-prompt metadata/user pair;
+    // point at its immutable identity instead of injecting a lossy 400-char
+    // quote as a fresh user message.
+    let instruction_clause = prompt_context.active_receipt().map_or_else(
+        || {
+            " Re-read the protected [NEWT ACTIVE PROMPT v1] prompt pair (or call \
+             prompt_read with address `current`) before continuing."
+                .to_string()
+        },
+        |receipt| {
+            format!(
+                " The authoritative operator prompt is protected in the [NEWT ACTIVE \
+                 PROMPT v1] metadata/user pair at address {} with model digest {}; call prompt_read \
+                 with address `current` to recover it verbatim before continuing.",
+                receipt.id(),
+                receipt.model_digest()
+            )
+        },
+    );
     format!(
         "{} You are mid-task: the context above was just compacted, not \
-         completed.{instruction_clause}{plan_clause} Continue working — your \
+         completed.{instruction_clause}{plan_clause} For prompt-rooted work, \
+         recover the objective's artifact chain with artifact_read {{\"address\":\"root\"}} \
+         before deciding what remains. Continue working — your \
          next output should be the next concrete tool call (re-read any file \
          you are about to edit first, since full file contents were not \
          preserved). Before concluding ANYTHING about prior work, re-anchor on \
@@ -3114,10 +3527,12 @@ fn apply_post_compaction_continuation(
     narration_nudges: &mut usize,
     action: CompressAction,
     step_ledger: Option<&dyn scheduled::StepLedger>,
-    task: &str,
+    prompt_context: prompt_read::PromptReadContext<'_>,
     mid_turn: bool,
+    action_nudges: bool,
 ) {
-    if !mid_turn
+    if !action_nudges
+        || !mid_turn
         || !matches!(
             action,
             CompressAction::Summarized | CompressAction::StaticFallback
@@ -3130,7 +3545,7 @@ fn apply_post_compaction_continuation(
     messages.retain(|m| !compress::is_continuation_message(m));
     messages.push(serde_json::json!({
         "role": "user",
-        "content": post_compaction_continuation(step_ledger, task),
+        "content": post_compaction_continuation(step_ledger, prompt_context),
     }));
 }
 
@@ -3533,6 +3948,13 @@ struct CapExit {
     wasted_calls: usize,
     progress: Option<String>,
     observed: Vec<String>,
+    /// Complete-request ceiling for the final tools-disabled dispatch.
+    request_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    /// Ollama must repeat the configured context window on every request,
+    /// including the tools-disabled cap exit. Ignored by OpenAI chat.
+    ollama_num_ctx: Option<u32>,
 }
 
 /// Final tools-disabled completion for the Ollama (`/api/chat`) path.
@@ -3553,17 +3975,45 @@ async fn final_summary_ollama(
         wasted_calls,
         progress,
         observed,
+        request_budget,
+        calibration,
+        estimation,
+        ollama_num_ctx,
     } = cap;
     messages.push(serde_json::json!({
         "role": "user",
         "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
     }));
+    if preflight_full_message_request(
+        &messages,
+        None,
+        request_budget,
+        calibration,
+        estimation,
+        model,
+    )
+    .is_err()
+    {
+        return Ok((
+            cap_exit_fallback(
+                max_tool_rounds,
+                accumulated,
+                wasted_calls,
+                progress.as_deref(),
+            ),
+            false,
+            accumulated,
+        ));
+    }
     // No `tools` key => the model cannot emit tool calls.
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": &messages,
         "stream": false,
     });
+    if let Some(num_ctx) = ollama_num_ctx {
+        body["options"] = serde_json::json!({ "num_ctx": num_ctx });
+    }
     let retry = tui_retry_policy();
     let result = with_backoff_notify(
         &retry,
@@ -3654,11 +4104,36 @@ async fn final_summary_openai(
         wasted_calls,
         progress,
         observed,
+        request_budget,
+        calibration,
+        estimation,
+        ollama_num_ctx: _,
     } = cap;
     messages.push(serde_json::json!({
         "role": "user",
         "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
     }));
+    if preflight_full_message_request(
+        &messages,
+        None,
+        request_budget,
+        calibration,
+        estimation,
+        model,
+    )
+    .is_err()
+    {
+        return Ok((
+            cap_exit_fallback(
+                max_tool_rounds,
+                accumulated,
+                wasted_calls,
+                progress.as_deref(),
+            ),
+            false,
+            accumulated,
+        ));
+    }
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
     let body = serde_json::json!({
         "model": model,
@@ -3748,6 +4223,36 @@ pub async fn openai_chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    openai_chat_complete_with_prompt(ctx, None, None, mcp).await
+}
+
+/// Provenance-aware OpenAI Chat Completions loop. See
+/// [`chat_complete_with_prompt`] for the compatibility contract.
+pub async fn openai_chat_complete_with_prompt(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    openai_chat_complete_with_prompt_and_artifacts(
+        ctx,
+        turn_prompt_context,
+        prompt_source,
+        None,
+        None,
+        mcp,
+    )
+    .await
+}
+
+async fn openai_chat_complete_with_prompt_and_artifacts(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    artifact_source: Option<&dyn artifact_read::ArtifactSource>,
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
         url,
         model,
@@ -3772,6 +4277,8 @@ pub async fn openai_chat_complete(
         workflow_grace_rounds,
         narration_nudge_cap,
         action_nudges,
+        prompt_disposition,
+        prompt_intake,
         tool_output_lines,
         debug,
         trace,
@@ -3779,6 +4286,7 @@ pub async fn openai_chat_complete(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold,
+        compaction_trigger_policy,
         mid_loop_trim_tokens,
         max_ok_input,
         build_check_cmd,
@@ -3806,6 +4314,10 @@ pub async fn openai_chat_complete(
         git_tool,
         crew_runner,
     } = ctx;
+    // See the Ollama path: a non-Act turn is allowed bounded reads but never
+    // execution-pressure nudges.
+    let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
     let compress_state = match compress_state {
@@ -3839,6 +4351,24 @@ pub async fn openai_chat_complete(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+    let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
+        crate::TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        )
+    });
+    let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
+    let prompt_context =
+        prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
+    let artifact_context = turn_prompt_context
+        .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
+    let active_task = prompt_context.active_text();
+    if let Some(intake) = prompt_intake {
+        prompt_read::ensure_active_prompt_card_with_intake(&mut messages, prompt_context, intake);
+    } else {
+        prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
+    }
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
     if note_sink.is_some() {
@@ -3886,11 +4416,20 @@ pub async fn openai_chat_complete(
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
+    let tools = filter_tools_for_disposition(tools, prompt_disposition);
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
     let cal = sanitize_estimate_ratio(estimate_ratio);
     let tool_tokens_real = calibrate_up(tool_tokens, cal);
+    preflight_irreducible_request(
+        &messages,
+        Some(&tools),
+        authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens),
+        cal,
+        estimation,
+        model,
+    )?;
     // Truthful context-size tracker (prompt-tokens-preferred, Step 18.1).
     let mut prompt_tracker = PromptTracker::new();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -3909,14 +4448,7 @@ pub async fn openai_chat_complete(
     let mut stale_file_nudges: usize = 0;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: same intent gate as the primary loop — see the comment there.
-    let action_turn = action_nudges
-        && messages
-            .iter()
-            .rev()
-            .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
-            .and_then(|m| m["content"].as_str())
-            .map(crate::classifiers::user_turn_invites_action)
-            .unwrap_or(true);
+    let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
     // See the Ollama path: a matching workflow's grace-horizon override.
@@ -3933,6 +4465,9 @@ pub async fn openai_chat_complete(
     'round_loop: for round in 0..hard_tool_rounds {
         if round >= current_tool_round_limit {
             if workflow_grace_active {
+                break;
+            }
+            if !action_nudges {
                 break;
             }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
@@ -3972,7 +4507,7 @@ pub async fn openai_chat_complete(
 
         // Conditional plan re-seat (#630 b) — mirror of the Ollama path: re-show
         // the active step each round so a multi-step plan doesn't go stale.
-        if round > 0 {
+        if round > 0 && action_nudges {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
@@ -3991,14 +4526,24 @@ pub async fn openai_chat_complete(
             // Count-only budget priced in message-token space (F1) — mirrors
             // the Ollama path.
             let message_tokens = estimate_tokens(&messages, estimation);
+            let has_authoritative_headroom = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            )
+            .is_some();
             if let Some(trigger) = compression_trigger(
                 messages.len(),
                 current,
                 message_tokens,
-                mid_loop_trim_threshold,
-                mid_loop_trim_tokens,
-                send_budget,
-                tool_tokens_real,
+                CompressionTriggerLimits {
+                    count_threshold: mid_loop_trim_threshold,
+                    token_threshold: mid_loop_trim_tokens,
+                    send_budget,
+                    tool_tokens: tool_tokens_real,
+                    policy: compaction_trigger_policy,
+                    has_authoritative_headroom,
+                },
             ) {
                 // Hard budgets are real-token currency → pipeline chars/4
                 // (Phase 20 §2.3); count-only budgets pass through (F1).
@@ -4016,7 +4561,7 @@ pub async fn openai_chat_complete(
                         messages: &messages,
                         budget: pipeline_budget,
                         max_messages: trigger.max_messages,
-                        task,
+                        task: active_task,
                         hard_budget: trigger.hard_budget,
                         authoritative: token_fired || send_budget_authoritative,
                         focus: None,
@@ -4041,8 +4586,9 @@ pub async fn openai_chat_complete(
                 }
                 if outcome.fired {
                     // N2 (mirrors the Ollama path): flag a still-over-budget
-                    // assembly in the notice — compared in the pipeline's
-                    // own chars/4 currency (Phase 20 §2.3).
+                    // assembly before the full-request preflight refuses its
+                    // dispatch — compared in the pipeline's own chars/4
+                    // currency (Phase 20 §2.3).
                     let suffix = if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
                         ", still over budget"
                     } else {
@@ -4074,16 +4620,47 @@ pub async fn openai_chat_complete(
                         &mut narration_nudges,
                         outcome.action,
                         step_ledger,
-                        task,
+                        prompt_context,
                         round > 0,
+                        action_nudges,
+                    );
+                    record_compaction_artifact(
+                        artifact_sink,
+                        artifact_context,
+                        outcome.action,
+                        outcome.tokens_before,
+                        outcome.tokens_after,
+                        pipeline_budget,
+                        round,
+                        trigger.primary_cause.artifact_reason(),
+                        Some(&trigger),
+                        send_budget_authoritative,
+                        color,
                     );
                 }
             }
         }
 
+        // Mirror the Ollama full-request gate. A known authoritative ceiling
+        // means the harness must not dispatch an impossible request,
+        // especially after a giant exact prompt_read result.
+        preflight_full_message_request(
+            &messages,
+            tools_supported.then_some(&tools),
+            authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            ),
+            cal,
+            estimation,
+            model,
+        )?;
+
         // Phase 20 §2.2: chars/4 estimate of exactly the request about to be
         // dispatched — mirrors the Ollama path.
-        let round_est_raw = estimate_request_tokens(&messages, Some(&tools), estimation);
+        let round_est_raw =
+            estimate_request_tokens(&messages, tools_supported.then_some(&tools), estimation);
 
         // OpenAI-compatible endpoints don't use Ollama's `options.num_ctx` —
         // context limits are configured server-side (vLLM --max-model-len).
@@ -4179,7 +4756,7 @@ pub async fn openai_chat_complete(
                                     cal,
                                 ),
                                 max_messages: None,
-                                task,
+                                task: active_task,
                                 hard_budget: true,
                                 authoritative: true,
                                 focus: None,
@@ -4206,8 +4783,25 @@ pub async fn openai_chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
-                                task,
+                                prompt_context,
                                 round > 0,
+                                action_nudges,
+                            );
+                            record_compaction_artifact(
+                                artifact_sink,
+                                artifact_context,
+                                outcome.action,
+                                outcome.tokens_before,
+                                outcome.tokens_after,
+                                calibrate_down(
+                                    (new_cap as usize).saturating_sub(tool_tokens_real),
+                                    cal,
+                                ),
+                                round,
+                                "context_window_400",
+                                None,
+                                false,
+                                color,
                             );
                         }
                         cw_retries += 1;
@@ -4397,6 +4991,7 @@ pub async fn openai_chat_complete(
             if !content.is_empty()
                 && stale_file_nudges < STALE_FILE_NUDGE_CAP
                 && round + 1 < current_tool_round_limit
+                && action_nudges
                 && looks_like_unverified_stale_file_blocker(&content)
             {
                 if debug {
@@ -4515,6 +5110,13 @@ pub async fn openai_chat_complete(
         // <think>) and no prior-turn `reasoning_content` (the model must not be fed
         // its own CoT back). The `tool_calls` are preserved.
         let mut assistant_turn = message.clone();
+        // OpenAI-compatible proxies are not perfectly uniform: some omit the
+        // otherwise-required `role` field from a tool-calling response. Keep
+        // the transcript canonical before compression/repair so its matched
+        // `role="tool"` results are not mistaken for orphans and discarded.
+        if assistant_turn["role"].as_str().is_none() {
+            assistant_turn["role"] = serde_json::Value::String("assistant".into());
+        }
         assistant_turn["content"] = serde_json::Value::String(oa_content.clone());
         if let Some(obj) = assistant_turn.as_object_mut() {
             obj.remove("reasoning_content");
@@ -4616,7 +5218,7 @@ pub async fn openai_chat_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool_with_offload(
+                execute_tool_with_offload_and_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
@@ -4633,6 +5235,9 @@ pub async fn openai_chat_complete(
                         .map(|s| &mut *s as &mut dyn NoteSink),
                     recall_source,
                     memory_source,
+                    Some(prompt_context),
+                    artifact_context,
+                    artifact_sink,
                     // #263 prompted grants — same reborrow pattern as note_sink.
                     permission_gate
                         .as_deref_mut()
@@ -4650,6 +5255,7 @@ pub async fn openai_chat_complete(
                     tool_offload,
                     spill_store,
                     persona_tools,
+                    prompt_disposition,
                 )
                 .await
             };
@@ -4711,7 +5317,8 @@ pub async fn openai_chat_complete(
 
     // Reached the round cap. Trim the message list and make ONE final
     // tools-disabled completion (matches the Ollama path).
-    let trimmed = trim_for_summary(&messages, 2, 6);
+    let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
+    let trimmed = trim_for_summary(&messages, protected_head, 6);
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     let (text, streamed, usage) = final_summary_openai(
@@ -4726,6 +5333,14 @@ pub async fn openai_chat_complete(
             wasted_calls: repeat_calls.total_failures(),
             progress,
             observed: observed_paths.into_vec(),
+            request_budget: authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            ),
+            calibration: cal,
+            estimation,
+            ollama_num_ctx: None,
         },
     )
     .await?;
@@ -4870,13 +5485,41 @@ pub async fn openai_responses_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    openai_responses_complete_with_prompt(ctx, None, None, mcp).await
+}
+
+pub async fn openai_responses_complete_with_prompt(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    openai_responses_complete_with_prompt_and_artifacts(
+        ctx,
+        turn_prompt_context,
+        prompt_source,
+        None,
+        None,
+        mcp,
+    )
+    .await
+}
+
+async fn openai_responses_complete_with_prompt_and_artifacts(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    artifact_source: Option<&dyn artifact_read::ArtifactSource>,
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
         url,
         model,
         kind: _,
         api_key,
         messages: mem_messages,
-        task: _,
+        task,
         workspace,
         color,
         markdown: _,
@@ -4894,6 +5537,8 @@ pub async fn openai_responses_complete(
         workflow_grace_rounds: _,
         narration_nudge_cap: _,
         action_nudges: _,
+        prompt_disposition,
+        prompt_intake,
         tool_output_lines,
         debug,
         trace,
@@ -4904,10 +5549,11 @@ pub async fn openai_responses_complete(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold: _,
-        mid_loop_trim_tokens: _,
-        max_ok_input: _,
+        compaction_trigger_policy: _,
+        mid_loop_trim_tokens,
+        max_ok_input,
         build_check_cmd,
-        safe_context: _,
+        safe_context,
         recover_cw_400: _,
         mut note_sink,
         mut note_nudge,
@@ -4920,7 +5566,7 @@ pub async fn openai_responses_complete(
         end_reason: _,
         mut permission_gate,
         on_round_usage: _,
-        estimate_ratio: _,
+        estimate_ratio,
         // #727: bound for the get_context_remaining used-token estimate.
         estimation,
         summary_input_cap_floor_chars: _,
@@ -4932,6 +5578,7 @@ pub async fn openai_responses_complete(
         git_tool,
         crew_runner,
     } = ctx;
+    let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // The OpenAI-Responses loop offloads tool output (spill_store) but does not
     // run the compressor, so it never stores compaction spans.
     let _ = compaction_store;
@@ -4956,10 +5603,27 @@ pub async fn openai_responses_complete(
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
-    let msgs_json: Vec<serde_json::Value> = mem_messages
+    let mut msgs_json: Vec<serde_json::Value> = mem_messages
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+    let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
+        crate::TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        )
+    });
+    let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
+    let prompt_context =
+        prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
+    let artifact_context = turn_prompt_context
+        .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
+    if let Some(intake) = prompt_intake {
+        prompt_read::ensure_active_prompt_card_with_intake(&mut msgs_json, prompt_context, intake);
+    } else {
+        prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
+    }
     let (instructions, mut input) = build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
         mcp,
@@ -4976,7 +5640,26 @@ pub async fn openai_responses_complete(
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona
     // (Responses wire). No-op when `persona_tools` is `None`.
     let tools_chat = filter_advertised_tools(tools_chat, persona_tools);
+    let tools_chat = filter_tools_for_disposition(tools_chat, prompt_disposition);
     let tools = tools_to_responses(&tools_chat);
+    let tools_for_estimate = serde_json::Value::Array(tools.clone());
+    let cal = sanitize_estimate_ratio(estimate_ratio);
+    // Responses, like Chat Completions, has no client-sent `num_ctx`: model
+    // limits are provider-side. Retain ChatCtx.num_ctx only for the
+    // get_context_remaining display seam above; it must not become a local
+    // authoritative refusal threshold for a value absent from this wire.
+    let send_budget = initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
+    let send_budget_authoritative = safe_context.is_some();
+    let authoritative_budget =
+        authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens);
+    preflight_irreducible_request(
+        &msgs_json,
+        Some(&tools_for_estimate),
+        authoritative_budget,
+        cal,
+        estimation,
+        model,
+    )?;
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
@@ -5001,6 +5684,15 @@ pub async fn openai_responses_complete(
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
+        preflight_responses_request(
+            instructions.as_deref(),
+            &input,
+            tools_supported.then_some(tools.as_slice()),
+            authoritative_budget,
+            cal,
+            estimation,
+            model,
+        )?;
         let body = build_body(&input, tools_supported);
         let dispatch = with_backoff_notify(
             &retry,
@@ -5137,7 +5829,7 @@ pub async fn openai_responses_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool_with_offload(
+                execute_tool_with_offload_and_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
@@ -5151,6 +5843,9 @@ pub async fn openai_responses_complete(
                         .map(|s| &mut *s as &mut dyn NoteSink),
                     recall_source,
                     memory_source,
+                    Some(prompt_context),
+                    artifact_context,
+                    artifact_sink,
                     permission_gate
                         .as_deref_mut()
                         .map(|g| &mut *g as &mut dyn PermissionGate),
@@ -5164,6 +5859,7 @@ pub async fn openai_responses_complete(
                     tool_offload,
                     spill_store,
                     persona_tools,
+                    prompt_disposition,
                 )
                 .await
             };
@@ -5211,6 +5907,15 @@ pub async fn openai_responses_complete(
 
     // Round cap: one final tools-disabled call for a summary answer (mirrors
     // the chat path's final_summary, in the Responses shape).
+    preflight_responses_request(
+        instructions.as_deref(),
+        &input,
+        None,
+        authoritative_budget,
+        cal,
+        estimation,
+        model,
+    )?;
     let body = build_body(&input, false);
     let mut req = client.post(&responses_url).json(&body);
     if let Some(key) = api_key {
@@ -6111,9 +6816,19 @@ mod cap_exit_unit_tests {
             "web_fetch",
             "use_skill",
             "save_note",
+            "prompt_read",
         ] {
             assert!(is_read_only_tool(name), "{name} should be read-only");
         }
+    }
+
+    #[test]
+    fn prompt_read_exact_recovery_is_never_spilled() {
+        let store = spill::SessionSpillStore::default();
+        let exact = "x".repeat(spill::TOOL_RESULT_SPILL_CAP + 1);
+        let output = maybe_offload_tool_result("prompt_read", exact.clone(), true, Some(&store));
+        assert_eq!(output, exact);
+        assert_eq!(spill::SpillStore::spills(&store), 0);
     }
 
     #[test]
@@ -6390,11 +7105,238 @@ mod tool_round_cap_tests {
         }
     }
 
+    struct ProtectedCapResponder {
+        openai: bool,
+        exact_task: String,
+        pair_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
+        omission_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Respond for ProtectedCapResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if request_has_tools(req) {
+                if self.openai {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_cap",
+                                "type": "function",
+                                "function": {
+                                    "name": "definitely_not_a_real_tool",
+                                    "arguments": "{}"
+                                }
+                            }]
+                        }}]
+                    }));
+                }
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{"function": {
+                            "name": "definitely_not_a_real_tool",
+                            "arguments": {}
+                        }}]
+                    }
+                }));
+            }
+
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            let pair_seen = messages.windows(2).any(|pair| {
+                let card = pair[0]["role"].as_str() == Some("system")
+                    && pair[0]["content"].as_str().is_some_and(|content| {
+                        content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX)
+                            && content.contains("address: prompt:")
+                            && !content.contains("<ephemeral-unrecorded>")
+                    });
+                card && pair[1]["role"].as_str() == Some("user")
+                    && pair[1]["content"].as_str() == Some(self.exact_task.as_str())
+            });
+            self.pair_seen_on_final.store(pair_seen, Ordering::SeqCst);
+            self.omission_seen_on_final.store(
+                messages.iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("messages omitted"))
+                }),
+                Ordering::SeqCst,
+            );
+
+            if self.openai {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "cap summary"}}]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "cap summary"}
+                }))
+            }
+        }
+    }
+
     fn msgs() -> Vec<MemMessage> {
         vec![
             MemMessage::system("you are a test"),
             MemMessage::user("do the thing"),
         ]
+    }
+
+    fn hard_budget_ctx<'a>(
+        url: &'a str,
+        messages: &'a [MemMessage],
+        caveats: &'a Caveats,
+        task: &'a str,
+        kind: BackendKind,
+    ) -> ChatCtx<'a> {
+        ChatCtx {
+            url,
+            model: "tiny-context-model",
+            kind,
+            api_key: (kind == BackendKind::Openai).then_some("sk-test"),
+            messages,
+            task,
+            workspace: ".",
+            color: false,
+            markdown: false,
+            tool_offload: false,
+            spill_store: None,
+            compaction_store: None,
+            scratchpad: false,
+            scratchpad_store: None,
+            code_search: None,
+            experience_store: None,
+            step_ledger: None,
+            caveats,
+            persona_tools: None,
+            max_tool_rounds: 1,
+            narration_nudge_cap: 1,
+            action_nudges: true,
+            prompt_disposition: PromptDisposition::Act,
+            prompt_intake: None,
+            workflow_grace_rounds: 0,
+            tool_output_lines: 20,
+            debug: false,
+            trace: false,
+            num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
+            connect_timeout_secs: 5,
+            inference_timeout_secs: 5,
+            mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
+            mid_loop_trim_tokens: None,
+            max_ok_input: None,
+            build_check_cmd: None,
+            safe_context: Some(256),
+            recover_cw_400: None,
+            note_sink: None,
+            note_nudge: None,
+            recall_source: None,
+            memory_source: None,
+            summarizer: None,
+            compress_state: None,
+            tool_events: None,
+            phantom_reaches: None,
+            end_reason: None,
+            permission_gate: None,
+            on_round_usage: None,
+            estimate_ratio: None,
+            estimation: crate::tokens::TokenEstimation::default(),
+            summary_input_cap_floor_chars: 8_192,
+            exec_floor: None,
+            write_ledger: None,
+            cancel: None,
+            git_tool: None,
+            crew_runner: None,
+        }
+    }
+
+    async fn assert_no_requests(server: &MockServer) {
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("wiremock request journal")
+                .is_empty(),
+            "irreducible-prompt refusal must happen before HTTP dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_cap_trim_keeps_headless_active_pair_after_more_than_six_trailing_messages() {
+        let server = MockServer::start().await;
+        let task = "CURRENT-B: keep this exact prompt through cap trim";
+        let pair_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let omission_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ProtectedCapResponder {
+                openai: false,
+                exact_task: task.to_string(),
+                pair_seen_on_final: pair_seen.clone(),
+                omission_seen_on_final: omission_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+        let messages = vec![
+            MemMessage::system("base"),
+            MemMessage::user("historical A"),
+            MemMessage::assistant("A done"),
+            MemMessage::user(task),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Ollama);
+        context.safe_context = None;
+        context.max_tool_rounds = 4;
+        let (reply, _, _, _) = chat_complete(context, &mut NoMcp)
+            .await
+            .expect("cap exit succeeds");
+        assert_eq!(reply, "cap summary");
+        assert!(pair_seen.load(Ordering::SeqCst));
+        assert!(
+            omission_seen.load(Ordering::SeqCst),
+            "four tool rounds create >6 trailing messages and force a real trim"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_cap_trim_keeps_headless_active_pair_after_more_than_six_trailing_messages() {
+        let server = MockServer::start().await;
+        let task = "CURRENT-B: keep this exact OpenAI prompt through cap trim";
+        let pair_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let omission_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ProtectedCapResponder {
+                openai: true,
+                exact_task: task.to_string(),
+                pair_seen_on_final: pair_seen.clone(),
+                omission_seen_on_final: omission_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+        let messages = vec![
+            MemMessage::system("base"),
+            MemMessage::user("historical A"),
+            MemMessage::assistant("A done"),
+            MemMessage::user(task),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        context.safe_context = None;
+        context.max_tool_rounds = 4;
+        let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
+            .await
+            .expect("cap exit succeeds");
+        assert_eq!(reply, "cap summary");
+        assert!(pair_seen.load(Ordering::SeqCst));
+        assert!(
+            omission_seen.load(Ordering::SeqCst),
+            "four tool rounds create >6 trailing messages and force a real trim"
+        );
     }
 
     #[tokio::test]
@@ -6438,6 +7380,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6448,6 +7392,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -6515,6 +7460,10 @@ mod tool_round_cap_tests {
                 wasted_calls: 0,
                 progress: Some("<plan>1. [ ] fix duplicate helper definitions</plan>".to_string()),
                 observed: Vec::new(),
+                request_budget: None,
+                calibration: 1.0,
+                estimation: crate::tokens::TokenEstimation::default(),
+                ollama_num_ctx: Some(4_096),
             },
         )
         .await
@@ -6535,6 +7484,128 @@ mod tool_round_cap_tests {
         assert!(
             reply.contains("Progress captured at the tool-call limit"),
             "{reply}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["options"]["num_ctx"], 4_096);
+    }
+
+    #[tokio::test]
+    async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": "must not be dispatched" }
+            })))
+            .mount(&server)
+            .await;
+
+        let exact_task = "CURRENT-B: preserve this exact active operator prompt";
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": format!("{}\naddress: prompt:test", prompt_read::ACTIVE_PROMPT_PREFIX),
+            }),
+            serde_json::json!({"role": "user", "content": exact_task}),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "huge.txt"}}}],
+            }),
+            serde_json::json!({"role": "tool", "content": "x".repeat(32_000)}),
+        ];
+        let head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
+        messages = trim_for_summary(&messages, head, 6);
+        let client = reqwest::Client::new();
+        let (reply, streamed, usage) = final_summary_ollama(
+            &client,
+            &format!("{}/api/chat", server.uri()),
+            "tiny-model",
+            messages,
+            CapExit {
+                max_tool_rounds: 1,
+                accumulated: None,
+                wasted_calls: 0,
+                progress: None,
+                observed: Vec::new(),
+                request_budget: Some(2_000),
+                calibration: 1.0,
+                estimation: crate::tokens::TokenEstimation::default(),
+                ollama_num_ctx: Some(2_500),
+            },
+        )
+        .await
+        .expect("oversized cap exit returns deterministic fallback");
+        assert!(!streamed);
+        assert!(usage.is_none());
+        assert!(reply.contains("tool-call limit of 1"), "{reply}");
+        assert!(
+            reply.contains("final summarization request also failed"),
+            "{reply}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("wiremock request journal")
+                .is_empty(),
+            "the oversized cap-exit request must never reach the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "must not be dispatched"}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": format!("{}\naddress: prompt:test", prompt_read::ACTIVE_PROMPT_PREFIX),
+            }),
+            serde_json::json!({"role": "user", "content": "CURRENT-B exact task"}),
+            serde_json::json!({"role": "tool", "content": "x".repeat(32_000)}),
+        ];
+        let client = reqwest::Client::new();
+        let (reply, streamed, usage) = final_summary_openai(
+            &client,
+            &format!("{}/v1/chat/completions", server.uri()),
+            "tiny-model",
+            None,
+            messages,
+            CapExit {
+                max_tool_rounds: 1,
+                accumulated: None,
+                wasted_calls: 0,
+                progress: None,
+                observed: Vec::new(),
+                request_budget: Some(2_000),
+                calibration: 1.0,
+                estimation: crate::tokens::TokenEstimation::default(),
+                ollama_num_ctx: None,
+            },
+        )
+        .await
+        .expect("oversized cap exit returns deterministic fallback");
+        assert!(!streamed);
+        assert!(usage.is_none());
+        assert!(reply.contains("tool-call limit of 1"), "{reply}");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("wiremock request journal")
+                .is_empty(),
+            "the oversized cap-exit request must never reach the backend"
         );
     }
 
@@ -6607,6 +7678,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6617,6 +7690,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -6693,6 +7767,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6703,6 +7779,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -6756,6 +7833,30 @@ mod tool_round_cap_tests {
     }
 
     #[test]
+    fn responses_keeps_exact_active_prompt_at_user_priority() {
+        let exact = "operator text must remain user data";
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "base policy"}),
+            serde_json::json!({"role": "user", "content": "historical ask"}),
+        ];
+        prompt_read::ensure_active_prompt_card(
+            &mut messages,
+            prompt_read::PromptReadContext::new(None, exact, None),
+        );
+
+        let (instructions, input) = build_responses_input(&messages);
+        let instructions = instructions.expect("base and metadata instructions");
+        assert!(instructions.contains(prompt_read::ACTIVE_PROMPT_PREFIX));
+        assert!(
+            !instructions.contains(exact),
+            "operator content must not be promoted to Responses instructions"
+        );
+        assert!(input
+            .iter()
+            .any(|item| { item["role"] == "user" && item["content"].as_str() == Some(exact) }));
+    }
+
+    #[test]
     fn tools_flatten_to_responses_shape() {
         let chat = serde_json::json!([{
             "type": "function",
@@ -6797,8 +7898,399 @@ mod tool_round_cap_tests {
         assert_eq!(usage.output_tokens, 20);
     }
 
+    fn giant_prompt_messages(task: &str) -> Vec<MemMessage> {
+        vec![MemMessage::system("base policy"), MemMessage::user(task)]
+    }
+
+    const MID_SIZED_PAIR_BUDGET: usize = 5_500;
+
+    fn mid_sized_pair_task(label: &str) -> String {
+        format!("{label} {}", "x".repeat(6_000))
+    }
+
+    /// Prove the regression fixture isolates the live-tail duplicate: the
+    /// protected recovery copy and schemas fit, but the irreducible complete
+    /// request (recovery copy + newest user presentation) does not.
+    fn assert_mid_sized_pair_fixture(task: &str, responses_wire: bool) {
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "base policy"}),
+            serde_json::json!({"role": "user", "content": task}),
+        ];
+        prompt_read::ensure_active_prompt_card(
+            &mut messages,
+            prompt_read::PromptReadContext::new(None, task, None),
+        );
+        let head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
+        let chat_tools = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false,
+        );
+        let tools = if responses_wire {
+            serde_json::Value::Array(tools_to_responses(&chat_tools))
+        } else {
+            chat_tools
+        };
+        let estimation = crate::tokens::TokenEstimation::default();
+        let one_copy = estimate_request_tokens(&messages[..head], Some(&tools), estimation);
+        let complete = estimate_request_tokens(&messages, Some(&tools), estimation);
+        assert!(
+            one_copy <= MID_SIZED_PAIR_BUDGET,
+            "fixture invalid: one protected copy needs {one_copy} tokens"
+        );
+        assert!(
+            complete > MID_SIZED_PAIR_BUDGET,
+            "fixture invalid: the irreducible pair needs only {complete} tokens"
+        );
+    }
+
+    fn assert_irreducible_refusal(error: &anyhow::Error) {
+        let message = error.to_string();
+        assert!(
+            message.contains("refusing before inference dispatch"),
+            "{message}"
+        );
+        assert!(
+            message.contains("operator prompt was not truncated"),
+            "{message}"
+        );
+    }
+
     #[tokio::test]
-    async fn responses_loop_returns_message_text_from_v1_responses() {
+    async fn ollama_giant_exact_prompt_refuses_before_zero_wire_dispatches() {
+        let server = MockServer::start().await;
+        let task = format!("OLLAMA-GIANT {}", "x".repeat(20_000));
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let error = chat_complete(
+            hard_budget_ctx(
+                &server.uri(),
+                &messages,
+                &caveats,
+                &task,
+                BackendKind::Ollama,
+            ),
+            &mut NoMcp,
+        )
+        .await
+        .expect_err("giant exact prompt is irreducible");
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn openai_chat_giant_exact_prompt_refuses_before_zero_wire_dispatches() {
+        let server = MockServer::start().await;
+        let task = format!("OPENAI-CHAT-GIANT {}", "x".repeat(20_000));
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let error = openai_chat_complete(
+            hard_budget_ctx(
+                &server.uri(),
+                &messages,
+                &caveats,
+                &task,
+                BackendKind::Openai,
+            ),
+            &mut NoMcp,
+        )
+        .await
+        .expect_err("giant exact prompt is irreducible");
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn responses_giant_exact_prompt_refuses_before_zero_wire_dispatches() {
+        let server = MockServer::start().await;
+        let task = format!("RESPONSES-GIANT {}", "x".repeat(20_000));
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let error = openai_responses_complete(
+            hard_budget_ctx(
+                &server.uri(),
+                &messages,
+                &caveats,
+                &task,
+                BackendKind::Openai,
+            ),
+            &mut NoMcp,
+        )
+        .await
+        .expect_err("giant exact prompt is irreducible");
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn ollama_mid_sized_irreducible_prompt_pair_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("OLLAMA-MID-PAIR");
+        assert_mid_sized_pair_fixture(&task, false);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Ollama);
+        ctx.safe_context = Some(MID_SIZED_PAIR_BUDGET as u32);
+        let error = chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the two irreducible prompt presentations exceed the window");
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn openai_chat_mid_sized_irreducible_prompt_pair_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("OPENAI-CHAT-MID-PAIR");
+        assert_mid_sized_pair_fixture(&task, false);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = Some(MID_SIZED_PAIR_BUDGET as u32);
+        let error = openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the two irreducible prompt presentations exceed the window");
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn responses_mid_sized_irreducible_prompt_pair_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("RESPONSES-MID-PAIR");
+        assert_mid_sized_pair_fixture(&task, true);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = Some(MID_SIZED_PAIR_BUDGET as u32);
+        let error = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the two irreducible prompt presentations exceed the window");
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn responses_ignores_unsent_num_ctx_as_a_local_refusal_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "provider accepted"}]
+                }],
+                "usage": {"input_tokens": 20, "output_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "a normal Responses request";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1);
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("an unsent num_ctx must not block the provider request");
+        assert_eq!(reply, "provider accepted");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("num_ctx").is_none(),
+            "Responses must not send the ChatCtx num_ctx display hint"
+        );
+    }
+
+    struct GiantPromptReadResponder {
+        openai: bool,
+    }
+
+    impl Respond for GiantPromptReadResponder {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            if self.openai {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_prompt_read",
+                            "type": "function",
+                            "function": {
+                                "name": "prompt_read",
+                                "arguments": "{\"address\":\"previous\"}"
+                            }
+                        }]
+                    }}]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "", "tool_calls": [{
+                        "function": {
+                            "name": "prompt_read",
+                            "arguments": {"address": "previous"}
+                        }
+                    }]}
+                }))
+            }
+        }
+    }
+
+    fn giant_previous_prompt_context(
+        store: &SessionPromptStore,
+        conversation_id: &str,
+        task: &str,
+    ) -> crate::TurnPromptContext {
+        let giant = format!("GIANT PREVIOUS OPERATOR PROMPT\n{}", "z\n".repeat(25_000));
+        store
+            .begin_prompt(
+                conversation_id,
+                crate::NewPrompt::operator(giant.as_bytes(), giant.as_bytes()),
+            )
+            .unwrap();
+        store
+            .begin_prompt(
+                conversation_id,
+                crate::NewPrompt::operator(task.as_bytes(), task.as_bytes()),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ollama_giant_prompt_read_result_refuses_before_second_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(GiantPromptReadResponder { openai: false })
+            .mount(&server)
+            .await;
+        let task = "re-read the prior prompt, then explain it";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let prompt_store = SessionPromptStore::default();
+        let turn = giant_previous_prompt_context(&prompt_store, "ollama-prompt-read", task);
+        let source = prompt_store.source("ollama-prompt-read");
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Ollama);
+        ctx.safe_context = Some(8_000);
+        ctx.max_tool_rounds = 2;
+
+        let error = chat_complete_with_prompt(ctx, Some(&turn), Some(&source), &mut NoMcp)
+            .await
+            .expect_err("the giant exact prompt_read result must block the next request");
+        let message = error.to_string();
+        assert!(
+            message.contains("complete inference request needs"),
+            "{message}"
+        );
+        assert!(
+            message.contains("tool results were not truncated"),
+            "{message}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        assert_eq!(requests.len(), 1, "no over-budget second dispatch");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_giant_prompt_read_result_refuses_before_second_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(GiantPromptReadResponder { openai: true })
+            .mount(&server)
+            .await;
+        let task = "re-read the prior prompt, then explain it";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let prompt_store = SessionPromptStore::default();
+        let turn = giant_previous_prompt_context(&prompt_store, "openai-prompt-read", task);
+        let source = prompt_store.source("openai-prompt-read");
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = Some(8_000);
+        ctx.max_tool_rounds = 2;
+
+        let error = openai_chat_complete_with_prompt(ctx, Some(&turn), Some(&source), &mut NoMcp)
+            .await
+            .expect_err("the giant exact prompt_read result must block the next request");
+        let message = error.to_string();
+        assert!(
+            message.contains("complete inference request needs"),
+            "{message}"
+        );
+        assert!(
+            message.contains("tool results were not truncated"),
+            "{message}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        assert_eq!(requests.len(), 1, "no over-budget second dispatch");
+    }
+
+    #[tokio::test]
+    async fn responses_refuses_giant_function_output_before_second_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_huge",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"huge.txt\"}"
+                }],
+                "usage": {"input_tokens": 100, "output_tokens": 10}
+            })))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("huge.txt"), "x".repeat(64_000)).unwrap();
+        let task = "read the large fixture and report what it contains";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.workspace = workspace.path().to_str().unwrap();
+        ctx.safe_context = Some(8_000);
+        ctx.max_tool_rounds = 2;
+
+        let error = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("giant function output must block the next request");
+        let message = error.to_string();
+        assert!(message.contains("Responses request needs"), "{message}");
+        assert!(
+            message.contains("function outputs were not truncated"),
+            "{message}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        assert_eq!(
+            requests.len(),
+            1,
+            "the first tool call may dispatch, but its giant output must never be resent"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -6814,16 +8306,36 @@ mod tool_round_cap_tests {
             .mount(&server)
             .await;
 
-        let messages = msgs();
+        let store_root = tempfile::TempDir::new().unwrap();
+        let store_workspace = tempfile::TempDir::new().unwrap();
+        let store =
+            crate::ConversationStore::new(store_root.path(), store_workspace.path(), 0).unwrap();
+        let conversation_id = "responses-durable-wire";
+        let exact_task = "do the thing through the durable Responses seam";
+        let turn_prompt = store
+            .begin_prompt(
+                conversation_id,
+                "Responses durable wire",
+                None,
+                crate::NewPrompt::operator(exact_task.as_bytes(), exact_task.as_bytes()),
+            )
+            .unwrap();
+        let prompt_source = StorePromptSource::new(&store, conversation_id);
+        let expected_address = turn_prompt.active().id().to_string();
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user(exact_task),
+        ];
         let caveats = Caveats::top();
-        let (reply, streamed, usage, _hallu) = openai_responses_complete(
+        let uri = server.uri();
+        let (reply, streamed, usage, _hallu) = openai_responses_complete_with_prompt(
             ChatCtx {
-                url: &server.uri(),
+                url: &uri,
                 model: "gpt-5-codex",
                 kind: BackendKind::Openai,
                 api_key: Some("sk-test"),
                 messages: &messages,
-                task: "do the thing",
+                task: exact_task,
                 workspace: ".",
                 color: false,
                 markdown: false,
@@ -6840,6 +8352,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6850,6 +8364,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -6875,6 +8390,8 @@ mod tool_round_cap_tests {
                 git_tool: None,
                 crew_runner: None,
             },
+            Some(&turn_prompt),
+            Some(&prompt_source),
             &mut NoMcp,
         )
         .await
@@ -6882,6 +8399,18 @@ mod tool_round_cap_tests {
         assert_eq!(reply, "hello from responses");
         assert!(!streamed);
         assert_eq!(usage.map(|u| u.input_tokens), Some(12));
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let instructions = body["instructions"].as_str().unwrap_or_default();
+        assert!(instructions.contains(prompt_read::ACTIVE_PROMPT_PREFIX));
+        assert!(instructions.contains(&format!("address: {expected_address}")));
+        assert!(!instructions.contains("<ephemeral-unrecorded>"));
+        assert!(body["input"].as_array().is_some_and(|input| input
+            .iter()
+            .any(|item| item["role"] == "user" && item["content"].as_str() == Some(exact_task))));
     }
 
     #[tokio::test]
@@ -6924,6 +8453,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6934,6 +8465,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -7031,6 +8563,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7041,6 +8575,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -7150,6 +8685,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7160,6 +8697,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -7261,6 +8799,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7271,6 +8811,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -7413,6 +8954,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7423,6 +8966,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -7575,6 +9119,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 5,
                 debug: false,
@@ -7585,6 +9131,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 30,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -7631,6 +9178,12 @@ mod tool_round_cap_tests {
 // summary, all against wiremock backends.
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+#[path = "mod_tests/artifact_compaction_provenance.rs"]
+mod artifact_compaction_provenance_tests;
+#[cfg(test)]
+#[path = "mod_tests/artifact_provenance.rs"]
+mod artifact_provenance_tests;
 #[cfg(test)]
 #[path = "mod_tests/http_loop.rs"]
 mod http_loop_tests;
@@ -7692,6 +9245,8 @@ mod save_note_loop_tests {
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
             action_nudges: true,
+            prompt_disposition: PromptDisposition::Act,
+            prompt_intake: None,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -7702,6 +9257,7 @@ mod save_note_loop_tests {
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
             mid_loop_trim_tokens: None,
             max_ok_input: None,
             build_check_cmd: None,
@@ -8183,6 +9739,8 @@ mod compression_loop_tests {
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
             action_nudges: true,
+            prompt_disposition: PromptDisposition::Act,
+            prompt_intake: None,
             workflow_grace_rounds: 0,
             tool_output_lines: 2,
             debug: false,
@@ -8193,6 +9751,7 @@ mod compression_loop_tests {
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
             // The token trigger under test: well below what a few 4 KB
             // tool results accumulate to.
             mid_loop_trim_tokens: Some(5_000),
@@ -8264,6 +9823,17 @@ mod compression_loop_tests {
             .unwrap_or(0)
     }
 
+    /// chars/4 estimate of the complete model input: messages plus the tool
+    /// schemas that ride on every tools-enabled request.
+    fn body_request_tokens(body: &serde_json::Value) -> usize {
+        let estimation = crate::tokens::TokenEstimation::default();
+        body_message_tokens(body)
+            + body
+                .get("tools")
+                .map(|tools| estimate_value_tokens(tools, estimation))
+                .unwrap_or(0)
+    }
+
     /// A summarizer that records every request it receives and returns the
     /// canned summary.
     fn canned_summarizer(prompts: Arc<Mutex<Vec<String>>>) -> Summarizer {
@@ -8281,8 +9851,9 @@ mod compression_loop_tests {
     /// answers. Records per-request observations the assertions need.
     struct GauntletResponder {
         final_answer: String,
-        /// `(had_marker, est_message_tokens)` per non-streaming request.
-        log: Arc<Mutex<Vec<(bool, usize)>>>,
+        /// `(had_marker, est_message_tokens, est_full_request_tokens)` per
+        /// non-streaming request.
+        log: Arc<Mutex<Vec<(bool, usize, usize)>>>,
         task_in_marker_request: Arc<AtomicBool>,
         summary_in_marker_request: Arc<AtomicBool>,
         old_placeholder_seen: Arc<AtomicBool>,
@@ -8294,10 +9865,11 @@ mod compression_loop_tests {
             let body = body_json(req);
             let has_marker = messages_contain(&body, SUMMARY_PREFIX);
             if !body["stream"].as_bool().unwrap_or(false) {
-                self.log
-                    .lock()
-                    .unwrap()
-                    .push((has_marker, body_message_tokens(&body)));
+                self.log.lock().unwrap().push((
+                    has_marker,
+                    body_message_tokens(&body),
+                    body_request_tokens(&body),
+                ));
             }
             if messages_contain(&body, "earlier tool-call messages omitted") {
                 self.old_placeholder_seen.store(true, Ordering::SeqCst);
@@ -8363,6 +9935,12 @@ mod compression_loop_tests {
         let summarizer = canned_summarizer(prompts.clone());
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        // The trigger is a complete-request ceiling, including the expanded
+        // builtin tool catalog. Leave about 5k message tokens after schema
+        // overhead so the first zero-cost prune remains observable on wire
+        // before the summarizing pass; the >40% reclaim assertion below still
+        // measures actual dispatched requests.
+        c.mid_loop_trim_tokens = Some(9_400);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _streamed, _usage, hallu) = chat_complete(c, &mut NoMcp)
@@ -8396,14 +9974,14 @@ mod compression_loop_tests {
         let log = log.lock().unwrap();
         let before = log
             .iter()
-            .filter(|(m, _)| !m)
-            .map(|&(_, t)| t)
+            .filter(|(m, ..)| !m)
+            .map(|&(_, t, _)| t)
             .max()
             .expect("pre-compression requests were dispatched");
         let after = log
             .iter()
-            .find(|(m, _)| *m)
-            .map(|&(_, t)| t)
+            .find(|(m, ..)| *m)
+            .map(|&(_, t, _)| t)
             .expect("a compressed request was dispatched");
         println!("e2e reclaim: ~{before} -> ~{after} est. message tokens");
         assert!(
@@ -8417,7 +9995,7 @@ mod compression_loop_tests {
     /// `num_ctx` ceiling must compress BEFORE dispatch and dispatch under the
     /// ceiling. Pre-fix, `send_budget` was `None` here — the after-benchmark
     /// measured all 10 B6 runs shipping ~41k-token requests into a forced
-    /// 4,096 window with zero compression events (8/10 silently wrong),
+    /// 6,144 window with zero compression events (8/10 silently wrong),
     /// because the `num_ctx` newt itself sent fed into nothing.
     #[tokio::test]
     async fn first_turn_over_num_ctx_ceiling_compresses_before_dispatch() {
@@ -8442,7 +10020,7 @@ mod compression_loop_tests {
         // The B6 shape, condensed: turn 1 of a fresh process already carries
         // a history far over the forced window (a restored conversation whose
         // assistant replies dumped file contents) — ~34k chars ≈ 9k estimated
-        // tokens against a 4,096 num_ctx. The task itself is small and sits
+        // tokens against a 6,144 num_ctx. The task itself is small and sits
         // up front (the protected head), the bulk is summarizable middle, and
         // the recent tail is small — compression CAN reach the budget here,
         // so a still-over-budget dispatch would be a wiring failure, not an
@@ -8468,7 +10046,11 @@ mod compression_loop_tests {
         c.max_ok_input = None;
         c.safe_context = None;
         c.mid_loop_trim_tokens = None;
-        c.num_ctx = Some(4_096);
+        // The expanded always-on catalog plus the exact prompt/card needs
+        // ~3.5k tokens by itself. A 6,144-token window leaves a truthful
+        // 4,915-token input budget while still forcing this ~12k-token full
+        // request through compression before its first dispatch.
+        c.num_ctx = Some(6_144);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
@@ -8491,7 +10073,7 @@ mod compression_loop_tests {
             "compression ran before the first dispatch (≥1 bounded summary request)"
         );
         let log = log.lock().unwrap();
-        let (first_had_marker, first_tokens) =
+        let (first_had_marker, first_message_tokens, first_request_tokens) =
             *log.first().expect("at least one request dispatched");
         assert!(
             first_had_marker,
@@ -8499,12 +10081,14 @@ mod compression_loop_tests {
              pre-#282 it went out raw at ~9k tokens"
         );
 
-        // And it dispatched UNDER the ceiling: 80% of 4,096 = 3,276 input
-        // tokens (the same reply headroom the probe math reserves).
+        // And the COMPLETE request dispatched under the ceiling: 80% of
+        // 6,144 = 4,915 input tokens (the same reply headroom the probe math
+        // reserves). Counting only messages here would hide the catalog cost.
         assert!(
-            first_tokens <= 3_276,
+            first_request_tokens <= 4_915,
             "first dispatch must fit the num_ctx input ceiling \
-             (got ~{first_tokens} est. message tokens > 3,276)"
+             (got ~{first_request_tokens} est. full-request tokens, \
+              including ~{first_message_tokens} message tokens, > 4,915)"
         );
 
         // Summarize-don't-discard still holds on the turn-1 path.
@@ -8568,6 +10152,11 @@ mod compression_loop_tests {
         let uri = server.uri();
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        // The complete-request gate now honestly includes the advertised
+        // schemas. Leave a sliver of room for the static fallback marker so
+        // this test continues to isolate summarizer failure rather than an
+        // irreducible-window refusal.
+        c.mid_loop_trim_tokens = Some(5_600);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -8663,6 +10252,11 @@ mod compression_loop_tests {
         c.api_key = Some("sk-test");
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
+        // Drive the count trigger: structural pruning shortens read results but
+        // cannot reduce message cardinality, so the shared summary stage must
+        // run on this wire too.
+        c.mid_loop_trim_tokens = None;
+        c.mid_loop_trim_threshold = 8;
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
             .await
             .expect("openai loop should succeed");
@@ -8744,6 +10338,36 @@ mod compression_loop_tests {
             MemMessage::assistant("sketched in my head"),
             MemMessage::user(TASK),
         ]
+    }
+
+    /// Leave exactly one estimated token of room for the initial request. This
+    /// keeps the hard-budget regressions coupled to the live advertised tool
+    /// catalog rather than a stale numeric snapshot of its schema overhead.
+    fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
+        let tools = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false,
+        );
+        let mut wire_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({"role": message.role.as_str(), "content": message.content})
+            })
+            .collect();
+        let receipt = crate::TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        );
+        prompt_read::ensure_active_prompt_card(
+            &mut wire_messages,
+            prompt_read::PromptReadContext::new(Some(&receipt), task, None),
+        );
+        estimate_request_tokens(
+            &wire_messages,
+            Some(&tools),
+            crate::tokens::TokenEstimation::default(),
+        )
+        .saturating_add(1)
     }
 
     /// Drive `rounds` tool rounds under count-only compression pressure.
@@ -9002,7 +10626,11 @@ mod compression_loop_tests {
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
         c.max_tool_rounds = 12;
-        c.mid_loop_trim_tokens = Some(4_000); // hard trigger, fires most rounds
+        // The full request includes ~3.4k tokens of always-on schemas. Keep
+        // enough room for one complete fresh result group and make the
+        // request (rather than message-only accounting) drive compression.
+        // The tools-disabled cap-exit then truthfully fits the same budget.
+        c.mid_loop_trim_tokens = Some(8_000); // hard trigger, fires most rounds
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -9071,7 +10699,7 @@ mod compression_loop_tests {
             let a_onelined = messages_contain(&body, "[read_file] read 'a.txt'");
             if !body["stream"].as_bool().unwrap_or(false) {
                 self.log.lock().unwrap().push((
-                    body_message_tokens(&body),
+                    body_request_tokens(&body),
                     a_onelined,
                     messages_contain(&body, "[read_file] read 'b.txt'"),
                     messages_contain(&body, "NEWEST-PAYLOAD-C-INTACT"),
@@ -9118,9 +10746,10 @@ mod compression_loop_tests {
             .respond_with(OversizedRoundResponder { log: log.clone() })
             .mount(&server)
             .await;
-        // Three ~7 KB results: together ~5.3k est tokens against a 4,096
-        // num_ctx (3,276-token input ceiling) — the trailing group ALONE
-        // exceeds the window; no boundary can split it (B6's shape).
+        // Three ~7 KB results plus ~3.4k tokens of schemas exceed an 8,192
+        // num_ctx (6,553-token input ceiling) — the trailing group makes the
+        // COMPLETE request exceed the window; no boundary can split it
+        // (B6's shape).
         // Distinct contents per file: identical results would engage the
         // dedupe pass, which is not what this test pins.
         let ws = tempfile::TempDir::new().unwrap();
@@ -9155,7 +10784,7 @@ mod compression_loop_tests {
         c.max_ok_input = None;
         c.safe_context = None;
         c.mid_loop_trim_tokens = None;
-        c.num_ctx = Some(4_096);
+        c.num_ctx = Some(8_192);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -9170,14 +10799,14 @@ mod compression_loop_tests {
         assert_eq!(reply, "the three files are summarized");
 
         // THE #285 property: no dispatch ships over the window. The newest
-        // result alone fits the ceiling here, so there is no truthful
+        // result plus schemas fits the ceiling here, so there is no truthful
         // still-over residual to excuse an oversized request — pre-fix the
         // round-1 dispatch went out at ~5.5k est tokens against 3,276.
         for (i, &(tokens, ..)) in log.iter().enumerate() {
             assert!(
-                tokens <= 3_276,
+                tokens <= 6_553,
                 "request {i} dispatched over the window: ~{tokens} est. \
-                 message tokens > 3,276 (the pre-#285 B6 residual)"
+                 full-request tokens > 6,553 (the pre-#285 B6 residual)"
             );
         }
 
@@ -9195,24 +10824,23 @@ mod compression_loop_tests {
         );
         assert!(task_present, "the task survives the within-group reclaim");
         // The dispatch fits the same input ceiling the #284 test pins:
-        // 80% of 4,096 = 3,276 estimated message tokens.
+        // 80% of 8,192 = 6,553 estimated full-request tokens.
         assert!(
-            tokens <= 3_276,
+            tokens <= 6_553,
             "#285: the reclaimed dispatch must fit the window \
-             (got ~{tokens} est. message tokens > 3,276)"
+             (got ~{tokens} est. full-request tokens > 6,553)"
         );
         println!(
             "#285 e2e trace: reclaimed dispatch ~{tokens} est. tokens \
-             (ceiling 3,276), a/b one-lined, c intact"
+             (full-request ceiling 6,553), a/b one-lined, c intact"
         );
     }
 
-    /// N3 — the loop-level refusal path end-to-end: a HARD token trigger
-    /// (`mid_loop_trim_tokens`) over a genuinely incompressible context
-    /// records two poor passes, latches anti-thrash, and the next
-    /// over-budget round refuses the dispatch: `chat_complete` errors with
-    /// the named message. Post-F2 only token-over-budget sessions can reach
-    /// this — the bail text is now truthful.
+    /// N3 — the loop-level hard-budget refusal path end-to-end. The older
+    /// regression intentionally dispatched repeated known-over-budget
+    /// requests until anti-thrash latched. The authoritative full-request
+    /// gate now supersedes that unsafe route: after one valid tool round, an
+    /// incompressible follow-up is refused before its wire dispatch.
     #[tokio::test]
     async fn hard_budget_thrash_latches_then_bails_with_named_error() {
         let server = MockServer::start().await;
@@ -9226,30 +10854,37 @@ mod compression_loop_tests {
             .mount(&server)
             .await;
         let ws = tempfile::TempDir::new().unwrap();
+        // The protected prompt + catalog fits the configured budget, so the
+        // first request is valid. The newest tool result does not fit in the
+        // remaining message budget and cannot be discarded.
         std::fs::write(ws.path().join("tiny.txt"), "ok").unwrap();
         let workspace = ws.path().to_string_lossy().to_string();
         // Incompressible: the system prompt dominates and no structural
         // pass or boundary can reduce it.
         let messages = vec![
-            MemMessage::system(format!("you are a test. {}", "rule. ".repeat(700))),
+            MemMessage::system(format!("you are a test. {}", "rule. ".repeat(7_000))),
             MemMessage::user(TASK),
         ];
         let caveats = Caveats::top();
         let uri = server.uri();
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
-        c.mid_loop_trim_tokens = Some(50); // hard trigger, unreachable budget
+        c.mid_loop_trim_tokens = Some(initial_request_budget(&messages, TASK));
         c.compress_state = Some(&mut compress_state);
         let err = chat_complete(c, &mut NoMcp)
             .await
-            .expect_err("the post-latch over-budget round must refuse the send");
+            .expect_err("the first known-over-budget follow-up must refuse the send");
         let msg = err.to_string();
-        assert!(msg.contains("exceeds the model's input budget"), "{msg}");
-        assert!(msg.contains("auto-compression is disabled"), "{msg}");
-        assert!(compress_state.is_disabled(), "anti-thrash latched first");
+        assert!(msg.contains("complete inference request needs"), "{msg}");
+        assert!(msg.contains("tool results were not truncated"), "{msg}");
         assert!(
-            log.lock().unwrap().len() <= 3,
-            "the refusal must stop the loop within a round or two"
+            !compress_state.is_disabled(),
+            "preflight refuses before thrashing"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "no known-over-budget follow-up may reach the wire"
         );
     }
 
@@ -9353,6 +10988,8 @@ mod observation_hook_tests {
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
             action_nudges: true,
+            prompt_disposition: PromptDisposition::Act,
+            prompt_intake: None,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -9363,6 +11000,7 @@ mod observation_hook_tests {
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
             mid_loop_trim_tokens: None,
             max_ok_input: None,
             build_check_cmd: None,
@@ -9389,6 +11027,36 @@ mod observation_hook_tests {
             git_tool: None,
             crew_runner: None,
         }
+    }
+
+    /// Set a hard gate immediately above the live initial wire request. The
+    /// following tool result must then exercise the preflight refusal rather
+    /// than making this regression depend on a frozen catalog size.
+    fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
+        let tools = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false,
+        );
+        let mut wire_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({"role": message.role.as_str(), "content": message.content})
+            })
+            .collect();
+        let receipt = crate::TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        );
+        prompt_read::ensure_active_prompt_card(
+            &mut wire_messages,
+            prompt_read::PromptReadContext::new(Some(&receipt), task, None),
+        );
+        estimate_request_tokens(
+            &wire_messages,
+            Some(&tools),
+            crate::tokens::TokenEstimation::default(),
+        )
+        .saturating_add(1)
     }
 
     fn body_json(req: &Request) -> serde_json::Value {
@@ -9508,7 +11176,7 @@ mod observation_hook_tests {
                     "message": {"content": "", "tool_calls": [{
                         "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
                     }]},
-                    "prompt_eval_count": 100, "eval_count": 5,
+                    "prompt_eval_count": 14_000, "eval_count": 5,
                 }))
             } else {
                 ResponseTemplate::new(200)
@@ -9517,11 +11185,10 @@ mod observation_hook_tests {
         }
     }
 
-    /// A turn that ends `Err` (the Refused bail) STILL delivered the earlier
-    /// rounds' `Accepted` observations first — evidence at the moment of
-    /// observation, not in an epilogue the error skips (the spec's headline
-    /// property). Also pins the bail's new tail: it names the model and the
-    /// `newt tunings reset` escape hatch.
+    /// A turn that ends `Err` at the authoritative full-request preflight
+    /// STILL delivered the earlier round's `Accepted` observation first —
+    /// evidence at the moment of observation, not in an epilogue the error
+    /// skips (the spec's headline property).
     #[tokio::test]
     async fn err_turn_still_delivered_accepted_observations_first() {
         let server = MockServer::start().await;
@@ -9531,10 +11198,11 @@ mod observation_hook_tests {
             .mount(&server)
             .await;
 
-        // Incompressible context + unreachable hard token budget → two poor
-        // passes latch anti-thrash, the next round refuses the send.
+        // Incompressible context + hard token budget: the initial request is
+        // valid and accepted, then its fresh result makes the follow-up
+        // impossible. The full gate refuses that follow-up before the wire.
         let messages = vec![
-            MemMessage::system(format!("you are a test. {}", "rule. ".repeat(700))),
+            MemMessage::system(format!("you are a test. {}", "rule. ".repeat(7_000))),
             MemMessage::user("do the thing"),
         ];
         let caveats = Caveats::top();
@@ -9543,24 +11211,21 @@ mod observation_hook_tests {
         let mut observations: Vec<RoundObservation> = Vec::new();
         let mut hook = |obs: RoundObservation| observations.push(obs);
         let mut c = ctx(&uri, &messages, &caveats);
-        c.mid_loop_trim_tokens = Some(50);
+        c.mid_loop_trim_tokens = Some(initial_request_budget(&messages, "do the thing"));
         c.compress_state = Some(&mut compress_state);
         c.on_round_usage = Some(&mut hook);
         let err = chat_complete(c, &mut NoMcp)
             .await
-            .expect_err("the post-latch over-budget round must refuse the send");
+            .expect_err("the known-over-budget follow-up must refuse the send");
 
         let msg = err.to_string();
-        assert!(msg.contains("exceeds the model's input budget"), "{msg}");
-        assert!(
-            msg.contains("newt tunings reset test-model"),
-            "the bail must name the model's reset command: {msg}"
-        );
+        assert!(msg.contains("complete inference request needs"), "{msg}");
+        assert!(msg.contains("tool results were not truncated"), "{msg}");
         assert!(
             observations.iter().any(|o| matches!(
                 o,
                 RoundObservation::Accepted {
-                    prompt_tokens: 100,
+                    prompt_tokens: 14_000,
                     ..
                 }
             )),
@@ -9669,13 +11334,13 @@ mod observation_hook_tests {
                     "message": {"content": "", "tool_calls": [{
                         "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
                     }]},
-                    // 4,000 ≥ 95% of 4,096 (3,891) — truncation suspect.
-                    "prompt_eval_count": 4_000, "eval_count": 5,
+                    // 5,000 ≥ 95% of 5,120 (4,864) — truncation suspect.
+                    "prompt_eval_count": 5_000, "eval_count": 5,
                 }))
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "message": {"content": "suspect answer"},
-                    "prompt_eval_count": 4_000, "eval_count": 5,
+                    "prompt_eval_count": 5_000, "eval_count": 5,
                 }))
             }
         }
@@ -9702,7 +11367,10 @@ mod observation_hook_tests {
         let mut observations: Vec<RoundObservation> = Vec::new();
         let mut hook = |obs: RoundObservation| observations.push(obs);
         let mut c = ctx(&uri, &messages, &caveats);
-        c.num_ctx = Some(4_096);
+        // The exact prompt + schemas fit inside the 4,096-token input share;
+        // the backend's 5,000-token report is nevertheless within 5% of the
+        // complete 5,120-token context and remains truncation-suspect.
+        c.num_ctx = Some(5_120);
         c.on_round_usage = Some(&mut hook);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
             .await

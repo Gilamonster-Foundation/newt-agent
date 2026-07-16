@@ -32,6 +32,8 @@
 //! id resolves to labelled coaching, never a crash.
 
 use super::display::{print_tool_call, print_tool_output};
+use super::prompt_read::PromptSource;
+use crate::PromptId;
 
 /// A parsed, tagged memory address. Each variant resolves against its own
 /// surface ([`Self::Note`]/[`Self::Turn`] read existing stores; [`Self::Spill`]/
@@ -127,6 +129,19 @@ pub trait MemorySource: Send + Sync {
     /// distinguishes the two (a backend error surfaces as `error:` verbatim;
     /// absence surfaces as coaching).
     fn fetch(&self, addr: &MemAddr) -> anyhow::Result<MemPayload>;
+
+    /// Resolve the additive `prompt:<uuid>` compatibility alias without
+    /// adding a variant to the public [`MemAddr`] enum. The default preserves
+    /// source compatibility for third-party implementations and reports a
+    /// labelled absence; prompt-aware sources override it with a
+    /// conversation-fenced resolver.
+    fn fetch_prompt(&self, id: PromptId) -> anyhow::Result<MemPayload> {
+        Ok(MemPayload::NotFound {
+            reason: format!(
+                "no prompt {id} in this active conversation — use the always-on prompt_read tool"
+            ),
+        })
+    }
 }
 
 /// The canonical [`MemorySource`]: a [`crate::notes::NoteStore`] for `note:`
@@ -149,6 +164,9 @@ pub struct StoreMemorySource<'a> {
     /// progressive disclosure is off — `compaction:` then resolves to a labelled
     /// absence.
     compaction: Option<&'a dyn super::spill::SpillStore>,
+    /// Optional compatibility route for `memory_fetch prompt:<uuid>`. The
+    /// always-on `prompt_read` tool remains the primary prompt surface.
+    prompt: Option<&'a dyn PromptSource>,
 }
 
 impl<'a> StoreMemorySource<'a> {
@@ -161,6 +179,7 @@ impl<'a> StoreMemorySource<'a> {
             store,
             spill: None,
             compaction: None,
+            prompt: None,
         }
     }
 
@@ -176,6 +195,14 @@ impl<'a> StoreMemorySource<'a> {
     #[must_use]
     pub fn with_compaction_store(mut self, compaction: &'a dyn super::spill::SpillStore) -> Self {
         self.compaction = Some(compaction);
+        self
+    }
+
+    /// Attach the active-conversation prompt resolver for the compatibility
+    /// `memory_fetch prompt:<uuid>` address form.
+    #[must_use]
+    pub fn with_prompt_source(mut self, prompt: &'a dyn PromptSource) -> Self {
+        self.prompt = Some(prompt);
         self
     }
 }
@@ -205,9 +232,9 @@ impl MemorySource for StoreMemorySource<'_> {
                     }),
                 }
             }
-            // #661 group B: the verbatim (redacted) middle span the compressor
-            // evicted, if the session compaction store still holds it. Redacted
-            // on store (same closed-table contract as `spill:`), session-scoped.
+            // Prompt addresses are intercepted by `execute_memory_fetch`
+            // before public `MemAddr` parsing to keep that enum exhaustive-
+            // match compatible for embedders.
             MemAddr::Compaction { id } => match self.compaction.and_then(|s| s.fetch(id)) {
                 Some(body) => Ok(MemPayload::Found(body)),
                 None => Ok(MemPayload::NotFound {
@@ -229,6 +256,31 @@ impl MemorySource for StoreMemorySource<'_> {
                     ),
                 }),
             },
+        }
+    }
+
+    fn fetch_prompt(&self, id: PromptId) -> anyhow::Result<MemPayload> {
+        match self.prompt {
+            Some(source) => match source.fetch_prompt(id)? {
+                Some(receipt) => {
+                    receipt.verify_integrity()?;
+                    let text = receipt.model_text_utf8().map_err(|_| {
+                        anyhow::anyhow!("prompt {id} model text is not valid UTF-8")
+                    })?;
+                    Ok(MemPayload::Found(text.to_string()))
+                }
+                None => Ok(MemPayload::NotFound {
+                    reason: format!(
+                        "no prompt {id} in this active conversation — use prompt_read \
+                         with `current`, `submitted`, `root`, `parent`, or `previous`"
+                    ),
+                }),
+            },
+            None => Ok(MemPayload::NotFound {
+                reason: "prompt addresses require an active conversation prompt source; \
+                         use the always-on prompt_read tool"
+                    .to_string(),
+            }),
         }
     }
 }
@@ -266,6 +318,8 @@ const MEMORY_FETCH_DESCRIPTION: &str =
      Addresses look like `note:3` (a numbered note from the memory index) or \
      `turn:<conversation-id>#<seq>` (one past turn, e.g. \
      `turn:174856320012#7` — copy the id and `seq N` from a recall hit), \
+     or `prompt:<uuid>` (compatibility alias for one immutable prompt receipt; \
+     prefer the always-on prompt_read tool for current/root/ancestry selectors), \
      or `spill:<id>` (the full secret-redacted body of a tool output that was \
      truncated for length — the `[… truncated …]` marker carries the id; add \
      `grep` to return matching lines instead of the whole payload), \
@@ -293,8 +347,8 @@ pub fn memory_fetch_tool_definition() -> serde_json::Value {
                     "address": {
                         "type": "string",
                         "description": "The tagged address to fetch, e.g. \
-                                        'note:3', 'turn:174856320012#7', 'spill:s3', \
-                                        or 'compaction:s1' — copy it exactly as the \
+                                        'note:3', 'turn:174856320012#7', \
+                                        'prompt:<uuid>', 'spill:s3', or 'compaction:s1' — copy it exactly as the \
                                         index, a recall hit, a truncation marker, or \
                                         a compaction summary showed it"
                     },
@@ -349,7 +403,18 @@ pub(crate) fn execute_memory_fetch(
             .to_string();
     }
 
-    let Some(addr) = MemAddr::parse(address) else {
+    let payload = if address.starts_with("prompt:") {
+        let Ok(id) = address.parse::<PromptId>() else {
+            let out = format!(
+                "{address:?} is not a valid prompt address — copy a `prompt:<uuid>` handle exactly as Newt showed it."
+            );
+            print_tool_output(&out, tool_output_lines, color);
+            return out;
+        };
+        source.fetch_prompt(id)
+    } else if let Some(addr) = MemAddr::parse(address) {
+        source.fetch(&addr)
+    } else {
         let out = format!(
             "{address:?} is not a memory address — they look like `note:3` \
              (a numbered note) or `turn:174856320012#7` (a conversation id \
@@ -359,7 +424,7 @@ pub(crate) fn execute_memory_fetch(
         return out;
     };
 
-    let payload = match source.fetch(&addr) {
+    let payload = match payload {
         Ok(p) => p,
         Err(e) => return format!("error: {e}"),
     };
@@ -462,7 +527,7 @@ pub(crate) mod tests {
     // -- address parsing -----------------------------------------------------
 
     #[test]
-    fn parse_note_turn_and_compaction_forms() {
+    fn parse_note_turn_and_compaction_forms_without_expanding_public_enum() {
         assert_eq!(
             MemAddr::parse("note:3"),
             Some(MemAddr::Note { id: "3".into() })
@@ -478,6 +543,7 @@ pub(crate) mod tests {
             MemAddr::parse("compaction:abc"),
             Some(MemAddr::Compaction { id: "abc".into() })
         );
+        assert_eq!(MemAddr::parse(&PromptId::new().to_string()), None);
         // Step 26.3 (#584): the spill: form (trims; non-empty).
         assert_eq!(
             MemAddr::parse("  spill:s3 "),
@@ -517,6 +583,7 @@ pub(crate) mod tests {
         let desc = def["function"]["description"].as_str().unwrap();
         assert!(desc.contains("note:3"), "got: {desc}");
         assert!(desc.contains("turn:174856320012#7"), "got: {desc}");
+        assert!(desc.contains("prompt:<uuid>"), "got: {desc}");
     }
 
     #[test]
@@ -736,6 +803,31 @@ pub(crate) mod tests {
             20,
         );
         assert!(none.starts_with("no such memory item:"), "got: {none}");
+    }
+
+    #[test]
+    fn prompt_address_alias_resolves_exact_model_text_through_conversation_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::notes::NoteStore::new(dir.path().join("NOTES.md"), 2_200);
+        let store = test_store(&dir);
+        let turn = store
+            .begin_prompt(
+                "conv",
+                "title",
+                None,
+                crate::NewPrompt::operator("raw", "exact model text\n"),
+            )
+            .unwrap();
+        let prompt = super::super::prompt_read::StorePromptSource::new(&store, "conv");
+        let source = StoreMemorySource::new(&notes, &store).with_prompt_source(&prompt);
+
+        let out = execute_memory_fetch(
+            &serde_json::json!({"address": turn.submitted().id().to_string()}),
+            &source,
+            false,
+            20,
+        );
+        assert_eq!(out, "exact model text\n");
     }
 
     // -- StoreMemorySource against real surfaces (tempdir) -------------------

@@ -48,23 +48,29 @@ Adopt a hybrid objective contract with five layers.
 
 ### 1. Caller-owned active prompt
 
-The task accepted by the TUI is the sole authority for the current turn. Thread
-it into the agent loop as a typed `ActivePrompt`; never infer it from role
-messages, summaries, or harness guidance. Every post-compaction continuation
-receives that value directly.
+The operator task accepted by the TUI is the sole mutation authority for the
+current turn. Thread a typed `TurnPromptContext` into the agent loop; it keeps
+the submitted attempt distinct from the nearest validated operator prompt and
+never infers either from role messages, summaries, or harness guidance. Every
+post-compaction continuation receives that value directly.
 
 Exactly one compression-immune active-prompt card reaches every primary-model
-request. The card names both the current prompt and its objective root. The exact
-current model text remains present. If system instructions plus the exact prompt
-cannot fit the hard context window, Newt refuses before dispatch rather than
-substituting a paraphrase.
+request. The card names the active operator prompt and objective root, and names
+the submitted attempt plus its chronological/semantic links when they differ or
+lead elsewhere. The exact active operator `model_text` remains at user priority.
+If
+system instructions, required schemas, and that exact prompt cannot fit the hard
+context window, Newt refuses before dispatch rather than substituting a
+paraphrase.
 
 ### 2. Write-before-work prompt receipts
 
 Before retrieval, compaction, inference, or tool dispatch, atomically persist an
 immutable prompt receipt in the existing conversation SQLite store. Each receipt
-has a stable `prompt:<uuid>` address, conversation/writer identity, parent and
-root references, receipt sequence, origin, and domain-separated BLAKE3 digests.
+has a stable `prompt:<uuid>` address, conversation/writer identity, automatic
+chronological predecessor, explicit semantic parent and objective root,
+validated active-operator reference, receipt sequence, origin, and
+domain-separated BLAKE3 digests.
 
 Preserve two explicitly named representations:
 
@@ -81,13 +87,15 @@ make no SQLite write. Conversation deletion cascades to prompt records.
 ### 3. Exact retrieval
 
 Advertise a narrow, read-only `prompt_read` tool independently of general memory
-disclosure. With no address it returns the current prompt; it also accepts
-`root` or an explicit `prompt:<uuid>`, plus bounded offsets for long prompts.
-The result includes exact `model_text`, total length, and a verified digest.
+disclosure. With no address it returns the active operator prompt; it also
+accepts `submitted`, `root`, `parent`, `previous`, or an explicit
+`prompt:<uuid>`, plus bounded offsets for long prompts. The result includes
+exact `model_text`, total length, ancestry metadata, and a verified digest.
 
 `memory_fetch` may resolve `prompt:` for compatibility when general memory is
 enabled, but core task recovery must not depend on that optional feature.
-Resume context names the current and root prompt handles.
+Resume context names active and submitted handles plus predecessor, parent, and
+root links without copying prompt bodies.
 
 ### 4. Prompt-rooted artifacts
 
@@ -99,7 +107,10 @@ provenance automatically:
 - `update_plan` creates a `plan_revision`.
 - compaction creates a `compaction_checkpoint`.
 - a successful file mutation creates a `file_change` with a workspace-relative
-  locator and before/after digests, not a duplicate file body.
+  locator and before/after digests, not a duplicate file body. Capture opens
+  the final file component without following links (Unix `O_NOFOLLOW`; Windows
+  `FILE_FLAG_OPEN_REPARSE_POINT`); platforms without an equivalent primitive
+  fail closed rather than emitting unverified file provenance.
 - a completed response creates a `turn_outcome`.
 - a commit or observed HEAD transition creates a `commit` artifact.
 - an explicit decision operation may create a `decision` artifact.
@@ -139,12 +150,13 @@ receipts explicitly linked to the pending decision manifest.
    transformed message list.
 2. A persistent prompt receipt is committed before any model or tool work.
 3. Prompt text and identity are immutable; summaries are derived references.
-4. Every primary-model request contains exactly one protected active prompt.
+4. Every primary-model request contains exactly one protected active-operator
+   prompt pair, and keeps submitted retry prose distinct.
 5. Compaction may summarize background and progress, never the active prompt.
-6. Exact current/root prompts remain retrievable after compaction, restart, or
-   an incomplete turn.
-7. Harness retries remain children of the operator prompt rather than replacing
-   it.
+6. Exact active/submitted/root/parent/previous prompts remain retrievable after
+   compaction, restart, or an incomplete turn.
+7. Harness retries remain children of their immediate submitted attempt and
+   inherit the nearest validated operator authority rather than replacing it.
 8. Derived artifacts remain rooted in the prompt that caused them and are never
    silently reparented after a follow-up prompt.
 9. Prompt text is absent from operational telemetry; IDs and digests are enough.
@@ -166,6 +178,58 @@ The change lands as five reviewable PRs:
    diagnostics.
 5. **Prompt dispositions:** structured ask decomposition, decision manifests,
    ask/act/explain/research transitions, capability gates, and nudge scoping.
+
+### PR4 compaction-policy contract
+
+`[context].compaction_trigger_policy` defaults to `headroom_aware`. Under this
+policy, a message-count threshold is a fallback only when Newt does not know a
+usable input ceiling. A configured nonzero token threshold, or a nonzero send
+budget backed by a declared/believed/recovered window, is authoritative and
+suppresses a *count-only* checkpoint until genuine token pressure arrives.
+`max_ok_input` by itself remains a proven-good high-water mark, not proof of a
+context window, so it does not suppress the fallback count guard.
+
+`message_count` is an explicit compatibility policy that restores the legacy
+count-only behavior. Neither policy changes hard token/send-budget compression,
+manual `/compress`, recovered context-window 400 handling, silent-overflow
+recovery, or the Responses API's current lack of an automatic compressor.
+
+Every automatic compaction checkpoint records the policy, scalar trigger
+inputs, authoritative-budget state, fired causes, and the selected cause under
+its objective root. The artifact body includes its `root:prompt:<uuid>`
+selector. This audit record never stores prompt text, message payloads, or tool
+output; a deferred count-only decision writes no artifact to avoid ledger spam.
+
+### PR5 prompt-comprehension contract
+
+Immediately after a prompt receipt is accepted, Newt derives a bounded
+prompt-comprehension manifest: atomic-ask count/digests, a disposition, and
+decision locks whose sources are only `operator`, deterministic `policy`, or
+an explicitly authorized low-risk `authorized_assumption`. The manifest is
+recorded as a prompt-rooted `decision` artifact without copying prompt text or
+clarification text into the artifact ledger.
+
+The only dispositions are `ask`, `act`, `explain`, and `research`. `ask` is a
+harness-owned, bounded clarification batch that ends before model/tool work;
+the next direct operator answer is persisted as an explicit
+`operator_continuation` of the pending objective. Fully specified multi-part
+requests are `act`, not automatically ambiguous. Informational requests are
+`explain`; evidence-gathering requests are `research` and receive a fixed,
+read-only catalog.
+
+Pending clarification is not session-local state: restore rebuilds it from the
+verified semantic lineage of immutable operator receipts, ending at the latest
+unresolved continuation. A malformed or over-bound lineage fails closed rather
+than recasting the next reply as a new executable objective. Intake truncation
+also fails closed: an over-capacity request remains `ask` until the operator
+starts a smaller task with `/new`.
+
+Catalog filtering is an ergonomic surface, not the authority boundary. The
+tool dispatcher rejects non-`act` mutations, exec, permission-grant attempts,
+and every generic MCP tool before aliasing, routing, or interactive grants can
+run. `act` is the sole disposition with execution-oriented nudges; the default
+agent identity must not override a per-turn `ask`, `explain`, or `research`
+gate with unconditional "act now" language.
 
 Newt-Agent owns storage, assembly, retrieval, and lifecycle behavior. Backend
 adapters must preserve the active-prompt invariant. TUI code owns capturing raw

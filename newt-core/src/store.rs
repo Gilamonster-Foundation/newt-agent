@@ -176,10 +176,14 @@ use fts::create_fts_index;
 use fts::events_extract_sql;
 pub use fts::sanitize_fts5_query;
 
+use crate::artifact::{
+    ArtifactId, ArtifactKind, ArtifactRelation, NewPromptArtifact, PromptArtifact,
+};
 use crate::conversation::{
     new_conversation_id, session_plan_dir, ConversationRecord, ConversationSummary,
     ConversationTurn,
 };
+use crate::prompt::{NewPrompt, PromptId, PromptOrigin, PromptReceipt, TurnPromptContext};
 
 /// Database file name under the store root (`~/.newt/conversations.db`).
 const DB_FILE: &str = "conversations.db";
@@ -207,6 +211,14 @@ const IDENTITY_PEM_FILE: &str = "identity.pem";
 /// behind this.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum number of receipts examined while resolving the active operator
+/// through a harness-retry parent chain. This includes both the submitted
+/// receipt and the terminal operator receipt. A finite bound makes corrupted
+/// or adversarial lineage fail closed without unbounded CPU/memory use; 256
+/// still permits far more consecutive automatic retries than a useful turn
+/// should ever require.
+const MAX_PROMPT_LINEAGE_DEPTH: usize = 256;
+
 /// Domain-separation prefix for the v1 canonical turn encoding (`prev_hash`
 /// chain). Versioned so a future encoding change cannot collide with v1.
 const TURN_ENCODING_V1_PREFIX: &[u8] = b"newt-turn:v1";
@@ -219,6 +231,13 @@ const TURN_ENCODING_VERSION_CURRENT: i64 = 1;
 
 /// Domain-separation prefix for the per-(conversation, writer) genesis hash.
 const GENESIS_PREFIX: &[u8] = b"newt-turn-chain-genesis:v1";
+
+/// Domain-separation prefix for the per-conversation prompt-artifact chain.
+const ARTIFACT_GENESIS_PREFIX: &[u8] = b"newt-prompt-artifact-chain-genesis:v1";
+
+/// Hard upper bound for one paged artifact read. Internal verification still
+/// covers the complete chain before a page is returned.
+const MAX_ARTIFACT_PAGE_SIZE: usize = 256;
 
 /// SQLite-backed conversation store (see module docs).
 ///
@@ -357,6 +376,537 @@ impl ConversationStore {
         &self.writer_fingerprint
     }
 
+    /// Atomically accept one prompt before any model or tool work begins.
+    ///
+    /// The transaction lazy-creates `conversation_id` when this is its first
+    /// prompt, allocates the prompt's Lamport sequence, resolves explicit
+    /// ancestry, writes the immutable receipt, and advances conversation
+    /// activity. It deliberately does **not** touch the conversation's turn
+    /// `writer_fingerprint` / `tip_hash` pair: prompts have their own hashes
+    /// and must not masquerade as completed turns in the existing chain.
+    ///
+    /// `previous_prompt_id` is assigned from serialized receipt chronology.
+    /// That is independent from semantic parentage: a plain operator prompt
+    /// has no parent and roots at itself. Explicit continuations/retries must
+    /// name a same-conversation parent and inherit its validated root.
+    pub fn begin_prompt(
+        &self,
+        conversation_id: &str,
+        title: &str,
+        persona: Option<&str>,
+        prompt: NewPrompt,
+    ) -> anyhow::Result<TurnPromptContext> {
+        validate_record_id(conversation_id)?;
+        std::str::from_utf8(prompt.model_text()).map_err(|error| {
+            anyhow::anyhow!(
+                "prompt model text is not valid UTF-8 and cannot be sent to inference: {error}"
+            )
+        })?;
+        let now = (self.claim_clock)();
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+
+        // The global conversation id is itself an authority boundary. Never
+        // let a caller in workspace B attach a prompt to workspace A's row.
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT workspace_key FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = owner.as_deref() {
+            if owner != self.workspace_id {
+                anyhow::bail!(
+                    "conversation id `{conversation_id}` belongs to another workspace \
+                     (key {owner}); refusing to attach a prompt across the workspace fence"
+                );
+            }
+        }
+
+        let tick = next_tick(&tx, &self.writer_fingerprint)?;
+        let created = owner.is_none();
+        if created {
+            // Unlike `create_with_id`, this is an INSERT, never REPLACE. A
+            // prompt receipt and the conversation that owns it become visible
+            // together at commit; no crash window can leave only one behind.
+            tx.execute(
+                "INSERT INTO conversations
+                   (id, title, workspace_path, workspace_key, persona, end_reason,
+                    writer_fingerprint, activity_tick, tip_hash,
+                    started_at_claim, updated_at_claim)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?9)",
+                rusqlite::params![
+                    conversation_id,
+                    title.trim(),
+                    self.workspace.to_string_lossy(),
+                    self.workspace_id,
+                    persona,
+                    self.writer_fingerprint,
+                    tick,
+                    genesis_hash(conversation_id, &self.writer_fingerprint),
+                    now,
+                ],
+            )?;
+        } else {
+            // A submitted prompt is real activity even if inference later
+            // fails. Do not move the turn writer/tip pair here.
+            tx.execute(
+                "UPDATE conversations
+                    SET activity_tick = ?2, updated_at_claim = ?3
+                  WHERE id = ?1 AND workspace_key = ?4",
+                rusqlite::params![conversation_id, tick, now, self.workspace_id],
+            )?;
+        }
+
+        let previous_prompt_id = latest_prompt_on_conn(&tx, conversation_id, &self.workspace_id)?
+            .map(|receipt| receipt.id());
+        let prompt_id = PromptId::new();
+
+        let parent = match prompt.parent_prompt_id {
+            Some(parent_id) => Some(
+                load_prompt_in_conversation_on_conn(
+                    &tx,
+                    conversation_id,
+                    parent_id,
+                    &self.workspace_id,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "prompt parent {parent_id} is not in conversation \
+                             `{conversation_id}` in this workspace"
+                    )
+                })?,
+            ),
+            None => None,
+        };
+        if prompt.origin == PromptOrigin::HarnessRetry && parent.is_none() {
+            anyhow::bail!("a harness retry must name an operator-prompt parent");
+        }
+
+        let root_prompt_id = match parent.as_ref() {
+            Some(parent) => {
+                validate_objective_root_on_conn(
+                    &tx,
+                    conversation_id,
+                    parent.root_prompt_id(),
+                    &self.workspace_id,
+                )?;
+                parent.root_prompt_id()
+            }
+            None => prompt_id,
+        };
+        let active_operator = match prompt.origin {
+            PromptOrigin::Operator => None,
+            PromptOrigin::HarnessRetry => {
+                let parent = parent.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("a harness retry must name an operator-prompt parent")
+                })?;
+                let (active, parent_depth) = resolve_active_operator_on_conn(
+                    &tx,
+                    conversation_id,
+                    parent,
+                    &self.workspace_id,
+                )?;
+                if parent_depth >= MAX_PROMPT_LINEAGE_DEPTH {
+                    anyhow::bail!(
+                        "harness retry would exceed the maximum prompt lineage depth of \
+                         {MAX_PROMPT_LINEAGE_DEPTH} receipts"
+                    );
+                }
+                Some(active)
+            }
+        };
+        let active_operator_id = active_operator
+            .as_ref()
+            .map_or(prompt_id, PromptReceipt::id);
+
+        let receipt = PromptReceipt::new(
+            prompt_id,
+            conversation_id.to_string(),
+            self.writer_fingerprint.clone(),
+            tick,
+            previous_prompt_id,
+            parent.as_ref().map(PromptReceipt::id),
+            root_prompt_id,
+            active_operator_id,
+            prompt.origin,
+            prompt.raw_text,
+            prompt.model_text,
+            now,
+        );
+        insert_prompt_receipt(&tx, &receipt)?;
+        let context = TurnPromptContext::new(
+            receipt.clone(),
+            active_operator.unwrap_or_else(|| receipt.clone()),
+        );
+        tx.commit()?;
+        drop(conn);
+
+        if created {
+            // The receipt is already committed. Retention is housekeeping,
+            // not part of prompt acceptance: reporting an error here would
+            // tell the caller the prompt was not recorded even though it is
+            // durable, inviting a duplicate retry. Keep the accepted receipt
+            // authoritative and surface pruning failure as a diagnostic.
+            if let Err(error) = self.prune_to_cap_excluding(conversation_id) {
+                tracing::warn!(
+                    %error,
+                    conversation_id,
+                    "prompt committed but conversation retention pruning failed"
+                );
+            }
+        }
+        Ok(context)
+    }
+
+    /// Read one prompt by its stable address, fenced to this store's
+    /// workspace. An address owned by another workspace is indistinguishable
+    /// from absence.
+    pub fn load_prompt(&self, prompt_id: PromptId) -> anyhow::Result<Option<PromptReceipt>> {
+        let conn = self.lock_conn();
+        load_prompt_on_conn(&conn, prompt_id, &self.workspace_id)
+    }
+
+    /// Read one prompt only when both its address and owning conversation
+    /// match. This is the narrow resolver used by an always-on prompt tool: a
+    /// model cannot use a valid same-workspace handle to escape its active
+    /// conversation.
+    pub fn load_prompt_in_conversation(
+        &self,
+        conversation_id: &str,
+        prompt_id: PromptId,
+    ) -> anyhow::Result<Option<PromptReceipt>> {
+        validate_record_id(conversation_id)?;
+        let conn = self.lock_conn();
+        load_prompt_in_conversation_on_conn(&conn, conversation_id, prompt_id, &self.workspace_id)
+    }
+
+    /// The most recently received prompt in a conversation, or `None` for an
+    /// unknown/empty conversation. Receipt order is SQLite-serialized append
+    /// order, not a wall-clock claim.
+    pub fn latest_prompt(&self, conversation_id: &str) -> anyhow::Result<Option<PromptReceipt>> {
+        validate_record_id(conversation_id)?;
+        let conn = self.lock_conn();
+        latest_prompt_on_conn(&conn, conversation_id, &self.workspace_id)
+    }
+
+    /// Follow the automatic chronological predecessor link for one prompt.
+    pub fn previous_prompt(&self, prompt_id: PromptId) -> anyhow::Result<Option<PromptReceipt>> {
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        let Some(receipt) = load_prompt_on_conn(&tx, prompt_id, &self.workspace_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let Some(previous) = receipt.previous_prompt_id() else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let previous = load_prompt_in_conversation_on_conn(
+            &tx,
+            receipt.conversation_id(),
+            previous,
+            &self.workspace_id,
+        )?;
+        tx.commit()?;
+        Ok(previous)
+    }
+
+    /// All prompt receipts in durable receipt order for one conversation.
+    pub fn prompt_chain(&self, conversation_id: &str) -> anyhow::Result<Vec<PromptReceipt>> {
+        validate_record_id(conversation_id)?;
+        let conn = self.lock_conn();
+        prompt_chain_on_conn(&conn, conversation_id, &self.workspace_id)
+    }
+
+    /// Atomically append one bounded derived-work artifact to a prompt.
+    ///
+    /// The objective root is derived from the immutable prompt receipt, never
+    /// accepted from the caller. The complete existing artifact chain is
+    /// verified under the same `BEGIN IMMEDIATE` transaction that allocates
+    /// the next sequence and inserts the row, so concurrent processes cannot
+    /// fork the chain and pre-existing tampering fails closed.
+    pub fn append_prompt_artifact(
+        &self,
+        conversation_id: &str,
+        prompt_id: PromptId,
+        content: NewPromptArtifact,
+    ) -> anyhow::Result<PromptArtifact> {
+        validate_record_id(conversation_id)?;
+        // Validate bounded content before taking SQLite's write lock.
+        content.validate()?;
+        let now = (self.claim_clock)();
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT workspace_key FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match owner.as_deref() {
+            Some(owner) if owner == self.workspace_id => {}
+            Some(owner) => anyhow::bail!(
+                "conversation id `{conversation_id}` belongs to another workspace \
+                 (key {owner}); refusing to append an artifact across the workspace fence"
+            ),
+            None => anyhow::bail!("unknown conversation `{conversation_id}`"),
+        }
+
+        // Artifact provenance is meaningful only while the complete prompt
+        // chronology remains valid. In particular, fail closed if mutable
+        // receipt_order metadata was tampered even though this one receipt's
+        // content hash still verifies.
+        let prompt_chain = prompt_chain_on_conn(&tx, conversation_id, &self.workspace_id)?;
+        let prompt = prompt_chain
+            .iter()
+            .find(|prompt| prompt.id() == prompt_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                "prompt {prompt_id} is not in conversation `{conversation_id}` in this workspace"
+            )
+            })?;
+        validate_objective_root_on_conn(
+            &tx,
+            conversation_id,
+            prompt.root_prompt_id(),
+            &self.workspace_id,
+        )?;
+
+        let chain = artifact_chain_on_conn(&tx, conversation_id, &self.workspace_id)?;
+        let (seq, prev_hash) = match chain.last() {
+            Some(previous) => (
+                previous
+                    .seq()
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("prompt artifact sequence overflow"))?,
+                previous.artifact_hash().to_string(),
+            ),
+            None => (1, artifact_genesis_hash(conversation_id)),
+        };
+        let artifact = PromptArtifact::mint(
+            ArtifactId::new(),
+            conversation_id.to_string(),
+            self.writer_fingerprint.clone(),
+            seq,
+            prev_hash,
+            prompt.id(),
+            prompt.root_prompt_id(),
+            content,
+            now,
+        )?;
+        insert_prompt_artifact(&tx, &artifact)?;
+        tx.commit()?;
+        Ok(artifact)
+    }
+
+    /// Fetch one artifact through both its conversation and workspace fence.
+    /// The complete conversation chain is verified before the record is
+    /// returned, so deletion/reordering of a predecessor is detected too.
+    pub fn load_prompt_artifact(
+        &self,
+        conversation_id: &str,
+        artifact_id: ArtifactId,
+    ) -> anyhow::Result<Option<PromptArtifact>> {
+        validate_record_id(conversation_id)?;
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        let found = artifact_chain_on_conn(&tx, conversation_id, &self.workspace_id)?
+            .into_iter()
+            .find(|artifact| artifact.id() == artifact_id);
+        tx.commit()?;
+        Ok(found)
+    }
+
+    /// Read a bounded page of the verified artifact chain in causal order.
+    pub fn list_prompt_artifacts(
+        &self,
+        conversation_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PromptArtifact>> {
+        self.page_prompt_artifacts(conversation_id, offset, limit)
+            .map(|(artifacts, _)| artifacts)
+    }
+
+    /// Return a verified causal page and its snapshot-consistent total.
+    pub fn page_prompt_artifacts(
+        &self,
+        conversation_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<PromptArtifact>, usize)> {
+        validate_record_id(conversation_id)?;
+        validate_artifact_page_size(limit)?;
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        let chain = artifact_chain_on_conn(&tx, conversation_id, &self.workspace_id)?;
+        let total = chain.len();
+        let page = chain.into_iter().skip(offset).take(limit).collect();
+        tx.commit()?;
+        Ok((page, total))
+    }
+
+    /// Count the verified artifact chain through the workspace fence.
+    pub fn count_prompt_artifacts(&self, conversation_id: &str) -> anyhow::Result<usize> {
+        self.page_prompt_artifacts(conversation_id, 0, 0)
+            .map(|(_, total)| total)
+    }
+
+    /// Read a bounded causal page containing only artifacts attached directly
+    /// to `prompt_id`. A prompt outside this conversation/workspace resolves
+    /// to an empty page rather than becoming an address-existence oracle.
+    pub fn list_prompt_artifacts_for_prompt(
+        &self,
+        conversation_id: &str,
+        prompt_id: PromptId,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PromptArtifact>> {
+        self.page_prompt_artifacts_for_prompt(conversation_id, prompt_id, offset, limit)
+            .map(|(artifacts, _)| artifacts)
+    }
+
+    /// Return a direct-prompt page and its total from one read transaction.
+    pub fn page_prompt_artifacts_for_prompt(
+        &self,
+        conversation_id: &str,
+        prompt_id: PromptId,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<PromptArtifact>, usize)> {
+        validate_record_id(conversation_id)?;
+        validate_artifact_page_size(limit)?;
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        if load_prompt_in_conversation_on_conn(&tx, conversation_id, prompt_id, &self.workspace_id)?
+            .is_none()
+        {
+            tx.commit()?;
+            return Ok((Vec::new(), 0));
+        }
+        let matching: Vec<_> = artifact_chain_on_conn(&tx, conversation_id, &self.workspace_id)?
+            .into_iter()
+            .filter(|artifact| artifact.prompt_id() == prompt_id)
+            .collect();
+        let total = matching.len();
+        let page = matching.into_iter().skip(offset).take(limit).collect();
+        tx.commit()?;
+        Ok((page, total))
+    }
+
+    /// Count verified artifacts attached directly to one prompt.
+    pub fn count_prompt_artifacts_for_prompt(
+        &self,
+        conversation_id: &str,
+        prompt_id: PromptId,
+    ) -> anyhow::Result<usize> {
+        self.page_prompt_artifacts_for_prompt(conversation_id, prompt_id, 0, 0)
+            .map(|(_, total)| total)
+    }
+
+    /// Read a bounded causal page for an entire objective root, including
+    /// artifacts attached to later clarifications and harness retries.
+    pub fn list_prompt_artifacts_for_root(
+        &self,
+        conversation_id: &str,
+        root_prompt_id: PromptId,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PromptArtifact>> {
+        self.page_prompt_artifacts_for_root(conversation_id, root_prompt_id, offset, limit)
+            .map(|(artifacts, _)| artifacts)
+    }
+
+    /// Return an objective-root page and its total from one read transaction.
+    pub fn page_prompt_artifacts_for_root(
+        &self,
+        conversation_id: &str,
+        root_prompt_id: PromptId,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<PromptArtifact>, usize)> {
+        validate_record_id(conversation_id)?;
+        validate_artifact_page_size(limit)?;
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        let Some(root) = load_prompt_in_conversation_on_conn(
+            &tx,
+            conversation_id,
+            root_prompt_id,
+            &self.workspace_id,
+        )?
+        else {
+            tx.commit()?;
+            return Ok((Vec::new(), 0));
+        };
+        if root.id() != root.root_prompt_id() {
+            anyhow::bail!("prompt {root_prompt_id} is not an objective root");
+        }
+        validate_objective_root_on_conn(&tx, conversation_id, root_prompt_id, &self.workspace_id)?;
+        let matching: Vec<_> = artifact_chain_on_conn(&tx, conversation_id, &self.workspace_id)?
+            .into_iter()
+            .filter(|artifact| artifact.root_prompt_id() == root_prompt_id)
+            .collect();
+        let total = matching.len();
+        let page = matching.into_iter().skip(offset).take(limit).collect();
+        tx.commit()?;
+        Ok((page, total))
+    }
+
+    /// Count verified artifacts in one objective-root lineage.
+    pub fn count_prompt_artifacts_for_root(
+        &self,
+        conversation_id: &str,
+        root_prompt_id: PromptId,
+    ) -> anyhow::Result<usize> {
+        self.page_prompt_artifacts_for_root(conversation_id, root_prompt_id, 0, 0)
+            .map(|(_, total)| total)
+    }
+
+    /// Verify every artifact hash, causal sequence, and predecessor link in a
+    /// conversation. Unknown and cross-workspace conversations expose an empty
+    /// valid chain, matching the fenced read APIs.
+    pub fn verify_prompt_artifact_chain(&self, conversation_id: &str) -> anyhow::Result<()> {
+        validate_record_id(conversation_id)?;
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        artifact_chain_on_conn(&tx, conversation_id, &self.workspace_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rebuild the submitted-vs-active authority context for a prompt. An
+    /// operator receipt is active itself; a harness retry resolves to the
+    /// nearest validated operator authority inherited from its parent. The
+    /// objective root remains a separate lineage pointer.
+    pub fn turn_prompt_context(
+        &self,
+        conversation_id: &str,
+        submitted_prompt_id: PromptId,
+    ) -> anyhow::Result<Option<TurnPromptContext>> {
+        validate_record_id(conversation_id)?;
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        let Some(submitted) = load_prompt_in_conversation_on_conn(
+            &tx,
+            conversation_id,
+            submitted_prompt_id,
+            &self.workspace_id,
+        )?
+        else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let (active, _) =
+            resolve_active_operator_on_conn(&tx, conversation_id, &submitted, &self.workspace_id)?;
+        tx.commit()?;
+        Ok(Some(TurnPromptContext::new(submitted, active)))
+    }
+
     /// Create a conversation with a freshly minted id; returns the id.
     pub fn create(&self, title: &str, persona: Option<&str>) -> anyhow::Result<String> {
         let id = new_conversation_id();
@@ -400,12 +950,25 @@ impl ConversationStore {
                          (key {owner}); refusing to overwrite across the workspace fence"
                     );
                 }
+                let has_prompt_receipts: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM prompt_receipts WHERE conversation_id = ?1
+                     )",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                if has_prompt_receipts {
+                    anyhow::bail!(
+                        "conversation `{id}` has immutable prompt receipts; refusing to \
+                         recreate it implicitly (delete it explicitly before reusing the id)"
+                    );
+                }
             }
             let tick = next_tick(&tx, &self.writer_fingerprint)?;
-            // INSERT OR REPLACE mirrors the JSON backend, where re-creating an
-            // existing id overwrote the record (turns reset). The REPLACE
-            // deletes the old row, and `ON DELETE CASCADE` drops its turns —
-            // safe only because of the fence above.
+            // INSERT OR REPLACE mirrors the JSON backend for legacy rows where
+            // re-creating an existing id overwrote the record (turns reset).
+            // Prompt-bearing rows are rejected above: an ordinary "create"
+            // API must never cascade away an already-accepted prompt receipt.
             tx.execute(
                 "INSERT OR REPLACE INTO conversations
                    (id, title, workspace_path, workspace_key, persona, end_reason,
@@ -426,7 +989,15 @@ impl ConversationStore {
             )?;
             tx.commit()?;
         }
-        self.prune_to_cap()?;
+        // Creation is committed above; retention failure must not turn that
+        // success into a false negative for the caller.
+        if let Err(error) = self.prune_to_cap_excluding(id) {
+            tracing::warn!(
+                %error,
+                conversation_id = id,
+                "conversation created but retention pruning failed"
+            );
+        }
         Ok(())
     }
 
@@ -1295,13 +1866,25 @@ impl ConversationStore {
         self.pid = pid;
     }
 
-    fn prune_to_cap(&self) -> anyhow::Result<()> {
+    /// Prune old, inactive conversations without ever deleting the row the
+    /// caller just created.
+    ///
+    /// Victim selection and deletion share one `BEGIN IMMEDIATE`
+    /// transaction. The old two-phase implementation selected ids, released
+    /// the database lock, then called [`delete`](Self::delete) for each id; a
+    /// concurrent `begin_prompt` could refresh a selected conversation in that
+    /// gap and then lose its newly committed receipt to the stale delete.
+    /// Live-owned conversations are also ineligible: a retention cap must not
+    /// erase another running session.
+    fn prune_to_cap_excluding(&self, protected_id: &str) -> anyhow::Result<()> {
         if self.max_per_workspace == 0 {
             return Ok(());
         }
+        let now = (self.claim_clock)();
         let victims: Vec<String> = {
             let conn = self.lock_conn();
-            let count: i64 = conn.query_row(
+            let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            let count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM conversations WHERE workspace_key = ?1",
                 [&self.workspace_id],
                 |row| row.get(0),
@@ -1310,23 +1893,53 @@ impl ConversationStore {
             if excess <= 0 {
                 return Ok(());
             }
-            // Oldest = lowest activity tick (§6 — never a timestamp).
-            let mut stmt = conn.prepare(
-                "SELECT id FROM conversations
-                  WHERE workspace_key = ?1
-                  ORDER BY activity_tick ASC, id ASC
-                  LIMIT ?2",
-            )?;
-            let ids = stmt
-                .query_map(rusqlite::params![self.workspace_id, excess], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
+            // Oldest = lowest activity tick (§6 — never a timestamp). Gather
+            // candidates first, then consult the same liveness oracle as
+            // `claim`: a live owner is protected, while a crashed process's
+            // stale row must not defeat retention forever.
+            let candidates = {
+                let mut stmt = tx.prepare(
+                    "SELECT c.id
+                       FROM conversations c
+                      WHERE c.workspace_key = ?1
+                        AND c.id <> ?2
+                      ORDER BY c.activity_tick ASC, c.id ASC",
+                )?;
+                let selected = stmt
+                    .query_map(rusqlite::params![self.workspace_id, protected_id], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                selected
+            };
+            let mut ids = Vec::with_capacity(excess as usize);
+            for id in candidates {
+                if ids.len() >= excess as usize {
+                    break;
+                }
+                if let Some(owner) = live_owner_row(&tx, &id)? {
+                    if (self.liveness)(&owner, now) {
+                        continue;
+                    }
+                    tx.execute("DELETE FROM live_owners WHERE conversation_id = ?1", [&id])?;
+                }
+                ids.push(id);
+            }
+            for id in &ids {
+                tx.execute(
+                    "DELETE FROM conversations WHERE id = ?1 AND workspace_key = ?2",
+                    rusqlite::params![id, self.workspace_id],
+                )?;
+            }
+            tx.commit()?;
             ids
         };
         for id in victims {
-            // Route through delete() so plan dirs are cleaned up too.
-            self.delete(&id)?;
+            // Database deletion is already committed atomically above. Plan
+            // directories are best-effort derived state and must never block
+            // retention cleanup.
+            let plan_dir = self.workspace.join(session_plan_dir(&id));
+            let _ = std::fs::remove_dir_all(plan_dir);
         }
         Ok(())
     }
@@ -1361,6 +1974,550 @@ pub struct SearchHit {
     pub snippet: String,
     /// Raw bm25 rank (negative; more negative = better match).
     pub rank: f64,
+}
+
+/// SQLite representation of an immutable prompt receipt. Conversion is kept
+/// separate from rusqlite's row callback so address parsing and cryptographic
+/// verification can return rich `anyhow` errors.
+#[derive(Debug)]
+struct PromptRow {
+    id: String,
+    conversation_id: String,
+    writer_fingerprint: String,
+    seq: i64,
+    previous_prompt_id: Option<String>,
+    parent_prompt_id: Option<String>,
+    root_prompt_id: String,
+    active_operator_id: Option<String>,
+    origin: String,
+    raw_text: Vec<u8>,
+    model_text: Vec<u8>,
+    raw_digest: String,
+    model_digest: String,
+    receipt_hash: String,
+    ts_claim: i64,
+    encoding_version: i64,
+}
+
+impl PromptRow {
+    fn into_receipt(self) -> anyhow::Result<PromptReceipt> {
+        let receipt = PromptReceipt::from_stored_parts(
+            self.id.parse()?,
+            self.conversation_id,
+            self.writer_fingerprint,
+            self.seq,
+            self.previous_prompt_id.map(|id| id.parse()).transpose()?,
+            self.parent_prompt_id.map(|id| id.parse()).transpose()?,
+            self.root_prompt_id.parse()?,
+            self.active_operator_id.map(|id| id.parse()).transpose()?,
+            PromptOrigin::from_db_str(&self.origin)?,
+            self.raw_text,
+            self.model_text,
+            self.raw_digest,
+            self.model_digest,
+            self.receipt_hash,
+            self.ts_claim,
+            self.encoding_version,
+        );
+        receipt.verify_integrity()?;
+        Ok(receipt)
+    }
+}
+
+fn prompt_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromptRow> {
+    Ok(PromptRow {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        writer_fingerprint: row.get(2)?,
+        seq: row.get(3)?,
+        previous_prompt_id: row.get(4)?,
+        parent_prompt_id: row.get(5)?,
+        root_prompt_id: row.get(6)?,
+        active_operator_id: row.get(7)?,
+        origin: row.get(8)?,
+        raw_text: row.get(9)?,
+        model_text: row.get(10)?,
+        raw_digest: row.get(11)?,
+        model_digest: row.get(12)?,
+        receipt_hash: row.get(13)?,
+        ts_claim: row.get(14)?,
+        encoding_version: row.get(15)?,
+    })
+}
+
+fn insert_prompt_receipt(conn: &Connection, receipt: &PromptReceipt) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO prompt_receipts
+           (id, conversation_id, writer_fingerprint, seq, previous_prompt_id,
+            parent_prompt_id, root_prompt_id, active_operator_id, origin,
+            raw_text, model_text, raw_digest, model_digest, receipt_hash,
+            ts_claim, encoding_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        rusqlite::params![
+            receipt.id().to_string(),
+            receipt.conversation_id(),
+            receipt.writer_fingerprint(),
+            receipt.seq(),
+            receipt.previous_prompt_id().map(|id| id.to_string()),
+            receipt.parent_prompt_id().map(|id| id.to_string()),
+            receipt.root_prompt_id().to_string(),
+            receipt.active_operator_id().map(|id| id.to_string()),
+            receipt.origin().as_db_str(),
+            receipt.raw_text(),
+            receipt.model_text(),
+            receipt.raw_digest(),
+            receipt.model_digest(),
+            receipt.receipt_hash(),
+            receipt.ts_claim(),
+            receipt.encoding_version(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_prompt_on_conn(
+    conn: &Connection,
+    prompt_id: PromptId,
+    workspace_id: &str,
+) -> anyhow::Result<Option<PromptReceipt>> {
+    let row = conn
+        .query_row(
+            "SELECT p.id, p.conversation_id, p.writer_fingerprint, p.seq,
+                    p.previous_prompt_id, p.parent_prompt_id, p.root_prompt_id,
+                    p.active_operator_id, p.origin, p.raw_text, p.model_text,
+                    p.raw_digest, p.model_digest, p.receipt_hash, p.ts_claim,
+                    p.encoding_version
+               FROM prompt_receipts p
+               JOIN conversations c ON c.id = p.conversation_id
+              WHERE p.id = ?1 AND c.workspace_key = ?2",
+            rusqlite::params![prompt_id.to_string(), workspace_id],
+            prompt_row_from_sql,
+        )
+        .optional()?;
+    row.map(PromptRow::into_receipt).transpose()
+}
+
+fn load_prompt_in_conversation_on_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    prompt_id: PromptId,
+    workspace_id: &str,
+) -> anyhow::Result<Option<PromptReceipt>> {
+    let row = conn
+        .query_row(
+            "SELECT p.id, p.conversation_id, p.writer_fingerprint, p.seq,
+                    p.previous_prompt_id, p.parent_prompt_id, p.root_prompt_id,
+                    p.active_operator_id, p.origin, p.raw_text, p.model_text,
+                    p.raw_digest, p.model_digest, p.receipt_hash, p.ts_claim,
+                    p.encoding_version
+               FROM prompt_receipts p
+               JOIN conversations c ON c.id = p.conversation_id
+              WHERE p.id = ?1 AND p.conversation_id = ?2
+                AND c.workspace_key = ?3",
+            rusqlite::params![prompt_id.to_string(), conversation_id, workspace_id],
+            prompt_row_from_sql,
+        )
+        .optional()?;
+    row.map(PromptRow::into_receipt).transpose()
+}
+
+fn validate_objective_root_on_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    root_prompt_id: PromptId,
+    workspace_id: &str,
+) -> anyhow::Result<PromptReceipt> {
+    let root =
+        load_prompt_in_conversation_on_conn(conn, conversation_id, root_prompt_id, workspace_id)?
+            .ok_or_else(|| {
+            anyhow::anyhow!(
+                "prompt root {root_prompt_id} is missing from conversation `{conversation_id}`"
+            )
+        })?;
+    if root.origin() != PromptOrigin::Operator
+        || root.root_prompt_id() != root.id()
+        || root
+            .active_operator_id()
+            .is_some_and(|active| active != root.id())
+    {
+        anyhow::bail!("prompt root {root_prompt_id} is not a self-rooted operator prompt");
+    }
+    Ok(root)
+}
+
+/// Resolve the nearest operator authority through explicit semantic parentage.
+///
+/// Version-2 receipts persist and hash the expected result, but the parent walk
+/// remains the validator: a stored pointer that disagrees with its parent's
+/// authority is rejected. Version-1 rows have no pointer and are recovered by
+/// the same walk, preserving receipts written before the additive column. The
+/// walk is iterative and capped at [`MAX_PROMPT_LINEAGE_DEPTH`] receipts so a
+/// corrupt database cannot induce stack growth or unbounded traversal.
+fn resolve_active_operator_on_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    submitted: &PromptReceipt,
+    workspace_id: &str,
+) -> anyhow::Result<(PromptReceipt, usize)> {
+    validate_objective_root_on_conn(
+        conn,
+        conversation_id,
+        submitted.root_prompt_id(),
+        workspace_id,
+    )?;
+    let objective_root = submitted.root_prompt_id();
+    let mut visited = std::collections::HashSet::new();
+    let mut retry_authorities: Vec<(PromptId, Option<PromptId>)> = Vec::new();
+    let mut current = submitted.clone();
+
+    for depth in 1..=MAX_PROMPT_LINEAGE_DEPTH {
+        if !visited.insert(current.id()) {
+            anyhow::bail!("prompt parent cycle detected at {}", current.id());
+        }
+        if current.conversation_id() != conversation_id
+            || current.root_prompt_id() != objective_root
+        {
+            anyhow::bail!(
+                "prompt {} crosses its conversation or objective-root boundary",
+                current.id()
+            );
+        }
+
+        match current.origin() {
+            PromptOrigin::Operator => {
+                if current
+                    .active_operator_id()
+                    .is_some_and(|active| active != current.id())
+                {
+                    anyhow::bail!(
+                        "operator prompt {} names a different active authority",
+                        current.id()
+                    );
+                }
+                for (retry_id, stored_authority) in retry_authorities {
+                    if stored_authority.is_some_and(|stored| stored != current.id()) {
+                        anyhow::bail!(
+                            "harness retry {retry_id} active operator disagrees with parent \
+                             authority {}",
+                            current.id()
+                        );
+                    }
+                }
+                return Ok((current, depth));
+            }
+            PromptOrigin::HarnessRetry => {
+                let parent_id = current.parent_prompt_id().ok_or_else(|| {
+                    anyhow::anyhow!("harness retry {} has no parent", current.id())
+                })?;
+                retry_authorities.push((current.id(), current.active_operator_id()));
+                current = load_prompt_in_conversation_on_conn(
+                    conn,
+                    conversation_id,
+                    parent_id,
+                    workspace_id,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "harness retry {} references missing parent {parent_id}",
+                        current.id()
+                    )
+                })?;
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "prompt lineage from {} exceeds the maximum depth of \
+         {MAX_PROMPT_LINEAGE_DEPTH} receipts",
+        submitted.id()
+    )
+}
+
+fn latest_prompt_on_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    workspace_id: &str,
+) -> anyhow::Result<Option<PromptReceipt>> {
+    // `receipt_order` is serialized database presentation metadata, not part
+    // of an immutable receipt hash. Never trust its largest value by itself:
+    // validate the complete hashed `previous_prompt_id` chain first, then take
+    // its verified tip. This makes both reads and the next append fail closed
+    // if mutable row order is corrupt instead of silently forking chronology.
+    let mut chain = prompt_chain_on_conn(conn, conversation_id, workspace_id)?;
+    Ok(chain.pop())
+}
+
+fn prompt_chain_on_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    workspace_id: &str,
+) -> anyhow::Result<Vec<PromptReceipt>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.conversation_id, p.writer_fingerprint, p.seq,
+                p.previous_prompt_id, p.parent_prompt_id, p.root_prompt_id,
+                p.active_operator_id, p.origin, p.raw_text, p.model_text,
+                p.raw_digest, p.model_digest, p.receipt_hash, p.ts_claim,
+                p.encoding_version
+           FROM prompt_receipts p
+           JOIN conversations c ON c.id = p.conversation_id
+          WHERE p.conversation_id = ?1 AND c.workspace_key = ?2
+          ORDER BY p.receipt_order ASC",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![conversation_id, workspace_id],
+        prompt_row_from_sql,
+    )?;
+    let receipts: Vec<PromptReceipt> = rows
+        .map(|row| {
+            row.map_err(anyhow::Error::from)
+                .and_then(PromptRow::into_receipt)
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let mut expected_previous = None;
+    for receipt in &receipts {
+        if receipt.previous_prompt_id() != expected_previous {
+            anyhow::bail!(
+                "prompt chronology mismatch in conversation `{conversation_id}` at {}: \
+                 expected previous {:?}, stored {:?}",
+                receipt.id(),
+                expected_previous,
+                receipt.previous_prompt_id()
+            );
+        }
+        expected_previous = Some(receipt.id());
+    }
+    Ok(receipts)
+}
+
+/// SQLite representation of one immutable prompt artifact. Rich parsing and
+/// hash verification happen outside rusqlite's row callback.
+#[derive(Debug)]
+struct ArtifactRow {
+    id: String,
+    conversation_id: String,
+    writer_fingerprint: String,
+    seq: i64,
+    prev_hash: String,
+    prompt_id: String,
+    root_prompt_id: String,
+    kind: String,
+    relation: String,
+    locator: Option<String>,
+    body: Option<String>,
+    metadata_json: String,
+    ts_claim: i64,
+    encoding_version: i64,
+    artifact_hash: String,
+}
+
+impl ArtifactRow {
+    fn into_artifact(self) -> anyhow::Result<PromptArtifact> {
+        let artifact = PromptArtifact::from_stored_parts(
+            self.id.parse()?,
+            self.conversation_id,
+            self.writer_fingerprint,
+            self.seq,
+            self.prev_hash,
+            self.prompt_id.parse()?,
+            self.root_prompt_id.parse()?,
+            ArtifactKind::from_db_str(&self.kind)?,
+            ArtifactRelation::from_db_str(&self.relation)?,
+            self.locator,
+            self.body,
+            self.metadata_json,
+            self.ts_claim,
+            self.encoding_version,
+            self.artifact_hash,
+        )?;
+        artifact.verify_integrity()?;
+        Ok(artifact)
+    }
+}
+
+fn artifact_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRow> {
+    Ok(ArtifactRow {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        writer_fingerprint: row.get(2)?,
+        seq: row.get(3)?,
+        prev_hash: row.get(4)?,
+        prompt_id: row.get(5)?,
+        root_prompt_id: row.get(6)?,
+        kind: row.get(7)?,
+        relation: row.get(8)?,
+        locator: row.get(9)?,
+        body: row.get(10)?,
+        metadata_json: row.get(11)?,
+        ts_claim: row.get(12)?,
+        encoding_version: row.get(13)?,
+        artifact_hash: row.get(14)?,
+    })
+}
+
+fn insert_prompt_artifact(conn: &Connection, artifact: &PromptArtifact) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO prompt_artifacts
+           (id, conversation_id, writer_fingerprint, seq, prev_hash,
+            prompt_id, root_prompt_id, kind, relation, locator, body, metadata,
+            ts_claim, encoding_version, artifact_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        rusqlite::params![
+            artifact.id().to_string(),
+            artifact.conversation_id(),
+            artifact.writer_fingerprint(),
+            artifact.seq(),
+            artifact.prev_hash(),
+            artifact.prompt_id().to_string(),
+            artifact.root_prompt_id().to_string(),
+            artifact.kind().as_db_str(),
+            artifact.relation().as_db_str(),
+            artifact.locator(),
+            artifact.body(),
+            serde_json::to_string(artifact.metadata())?,
+            artifact.ts_claim(),
+            artifact.encoding_version(),
+            artifact.artifact_hash(),
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO prompt_artifact_tips (conversation_id, last_seq, tip_hash)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(conversation_id) DO UPDATE SET
+             last_seq = excluded.last_seq,
+             tip_hash = excluded.tip_hash",
+        rusqlite::params![
+            artifact.conversation_id(),
+            artifact.seq(),
+            artifact.artifact_hash(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn artifact_chain_on_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    workspace_id: &str,
+) -> anyhow::Result<Vec<PromptArtifact>> {
+    // Never return or extend a derived-work chain whose prompt authority is
+    // itself corrupt. Prompt receipt_order is intentionally outside each
+    // receipt content hash, so the full chronology validator is required here.
+    let _ = prompt_chain_on_conn(conn, conversation_id, workspace_id)?;
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.conversation_id, a.writer_fingerprint, a.seq,
+                a.prev_hash, a.prompt_id, a.root_prompt_id, a.kind, a.relation,
+                a.locator, a.body, a.metadata, a.ts_claim, a.encoding_version,
+                a.artifact_hash
+           FROM prompt_artifacts a
+           JOIN conversations c ON c.id = a.conversation_id
+          WHERE a.conversation_id = ?1 AND c.workspace_key = ?2
+          ORDER BY a.seq ASC",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![conversation_id, workspace_id],
+        artifact_row_from_sql,
+    )?;
+    let artifacts: Vec<PromptArtifact> = rows
+        .map(|row| {
+            row.map_err(anyhow::Error::from)
+                .and_then(ArtifactRow::into_artifact)
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    let mut expected_seq = 1_i64;
+    let mut expected_prev = artifact_genesis_hash(conversation_id);
+    for artifact in &artifacts {
+        let prompt = load_prompt_in_conversation_on_conn(
+            conn,
+            conversation_id,
+            artifact.prompt_id(),
+            workspace_id,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "prompt artifact {} is orphaned from prompt {}",
+                artifact.id(),
+                artifact.prompt_id()
+            )
+        })?;
+        if prompt.root_prompt_id() != artifact.root_prompt_id() {
+            anyhow::bail!(
+                "prompt artifact {} claims objective root {}, but prompt {} is rooted at {}",
+                artifact.id(),
+                artifact.root_prompt_id(),
+                prompt.id(),
+                prompt.root_prompt_id()
+            );
+        }
+        validate_objective_root_on_conn(
+            conn,
+            conversation_id,
+            artifact.root_prompt_id(),
+            workspace_id,
+        )?;
+        if artifact.seq() != expected_seq {
+            anyhow::bail!(
+                "prompt artifact sequence mismatch in conversation `{conversation_id}` at {}: \
+                 expected {expected_seq}, stored {}",
+                artifact.id(),
+                artifact.seq()
+            );
+        }
+        if artifact.prev_hash() != expected_prev {
+            anyhow::bail!(
+                "prompt artifact predecessor mismatch in conversation `{conversation_id}` at {}",
+                artifact.id()
+            );
+        }
+        expected_seq = expected_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("prompt artifact sequence overflow"))?;
+        expected_prev = artifact.artifact_hash().to_string();
+    }
+
+    let stored_tip: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT t.last_seq, t.tip_hash
+               FROM prompt_artifact_tips t
+               JOIN conversations c ON c.id = t.conversation_id
+              WHERE t.conversation_id = ?1 AND c.workspace_key = ?2",
+            rusqlite::params![conversation_id, workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match (artifacts.last(), stored_tip) {
+        (None, None) => {}
+        (Some(last), Some((last_seq, tip_hash)))
+            if last.seq() == last_seq && last.artifact_hash() == tip_hash => {}
+        (None, Some(_)) => anyhow::bail!(
+            "prompt artifact chain tip exists without rows in conversation `{conversation_id}`"
+        ),
+        (Some(_), None) => anyhow::bail!(
+            "prompt artifact rows exist without a chain tip in conversation `{conversation_id}`"
+        ),
+        (Some(last), Some((last_seq, tip_hash))) => anyhow::bail!(
+            "prompt artifact chain tip mismatch in conversation `{conversation_id}`: \
+             row tip is ({}, {}), stored tip is ({last_seq}, {tip_hash})",
+            last.seq(),
+            last.artifact_hash()
+        ),
+    }
+    Ok(artifacts)
+}
+
+fn artifact_genesis_hash(conversation_id: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ARTIFACT_GENESIS_PREFIX);
+    hasher.update(&(conversation_id.len() as u64).to_le_bytes());
+    hasher.update(conversation_id.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn validate_artifact_page_size(limit: usize) -> anyhow::Result<()> {
+    if limit > MAX_ARTIFACT_PAGE_SIZE {
+        anyhow::bail!("prompt artifact page limit exceeds {MAX_ARTIFACT_PAGE_SIZE}");
+    }
+    Ok(())
 }
 
 /// One turn row, exactly as stored. Internal: the canonical encoding hashes
@@ -1546,6 +2703,11 @@ fn next_tick(conn: &Connection, writer_fingerprint: &str) -> anyhow::Result<i64>
              SELECT ?1, COALESCE(MAX(t), 0) FROM (
                  SELECT MAX(seq) AS t FROM turns
                  UNION ALL
+                 -- A prompt is allocated before its turn and survives when
+                 -- that turn fails. The clock must never reuse its sequence
+                 -- after a lost/recreated writer_clock row.
+                 SELECT MAX(seq) AS t FROM prompt_receipts
+                 UNION ALL
                  SELECT MAX(activity_tick) AS t FROM conversations
                  UNION ALL
                  -- Other writers' issued ticks: keeps the seed at the true
@@ -1653,6 +2815,30 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              phantom_reaches    TEXT NOT NULL DEFAULT '[]', -- JSON phantom-reach telemetry (#717); NOT hashed (§6 chain unchanged)
              PRIMARY KEY (conversation_id, writer_fingerprint, seq)
          );
+         -- Immutable prompt receipts are written before inference/tool work.
+         -- They are deliberately separate from `turns`: a failed turn still
+         -- has a prompt, while the existing turn-chain writer/tip pair remains
+         -- byte-for-byte compatible with all prior databases.
+         CREATE TABLE IF NOT EXISTS prompt_receipts (
+             receipt_order      INTEGER PRIMARY KEY AUTOINCREMENT, -- serialized receipt chronology
+             id                 TEXT NOT NULL UNIQUE,              -- prompt:<uuid>
+             conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+             writer_fingerprint TEXT NOT NULL,
+             seq                INTEGER NOT NULL,                  -- writer Lamport tick
+             previous_prompt_id TEXT REFERENCES prompt_receipts(id), -- automatic chronology
+             parent_prompt_id   TEXT REFERENCES prompt_receipts(id), -- explicit semantic ancestry
+             root_prompt_id     TEXT NOT NULL REFERENCES prompt_receipts(id),
+             active_operator_id TEXT REFERENCES prompt_receipts(id), -- nearest operator authority; v1 rows are NULL
+             origin             TEXT NOT NULL CHECK (origin IN ('operator', 'harness_retry')),
+             raw_text           BLOB NOT NULL,
+             model_text         BLOB NOT NULL,
+             raw_digest         TEXT NOT NULL,
+             model_digest       TEXT NOT NULL,
+             receipt_hash       TEXT NOT NULL,
+             ts_claim           INTEGER NOT NULL,                  -- display-only wall clock
+             encoding_version   INTEGER NOT NULL DEFAULT 1,
+             UNIQUE (conversation_id, writer_fingerprint, seq)
+         );
          -- The per-writer Lamport clock (§6 'each agent is its own clock').
          CREATE TABLE IF NOT EXISTS writer_clock (
              writer_fingerprint TEXT PRIMARY KEY,
@@ -1660,6 +2846,58 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_conversations_ws_tick
              ON conversations (workspace_key, activity_tick);
+         CREATE INDEX IF NOT EXISTS idx_prompt_receipts_conversation_order
+             ON prompt_receipts (conversation_id, receipt_order);
+         CREATE INDEX IF NOT EXISTS idx_prompt_receipts_root
+             ON prompt_receipts (root_prompt_id);
+         -- Composite uniqueness lets artifact foreign keys enforce that both
+         -- the direct prompt and objective root belong to the artifact's own
+         -- conversation, not merely that those globally-unique ids exist.
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_receipts_conversation_id
+             ON prompt_receipts (conversation_id, id);
+         -- Bounded derived-work lineage. This is not a duplicate transcript:
+         -- bodies and structured metadata have hard byte ceilings, while file
+         -- and commit records retain locators/digests rather than raw output.
+         CREATE TABLE IF NOT EXISTS prompt_artifacts (
+             id                 TEXT PRIMARY KEY,                 -- artifact:<uuid>
+             conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+             writer_fingerprint TEXT NOT NULL,
+             seq                INTEGER NOT NULL CHECK (seq > 0), -- per-conversation causal order
+             prev_hash          TEXT NOT NULL,
+             prompt_id          TEXT NOT NULL,
+             root_prompt_id     TEXT NOT NULL,
+             kind               TEXT NOT NULL CHECK (kind IN (
+                                    'plan_revision', 'compaction_checkpoint',
+                                    'file_change', 'turn_outcome', 'commit', 'decision')),
+             relation           TEXT NOT NULL CHECK (relation IN (
+                                    'derived_from', 'updates', 'summarizes', 'realizes')),
+             locator            TEXT CHECK (locator IS NULL OR length(CAST(locator AS BLOB)) <= 4096),
+             body               TEXT CHECK (body IS NULL OR length(CAST(body AS BLOB)) <= 65536),
+             metadata           TEXT NOT NULL CHECK (
+                                    json_valid(metadata)
+                                    AND json_type(metadata) = 'object'
+                                    AND length(CAST(metadata AS BLOB)) <= 16384),
+             ts_claim           INTEGER NOT NULL,                 -- display-only wall clock
+             encoding_version   INTEGER NOT NULL DEFAULT 1,
+             artifact_hash      TEXT NOT NULL,
+             UNIQUE (conversation_id, seq),
+             FOREIGN KEY (conversation_id, prompt_id)
+                 REFERENCES prompt_receipts(conversation_id, id) ON DELETE CASCADE,
+             FOREIGN KEY (conversation_id, root_prompt_id)
+                 REFERENCES prompt_receipts(conversation_id, id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_prompt_artifacts_prompt
+             ON prompt_artifacts (conversation_id, prompt_id, seq);
+         CREATE INDEX IF NOT EXISTS idx_prompt_artifacts_root
+             ON prompt_artifacts (conversation_id, root_prompt_id, seq);
+         -- A separately stored tip detects truncation of the final row. Like
+         -- the existing conversation tip, this is anti-naive-edit integrity,
+         -- not a signature against an adversary who can rewrite every table.
+         CREATE TABLE IF NOT EXISTS prompt_artifact_tips (
+             conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+             last_seq         INTEGER NOT NULL CHECK (last_seq > 0),
+             tip_hash         TEXT NOT NULL
+         );
          -- #1030 Plans within Plans: the roadmap tree, persisted as a serialized
          -- plan.rs::Plan blob (Roadmap->Phase->Plan->Task Subtask nodes). A Plan
          -- node binds a conversations row via conversations.node_id; the tree's
@@ -1761,6 +2999,16 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("writer_fingerprint", "TEXT"),
             ("last_tick", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    ),
+    (
+        "prompt_receipts",
+        &[
+            // Prompt receipt v2: v1 hashes did not include an active authority
+            // pointer. NULL is therefore the only honest additive backfill;
+            // reads reconstruct v1 authority through the validated parent
+            // chain, while every new v2 row stores and hashes this field.
+            ("active_operator_id", "TEXT REFERENCES prompt_receipts(id)"),
         ],
     ),
 ];
@@ -2385,6 +3633,1064 @@ fn validate_record_id(id: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_prompt_lineage_for_test(
+        store: &ConversationStore,
+        conversation_id: &str,
+        depth: usize,
+    ) -> (PromptId, PromptId) {
+        assert!(depth >= 1);
+        store
+            .create_with_id(conversation_id, "lineage test", None)
+            .unwrap();
+        let writer = store.writer_fingerprint().to_string();
+        let root_id = PromptId::new();
+        let root = PromptReceipt::new(
+            root_id,
+            conversation_id.to_string(),
+            writer.clone(),
+            1,
+            None,
+            None,
+            root_id,
+            root_id,
+            PromptOrigin::Operator,
+            b"root".to_vec(),
+            b"root".to_vec(),
+            1,
+        );
+        let conn = store.lock_conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        insert_prompt_receipt(&tx, &root).unwrap();
+        let mut previous_id = root_id;
+        for index in 1..depth {
+            let id = PromptId::new();
+            let text = format!("retry-{index}").into_bytes();
+            let retry = PromptReceipt::new(
+                id,
+                conversation_id.to_string(),
+                writer.clone(),
+                i64::try_from(index + 1).unwrap(),
+                Some(previous_id),
+                Some(previous_id),
+                root_id,
+                root_id,
+                PromptOrigin::HarnessRetry,
+                text.clone(),
+                text,
+                i64::try_from(index + 1).unwrap(),
+            );
+            insert_prompt_receipt(&tx, &retry).unwrap();
+            previous_id = id;
+        }
+        tx.commit().unwrap();
+        (root_id, previous_id)
+    }
+
+    // Durable prompt receipts: write-before-work provenance. These tests are
+    // intentionally store-level because a receipt must survive even when no
+    // assistant turn is ever appended.
+    #[test]
+    fn prompt_receipt_is_byte_exact_and_survives_an_incomplete_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let conversation_id = "prompt-byte-exact";
+
+        let receipt = {
+            let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+            let prompt = crate::prompt::NewPrompt::operator(
+                b"raw\0bytes\xff".to_vec(),
+                "model text\nwith Unicode: \u{1f9ad}".as_bytes().to_vec(),
+            );
+            store
+                .begin_prompt(conversation_id, "prompt title", None, prompt)
+                .unwrap()
+                .submitted()
+                .receipt()
+                .clone()
+        };
+
+        // Reopen the database: the prompt is durable despite there being no
+        // completed `turns` row at all.
+        let reopened = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let loaded = reopened
+            .load_prompt_in_conversation(conversation_id, receipt.id())
+            .unwrap()
+            .expect("prompt receipt survives a failed/interrupted turn");
+        assert_eq!(loaded.raw_text(), b"raw\0bytes\xff");
+        assert_eq!(
+            loaded.model_text_utf8().unwrap(),
+            "model text\nwith Unicode: \u{1f9ad}"
+        );
+        loaded.verify_integrity().unwrap();
+        assert!(reopened.load(conversation_id).unwrap().turns.is_empty());
+    }
+
+    #[test]
+    fn prompt_chronology_is_automatic_but_objective_parentage_is_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conv = "prompt-ancestry";
+
+        let first = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator("first", "first"),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+        assert_eq!(first.root_prompt_id(), first.id());
+        assert_eq!(first.previous_prompt_id(), None);
+        assert_eq!(first.parent_prompt_id(), None);
+
+        // A normal new operator prompt is chronologically after `first`, but
+        // is a new objective root. Chronology must never silently become
+        // semantic parentage.
+        let second = store
+            .begin_prompt(
+                conv,
+                "ignored on existing conversation",
+                None,
+                crate::prompt::NewPrompt::operator("second", "second"),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+        assert_eq!(second.previous_prompt_id(), Some(first.id()));
+        assert_eq!(second.parent_prompt_id(), None);
+        assert_eq!(second.root_prompt_id(), second.id());
+
+        // A harness retry is an explicit child. It inherits the validated
+        // parent root, while the active operator prompt remains `first`.
+        let retry = store
+            .begin_prompt(
+                conv,
+                "ignored",
+                None,
+                crate::prompt::NewPrompt::harness_retry("retry", "retry", first.id()),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+        assert_eq!(retry.previous_prompt_id(), Some(second.id()));
+        assert_eq!(retry.parent_prompt_id(), Some(first.id()));
+        assert_eq!(retry.root_prompt_id(), first.id());
+
+        let context = store
+            .turn_prompt_context(conv, retry.id())
+            .unwrap()
+            .expect("retry context");
+        assert_eq!(context.submitted_prompt().id(), retry.id());
+        assert_eq!(context.active_operator_prompt().id(), first.id());
+
+        assert_eq!(
+            store.prompt_chain(conv).unwrap(),
+            vec![first, second, retry]
+        );
+    }
+
+    #[test]
+    fn mutable_receipt_order_cannot_reparent_the_verified_prompt_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conv = "prompt-order-tamper";
+        let first = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator("first", "first"),
+            )
+            .unwrap()
+            .submitted()
+            .id();
+        let second = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator("second", "second"),
+            )
+            .unwrap()
+            .submitted()
+            .id();
+
+        // Swap only the unhashed SQLite presentation order. Both receipts and
+        // their hashed predecessor links remain individually valid.
+        store
+            .lock_conn()
+            .execute(
+                "UPDATE prompt_receipts
+                    SET receipt_order = CASE id WHEN ?1 THEN 2002 WHEN ?2 THEN 2001 END
+                  WHERE id IN (?1, ?2)",
+                rusqlite::params![first.to_string(), second.to_string()],
+            )
+            .unwrap();
+
+        let latest_error = store.latest_prompt(conv).unwrap_err().to_string();
+        assert!(
+            latest_error.contains("prompt chronology mismatch"),
+            "{latest_error}"
+        );
+        let append_error = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator("third", "third"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            append_error.contains("prompt chronology mismatch"),
+            "{append_error}"
+        );
+        let receipt_count: i64 = store
+            .lock_conn()
+            .query_row(
+                "SELECT COUNT(*) FROM prompt_receipts WHERE conversation_id = ?1",
+                [conv],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_count, 2, "failed append must roll back completely");
+    }
+
+    #[test]
+    fn concurrent_store_connections_serialize_prompt_predecessors() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let conv = "concurrent-prompt-append";
+        let seed_store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let seed = seed_store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator("seed", "seed"),
+            )
+            .unwrap()
+            .submitted()
+            .id();
+        drop(seed_store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for label in ["left", "right"] {
+            let root_path = root.path().to_path_buf();
+            let workspace_path = workspace.path().to_path_buf();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let store = ConversationStore::new(root_path, workspace_path, 100).unwrap();
+                barrier.wait();
+                store
+                    .begin_prompt(
+                        conv,
+                        "title",
+                        None,
+                        crate::prompt::NewPrompt::operator(label, label),
+                    )
+                    .unwrap()
+                    .submitted()
+                    .id()
+            }));
+        }
+        barrier.wait();
+        let appended: Vec<PromptId> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+
+        let reopened = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let chain = reopened.prompt_chain(conv).unwrap();
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0].id(), seed);
+        assert_eq!(chain[1].previous_prompt_id(), Some(seed));
+        assert_eq!(chain[2].previous_prompt_id(), Some(chain[1].id()));
+        assert!(appended.contains(&chain[1].id()));
+        assert!(appended.contains(&chain[2].id()));
+    }
+
+    #[test]
+    fn prompt_reads_are_conversation_and_workspace_fenced_and_delete_cascades() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let store_a = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+
+        let a = store_a
+            .begin_prompt(
+                "conversation-a",
+                "A",
+                None,
+                crate::prompt::NewPrompt::operator("secret-a", "secret-a"),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+        let cross_workspace_append = store_b
+            .begin_prompt(
+                "conversation-a",
+                "foreign",
+                None,
+                crate::prompt::NewPrompt::operator("intruder", "intruder"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            cross_workspace_append.contains("belongs to another workspace"),
+            "{cross_workspace_append}"
+        );
+        let b = store_b
+            .begin_prompt(
+                "conversation-b",
+                "B",
+                None,
+                crate::prompt::NewPrompt::operator("secret-b", "secret-b"),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+
+        assert!(store_b.load_prompt(a.id()).unwrap().is_none());
+        assert!(store_a
+            .load_prompt_in_conversation("conversation-a", b.id())
+            .unwrap()
+            .is_none());
+        assert!(store_b.latest_prompt("conversation-a").unwrap().is_none());
+        assert!(store_b.prompt_chain("conversation-a").unwrap().is_empty());
+        assert!(store_b
+            .turn_prompt_context("conversation-a", a.id())
+            .unwrap()
+            .is_none());
+        assert!(store_a.previous_prompt(b.id()).unwrap().is_none());
+
+        store_a.delete("conversation-a").unwrap();
+        assert!(store_a.load_prompt(a.id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn prompt_lineage_accepts_the_documented_depth_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conversation_id = "lineage-at-boundary";
+        let (root_id, leaf_id) =
+            insert_prompt_lineage_for_test(&store, conversation_id, MAX_PROMPT_LINEAGE_DEPTH);
+
+        let context = store
+            .turn_prompt_context(conversation_id, leaf_id)
+            .unwrap()
+            .expect("a lineage exactly at the documented limit is valid");
+        assert_eq!(context.active().id(), root_id);
+    }
+
+    #[test]
+    fn prompt_lineage_rejects_a_deeper_retry_before_inserting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conversation_id = "lineage-over-boundary";
+        let (_, leaf_id) =
+            insert_prompt_lineage_for_test(&store, conversation_id, MAX_PROMPT_LINEAGE_DEPTH);
+
+        let error = store
+            .begin_prompt(
+                conversation_id,
+                "ignored",
+                None,
+                crate::prompt::NewPrompt::harness_retry("too deep", "too deep", leaf_id),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maximum prompt lineage depth"), "{error}");
+        assert_eq!(
+            store.prompt_chain(conversation_id).unwrap().len(),
+            MAX_PROMPT_LINEAGE_DEPTH
+        );
+    }
+
+    #[test]
+    fn prompt_lineage_rejects_a_persisted_chain_over_the_depth_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conversation_id = "persisted-lineage-over-boundary";
+        let (_, leaf_id) =
+            insert_prompt_lineage_for_test(&store, conversation_id, MAX_PROMPT_LINEAGE_DEPTH + 1);
+
+        let error = store
+            .turn_prompt_context(conversation_id, leaf_id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds the maximum depth"), "{error}");
+    }
+
+    #[test]
+    fn prompt_lineage_cycle_is_detected_without_recursion() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conversation_id = "lineage-cycle";
+        store
+            .create_with_id(conversation_id, "cycle test", None)
+            .unwrap();
+
+        let writer = store.writer_fingerprint().to_string();
+        let root_id = PromptId::new();
+        let retry_a_id = PromptId::new();
+        let retry_b_id = PromptId::new();
+        let root_receipt = PromptReceipt::new(
+            root_id,
+            conversation_id.to_string(),
+            writer.clone(),
+            1,
+            None,
+            None,
+            root_id,
+            root_id,
+            PromptOrigin::Operator,
+            b"root".to_vec(),
+            b"root".to_vec(),
+            1,
+        );
+        let retry_a = PromptReceipt::new(
+            retry_a_id,
+            conversation_id.to_string(),
+            writer.clone(),
+            2,
+            Some(root_id),
+            Some(retry_b_id),
+            root_id,
+            root_id,
+            PromptOrigin::HarnessRetry,
+            b"retry-a".to_vec(),
+            b"retry-a".to_vec(),
+            2,
+        );
+        let retry_b = PromptReceipt::new(
+            retry_b_id,
+            conversation_id.to_string(),
+            writer,
+            3,
+            Some(retry_a_id),
+            Some(retry_a_id),
+            root_id,
+            root_id,
+            PromptOrigin::HarnessRetry,
+            b"retry-b".to_vec(),
+            b"retry-b".to_vec(),
+            3,
+        );
+        {
+            let conn = store.lock_conn();
+            let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute_batch("PRAGMA defer_foreign_keys = ON").unwrap();
+            insert_prompt_receipt(&tx, &root_receipt).unwrap();
+            insert_prompt_receipt(&tx, &retry_a).unwrap();
+            insert_prompt_receipt(&tx, &retry_b).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let error = store
+            .turn_prompt_context(conversation_id, retry_b_id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prompt parent cycle detected"), "{error}");
+    }
+
+    #[test]
+    fn prompt_ticks_reseed_the_writer_clock_without_moving_the_turn_chain_tip() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conv = "prompt-clock";
+
+        let first = store
+            .begin_prompt(
+                conv,
+                "clock",
+                None,
+                crate::prompt::NewPrompt::operator("one", "one"),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+        let (writer_before, tip_before): (String, String) = {
+            let conn = store.lock_conn();
+            conn.query_row(
+                "SELECT writer_fingerprint, tip_hash FROM conversations WHERE id = ?1",
+                [conv],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        // Simulate a lost writer_clock row. Reseeding must observe prompt seq,
+        // not only completed turns and conversation activity.
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "DELETE FROM writer_clock WHERE writer_fingerprint = ?1",
+                [store.writer_fingerprint()],
+            )
+            .unwrap();
+        }
+        let second = store
+            .begin_prompt(
+                conv,
+                "clock",
+                None,
+                crate::prompt::NewPrompt::operator("two", "two"),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+        assert!(second.seq() > first.seq());
+
+        let (writer_after, tip_after): (String, String) = {
+            let conn = store.lock_conn();
+            conn.query_row(
+                "SELECT writer_fingerprint, tip_hash FROM conversations WHERE id = ?1",
+                [conv],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(writer_after, writer_before);
+        assert_eq!(tip_after, tip_before);
+    }
+
+    #[test]
+    fn prompt_receipts_do_not_backfill_historical_turns() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conv = store.create("historical", None).unwrap();
+        store
+            .append_turn(&conv, "old user text", "old answer")
+            .unwrap();
+
+        // Opening the prompt-capable store adds only the empty table. Existing
+        // completed turns are not silently reinterpreted as receipts because
+        // their ingress/raw representation is unknowable after the fact.
+        let reopened = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        assert!(reopened.prompt_chain(&conv).unwrap().is_empty());
+        assert!(reopened.latest_prompt(&conv).unwrap().is_none());
+    }
+
+    #[test]
+    fn begin_prompt_rolls_back_lazy_conversation_when_ancestry_is_invalid() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let missing = crate::prompt::PromptId::new();
+
+        let err = store
+            .begin_prompt(
+                "atomic-invalid-parent",
+                "must roll back",
+                None,
+                crate::prompt::NewPrompt::harness_retry("raw", "model", missing),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not in conversation"), "{err}");
+        assert!(!store.exists("atomic-invalid-parent").unwrap());
+        assert!(store.load_prompt(missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn begin_prompt_rejects_non_utf8_model_bytes_before_creating_a_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+        let error = store
+            .begin_prompt(
+                "invalid-model-encoding",
+                "must not persist",
+                None,
+                crate::prompt::NewPrompt::operator(b"raw may be bytes".to_vec(), vec![0xff]),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(!store.exists("invalid-model-encoding").unwrap());
+    }
+
+    #[test]
+    fn prompt_retention_never_prunes_the_receipt_it_just_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 1).unwrap();
+
+        store
+            .begin_prompt(
+                "older-conversation",
+                "older",
+                None,
+                crate::prompt::NewPrompt::operator("older", "older"),
+            )
+            .unwrap();
+
+        // Simulate an existing writer clock lagging another writer's observed
+        // activity. Without an explicit exclusion, the newly accepted row's
+        // low tick makes it the apparent oldest retention victim.
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "UPDATE conversations SET activity_tick = 100 WHERE id = ?1",
+                ["older-conversation"],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE writer_clock SET last_tick = 0 WHERE writer_fingerprint = ?1",
+                [store.writer_fingerprint()],
+            )
+            .unwrap();
+        }
+
+        let accepted = store
+            .begin_prompt(
+                "newly-accepted",
+                "new",
+                None,
+                crate::prompt::NewPrompt::operator("new", "new"),
+            )
+            .unwrap();
+
+        assert!(store.exists("newly-accepted").unwrap());
+        assert!(store
+            .load_prompt_in_conversation("newly-accepted", accepted.submitted().id())
+            .unwrap()
+            .is_some());
+        assert!(!store.exists("older-conversation").unwrap());
+    }
+
+    #[test]
+    fn prompt_retention_skips_live_owners_but_reclaims_stale_claims() {
+        fn never_live(_owner: &StoredOwner, _now: i64) -> bool {
+            false
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut store = ConversationStore::new(root.path(), workspace.path(), 1).unwrap();
+        let first = store
+            .begin_prompt(
+                "live-retention-owner",
+                "first",
+                None,
+                crate::prompt::NewPrompt::operator("first", "first"),
+            )
+            .unwrap();
+        assert_eq!(
+            store.claim("live-retention-owner").unwrap(),
+            ClaimOutcome::Claimed
+        );
+
+        store
+            .begin_prompt(
+                "protected-new-prompt",
+                "second",
+                None,
+                crate::prompt::NewPrompt::operator("second", "second"),
+            )
+            .unwrap();
+        assert!(store.exists("live-retention-owner").unwrap());
+        assert!(store.exists("protected-new-prompt").unwrap());
+        assert!(store.load_prompt(first.submitted().id()).unwrap().is_some());
+
+        // A crashed owner's row must not pin the conversation forever. The
+        // next retention transaction uses the same liveness judgement as
+        // `claim`, removes the stale owner, and reclaims the oldest rows.
+        store.set_liveness_for_test(never_live);
+        store
+            .begin_prompt(
+                "third-prompt",
+                "third",
+                None,
+                crate::prompt::NewPrompt::operator("third", "third"),
+            )
+            .unwrap();
+        assert!(!store.exists("live-retention-owner").unwrap());
+        assert!(!store.exists("protected-new-prompt").unwrap());
+        assert!(store.exists("third-prompt").unwrap());
+        assert!(store.live_owner("live-retention-owner").unwrap().is_none());
+    }
+
+    #[test]
+    fn create_with_id_cannot_implicitly_erase_an_accepted_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conversation_id = "prompt-cannot-be-replaced";
+        let accepted = store
+            .begin_prompt(
+                conversation_id,
+                "original",
+                None,
+                crate::prompt::NewPrompt::operator("raw", "model"),
+            )
+            .unwrap();
+
+        let error = store
+            .create_with_id(conversation_id, "replacement", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("immutable prompt receipts"), "{error}");
+        assert!(store
+            .load_prompt_in_conversation(conversation_id, accepted.submitted().id())
+            .unwrap()
+            .is_some());
+        assert_eq!(store.load(conversation_id).unwrap().title, "original");
+    }
+
+    #[test]
+    fn operator_continuation_inherits_root_but_is_itself_active() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conv = "operator-continuation";
+        let root_prompt = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator("root", "root"),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+        let continuation = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator_continuation(
+                    "continue",
+                    "continue",
+                    root_prompt.id(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(continuation.submitted().root_prompt_id(), root_prompt.id());
+        assert_eq!(continuation.active().id(), continuation.submitted().id());
+    }
+
+    #[test]
+    fn retries_preserve_nearest_operator_authority_across_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let conv = "continuation-retry-authority";
+
+        let (a_id, b_id, retry_id, retry_again_id) = {
+            let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+            let a = store
+                .begin_prompt(
+                    conv,
+                    "title",
+                    None,
+                    crate::prompt::NewPrompt::operator("A", "A root objective"),
+                )
+                .unwrap();
+            let b = store
+                .begin_prompt(
+                    conv,
+                    "title",
+                    None,
+                    crate::prompt::NewPrompt::operator_continuation(
+                        "B",
+                        "B locked clarification",
+                        a.active().id(),
+                    ),
+                )
+                .unwrap();
+            let retry = store
+                .begin_prompt(
+                    conv,
+                    "title",
+                    None,
+                    crate::prompt::NewPrompt::harness_retry(
+                        "retry B",
+                        "retry B",
+                        b.submitted().id(),
+                    ),
+                )
+                .unwrap();
+            let retry_again = store
+                .begin_prompt(
+                    conv,
+                    "title",
+                    None,
+                    crate::prompt::NewPrompt::harness_retry(
+                        "retry retry B",
+                        "retry retry B",
+                        retry.submitted().id(),
+                    ),
+                )
+                .unwrap();
+
+            assert_eq!(b.submitted().root_prompt_id(), a.submitted().id());
+            assert_eq!(b.active().id(), b.submitted().id());
+            assert_eq!(retry.submitted().root_prompt_id(), a.submitted().id());
+            assert_eq!(retry.active().id(), b.submitted().id());
+            assert_eq!(retry_again.active().id(), b.submitted().id());
+
+            // Simulate receipts written by the v1 schema: no persisted active
+            // pointer, and the canonical v1 hash. Reopen must recover the same
+            // nearest authority by walking explicit parents. Keep the final
+            // retry at v2 to prove mixed-version ancestry works too.
+            for id in [b.submitted().id(), retry.submitted().id()] {
+                let legacy = store
+                    .load_prompt(id)
+                    .unwrap()
+                    .unwrap()
+                    .into_legacy_v1_for_test();
+                let conn = store.lock_conn();
+                conn.execute(
+                    "UPDATE prompt_receipts
+                        SET active_operator_id = NULL, receipt_hash = ?2,
+                            encoding_version = 1
+                      WHERE id = ?1",
+                    rusqlite::params![id.to_string(), legacy.receipt_hash()],
+                )
+                .unwrap();
+            }
+            (
+                a.submitted().id(),
+                b.submitted().id(),
+                retry.submitted().id(),
+                retry_again.submitted().id(),
+            )
+        };
+
+        let reopened = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        for retry_id in [retry_id, retry_again_id] {
+            let context = reopened
+                .turn_prompt_context(conv, retry_id)
+                .unwrap()
+                .expect("retry receipt survives reopen");
+            assert_eq!(context.active().id(), b_id);
+            assert_eq!(context.submitted().root_prompt_id(), a_id);
+        }
+    }
+
+    #[test]
+    fn retry_rejects_hashed_active_pointer_that_disagrees_with_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conv = "tampered-retry-authority";
+        let a = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator("A", "A"),
+            )
+            .unwrap();
+        let b = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator_continuation("B", "B", a.submitted().id()),
+            )
+            .unwrap();
+        let retry = store
+            .begin_prompt(
+                conv,
+                "title",
+                None,
+                crate::prompt::NewPrompt::harness_retry("retry", "retry", b.submitted().id()),
+            )
+            .unwrap();
+
+        // Rehash the row after pointing it at A. Cryptographic row integrity
+        // alone therefore passes; semantic validation against the explicit
+        // parent B must still reject the authority substitution.
+        let forged = retry
+            .submitted()
+            .receipt()
+            .clone()
+            .with_active_operator_for_test(a.submitted().id());
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "UPDATE prompt_receipts
+                    SET active_operator_id = ?2, receipt_hash = ?3
+                  WHERE id = ?1",
+                rusqlite::params![
+                    forged.id().to_string(),
+                    forged.active_operator_id().unwrap().to_string(),
+                    forged.receipt_hash(),
+                ],
+            )
+            .unwrap();
+        }
+        let error = store
+            .turn_prompt_context(conv, forged.id())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disagrees with parent authority"), "{error}");
+    }
+
+    #[test]
+    fn post_commit_prune_failure_does_not_report_prompt_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 1).unwrap();
+        store
+            .begin_prompt(
+                "retention-first",
+                "first",
+                None,
+                crate::prompt::NewPrompt::operator("first", "first"),
+            )
+            .unwrap();
+
+        // Make the cap's live-owner exclusion query fail deterministically
+        // after the next receipt commits. Prompt acceptance must remain Ok.
+        {
+            let conn = store.lock_conn();
+            conn.execute_batch("ALTER TABLE live_owners RENAME TO broken_live_owners")
+                .unwrap();
+        }
+        let accepted = store
+            .begin_prompt(
+                "retention-second",
+                "second",
+                None,
+                crate::prompt::NewPrompt::operator("second", "second"),
+            )
+            .expect("post-commit housekeeping cannot negate prompt acceptance");
+        let loaded = store
+            .load_prompt(accepted.submitted().id())
+            .unwrap()
+            .expect("committed receipt remains readable");
+        assert_eq!(loaded.model_text_utf8().unwrap(), "second");
+    }
+
+    #[test]
+    fn opening_v1_prompt_schema_adds_authority_column_without_backfill_guessing() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let conv = "v1-authority-migration";
+        let (b_id, retry_id) = {
+            let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+            let a = store
+                .begin_prompt(
+                    conv,
+                    "title",
+                    None,
+                    crate::prompt::NewPrompt::operator("A", "A"),
+                )
+                .unwrap();
+            let b = store
+                .begin_prompt(
+                    conv,
+                    "title",
+                    None,
+                    crate::prompt::NewPrompt::operator_continuation("B", "B", a.submitted().id()),
+                )
+                .unwrap();
+            let retry = store
+                .begin_prompt(
+                    conv,
+                    "title",
+                    None,
+                    crate::prompt::NewPrompt::harness_retry("retry", "retry", b.submitted().id()),
+                )
+                .unwrap();
+
+            // Rewrite every row exactly as the v1 writer did, then remove the
+            // v2-only column. Reconciliation must add it back as NULL rather
+            // than fabricating authority that was never part of the v1 hash.
+            for receipt in store.prompt_chain(conv).unwrap() {
+                let legacy = receipt.into_legacy_v1_for_test();
+                let conn = store.lock_conn();
+                conn.execute(
+                    "UPDATE prompt_receipts
+                        SET active_operator_id = NULL, receipt_hash = ?2,
+                            encoding_version = 1
+                      WHERE id = ?1",
+                    rusqlite::params![legacy.id().to_string(), legacy.receipt_hash()],
+                )
+                .unwrap();
+            }
+            {
+                let conn = store.lock_conn();
+                conn.execute_batch("ALTER TABLE prompt_receipts DROP COLUMN active_operator_id")
+                    .unwrap();
+            }
+            (b.submitted().id(), retry.submitted().id())
+        };
+
+        let reopened = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let context = reopened
+            .turn_prompt_context(conv, retry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.active().id(), b_id);
+        assert_eq!(context.submitted().receipt().active_operator_id(), None);
+        let columns: Vec<String> = {
+            let conn = reopened.lock_conn();
+            let mut stmt = conn.prepare("PRAGMA table_info(prompt_receipts)").unwrap();
+            let selected = stmt
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            selected
+        };
+        assert!(columns.iter().any(|column| column == "active_operator_id"));
+    }
+
+    #[test]
+    fn prompt_load_rejects_tampered_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let receipt = store
+            .begin_prompt(
+                "tamper",
+                "title",
+                None,
+                crate::prompt::NewPrompt::operator("raw", "model"),
+            )
+            .unwrap()
+            .submitted()
+            .receipt()
+            .clone();
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "UPDATE prompt_receipts SET model_text = ?2 WHERE id = ?1",
+                rusqlite::params![receipt.id().to_string(), b"changed".as_slice()],
+            )
+            .unwrap();
+        }
+        let err = store.load_prompt(receipt.id()).unwrap_err().to_string();
+        assert!(err.contains("model-text digest mismatch"), "{err}");
+    }
 
     #[test]
     fn wal_fallback_classifier_matches_known_nfs_failures() {

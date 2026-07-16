@@ -1,3 +1,4 @@
+use super::super::prompt_intake::PromptDisposition;
 use super::*;
 use std::sync::LazyLock;
 
@@ -307,9 +308,10 @@ pub(crate) fn merged_tool_definitions(
     };
     // #894: everything after the base array is [`EXTENDED_TOOL_REGISTRY`],
     // advertised in declaration order when its gate is satisfied. The always-on
-    // tools (resume_context #714 / tool_search #725 / get_context_remaining #727
-    // / request_user_input #728 / lifecycle #891) carry `Gate::Always` and ride
-    // every session, degrading honestly when their backing source is `None`; the
+    // tools (resume_context #714 / prompt_read / artifact_read / tool_search
+    // #725 / get_context_remaining #727 / request_user_input #728 / lifecycle
+    // #891) carry `Gate::Always` and ride every session, degrading honestly
+    // when their backing source is `None`; the
     // rest are gated on the matching injected `with_*` capability (git PR4,
     // compose_roster+crew #479, scratchpad #583, code_search #582, experiential
     // #585, scheduled #586/#715/#716). Adding a tool is one `ToolSpec`, which
@@ -335,9 +337,10 @@ pub(crate) fn merged_tool_definitions(
 }
 
 /// The always-on infra tools ([`Gate::Always`] in [`EXTENDED_TOOL_REGISTRY`]:
-/// resume_context / tool_search / get_context_remaining / request_user_input /
-/// lifecycle). The loop depends on these every round, so a persona allow-list
-/// can NEVER fence them off — they ride every session regardless of `tools:`.
+/// resume_context / prompt_read / artifact_read / tool_search /
+/// get_context_remaining / request_user_input / lifecycle). The loop depends
+/// on these every round, so a persona allow-list can NEVER fence them off —
+/// they ride every session regardless of `tools:`.
 fn is_always_on_tool(name: &str) -> bool {
     EXTENDED_TOOL_REGISTRY
         .iter()
@@ -392,6 +395,96 @@ pub fn filter_advertised_tools(
             })
             .collect(),
     )
+}
+
+/// Whether `name` is available under the prompt's validated disposition.
+///
+/// `Act` retains the complete catalog. `Explain` and `Research` are deliberately
+/// a small, explicit read/recovery set: an unknown name is denied rather than
+/// assumed safe, which also fences every generic MCP name (`server__tool`) until
+/// MCP supplies machine-readable authority metadata. `Ask` is terminal at the
+/// harness layer, so no model tool invocation is admitted as defense in depth.
+///
+/// This predicate is shared by advertisement and dispatch. The latter remains
+/// the security boundary: a model can always fabricate an omitted tool name.
+pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
+    match disposition {
+        PromptDisposition::Act => true,
+        PromptDisposition::Ask => false,
+        PromptDisposition::Explain | PromptDisposition::Research => matches!(
+            name,
+            // Workspace / prompt / artifact recovery.
+            "read_file"
+                | "list_dir"
+                | "find"
+                | "prompt_read"
+                | "artifact_read"
+                | "resume_context"
+                // Read-only evidence and memory retrieval. `web_fetch` remains
+                // subject to the existing net caveat; dispatch removes the
+                // permission gate in non-Act modes so it cannot mint a grant.
+                | "web_fetch"
+                | "use_skill"
+                | "recall"
+                | "memory_fetch"
+                | "state_get"
+                | "code_search"
+                | "experience_recall"
+                | "plan_get"
+                // Read-only harness utilities / presentation.
+                | "tool_search"
+                | "get_context_remaining"
+                | "render_report"
+        ),
+    }
+}
+
+/// Restrict an advertised tool catalog to the current prompt disposition.
+///
+/// Apply this alongside [`filter_advertised_tools`]: the persona filter scopes
+/// an operator-selected role, while this filter scopes the authority implied by
+/// the current prompt. Under a non-Act disposition, malformed definitions are
+/// dropped too because their callable name cannot be proven safe.
+pub fn filter_tools_for_disposition(
+    defs: serde_json::Value,
+    disposition: PromptDisposition,
+) -> serde_json::Value {
+    if disposition == PromptDisposition::Act {
+        return defs;
+    }
+    let serde_json::Value::Array(arr) = defs else {
+        // Unlike the persona filter, non-Act disposition filtering is an
+        // authority boundary. A non-array value cannot prove any callable
+        // name safe, so advertise no tools rather than forwarding it.
+        return serde_json::Value::Array(Vec::new());
+    };
+    serde_json::Value::Array(
+        arr.into_iter()
+            .filter(|def| tool_def_name(def).is_some_and(|name| tool_allowed(disposition, name)))
+            .collect(),
+    )
+}
+
+/// The refusal returned when a model calls a tool outside the current prompt
+/// disposition. Kept distinct from a persona refusal: changing personas cannot
+/// widen a non-Act prompt into an execution turn.
+pub(super) fn disposition_tool_denied_message(
+    disposition: PromptDisposition,
+    name: &str,
+) -> String {
+    let guidance = match disposition {
+        PromptDisposition::Ask => {
+            "The harness is awaiting the operator's clarification; this turn cannot run tools."
+        }
+        PromptDisposition::Explain => {
+            "This is an Explain turn: only the bounded read-only evidence and recovery tools are available."
+        }
+        PromptDisposition::Research => {
+            "This is a Research turn: only the bounded read-only evidence and recovery tools are available; capability grants, execution, mutations, and generic MCP calls require an Act disposition."
+        }
+        PromptDisposition::Act => unreachable!("Act permits every tool"),
+    };
+    format!("Tool `{name}` is unavailable under the current prompt disposition. {guidance}")
 }
 
 /// The refusal returned to the model when it calls a tool the active persona
@@ -503,10 +596,20 @@ pub(super) struct ToolSpec {
 /// byte-for-byte from the previous hand-written push ladder.
 pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
     // Always-on (degrade gracefully when their source is None) —
-    // #714 / #725 / #727 / #728 / #891.
+    // #714 / prompt recovery / artifact recovery / #725 / #727 / #728 / #891.
     ToolSpec {
         name: "resume_context",
         definition: super::super::resume::resume_context_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "prompt_read",
+        definition: super::super::prompt_read::prompt_read_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "artifact_read",
+        definition: super::super::artifact_read::artifact_read_tool_definition,
         gate: Gate::Always,
     },
     ToolSpec {

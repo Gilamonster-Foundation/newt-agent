@@ -8,6 +8,7 @@ pub mod agent_identity;
 pub mod agentic;
 pub mod agents;
 pub mod api_surface;
+pub mod artifact;
 pub mod backend_probe;
 pub mod caveats;
 pub mod classifiers;
@@ -33,6 +34,7 @@ pub mod ocap;
 pub mod ocap_store;
 pub mod plan;
 pub mod pricing;
+pub mod prompt;
 pub mod prune;
 pub mod reasoning;
 pub mod retry;
@@ -80,14 +82,16 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // the surface — the TUI implements the gate; headless callers pass None.
 pub use agentic::wrap_untrusted;
 pub use agentic::{
-    append_denial, chat_complete, compress_user_initiated, execute_tool, experience_block,
-    gather_code_files, index_files, load_denials, memory_fetch_tool_definition,
-    openai_chat_complete, plan_block, retrieve_evidence, transcript_lines, transcript_lines_styled,
-    trim_for_summary, widen_caveats, ChatCtx, CodeSearch, CompressCounters, CompressState,
-    DenialKind, Embedder, EmbeddingsClient, ExperienceStore, ManualCompressOutcome, McpTools,
-    MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
-    PermissionGate, PermissionRecord, PermissionRequest, PlanSnapshot, RecallSource,
-    RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
+    append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
+    compress_user_initiated_for_task, execute_tool, experience_block, gather_code_files,
+    index_files, load_denials, memory_fetch_tool_definition, openai_chat_complete,
+    openai_chat_complete_with_prompt, openai_responses_complete,
+    openai_responses_complete_with_prompt, plan_block, retrieve_evidence, transcript_lines,
+    transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CodeSearch,
+    CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ExperienceStore,
+    ManualCompressOutcome, McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink,
+    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PlanSnapshot,
+    RecallSource, RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
     SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, SessionStepLedger,
     ShellObservation, SpillStore, Step, StepLedger, StepStatus, StoreMemorySource,
     StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine, TranscriptRole,
@@ -96,6 +100,10 @@ pub use agentic::{
 };
 pub use agents::AgentsProvider;
 pub use api_surface::ApiSurfaceProvider;
+pub use artifact::{
+    ArtifactId, ArtifactKind, ArtifactRelation, NewPromptArtifact, PromptArtifact,
+    MAX_ARTIFACT_BODY_BYTES, MAX_ARTIFACT_LOCATOR_BYTES, MAX_ARTIFACT_METADATA_BYTES,
+};
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use classifiers::{
     classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
@@ -103,11 +111,11 @@ pub use classifiers::{
 pub use config::{
     derive_serving, full_access_default_engine, mcp_stdio_env_passthrough, ocap_l3_backend,
     resolve_shell_engine, shell_env_passthrough_default, write_backend_dropin, AgentsConfig,
-    BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, Config, ContextConfig,
-    ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager, ConversationsConfig,
-    CrewPolicyConfig, EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MarkdownMode,
-    MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure, OpenAiApi,
-    PermissionPreset, PickVia, PlanConfig, PlanPruneConfig, ProfilePick, ProviderConfig,
+    BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, CompactionTriggerPolicy,
+    Config, ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager,
+    ConversationsConfig, CrewPolicyConfig, EditMode, FooterMode, Loadout, LoadoutSettings,
+    LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure,
+    OpenAiApi, PermissionPreset, PickVia, PlanConfig, PlanPruneConfig, ProfilePick, ProviderConfig,
     ScratchConfig, SemanticConfig, Serving, ShellConfig, ShellEngine, SkillsConfig,
     SummarizerConfig, ThinkingMode, ToolPermissions, TuiConfig,
 };
@@ -133,6 +141,9 @@ pub use memory::{
 pub use metrics::{TokenUsage, TurnEndReason, TurnMetrics};
 pub use model_id::ModelId;
 pub use pricing::{ModelRate, PricingConfig};
+pub use prompt::{
+    ActivePrompt, NewPrompt, PromptId, PromptOrigin, PromptReceipt, TurnPromptContext,
+};
 pub use reasoning::{split_reasoning, ThinkFilter};
 pub use role_profile::{
     Altitude, CaveatProfile, NamedPermissionPreset, RoleProfile, ScopeKeyword, ScopeSpec,

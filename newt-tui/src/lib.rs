@@ -37,6 +37,7 @@ mod setup;
 mod setup_tui;
 mod wizard;
 
+use anyhow::Context as _;
 use mcp::Mcp;
 // Step 9.7: the agentic loop (ChatCtx / chat_complete / execute_tool and their
 // dependency closure) lives in `newt_core::agentic` now — the TUI is a thin
@@ -51,9 +52,7 @@ use chat::run_chat;
 pub(crate) use chat::{InputSurface, ReadOutcome};
 pub use color::color_supported;
 use color::{color_enabled_for, resolve_color_mode};
-use newt_core::agentic::{
-    chat_complete, print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT,
-};
+use newt_core::agentic::{print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT};
 #[cfg(test)]
 use prompt::expand_prompt_tokens;
 #[cfg(feature = "rich-tui")]
@@ -2187,6 +2186,10 @@ fn verify_gate_summary(
 struct RevertAction {
     banner: String,
     corrective: String,
+    /// Workspace-relative paths actually restored by the governed write
+    /// ledger. Used to append compensating prompt artifacts without claiming
+    /// access to the restored bytes.
+    reverted: Vec<std::path::PathBuf>,
 }
 
 /// What the loop should do after a revert, given the remaining re-prompt budget.
@@ -2269,7 +2272,11 @@ async fn retry_revert(
         "retry: reverted {} file(s) newt wrote this turn to pre-turn state:{detail}",
         outcome.reverted.len()
     );
-    Some(RevertAction { banner, corrective })
+    Some(RevertAction {
+        banner,
+        corrective,
+        reverted: outcome.reverted,
+    })
 }
 
 /// The inference backend the TUI session should talk to: endpoint, model,
@@ -3372,17 +3379,18 @@ fn new_conversation_message(active_persona: Option<&Persona>) -> String {
 /// old "won't resume next launch" wording is retired — with fresh-on-launch
 /// nothing auto-resumes, so `/resume` is how you get back either way.
 ///
-/// `outgoing_persisted` is false for an empty conversation (no turn saved) or an
-/// ephemeral session: nothing was written, so the message makes NO "saved /
-/// stays open — /resume" promise it cannot keep — just the plain new line.
-pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_persisted: bool) -> String {
+/// `outgoing_durable` is true when a durable conversation row exists: an
+/// accepted prompt receipt, a completed turn, or an explicitly titled
+/// `/start`. A prompt-only failed/cancelled turn is therefore resumable. It is
+/// false only when nothing was recorded or the session is ephemeral.
+pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_durable: bool) -> String {
     // #1165/#1170: `/end` must LEAD with the ending regardless of whether the
-    // outgoing conversation was persisted — the operator typed "end" and
-    // expects ending language, not "Started a new conversation." An EMPTY
-    // conversation had nothing to save, so drop the "/resume to reopen" that
-    // it cannot honor; a persisted one keeps it.
+    // outgoing conversation was durable — the operator typed "end" and
+    // expects ending language, not "Started a new conversation." A truly
+    // untouched conversation had nothing to save, so drop the "/resume to
+    // reopen" that it cannot honor; prompt-only durable content keeps it.
     if reason == "end" {
-        return if outgoing_persisted {
+        return if outgoing_durable {
             "Conversation ended and saved — /resume to reopen it, /exit to leave newt. \
              (A fresh conversation is now open.)"
                 .to_string()
@@ -3391,7 +3399,7 @@ pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_persisted:
                 .to_string()
         };
     }
-    if !outgoing_persisted {
+    if !outgoing_durable {
         return started.to_string();
     }
     match reason {
@@ -3522,6 +3530,22 @@ fn conversation_title_from_task(task: &str) -> String {
     }
 }
 
+/// What the per-turn persistence seam knows after attempting a save.
+///
+/// A reply row is appended before scratchpad/plan/claim bookkeeping. Those
+/// later updates are useful but must not erase the fact that the transcript is
+/// already durable; callers use this distinction to append digest-only
+/// provenance honestly.
+#[derive(Debug)]
+enum TurnSaveState {
+    /// The reply and all ancillary session state were saved durably.
+    Durable,
+    /// The reply is durable, but a later ancillary update failed.
+    DurableWithAncillaryWarning(anyhow::Error),
+    /// `--ephemeral`: no SQLite row exists, but session-local state is live.
+    Ephemeral,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn save_successful_conversation_turn(
     store: &newt_core::ConversationStore,
@@ -3535,7 +3559,61 @@ fn save_successful_conversation_turn(
     compaction: Option<String>,
     scratchpad: &std::collections::BTreeMap<String, String>,
     plan: &newt_core::PlanSnapshot,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TurnSaveState> {
+    save_successful_conversation_turn_with_ancillary(
+        store,
+        conversation_id,
+        active_persona,
+        task,
+        reply,
+        events,
+        phantom_reaches,
+        usage,
+        compaction,
+        scratchpad,
+        plan,
+        |store, conversation_id, scratchpad, plan| {
+            // #713: snapshot the live scratchpad <state> onto the conversation
+            // row so a later interrupt + auto-resume can re-hydrate it.
+            store
+                .update_scratchpad(conversation_id, scratchpad)
+                .context("reply persisted but scratchpad snapshot could not be updated")?;
+            // #715: snapshot the live plan ledger onto the conversation row,
+            // alongside the scratchpad and under the same discipline.
+            store
+                .update_plan_snapshot(conversation_id, plan)
+                .context("reply persisted but plan snapshot could not be updated")?;
+            // #1030: refresh this process's live-owner heartbeat every turn.
+            store
+                .heartbeat(conversation_id)
+                .context("reply persisted but conversation heartbeat could not be refreshed")
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_successful_conversation_turn_with_ancillary<F>(
+    store: &newt_core::ConversationStore,
+    conversation_id: &str,
+    active_persona: Option<&Persona>,
+    task: &str,
+    reply: &str,
+    events: &[newt_core::ToolEvent],
+    phantom_reaches: &[newt_core::PhantomReach],
+    usage: Option<newt_core::TokenUsage>,
+    compaction: Option<String>,
+    scratchpad: &std::collections::BTreeMap<String, String>,
+    plan: &newt_core::PlanSnapshot,
+    ancillary: F,
+) -> anyhow::Result<TurnSaveState>
+where
+    F: FnOnce(
+        &newt_core::ConversationStore,
+        &str,
+        &std::collections::BTreeMap<String, String>,
+        &newt_core::PlanSnapshot,
+    ) -> anyhow::Result<()>,
+{
     // The id is pre-assigned for the whole session (issue #220), so the first
     // turn creates the record with that id; later turns just append.
     // `exists()?` — an error must NOT read as "absent": routing a transient
@@ -3571,28 +3649,17 @@ fn save_successful_conversation_turn(
         usage.map(|u| u.input_tokens),
         usage.map(|u| u.output_tokens),
     )?;
-    // #713: snapshot the live scratchpad <state> onto the conversation row so a
-    // later interrupt + auto-resume can re-hydrate it. Working memory, not
-    // provenance: it rides the conversation row (NOT a turn) and never enters
-    // the §6 content chain. Saved every turn so the row always carries the most
-    // recent <state>. Runs AFTER append so the row is guaranteed to exist.
-    store.update_scratchpad(conversation_id, scratchpad)?;
-    // #715: snapshot the live plan ledger onto the conversation row, alongside
-    // the scratchpad and under the same discipline — working memory, not
-    // provenance (rides the conversation row, never enters the §6 content
-    // chain). Saved every turn so the row always carries the most recent plan.
-    store.update_plan_snapshot(conversation_id, plan)?;
-    // #1030: refresh this process's live_owners heartbeat every turn — the
-    // freshness signal a cross-host / post-reboot liveness check reads. A no-op
-    // if this process does not hold the claim.
-    store.heartbeat(conversation_id)
+    match ancillary(store, conversation_id, scratchpad, plan) {
+        Ok(()) => Ok(TurnSaveState::Durable),
+        Err(error) => Ok(TurnSaveState::DurableWithAncillaryWarning(error)),
+    }
 }
 
 /// The run loop's per-turn save seam (17.7): persistent sessions route to
 /// [`save_successful_conversation_turn`]; an ephemeral session has no store
-/// (`None`) and this is a no-op — no row created, no turn appended, no error.
-/// A compaction record (18.5) taken in an ephemeral session is dropped with
-/// the rest of the turn: nothing persists, so there is nothing to rehydrate.
+/// (`None`) and this makes no SQLite write. Its caller still receives
+/// [`TurnSaveState::Ephemeral`] so it can maintain the process-local prompt
+/// artifact ledger, including a compaction checkpoint when appropriate.
 #[allow(clippy::too_many_arguments)] // mirrors save_successful_conversation_turn
 fn save_turn_if_persistent(
     store: Option<&newt_core::ConversationStore>,
@@ -3606,7 +3673,7 @@ fn save_turn_if_persistent(
     compaction: Option<String>,
     scratchpad: &std::collections::BTreeMap<String, String>,
     plan: &newt_core::PlanSnapshot,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TurnSaveState> {
     match store {
         Some(store) => save_successful_conversation_turn(
             store,
@@ -3621,7 +3688,7 @@ fn save_turn_if_persistent(
             scratchpad,
             plan,
         ),
-        None => Ok(()),
+        None => Ok(TurnSaveState::Ephemeral),
     }
 }
 
@@ -3689,6 +3756,10 @@ struct ConversationCommandContext<'a> {
     /// a resumed `<plan>` block / `plan_get` returns the saved plan — with the
     /// correct active step and done statuses — instead of an empty ledger.
     step_ledger: &'a dyn newt_core::StepLedger,
+    /// Latest submitted prompt metadata for the active conversation. Restore
+    /// rehydrates it for addressability, but never turns it into queued input:
+    /// resuming a prompt-only conversation still waits for the operator.
+    active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
 }
 
 fn handle_conversation_command(
@@ -3743,6 +3814,13 @@ fn restore_conversation_into_session(
     id: &str,
 ) -> anyhow::Result<(newt_core::ConversationRecord, Option<String>)> {
     let record = ctx.store.load(id)?;
+    // Prompt receipts are a parallel immutable log, not presentation history.
+    // Resolve and verify them before mutating any live session state, so a
+    // corrupt receipt makes restore fail without partially switching memory.
+    let restored_prompt_context = match ctx.store.latest_prompt(&record.id)? {
+        Some(receipt) => ctx.store.turn_prompt_context(&record.id, receipt.id())?,
+        None => None,
+    };
     ctx.memory.restore_turns(&record.turns);
     // #713: re-hydrate the live scratchpad <state> store from the restored
     // record, right next to `restore_turns`, so an interrupt + auto-resume gives
@@ -3761,6 +3839,9 @@ fn restore_conversation_into_session(
     // restore is a conversation boundary) and reinstates the saved active step +
     // done statuses verbatim.
     ctx.step_ledger.restore(&record.plan);
+    // Rehydrate the verified metadata so prompt handles remain resolvable,
+    // while leaving the input queue untouched (no auto-execution).
+    *ctx.active_prompt_context = restored_prompt_context;
     let mut warning = None;
     match record.persona.as_deref() {
         Some(name) => match ctx.persona_store.load(name) {
@@ -5785,6 +5866,35 @@ fn context_manager(
         .unwrap_or_default()
 }
 
+/// Resolve the automatic-compaction trigger policy: the interactive-session
+/// override (`/context compaction`) wins over `[context]`, which in turn falls
+/// back to the safe headroom-aware default.
+fn compaction_trigger_policy(
+    cfg: &newt_core::Config,
+    session: Option<newt_core::CompactionTriggerPolicy>,
+) -> newt_core::CompactionTriggerPolicy {
+    session
+        .or_else(|| cfg.context.as_ref().map(|c| c.compaction_trigger_policy))
+        .unwrap_or_default()
+}
+
+/// Human-readable provenance for [`compaction_trigger_policy`]. A present
+/// `[context]` section is the closest provenance the deserialized config can
+/// preserve; TOML does not retain whether an individual defaulted field was
+/// explicitly written.
+fn compaction_trigger_policy_source(
+    cfg: &newt_core::Config,
+    session: Option<newt_core::CompactionTriggerPolicy>,
+) -> &'static str {
+    if session.is_some() {
+        "session"
+    } else if cfg.context.is_some() {
+        "config"
+    } else {
+        "default"
+    }
+}
+
 /// Resolve the effective context-feature set (Step 26.1, #588): the `manager`
 /// preset's base bundle → `[context.features]` config overrides → session
 /// (`/context feature`) overrides.
@@ -5819,6 +5929,16 @@ struct ContextCommandResult {
     /// `/context size <N>` session budget override; `Some(0)` clears it back
     /// to the probed / configured value.
     set_budget: Option<u32>,
+    /// `/context compaction …` mutation. The explicit `Reset` variant keeps a
+    /// reset distinguishable from a command that simply leaves the override
+    /// alone.
+    set_compaction_trigger_policy: Option<CompactionTriggerPolicyOverride>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionTriggerPolicyOverride {
+    Set(newt_core::CompactionTriggerPolicy),
+    Reset,
 }
 
 fn handle_context_feature_arg(
@@ -5875,14 +5995,15 @@ fn handle_context_feature_arg(
     }
 }
 
-/// Dispatch `/context [manager <preset> | feature <name> [on|off]]` against the
-/// current config + session overrides (Step 26.1, #588). `rest` is the text
-/// after `context`. Unavailable presets/features report "not yet available" and
-/// are NOT applied.
+/// Dispatch `/context [manager <preset> | feature <name> [on|off] | compaction
+/// <policy>]` against the current config + session overrides (Step 26.1, #588).
+/// `rest` is the text after `context`. Unavailable presets/features report
+/// "not yet available" and are NOT applied.
 fn handle_context_command(
     rest: &str,
     cfg: &newt_core::Config,
     manager_override: Option<newt_core::ContextManager>,
+    compaction_policy_override: Option<newt_core::CompactionTriggerPolicy>,
     feature_override: &newt_core::ContextFeatures,
     kind: newt_core::BackendKind,
 ) -> ContextCommandResult {
@@ -5890,6 +6011,9 @@ fn handle_context_command(
     let rest = rest.trim();
     let manager = context_manager(cfg, manager_override);
     let features = context_features(cfg, manager, feature_override, kind);
+    let compaction_policy = compaction_trigger_policy(cfg, compaction_policy_override);
+    let compaction_policy_source =
+        compaction_trigger_policy_source(cfg, compaction_policy_override);
     let mgr_src = if manager_override.is_some() {
         "session"
     } else {
@@ -5922,8 +6046,13 @@ fn handle_context_command(
             manager.keyword(),
             feat_summary()
         ));
+        out.lines.push(format!(
+            "compaction trigger policy: {} ({compaction_policy_source})",
+            compaction_policy.keyword()
+        ));
         out.lines.push(
-            "  /context manager <preset>  ·  /context feature <name> [on|off]  ·  /context stats"
+            "  /context manager <preset>  ·  /context feature <name> [on|off]  ·  \
+             /context compaction [headroom_aware|message_count|reset]  ·  /context stats"
                 .to_string(),
         );
     } else if rest == "size" {
@@ -5972,6 +6101,34 @@ fn handle_context_command(
                 name.trim()
             )),
         }
+    } else if rest == "compaction" {
+        out.lines.push(format!(
+            "compaction trigger policy: {} ({compaction_policy_source}) — \
+             use /context compaction headroom_aware|message_count|reset",
+            compaction_policy.keyword()
+        ));
+    } else if let Some(policy) = rest.strip_prefix("compaction ") {
+        let policy = policy.trim();
+        if policy.eq_ignore_ascii_case("reset") {
+            out.set_compaction_trigger_policy = Some(CompactionTriggerPolicyOverride::Reset);
+            let reset_policy = compaction_trigger_policy(cfg, None);
+            let reset_source = compaction_trigger_policy_source(cfg, None);
+            out.lines.push(format!(
+                "compaction trigger policy → {} ({reset_source})",
+                reset_policy.keyword()
+            ));
+        } else if let Some(policy) = newt_core::CompactionTriggerPolicy::from_keyword(policy) {
+            out.set_compaction_trigger_policy = Some(CompactionTriggerPolicyOverride::Set(policy));
+            out.lines.push(format!(
+                "compaction trigger policy → {} (session override)",
+                policy.keyword()
+            ));
+        } else {
+            out.lines.push(format!(
+                "unknown compaction trigger policy '{policy}' — \
+                 use headroom_aware|message_count|reset"
+            ));
+        }
     } else if rest == "feature" || rest == "features" {
         out.lines.push("context features:".to_string());
         for f in ContextFeature::ALL {
@@ -5991,13 +6148,15 @@ fn handle_context_command(
         } else {
             out.lines.push(format!(
                 "unknown /context subcommand '{rest}' — \
-                 use /context [manager <preset> | feature <name> [on|off] | size <N> | show | stats]"
+                 use /context [manager <preset> | feature <name> [on|off] | \
+                 compaction <policy> | size <N> | show | stats]"
             ));
         }
     } else {
         out.lines.push(format!(
             "unknown /context subcommand '{rest}' — \
-             use /context [manager <preset> | feature <name> [on|off] | size <N> | show | stats]"
+             use /context [manager <preset> | feature <name> [on|off] | \
+             compaction <policy> | size <N> | show | stats]"
         ));
     }
     out
@@ -6005,14 +6164,16 @@ fn handle_context_command(
 
 /// Render the `/context stats` experimentation dashboard (Step 26.2, #588).
 /// Composes the live context budget (the 24.5/24.6 gauge state), the
-/// compression counters, and the resolved feature set with per-feature impact.
-/// Pure → unit-testable. `tool_offload_impact` = `(spills, offloaded_chars)`
-/// from the session spill store (Step 26.3); other features instrument as they
-/// land (26.4+).
-#[allow(clippy::too_many_arguments)] // gauge + counters + features + one impact tuple per feature
+/// compression counters, the effective automatic-compaction policy, and the
+/// resolved feature set with per-feature impact. Pure → unit-testable.
+/// `tool_offload_impact` = `(spills, offloaded_chars)` from the session spill
+/// store (Step 26.3); other features instrument as they land (26.4+).
+#[allow(clippy::too_many_arguments)] // gauge + counters + policy + features + one impact tuple per feature
 fn context_stats_text(
     gauge: Option<(u32, u32)>,
     counters: &newt_core::CompressCounters,
+    compaction_policy: newt_core::CompactionTriggerPolicy,
+    compaction_policy_source: &str,
     features: newt_core::ContextFeatureSet,
     tool_offload_impact: Option<(u64, u64)>,
     scratchpad_impact: Option<(u64, u64)>,
@@ -6032,6 +6193,10 @@ fn context_stats_text(
         }
         _ => lines.push("  budget: not yet measured (no completed turn)".to_string()),
     }
+    lines.push(format!(
+        "  automatic compaction: {} ({compaction_policy_source})",
+        compaction_policy.keyword()
+    ));
     // Compression activity — reuse the /memory anti-thrash section verbatim.
     for l in memory_compress_section(counters).lines() {
         lines.push(l.to_string());
@@ -6751,6 +6916,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /context                 - show the active context manager + features",
         "  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)",
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
+        "  /context compaction [headroom_aware|message_count|reset] - set this session's automatic-compaction trigger policy",
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)",
@@ -8698,6 +8864,8 @@ mod tool_round_cap_tests {
                     max_tool_rounds: 5,
                     narration_nudge_cap: 1,
                     action_nudges: true,
+                    prompt_disposition: newt_core::agentic::PromptDisposition::Act,
+                    prompt_intake: None,
                     workflow_grace_rounds: 0,
                     tool_output_lines: 20,
                     debug: false,
@@ -8708,6 +8876,7 @@ mod tool_round_cap_tests {
                     connect_timeout_secs: 5,
                     inference_timeout_secs: 120,
                     mid_loop_trim_threshold: 40,
+                    compaction_trigger_policy: newt_core::CompactionTriggerPolicy::HeadroomAware,
                     mid_loop_trim_tokens: None,
                     max_ok_input: None,
                     build_check_cmd: None,

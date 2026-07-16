@@ -11,6 +11,36 @@
 
 use crate::tokens::TokenEstimation;
 
+/// Return the compression-immune head length for a transcript carrying a
+/// harness-owned active-prompt card.
+///
+/// Every leading system message is protected. When the final leading system
+/// message is the active-prompt card, its immediately following user message
+/// is protected as well. Keeping this calculation in one place prevents the
+/// normal compressor and the round-cap summarizer from disagreeing about the
+/// card/prompt adjacency contract.
+pub(crate) fn protected_prompt_head_len(
+    messages: &[serde_json::Value],
+    active_prompt_prefix: &str,
+) -> usize {
+    let mut head = messages
+        .iter()
+        .take_while(|message| message["role"].as_str() == Some("system"))
+        .count();
+    if head > 0
+        && messages[head - 1]["content"]
+            .as_str()
+            .is_some_and(|content| content.starts_with(active_prompt_prefix))
+        && messages
+            .get(head)
+            .and_then(|message| message["role"].as_str())
+            == Some("user")
+    {
+        head += 1;
+    }
+    head
+}
+
 /// Trim a message list for the cap-exit summary: keep the first `head` messages
 /// (system prompt + original task) and the last `tail` messages (recent rounds).
 /// Inserts a single placeholder when the middle is dropped so the model knows
@@ -286,6 +316,30 @@ mod tests {
     /// Default estimation (chars_per_token = 4) for the unit tests.
     const EST: TokenEstimation = TokenEstimation { chars_per_token: 4 };
     use serde_json::json;
+
+    #[test]
+    fn protected_head_keeps_active_card_and_exact_prompt_adjacent() {
+        let prefix = "[ACTIVE]";
+        let messages = vec![
+            json!({"role": "system", "content": "base"}),
+            json!({"role": "system", "content": "[ACTIVE]\naddress: prompt:1"}),
+            json!({"role": "user", "content": "exact operator prompt"}),
+            json!({"role": "user", "content": "historical message"}),
+        ];
+        assert_eq!(protected_prompt_head_len(&messages, prefix), 3);
+        let trimmed = trim_for_summary(&messages, protected_prompt_head_len(&messages, prefix), 0);
+        assert_eq!(trimmed[1], messages[1]);
+        assert_eq!(trimmed[2], messages[2]);
+    }
+
+    #[test]
+    fn protected_head_never_promotes_arbitrary_first_user() {
+        let messages = vec![
+            json!({"role": "system", "content": "base"}),
+            json!({"role": "user", "content": "old ask"}),
+        ];
+        assert_eq!(protected_prompt_head_len(&messages, "[ACTIVE]"), 1);
+    }
 
     /// `trim_for_summary` keeps head + tail and inserts a placeholder for
     /// the dropped middle section.

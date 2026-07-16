@@ -114,9 +114,9 @@ pyo3 = { workspace = true, optional = true }
 # #1030 collision fix, Windows side: `pid_is_alive`'s `OpenProcess`-based
 # process probe (store.rs) — the Windows analogue of the Unix `libc::kill(pid,
 # 0)` check above. windows-sys is the official zero-cost sys-binding crate;
-# only the two API surfaces actually used are enabled to keep the Windows-only
+# only the API surfaces actually used are enabled to keep the Windows-only
 # build graph addition minimal.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [features]
 default = ["markdown"]

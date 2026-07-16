@@ -2,6 +2,7 @@
 //! Moved verbatim from `newt-tui` in Step 9.7 — the Caveats enforcement,
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 
+use super::artifact_read::{execute_artifact_read, ArtifactReadContext};
 use super::crew_tool::CrewRunner;
 use super::display::{print_denied, print_tool_call, print_tool_output};
 use super::git_tool::GitTool;
@@ -9,6 +10,8 @@ use super::mcp::McpTools;
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
+use super::prompt_intake::PromptDisposition;
+use super::prompt_read::{execute_prompt_read, PromptReadContext};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
 use super::spill::{self, SpillStore};
@@ -30,12 +33,18 @@ pub(crate) use catalog::{
     classify_gated_off_reach, classify_phantom_reach, is_context_remaining_call, is_hallucination,
     known_builtin_tool_name, merged_tool_definitions, resolve_tool_alias, AliasOutcome,
 };
-pub use catalog::{filter_advertised_tools, persona_tool_allowed, tool_definitions};
+use catalog::{
+    disposition_tool_denied_message, persona_tool_denied_message, run_command_redirect,
+    unknown_tool_message,
+};
+pub use catalog::{
+    filter_advertised_tools, filter_tools_for_disposition, persona_tool_allowed, tool_allowed,
+    tool_definitions,
+};
 #[cfg(test)]
 use catalog::{
     levenshtein, nearest_tool_name, ALL_TOOL_NAMES, BASE_TOOL_NAMES, EXTENDED_TOOL_REGISTRY,
 };
-use catalog::{persona_tool_denied_message, run_command_redirect, unknown_tool_message};
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///
@@ -1777,6 +1786,203 @@ fn find_walk(
 /// This is what makes a deliberately-restricted on-call/triage mode win over a
 /// `--yolo` flag — the preset clamp is consulted as a ceiling the bypass
 /// cannot cross.
+/// Open one artifact candidate without ever blocking on a FIFO/device or
+/// following a final symlink. Artifact capture is diagnostic, so platforms
+/// without this race-safe primitive fail closed rather than weakening the file
+/// tools' existing mutation policy.
+#[cfg(unix)]
+fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    // Open the final component itself, rather than following a symlink or
+    // another reparse point that could have replaced it after the lexical
+    // check. This is the Windows analogue of Unix O_NOFOLLOW.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn artifact_open_regular_file(_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "race-safe artifact file capture is unavailable on this platform",
+    ))
+}
+
+fn artifact_preimage_state(
+    path: &std::path::Path,
+    read_authorized: bool,
+) -> super::artifact_hooks::ArtifactFileState {
+    use std::io::Read as _;
+
+    if !read_authorized {
+        return super::artifact_hooks::ArtifactFileState::unavailable("fs_read_not_granted");
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            super::artifact_hooks::ArtifactFileState::unavailable("symlink_preimage_not_hashed")
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            super::artifact_hooks::ArtifactFileState::unavailable("preimage_not_regular_file")
+        }
+        Ok(_) => {
+            let mut file = match artifact_open_regular_file(path) {
+                Ok(file) => file,
+                Err(_) => {
+                    return super::artifact_hooks::ArtifactFileState::unavailable(
+                        "preimage_read_failed",
+                    )
+                }
+            };
+            let mut hasher = blake3::Hasher::new();
+            let mut bytes = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        hasher.update(&buffer[..read]);
+                        bytes = bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                    }
+                    Err(_) => {
+                        return super::artifact_hooks::ArtifactFileState::unavailable(
+                            "preimage_read_failed",
+                        )
+                    }
+                }
+            }
+            super::artifact_hooks::ArtifactFileState::from_digest(
+                hasher.finalize().to_hex().to_string(),
+                bytes,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            super::artifact_hooks::ArtifactFileState::absent()
+        }
+        Err(_) => super::artifact_hooks::ArtifactFileState::unavailable("preimage_read_failed"),
+    }
+}
+
+/// Verify a governed write against the bytes it submitted without allocating a
+/// second copy of the file. Only a regular file can satisfy the postcondition.
+fn artifact_file_matches(path: &std::path::Path, expected: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read as _;
+
+    let mut file = artifact_open_regular_file(path)?;
+    let mut offset = 0_usize;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(offset == expected.len());
+        }
+        let Some(end) = offset.checked_add(read) else {
+            return Ok(false);
+        };
+        if expected.get(offset..end) != Some(&buffer[..read]) {
+            return Ok(false);
+        }
+        offset = end;
+    }
+}
+
+/// Return true only when the artifact locator can be proven to resolve inside
+/// the physical workspace. The file tools intentionally retain their existing
+/// lexical OCAP policy, but provenance must not turn a write through an
+/// in-workspace symlink into a false claim about workspace state.
+///
+/// For a path that does not exist yet, walk to the nearest existing ancestor.
+/// An existing (including dangling) symlink must canonicalize successfully;
+/// otherwise the provenance check fails closed instead of walking past it.
+fn artifact_path_is_physically_within_workspace(
+    workspace: &std::path::Path,
+    target: &std::path::Path,
+) -> bool {
+    let Ok(workspace) = workspace.canonicalize() else {
+        return false;
+    };
+    let mut probe = target;
+    loop {
+        match std::fs::symlink_metadata(probe) {
+            Ok(_) => {
+                return probe
+                    .canonicalize()
+                    .is_ok_and(|resolved| resolved.starts_with(&workspace));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = probe.parent() else {
+                    return false;
+                };
+                probe = parent;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_governed_file_change(
+    sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
+    context: Option<ArtifactReadContext<'_>>,
+    path: &str,
+    operation: &'static str,
+    before: Option<super::artifact_hooks::ArtifactFileState>,
+    after: super::artifact_hooks::ArtifactFileState,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    let (Some(sink), Some(context), Some(before)) = (sink, context, before) else {
+        return String::new();
+    };
+    match super::artifact_hooks::record_file_change(sink, context, path, operation, before, after) {
+        Ok(_) => String::new(),
+        Err(error) => {
+            let warning = format!("warning: failed to record file-change artifact: {error}");
+            print_tool_output(&warning, tool_output_lines, color);
+            format!("\n{warning}")
+        }
+    }
+}
+
+fn artifact_postcondition_warning(
+    path: &str,
+    detail: &str,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    let warning =
+        format!("warning: {path} changed, but no file-change artifact was recorded: {detail}");
+    print_tool_output(&warning, tool_output_lines, color);
+    format!("\n{warning}")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     name: &str,
@@ -1841,6 +2047,126 @@ pub async fn execute_tool_with_offload(
     note_sink: Option<&mut dyn NoteSink>,
     recall_source: Option<&dyn RecallSource>,
     memory_source: Option<&dyn MemorySource>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
+    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    persona_tools: Option<&[String]>,
+) -> String {
+    execute_tool_with_offload_and_prompt(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        build_check_cmd,
+        note_sink,
+        recall_source,
+        memory_source,
+        None,
+        permission_gate,
+        exec_floor,
+        git_tool,
+        crew_runner,
+        scratchpad_store,
+        code_search,
+        experience_store,
+        step_ledger,
+        tool_offload,
+        spill_store,
+        persona_tools,
+    )
+    .await
+}
+
+/// Prompt-aware tool dispatcher used by inference loops.
+///
+/// The historical [`execute_tool_with_offload`] entry point remains
+/// source-compatible for embedders; only loops carrying a verified active
+/// prompt need this extended seam.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_with_offload_and_prompt(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
+    prompt_context: Option<PromptReadContext<'_>>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
+    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    persona_tools: Option<&[String]>,
+) -> String {
+    execute_tool_with_offload_and_prompt_and_artifacts(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        build_check_cmd,
+        note_sink,
+        recall_source,
+        memory_source,
+        prompt_context,
+        None,
+        None,
+        permission_gate,
+        exec_floor,
+        git_tool,
+        crew_runner,
+        scratchpad_store,
+        code_search,
+        experience_store,
+        step_ledger,
+        tool_offload,
+        spill_store,
+        persona_tools,
+        PromptDisposition::Act,
+    )
+    .await
+}
+
+/// Prompt- and artifact-aware tool dispatcher used by inference loops.
+/// The prompt-only entry point above remains source-compatible for embedders.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
+    prompt_context: Option<PromptReadContext<'_>>,
+    artifact_context: Option<ArtifactReadContext<'_>>,
+    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
     mut permission_gate: Option<&mut dyn PermissionGate>,
     exec_floor: Option<&crate::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
@@ -1857,9 +2183,35 @@ pub async fn execute_tool_with_offload(
     // real ONLY because this executor refuses a disallowed name even if the
     // model calls it unprompted.
     persona_tools: Option<&[String]>,
+    // The prompt's validated disposition. This is deliberately a required
+    // dispatcher input: catalog filtering is cosmetic, whereas this check is
+    // the boundary that refuses fabricated tool names before MCP routing,
+    // aliases, or permission widening can run.
+    disposition: PromptDisposition,
 ) -> String {
+    // Prompt-comprehension boundary: enforce the validated disposition BEFORE
+    // every other routing or grant path. In particular, unknown names (including
+    // generic `server__tool` MCP calls) fail closed under a non-Act disposition;
+    // there is no safe way to infer a remote tool's authority from its name.
+    if !tool_allowed(disposition, name) {
+        let msg = disposition_tool_denied_message(disposition, name);
+        print_tool_call(name, &args.to_string(), color);
+        print_tool_output(&msg, tool_output_lines, color);
+        return msg;
+    }
+
+    // A read/recovery tool can itself hit a caveat denial (for example
+    // `web_fetch` outside the net allow-list). Non-Act turns must never turn
+    // that into an authority grant, so remove the human grant seam even for the
+    // narrow tools the disposition permits. The existing caveats still decide
+    // whether the read is legal.
+    if disposition != PromptDisposition::Act {
+        permission_gate = None;
+    }
+
     // FR-3 (#998): the absolute deny-list — a grant-independent veto checked
-    // FIRST, above every other leash (persona, MCP, alias, routing). It refuses
+    // immediately after the prompt-disposition boundary, above every other
+    // leash (persona, MCP, alias, routing). It refuses
     // catastrophic exec (ssh / rm / systemctl restart …) by STRUCTURAL target,
     // so no capability, mode, or persona grant can unlock it. Runs on the RAW
     // name + args (pre-rewrite) so a shell alias or a routed command can't slip
@@ -1984,6 +2336,22 @@ pub async fn execute_tool_with_offload(
     };
 
     match name {
+        // Exact prompt recovery is always available. Durable TUI sessions pass
+        // a conversation-fenced source; headless callers pass an ephemeral
+        // context and still recover the exact active task text.
+        "prompt_read" => match prompt_context {
+            Some(context) => execute_prompt_read(args, context, color, tool_output_lines),
+            None => "prompt_read error: no active prompt context in this session".to_string(),
+        },
+
+        // Derived-work recovery is also always available. The context carries
+        // only harness-owned prompt ids and an already conversation/workspace-
+        // fenced source; model arguments can select an address, never a fence.
+        "artifact_read" => match artifact_context {
+            Some(context) => execute_artifact_read(args, context, color, tool_output_lines),
+            None => "error: artifact_read: no active artifact context in this session".to_string(),
+        },
+
         // Model-curated memory (Step 19.3): routes add / replace / remove
         // through the caller's NoteSink — the same MemoryManager → NoteStore
         // path as `/remember`, so the 19.1 char-cap curator error and the
@@ -2065,7 +2433,27 @@ pub async fn execute_tool_with_offload(
         // WRITE tool, presence-gated on the ledger (advertised only when the
         // `scheduled` feature is on). Replaces plan_set + plan_advance.
         "update_plan" => match step_ledger {
-            Some(l) => super::scheduled::execute_update_plan(args, l, color, tool_output_lines),
+            Some(ledger) => {
+                let mut out =
+                    super::scheduled::execute_update_plan(args, ledger, color, tool_output_lines);
+                if tool_result_ok(&out) {
+                    if let (Some(sink), Some(context)) = (artifact_sink, artifact_context) {
+                        let plan = ledger.snapshot();
+                        if !plan.is_empty() {
+                            if let Err(error) =
+                                super::artifact_hooks::record_plan_revision(sink, context, &plan)
+                            {
+                                let warning =
+                                    format!("warning: failed to record plan artifact: {error}");
+                                print_tool_output(&warning, tool_output_lines, color);
+                                out.push('\n');
+                                out.push_str(&warning);
+                            }
+                        }
+                    }
+                }
+                out
+            }
             None => "unknown tool: update_plan (scheduled planning is off)".to_string(),
         },
 
@@ -2109,6 +2497,7 @@ pub async fn execute_tool_with_offload(
             recall_source,
             step_ledger,
             scratchpad_store,
+            prompt_context,
             color,
             tool_output_lines,
         ),
@@ -2162,6 +2551,7 @@ pub async fn execute_tool_with_offload(
                 ),
                 persona_tools,
             );
+            let catalog = filter_tools_for_disposition(catalog, disposition);
             let out = super::tool_search::execute_tool_search(query, &catalog);
             print_tool_output(&out, tool_output_lines, color);
             out
@@ -2435,6 +2825,18 @@ pub async fn execute_tool_with_offload(
                     return msg;
                 }
             }
+            // Capture provenance only after fs_write authorization. The
+            // preimage digest is withheld unless this turn also has fs_read;
+            // a write-only grant must not mint a persistent equality oracle.
+            let artifact_tracking = artifact_sink.is_some() && artifact_context.is_some();
+            let artifact_path_within = artifact_tracking
+                && artifact_path_is_physically_within_workspace(
+                    std::path::Path::new(workspace),
+                    &full,
+                );
+            let artifact_before = artifact_path_within.then(|| {
+                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
+            });
 
             // Shrink guard: refuse if the proposed write removes > 30% of
             // lines AND > 30 lines absolute. This catches the failure mode
@@ -2490,10 +2892,55 @@ pub async fn execute_tool_with_offload(
                     Ok(_) => {
                         let line_count = content.lines().count();
                         println!("✓ wrote {path} ({line_count} lines)");
+                        // Verify exactly the bytes this governed tool submitted
+                        // before an arbitrary build-check command can touch the
+                        // workspace. A mismatch emits no false provenance.
+                        let artifact = if !artifact_tracking {
+                            String::new()
+                        } else if !artifact_path_within
+                            || !artifact_path_is_physically_within_workspace(
+                                std::path::Path::new(workspace),
+                                &full,
+                            )
+                        {
+                            artifact_postcondition_warning(
+                                path,
+                                "the physical path could not be proven inside the workspace",
+                                color,
+                                tool_output_lines,
+                            )
+                        } else {
+                            match artifact_file_matches(&full, content.as_bytes()) {
+                                Ok(true) => record_governed_file_change(
+                                    artifact_sink,
+                                    artifact_context,
+                                    path,
+                                    "write_file",
+                                    artifact_before,
+                                    super::artifact_hooks::ArtifactFileState::from_bytes(
+                                        content.as_bytes(),
+                                    ),
+                                    color,
+                                    tool_output_lines,
+                                ),
+                                Ok(false) => artifact_postcondition_warning(
+                                    path,
+                                    "post-write bytes did not match the submitted content",
+                                    color,
+                                    tool_output_lines,
+                                ),
+                                Err(_) => artifact_postcondition_warning(
+                                    path,
+                                    "post-write bytes could not be verified",
+                                    color,
+                                    tool_output_lines,
+                                ),
+                            }
+                        };
                         let check = build_check_cmd
                             .map(|cmd| run_build_check(cmd, workspace))
                             .unwrap_or_default();
-                        format!("wrote {path} ({line_count} lines){check}")
+                        format!("wrote {path} ({line_count} lines){artifact}{check}")
                     }
                     Err(e) => format!("error writing {path}: {e}"),
                 }
@@ -2537,6 +2984,15 @@ pub async fn execute_tool_with_offload(
             if meta.file_type().is_dir() {
                 return format!("error deleting {path}: delete_file refuses directories");
             }
+            let artifact_tracking = artifact_sink.is_some() && artifact_context.is_some();
+            let artifact_path_within = artifact_tracking
+                && artifact_path_is_physically_within_workspace(
+                    std::path::Path::new(workspace),
+                    &full,
+                );
+            let artifact_before = artifact_path_within.then(|| {
+                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
+            });
 
             print_tool_call("delete_file", path, color);
             let confirmed = confirm_unrestricted_fs_mutation(
@@ -2553,10 +3009,46 @@ pub async fn execute_tool_with_offload(
             match std::fs::remove_file(&full) {
                 Ok(_) => {
                     println!("✓ deleted {path}");
+                    let artifact = if !artifact_tracking {
+                        String::new()
+                    } else if !artifact_path_within
+                        || !artifact_path_is_physically_within_workspace(
+                            std::path::Path::new(workspace),
+                            &full,
+                        )
+                    {
+                        artifact_postcondition_warning(
+                            path,
+                            "the physical path could not be proven inside the workspace",
+                            color,
+                            tool_output_lines,
+                        )
+                    } else {
+                        match std::fs::symlink_metadata(&full) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                record_governed_file_change(
+                                    artifact_sink,
+                                    artifact_context,
+                                    path,
+                                    "delete_file",
+                                    artifact_before,
+                                    super::artifact_hooks::ArtifactFileState::absent(),
+                                    color,
+                                    tool_output_lines,
+                                )
+                            }
+                            _ => artifact_postcondition_warning(
+                                path,
+                                "the path still existed after delete_file returned success",
+                                color,
+                                tool_output_lines,
+                            ),
+                        }
+                    };
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!("deleted {path}{check}")
+                    format!("deleted {path}{artifact}{check}")
                 }
                 Err(e) => format!("error deleting {path}: {e}"),
             }
@@ -2624,6 +3116,25 @@ pub async fn execute_tool_with_offload(
                      Add more surrounding context to make it unique."
                 );
             }
+            let artifact_tracking = artifact_sink.is_some() && artifact_context.is_some();
+            let artifact_path_within = artifact_tracking
+                && artifact_path_is_physically_within_workspace(
+                    std::path::Path::new(workspace),
+                    &full,
+                );
+            let artifact_before = artifact_path_within.then(|| {
+                if !tui_permits_path(&caveats.fs_read, &full_str) {
+                    super::artifact_hooks::ArtifactFileState::unavailable("fs_read_not_granted")
+                } else if std::fs::symlink_metadata(&full)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    super::artifact_hooks::ArtifactFileState::unavailable(
+                        "symlink_preimage_not_hashed",
+                    )
+                } else {
+                    super::artifact_hooks::ArtifactFileState::from_bytes(existing.as_bytes())
+                }
+            });
             let updated = existing.replacen(old_string, new_string, 1);
             let old_lines = existing.lines().count();
             let new_lines = updated.lines().count();
@@ -2637,10 +3148,54 @@ pub async fn execute_tool_with_offload(
             match std::fs::write(&full, &updated) {
                 Ok(_) => {
                     println!("✓ edited {path} ({delta_str} lines, now {new_lines} total)");
+                    let artifact = if !artifact_tracking {
+                        String::new()
+                    } else if !artifact_path_within
+                        || !artifact_path_is_physically_within_workspace(
+                            std::path::Path::new(workspace),
+                            &full,
+                        )
+                    {
+                        artifact_postcondition_warning(
+                            path,
+                            "the physical path could not be proven inside the workspace",
+                            color,
+                            tool_output_lines,
+                        )
+                    } else {
+                        match artifact_file_matches(&full, updated.as_bytes()) {
+                            Ok(true) => record_governed_file_change(
+                                artifact_sink,
+                                artifact_context,
+                                path,
+                                "edit_file",
+                                artifact_before,
+                                super::artifact_hooks::ArtifactFileState::from_bytes(
+                                    updated.as_bytes(),
+                                ),
+                                color,
+                                tool_output_lines,
+                            ),
+                            Ok(false) => artifact_postcondition_warning(
+                                path,
+                                "post-edit bytes did not match the computed replacement",
+                                color,
+                                tool_output_lines,
+                            ),
+                            Err(_) => artifact_postcondition_warning(
+                                path,
+                                "post-edit bytes could not be verified",
+                                color,
+                                tool_output_lines,
+                            ),
+                        }
+                    };
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!("edited {path} ({delta_str} lines, now {new_lines} total){check}")
+                    format!(
+                        "edited {path} ({delta_str} lines, now {new_lines} total){artifact}{check}"
+                    )
                 }
                 Err(e) => format!("error writing {path}: {e}"),
             }
@@ -3274,6 +3829,12 @@ mod tests {
                 // #714: advertised ALWAYS (no presence gate), so it joins the
                 // base set even with every `with_*` flag off.
                 "resume_context",
+                // Exact prompt recovery is an invariant, independent of the
+                // optional general-memory disclosure surface.
+                "prompt_read",
+                // Prompt-rooted work recovery is equally invariant and
+                // always present, even before any artifact has been written.
+                "artifact_read",
                 // #725: advertised ALWAYS (a discovery tool must always be
                 // present), so it too joins the base set with every flag off.
                 "tool_search",
@@ -3335,6 +3896,7 @@ mod tests {
         }
         for infra in [
             "resume_context",
+            "prompt_read",
             "tool_search",
             "get_context_remaining",
             "request_user_input",
@@ -3366,6 +3928,53 @@ mod tests {
         assert!(
             !persona_tool_allowed("delete_file", &allow),
             "unlisted non-infra → denied"
+        );
+    }
+
+    /// Prompt disposition is an independent, fail-closed catalog boundary:
+    /// non-Act turns retain only explicit read/recovery tools, so a generic MCP
+    /// name cannot appear merely because its schema was connected to the session.
+    #[test]
+    fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
+        let defs = serde_json::json!([
+            { "type": "function", "function": { "name": "read_file" } },
+            { "type": "function", "function": { "name": "write_file" } },
+            { "type": "function", "function": { "name": "run_command" } },
+            { "type": "function", "function": { "name": "request_permissions" } },
+            { "type": "function", "function": { "name": "incident__read" } },
+            { "not": "a callable definition" }
+        ]);
+        let names = |defs: &serde_json::Value| {
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|def| def["function"]["name"].as_str())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+
+        let research = filter_tools_for_disposition(defs.clone(), PromptDisposition::Research);
+        assert_eq!(names(&research), vec!["read_file"]);
+        assert!(tool_allowed(PromptDisposition::Explain, "read_file"));
+        assert!(!tool_allowed(PromptDisposition::Explain, "write_file"));
+        assert!(!tool_allowed(PromptDisposition::Research, "incident__read"));
+        assert!(!tool_allowed(PromptDisposition::Ask, "read_file"));
+        assert!(tool_allowed(PromptDisposition::Act, "incident__write"));
+        assert_eq!(
+            filter_tools_for_disposition(
+                serde_json::json!({ "not": "a catalog" }),
+                PromptDisposition::Research
+            ),
+            serde_json::json!([]),
+            "a non-Act catalog with no enumerable tool names must fail closed"
+        );
+
+        // Act is the compatibility/default path: it preserves definitions,
+        // including an opaque extension definition the disposition filter cannot
+        // classify by name.
+        assert_eq!(
+            filter_tools_for_disposition(defs.clone(), PromptDisposition::Act),
+            defs
         );
     }
 
@@ -4293,6 +4902,69 @@ mod tests {
         );
     }
 
+    /// The file tools retain the lexical OCAP residual above, but their
+    /// provenance hook must fail closed so it never labels an outside target as
+    /// a workspace artifact.
+    #[cfg(unix)]
+    #[test]
+    fn artifact_provenance_rejects_physical_symlink_escapes() {
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("existing"), b"x").unwrap();
+        let ws = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        assert!(artifact_path_is_physically_within_workspace(
+            ws.path(),
+            &ws.path().join("new/leaf.txt")
+        ));
+        assert!(!artifact_path_is_physically_within_workspace(
+            ws.path(),
+            &ws.path().join("link/existing")
+        ));
+        assert!(!artifact_path_is_physically_within_workspace(
+            ws.path(),
+            &ws.path().join("link/new-file")
+        ));
+
+        std::os::unix::fs::symlink(outside.path().join("missing"), ws.path().join("dangling"))
+            .unwrap();
+        assert!(!artifact_path_is_physically_within_workspace(
+            ws.path(),
+            &ws.path().join("dangling")
+        ));
+    }
+
+    #[test]
+    fn artifact_file_streaming_hash_and_postcondition_are_exact() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let bytes = vec![0x5a; 3 * 64 * 1024 + 17];
+        let path = ws.path().join("large.bin");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            artifact_preimage_state(&path, true),
+            super::super::artifact_hooks::ArtifactFileState::from_bytes(&bytes)
+        );
+        assert!(artifact_file_matches(&path, &bytes).unwrap());
+        let mut different = bytes.clone();
+        different[64 * 1024] ^= 1;
+        assert!(!artifact_file_matches(&path, &different).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_preimage_never_opens_non_regular_files() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let socket = ws.path().join("local.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(
+            artifact_preimage_state(&socket, true),
+            super::super::artifact_hooks::ArtifactFileState::unavailable(
+                "preimage_not_regular_file"
+            )
+        );
+    }
+
     // --- PR4: the `git` tool is presence-gated -----------------------------
 
     #[test]
@@ -4678,7 +5350,11 @@ mod tests {
 mod execute_tool_branch_tests {
     use super::super::NoMcp;
     use super::*;
+    use crate::agentic::{ArtifactReadContext, ArtifactReadRecord, PromptArtifactSink};
+    use crate::artifact::{ArtifactId, ArtifactKind, NewPromptArtifact};
     use crate::caveats::{Caveats, CountBound, Scope};
+    use crate::PromptId;
+    use std::sync::Mutex;
 
     /// fs read everywhere, fs write scoped to the workspace (skips the y/N
     /// confirm — the scoped preset is the consent), nothing else.
@@ -4691,6 +5367,96 @@ mod execute_tool_branch_tests {
             max_calls: CountBound::Unlimited,
             valid_for_generation: Scope::All,
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingArtifactSink {
+        artifacts: Mutex<Vec<NewPromptArtifact>>,
+    }
+
+    impl RecordingArtifactSink {
+        fn only_artifact(&self) -> NewPromptArtifact {
+            let artifacts = self.artifacts.lock().unwrap();
+            assert_eq!(artifacts.len(), 1, "expected exactly one artifact");
+            artifacts[0].clone()
+        }
+
+        #[cfg(unix)]
+        fn is_empty(&self) -> bool {
+            self.artifacts.lock().unwrap().is_empty()
+        }
+    }
+
+    impl PromptArtifactSink for RecordingArtifactSink {
+        fn append_artifact(
+            &self,
+            originating_prompt_id: PromptId,
+            objective_root_id: PromptId,
+            artifact: NewPromptArtifact,
+        ) -> anyhow::Result<ArtifactReadRecord> {
+            let mut artifacts = self.artifacts.lock().unwrap();
+            artifacts.push(artifact.clone());
+            Ok(ArtifactReadRecord {
+                id: ArtifactId::new(),
+                prompt_id: originating_prompt_id,
+                root_prompt_id: objective_root_id,
+                writer_fingerprint: "tool-test".to_string(),
+                seq: artifacts.len() as u64,
+                prev_hash: "previous".to_string(),
+                kind: format!("{:?}", artifact.kind()),
+                relation: format!("{:?}", artifact.relation()),
+                locator: artifact.locator().map(str::to_string),
+                body: artifact.body().map(str::to_string),
+                metadata: artifact.metadata().clone(),
+                ts_claim: 1,
+                artifact_hash: "hash".to_string(),
+            })
+        }
+    }
+
+    fn artifact_context() -> ArtifactReadContext<'static> {
+        let prompt = PromptId::new();
+        ArtifactReadContext::new(Some(prompt), Some(prompt), Some(prompt), None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_artifact_tool(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        build_check: Option<&str>,
+        sink: &RecordingArtifactSink,
+    ) -> String {
+        execute_tool_with_offload_and_prompt_and_artifacts(
+            name,
+            &args,
+            &ws.to_string_lossy(),
+            false,
+            20,
+            caveats,
+            &mut NoMcp,
+            build_check,
+            None, // note_sink
+            None, // recall_source
+            None, // memory_source
+            None, // prompt_context
+            Some(artifact_context()),
+            Some(sink),
+            None,  // permission_gate
+            None,  // exec_floor
+            None,  // git_tool
+            None,  // crew_runner
+            None,  // scratchpad_store
+            None,  // code_search
+            None,  // experience_store
+            None,  // step_ledger
+            false, // tool_offload
+            None,  // spill_store
+            None,  // persona_tools
+            PromptDisposition::Act,
+        )
+        .await
     }
 
     // --- PR4: the `git` tool arm in execute_tool ---------------------------
@@ -5650,6 +6416,164 @@ mod execute_tool_branch_tests {
     }
 
     #[tokio::test]
+    async fn delete_file_records_digest_to_absent_transition() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let original = b"retired implementation\n";
+        std::fs::write(ws.path().join("old.rs"), original).unwrap();
+        let sink = RecordingArtifactSink::default();
+
+        let out = run_artifact_tool(
+            "delete_file",
+            serde_json::json!({"path": "old.rs"}),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            None,
+            &sink,
+        )
+        .await;
+
+        assert!(out.starts_with("deleted old.rs"), "got: {out}");
+        let artifact = sink.only_artifact();
+        assert_eq!(artifact.kind(), ArtifactKind::FileChange);
+        assert_eq!(artifact.locator(), Some("old.rs"));
+        assert_eq!(artifact.metadata()["operation"], "delete_file");
+        assert_eq!(artifact.metadata()["before"]["available"], true);
+        assert_eq!(artifact.metadata()["before"]["exists"], true);
+        assert_eq!(
+            artifact.metadata()["before"]["digest"],
+            blake3::hash(original).to_hex().to_string()
+        );
+        assert_eq!(artifact.metadata()["after"]["available"], true);
+        assert_eq!(artifact.metadata()["after"]["exists"], false);
+        assert!(artifact.metadata()["after"]["digest"].is_null());
+    }
+
+    #[tokio::test]
+    async fn write_only_authority_does_not_record_a_preimage_digest() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let original = b"secret preimage\n";
+        let replacement = b"public result\n";
+        std::fs::write(ws.path().join("state.txt"), original).unwrap();
+        let caveats = Caveats {
+            fs_read: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let sink = RecordingArtifactSink::default();
+
+        let out = run_artifact_tool(
+            "write_file",
+            serde_json::json!({
+                "path": "state.txt",
+                "content": std::str::from_utf8(replacement).unwrap(),
+            }),
+            ws.path(),
+            &caveats,
+            None,
+            &sink,
+        )
+        .await;
+
+        assert!(out.starts_with("wrote state.txt"), "got: {out}");
+        let artifact = sink.only_artifact();
+        assert_eq!(artifact.metadata()["before"]["available"], false);
+        assert_eq!(
+            artifact.metadata()["before"]["reason"],
+            "fs_read_not_granted"
+        );
+        assert!(artifact.metadata()["before"].get("digest").is_none());
+        assert_eq!(
+            artifact.metadata()["after"]["digest"],
+            blake3::hash(replacement).to_hex().to_string()
+        );
+        assert!(
+            !artifact
+                .metadata()
+                .to_string()
+                .contains(&blake3::hash(original).to_hex().to_string()),
+            "the preimage digest must not become a persistent read oracle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_check_mutation_is_not_recorded_as_the_governed_write_postimage() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let governed = b"governed bytes\n";
+        let build_hook = b"build-hook bytes\n";
+        let sink = RecordingArtifactSink::default();
+
+        let out = run_artifact_tool(
+            "write_file",
+            serde_json::json!({
+                "path": "target.txt",
+                "content": std::str::from_utf8(governed).unwrap(),
+            }),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            Some("printf 'build-hook bytes\\n' > target.txt"),
+            &sink,
+        )
+        .await;
+
+        assert!(out.contains("build check passed"), "got: {out}");
+        assert_eq!(
+            std::fs::read(ws.path().join("target.txt")).unwrap(),
+            build_hook
+        );
+        let artifact = sink.only_artifact();
+        assert_eq!(artifact.metadata()["operation"], "write_file");
+        assert_eq!(
+            artifact.metadata()["after"]["digest"],
+            blake3::hash(governed).to_hex().to_string(),
+            "the artifact must describe the tool's immediate verified write"
+        );
+        assert_ne!(
+            artifact.metadata()["after"]["digest"],
+            blake3::hash(build_hook).to_hex().to_string(),
+            "a later build hook mutation must not be attributed to write_file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn physical_symlink_escape_mutates_under_existing_policy_but_emits_no_artifact() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("target.txt"), "outside before\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+        let sink = RecordingArtifactSink::default();
+
+        let out = run_artifact_tool(
+            "write_file",
+            serde_json::json!({
+                "path": "link/target.txt",
+                "content": "outside after\n",
+            }),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            None,
+            &sink,
+        )
+        .await;
+
+        assert!(out.starts_with("wrote link/target.txt"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("target.txt")).unwrap(),
+            "outside after\n",
+            "this pins the existing lexical mutation policy"
+        );
+        assert!(
+            out.contains("no file-change artifact was recorded")
+                && out.contains("physical path could not be proven inside the workspace"),
+            "the physical escape must be surfaced honestly: {out}"
+        );
+        assert!(
+            sink.is_empty(),
+            "an out-of-workspace mutation must not be claimed as a workspace artifact"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_file_denies_missing_files_directories_and_fs_write_misses() {
         let ws = tempfile::TempDir::new().unwrap();
         std::fs::write(ws.path().join("secret.txt"), "x").unwrap();
@@ -6212,6 +7136,176 @@ mod execute_tool_branch_tests {
             persona_tools,
         )
         .await
+    }
+
+    /// Directly exercise the disposition-aware dispatcher. Unlike
+    /// [`execute_tool_with_offload`], this reaches the new required boundary
+    /// argument while fixing all unrelated optional seams to their inert shape.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_tool_with_disposition(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        mcp: &mut dyn McpTools,
+        gate: Option<&mut MockGate>,
+        disposition: PromptDisposition,
+    ) -> String {
+        let gate = gate.map(|gate| gate as &mut dyn PermissionGate);
+        execute_tool_with_offload_and_prompt_and_artifacts(
+            name,
+            &args,
+            &ws.to_string_lossy(),
+            false,
+            20,
+            caveats,
+            mcp,
+            None, // build_check_cmd
+            None, // note_sink
+            None, // recall_source
+            None, // memory_source
+            None, // prompt_context
+            None, // artifact_context
+            None, // artifact_sink
+            gate,
+            None,  // exec_floor
+            None,  // git_tool
+            None,  // crew_runner
+            None,  // scratchpad_store
+            None,  // code_search
+            None,  // experience_store
+            None,  // step_ledger
+            false, // tool_offload
+            None,  // spill_store
+            None,  // persona_tools
+            disposition,
+        )
+        .await
+    }
+
+    /// A non-Act disposition is an executor boundary, not just a reduced tool
+    /// schema: fabricated mutations, exec, capability requests, and remote MCP
+    /// calls must be refused before they reach their own dispatch logic.
+    #[tokio::test]
+    async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top(); // prove disposition wins over ambient authority
+
+        let mut no_mcp = NoMcp;
+        let write = run_tool_with_disposition(
+            "write_file",
+            serde_json::json!({ "path": "must-not-write.txt", "content": "no" }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(write.contains("current prompt disposition"), "got: {write}");
+        assert!(
+            !ws.path().join("must-not-write.txt").exists(),
+            "disposition rejection must precede the write handler"
+        );
+
+        let exec = run_tool_with_disposition(
+            "run_command",
+            serde_json::json!({ "command": "touch must-not-exec.txt" }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            PromptDisposition::Explain,
+        )
+        .await;
+        assert!(exec.contains("current prompt disposition"), "got: {exec}");
+        assert!(
+            !ws.path().join("must-not-exec.txt").exists(),
+            "disposition rejection must precede the shell handler"
+        );
+
+        let mut gate = MockGate::new(true, &caveats);
+        let grant = run_tool_with_disposition(
+            "request_permissions",
+            serde_json::json!({
+                "capability": "fs_write",
+                "target": "/tmp/should-not-be-granted",
+                "reason": "test",
+            }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            Some(&mut gate),
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(grant.contains("current prompt disposition"), "got: {grant}");
+        assert!(
+            gate.asks.is_empty(),
+            "non-Act must not consult a grant gate"
+        );
+
+        let mut mcp = OneRemoteTool::new("incident__read");
+        let remote = run_tool_with_disposition(
+            "incident__read",
+            serde_json::json!({}),
+            ws.path(),
+            &caveats,
+            &mut mcp,
+            None,
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(
+            remote.contains("current prompt disposition"),
+            "got: {remote}"
+        );
+        assert!(
+            !mcp.called,
+            "generic MCP must be denied before remote routing in non-Act"
+        );
+
+        std::fs::write(ws.path().join("evidence.txt"), "durable evidence\n").unwrap();
+        let read = run_tool_with_disposition(
+            "read_file",
+            serde_json::json!({ "path": "evidence.txt" }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(
+            read.contains("durable evidence"),
+            "safe read must remain usable: {read}"
+        );
+    }
+
+    /// Permitted non-Act reads still honor their caveats, but they must not
+    /// silently turn a denial into an interactive authority grant.
+    #[tokio::test]
+    async fn non_act_read_tools_do_not_consult_permission_gate() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut caveats = Caveats::top();
+        caveats.net = crate::caveats::Scope::none();
+        let mut gate = MockGate::new(true, &caveats);
+        let mut mcp = NoMcp;
+
+        let _ = run_tool_with_disposition(
+            "web_fetch",
+            serde_json::json!({ "url": "https://example.com" }),
+            ws.path(),
+            &caveats,
+            &mut mcp,
+            Some(&mut gate),
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(
+            gate.asks.is_empty(),
+            "a non-Act web read may be caveat-denied but must never mint net authority"
+        );
     }
 
     /// FR-2 (#1001): a remote MCP tool OUTSIDE the persona's allow-list is

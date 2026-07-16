@@ -183,7 +183,7 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
         "coach altitude installs COACH_SOUL"
     );
     assert!(
-        !prompt.contains("Never describe a code change"),
+        !prompt.contains("On an `act` turn, never describe a code change"),
         "coach altitude REPLACES the doer soul, it does not append to it"
     );
     assert!(
@@ -199,7 +199,7 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
         Some(&doer),
         "test-plan.md",
     );
-    assert!(doer_prompt.contains("Never describe a code change"));
+    assert!(doer_prompt.contains("On an `act` turn, never describe a code change"));
     assert!(!doer_prompt.contains("COACH mode"));
 }
 
@@ -1685,6 +1685,38 @@ fn save_successful_turn_creates_and_reuses_active_conversation() {
     assert_eq!(record.turns[1].events, events);
 }
 
+#[test]
+fn partial_ancillary_save_keeps_reply_durable_and_reports_its_true_state() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let store = newt_core::ConversationStore::new(tmp.path(), workspace.path(), 100).unwrap();
+    let id = newt_core::new_conversation_id();
+
+    let state = save_successful_conversation_turn_with_ancillary(
+        &store,
+        &id,
+        None,
+        "persist the reply",
+        "reply is durable",
+        &[],
+        &[],
+        None,
+        None,
+        &std::collections::BTreeMap::new(),
+        &newt_core::PlanSnapshot::default(),
+        |_, _, _, _| Err(anyhow::anyhow!("injected ancillary failure")),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        state,
+        TurnSaveState::DurableWithAncillaryWarning(_)
+    ));
+    let record = store.load(&id).unwrap();
+    assert_eq!(record.turns.len(), 1);
+    assert_eq!(record.turns[0].assistant, "reply is durable");
+}
+
 /// #713: the per-turn save path threads the live scratchpad `<state>`
 /// snapshot onto the conversation row, so `store.load()` reads it back —
 /// the durable half of the resume fix (the restore half re-hydrates it).
@@ -1747,6 +1779,14 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
     let state = tmp.path().join("state");
     let store = newt_core::ConversationStore::new(&state, &workspace, 100).unwrap();
     let id = store.create("Saved work", Some("reviewer")).unwrap();
+    let saved_prompt = store
+        .begin_prompt(
+            &id,
+            "Saved work",
+            Some("reviewer"),
+            newt_core::NewPrompt::operator(b"saved task".to_vec(), b"saved task".to_vec()),
+        )
+        .unwrap();
     store.append_turn(&id, "saved task", "saved reply").unwrap();
 
     let persona_dir = tmp.path().join("personas");
@@ -1769,6 +1809,7 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
     compress_state.latch_disabled_for_tests();
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
     let mut conversation_ctx = ConversationCommandContext {
         store: &store,
         persona_store: &persona_store,
@@ -1780,6 +1821,7 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
         compress_state: &mut compress_state,
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
     };
 
     let message = handle_conversation_command(
@@ -1795,6 +1837,14 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
     assert!(message.contains("Restored conversation"));
     assert_eq!(active_conversation_id, id);
     assert_eq!(
+        active_prompt_context
+            .as_ref()
+            .expect("restore rehydrates prompt metadata without executing it")
+            .submitted_prompt()
+            .id(),
+        saved_prompt.submitted_prompt().id()
+    );
+    assert_eq!(
         active_persona.as_ref().map(|p| p.name.as_str()),
         Some("reviewer")
     );
@@ -1803,6 +1853,101 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
     assert!(!messages.iter().any(|m| m.content == "old task"));
     assert!(messages.iter().any(|m| m.content == "saved task"));
     assert!(messages.iter().any(|m| m.content == "saved reply"));
+}
+
+#[tokio::test]
+async fn prompt_only_restore_rehydrates_receipt_without_replaying_it_as_input() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let state = tmp.path().join("state");
+    let id = newt_core::new_conversation_id();
+    let accepted_id = {
+        let store = newt_core::ConversationStore::new(&state, &workspace, 100).unwrap();
+        let accepted = store
+            .begin_prompt(
+                &id,
+                "unfinished accepted prompt",
+                None,
+                newt_core::NewPrompt::operator(
+                    b"unfinished accepted prompt".to_vec(),
+                    b"unfinished accepted prompt".to_vec(),
+                ),
+            )
+            .unwrap();
+        assert!(store.load(&id).unwrap().turns.is_empty());
+        accepted.submitted_prompt().id()
+    };
+
+    // A new store instance models a process restart. The receipt must rehydrate
+    // as metadata, without appearing in presentation history or running itself.
+    let store = newt_core::ConversationStore::new(&state, &workspace, 100).unwrap();
+
+    let persona_store = PersonaStore::new(tmp.path().join("personas"));
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::RollingWindow::new(5));
+    let workspace_str = workspace.to_str().unwrap();
+    let mut system = rebuild_system_prompt(workspace_str, &memory, None, "fresh-session");
+    let mut active_persona = None;
+    let mut active_conversation_id = newt_core::new_conversation_id();
+    let mut compress_state = newt_core::CompressState::new();
+    let scratchpad_store = newt_core::SessionScratchpadStore::default();
+    let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
+    let mut ctx = ConversationCommandContext {
+        store: &store,
+        persona_store: &persona_store,
+        workspace: workspace_str,
+        memory: &mut memory,
+        system: &mut system,
+        active_persona: &mut active_persona,
+        active_conversation_id: &mut active_conversation_id,
+        compress_state: &mut compress_state,
+        scratchpad: &scratchpad_store,
+        step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
+    };
+
+    resume_exact_conversation(&mut ctx, &id).unwrap();
+
+    assert_eq!(
+        active_prompt_context
+            .as_ref()
+            .expect("prompt metadata rehydrated")
+            .submitted_prompt()
+            .id(),
+        accepted_id
+    );
+    let messages = memory.build_messages(&system, "a new operator prompt");
+    assert!(messages
+        .iter()
+        .any(|m| m.content == "a new operator prompt"));
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m.content == "unfinished accepted prompt"),
+        "restore must not replay or auto-execute a prompt-only receipt"
+    );
+
+    // Once the operator submits a new prompt, normal durable ingress creates a
+    // chronological link to the restored prompt. The model-facing card/tool
+    // tests in newt-core pin how that handle is surfaced and dereferenced.
+    let continued = store
+        .begin_prompt(
+            &id,
+            "ignored on an existing conversation",
+            None,
+            newt_core::NewPrompt::operator("continue", "continue"),
+        )
+        .unwrap();
+    assert_eq!(
+        continued.submitted().receipt().previous_prompt_id(),
+        Some(accepted_id)
+    );
+    assert!(
+        store.load(&id).unwrap().turns.is_empty(),
+        "accepting the follow-up must not synthesize or replay a completed turn"
+    );
 }
 
 // -- 17.7: auto-resume, --ephemeral, NEWT_CONVERSATION_ID (#246) ---------
@@ -1897,6 +2042,7 @@ async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
     let mut compress_state = newt_core::CompressState::new();
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
         store: &store,
         persona_store: &persona_store,
@@ -1908,6 +2054,7 @@ async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
         compress_state: &mut compress_state,
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
     };
 
     let banner = auto_resume_latest(&mut ctx).unwrap().expect("a banner");
@@ -1942,6 +2089,7 @@ fn auto_resume_empty_workspace_is_silent_fresh_start() {
     let mut compress_state = newt_core::CompressState::new();
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
         store: &store,
         persona_store: &persona_store,
@@ -1953,6 +2101,7 @@ fn auto_resume_empty_workspace_is_silent_fresh_start() {
         compress_state: &mut compress_state,
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
     };
 
     assert_eq!(auto_resume_latest(&mut ctx).unwrap(), None);
@@ -1981,6 +2130,7 @@ async fn resume_exact_restores_that_conversation() {
     let mut compress_state = newt_core::CompressState::new();
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
         store: &store,
         persona_store: &persona_store,
@@ -1992,6 +2142,7 @@ async fn resume_exact_restores_that_conversation() {
         compress_state: &mut compress_state,
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &target).unwrap();
@@ -2029,6 +2180,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
     let mut compress_state = newt_core::CompressState::new();
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
     // A stale key from a "prior conversation" the boundary must drop.
     scratchpad_store.set("stale", "from before".to_string());
     let mut ctx = ConversationCommandContext {
@@ -2042,6 +2194,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
         compress_state: &mut compress_state,
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -2098,6 +2251,7 @@ async fn resume_rehydrates_plan_into_live_ledger() {
     let mut compress_state = newt_core::CompressState::new();
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
     // A stale plan from a "prior conversation" the boundary must drop.
     step_ledger.set_plan(&["stale step".to_string()]);
     let mut ctx = ConversationCommandContext {
@@ -2111,6 +2265,7 @@ async fn resume_rehydrates_plan_into_live_ledger() {
         compress_state: &mut compress_state,
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -2154,6 +2309,7 @@ fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
     let mut compress_state = newt_core::CompressState::new();
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
         store: &store,
         persona_store: &persona_store,
@@ -2165,6 +2321,7 @@ fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
         compress_state: &mut compress_state,
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
     };
 
     for id in [newt_core::new_conversation_id(), foreign_id] {
@@ -2372,7 +2529,10 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
 
     // Live session: Summarizing provider with a stub summarizer.
     let mut memory = newt_core::MemoryManager::new();
-    memory.add_provider(newt_core::Summarizing::new(100).with_summarizer(
+    // Leave enough room for the irreducible active-prompt metadata + exact
+    // user pair. A smaller authoritative budget must refuse compression
+    // rather than summarize either half of that pair.
+    memory.add_provider(newt_core::Summarizing::new(512).with_summarizer(
         |_req: String| -> newt_core::SummarizeFuture {
             Box::pin(async { Ok("FACTS FROM THE COMPRESSED MIDDLE".to_string()) })
         },
@@ -2400,7 +2560,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
         .unwrap();
     }
     // The over-budget turn mints the compaction record during sync.
-    memory.sync_all("final task", &big, &metrics(120)).await;
+    memory.sync_all("final task", &big, &metrics(600)).await;
     let record = memory.take_compaction_record();
     assert!(record.is_some(), "compression must mint a record");
     save_successful_conversation_turn(
@@ -2412,7 +2572,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
         &[],
         &[],
         Some(newt_core::TokenUsage {
-            input_tokens: 120,
+            input_tokens: 600,
             output_tokens: 9,
         }),
         record,
@@ -2425,7 +2585,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
     // restore must never need one).
     let persona_store = PersonaStore::new(tmp.path().join("personas"));
     let mut memory2 = newt_core::MemoryManager::new();
-    memory2.add_provider(newt_core::Summarizing::new(100));
+    memory2.add_provider(newt_core::Summarizing::new(512));
     let workspace_str = workspace.to_str().unwrap();
     let mut system = rebuild_system_prompt(workspace_str, &memory2, None, "test-session");
     let mut active_persona = None;
@@ -2433,6 +2593,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
     let mut compress_state = newt_core::CompressState::new();
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
         store: &store,
         persona_store: &persona_store,
@@ -2444,6 +2605,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
         compress_state: &mut compress_state,
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
     };
     handle_conversation_command(&format!("/conversation restore {id}"), &mut ctx).unwrap();
 

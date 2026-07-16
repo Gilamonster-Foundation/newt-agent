@@ -483,15 +483,18 @@ async fn summarizing_provider_delegates_through_loop_summarizer() {
         .await;
 
     let mut memory = newt_core::MemoryManager::new();
+    // Leave enough room for the irreducible active-prompt metadata + exact
+    // user pair. A smaller authoritative budget must refuse compression
+    // rather than summarize either half of that pair.
     memory.add_provider(
-        newt_core::Summarizing::new(100).with_summarizer(make_loop_summarizer(
+        newt_core::Summarizing::new(512).with_summarizer(make_loop_summarizer(
             server.uri(),
             "test-model".into(),
             newt_core::BackendKind::Ollama,
             None,
             None,
             SummarizerOpts {
-                num_ctx: Some(100),
+                num_ctx: Some(512),
                 ..Default::default()
             },
         )),
@@ -510,7 +513,7 @@ async fn summarizing_provider_delegates_through_loop_summarizer() {
             .await;
     }
     assert!(bodies.lock().unwrap().is_empty(), "under budget — no calls");
-    memory.sync_all("final task", &big, &metrics(120)).await;
+    memory.sync_all("final task", &big, &metrics(600)).await;
 
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 1, "exactly one summarizer call");
