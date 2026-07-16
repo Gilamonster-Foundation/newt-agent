@@ -49,6 +49,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         connect_timeout_secs: 5,
         inference_timeout_secs: 30,
         mid_loop_trim_threshold: 40,
+        compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
         mid_loop_trim_tokens: None,
         max_ok_input: None,
         build_check_cmd: None,
@@ -224,6 +225,164 @@ impl Respond for AutomaticCheckpointResponder {
     }
 }
 
+/// A normal final-response mock that records whether the request retained the
+/// immutable active prompt or was transformed by the compressor. It lets the
+/// regression prove the default policy does not summarize a roomy, known
+/// context merely because its message count crossed the legacy threshold.
+struct HeadroomRetentionResponder {
+    active_prompt_seen: Arc<AtomicBool>,
+    compaction_marker_seen: Arc<AtomicBool>,
+}
+
+impl Respond for HeadroomRetentionResponder {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body = body_json(req);
+        self.active_prompt_seen
+            .fetch_or(request_contains(&body, TASK), Ordering::SeqCst);
+        self.compaction_marker_seen
+            .fetch_or(request_contains(&body, SUMMARY_PREFIX), Ordering::SeqCst);
+        if is_stream(req) {
+            ndjson(&[serde_json::json!({
+                "message": {"content": "headroom retained the active prompt"},
+                "done": true,
+                "prompt_eval_count": 100,
+                "eval_count": 4,
+            })])
+        } else {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": "headroom retained the active prompt"},
+                "prompt_eval_count": 100,
+                "eval_count": 4,
+            }))
+        }
+    }
+}
+
+#[tokio::test]
+async fn headroom_aware_policy_defers_count_only_compaction_for_known_roomy_window() {
+    let server = MockServer::start().await;
+    let active_prompt_seen = Arc::new(AtomicBool::new(false));
+    let compaction_marker_seen = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(HeadroomRetentionResponder {
+            active_prompt_seen: active_prompt_seen.clone(),
+            compaction_marker_seen: compaction_marker_seen.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = automatic_compaction_messages();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let turn =
+        crate::TurnPromptContext::ephemeral_operator("headroom-aware-count-deferral", TASK, TASK);
+    let artifacts = SessionArtifactStore::new("headroom-aware-count-deferral").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let summarizer = canned_summarizer(calls.clone());
+    let mut compress_state = CompressState::new();
+    let mut c = ctx(&uri, &messages, &caveats);
+    // Count exceeds this deliberately low legacy threshold, but the known
+    // one-million-token window leaves ample headroom. The default policy must
+    // retain the original active prompt and skip artifact creation entirely.
+    c.mid_loop_trim_threshold = 20;
+    c.safe_context = Some(1_000_000);
+    c.summarizer = Some(&*summarizer);
+    c.compress_state = Some(&mut compress_state);
+
+    let (reply, _, _, _) = chat_complete_with_prompt_and_artifacts(
+        c,
+        Some(&turn),
+        None,
+        Some(&artifacts),
+        Some(&artifacts),
+        &mut NoMcp,
+    )
+    .await
+    .expect("roomy count-only loop succeeds");
+
+    assert_eq!(reply, "headroom retained the active prompt");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no summarizer invocation");
+    assert!(active_prompt_seen.load(Ordering::SeqCst));
+    assert!(
+        !compaction_marker_seen.load(Ordering::SeqCst),
+        "a count-only deferral must not install a compaction summary"
+    );
+    assert_eq!(
+        artifacts
+            .list_for_root(turn.active_operator_prompt().root_prompt_id(), 0, 10)
+            .unwrap()
+            .total,
+        0,
+        "a deferred decision is not an artifact-worthy transformation"
+    );
+}
+
+#[tokio::test]
+async fn legacy_message_count_policy_still_compacts_under_the_same_roomy_window() {
+    let server = MockServer::start().await;
+    let marker_seen = Arc::new(AtomicBool::new(true));
+    let requests = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(AutomaticCheckpointResponder {
+            marker_seen: marker_seen.clone(),
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = automatic_compaction_messages();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let turn =
+        crate::TurnPromptContext::ephemeral_operator("legacy-message-count-policy", TASK, TASK);
+    let artifacts = SessionArtifactStore::new("legacy-message-count-policy").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let summarizer = canned_summarizer(calls.clone());
+    let mut compress_state = CompressState::new();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.mid_loop_trim_threshold = 20;
+    c.compaction_trigger_policy = crate::CompactionTriggerPolicy::MessageCount;
+    c.safe_context = Some(1_000_000);
+    c.summarizer = Some(&*summarizer);
+    c.compress_state = Some(&mut compress_state);
+
+    let (reply, _, _, _) = chat_complete_with_prompt_and_artifacts(
+        c,
+        Some(&turn),
+        None,
+        Some(&artifacts),
+        Some(&artifacts),
+        &mut NoMcp,
+    )
+    .await
+    .expect("legacy count-only loop succeeds");
+
+    assert_eq!(reply, "automatic checkpoint complete");
+    assert!(calls.load(Ordering::SeqCst) >= 1);
+    assert!(marker_seen.load(Ordering::SeqCst));
+    assert!(requests.load(Ordering::SeqCst) >= 1);
+    assert_one_checkpoint(&artifacts, &turn, "summarized", "automatic_message_count");
+    let page = artifacts
+        .list_for_root(turn.active_operator_prompt().root_prompt_id(), 0, 10)
+        .unwrap();
+    let checkpoint = page
+        .records
+        .iter()
+        .find(|record| record.kind == "compaction_checkpoint")
+        .unwrap();
+    assert_eq!(checkpoint.metadata["trigger"]["policy"], "message_count");
+    assert_eq!(
+        checkpoint.metadata["trigger"]["primary_cause"],
+        "message_count"
+    );
+    assert_eq!(
+        checkpoint.metadata["trigger"]["send_budget_authoritative"],
+        true
+    );
+}
+
 #[tokio::test]
 async fn automatic_compaction_records_one_checkpoint_after_installing_summary() {
     let server = MockServer::start().await;
@@ -274,7 +433,28 @@ async fn automatic_compaction_records_one_checkpoint_after_installing_summary() 
         "the provider must observe the installed summary marker on the transformed request"
     );
     assert!(requests.load(Ordering::SeqCst) >= 1);
-    assert_one_checkpoint(&artifacts, &turn, "summarized", "automatic_token_budget");
+    assert_one_checkpoint(&artifacts, &turn, "summarized", "automatic_token_threshold");
+    let page = artifacts
+        .list_for_root(turn.active_operator_prompt().root_prompt_id(), 0, 10)
+        .unwrap();
+    let checkpoint = page
+        .records
+        .iter()
+        .find(|record| record.kind == "compaction_checkpoint")
+        .unwrap();
+    assert!(checkpoint.body.as_deref().unwrap().contains(&format!(
+        "root:{}",
+        turn.active_operator_prompt().root_prompt_id()
+    )));
+    assert_eq!(checkpoint.metadata["trigger"]["policy"], "headroom_aware");
+    assert_eq!(
+        checkpoint.metadata["trigger"]["primary_cause"],
+        "token_threshold"
+    );
+    assert_eq!(
+        checkpoint.metadata["trigger"]["causes"]["token_threshold"],
+        true
+    );
 }
 
 /// First probe + stream are both empty at the synthetic 85%-of-window mark.

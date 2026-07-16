@@ -859,6 +859,50 @@ impl ContextManager {
     }
 }
 
+/// Automatic compaction trigger policy — the `[context]
+/// compaction_trigger_policy` key.
+///
+/// The default is [`HeadroomAware`](Self::HeadroomAware): a message-count
+/// threshold is a fallback when Newt does not know the usable input ceiling,
+/// rather than a reason to compact a roomy, known context window. Explicit
+/// token/send-budget pressure continues to trigger compaction under either
+/// policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTriggerPolicy {
+    /// Defer a count-only compaction when an authoritative input ceiling is
+    /// known. This is the safe default for large-context models.
+    #[default]
+    HeadroomAware,
+    /// Preserve the legacy behavior: compact whenever the message count
+    /// exceeds its threshold, even if authoritative input headroom remains.
+    MessageCount,
+}
+
+impl CompactionTriggerPolicy {
+    /// Parse a CLI/config/command keyword (case-insensitive).
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "headroom_aware" => Some(Self::HeadroomAware),
+            "message_count" => Some(Self::MessageCount),
+            _ => None,
+        }
+    }
+
+    /// The canonical snake-case keyword (round-trips `from_keyword` + serde).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HeadroomAware => "headroom_aware",
+            Self::MessageCount => "message_count",
+        }
+    }
+
+    /// Alias for [`Self::as_str`], matching the existing context selector API.
+    pub const fn keyword(self) -> &'static str {
+        self.as_str()
+    }
+}
+
 /// A composable context-management feature (Phase 26, #588) — an independent
 /// on/off technique under `[context.features]` and the `/context feature <name>
 /// on|off` command. None are implemented yet (`available()` is false for all);
@@ -1079,6 +1123,12 @@ pub struct ContextConfig {
     #[serde(default)]
     pub manager: ContextManager,
 
+    /// Policy for automatic compaction triggers. Default `headroom_aware`:
+    /// message count alone only triggers when Newt lacks an authoritative
+    /// input ceiling; token and send-budget pressure always remain active.
+    #[serde(default)]
+    pub compaction_trigger_policy: CompactionTriggerPolicy,
+
     /// Per-feature overrides under `[context.features]` — each inherits the
     /// `manager` preset's default unless explicitly set (Phase 26, #588).
     #[serde(default)]
@@ -1139,6 +1189,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             manager: ContextManager::default(),
+            compaction_trigger_policy: CompactionTriggerPolicy::default(),
             features: ContextFeatures::default(),
             semantic: SemanticConfig::default(),
             estimation: crate::tokens::TokenEstimation::default(),
@@ -4130,13 +4181,61 @@ mod tests {
     }
 
     #[test]
+    fn compaction_trigger_policy_keyword_roundtrip_and_default() {
+        for policy in [
+            CompactionTriggerPolicy::HeadroomAware,
+            CompactionTriggerPolicy::MessageCount,
+        ] {
+            assert_eq!(
+                CompactionTriggerPolicy::from_keyword(policy.as_str()),
+                Some(policy)
+            );
+            assert_eq!(policy.keyword(), policy.as_str());
+        }
+        assert_eq!(
+            CompactionTriggerPolicy::from_keyword("  MESSAGE_COUNT "),
+            Some(CompactionTriggerPolicy::MessageCount),
+            "case/space-insensitive"
+        );
+        assert_eq!(CompactionTriggerPolicy::from_keyword("nope"), None);
+        assert_eq!(
+            CompactionTriggerPolicy::default(),
+            CompactionTriggerPolicy::HeadroomAware
+        );
+    }
+
+    #[test]
     fn context_section_defaults_and_parses() {
         // Absent [context] → None on Config; the resolver falls back to standard.
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.context.is_none());
-        let c: ContextConfig = toml::from_str("manager = \"progressive\"").unwrap();
+        let c: ContextConfig = toml::from_str(
+            "manager = \"progressive\"\ncompaction_trigger_policy = \"message_count\"",
+        )
+        .unwrap();
         assert_eq!(c.manager, ContextManager::Progressive);
-        assert_eq!(ContextConfig::default().manager, ContextManager::Standard);
+        assert_eq!(
+            c.compaction_trigger_policy,
+            CompactionTriggerPolicy::MessageCount
+        );
+        let defaults = ContextConfig::default();
+        assert_eq!(defaults.manager, ContextManager::Standard);
+        assert_eq!(
+            defaults.compaction_trigger_policy,
+            CompactionTriggerPolicy::HeadroomAware
+        );
+        // Omitting the key uses the serde default rather than requiring every
+        // existing `[context]` configuration to opt in explicitly.
+        let parsed_default: ContextConfig = toml::from_str("manager = \"standard\"").unwrap();
+        assert_eq!(
+            parsed_default.compaction_trigger_policy,
+            CompactionTriggerPolicy::HeadroomAware
+        );
+        assert!(
+            toml::from_str::<ContextConfig>("compaction_trigger_policy = \"not_a_policy\"")
+                .is_err(),
+            "an invalid policy must fail config parsing rather than silently changing safety behavior"
+        );
     }
 
     #[test]

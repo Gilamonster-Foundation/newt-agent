@@ -5866,6 +5866,35 @@ fn context_manager(
         .unwrap_or_default()
 }
 
+/// Resolve the automatic-compaction trigger policy: the interactive-session
+/// override (`/context compaction`) wins over `[context]`, which in turn falls
+/// back to the safe headroom-aware default.
+fn compaction_trigger_policy(
+    cfg: &newt_core::Config,
+    session: Option<newt_core::CompactionTriggerPolicy>,
+) -> newt_core::CompactionTriggerPolicy {
+    session
+        .or_else(|| cfg.context.as_ref().map(|c| c.compaction_trigger_policy))
+        .unwrap_or_default()
+}
+
+/// Human-readable provenance for [`compaction_trigger_policy`]. A present
+/// `[context]` section is the closest provenance the deserialized config can
+/// preserve; TOML does not retain whether an individual defaulted field was
+/// explicitly written.
+fn compaction_trigger_policy_source(
+    cfg: &newt_core::Config,
+    session: Option<newt_core::CompactionTriggerPolicy>,
+) -> &'static str {
+    if session.is_some() {
+        "session"
+    } else if cfg.context.is_some() {
+        "config"
+    } else {
+        "default"
+    }
+}
+
 /// Resolve the effective context-feature set (Step 26.1, #588): the `manager`
 /// preset's base bundle → `[context.features]` config overrides → session
 /// (`/context feature`) overrides.
@@ -5900,6 +5929,16 @@ struct ContextCommandResult {
     /// `/context size <N>` session budget override; `Some(0)` clears it back
     /// to the probed / configured value.
     set_budget: Option<u32>,
+    /// `/context compaction …` mutation. The explicit `Reset` variant keeps a
+    /// reset distinguishable from a command that simply leaves the override
+    /// alone.
+    set_compaction_trigger_policy: Option<CompactionTriggerPolicyOverride>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionTriggerPolicyOverride {
+    Set(newt_core::CompactionTriggerPolicy),
+    Reset,
 }
 
 fn handle_context_feature_arg(
@@ -5956,14 +5995,15 @@ fn handle_context_feature_arg(
     }
 }
 
-/// Dispatch `/context [manager <preset> | feature <name> [on|off]]` against the
-/// current config + session overrides (Step 26.1, #588). `rest` is the text
-/// after `context`. Unavailable presets/features report "not yet available" and
-/// are NOT applied.
+/// Dispatch `/context [manager <preset> | feature <name> [on|off] | compaction
+/// <policy>]` against the current config + session overrides (Step 26.1, #588).
+/// `rest` is the text after `context`. Unavailable presets/features report
+/// "not yet available" and are NOT applied.
 fn handle_context_command(
     rest: &str,
     cfg: &newt_core::Config,
     manager_override: Option<newt_core::ContextManager>,
+    compaction_policy_override: Option<newt_core::CompactionTriggerPolicy>,
     feature_override: &newt_core::ContextFeatures,
     kind: newt_core::BackendKind,
 ) -> ContextCommandResult {
@@ -5971,6 +6011,9 @@ fn handle_context_command(
     let rest = rest.trim();
     let manager = context_manager(cfg, manager_override);
     let features = context_features(cfg, manager, feature_override, kind);
+    let compaction_policy = compaction_trigger_policy(cfg, compaction_policy_override);
+    let compaction_policy_source =
+        compaction_trigger_policy_source(cfg, compaction_policy_override);
     let mgr_src = if manager_override.is_some() {
         "session"
     } else {
@@ -6003,8 +6046,13 @@ fn handle_context_command(
             manager.keyword(),
             feat_summary()
         ));
+        out.lines.push(format!(
+            "compaction trigger policy: {} ({compaction_policy_source})",
+            compaction_policy.keyword()
+        ));
         out.lines.push(
-            "  /context manager <preset>  ·  /context feature <name> [on|off]  ·  /context stats"
+            "  /context manager <preset>  ·  /context feature <name> [on|off]  ·  \
+             /context compaction [headroom_aware|message_count|reset]  ·  /context stats"
                 .to_string(),
         );
     } else if rest == "size" {
@@ -6053,6 +6101,34 @@ fn handle_context_command(
                 name.trim()
             )),
         }
+    } else if rest == "compaction" {
+        out.lines.push(format!(
+            "compaction trigger policy: {} ({compaction_policy_source}) — \
+             use /context compaction headroom_aware|message_count|reset",
+            compaction_policy.keyword()
+        ));
+    } else if let Some(policy) = rest.strip_prefix("compaction ") {
+        let policy = policy.trim();
+        if policy.eq_ignore_ascii_case("reset") {
+            out.set_compaction_trigger_policy = Some(CompactionTriggerPolicyOverride::Reset);
+            let reset_policy = compaction_trigger_policy(cfg, None);
+            let reset_source = compaction_trigger_policy_source(cfg, None);
+            out.lines.push(format!(
+                "compaction trigger policy → {} ({reset_source})",
+                reset_policy.keyword()
+            ));
+        } else if let Some(policy) = newt_core::CompactionTriggerPolicy::from_keyword(policy) {
+            out.set_compaction_trigger_policy = Some(CompactionTriggerPolicyOverride::Set(policy));
+            out.lines.push(format!(
+                "compaction trigger policy → {} (session override)",
+                policy.keyword()
+            ));
+        } else {
+            out.lines.push(format!(
+                "unknown compaction trigger policy '{policy}' — \
+                 use headroom_aware|message_count|reset"
+            ));
+        }
     } else if rest == "feature" || rest == "features" {
         out.lines.push("context features:".to_string());
         for f in ContextFeature::ALL {
@@ -6072,13 +6148,15 @@ fn handle_context_command(
         } else {
             out.lines.push(format!(
                 "unknown /context subcommand '{rest}' — \
-                 use /context [manager <preset> | feature <name> [on|off] | size <N> | show | stats]"
+                 use /context [manager <preset> | feature <name> [on|off] | \
+                 compaction <policy> | size <N> | show | stats]"
             ));
         }
     } else {
         out.lines.push(format!(
             "unknown /context subcommand '{rest}' — \
-             use /context [manager <preset> | feature <name> [on|off] | size <N> | show | stats]"
+             use /context [manager <preset> | feature <name> [on|off] | \
+             compaction <policy> | size <N> | show | stats]"
         ));
     }
     out
@@ -6086,14 +6164,16 @@ fn handle_context_command(
 
 /// Render the `/context stats` experimentation dashboard (Step 26.2, #588).
 /// Composes the live context budget (the 24.5/24.6 gauge state), the
-/// compression counters, and the resolved feature set with per-feature impact.
-/// Pure → unit-testable. `tool_offload_impact` = `(spills, offloaded_chars)`
-/// from the session spill store (Step 26.3); other features instrument as they
-/// land (26.4+).
-#[allow(clippy::too_many_arguments)] // gauge + counters + features + one impact tuple per feature
+/// compression counters, the effective automatic-compaction policy, and the
+/// resolved feature set with per-feature impact. Pure → unit-testable.
+/// `tool_offload_impact` = `(spills, offloaded_chars)` from the session spill
+/// store (Step 26.3); other features instrument as they land (26.4+).
+#[allow(clippy::too_many_arguments)] // gauge + counters + policy + features + one impact tuple per feature
 fn context_stats_text(
     gauge: Option<(u32, u32)>,
     counters: &newt_core::CompressCounters,
+    compaction_policy: newt_core::CompactionTriggerPolicy,
+    compaction_policy_source: &str,
     features: newt_core::ContextFeatureSet,
     tool_offload_impact: Option<(u64, u64)>,
     scratchpad_impact: Option<(u64, u64)>,
@@ -6113,6 +6193,10 @@ fn context_stats_text(
         }
         _ => lines.push("  budget: not yet measured (no completed turn)".to_string()),
     }
+    lines.push(format!(
+        "  automatic compaction: {} ({compaction_policy_source})",
+        compaction_policy.keyword()
+    ));
     // Compression activity — reuse the /memory anti-thrash section verbatim.
     for l in memory_compress_section(counters).lines() {
         lines.push(l.to_string());
@@ -6832,6 +6916,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /context                 - show the active context manager + features",
         "  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)",
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
+        "  /context compaction [headroom_aware|message_count|reset] - set this session's automatic-compaction trigger policy",
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)",
@@ -8789,6 +8874,7 @@ mod tool_round_cap_tests {
                     connect_timeout_secs: 5,
                     inference_timeout_secs: 120,
                     mid_loop_trim_threshold: 40,
+                    compaction_trigger_policy: newt_core::CompactionTriggerPolicy::HeadroomAware,
                     mid_loop_trim_tokens: None,
                     max_ok_input: None,
                     build_check_cmd: None,

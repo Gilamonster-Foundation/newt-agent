@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 
 use super::artifact_read::{ArtifactReadContext, ArtifactReadRecord, PromptArtifactSink};
-use super::compress::CompressAction;
+use super::compress::{CompressAction, CompressTrigger};
 use super::scheduled::{PlanSnapshot, Step, StepStatus, MAX_STEPS, STEP_DESC_CAP};
 use crate::artifact::{ArtifactKind, ArtifactRelation, NewPromptArtifact};
 use crate::{TokenUsage, TurnEndReason};
@@ -274,6 +274,11 @@ fn path_locator(path: &Path) -> Option<String> {
 
 /// Record a context transformation that actually replaced or pruned material.
 /// Fit/refusal/pass-through outcomes are explicitly not checkpoints.
+///
+/// Automatic callers pass their original [`CompressTrigger`] so the artifact
+/// can explain the decision in bounded scalar metadata. Recovery and manual
+/// callers pass `None`; `send_budget_authoritative` is then intentionally
+/// ignored and no automatic-trigger metadata is written.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_compaction_checkpoint(
     sink: &dyn PromptArtifactSink,
@@ -284,6 +289,8 @@ pub(crate) fn record_compaction_checkpoint(
     budget: usize,
     round: usize,
     reason: &str,
+    trigger: Option<&CompressTrigger>,
+    send_budget_authoritative: bool,
 ) -> anyhow::Result<Option<ArtifactReadRecord>> {
     let action = match action {
         CompressAction::Pruned => "pruned",
@@ -294,10 +301,33 @@ pub(crate) fn record_compaction_checkpoint(
         }
     };
     let reason = truncate_chars(reason.trim(), COMPACTION_REASON_CHARS);
+    // A successful checkpoint is necessarily rooted (the append below
+    // validates it too). Put that durable selector in the bounded body so a
+    // recovered artifact makes its objective scope clear without copying any
+    // prompt, message, or tool-result content.
+    let root_selector = context
+        .root_prompt_id()
+        .map(|root| format!("root:{root}"))
+        .unwrap_or_else(|| "root:unavailable".to_string());
     let body = format!(
-        "Context checkpoint: {action}; ~{tokens_before} → ~{tokens_after} tokens against a \
+        "Context checkpoint for {root_selector}: {action}; ~{tokens_before} → ~{tokens_after} tokens against a \
          ~{budget}-token budget at round {round}. Reason: {reason}"
     );
+    let mut metadata = json!({
+        "action": action,
+        "tokens_before": tokens_before,
+        "tokens_after": tokens_after,
+        "tokens_reclaimed": tokens_before.saturating_sub(tokens_after),
+        "budget": budget,
+        "round": round,
+        "reason": reason,
+    });
+    if let Some(trigger) = trigger {
+        // The trigger is deliberately a bounded, scalar-only projection. It
+        // explains why automatic compaction happened without retaining prompt
+        // text, message payloads, tool output, or a mutable context dump.
+        metadata["trigger"] = compaction_trigger_metadata(trigger, send_budget_authoritative);
+    }
     let record = append(
         sink,
         context,
@@ -306,17 +336,37 @@ pub(crate) fn record_compaction_checkpoint(
             ArtifactRelation::Summarizes,
         )
         .with_body(body)
-        .with_metadata(json!({
-            "action": action,
-            "tokens_before": tokens_before,
-            "tokens_after": tokens_after,
-            "tokens_reclaimed": tokens_before.saturating_sub(tokens_after),
-            "budget": budget,
-            "round": round,
-            "reason": reason,
-        })),
+        .with_metadata(metadata),
     )?;
     Ok(Some(record))
+}
+
+/// Bounded decision diagnostics for an automatic compaction checkpoint.
+///
+/// This is intentionally separate from the general checkpoint metadata so
+/// recovery, overflow, and manual callers can pass `None` and retain their
+/// established semantics. The values are all scalar configuration or measured
+/// token/count figures; no model-facing context is copied into the ledger.
+fn compaction_trigger_metadata(
+    trigger: &CompressTrigger,
+    send_budget_authoritative: bool,
+) -> Value {
+    json!({
+        "policy": trigger.policy.as_str(),
+        "message_count": trigger.message_count,
+        "message_count_threshold": trigger.message_count_threshold,
+        "current_tokens": trigger.current_tokens,
+        "token_threshold": trigger.token_threshold,
+        "send_budget": trigger.send_budget,
+        "send_budget_authoritative": send_budget_authoritative,
+        "has_authoritative_headroom": trigger.has_authoritative_headroom,
+        "causes": {
+            "message_count": trigger.count_fired,
+            "token_threshold": trigger.token_fired,
+            "send_budget": trigger.send_budget_fired,
+        },
+        "primary_cause": trigger.primary_cause.as_str(),
+    })
 }
 
 /// Record a completed turn without duplicating the assistant transcript.
@@ -704,6 +754,8 @@ mod tests {
                 80,
                 2,
                 "not transformed",
+                None,
+                false,
             )
             .unwrap()
             .is_none());
@@ -718,8 +770,10 @@ mod tests {
             let sink = RecordingSink::default();
             let (_, _, context) = context();
             let reason = "r".repeat(COMPACTION_REASON_CHARS + 100);
-            record_compaction_checkpoint(&sink, context, action, 1_000, 700, 800, 3, &reason)
-                .unwrap();
+            record_compaction_checkpoint(
+                &sink, context, action, 1_000, 700, 800, 3, &reason, None, false,
+            )
+            .unwrap();
             let artifacts = sink.artifacts();
             assert_eq!(artifacts[0].kind(), ArtifactKind::CompactionCheckpoint);
             assert_eq!(artifacts[0].relation(), ArtifactRelation::Summarizes);
@@ -732,7 +786,61 @@ mod tests {
                 COMPACTION_REASON_CHARS
             );
             assert_eq!(artifacts[0].metadata()["tokens_reclaimed"], 300);
+            assert!(artifacts[0].metadata().get("trigger").is_none());
         }
+    }
+
+    #[test]
+    fn automatic_compaction_checkpoint_records_bounded_trigger_diagnostics() {
+        let sink = RecordingSink::default();
+        let (_, root, context) = context();
+        let trigger = CompressTrigger {
+            budget: 9_500,
+            max_messages: Some(20),
+            hard_budget: true,
+            policy: crate::CompactionTriggerPolicy::HeadroomAware,
+            message_count: 41,
+            message_count_threshold: 40,
+            current_tokens: 10_100,
+            token_threshold: Some(10_000),
+            send_budget: Some(20_000),
+            has_authoritative_headroom: true,
+            count_fired: false,
+            token_fired: true,
+            send_budget_fired: false,
+            primary_cause: super::super::compress::CompressTriggerCause::TokenThreshold,
+        };
+
+        record_compaction_checkpoint(
+            &sink,
+            context,
+            CompressAction::Summarized,
+            12_000,
+            5_000,
+            trigger.budget,
+            4,
+            "automatic_token_threshold",
+            Some(&trigger),
+            true,
+        )
+        .unwrap();
+
+        let artifacts = sink.artifacts();
+        let artifact = &artifacts[0];
+        assert!(artifact.body().unwrap().contains(&format!("root:{root}")));
+        let trigger = &artifact.metadata()["trigger"];
+        assert_eq!(trigger["policy"], "headroom_aware");
+        assert_eq!(trigger["message_count"], 41);
+        assert_eq!(trigger["message_count_threshold"], 40);
+        assert_eq!(trigger["current_tokens"], 10_100);
+        assert_eq!(trigger["token_threshold"], 10_000);
+        assert_eq!(trigger["send_budget"], 20_000);
+        assert_eq!(trigger["send_budget_authoritative"], true);
+        assert_eq!(trigger["has_authoritative_headroom"], true);
+        assert_eq!(trigger["causes"]["message_count"], false);
+        assert_eq!(trigger["causes"]["token_threshold"], true);
+        assert_eq!(trigger["causes"]["send_budget"], false);
+        assert_eq!(trigger["primary_cause"], "token_threshold");
     }
 
     #[test]

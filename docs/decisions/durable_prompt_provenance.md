@@ -175,6 +175,27 @@ The change lands as five reviewable PRs:
 5. **Prompt dispositions:** structured ask decomposition, decision manifests,
    ask/act/explain/research transitions, capability gates, and nudge scoping.
 
+### PR4 compaction-policy contract
+
+`[context].compaction_trigger_policy` defaults to `headroom_aware`. Under this
+policy, a message-count threshold is a fallback only when Newt does not know a
+usable input ceiling. A configured nonzero token threshold, or a nonzero send
+budget backed by a declared/believed/recovered window, is authoritative and
+suppresses a *count-only* checkpoint until genuine token pressure arrives.
+`max_ok_input` by itself remains a proven-good high-water mark, not proof of a
+context window, so it does not suppress the fallback count guard.
+
+`message_count` is an explicit compatibility policy that restores the legacy
+count-only behavior. Neither policy changes hard token/send-budget compression,
+manual `/compress`, recovered context-window 400 handling, silent-overflow
+recovery, or the Responses API's current lack of an automatic compressor.
+
+Every automatic compaction checkpoint records the policy, scalar trigger
+inputs, authoritative-budget state, fired causes, and the selected cause under
+its objective root. The artifact body includes its `root:prompt:<uuid>`
+selector. This audit record never stores prompt text, message payloads, or tool
+output; a deferred count-only decision writes no artifact to avoid ledger spam.
+
 Newt-Agent owns storage, assembly, retrieval, and lifecycle behavior. Backend
 adapters must preserve the active-prompt invariant. TUI code owns capturing raw
 and model-normalized prompt forms. The operator owns retention through existing

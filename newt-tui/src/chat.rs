@@ -358,6 +358,9 @@ pub(crate) fn run_chat(
     // Step 24.8 (#559): per-session context-manager override from
     // `/context manager <name>`. `None` defers to `[context].manager`.
     let mut context_manager_override: Option<newt_core::ContextManager> = None;
+    // Per-session automatic-compaction trigger override from `/context
+    // compaction <policy>`. `None` defers to `[context].compaction_trigger_policy`.
+    let mut compaction_trigger_policy_override: Option<newt_core::CompactionTriggerPolicy> = None;
     // Step 26.1 (#588): per-session context-FEATURE overrides from
     // `/context feature <name> on|off`. Each `None` defers to `[context.features]`
     // then the `manager` preset default.
@@ -1458,6 +1461,12 @@ pub(crate) fn run_chat(
                             // counters), so it's handled here, not in the pure
                             // dispatch helper.
                             let manager = context_manager(&cfg, context_manager_override);
+                            let compaction_policy =
+                                compaction_trigger_policy(&cfg, compaction_trigger_policy_override);
+                            let compaction_policy_source = compaction_trigger_policy_source(
+                                &cfg,
+                                compaction_trigger_policy_override,
+                            );
                             let features = context_features(
                                 &cfg,
                                 manager,
@@ -1494,6 +1503,8 @@ pub(crate) fn run_chat(
                             for line in context_stats_text(
                                 token_gauge,
                                 &compress_state.counters(),
+                                compaction_policy,
+                                compaction_policy_source,
                                 features,
                                 impact,
                                 scratch_impact,
@@ -1539,6 +1550,7 @@ pub(crate) fn run_chat(
                                 rest,
                                 &cfg,
                                 context_manager_override,
+                                compaction_trigger_policy_override,
                                 &context_features_override,
                                 inf_kind,
                             );
@@ -1553,6 +1565,16 @@ pub(crate) fn run_chat(
                             }
                             if let Some(sz) = result.set_budget {
                                 context_size_override = if sz == 0 { None } else { Some(sz) };
+                            }
+                            if let Some(policy) = result.set_compaction_trigger_policy {
+                                match policy {
+                                    CompactionTriggerPolicyOverride::Set(policy) => {
+                                        compaction_trigger_policy_override = Some(policy);
+                                    }
+                                    CompactionTriggerPolicyOverride::Reset => {
+                                        compaction_trigger_policy_override = None;
+                                    }
+                                }
                             }
                         }
                         surface.save_history();
@@ -2282,6 +2304,8 @@ pub(crate) fn run_chat(
                         model_tune.and_then(|t| t.mid_loop_trim_tokens),
                         cfg.tui.as_ref().and_then(|t| t.mid_loop_trim_tokens),
                     );
+                    let eff_compaction_trigger_policy =
+                        compaction_trigger_policy(&cfg, compaction_trigger_policy_override);
 
                     // Lazy context-window discovery: /api/show is attempted at
                     // most ONCE per model per session — even when the fetch
@@ -2831,6 +2855,7 @@ pub(crate) fn run_chat(
                                         connect_timeout_secs: connect_timeout_secs(&cfg),
                                         inference_timeout_secs: inference_timeout_secs(&cfg),
                                         mid_loop_trim_threshold: eff_mid_loop_trim,
+                                        compaction_trigger_policy: eff_compaction_trigger_policy,
                                         mid_loop_trim_tokens: eff_mid_loop_trim_tokens,
                                         max_ok_input: eff_max_ok_input,
                                         build_check_cmd: build_check_cmd(&cfg),

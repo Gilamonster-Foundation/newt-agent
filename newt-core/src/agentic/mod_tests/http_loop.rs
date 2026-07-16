@@ -47,6 +47,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         connect_timeout_secs: 5,
         inference_timeout_secs: 30,
         mid_loop_trim_threshold: 40,
+        compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
         mid_loop_trim_tokens: None,
         max_ok_input: None,
         build_check_cmd: None,

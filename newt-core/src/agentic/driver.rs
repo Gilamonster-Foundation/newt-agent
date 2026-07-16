@@ -56,7 +56,7 @@ use tokio::sync::oneshot;
 
 use super::observation::ShellObservation;
 use super::{chat_complete, openai_chat_complete, ChatCtx, NoMcp};
-use crate::{BackendKind, MemMessage, Role, TokenUsage};
+use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, Role, TokenUsage};
 
 /// Owned, `'static` configuration for one [`TurnDriver`] — the cloneable
 /// counterpart of the borrow-heavy [`ChatCtx`]. The driver clones it into each
@@ -98,6 +98,10 @@ pub struct TurnDriverConfig {
     pub inference_timeout_secs: u64,
     /// Message count at which the in-flight conversation is trimmed mid-turn.
     pub mid_loop_trim_threshold: usize,
+    /// Whether a known authoritative input ceiling suppresses a count-only
+    /// compaction. Headless callers default to the same safe policy as the
+    /// interactive harness.
+    pub compaction_trigger_policy: CompactionTriggerPolicy,
     /// Token threshold that also triggers a mid-loop trim. `None` disables it.
     pub mid_loop_trim_tokens: Option<usize>,
     /// Highest input-token count the model has accepted (pre-send budget gate).
@@ -138,6 +142,7 @@ impl TurnDriverConfig {
             connect_timeout_secs: 5,
             inference_timeout_secs: 120,
             mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: CompactionTriggerPolicy::HeadroomAware,
             mid_loop_trim_tokens: None,
             max_ok_input: None,
             build_check_cmd: None,
@@ -406,6 +411,7 @@ async fn run_one_turn(
         connect_timeout_secs: config.connect_timeout_secs,
         inference_timeout_secs: config.inference_timeout_secs,
         mid_loop_trim_threshold: config.mid_loop_trim_threshold,
+        compaction_trigger_policy: config.compaction_trigger_policy,
         mid_loop_trim_tokens: config.mid_loop_trim_tokens,
         max_ok_input: config.max_ok_input,
         build_check_cmd: config.build_check_cmd.clone(),

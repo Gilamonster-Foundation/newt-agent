@@ -57,6 +57,7 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 
 use crate::prune::{prune, PruneConfig};
+use crate::CompactionTriggerPolicy;
 
 use super::prompt_read::{
     active_prompt_card, ensure_active_prompt_card, PromptReadContext, ACTIVE_PROMPT_PREFIX,
@@ -368,6 +369,77 @@ pub(crate) struct CompressTrigger {
     /// that consults and feeds anti-thrash. False for count-only (VRAM
     /// guard) firings, whose aim-to-halve budget does neither (F2).
     pub hard_budget: bool,
+    /// The effective policy that admitted this automatic checkpoint.
+    pub policy: CompactionTriggerPolicy,
+    /// Messages present when the trigger was evaluated. Retained as bounded
+    /// diagnostic state only; it never includes message contents.
+    pub message_count: usize,
+    /// Configured message-count threshold evaluated for this decision.
+    pub message_count_threshold: usize,
+    /// Calibrated full-request tokens evaluated for this decision.
+    pub current_tokens: usize,
+    /// Nonzero configured token threshold, when one was active.
+    pub token_threshold: Option<usize>,
+    /// Nonzero pre-send budget, when one was active.
+    pub send_budget: Option<usize>,
+    /// Whether Newt had an authoritative input ceiling when it evaluated the
+    /// count guard. A learned `max_ok_input` high-water mark alone is not one.
+    pub has_authoritative_headroom: bool,
+    /// Which individual guards fired. Retained so checkpoint artifacts can
+    /// explain a decision without retaining prompt or tool-result content.
+    pub count_fired: bool,
+    pub token_fired: bool,
+    pub send_budget_fired: bool,
+    /// The hard cause that set `budget`, or the count guard when no hard
+    /// budget fired. The tightest hard budget wins.
+    pub primary_cause: CompressTriggerCause,
+}
+
+/// Bounded, content-free reason for an automatic compression checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompressTriggerCause {
+    MessageCount,
+    TokenThreshold,
+    SendBudget,
+}
+
+impl CompressTriggerCause {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageCount => "message_count",
+            Self::TokenThreshold => "token_threshold",
+            Self::SendBudget => "send_budget",
+        }
+    }
+
+    pub(crate) const fn artifact_reason(self) -> &'static str {
+        match self {
+            Self::MessageCount => "automatic_message_count",
+            Self::TokenThreshold => "automatic_token_threshold",
+            Self::SendBudget => "automatic_send_budget",
+        }
+    }
+}
+
+/// Static limits and policy inputs for one automatic trigger decision.
+///
+/// Grouping these settings keeps [`compression_trigger`] focused on the three
+/// measured values that change every round, while making the policy boundary
+/// explicit at each caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompressionTriggerLimits {
+    /// Mid-loop message-count threshold.
+    pub count_threshold: usize,
+    /// Optional nonzero token threshold; zero is treated as disabled.
+    pub token_threshold: Option<usize>,
+    /// Optional pre-send input budget; zero is treated as disabled.
+    pub send_budget: Option<usize>,
+    /// Stable advertised-tool schema cost in real-token space.
+    pub tool_tokens: usize,
+    /// Effective session/configuration policy.
+    pub policy: CompactionTriggerPolicy,
+    /// Whether a genuine input ceiling is known for this turn.
+    pub has_authoritative_headroom: bool,
 }
 
 /// Decide whether compression fires this round, and with what message-space
@@ -384,42 +456,56 @@ pub(crate) struct CompressTrigger {
 /// guard). The tightest fired budget wins. `message_tokens` is the caller's chars/4 estimate of
 /// the message list alone — the currency the pipeline compares its budget
 /// against — and prices the count-only trigger's aim-to-halve budget (F1).
+///
+/// The count guard is a fallback when Newt cannot prove an input ceiling. When
+/// an authoritative ceiling is present, [`CompactionTriggerPolicy::HeadroomAware`]
+/// leaves roomy contexts intact and lets the token/send guards decide; the
+/// explicit `message_count` policy preserves legacy behavior.
 pub(crate) fn compression_trigger(
     len: usize,
     current_tokens: usize,
     message_tokens: usize,
-    count_threshold: usize,
-    token_threshold: Option<usize>,
-    send_budget: Option<usize>,
-    tool_tokens: usize,
+    limits: CompressionTriggerLimits,
 ) -> Option<CompressTrigger> {
+    let CompressionTriggerLimits {
+        count_threshold,
+        token_threshold,
+        send_budget,
+        tool_tokens,
+        policy,
+        has_authoritative_headroom,
+    } = limits;
     // A zero token budget from config means DISABLED, not "compress to zero
     // every round" — the old `trim_to_token_budget` zero-is-noop contract,
     // re-homed here (F3).
     let token_threshold = token_threshold.filter(|&b| b > 0);
     let send_budget = send_budget.filter(|&b| b > 0);
 
-    let count_fired = len > count_threshold;
+    let count_fired = len > count_threshold
+        && (policy == CompactionTriggerPolicy::MessageCount || !has_authoritative_headroom);
     let token_fired = token_threshold.is_some_and(|b| current_tokens > b);
-    let guard_fired = send_budget.is_some_and(|b| current_tokens > b);
-    if !(count_fired || token_fired || guard_fired) {
+    let send_budget_fired = send_budget.is_some_and(|b| current_tokens > b);
+    if !(count_fired || token_fired || send_budget_fired) {
         return None;
     }
-    let mut budget = usize::MAX;
-    if token_fired {
-        budget = budget.min(
-            token_threshold
-                .unwrap_or(usize::MAX)
-                .saturating_sub(tool_tokens),
-        );
-    }
-    if guard_fired {
-        budget = budget.min(
-            send_budget
-                .unwrap_or(usize::MAX)
-                .saturating_sub(tool_tokens),
-        );
-    }
+    let token_budget = token_fired.then(|| {
+        token_threshold
+            .unwrap_or(usize::MAX)
+            .saturating_sub(tool_tokens)
+    });
+    let send_budget_target = send_budget_fired.then(|| {
+        send_budget
+            .unwrap_or(usize::MAX)
+            .saturating_sub(tool_tokens)
+    });
+    let (mut budget, primary_cause) = match (token_budget, send_budget_target) {
+        (Some(token), Some(send)) if send <= token => (send, CompressTriggerCause::SendBudget),
+        (Some(token), Some(_)) | (Some(token), None) => {
+            (token, CompressTriggerCause::TokenThreshold)
+        }
+        (None, Some(send)) => (send, CompressTriggerCause::SendBudget),
+        (None, None) => (usize::MAX, CompressTriggerCause::MessageCount),
+    };
     let hard_budget = budget != usize::MAX;
     if !hard_budget {
         // Count-only trigger: no token target configured — aim to halve, in
@@ -433,6 +519,17 @@ pub(crate) fn compression_trigger(
         budget,
         max_messages: count_fired.then_some(count_threshold / 2),
         hard_budget,
+        policy,
+        message_count: len,
+        message_count_threshold: count_threshold,
+        current_tokens,
+        token_threshold,
+        send_budget,
+        has_authoritative_headroom,
+        count_fired,
+        token_fired,
+        send_budget_fired,
+        primary_cause,
     })
 }
 
@@ -1732,6 +1829,24 @@ mod tests {
 
     fn tool_result(content: &str) -> Value {
         json!({"role": "tool", "content": content})
+    }
+
+    fn trigger_limits(
+        count_threshold: usize,
+        token_threshold: Option<usize>,
+        send_budget: Option<usize>,
+        tool_tokens: usize,
+        policy: CompactionTriggerPolicy,
+        has_authoritative_headroom: bool,
+    ) -> CompressionTriggerLimits {
+        CompressionTriggerLimits {
+            count_threshold,
+            token_threshold,
+            send_budget,
+            tool_tokens,
+            policy,
+            has_authoritative_headroom,
+        }
     }
 
     /// `[system, active-prompt metadata, exact task user, tool rounds…]` —
@@ -3494,49 +3609,200 @@ mod tests {
     #[test]
     fn trigger_fires_on_count_token_or_guard() {
         // Nothing fired.
-        assert!(compression_trigger(10, 1_000, 900, 40, None, None, 100).is_none());
+        assert!(compression_trigger(
+            10,
+            1_000,
+            900,
+            trigger_limits(
+                40,
+                None,
+                None,
+                100,
+                CompactionTriggerPolicy::HeadroomAware,
+                false,
+            ),
+        )
+        .is_none());
         // Token threshold (issue #223's crux: count far under threshold).
         // Like the send guard, it is a whole-request ceiling and must reserve
         // the advertised schema overhead before entering message space.
-        assert_eq!(
-            compression_trigger(4, 60_000, 59_000, 40, Some(50_000), None, 100),
-            Some(CompressTrigger {
-                budget: 49_900,
-                max_messages: None,
-                hard_budget: true,
-            })
-        );
+        let token = compression_trigger(
+            4,
+            60_000,
+            59_000,
+            trigger_limits(
+                40,
+                Some(50_000),
+                None,
+                100,
+                CompactionTriggerPolicy::HeadroomAware,
+                true,
+            ),
+        )
+        .unwrap();
+        assert_eq!(token.budget, 49_900);
+        assert!(token.hard_budget);
+        assert!(token.token_fired);
+        assert_eq!(token.primary_cause, CompressTriggerCause::TokenThreshold);
         // Guard: budget = send_budget − tool schema tokens.
-        assert_eq!(
-            compression_trigger(4, 9_000, 8_600, 40, None, Some(8_000), 500),
-            Some(CompressTrigger {
-                budget: 7_500,
-                max_messages: None,
-                hard_budget: true,
-            })
-        );
+        let guard = compression_trigger(
+            4,
+            9_000,
+            8_600,
+            trigger_limits(
+                40,
+                None,
+                Some(8_000),
+                500,
+                CompactionTriggerPolicy::HeadroomAware,
+                true,
+            ),
+        )
+        .unwrap();
+        assert_eq!(guard.budget, 7_500);
+        assert!(guard.hard_budget);
+        assert!(guard.send_budget_fired);
+        assert_eq!(guard.primary_cause, CompressTriggerCause::SendBudget);
         // Count only: budget halves the MESSAGE-token figure (NOT the
         // schema-inclusive current figure — the F1 cross-currency bug),
         // max_messages set, and the budget is soft (no anti-thrash).
-        assert_eq!(
-            compression_trigger(41, 1_000, 800, 40, None, None, 100),
-            Some(CompressTrigger {
-                budget: 400,
-                max_messages: Some(20),
-                hard_budget: false,
-            })
-        );
+        let count = compression_trigger(
+            41,
+            1_000,
+            800,
+            trigger_limits(
+                40,
+                None,
+                None,
+                100,
+                CompactionTriggerPolicy::HeadroomAware,
+                false,
+            ),
+        )
+        .unwrap();
+        assert_eq!(count.budget, 400);
+        assert_eq!(count.max_messages, Some(20));
+        assert!(!count.hard_budget);
+        assert!(count.count_fired);
+        assert_eq!(count.primary_cause, CompressTriggerCause::MessageCount);
         // All at once: the tightest token budget wins and stays hard.
-        assert_eq!(
-            compression_trigger(41, 60_000, 59_000, 40, Some(50_000), Some(20_000), 500),
-            Some(CompressTrigger {
-                budget: 19_500,
-                max_messages: Some(20),
-                hard_budget: true,
-            })
-        );
+        let combined = compression_trigger(
+            41,
+            60_000,
+            59_000,
+            trigger_limits(
+                40,
+                Some(50_000),
+                Some(20_000),
+                500,
+                CompactionTriggerPolicy::MessageCount,
+                true,
+            ),
+        )
+        .unwrap();
+        assert_eq!(combined.budget, 19_500);
+        assert_eq!(combined.max_messages, Some(20));
+        assert!(combined.hard_budget);
+        assert!(combined.count_fired);
+        assert!(combined.token_fired);
+        assert!(combined.send_budget_fired);
+        assert_eq!(combined.primary_cause, CompressTriggerCause::SendBudget);
         // Under-threshold figures don't fire their triggers.
-        assert!(compression_trigger(4, 7_999, 7_000, 40, Some(50_000), Some(8_000), 0).is_none());
+        assert!(compression_trigger(
+            4,
+            7_999,
+            7_000,
+            trigger_limits(
+                40,
+                Some(50_000),
+                Some(8_000),
+                0,
+                CompactionTriggerPolicy::HeadroomAware,
+                true,
+            ),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn headroom_aware_defers_count_only_compression_but_legacy_mode_keeps_it() {
+        // A known million-token ceiling does not make 41 tiny messages an
+        // emergency. The default must preserve the active prompt until real
+        // token pressure appears.
+        assert!(compression_trigger(
+            41,
+            1_000,
+            800,
+            trigger_limits(
+                40,
+                None,
+                Some(1_000_000),
+                100,
+                CompactionTriggerPolicy::HeadroomAware,
+                true,
+            ),
+        )
+        .is_none());
+
+        let legacy = compression_trigger(
+            41,
+            1_000,
+            800,
+            trigger_limits(
+                40,
+                None,
+                Some(1_000_000),
+                100,
+                CompactionTriggerPolicy::MessageCount,
+                true,
+            ),
+        )
+        .unwrap();
+        assert_eq!(legacy.primary_cause, CompressTriggerCause::MessageCount);
+        assert!(legacy.count_fired);
+        assert!(legacy.has_authoritative_headroom);
+
+        // A learned `max_ok_input` high-water mark is not a known window, so
+        // the fallback count guard remains available to protect that session.
+        let unknown_window = compression_trigger(
+            41,
+            1_000,
+            800,
+            trigger_limits(
+                40,
+                None,
+                Some(1_000_000),
+                100,
+                CompactionTriggerPolicy::HeadroomAware,
+                false,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            unknown_window.primary_cause,
+            CompressTriggerCause::MessageCount
+        );
+        assert!(!unknown_window.has_authoritative_headroom);
+
+        // Real hard pressure still fires under the default even when the
+        // count-only path is deferred.
+        let hard = compression_trigger(
+            41,
+            2_000,
+            1_800,
+            trigger_limits(
+                40,
+                Some(1_500),
+                Some(1_000_000),
+                100,
+                CompactionTriggerPolicy::HeadroomAware,
+                true,
+            ),
+        )
+        .unwrap();
+        assert!(hard.hard_budget);
+        assert!(!hard.count_fired);
+        assert_eq!(hard.primary_cause, CompressTriggerCause::TokenThreshold);
     }
 
     /// Re-homed `trim_to_token_budget_zero_is_noop` (F3): a configured zero
@@ -3544,17 +3810,51 @@ mod tests {
     /// regression flipped it to "compress to budget zero every round").
     #[test]
     fn trigger_zero_token_budget_is_disabled() {
-        assert!(compression_trigger(4, 100, 90, 40, Some(0), None, 0).is_none());
-        assert!(compression_trigger(4, 100, 90, 40, None, Some(0), 10).is_none());
+        assert!(compression_trigger(
+            4,
+            100,
+            90,
+            trigger_limits(
+                40,
+                Some(0),
+                None,
+                0,
+                CompactionTriggerPolicy::HeadroomAware,
+                false,
+            ),
+        )
+        .is_none());
+        assert!(compression_trigger(
+            4,
+            100,
+            90,
+            trigger_limits(
+                40,
+                None,
+                Some(0),
+                10,
+                CompactionTriggerPolicy::HeadroomAware,
+                false,
+            ),
+        )
+        .is_none());
         // Zero token budgets stay disabled while a real count trigger fires.
-        assert_eq!(
-            compression_trigger(41, 100, 90, 40, Some(0), Some(0), 10),
-            Some(CompressTrigger {
-                budget: 45,
-                max_messages: Some(20),
-                hard_budget: false,
-            })
-        );
+        let count = compression_trigger(
+            41,
+            100,
+            90,
+            trigger_limits(
+                40,
+                Some(0),
+                Some(0),
+                10,
+                CompactionTriggerPolicy::HeadroomAware,
+                false,
+            ),
+        )
+        .unwrap();
+        assert_eq!(count.budget, 45);
+        assert_eq!(count.primary_cause, CompressTriggerCause::MessageCount);
     }
 
     // -- redaction ----------------------------------------------------------------

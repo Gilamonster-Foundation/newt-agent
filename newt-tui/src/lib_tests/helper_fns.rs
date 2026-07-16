@@ -120,6 +120,54 @@ fn context_manager_resolves_session_config_default() {
 }
 
 #[test]
+fn compaction_trigger_policy_resolves_session_config_default() {
+    use newt_core::{CompactionTriggerPolicy, ContextConfig};
+    let cfg_with = |policy: CompactionTriggerPolicy| newt_core::Config {
+        context: Some(ContextConfig {
+            compaction_trigger_policy: policy,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // No [context] → the conservative headroom-aware default.
+    assert_eq!(
+        compaction_trigger_policy(&newt_core::Config::default(), None),
+        CompactionTriggerPolicy::HeadroomAware
+    );
+    assert_eq!(
+        compaction_trigger_policy_source(&newt_core::Config::default(), None),
+        "default"
+    );
+
+    // Config wins when the session has not selected a temporary policy.
+    assert_eq!(
+        compaction_trigger_policy(&cfg_with(CompactionTriggerPolicy::MessageCount), None),
+        CompactionTriggerPolicy::MessageCount
+    );
+    assert_eq!(
+        compaction_trigger_policy_source(&cfg_with(CompactionTriggerPolicy::MessageCount), None),
+        "config"
+    );
+
+    // A session override remains highest precedence.
+    assert_eq!(
+        compaction_trigger_policy(
+            &cfg_with(CompactionTriggerPolicy::MessageCount),
+            Some(CompactionTriggerPolicy::HeadroomAware)
+        ),
+        CompactionTriggerPolicy::HeadroomAware
+    );
+    assert_eq!(
+        compaction_trigger_policy_source(
+            &cfg_with(CompactionTriggerPolicy::MessageCount),
+            Some(CompactionTriggerPolicy::HeadroomAware)
+        ),
+        "session"
+    );
+}
+
+#[test]
 fn context_features_resolves_preset_config_session() {
     use newt_core::{
         BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
@@ -211,12 +259,13 @@ fn context_features_local_backend_defaults_plan_semantic_ledger_on() {
 
 #[test]
 fn handle_context_command_dispatch() {
-    use newt_core::{BackendKind, ContextFeatures, ContextManager};
+    use newt_core::{BackendKind, CompactionTriggerPolicy, ContextFeatures, ContextManager};
     let cfg = newt_core::Config::default();
     let none = ContextFeatures::default();
     // Cloud kind keeps the all-off base so these assertions isolate the
     // dispatch logic from the Step 27.4 local default.
-    let run = |rest: &str| handle_context_command(rest, &cfg, None, &none, BackendKind::Openai);
+    let run =
+        |rest: &str| handle_context_command(rest, &cfg, None, None, &none, BackendKind::Openai);
 
     // bare status: manager + features summary, no mutation. `tool_offload`
     // now defaults on for EVERY backend kind (`base_for` sets it
@@ -226,7 +275,49 @@ fn handle_context_command_dispatch() {
     let r = run("");
     assert!(r.lines[0].contains("context manager: standard"));
     assert!(r.lines[0].contains("features on: tool_offload"));
+    assert!(r.lines[1].contains("headroom_aware (default)"));
     assert!(r.set_manager.is_none() && r.set_feature.is_none());
+
+    // The policy has its own inspect/set/reset surface. A reset is explicit in
+    // the pure result so the chat loop can clear rather than leave a stale
+    // session override in place.
+    assert!(run("compaction").lines[0].contains("headroom_aware (default)"));
+    assert_eq!(
+        run("compaction message_count").set_compaction_trigger_policy,
+        Some(CompactionTriggerPolicyOverride::Set(
+            CompactionTriggerPolicy::MessageCount
+        ))
+    );
+    assert_eq!(
+        run("compaction HEADROOM_AWARE").set_compaction_trigger_policy,
+        Some(CompactionTriggerPolicyOverride::Set(
+            CompactionTriggerPolicy::HeadroomAware
+        )),
+        "the command accepts the canonical policy parser's case-insensitive form"
+    );
+    let session_status = handle_context_command(
+        "",
+        &cfg,
+        None,
+        Some(CompactionTriggerPolicy::MessageCount),
+        &none,
+        BackendKind::Openai,
+    );
+    assert!(session_status.lines[1].contains("message_count (session)"));
+    let r = handle_context_command(
+        "compaction reset",
+        &cfg,
+        None,
+        Some(CompactionTriggerPolicy::MessageCount),
+        &none,
+        BackendKind::Openai,
+    );
+    assert_eq!(
+        r.set_compaction_trigger_policy,
+        Some(CompactionTriggerPolicyOverride::Reset)
+    );
+    assert!(r.lines[0].contains("headroom_aware (default)"));
+    assert!(run("compaction nope").lines[0].contains("unknown compaction trigger policy"));
 
     // manager set (standard is available)
     assert_eq!(
@@ -293,6 +384,7 @@ fn handle_context_command_dispatch() {
         "feature provenance off",
         &cfg_on,
         None,
+        None,
         &none,
         BackendKind::Openai,
     );
@@ -306,7 +398,7 @@ fn handle_context_command_dispatch() {
         r.lines[0]
     );
     assert!(
-        handle_context_command("", &cfg_on, None, &none, BackendKind::Openai).lines[0]
+        handle_context_command("", &cfg_on, None, None, &none, BackendKind::Openai).lines[0]
             .contains("provenance (pending #584)"),
         "bare status annotates a config-on-but-unavailable feature as pending"
     );
@@ -352,7 +444,7 @@ fn handle_context_command_dispatch() {
 
 #[test]
 fn context_stats_text_composes_budget_compression_and_features() {
-    use newt_core::{CompressCounters, ContextFeatureSet};
+    use newt_core::{CompactionTriggerPolicy, CompressCounters, ContextFeatureSet};
     let counters = CompressCounters {
         compressions: 3,
         strikes: 1,
@@ -362,14 +454,30 @@ fn context_stats_text_composes_budget_compression_and_features() {
     let features = ContextFeatureSet::default();
 
     // No gauge yet → "not yet measured".
-    let none = context_stats_text(None, &counters, features, None, None, None, None, None);
+    let none = context_stats_text(
+        None,
+        &counters,
+        CompactionTriggerPolicy::HeadroomAware,
+        "default",
+        features,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     assert_eq!(none[0], "context stats");
     assert!(none.iter().any(|l| l.contains("budget: not yet measured")));
+    assert!(none
+        .iter()
+        .any(|l| l.contains("automatic compaction: headroom_aware (default)")));
 
     // With a gauge → budget line shows the fraction + percent.
     let s = context_stats_text(
         Some((899_000, 1_024_000)),
         &counters,
+        CompactionTriggerPolicy::MessageCount,
+        "session",
         features,
         None,
         None,
@@ -380,6 +488,7 @@ fn context_stats_text_composes_budget_compression_and_features() {
     let joined = s.join("\n");
     assert!(joined.contains("899k/1024k"), "{joined}");
     assert!(joined.contains("% of the send window"), "{joined}");
+    assert!(joined.contains("automatic compaction: message_count (session)"));
     // Compression telemetry is reused from the /memory section.
     assert!(joined.contains("compressions this session: 3"), "{joined}");
     assert!(joined.contains("reclaimed 42%"), "{joined}");
@@ -404,6 +513,8 @@ fn context_stats_text_composes_budget_compression_and_features() {
     let imp = context_stats_text(
         None,
         &counters,
+        CompactionTriggerPolicy::HeadroomAware,
+        "config",
         on,
         Some((3, 48_000)),
         Some((5, 12_000)),
@@ -437,6 +548,8 @@ fn context_stats_text_composes_budget_compression_and_features() {
     assert!(context_stats_text(
         Some((10, 0)),
         &counters,
+        CompactionTriggerPolicy::HeadroomAware,
+        "default",
         features,
         None,
         None,

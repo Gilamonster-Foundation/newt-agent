@@ -254,7 +254,10 @@ pub use untrusted::wrap_untrusted;
 pub use warmup::warmup_if_cold;
 
 use crate::retry::{with_backoff_notify, RetryPolicy};
-use compress::{compress, compression_trigger, CompressAction, CompressRequest};
+use compress::{
+    compress, compression_trigger, CompressAction, CompressRequest, CompressTrigger,
+    CompressionTriggerLimits,
+};
 use crossterm::{
     execute,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
@@ -538,6 +541,11 @@ pub struct ChatCtx<'a> {
     /// Message list size at which the agent trims the middle of the in-flight
     /// conversation to prevent context overflow mid-turn.
     pub mid_loop_trim_threshold: usize,
+    /// Policy deciding whether the message-count guard alone may trigger a
+    /// compaction while an authoritative input ceiling is known. Resolved from
+    /// `[context].compaction_trigger_policy` by the interactive caller;
+    /// headless callers use the safe `headroom_aware` default.
+    pub compaction_trigger_policy: crate::CompactionTriggerPolicy,
     /// Estimated-token threshold that also triggers a mid-loop trim, regardless
     /// of message count. Guards against a single huge tool result blowing past
     /// the context window in one round (from `[tui].mid_loop_trim_tokens`).
@@ -1023,6 +1031,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold,
+        compaction_trigger_policy,
         mid_loop_trim_tokens,
         max_ok_input,
         build_check_cmd,
@@ -1352,14 +1361,28 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // (F1); `current` (schema/template-inclusive) still drives the
             // token triggers.
             let message_tokens = estimate_tokens(&messages, estimation);
+            // A learned `max_ok_input` alone is a proven-good floor, not a
+            // context-window ceiling. Only a configured token cap or a
+            // budget backed by a known/recovered window suppresses a
+            // count-only compaction under the default policy.
+            let has_authoritative_headroom = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            )
+            .is_some();
             if let Some(trigger) = compression_trigger(
                 messages.len(),
                 current,
                 message_tokens,
-                mid_loop_trim_threshold,
-                mid_loop_trim_tokens,
-                send_budget,
-                tool_tokens_real,
+                CompressionTriggerLimits {
+                    count_threshold: mid_loop_trim_threshold,
+                    token_threshold: mid_loop_trim_tokens,
+                    send_budget,
+                    tool_tokens: tool_tokens_real,
+                    policy: compaction_trigger_policy,
+                    has_authoritative_headroom,
+                },
             ) {
                 // A hard trigger's budget is real-token currency; the
                 // pipeline measures and reclaims in chars/4 — convert once
@@ -1475,11 +1498,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         outcome.tokens_after,
                         pipeline_budget,
                         round,
-                        if trigger.hard_budget {
-                            "automatic_token_budget"
-                        } else {
-                            "automatic_message_count"
-                        },
+                        trigger.primary_cause.artifact_reason(),
+                        Some(&trigger),
+                        send_budget_authoritative,
                         color,
                     );
                 }
@@ -1688,6 +1709,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 calibrate_down(new_budget.saturating_sub(tool_tokens_real), cal),
                                 round,
                                 "context_window_400",
+                                None,
+                                false,
                                 color,
                             );
                         }
@@ -2256,6 +2279,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 target,
                                 round,
                                 "silent_overflow_recovery",
+                                None,
+                                false,
                                 color,
                             );
                         } else {
@@ -2284,6 +2309,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     target,
                                     round,
                                     "silent_overflow_structural_fallback",
+                                    None,
+                                    false,
                                     color,
                                 );
                             }
@@ -3222,6 +3249,8 @@ fn record_compaction_artifact(
     budget: usize,
     round: usize,
     reason: &str,
+    trigger: Option<&CompressTrigger>,
+    send_budget_authoritative: bool,
     color: bool,
 ) {
     let (Some(sink), Some(context)) = (artifact_sink, artifact_context) else {
@@ -3236,6 +3265,8 @@ fn record_compaction_artifact(
         budget,
         round,
         reason,
+        trigger,
+        send_budget_authoritative,
     ) {
         print_harness_notice(
             &format!("warning: failed to record compaction artifact: {error}"),
@@ -4212,6 +4243,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold,
+        compaction_trigger_policy,
         mid_loop_trim_tokens,
         max_ok_input,
         build_check_cmd,
@@ -4439,14 +4471,24 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // Count-only budget priced in message-token space (F1) — mirrors
             // the Ollama path.
             let message_tokens = estimate_tokens(&messages, estimation);
+            let has_authoritative_headroom = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            )
+            .is_some();
             if let Some(trigger) = compression_trigger(
                 messages.len(),
                 current,
                 message_tokens,
-                mid_loop_trim_threshold,
-                mid_loop_trim_tokens,
-                send_budget,
-                tool_tokens_real,
+                CompressionTriggerLimits {
+                    count_threshold: mid_loop_trim_threshold,
+                    token_threshold: mid_loop_trim_tokens,
+                    send_budget,
+                    tool_tokens: tool_tokens_real,
+                    policy: compaction_trigger_policy,
+                    has_authoritative_headroom,
+                },
             ) {
                 // Hard budgets are real-token currency → pipeline chars/4
                 // (Phase 20 §2.3); count-only budgets pass through (F1).
@@ -4534,11 +4576,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         outcome.tokens_after,
                         pipeline_budget,
                         round,
-                        if trigger.hard_budget {
-                            "automatic_token_budget"
-                        } else {
-                            "automatic_message_count"
-                        },
+                        trigger.primary_cause.artifact_reason(),
+                        Some(&trigger),
+                        send_budget_authoritative,
                         color,
                     );
                 }
@@ -4702,6 +4742,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 ),
                                 round,
                                 "context_window_400",
+                                None,
+                                false,
                                 color,
                             );
                         }
@@ -5446,6 +5488,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold: _,
+        compaction_trigger_policy: _,
         mid_loop_trim_tokens,
         max_ok_input,
         build_check_cmd,
@@ -7111,6 +7154,7 @@ mod tool_round_cap_tests {
             connect_timeout_secs: 5,
             inference_timeout_secs: 5,
             mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
             mid_loop_trim_tokens: None,
             max_ok_input: None,
             build_check_cmd: None,
@@ -7276,6 +7320,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -7571,6 +7616,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -7657,6 +7703,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -8239,6 +8286,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -8337,6 +8385,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -8444,6 +8493,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -8563,6 +8613,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -8674,6 +8725,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -8826,6 +8878,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -8988,6 +9041,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 30,
                 mid_loop_trim_threshold: 40,
+                compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
                 mid_loop_trim_tokens: None,
                 max_ok_input: None,
                 build_check_cmd: None,
@@ -9111,6 +9165,7 @@ mod save_note_loop_tests {
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
             mid_loop_trim_tokens: None,
             max_ok_input: None,
             build_check_cmd: None,
@@ -9602,6 +9657,7 @@ mod compression_loop_tests {
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
             // The token trigger under test: well below what a few 4 KB
             // tool results accumulate to.
             mid_loop_trim_tokens: Some(5_000),
@@ -10848,6 +10904,7 @@ mod observation_hook_tests {
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
+            compaction_trigger_policy: crate::CompactionTriggerPolicy::HeadroomAware,
             mid_loop_trim_tokens: None,
             max_ok_input: None,
             build_check_cmd: None,
