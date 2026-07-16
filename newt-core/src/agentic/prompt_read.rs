@@ -490,7 +490,8 @@ pub(crate) fn active_prompt_card(context: PromptReadContext<'_>) -> String {
          objective_root: {root}\n\
          model_digest: {digest}\n\
          {submitted_block}\n\
-         recovery: prompt_read current"
+         recovery: prompt_read current\n\
+         artifact_recovery: for prompt-rooted work, artifact_read {{\"address\":\"root\"}}"
     )
 }
 
@@ -1059,6 +1060,10 @@ mod tests {
             "{card}"
         );
         assert!(card.contains("submitted_origin: harness_retry"), "{card}");
+        assert!(
+            card.contains("artifact_read {\"address\":\"root\"}"),
+            "{card}"
+        );
         assert!(
             card.contains(&format!(
                 "submitted_parent_address: {}",

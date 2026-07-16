@@ -2,6 +2,7 @@
 //! Moved verbatim from `newt-tui` in Step 9.7 — the Caveats enforcement,
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 
+use super::artifact_read::{execute_artifact_read, ArtifactReadContext};
 use super::crew_tool::CrewRunner;
 use super::display::{print_denied, print_tool_call, print_tool_output};
 use super::git_tool::GitTool;
@@ -1778,6 +1779,182 @@ fn find_walk(
 /// This is what makes a deliberately-restricted on-call/triage mode win over a
 /// `--yolo` flag — the preset clamp is consulted as a ceiling the bypass
 /// cannot cross.
+/// Open one artifact candidate without ever blocking on a FIFO/device or
+/// following a final symlink. Artifact capture is diagnostic, so platforms
+/// without this race-safe primitive fail closed rather than weakening the file
+/// tools' existing mutation policy.
+#[cfg(unix)]
+fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn artifact_open_regular_file(_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "race-safe artifact file capture is unavailable on this platform",
+    ))
+}
+
+fn artifact_preimage_state(
+    path: &std::path::Path,
+    read_authorized: bool,
+) -> super::artifact_hooks::ArtifactFileState {
+    use std::io::Read as _;
+
+    if !read_authorized {
+        return super::artifact_hooks::ArtifactFileState::unavailable("fs_read_not_granted");
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            super::artifact_hooks::ArtifactFileState::unavailable("symlink_preimage_not_hashed")
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            super::artifact_hooks::ArtifactFileState::unavailable("preimage_not_regular_file")
+        }
+        Ok(_) => {
+            let mut file = match artifact_open_regular_file(path) {
+                Ok(file) => file,
+                Err(_) => {
+                    return super::artifact_hooks::ArtifactFileState::unavailable(
+                        "preimage_read_failed",
+                    )
+                }
+            };
+            let mut hasher = blake3::Hasher::new();
+            let mut bytes = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        hasher.update(&buffer[..read]);
+                        bytes = bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                    }
+                    Err(_) => {
+                        return super::artifact_hooks::ArtifactFileState::unavailable(
+                            "preimage_read_failed",
+                        )
+                    }
+                }
+            }
+            super::artifact_hooks::ArtifactFileState::from_digest(
+                hasher.finalize().to_hex().to_string(),
+                bytes,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            super::artifact_hooks::ArtifactFileState::absent()
+        }
+        Err(_) => super::artifact_hooks::ArtifactFileState::unavailable("preimage_read_failed"),
+    }
+}
+
+/// Verify a governed write against the bytes it submitted without allocating a
+/// second copy of the file. Only a regular file can satisfy the postcondition.
+fn artifact_file_matches(path: &std::path::Path, expected: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read as _;
+
+    let mut file = artifact_open_regular_file(path)?;
+    let mut offset = 0_usize;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(offset == expected.len());
+        }
+        let Some(end) = offset.checked_add(read) else {
+            return Ok(false);
+        };
+        if expected.get(offset..end) != Some(&buffer[..read]) {
+            return Ok(false);
+        }
+        offset = end;
+    }
+}
+
+/// Return true only when the artifact locator can be proven to resolve inside
+/// the physical workspace. The file tools intentionally retain their existing
+/// lexical OCAP policy, but provenance must not turn a write through an
+/// in-workspace symlink into a false claim about workspace state.
+///
+/// For a path that does not exist yet, walk to the nearest existing ancestor.
+/// An existing (including dangling) symlink must canonicalize successfully;
+/// otherwise the provenance check fails closed instead of walking past it.
+fn artifact_path_is_physically_within_workspace(
+    workspace: &std::path::Path,
+    target: &std::path::Path,
+) -> bool {
+    let Ok(workspace) = workspace.canonicalize() else {
+        return false;
+    };
+    let mut probe = target;
+    loop {
+        match std::fs::symlink_metadata(probe) {
+            Ok(_) => {
+                return probe
+                    .canonicalize()
+                    .is_ok_and(|resolved| resolved.starts_with(&workspace));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = probe.parent() else {
+                    return false;
+                };
+                probe = parent;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_governed_file_change(
+    sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
+    context: Option<ArtifactReadContext<'_>>,
+    path: &str,
+    operation: &'static str,
+    before: Option<super::artifact_hooks::ArtifactFileState>,
+    after: super::artifact_hooks::ArtifactFileState,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    let (Some(sink), Some(context), Some(before)) = (sink, context, before) else {
+        return String::new();
+    };
+    match super::artifact_hooks::record_file_change(sink, context, path, operation, before, after) {
+        Ok(_) => String::new(),
+        Err(error) => {
+            let warning = format!("warning: failed to record file-change artifact: {error}");
+            print_tool_output(&warning, tool_output_lines, color);
+            format!("\n{warning}")
+        }
+    }
+}
+
+fn artifact_postcondition_warning(
+    path: &str,
+    detail: &str,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    let warning =
+        format!("warning: {path} changed, but no file-change artifact was recorded: {detail}");
+    print_tool_output(&warning, tool_output_lines, color);
+    format!("\n{warning}")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     name: &str,
@@ -1901,6 +2078,66 @@ pub async fn execute_tool_with_offload_and_prompt(
     recall_source: Option<&dyn RecallSource>,
     memory_source: Option<&dyn MemorySource>,
     prompt_context: Option<PromptReadContext<'_>>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
+    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    persona_tools: Option<&[String]>,
+) -> String {
+    execute_tool_with_offload_and_prompt_and_artifacts(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        build_check_cmd,
+        note_sink,
+        recall_source,
+        memory_source,
+        prompt_context,
+        None,
+        None,
+        permission_gate,
+        exec_floor,
+        git_tool,
+        crew_runner,
+        scratchpad_store,
+        code_search,
+        experience_store,
+        step_ledger,
+        tool_offload,
+        spill_store,
+        persona_tools,
+    )
+    .await
+}
+
+/// Prompt- and artifact-aware tool dispatcher used by inference loops.
+/// The prompt-only entry point above remains source-compatible for embedders.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
+    prompt_context: Option<PromptReadContext<'_>>,
+    artifact_context: Option<ArtifactReadContext<'_>>,
+    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
     mut permission_gate: Option<&mut dyn PermissionGate>,
     exec_floor: Option<&crate::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
@@ -2052,6 +2289,14 @@ pub async fn execute_tool_with_offload_and_prompt(
             None => "prompt_read error: no active prompt context in this session".to_string(),
         },
 
+        // Derived-work recovery is also always available. The context carries
+        // only harness-owned prompt ids and an already conversation/workspace-
+        // fenced source; model arguments can select an address, never a fence.
+        "artifact_read" => match artifact_context {
+            Some(context) => execute_artifact_read(args, context, color, tool_output_lines),
+            None => "error: artifact_read: no active artifact context in this session".to_string(),
+        },
+
         // Model-curated memory (Step 19.3): routes add / replace / remove
         // through the caller's NoteSink — the same MemoryManager → NoteStore
         // path as `/remember`, so the 19.1 char-cap curator error and the
@@ -2133,7 +2378,27 @@ pub async fn execute_tool_with_offload_and_prompt(
         // WRITE tool, presence-gated on the ledger (advertised only when the
         // `scheduled` feature is on). Replaces plan_set + plan_advance.
         "update_plan" => match step_ledger {
-            Some(l) => super::scheduled::execute_update_plan(args, l, color, tool_output_lines),
+            Some(ledger) => {
+                let mut out =
+                    super::scheduled::execute_update_plan(args, ledger, color, tool_output_lines);
+                if tool_result_ok(&out) {
+                    if let (Some(sink), Some(context)) = (artifact_sink, artifact_context) {
+                        let plan = ledger.snapshot();
+                        if !plan.is_empty() {
+                            if let Err(error) =
+                                super::artifact_hooks::record_plan_revision(sink, context, &plan)
+                            {
+                                let warning =
+                                    format!("warning: failed to record plan artifact: {error}");
+                                print_tool_output(&warning, tool_output_lines, color);
+                                out.push('\n');
+                                out.push_str(&warning);
+                            }
+                        }
+                    }
+                }
+                out
+            }
             None => "unknown tool: update_plan (scheduled planning is off)".to_string(),
         },
 
@@ -2504,6 +2769,18 @@ pub async fn execute_tool_with_offload_and_prompt(
                     return msg;
                 }
             }
+            // Capture provenance only after fs_write authorization. The
+            // preimage digest is withheld unless this turn also has fs_read;
+            // a write-only grant must not mint a persistent equality oracle.
+            let artifact_tracking = artifact_sink.is_some() && artifact_context.is_some();
+            let artifact_path_within = artifact_tracking
+                && artifact_path_is_physically_within_workspace(
+                    std::path::Path::new(workspace),
+                    &full,
+                );
+            let artifact_before = artifact_path_within.then(|| {
+                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
+            });
 
             // Shrink guard: refuse if the proposed write removes > 30% of
             // lines AND > 30 lines absolute. This catches the failure mode
@@ -2559,10 +2836,55 @@ pub async fn execute_tool_with_offload_and_prompt(
                     Ok(_) => {
                         let line_count = content.lines().count();
                         println!("✓ wrote {path} ({line_count} lines)");
+                        // Verify exactly the bytes this governed tool submitted
+                        // before an arbitrary build-check command can touch the
+                        // workspace. A mismatch emits no false provenance.
+                        let artifact = if !artifact_tracking {
+                            String::new()
+                        } else if !artifact_path_within
+                            || !artifact_path_is_physically_within_workspace(
+                                std::path::Path::new(workspace),
+                                &full,
+                            )
+                        {
+                            artifact_postcondition_warning(
+                                path,
+                                "the physical path could not be proven inside the workspace",
+                                color,
+                                tool_output_lines,
+                            )
+                        } else {
+                            match artifact_file_matches(&full, content.as_bytes()) {
+                                Ok(true) => record_governed_file_change(
+                                    artifact_sink,
+                                    artifact_context,
+                                    path,
+                                    "write_file",
+                                    artifact_before,
+                                    super::artifact_hooks::ArtifactFileState::from_bytes(
+                                        content.as_bytes(),
+                                    ),
+                                    color,
+                                    tool_output_lines,
+                                ),
+                                Ok(false) => artifact_postcondition_warning(
+                                    path,
+                                    "post-write bytes did not match the submitted content",
+                                    color,
+                                    tool_output_lines,
+                                ),
+                                Err(_) => artifact_postcondition_warning(
+                                    path,
+                                    "post-write bytes could not be verified",
+                                    color,
+                                    tool_output_lines,
+                                ),
+                            }
+                        };
                         let check = build_check_cmd
                             .map(|cmd| run_build_check(cmd, workspace))
                             .unwrap_or_default();
-                        format!("wrote {path} ({line_count} lines){check}")
+                        format!("wrote {path} ({line_count} lines){artifact}{check}")
                     }
                     Err(e) => format!("error writing {path}: {e}"),
                 }
@@ -2606,6 +2928,15 @@ pub async fn execute_tool_with_offload_and_prompt(
             if meta.file_type().is_dir() {
                 return format!("error deleting {path}: delete_file refuses directories");
             }
+            let artifact_tracking = artifact_sink.is_some() && artifact_context.is_some();
+            let artifact_path_within = artifact_tracking
+                && artifact_path_is_physically_within_workspace(
+                    std::path::Path::new(workspace),
+                    &full,
+                );
+            let artifact_before = artifact_path_within.then(|| {
+                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
+            });
 
             print_tool_call("delete_file", path, color);
             let confirmed = confirm_unrestricted_fs_mutation(
@@ -2622,10 +2953,46 @@ pub async fn execute_tool_with_offload_and_prompt(
             match std::fs::remove_file(&full) {
                 Ok(_) => {
                     println!("✓ deleted {path}");
+                    let artifact = if !artifact_tracking {
+                        String::new()
+                    } else if !artifact_path_within
+                        || !artifact_path_is_physically_within_workspace(
+                            std::path::Path::new(workspace),
+                            &full,
+                        )
+                    {
+                        artifact_postcondition_warning(
+                            path,
+                            "the physical path could not be proven inside the workspace",
+                            color,
+                            tool_output_lines,
+                        )
+                    } else {
+                        match std::fs::symlink_metadata(&full) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                record_governed_file_change(
+                                    artifact_sink,
+                                    artifact_context,
+                                    path,
+                                    "delete_file",
+                                    artifact_before,
+                                    super::artifact_hooks::ArtifactFileState::absent(),
+                                    color,
+                                    tool_output_lines,
+                                )
+                            }
+                            _ => artifact_postcondition_warning(
+                                path,
+                                "the path still existed after delete_file returned success",
+                                color,
+                                tool_output_lines,
+                            ),
+                        }
+                    };
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!("deleted {path}{check}")
+                    format!("deleted {path}{artifact}{check}")
                 }
                 Err(e) => format!("error deleting {path}: {e}"),
             }
@@ -2693,6 +3060,25 @@ pub async fn execute_tool_with_offload_and_prompt(
                      Add more surrounding context to make it unique."
                 );
             }
+            let artifact_tracking = artifact_sink.is_some() && artifact_context.is_some();
+            let artifact_path_within = artifact_tracking
+                && artifact_path_is_physically_within_workspace(
+                    std::path::Path::new(workspace),
+                    &full,
+                );
+            let artifact_before = artifact_path_within.then(|| {
+                if !tui_permits_path(&caveats.fs_read, &full_str) {
+                    super::artifact_hooks::ArtifactFileState::unavailable("fs_read_not_granted")
+                } else if std::fs::symlink_metadata(&full)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    super::artifact_hooks::ArtifactFileState::unavailable(
+                        "symlink_preimage_not_hashed",
+                    )
+                } else {
+                    super::artifact_hooks::ArtifactFileState::from_bytes(existing.as_bytes())
+                }
+            });
             let updated = existing.replacen(old_string, new_string, 1);
             let old_lines = existing.lines().count();
             let new_lines = updated.lines().count();
@@ -2706,10 +3092,54 @@ pub async fn execute_tool_with_offload_and_prompt(
             match std::fs::write(&full, &updated) {
                 Ok(_) => {
                     println!("✓ edited {path} ({delta_str} lines, now {new_lines} total)");
+                    let artifact = if !artifact_tracking {
+                        String::new()
+                    } else if !artifact_path_within
+                        || !artifact_path_is_physically_within_workspace(
+                            std::path::Path::new(workspace),
+                            &full,
+                        )
+                    {
+                        artifact_postcondition_warning(
+                            path,
+                            "the physical path could not be proven inside the workspace",
+                            color,
+                            tool_output_lines,
+                        )
+                    } else {
+                        match artifact_file_matches(&full, updated.as_bytes()) {
+                            Ok(true) => record_governed_file_change(
+                                artifact_sink,
+                                artifact_context,
+                                path,
+                                "edit_file",
+                                artifact_before,
+                                super::artifact_hooks::ArtifactFileState::from_bytes(
+                                    updated.as_bytes(),
+                                ),
+                                color,
+                                tool_output_lines,
+                            ),
+                            Ok(false) => artifact_postcondition_warning(
+                                path,
+                                "post-edit bytes did not match the computed replacement",
+                                color,
+                                tool_output_lines,
+                            ),
+                            Err(_) => artifact_postcondition_warning(
+                                path,
+                                "post-edit bytes could not be verified",
+                                color,
+                                tool_output_lines,
+                            ),
+                        }
+                    };
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!("edited {path} ({delta_str} lines, now {new_lines} total){check}")
+                    format!(
+                        "edited {path} ({delta_str} lines, now {new_lines} total){artifact}{check}"
+                    )
                 }
                 Err(e) => format!("error writing {path}: {e}"),
             }
@@ -3346,6 +3776,9 @@ mod tests {
                 // Exact prompt recovery is an invariant, independent of the
                 // optional general-memory disclosure surface.
                 "prompt_read",
+                // Prompt-rooted work recovery is equally invariant and
+                // always present, even before any artifact has been written.
+                "artifact_read",
                 // #725: advertised ALWAYS (a discovery tool must always be
                 // present), so it too joins the base set with every flag off.
                 "tool_search",
@@ -4366,6 +4799,69 @@ mod tests {
         );
     }
 
+    /// The file tools retain the lexical OCAP residual above, but their
+    /// provenance hook must fail closed so it never labels an outside target as
+    /// a workspace artifact.
+    #[cfg(unix)]
+    #[test]
+    fn artifact_provenance_rejects_physical_symlink_escapes() {
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("existing"), b"x").unwrap();
+        let ws = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        assert!(artifact_path_is_physically_within_workspace(
+            ws.path(),
+            &ws.path().join("new/leaf.txt")
+        ));
+        assert!(!artifact_path_is_physically_within_workspace(
+            ws.path(),
+            &ws.path().join("link/existing")
+        ));
+        assert!(!artifact_path_is_physically_within_workspace(
+            ws.path(),
+            &ws.path().join("link/new-file")
+        ));
+
+        std::os::unix::fs::symlink(outside.path().join("missing"), ws.path().join("dangling"))
+            .unwrap();
+        assert!(!artifact_path_is_physically_within_workspace(
+            ws.path(),
+            &ws.path().join("dangling")
+        ));
+    }
+
+    #[test]
+    fn artifact_file_streaming_hash_and_postcondition_are_exact() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let bytes = vec![0x5a; 3 * 64 * 1024 + 17];
+        let path = ws.path().join("large.bin");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            artifact_preimage_state(&path, true),
+            super::super::artifact_hooks::ArtifactFileState::from_bytes(&bytes)
+        );
+        assert!(artifact_file_matches(&path, &bytes).unwrap());
+        let mut different = bytes.clone();
+        different[64 * 1024] ^= 1;
+        assert!(!artifact_file_matches(&path, &different).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_preimage_never_opens_non_regular_files() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let socket = ws.path().join("local.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(
+            artifact_preimage_state(&socket, true),
+            super::super::artifact_hooks::ArtifactFileState::unavailable(
+                "preimage_not_regular_file"
+            )
+        );
+    }
+
     // --- PR4: the `git` tool is presence-gated -----------------------------
 
     #[test]
@@ -4751,7 +5247,11 @@ mod tests {
 mod execute_tool_branch_tests {
     use super::super::NoMcp;
     use super::*;
+    use crate::agentic::{ArtifactReadContext, ArtifactReadRecord, PromptArtifactSink};
+    use crate::artifact::{ArtifactId, ArtifactKind, NewPromptArtifact};
     use crate::caveats::{Caveats, CountBound, Scope};
+    use crate::PromptId;
+    use std::sync::Mutex;
 
     /// fs read everywhere, fs write scoped to the workspace (skips the y/N
     /// confirm — the scoped preset is the consent), nothing else.
@@ -4764,6 +5264,94 @@ mod execute_tool_branch_tests {
             max_calls: CountBound::Unlimited,
             valid_for_generation: Scope::All,
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingArtifactSink {
+        artifacts: Mutex<Vec<NewPromptArtifact>>,
+    }
+
+    impl RecordingArtifactSink {
+        fn only_artifact(&self) -> NewPromptArtifact {
+            let artifacts = self.artifacts.lock().unwrap();
+            assert_eq!(artifacts.len(), 1, "expected exactly one artifact");
+            artifacts[0].clone()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.artifacts.lock().unwrap().is_empty()
+        }
+    }
+
+    impl PromptArtifactSink for RecordingArtifactSink {
+        fn append_artifact(
+            &self,
+            originating_prompt_id: PromptId,
+            objective_root_id: PromptId,
+            artifact: NewPromptArtifact,
+        ) -> anyhow::Result<ArtifactReadRecord> {
+            let mut artifacts = self.artifacts.lock().unwrap();
+            artifacts.push(artifact.clone());
+            Ok(ArtifactReadRecord {
+                id: ArtifactId::new(),
+                prompt_id: originating_prompt_id,
+                root_prompt_id: objective_root_id,
+                writer_fingerprint: "tool-test".to_string(),
+                seq: artifacts.len() as u64,
+                prev_hash: "previous".to_string(),
+                kind: format!("{:?}", artifact.kind()),
+                relation: format!("{:?}", artifact.relation()),
+                locator: artifact.locator().map(str::to_string),
+                body: artifact.body().map(str::to_string),
+                metadata: artifact.metadata().clone(),
+                ts_claim: 1,
+                artifact_hash: "hash".to_string(),
+            })
+        }
+    }
+
+    fn artifact_context() -> ArtifactReadContext<'static> {
+        let prompt = PromptId::new();
+        ArtifactReadContext::new(Some(prompt), Some(prompt), Some(prompt), None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_artifact_tool(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        build_check: Option<&str>,
+        sink: &RecordingArtifactSink,
+    ) -> String {
+        execute_tool_with_offload_and_prompt_and_artifacts(
+            name,
+            &args,
+            &ws.to_string_lossy(),
+            false,
+            20,
+            caveats,
+            &mut NoMcp,
+            build_check,
+            None, // note_sink
+            None, // recall_source
+            None, // memory_source
+            None, // prompt_context
+            Some(artifact_context()),
+            Some(sink),
+            None,  // permission_gate
+            None,  // exec_floor
+            None,  // git_tool
+            None,  // crew_runner
+            None,  // scratchpad_store
+            None,  // code_search
+            None,  // experience_store
+            None,  // step_ledger
+            false, // tool_offload
+            None,  // spill_store
+            None,  // persona_tools
+        )
+        .await
     }
 
     // --- PR4: the `git` tool arm in execute_tool ---------------------------
@@ -5719,6 +6307,164 @@ mod execute_tool_branch_tests {
         assert!(
             !ws.path().join("old.rs").exists(),
             "delete_file must remove the target file"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_file_records_digest_to_absent_transition() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let original = b"retired implementation\n";
+        std::fs::write(ws.path().join("old.rs"), original).unwrap();
+        let sink = RecordingArtifactSink::default();
+
+        let out = run_artifact_tool(
+            "delete_file",
+            serde_json::json!({"path": "old.rs"}),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            None,
+            &sink,
+        )
+        .await;
+
+        assert!(out.starts_with("deleted old.rs"), "got: {out}");
+        let artifact = sink.only_artifact();
+        assert_eq!(artifact.kind(), ArtifactKind::FileChange);
+        assert_eq!(artifact.locator(), Some("old.rs"));
+        assert_eq!(artifact.metadata()["operation"], "delete_file");
+        assert_eq!(artifact.metadata()["before"]["available"], true);
+        assert_eq!(artifact.metadata()["before"]["exists"], true);
+        assert_eq!(
+            artifact.metadata()["before"]["digest"],
+            blake3::hash(original).to_hex().to_string()
+        );
+        assert_eq!(artifact.metadata()["after"]["available"], true);
+        assert_eq!(artifact.metadata()["after"]["exists"], false);
+        assert!(artifact.metadata()["after"]["digest"].is_null());
+    }
+
+    #[tokio::test]
+    async fn write_only_authority_does_not_record_a_preimage_digest() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let original = b"secret preimage\n";
+        let replacement = b"public result\n";
+        std::fs::write(ws.path().join("state.txt"), original).unwrap();
+        let caveats = Caveats {
+            fs_read: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let sink = RecordingArtifactSink::default();
+
+        let out = run_artifact_tool(
+            "write_file",
+            serde_json::json!({
+                "path": "state.txt",
+                "content": std::str::from_utf8(replacement).unwrap(),
+            }),
+            ws.path(),
+            &caveats,
+            None,
+            &sink,
+        )
+        .await;
+
+        assert!(out.starts_with("wrote state.txt"), "got: {out}");
+        let artifact = sink.only_artifact();
+        assert_eq!(artifact.metadata()["before"]["available"], false);
+        assert_eq!(
+            artifact.metadata()["before"]["reason"],
+            "fs_read_not_granted"
+        );
+        assert!(artifact.metadata()["before"].get("digest").is_none());
+        assert_eq!(
+            artifact.metadata()["after"]["digest"],
+            blake3::hash(replacement).to_hex().to_string()
+        );
+        assert!(
+            !artifact
+                .metadata()
+                .to_string()
+                .contains(&blake3::hash(original).to_hex().to_string()),
+            "the preimage digest must not become a persistent read oracle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_check_mutation_is_not_recorded_as_the_governed_write_postimage() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let governed = b"governed bytes\n";
+        let build_hook = b"build-hook bytes\n";
+        let sink = RecordingArtifactSink::default();
+
+        let out = run_artifact_tool(
+            "write_file",
+            serde_json::json!({
+                "path": "target.txt",
+                "content": std::str::from_utf8(governed).unwrap(),
+            }),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            Some("printf 'build-hook bytes\\n' > target.txt"),
+            &sink,
+        )
+        .await;
+
+        assert!(out.contains("build check passed"), "got: {out}");
+        assert_eq!(
+            std::fs::read(ws.path().join("target.txt")).unwrap(),
+            build_hook
+        );
+        let artifact = sink.only_artifact();
+        assert_eq!(artifact.metadata()["operation"], "write_file");
+        assert_eq!(
+            artifact.metadata()["after"]["digest"],
+            blake3::hash(governed).to_hex().to_string(),
+            "the artifact must describe the tool's immediate verified write"
+        );
+        assert_ne!(
+            artifact.metadata()["after"]["digest"],
+            blake3::hash(build_hook).to_hex().to_string(),
+            "a later build hook mutation must not be attributed to write_file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn physical_symlink_escape_mutates_under_existing_policy_but_emits_no_artifact() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("target.txt"), "outside before\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+        let sink = RecordingArtifactSink::default();
+
+        let out = run_artifact_tool(
+            "write_file",
+            serde_json::json!({
+                "path": "link/target.txt",
+                "content": "outside after\n",
+            }),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            None,
+            &sink,
+        )
+        .await;
+
+        assert!(out.starts_with("wrote link/target.txt"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("target.txt")).unwrap(),
+            "outside after\n",
+            "this pins the existing lexical mutation policy"
+        );
+        assert!(
+            out.contains("no file-change artifact was recorded")
+                && out.contains("physical path could not be proven inside the workspace"),
+            "the physical escape must be surfaced honestly: {out}"
+        );
+        assert!(
+            sink.is_empty(),
+            "an out-of-workspace mutation must not be claimed as a workspace artifact"
         );
     }
 

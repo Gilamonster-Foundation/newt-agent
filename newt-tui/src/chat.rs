@@ -1,4 +1,5 @@
 use super::*;
+use newt_core::agentic::chat_complete_with_prompt_and_artifacts;
 
 #[cfg(feature = "rich-tui")]
 fn block_open_delim(input: &str) -> Option<&'static str> {
@@ -134,6 +135,39 @@ fn begin_model_prompt(
             ),
         ),
     }
+}
+
+/// Build the prompt-artifact ledger for an explicitly ephemeral session.
+///
+/// Persistent conversations use a [`StoreArtifactStore`] adapter per turn;
+/// keeping that adapter out of this session slot makes the no-SQLite guarantee
+/// of `--ephemeral` explicit. Calling this again after a conversation rotation
+/// drops the prior in-memory ledger and creates a fresh conversation fence.
+fn session_artifact_store(
+    ephemeral_session: bool,
+    conversation_id: &str,
+) -> anyhow::Result<Option<newt_core::agentic::SessionArtifactStore>> {
+    ephemeral_session
+        .then(|| newt_core::agentic::SessionArtifactStore::new(conversation_id))
+        .transpose()
+}
+
+/// Read-only repository identity observed at one edge of an inference turn.
+///
+/// This is evidence of a transition, never an attribution: the embedded git
+/// tool, a shell command, or another process could all have moved HEAD. The
+/// observation uses the turn's effective authority and does no worktree scan.
+fn git_head_snapshot(
+    tool: Option<&newt_git::LocalGitTool>,
+    caveats: &newt_core::Caveats,
+) -> Option<newt_git::HeadSnapshot> {
+    let tool = tool?;
+    let root = tool.root.to_string_lossy().into_owned();
+    if !newt_core::ScopeExt::permits(&caveats.fs_read, &root) {
+        return None;
+    }
+    let git_caveats = newt_core::git_caveats::GitCaveats::from_session(caveats);
+    tool.head_snapshot(&git_caveats).ok()
 }
 
 /// Text that may be labelled as the active task in derived memory artifacts.
@@ -705,6 +739,12 @@ pub(crate) fn run_chat(
     // for the session; it never opens SQLite. Reads are bound to the current
     // conversation id, so `/new` cannot recover an earlier task's prompts.
     let ephemeral_prompt_store = newt_core::agentic::SessionPromptStore::default();
+    // Ephemeral prompt artifacts have the same append/read semantics as their
+    // persistent SQLite peers, but remain process-local. The store is rebound
+    // whenever the active conversation rotates so artifacts cannot cross a
+    // `/new` or persona-created task boundary.
+    let mut ephemeral_artifact_store =
+        session_artifact_store(ephemeral_session, &active_conversation_id)?;
     // Step 26.4 (#583): session-scoped scratchpad <state> store. Session-lived;
     // cleared on /new so a fresh task never inherits stale state.
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
@@ -1229,6 +1269,67 @@ pub(crate) fn run_chat(
                             // false claim. The durable store keeps the raw
                             // turn record untouched.
                             memory.restore_turns(&wire_messages_to_turns(&outcome.messages));
+
+                            // Manual compaction bypasses the provider loop, so
+                            // root its checkpoint explicitly in the currently
+                            // active operator receipt. The slash command itself
+                            // is not model input and therefore does not mint a
+                            // new prompt receipt.
+                            let durable_artifact_store_owner =
+                                conversation_store.as_ref().map(|store| {
+                                    newt_core::agentic::StoreArtifactStore::new(
+                                        store,
+                                        active_conversation_id.clone(),
+                                    )
+                                });
+                            let artifact_source: Option<&dyn newt_core::agentic::ArtifactSource> =
+                                durable_artifact_store_owner
+                                    .as_ref()
+                                    .map(|store| store as &dyn newt_core::agentic::ArtifactSource)
+                                    .or_else(|| {
+                                        ephemeral_artifact_store.as_ref().map(|store| {
+                                            store as &dyn newt_core::agentic::ArtifactSource
+                                        })
+                                    });
+                            let artifact_sink: Option<&dyn newt_core::agentic::PromptArtifactSink> =
+                                durable_artifact_store_owner
+                                    .as_ref()
+                                    .map(|store| {
+                                        store as &dyn newt_core::agentic::PromptArtifactSink
+                                    })
+                                    .or_else(|| {
+                                        ephemeral_artifact_store.as_ref().map(|store| {
+                                            store as &dyn newt_core::agentic::PromptArtifactSink
+                                        })
+                                    });
+                            match (active_prompt_context.as_ref(), artifact_sink) {
+                                (Some(turn), Some(sink)) => {
+                                    let context =
+                                        newt_core::agentic::ArtifactReadContext::from_turn(
+                                            turn,
+                                            artifact_source,
+                                        );
+                                    if let Err(e) =
+                                        newt_core::agentic::record_manual_compaction_checkpoint(
+                                            sink, context, &outcome,
+                                        )
+                                    {
+                                        print_newt(
+                                            &format!(
+                                                "warning: could not record manual compaction checkpoint: {e}"
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                (None, Some(_)) => print_newt(
+                                    "warning: context was compacted without an active prompt receipt; no checkpoint artifact was recorded",
+                                    color,
+                                    verbose,
+                                ),
+                                _ => {}
+                            }
                         }
                         if let Some(ref notice) = outcome.notice {
                             print_newt(notice, color, verbose);
@@ -1560,6 +1661,8 @@ pub(crate) fn run_chat(
                             &mut session_opted_fresh,
                         );
                         active_prompt_context = None;
+                        ephemeral_artifact_store =
+                            session_artifact_store(ephemeral_session, &active_conversation_id)?;
                         // #1030: pre-title a `/start <title>` conversation by
                         // creating its (empty) record up front, so it appears in
                         // `/resume` with that title immediately; the first turn
@@ -1978,6 +2081,8 @@ pub(crate) fn run_chat(
                         }
                         if active_conversation_id != conversation_id_before {
                             active_prompt_context = None;
+                            ephemeral_artifact_store =
+                                session_artifact_store(ephemeral_session, &active_conversation_id)?;
                         }
                         // FR-4 (#1041): only warn when this command actually
                         // activated a (possibly new) persona — not on every
@@ -2442,6 +2547,32 @@ pub(crate) fn run_chat(
                         (None, Some(source)) => Some(source),
                         (None, None) => None,
                     };
+                    // One conversation-fenced artifact adapter serves both the
+                    // model-facing artifact_read tool and all lifecycle writers
+                    // for this turn. Persistent mode writes through SQLite;
+                    // ephemeral mode uses the session-local hash-chained ledger.
+                    let durable_artifact_store_owner = conversation_store.as_ref().map(|store| {
+                        newt_core::agentic::StoreArtifactStore::new(
+                            store,
+                            active_conversation_id.clone(),
+                        )
+                    });
+                    let artifact_source: Option<&dyn newt_core::agentic::ArtifactSource> = match (
+                        durable_artifact_store_owner.as_ref(),
+                        ephemeral_artifact_store.as_ref(),
+                    ) {
+                        (Some(store), _) => Some(store),
+                        (None, Some(store)) => Some(store),
+                        (None, None) => None,
+                    };
+                    let artifact_sink: Option<&dyn newt_core::agentic::PromptArtifactSink> = match (
+                        durable_artifact_store_owner.as_ref(),
+                        ephemeral_artifact_store.as_ref(),
+                    ) {
+                        (Some(store), _) => Some(store),
+                        (None, Some(store)) => Some(store),
+                        (None, None) => None,
+                    };
                     // Progressive-disclosure memory (Workstream A MVP, #319):
                     // wired ONLY under `[memory] disclosure = "index"`. Default
                     // (`frozen`) leaves `memory_source: None` so the loop is
@@ -2622,6 +2753,11 @@ pub(crate) fn run_chat(
                     let turn_hard = std::sync::atomic::AtomicBool::new(false);
                     let interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
                     // (tool_offload_on / scratchpad_on resolved at the turn head.)
+                    // Prompt artifacts observe repository identity for every
+                    // inference turn, independent of roadmap binding. This is
+                    // a read-only before/after fact, not an authorship claim.
+                    let artifact_head_before_turn =
+                        git_head_snapshot(session_git_tool.as_ref(), &turn_caveats);
                     // #1062 auto-capture: snapshot HEAD before the turn so the
                     // after-turn hook can tell whether the model committed. Only
                     // when a roadmap is active (a possibly-bound turn) — otherwise
@@ -2632,7 +2768,7 @@ pub(crate) fn run_chat(
                     let response =
                         with_interrupt_watch(interruptible, &turn_cancel, &turn_hard, || {
                             tokio::task::block_in_place(|| {
-                                rt.block_on(chat_complete_with_prompt(
+                                rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
                                         url: &inf_url,
                                         model: &inf_model,
@@ -2777,6 +2913,8 @@ pub(crate) fn run_chat(
                                     },
                                     active_prompt_context.as_ref(),
                                     prompt_source,
+                                    artifact_source,
+                                    artifact_sink,
                                     &mut mcp,
                                 ))
                             })
@@ -2784,6 +2922,38 @@ pub(crate) fn run_chat(
 
                     let elapsed = t0.elapsed();
                     erase_line();
+                    // Snapshot again regardless of the response shape. A tool
+                    // may have committed before cancellation or a later model
+                    // error; preserve that transition as unattributed evidence.
+                    let artifact_head_after_turn =
+                        git_head_snapshot(session_git_tool.as_ref(), &turn_caveats);
+                    if let (Some(sink), Some(turn)) =
+                        (artifact_sink, active_prompt_context.as_ref())
+                    {
+                        let context = newt_core::agentic::ArtifactReadContext::from_turn(
+                            turn,
+                            artifact_source,
+                        );
+                        if let Err(e) = newt_core::agentic::record_observed_head_transition(
+                            sink,
+                            context,
+                            artifact_head_before_turn
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.head.as_deref()),
+                            artifact_head_after_turn
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.head.as_deref()),
+                            artifact_head_after_turn
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.branch.as_deref()),
+                        ) {
+                            print_newt(
+                                &format!("warning: could not record observed git transition: {e}"),
+                                color,
+                                verbose,
+                            );
+                        }
+                    }
                     // Esc during the turn: the loop returned early with an empty
                     // reply. Abandon it — print a notice and skip all post-turn
                     // processing (no save, no gates, turn not counted).
@@ -2837,6 +3007,32 @@ pub(crate) fn run_chat(
                                         rt.block_on(retry_revert(workspace, mode, ledger))
                                     });
                                     if let Some(action) = action {
+                                        if let (Some(sink), Some(turn)) =
+                                            (artifact_sink, active_prompt_context.as_ref())
+                                        {
+                                            let context =
+                                                newt_core::agentic::ArtifactReadContext::from_turn(
+                                                    turn,
+                                                    artifact_source,
+                                                );
+                                            for path in &action.reverted {
+                                                if let Err(e) =
+                                                    newt_core::agentic::record_retry_revert_file(
+                                                        sink,
+                                                        context,
+                                                        &path.to_string_lossy(),
+                                                    )
+                                                {
+                                                    print_newt(
+                                                        &format!(
+                                                            "warning: could not record retry revert artifact: {e}"
+                                                        ),
+                                                        color,
+                                                        verbose,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         let extra = match retry_step(retry_budget) {
                                         RetryStep::Reprompt => {
                                             retry_budget -= 1;
@@ -2931,7 +3127,13 @@ pub(crate) fn run_chat(
                                     use newt_core::StepLedger;
                                     step_ledger.snapshot()
                                 };
-                                if let Err(e) = save_turn_if_persistent(
+                                // `take_compaction_record` is destructive: bind
+                                // it once, retain one digest input, then pass the
+                                // owned record to conversation storage. Append
+                                // the checkpoint only after that save succeeds.
+                                let compaction_record = memory.take_compaction_record();
+                                let compaction_artifact_summary = compaction_record.clone();
+                                let conversation_save = save_turn_if_persistent(
                                     conversation_store.as_ref(),
                                     &active_conversation_id,
                                     active_persona.as_ref(),
@@ -2950,7 +3152,7 @@ pub(crate) fn run_chat(
                                     // memory provider during sync_all persists as
                                     // its own turn record so restore can rehydrate
                                     // the prev-summary chain.
-                                    memory.take_compaction_record(),
+                                    compaction_record,
                                     // #713: the live scratchpad <state> snapshot,
                                     // persisted onto the conversation row so resume
                                     // re-hydrates it (working memory, not chained).
@@ -2959,12 +3161,75 @@ pub(crate) fn run_chat(
                                     // onto the conversation row so resume re-hydrates
                                     // it (working memory, not chained).
                                     &plan_snapshot,
-                                ) {
-                                    print_newt(
+                                );
+                                match conversation_save {
+                                    Ok(save_state) => {
+                                        if let TurnSaveState::DurableWithAncillaryWarning(error) =
+                                            save_state
+                                        {
+                                            print_newt(
+                                                &format!("warning: conversation ancillary save failed: {error}"),
+                                                color,
+                                                verbose,
+                                            );
+                                        }
+                                        // The transcript remains the source for
+                                        // reply text. Append its digest-only
+                                        // outcome only after the transcript save
+                                        // succeeds, never before durable state.
+                                        if let (Some(sink), Some(turn)) =
+                                            (artifact_sink, active_prompt_context.as_ref())
+                                        {
+                                            let context =
+                                                newt_core::agentic::ArtifactReadContext::from_turn(
+                                                    turn,
+                                                    artifact_source,
+                                                );
+                                            if let Err(e) = newt_core::agentic::record_turn_outcome(
+                                                sink,
+                                                context,
+                                                &reply,
+                                                metrics.usage,
+                                                metrics.end_reason,
+                                                metrics.elapsed_ms,
+                                            ) {
+                                                print_newt(
+                                                    &format!(
+                                                        "warning: could not record turn outcome artifact: {e}"
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                );
+                                            }
+                                        }
+                                        if let (Some(summary), Some(sink), Some(turn)) = (
+                                            compaction_artifact_summary.as_deref(),
+                                            artifact_sink,
+                                            active_prompt_context.as_ref(),
+                                        ) {
+                                            let context =
+                                                newt_core::agentic::ArtifactReadContext::from_turn(
+                                                    turn,
+                                                    artifact_source,
+                                                );
+                                            if let Err(e) = newt_core::agentic::record_memory_compaction_checkpoint(
+                                                sink, context, summary,
+                                            ) {
+                                                print_newt(
+                                                    &format!(
+                                                        "warning: could not record compaction checkpoint artifact: {e}"
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => print_newt(
                                         &format!("warning: conversation save failed: {e}"),
                                         color,
                                         verbose,
-                                    );
+                                    ),
                                 }
                                 // #1062 auto-capture: if this bound conversation's
                                 // turn produced a commit, attribute it to the bound
@@ -3111,6 +3376,52 @@ mod prompt_ingress_tests {
         let store =
             newt_core::ConversationStore::new(tmp.path().join("state"), &workspace, 100).unwrap();
         (tmp, store, newt_core::new_conversation_id())
+    }
+
+    #[test]
+    fn session_artifact_store_exists_only_for_ephemeral_mode() {
+        let conversation_id = newt_core::new_conversation_id();
+
+        assert!(session_artifact_store(false, &conversation_id)
+            .unwrap()
+            .is_none());
+        let ephemeral = session_artifact_store(true, &conversation_id)
+            .unwrap()
+            .expect("ephemeral ledger");
+        assert_eq!(ephemeral.conversation_id(), conversation_id);
+    }
+
+    #[test]
+    fn session_artifact_store_rebinds_when_conversation_rotates() {
+        let first_id = newt_core::new_conversation_id();
+        let second_id = newt_core::new_conversation_id();
+        let mut ledger = session_artifact_store(true, &first_id)
+            .unwrap()
+            .expect("first ledger");
+        assert_eq!(ledger.conversation_id(), first_id);
+
+        ledger = session_artifact_store(true, &second_id)
+            .unwrap()
+            .expect("replacement ledger");
+        assert_eq!(ledger.conversation_id(), second_id);
+        assert_ne!(ledger.conversation_id(), first_id);
+    }
+
+    #[test]
+    fn git_head_snapshot_requires_effective_workspace_read_authority() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tool = newt_git::LocalGitTool {
+            root: tmp.path().to_path_buf(),
+            author: newt_git::Author {
+                name: "test".into(),
+                email: "test@example.com".into(),
+            },
+            coauthor: None,
+        };
+        let mut denied = newt_core::Caveats::top();
+        denied.fs_read = newt_core::Scope::none();
+        assert!(git_head_snapshot(Some(&tool), &denied).is_none());
+        assert!(git_head_snapshot(None, &newt_core::Caveats::top()).is_none());
     }
 
     #[test]

@@ -1933,6 +1933,7 @@ fn post_compaction_continuation_reanchors_on_ground_truth() {
         d.contains("clean working tree does NOT mean no work happened"),
         "{d}"
     );
+    assert!(d.contains("artifact_read {\"address\":\"root\"}"), "{d}");
     assert!(d.contains("do not repeat work"), "{d}");
 }
 

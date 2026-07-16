@@ -145,6 +145,18 @@ pub struct StatusReport {
     pub clean: bool,
 }
 
+/// Cheap repository identity at one observation edge.
+///
+/// Unlike [`StatusReport`], this does not scan the index or worktree, and the
+/// commit id is the complete object id rather than a presentation prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadSnapshot {
+    /// Current branch short name, or `None` when detached/unborn.
+    pub branch: Option<String>,
+    /// Complete HEAD object id, or `None` on an unborn HEAD.
+    pub head: Option<String>,
+}
+
 /// One commit's metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitInfo {
@@ -201,6 +213,25 @@ impl GitEngine {
             }
             None => Ok(None),
         }
+    }
+
+    /// Read only the current branch and complete HEAD object id.
+    ///
+    /// This is the bounded observation primitive used by provenance hooks; it
+    /// deliberately avoids the O(worktree) status scan. Requires `read` just
+    /// like every other repository observation.
+    pub fn head_snapshot(&self, caps: &GitCaveats) -> Result<HeadSnapshot, GitError> {
+        if !caps.permits_read() {
+            return Err(GitError::Denied("read"));
+        }
+        let (branch, head) = match resolve_head(&self.repo.git_dir)? {
+            HeadState::Branch {
+                short_name, oid, ..
+            } => (Some(short_name), oid.map(|oid| oid.to_hex())),
+            HeadState::Detached { oid } => (None, Some(oid.to_hex())),
+            HeadState::Invalid => (None, None),
+        };
+        Ok(HeadSnapshot { branch, head })
     }
 
     /// `git status` — requires the `read` capability.
@@ -929,6 +960,15 @@ pub struct LocalGitTool {
     pub coauthor: Option<String>,
 }
 
+impl LocalGitTool {
+    /// Capability-governed, O(HEAD) repository identity for harness
+    /// provenance. Opening afresh matches [`GitTool::dispatch`]'s stateless
+    /// behavior and never invents read authority.
+    pub fn head_snapshot(&self, caps: &GitCaveats) -> Result<HeadSnapshot, GitError> {
+        GitEngine::open(&self.root)?.head_snapshot(caps)
+    }
+}
+
 /// Append the `coauthor` trailer to a commit message, unless the message
 /// already carries any `Co-authored-by:` line (case-insensitive) — the user's
 /// "skip if one already present" rule. Pure, for testing.
@@ -1241,6 +1281,22 @@ mod tests {
         assert!(s.clean, "fresh commit -> clean: {s:?}");
         assert_eq!(s.branch.as_deref(), Some("main"));
         assert!(s.head.is_some());
+    }
+
+    #[test]
+    fn head_snapshot_is_full_oid_cheap_identity_and_read_gated() {
+        let dir = repo_with_commit();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        let snapshot = eng.head_snapshot(&GitCaveats::read_only()).unwrap();
+        let commit = eng.log(&GitCaveats::read_only(), 1).unwrap().remove(0);
+
+        assert_eq!(snapshot.branch.as_deref(), Some("main"));
+        assert_eq!(snapshot.head.as_deref(), Some(commit.id.as_str()));
+        assert!(snapshot.head.as_ref().unwrap().len() > 7);
+        assert!(matches!(
+            eng.head_snapshot(&GitCaveats::none()),
+            Err(GitError::Denied("read"))
+        ));
     }
 
     #[test]

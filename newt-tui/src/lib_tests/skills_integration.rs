@@ -1685,6 +1685,38 @@ fn save_successful_turn_creates_and_reuses_active_conversation() {
     assert_eq!(record.turns[1].events, events);
 }
 
+#[test]
+fn partial_ancillary_save_keeps_reply_durable_and_reports_its_true_state() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let store = newt_core::ConversationStore::new(tmp.path(), workspace.path(), 100).unwrap();
+    let id = newt_core::new_conversation_id();
+
+    let state = save_successful_conversation_turn_with_ancillary(
+        &store,
+        &id,
+        None,
+        "persist the reply",
+        "reply is durable",
+        &[],
+        &[],
+        None,
+        None,
+        &std::collections::BTreeMap::new(),
+        &newt_core::PlanSnapshot::default(),
+        |_, _, _, _| Err(anyhow::anyhow!("injected ancillary failure")),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        state,
+        TurnSaveState::DurableWithAncillaryWarning(_)
+    ));
+    let record = store.load(&id).unwrap();
+    assert_eq!(record.turns.len(), 1);
+    assert_eq!(record.turns[0].assistant, "reply is durable");
+}
+
 /// #713: the per-turn save path threads the live scratchpad `<state>`
 /// snapshot onto the conversation row, so `store.load()` reads it back —
 /// the durable half of the resume fix (the restore half re-hydrates it).

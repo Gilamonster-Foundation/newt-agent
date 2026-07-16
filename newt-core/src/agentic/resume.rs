@@ -34,7 +34,9 @@ const RESUME_CONTEXT_DESCRIPTION: &str =
     "Recover what you were working on — returns this conversation's recent \
      turns, the active prompt address/root/digest, the submitted receipt's \
      origin and previous/parent/root links, your current <plan>, and saved \
-     <state>. Use prompt_read on a returned address for exact text. Use this \
+     <state>. Use prompt_read on a returned address for exact text. For \
+     prompt-rooted work, use artifact_read {\"address\":\"root\"} to recover \
+     the objective's artifact chain. Use this \
      after a resume or when you've lost the thread. No args.";
 
 /// The `resume_context` tool definition. Unlike `recall`, this is advertised
@@ -70,6 +72,10 @@ pub(crate) fn execute_resume_context(
     print_tool_call("resume_context", "", color);
 
     let mut out = String::from("Recovering what this conversation was working on.\n");
+    out.push_str(
+        "For prompt-rooted work, recover this objective's artifact chain with \
+         artifact_read {\"address\":\"root\"}.\n",
+    );
 
     if let Some(context) = prompt_context {
         if let Some(receipt) = context.active_receipt() {
@@ -214,6 +220,10 @@ mod tests {
             desc.contains("<plan>") && desc.contains("<state>"),
             "{desc}"
         );
+        assert!(
+            desc.contains("artifact_read {\"address\":\"root\"}"),
+            "{desc}"
+        );
     }
 
     #[test]
@@ -299,6 +309,10 @@ mod tests {
         );
         assert!(out.contains("recover chronological predecessor"), "{out}");
         assert!(out.contains("prompt_read"), "{out}");
+        assert!(
+            out.contains("artifact_read {\"address\":\"root\"}"),
+            "{out}"
+        );
         assert!(!out.contains("exact operator secret"), "{out}");
         assert!(!out.contains("please continue"), "{out}");
     }

@@ -96,6 +96,8 @@ mod markdown {
         }
     }
 }
+mod artifact_hooks;
+mod artifact_read;
 mod mcp;
 mod memory_fetch;
 mod note_sink;
@@ -132,6 +134,14 @@ mod trim;
 mod untrusted;
 mod warmup;
 
+pub use artifact_hooks::{
+    record_manual_compaction_checkpoint, record_memory_compaction_checkpoint,
+    record_observed_head_transition, record_retry_revert_file, record_turn_outcome,
+};
+pub use artifact_read::{
+    artifact_read_tool_definition, ArtifactPage, ArtifactReadContext, ArtifactReadRecord,
+    ArtifactSource, PromptArtifactSink, SessionArtifactStore, StoreArtifactStore,
+};
 pub use compress::{
     compress_user_initiated, compress_user_initiated_for_task, CompressCounters, CompressState,
     ManualCompressOutcome, SummarizeFn, SummarizeFuture, Summarizer, CONTINUATION_PREFIX,
@@ -232,9 +242,9 @@ pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
-    filter_advertised_tools, full_access_requested, in_plan_phase, ocap_disabled,
-    persona_tool_allowed, plan_phase_clamp, set_max_output_tokens, set_output_head_tokens,
-    tool_definitions, venv_cmd_prefix,
+    execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
+    full_access_requested, in_plan_phase, ocap_disabled, persona_tool_allowed, plan_phase_clamp,
+    set_max_output_tokens, set_output_head_tokens, tool_definitions, venv_cmd_prefix,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -927,6 +937,31 @@ pub async fn chat_complete_with_prompt(
     prompt_source: Option<&dyn PromptSource>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    chat_complete_with_prompt_and_artifacts(
+        ctx,
+        turn_prompt_context,
+        prompt_source,
+        None,
+        None,
+        mcp,
+    )
+    .await
+}
+
+/// Prompt- and artifact-aware variant used by the interactive harness.
+///
+/// The separate source/sink arguments keep legacy embedders source-compatible
+/// while letting persistent and ephemeral TUI sessions expose the same
+/// append-only artifact surface. Both implementations are bound to the active
+/// conversation before they reach this function.
+pub async fn chat_complete_with_prompt_and_artifacts(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    artifact_source: Option<&dyn artifact_read::ArtifactSource>,
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     // OpenAI-compatible endpoints speak a different wire format (request,
     // tool_calls, and usage shapes all differ), so they get their own loop.
     if ctx.kind == crate::BackendKind::Openai {
@@ -934,16 +969,25 @@ pub async fn chat_complete_with_prompt(
         // (gpt-5-codex et al., served only there); the default stays on
         // /v1/chat/completions.
         if responses_api_selected() {
-            return openai_responses_complete_with_prompt(
+            return openai_responses_complete_with_prompt_and_artifacts(
                 ctx,
                 turn_prompt_context,
                 prompt_source,
+                artifact_source,
+                artifact_sink,
                 mcp,
             )
             .await;
         }
-        return openai_chat_complete_with_prompt(ctx, turn_prompt_context, prompt_source, mcp)
-            .await;
+        return openai_chat_complete_with_prompt_and_artifacts(
+            ctx,
+            turn_prompt_context,
+            prompt_source,
+            artifact_source,
+            artifact_sink,
+            mcp,
+        )
+        .await;
     }
     // Step 25.4 (#568): capture the markdown decision before `ctx` is consumed
     // by the destructure (the destructures ignore it via `markdown: _`).
@@ -1066,6 +1110,8 @@ pub async fn chat_complete_with_prompt(
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
+    let artifact_context = turn_prompt_context
+        .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
 
@@ -1419,6 +1465,23 @@ pub async fn chat_complete_with_prompt(
                         prompt_context,
                         round > 0,
                     );
+                    // Persist provenance only after the transformed working
+                    // set and its continuation have been installed.
+                    record_compaction_artifact(
+                        artifact_sink,
+                        artifact_context,
+                        outcome.action,
+                        outcome.tokens_before,
+                        outcome.tokens_after,
+                        pipeline_budget,
+                        round,
+                        if trigger.hard_budget {
+                            "automatic_token_budget"
+                        } else {
+                            "automatic_message_count"
+                        },
+                        color,
+                    );
                 }
             }
         }
@@ -1615,6 +1678,17 @@ pub async fn chat_complete_with_prompt(
                                 step_ledger,
                                 prompt_context,
                                 round > 0,
+                            );
+                            record_compaction_artifact(
+                                artifact_sink,
+                                artifact_context,
+                                outcome.action,
+                                outcome.tokens_before,
+                                outcome.tokens_after,
+                                calibrate_down(new_budget.saturating_sub(tool_tokens_real), cal),
+                                round,
+                                "context_window_400",
+                                color,
                             );
                         }
                         cw_retries += 1;
@@ -2173,6 +2247,17 @@ pub async fn chat_complete_with_prompt(
                                 prompt_context,
                                 round > 0,
                             );
+                            record_compaction_artifact(
+                                artifact_sink,
+                                artifact_context,
+                                outcome.action,
+                                outcome.tokens_before,
+                                outcome.tokens_after,
+                                target,
+                                round,
+                                "silent_overflow_recovery",
+                                color,
+                            );
                         } else {
                             // N1: the retry must differ from the request that
                             // just returned empty — when compress was a no-op
@@ -2186,8 +2271,21 @@ pub async fn chat_complete_with_prompt(
                                 },
                             );
                             if fallback.chars_reclaimed > 0 {
+                                let tokens_before = estimate_tokens(&messages, estimation);
+                                let tokens_after = estimate_tokens(&fallback.messages, estimation);
                                 messages = fallback.messages;
                                 prompt_tracker.invalidate();
+                                record_compaction_artifact(
+                                    artifact_sink,
+                                    artifact_context,
+                                    CompressAction::Pruned,
+                                    tokens_before,
+                                    tokens_after,
+                                    target,
+                                    round,
+                                    "silent_overflow_structural_fallback",
+                                    color,
+                                );
                             }
                         }
                         accumulated_usage = merged;
@@ -2362,7 +2460,7 @@ pub async fn chat_complete_with_prompt(
                 // host-exec timeout ceiling. `is_cancelled` between rounds still
                 // catches the abandoned turn; this closes the *during-a-tool*
                 // window that a foreground child on the tty used to wedge.
-                let dispatch = execute_tool_with_offload_and_prompt(
+                let dispatch = execute_tool_with_offload_and_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
@@ -2380,6 +2478,8 @@ pub async fn chat_complete_with_prompt(
                     recall_source,
                     memory_source,
                     Some(prompt_context),
+                    artifact_context,
+                    artifact_sink,
                     // #263 prompted grants — same reborrow pattern as note_sink.
                     permission_gate
                         .as_deref_mut()
@@ -3070,6 +3170,7 @@ fn is_read_only_tool(name: &str) -> bool {
             | "save_note"
             | "recall"
             | "prompt_read"
+            | "artifact_read"
     )
 }
 
@@ -3092,7 +3193,10 @@ fn maybe_offload_tool_result(
     tool_offload: bool,
     spill_store: Option<&dyn spill::SpillStore>,
 ) -> String {
-    if matches!(name, "run_command" | "lifecycle" | "prompt_read") {
+    if matches!(
+        name,
+        "run_command" | "lifecycle" | "prompt_read" | "artifact_read"
+    ) {
         result
     } else {
         spill::maybe_offload(result, tool_offload, spill_store)
@@ -3105,6 +3209,38 @@ fn meaningful_workflow_progress(name: &str, result: &str) -> bool {
         "write_file" => result.starts_with("wrote ") || result.starts_with("✓ wrote "),
         "edit_file" => edit_result_changed_file(result),
         _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_compaction_artifact(
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    artifact_context: Option<artifact_read::ArtifactReadContext<'_>>,
+    action: CompressAction,
+    tokens_before: usize,
+    tokens_after: usize,
+    budget: usize,
+    round: usize,
+    reason: &str,
+    color: bool,
+) {
+    let (Some(sink), Some(context)) = (artifact_sink, artifact_context) else {
+        return;
+    };
+    if let Err(error) = artifact_hooks::record_compaction_checkpoint(
+        sink,
+        context,
+        action,
+        tokens_before,
+        tokens_after,
+        budget,
+        round,
+        reason,
+    ) {
+        print_harness_notice(
+            &format!("warning: failed to record compaction artifact: {error}"),
+            color,
+        );
     }
 }
 
@@ -3285,7 +3421,9 @@ fn post_compaction_continuation(
     );
     format!(
         "{} You are mid-task: the context above was just compacted, not \
-         completed.{instruction_clause}{plan_clause} Continue working — your \
+         completed.{instruction_clause}{plan_clause} For prompt-rooted work, \
+         recover the objective's artifact chain with artifact_read {{\"address\":\"root\"}} \
+         before deciding what remains. Continue working — your \
          next output should be the next concrete tool call (re-read any file \
          you are about to edit first, since full file contents were not \
          preserved). Before concluding ANYTHING about prior work, re-anchor on \
@@ -4024,6 +4162,25 @@ pub async fn openai_chat_complete_with_prompt(
     prompt_source: Option<&dyn PromptSource>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    openai_chat_complete_with_prompt_and_artifacts(
+        ctx,
+        turn_prompt_context,
+        prompt_source,
+        None,
+        None,
+        mcp,
+    )
+    .await
+}
+
+async fn openai_chat_complete_with_prompt_and_artifacts(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    artifact_source: Option<&dyn artifact_read::ArtifactSource>,
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
         url,
         model,
@@ -4125,6 +4282,8 @@ pub async fn openai_chat_complete_with_prompt(
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
+    let artifact_context = turn_prompt_context
+        .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
 
@@ -4367,6 +4526,21 @@ pub async fn openai_chat_complete_with_prompt(
                         prompt_context,
                         round > 0,
                     );
+                    record_compaction_artifact(
+                        artifact_sink,
+                        artifact_context,
+                        outcome.action,
+                        outcome.tokens_before,
+                        outcome.tokens_after,
+                        pipeline_budget,
+                        round,
+                        if trigger.hard_budget {
+                            "automatic_token_budget"
+                        } else {
+                            "automatic_message_count"
+                        },
+                        color,
+                    );
                 }
             }
         }
@@ -4515,6 +4689,20 @@ pub async fn openai_chat_complete_with_prompt(
                                 step_ledger,
                                 prompt_context,
                                 round > 0,
+                            );
+                            record_compaction_artifact(
+                                artifact_sink,
+                                artifact_context,
+                                outcome.action,
+                                outcome.tokens_before,
+                                outcome.tokens_after,
+                                calibrate_down(
+                                    (new_cap as usize).saturating_sub(tool_tokens_real),
+                                    cal,
+                                ),
+                                round,
+                                "context_window_400",
+                                color,
                             );
                         }
                         cw_retries += 1;
@@ -4930,7 +5118,7 @@ pub async fn openai_chat_complete_with_prompt(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool_with_offload_and_prompt(
+                execute_tool_with_offload_and_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
@@ -4948,6 +5136,8 @@ pub async fn openai_chat_complete_with_prompt(
                     recall_source,
                     memory_source,
                     Some(prompt_context),
+                    artifact_context,
+                    artifact_sink,
                     // #263 prompted grants — same reborrow pattern as note_sink.
                     permission_gate
                         .as_deref_mut()
@@ -5203,6 +5393,25 @@ pub async fn openai_responses_complete_with_prompt(
     prompt_source: Option<&dyn PromptSource>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    openai_responses_complete_with_prompt_and_artifacts(
+        ctx,
+        turn_prompt_context,
+        prompt_source,
+        None,
+        None,
+        mcp,
+    )
+    .await
+}
+
+async fn openai_responses_complete_with_prompt_and_artifacts(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    artifact_source: Option<&dyn artifact_read::ArtifactSource>,
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
         url,
         model,
@@ -5303,6 +5512,8 @@ pub async fn openai_responses_complete_with_prompt(
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
+    let artifact_context = turn_prompt_context
+        .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
     let (instructions, mut input) = build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
@@ -5508,7 +5719,7 @@ pub async fn openai_responses_complete_with_prompt(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool_with_offload_and_prompt(
+                execute_tool_with_offload_and_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
@@ -5523,6 +5734,8 @@ pub async fn openai_responses_complete_with_prompt(
                     recall_source,
                     memory_source,
                     Some(prompt_context),
+                    artifact_context,
+                    artifact_sink,
                     permission_gate
                         .as_deref_mut()
                         .map(|g| &mut *g as &mut dyn PermissionGate),
@@ -8822,6 +9035,12 @@ mod tool_round_cap_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "mod_tests/artifact_compaction_provenance.rs"]
+mod artifact_compaction_provenance_tests;
+#[cfg(test)]
+#[path = "mod_tests/artifact_provenance.rs"]
+mod artifact_provenance_tests;
+#[cfg(test)]
 #[path = "mod_tests/http_loop.rs"]
 mod http_loop_tests;
 
@@ -9571,7 +9790,7 @@ mod compression_loop_tests {
         // overhead so the first zero-cost prune remains observable on wire
         // before the summarizing pass; the >40% reclaim assertion below still
         // measures actual dispatched requests.
-        c.mid_loop_trim_tokens = Some(9_000);
+        c.mid_loop_trim_tokens = Some(9_400);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _streamed, _usage, hallu) = chat_complete(c, &mut NoMcp)
@@ -9787,7 +10006,7 @@ mod compression_loop_tests {
         // schemas. Leave a sliver of room for the static fallback marker so
         // this test continues to isolate summarizer failure rather than an
         // irreducible-window refusal.
-        c.mid_loop_trim_tokens = Some(5_200);
+        c.mid_loop_trim_tokens = Some(5_600);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -9969,6 +10188,36 @@ mod compression_loop_tests {
             MemMessage::assistant("sketched in my head"),
             MemMessage::user(TASK),
         ]
+    }
+
+    /// Leave exactly one estimated token of room for the initial request. This
+    /// keeps the hard-budget regressions coupled to the live advertised tool
+    /// catalog rather than a stale numeric snapshot of its schema overhead.
+    fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
+        let tools = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false,
+        );
+        let mut wire_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({"role": message.role.as_str(), "content": message.content})
+            })
+            .collect();
+        let receipt = crate::TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        );
+        prompt_read::ensure_active_prompt_card(
+            &mut wire_messages,
+            prompt_read::PromptReadContext::new(Some(&receipt), task, None),
+        );
+        estimate_request_tokens(
+            &wire_messages,
+            Some(&tools),
+            crate::tokens::TokenEstimation::default(),
+        )
+        .saturating_add(1)
     }
 
     /// Drive `rounds` tool rounds under count-only compression pressure.
@@ -10470,7 +10719,7 @@ mod compression_loop_tests {
         let uri = server.uri();
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
-        c.mid_loop_trim_tokens = Some(14_050); // hard, but both prompt copies + catalog fit
+        c.mid_loop_trim_tokens = Some(initial_request_budget(&messages, TASK));
         c.compress_state = Some(&mut compress_state);
         let err = chat_complete(c, &mut NoMcp)
             .await
@@ -10627,6 +10876,36 @@ mod observation_hook_tests {
         }
     }
 
+    /// Set a hard gate immediately above the live initial wire request. The
+    /// following tool result must then exercise the preflight refusal rather
+    /// than making this regression depend on a frozen catalog size.
+    fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
+        let tools = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false,
+        );
+        let mut wire_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({"role": message.role.as_str(), "content": message.content})
+            })
+            .collect();
+        let receipt = crate::TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        );
+        prompt_read::ensure_active_prompt_card(
+            &mut wire_messages,
+            prompt_read::PromptReadContext::new(Some(&receipt), task, None),
+        );
+        estimate_request_tokens(
+            &wire_messages,
+            Some(&tools),
+            crate::tokens::TokenEstimation::default(),
+        )
+        .saturating_add(1)
+    }
+
     fn body_json(req: &Request) -> serde_json::Value {
         serde_json::from_slice(&req.body).unwrap_or_default()
     }
@@ -10779,7 +11058,7 @@ mod observation_hook_tests {
         let mut observations: Vec<RoundObservation> = Vec::new();
         let mut hook = |obs: RoundObservation| observations.push(obs);
         let mut c = ctx(&uri, &messages, &caveats);
-        c.mid_loop_trim_tokens = Some(14_050);
+        c.mid_loop_trim_tokens = Some(initial_request_budget(&messages, "do the thing"));
         c.compress_state = Some(&mut compress_state);
         c.on_round_usage = Some(&mut hook);
         let err = chat_complete(c, &mut NoMcp)

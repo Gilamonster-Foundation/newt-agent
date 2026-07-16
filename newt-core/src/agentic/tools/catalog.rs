@@ -307,9 +307,10 @@ pub(crate) fn merged_tool_definitions(
     };
     // #894: everything after the base array is [`EXTENDED_TOOL_REGISTRY`],
     // advertised in declaration order when its gate is satisfied. The always-on
-    // tools (resume_context #714 / tool_search #725 / get_context_remaining #727
-    // / request_user_input #728 / lifecycle #891) carry `Gate::Always` and ride
-    // every session, degrading honestly when their backing source is `None`; the
+    // tools (resume_context #714 / prompt_read / artifact_read / tool_search
+    // #725 / get_context_remaining #727 / request_user_input #728 / lifecycle
+    // #891) carry `Gate::Always` and ride every session, degrading honestly
+    // when their backing source is `None`; the
     // rest are gated on the matching injected `with_*` capability (git PR4,
     // compose_roster+crew #479, scratchpad #583, code_search #582, experiential
     // #585, scheduled #586/#715/#716). Adding a tool is one `ToolSpec`, which
@@ -335,9 +336,10 @@ pub(crate) fn merged_tool_definitions(
 }
 
 /// The always-on infra tools ([`Gate::Always`] in [`EXTENDED_TOOL_REGISTRY`]:
-/// resume_context / tool_search / get_context_remaining / request_user_input /
-/// lifecycle). The loop depends on these every round, so a persona allow-list
-/// can NEVER fence them off — they ride every session regardless of `tools:`.
+/// resume_context / prompt_read / artifact_read / tool_search /
+/// get_context_remaining / request_user_input / lifecycle). The loop depends
+/// on these every round, so a persona allow-list can NEVER fence them off —
+/// they ride every session regardless of `tools:`.
 fn is_always_on_tool(name: &str) -> bool {
     EXTENDED_TOOL_REGISTRY
         .iter()
@@ -503,7 +505,7 @@ pub(super) struct ToolSpec {
 /// byte-for-byte from the previous hand-written push ladder.
 pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
     // Always-on (degrade gracefully when their source is None) —
-    // #714 / #725 / #727 / #728 / #891.
+    // #714 / prompt recovery / artifact recovery / #725 / #727 / #728 / #891.
     ToolSpec {
         name: "resume_context",
         definition: super::super::resume::resume_context_tool_definition,
@@ -512,6 +514,11 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
     ToolSpec {
         name: "prompt_read",
         definition: super::super::prompt_read::prompt_read_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "artifact_read",
+        definition: super::super::artifact_read::artifact_read_tool_definition,
         gate: Gate::Always,
     },
     ToolSpec {

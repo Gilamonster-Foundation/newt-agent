@@ -8,6 +8,7 @@ pub mod agent_identity;
 pub mod agentic;
 pub mod agents;
 pub mod api_surface;
+pub mod artifact;
 pub mod backend_probe;
 pub mod caveats;
 pub mod classifiers;
@@ -99,6 +100,10 @@ pub use agentic::{
 };
 pub use agents::AgentsProvider;
 pub use api_surface::ApiSurfaceProvider;
+pub use artifact::{
+    ArtifactId, ArtifactKind, ArtifactRelation, NewPromptArtifact, PromptArtifact,
+    MAX_ARTIFACT_BODY_BYTES, MAX_ARTIFACT_LOCATOR_BYTES, MAX_ARTIFACT_METADATA_BYTES,
+};
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use classifiers::{
     classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,

@@ -37,6 +37,7 @@ mod setup;
 mod setup_tui;
 mod wizard;
 
+use anyhow::Context as _;
 use mcp::Mcp;
 // Step 9.7: the agentic loop (ChatCtx / chat_complete / execute_tool and their
 // dependency closure) lives in `newt_core::agentic` now — the TUI is a thin
@@ -51,9 +52,7 @@ use chat::run_chat;
 pub(crate) use chat::{InputSurface, ReadOutcome};
 pub use color::color_supported;
 use color::{color_enabled_for, resolve_color_mode};
-use newt_core::agentic::{
-    chat_complete_with_prompt, print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT,
-};
+use newt_core::agentic::{print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT};
 #[cfg(test)]
 use prompt::expand_prompt_tokens;
 #[cfg(feature = "rich-tui")]
@@ -2187,6 +2186,10 @@ fn verify_gate_summary(
 struct RevertAction {
     banner: String,
     corrective: String,
+    /// Workspace-relative paths actually restored by the governed write
+    /// ledger. Used to append compensating prompt artifacts without claiming
+    /// access to the restored bytes.
+    reverted: Vec<std::path::PathBuf>,
 }
 
 /// What the loop should do after a revert, given the remaining re-prompt budget.
@@ -2269,7 +2272,11 @@ async fn retry_revert(
         "retry: reverted {} file(s) newt wrote this turn to pre-turn state:{detail}",
         outcome.reverted.len()
     );
-    Some(RevertAction { banner, corrective })
+    Some(RevertAction {
+        banner,
+        corrective,
+        reverted: outcome.reverted,
+    })
 }
 
 /// The inference backend the TUI session should talk to: endpoint, model,
@@ -3523,6 +3530,22 @@ fn conversation_title_from_task(task: &str) -> String {
     }
 }
 
+/// What the per-turn persistence seam knows after attempting a save.
+///
+/// A reply row is appended before scratchpad/plan/claim bookkeeping. Those
+/// later updates are useful but must not erase the fact that the transcript is
+/// already durable; callers use this distinction to append digest-only
+/// provenance honestly.
+#[derive(Debug)]
+enum TurnSaveState {
+    /// The reply and all ancillary session state were saved durably.
+    Durable,
+    /// The reply is durable, but a later ancillary update failed.
+    DurableWithAncillaryWarning(anyhow::Error),
+    /// `--ephemeral`: no SQLite row exists, but session-local state is live.
+    Ephemeral,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn save_successful_conversation_turn(
     store: &newt_core::ConversationStore,
@@ -3536,7 +3559,61 @@ fn save_successful_conversation_turn(
     compaction: Option<String>,
     scratchpad: &std::collections::BTreeMap<String, String>,
     plan: &newt_core::PlanSnapshot,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TurnSaveState> {
+    save_successful_conversation_turn_with_ancillary(
+        store,
+        conversation_id,
+        active_persona,
+        task,
+        reply,
+        events,
+        phantom_reaches,
+        usage,
+        compaction,
+        scratchpad,
+        plan,
+        |store, conversation_id, scratchpad, plan| {
+            // #713: snapshot the live scratchpad <state> onto the conversation
+            // row so a later interrupt + auto-resume can re-hydrate it.
+            store
+                .update_scratchpad(conversation_id, scratchpad)
+                .context("reply persisted but scratchpad snapshot could not be updated")?;
+            // #715: snapshot the live plan ledger onto the conversation row,
+            // alongside the scratchpad and under the same discipline.
+            store
+                .update_plan_snapshot(conversation_id, plan)
+                .context("reply persisted but plan snapshot could not be updated")?;
+            // #1030: refresh this process's live-owner heartbeat every turn.
+            store
+                .heartbeat(conversation_id)
+                .context("reply persisted but conversation heartbeat could not be refreshed")
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_successful_conversation_turn_with_ancillary<F>(
+    store: &newt_core::ConversationStore,
+    conversation_id: &str,
+    active_persona: Option<&Persona>,
+    task: &str,
+    reply: &str,
+    events: &[newt_core::ToolEvent],
+    phantom_reaches: &[newt_core::PhantomReach],
+    usage: Option<newt_core::TokenUsage>,
+    compaction: Option<String>,
+    scratchpad: &std::collections::BTreeMap<String, String>,
+    plan: &newt_core::PlanSnapshot,
+    ancillary: F,
+) -> anyhow::Result<TurnSaveState>
+where
+    F: FnOnce(
+        &newt_core::ConversationStore,
+        &str,
+        &std::collections::BTreeMap<String, String>,
+        &newt_core::PlanSnapshot,
+    ) -> anyhow::Result<()>,
+{
     // The id is pre-assigned for the whole session (issue #220), so the first
     // turn creates the record with that id; later turns just append.
     // `exists()?` — an error must NOT read as "absent": routing a transient
@@ -3572,28 +3649,17 @@ fn save_successful_conversation_turn(
         usage.map(|u| u.input_tokens),
         usage.map(|u| u.output_tokens),
     )?;
-    // #713: snapshot the live scratchpad <state> onto the conversation row so a
-    // later interrupt + auto-resume can re-hydrate it. Working memory, not
-    // provenance: it rides the conversation row (NOT a turn) and never enters
-    // the §6 content chain. Saved every turn so the row always carries the most
-    // recent <state>. Runs AFTER append so the row is guaranteed to exist.
-    store.update_scratchpad(conversation_id, scratchpad)?;
-    // #715: snapshot the live plan ledger onto the conversation row, alongside
-    // the scratchpad and under the same discipline — working memory, not
-    // provenance (rides the conversation row, never enters the §6 content
-    // chain). Saved every turn so the row always carries the most recent plan.
-    store.update_plan_snapshot(conversation_id, plan)?;
-    // #1030: refresh this process's live_owners heartbeat every turn — the
-    // freshness signal a cross-host / post-reboot liveness check reads. A no-op
-    // if this process does not hold the claim.
-    store.heartbeat(conversation_id)
+    match ancillary(store, conversation_id, scratchpad, plan) {
+        Ok(()) => Ok(TurnSaveState::Durable),
+        Err(error) => Ok(TurnSaveState::DurableWithAncillaryWarning(error)),
+    }
 }
 
 /// The run loop's per-turn save seam (17.7): persistent sessions route to
 /// [`save_successful_conversation_turn`]; an ephemeral session has no store
-/// (`None`) and this is a no-op — no row created, no turn appended, no error.
-/// A compaction record (18.5) taken in an ephemeral session is dropped with
-/// the rest of the turn: nothing persists, so there is nothing to rehydrate.
+/// (`None`) and this makes no SQLite write. Its caller still receives
+/// [`TurnSaveState::Ephemeral`] so it can maintain the process-local prompt
+/// artifact ledger, including a compaction checkpoint when appropriate.
 #[allow(clippy::too_many_arguments)] // mirrors save_successful_conversation_turn
 fn save_turn_if_persistent(
     store: Option<&newt_core::ConversationStore>,
@@ -3607,7 +3673,7 @@ fn save_turn_if_persistent(
     compaction: Option<String>,
     scratchpad: &std::collections::BTreeMap<String, String>,
     plan: &newt_core::PlanSnapshot,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TurnSaveState> {
     match store {
         Some(store) => save_successful_conversation_turn(
             store,
@@ -3622,7 +3688,7 @@ fn save_turn_if_persistent(
             scratchpad,
             plan,
         ),
-        None => Ok(()),
+        None => Ok(TurnSaveState::Ephemeral),
     }
 }
 
