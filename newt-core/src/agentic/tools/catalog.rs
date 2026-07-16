@@ -510,6 +510,11 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
         gate: Gate::Always,
     },
     ToolSpec {
+        name: "prompt_read",
+        definition: super::super::prompt_read::prompt_read_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
         name: "tool_search",
         definition: super::super::tool_search::tool_search_tool_definition,
         gate: Gate::Always,

@@ -57,6 +57,97 @@ pub(crate) enum ReadOutcome {
     Fatal(String),
 }
 
+/// Provenance attached to a line entering the model-input branch.
+///
+/// A corrective retry is deliberately not represented as another human line:
+/// it carries the prompt context whose operator root authorized the original
+/// turn. That distinction keeps retries out of readline history and prevents a
+/// harness-generated string such as `/exit` or `! rm ...` from being interpreted
+/// as operator input by the TUI interceptors.
+#[derive(Debug, Clone)]
+enum ModelInputOrigin {
+    Operator,
+    HarnessRetry {
+        parent: Box<newt_core::TurnPromptContext>,
+    },
+}
+
+impl ModelInputOrigin {
+    fn is_operator(&self) -> bool {
+        matches!(self, Self::Operator)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingRetry {
+    text: String,
+    parent: Box<newt_core::TurnPromptContext>,
+}
+
+/// Mint the prompt receipt that must exist before inference or tool work.
+///
+/// Persistent sessions fail closed when the durable transaction fails. An
+/// ephemeral session mints the same typed receipt/context in memory, without
+/// constructing or touching a [`ConversationStore`](newt_core::ConversationStore).
+#[derive(Clone, Copy)]
+struct PromptIngress<'a> {
+    durable: Option<&'a newt_core::ConversationStore>,
+    ephemeral: &'a newt_core::agentic::SessionPromptStore,
+}
+
+fn begin_model_prompt(
+    ingress: PromptIngress<'_>,
+    conversation_id: &str,
+    title: &str,
+    persona: Option<&str>,
+    raw: &[u8],
+    model: &[u8],
+    origin: &ModelInputOrigin,
+) -> anyhow::Result<newt_core::TurnPromptContext> {
+    match (ingress.durable, origin) {
+        (Some(store), ModelInputOrigin::Operator) => store.begin_prompt(
+            conversation_id,
+            title,
+            persona,
+            newt_core::NewPrompt::operator(raw.to_vec(), model.to_vec()),
+        ),
+        (Some(store), ModelInputOrigin::HarnessRetry { parent }) => store.begin_prompt(
+            conversation_id,
+            title,
+            persona,
+            newt_core::NewPrompt::harness_retry(
+                raw.to_vec(),
+                model.to_vec(),
+                parent.submitted_prompt().id(),
+            ),
+        ),
+        (None, ModelInputOrigin::Operator) => ingress.ephemeral.begin_prompt(
+            conversation_id,
+            newt_core::NewPrompt::operator(raw.to_vec(), model.to_vec()),
+        ),
+        (None, ModelInputOrigin::HarnessRetry { parent }) => ingress.ephemeral.begin_prompt(
+            conversation_id,
+            newt_core::NewPrompt::harness_retry(
+                raw.to_vec(),
+                model.to_vec(),
+                parent.submitted_prompt().id(),
+            ),
+        ),
+    }
+}
+
+/// Text that may be labelled as the active task in derived memory artifacts.
+/// A harness retry is a submitted attempt, not new operator authority, so
+/// summaries must remain anchored to the validated operator receipt.
+fn active_operator_task<'a>(
+    context: Option<&'a newt_core::TurnPromptContext>,
+    submitted_task: &'a str,
+) -> &'a str {
+    context
+        .and_then(|context| context.active_operator_prompt().model_text_utf8().ok())
+        .unwrap_or(submitted_task)
+}
+
 /// The severable input boundary between the chat loop and the editor widget.
 ///
 /// `run_chat` drives the conversation through this trait so the *input widget*
@@ -609,6 +700,11 @@ pub(crate) fn run_chat(
     // the model can losslessly recover a dropped detail via memory_fetch. A
     // SEPARATE store from `spill_store` (own id space). Discarded at `/new`.
     let compaction_store = newt_core::SessionSpillStore::default();
+    // Ephemeral sessions still need durable-within-the-process prompt
+    // provenance. This is the receipt minting authority and exact-text source
+    // for the session; it never opens SQLite. Reads are bound to the current
+    // conversation id, so `/new` cannot recover an earlier task's prompts.
+    let ephemeral_prompt_store = newt_core::agentic::SessionPromptStore::default();
     // Step 26.4 (#583): session-scoped scratchpad <state> store. Session-lived;
     // cleared on /new so a fresh task never inherits stale state.
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
@@ -672,6 +768,11 @@ pub(crate) fn run_chat(
     // #1030: the roadmap this session is authoring/viewing (via /roadmap new|use);
     // /roadmap add and /tree operate on it. None until one is created or selected.
     let mut active_roadmap_id: Option<String> = None;
+    // The most recently submitted receipt in the active conversation. Restore
+    // rehydrates this metadata for addressability only; it never queues the
+    // prompt for execution. A new operator submission replaces it before the
+    // model sees that turn.
+    let mut active_prompt_context: Option<newt_core::TurnPromptContext> = None;
 
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
@@ -687,6 +788,7 @@ pub(crate) fn run_chat(
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store as &dyn newt_core::ScratchpadStore,
             step_ledger: &step_ledger as &dyn newt_core::StepLedger,
+            active_prompt_context: &mut active_prompt_context,
         };
         match &session_start {
             // NEWT_CONVERSATION_ID: an explicit override — errors are hard
@@ -741,6 +843,7 @@ pub(crate) fn run_chat(
                     &mut compress_state,
                     &mut session_opted_fresh,
                 );
+                active_prompt_context = None;
                 {
                     use newt_core::ScratchpadStore;
                     scratchpad_store.clear();
@@ -770,7 +873,7 @@ pub(crate) fn run_chat(
         .filter(|p| p.enables("retry"))
         .map(|p| p.retry_knobs().max_retries)
         .unwrap_or(0);
-    let mut pending_retry: Option<String> = None;
+    let mut pending_retry: Option<PendingRetry> = None;
     let mut retry_budget: u32 = 0;
 
     // PR4 (#461): the embedded `git` tool. Built once per session and injected
@@ -813,11 +916,16 @@ pub(crate) fn run_chat(
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before reading even starts.
-        let outcome = if let Some(corrective) = pending_retry.take() {
+        let (outcome, model_input_origin) = if let Some(retry) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
             // decremented when it was queued.
-            ReadOutcome::Line(corrective)
+            (
+                ReadOutcome::Line(retry.text),
+                ModelInputOrigin::HarnessRetry {
+                    parent: retry.parent,
+                },
+            )
         } else {
             // A fresh user turn: reset the re-prompt budget for it.
             retry_budget = retry_max;
@@ -832,7 +940,7 @@ pub(crate) fn run_chat(
             // Refresh the rich status header's model @ endpoint each turn (#527)
             // so a mid-session `/model` switch is reflected (no-op for lean).
             surface.set_runtime_context(&inf_model, &inf_url, token_gauge);
-            surface.read_line(&prompt)?
+            (surface.read_line(&prompt)?, ModelInputOrigin::Operator)
         };
         match outcome {
             ReadOutcome::Line(line) => {
@@ -842,7 +950,9 @@ pub(crate) fn run_chat(
                 if task.is_empty() {
                     continue;
                 }
-                surface.add_history(&task);
+                if model_input_origin.is_operator() {
+                    surface.add_history(&task);
+                }
                 println!();
                 // `! <cmd>` — human-only host shell-escape (interactive, inherited
                 // stdio: prompts + browser SAML work). Intercepted before the
@@ -854,7 +964,12 @@ pub(crate) fn run_chat(
                 // each `\`+newline to a bare newline, but the shell should do its
                 // own line-continuation, so a multi-line `! cmd \` joins into one
                 // command (`$SHELL -c` sees the backslash-newline intact).
-                if let Some(rest) = bang_command(line.trim()) {
+                let human_bang = if model_input_origin.is_operator() {
+                    bang_command(line.trim())
+                } else {
+                    None
+                };
+                if let Some(rest) = human_bang {
                     if bang_escape_enabled {
                         run_bang_escape(rest, color, verbose);
                     } else {
@@ -867,7 +982,7 @@ pub(crate) fn run_chat(
                     println!();
                     continue;
                 }
-                if task.starts_with('/') {
+                if model_input_origin.is_operator() && task.starts_with('/') {
                     // Per-command help, intercepted before ANY command runs so
                     // every command answers `--help`/`-h`/`help` (and `/help
                     // <cmd>`) uniformly — even the ones handled inline below.
@@ -1072,9 +1187,27 @@ pub(crate) fn run_chat(
                             Some(mem_budget),
                             color,
                         );
+                        let active_task =
+                            Some(active_operator_task(active_prompt_context.as_ref(), ""))
+                                .filter(|task| !task.is_empty())
+                                .or_else(|| {
+                                    wire.iter()
+                                        .rev()
+                                        .find(|message| {
+                                            message.get("role").and_then(serde_json::Value::as_str)
+                                                == Some("user")
+                                        })
+                                        .and_then(|message| {
+                                            message
+                                                .get("content")
+                                                .and_then(serde_json::Value::as_str)
+                                        })
+                                })
+                                .unwrap_or("");
                         let outcome = tokio::task::block_in_place(|| {
-                            rt.block_on(newt_core::compress_user_initiated(
+                            rt.block_on(newt_core::compress_user_initiated_for_task(
                                 &wire,
+                                active_task,
                                 focus.as_deref(),
                                 Some(&*summarizer),
                                 &mut compress_state,
@@ -1386,20 +1519,23 @@ pub(crate) fn run_chat(
                             }
                         }
                         let outgoing_id = active_conversation_id.clone();
-                        // #1030: was the outgoing conversation actually persisted
-                        // (a turn saved)? Drives both the `end_reason` marking and
-                        // the close-out message — no "saved / /resume" promise for
-                        // an empty or ephemeral conversation.
-                        let outgoing_persisted = conversation_store
+                        // #1030: does the outgoing conversation have a durable
+                        // row (an accepted prompt receipt, a completed turn, or
+                        // an explicitly titled `/start`)? Prompt-only
+                        // conversations survive failed/cancelled inference and
+                        // remain resumable. Only an unrecorded or ephemeral
+                        // conversation has no row.
+                        let outgoing_durable = conversation_store
                             .as_ref()
                             .is_some_and(|store| store.exists(&outgoing_id).unwrap_or(false));
                         if let Some(store) = conversation_store.as_ref() {
                             // `/start` leaves the outgoing conversation OPEN so it
                             // stays resumable via `/resume`; the finalizers mark it
                             // ended (`end_reason`, shown as ✓ in `/resume`). Only
-                            // when actually persisted — an empty conversation (no
-                            // turn saved yet) has no row to resolve.
-                            if reason != "start" && outgoing_persisted {
+                            // when durable content exists — a truly untouched
+                            // conversation has no row to resolve, while a
+                            // prompt-only conversation does.
+                            if reason != "start" && outgoing_durable {
                                 if let Err(e) = store.end_conversation(&outgoing_id, reason) {
                                     print_newt(
                                         &format!("warning: could not mark conversation ended: {e}"),
@@ -1423,6 +1559,7 @@ pub(crate) fn run_chat(
                             &mut compress_state,
                             &mut session_opted_fresh,
                         );
+                        active_prompt_context = None;
                         // #1030: pre-title a `/start <title>` conversation by
                         // creating its (empty) record up front, so it appears in
                         // `/resume` with that title immediately; the first turn
@@ -1461,7 +1598,7 @@ pub(crate) fn run_chat(
                             use newt_core::StepLedger;
                             step_ledger.clear();
                         }
-                        let msg = close_out_message(reason, &started, outgoing_persisted);
+                        let msg = close_out_message(reason, &started, outgoing_durable);
                         print_newt(&msg, color, verbose);
                         surface.save_history();
                         println!();
@@ -1551,6 +1688,7 @@ pub(crate) fn run_chat(
                                     scratchpad: &scratchpad_store
                                         as &dyn newt_core::ScratchpadStore,
                                     step_ledger: &step_ledger as &dyn newt_core::StepLedger,
+                                    active_prompt_context: &mut active_prompt_context,
                                 };
                                 match handle_conversation_command(&task, &mut conversation_ctx) {
                                     Ok(msg) => print_newt(&msg, color, verbose),
@@ -1677,6 +1815,8 @@ pub(crate) fn run_chat(
                                                         as &dyn newt_core::ScratchpadStore,
                                                     step_ledger: &step_ledger
                                                         as &dyn newt_core::StepLedger,
+                                                    active_prompt_context:
+                                                        &mut active_prompt_context,
                                                 };
                                                 match resume_session_conversation(
                                                     &mut resume_ctx,
@@ -1774,6 +1914,8 @@ pub(crate) fn run_chat(
                                                                 as &dyn newt_core::ScratchpadStore,
                                                             step_ledger: &step_ledger
                                                                 as &dyn newt_core::StepLedger,
+                                                            active_prompt_context:
+                                                                &mut active_prompt_context,
                                                         };
                                                         match resume_session_conversation(
                                                             &mut ctx, &target,
@@ -1821,6 +1963,7 @@ pub(crate) fn run_chat(
                         // (clear / set without --keep-context), so the per-session
                         // plan path follows (issue #220).
                         let persona_name_before = active_persona.as_ref().map(|p| p.name.clone());
+                        let conversation_id_before = active_conversation_id.clone();
                         match handle_persona_command(
                             &task,
                             workspace,
@@ -1832,6 +1975,9 @@ pub(crate) fn run_chat(
                         ) {
                             Ok(msg) => print_newt(&msg, color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        if active_conversation_id != conversation_id_before {
+                            active_prompt_context = None;
                         }
                         // FR-4 (#1041): only warn when this command actually
                         // activated a (possibly new) persona — not on every
@@ -1951,10 +2097,42 @@ pub(crate) fn run_chat(
                     // mode, then keep is_vi in sync for the next prompt.
                     surface.reload()?;
                     is_vi = resolve_edit_mode() == newt_core::EditMode::Vi;
-                } else if matches!(task.as_str(), "exit" | "quit") {
+                } else if model_input_origin.is_operator()
+                    && matches!(task.as_str(), "exit" | "quit")
+                {
                     clean_exit = true;
                     break;
                 } else {
+                    // Durable ingress is the FIRST operation in the final
+                    // model-input branch. It precedes hardware probes,
+                    // retrieval, inference, and every tool-capable path. Raw
+                    // bytes are the accepted surface line; model bytes are the
+                    // exact normalized `task` sent below.
+                    match begin_model_prompt(
+                        PromptIngress {
+                            durable: conversation_store.as_ref(),
+                            ephemeral: &ephemeral_prompt_store,
+                        },
+                        &active_conversation_id,
+                        &conversation_title_from_task(&task),
+                        active_persona.as_ref().map(|p| p.name.as_str()),
+                        line.as_bytes(),
+                        task.as_bytes(),
+                        &model_input_origin,
+                    ) {
+                        Ok(context) => active_prompt_context = Some(context),
+                        Err(e) => {
+                            active_prompt_context = None;
+                            print_newt(
+                                &format!("prompt not sent: prompt receipt creation failed ({e})"),
+                                color,
+                                verbose,
+                            );
+                            println!();
+                            continue;
+                        }
+                    }
+
                     // Pre-turn hardware snapshot: read the latest value the
                     // background sampler published (instant, never blocks). None
                     // unless verbose + a reachable DCGM (issue #414).
@@ -2246,6 +2424,24 @@ pub(crate) fn run_chat(
                     let recall_source = conversation_store.as_ref().map(|store| {
                         newt_core::StoreRecallSource::new(store, &active_conversation_id)
                     });
+                    // One conversation-fenced prompt resolver serves both the
+                    // always-on `prompt_read` tool and, when progressive
+                    // disclosure is enabled, the compatibility
+                    // `memory_fetch prompt:<uuid>` route.
+                    let durable_prompt_source_owner = conversation_store.as_ref().map(|store| {
+                        newt_core::agentic::StorePromptSource::new(store, &active_conversation_id)
+                    });
+                    let ephemeral_prompt_source_owner = conversation_store
+                        .is_none()
+                        .then(|| ephemeral_prompt_store.source(active_conversation_id.clone()));
+                    let prompt_source: Option<&dyn newt_core::agentic::PromptSource> = match (
+                        durable_prompt_source_owner.as_ref(),
+                        ephemeral_prompt_source_owner.as_ref(),
+                    ) {
+                        (Some(source), _) => Some(source),
+                        (None, Some(source)) => Some(source),
+                        (None, None) => None,
+                    };
                     // Progressive-disclosure memory (Workstream A MVP, #319):
                     // wired ONLY under `[memory] disclosure = "index"`. Default
                     // (`frozen`) leaves `memory_source: None` so the loop is
@@ -2277,11 +2473,13 @@ pub(crate) fn run_chat(
                             (Some(notes), Some(store)) => {
                                 // Step 26.3 (#584): attach the spill store so the
                                 // model can re-read offloaded payloads via `spill:`.
-                                Some(
-                                    newt_core::StoreMemorySource::new(notes, store)
-                                        .with_spill_store(&spill_store)
-                                        .with_compaction_store(&compaction_store),
-                                )
+                                let source = newt_core::StoreMemorySource::new(notes, store)
+                                    .with_spill_store(&spill_store)
+                                    .with_compaction_store(&compaction_store);
+                                Some(match prompt_source {
+                                    Some(prompt) => source.with_prompt_source(prompt),
+                                    None => source,
+                                })
                             }
                             _ => None,
                         };
@@ -2434,7 +2632,7 @@ pub(crate) fn run_chat(
                     let response =
                         with_interrupt_watch(interruptible, &turn_cancel, &turn_hard, || {
                             tokio::task::block_in_place(|| {
-                                rt.block_on(chat_complete(
+                                rt.block_on(chat_complete_with_prompt(
                                     ChatCtx {
                                         url: &inf_url,
                                         model: &inf_model,
@@ -2577,6 +2775,8 @@ pub(crate) fn run_chat(
                                         // the `/team` tools when present.
                                         crew_runner,
                                     },
+                                    active_prompt_context.as_ref(),
+                                    prompt_source,
                                     &mut mcp,
                                 ))
                             })
@@ -2641,11 +2841,22 @@ pub(crate) fn run_chat(
                                         RetryStep::Reprompt => {
                                             retry_budget -= 1;
                                             // Queue the grounded corrective turn as the
-                                            // next loop iteration's input.
-                                            pending_retry = Some(action.corrective);
-                                            format!(
-                                                "\n↻ retry: re-prompting the model to ground the rewrite ({retry_budget} re-prompt(s) remaining)"
-                                            )
+                                            // next loop iteration's derived input. It
+                                            // inherits the operator root captured before
+                                            // this turn; it never masquerades as a new
+                                            // operator prompt.
+                                            if let Some(parent) = active_prompt_context.clone() {
+                                                pending_retry = Some(PendingRetry {
+                                                    text: action.corrective,
+                                                    parent: Box::new(parent),
+                                                });
+                                                format!(
+                                                    "\n↻ retry: re-prompting the model to ground the rewrite ({retry_budget} re-prompt(s) remaining)"
+                                                )
+                                            } else {
+                                                "\n✗ retry: corrective input was not queued because the turn has no prompt receipt"
+                                                    .to_string()
+                                            }
                                         }
                                         RetryStep::GiveUp => format!(
                                             "\n✗ retry: gave up after {retry_max} re-prompt(s) — file(s) left reverted"
@@ -2693,8 +2904,15 @@ pub(crate) fn run_chat(
                                     hallucinations,
                                     end_reason: turn_end_reason,
                                 };
+                                let memory_task =
+                                    active_operator_task(active_prompt_context.as_ref(), &task);
                                 tokio::task::block_in_place(|| {
-                                    rt.block_on(memory.sync_all(&task, &reply, &metrics));
+                                    rt.block_on(memory.sync_all_with_active_task(
+                                        &task,
+                                        &reply,
+                                        &metrics,
+                                        memory_task,
+                                    ));
                                 });
                                 // 19.4: this conversation now has extractable
                                 // content — count it for the close-time gate.
@@ -2861,7 +3079,8 @@ pub(crate) fn run_chat(
 
     // vi `:wq` close-out: mark the active conversation ended so `latest_open`
     // skips it next launch (it stays in `/recall`). Runs after extraction so
-    // the summary still reads the turns. Only when persisted (a turn saved).
+    // the summary still reads completed turns. Mark any durable conversation,
+    // including a prompt-only failed/cancelled turn, as ended.
     if end_conversation_on_exit {
         if let Some(store) = conversation_store.as_ref() {
             if store.exists(&active_conversation_id).unwrap_or(false) {
@@ -2879,4 +3098,303 @@ pub(crate) fn run_chat(
 
     surface.save_history();
     Ok(())
+}
+
+#[cfg(test)]
+mod prompt_ingress_tests {
+    use super::*;
+
+    fn prompt_store() -> (tempfile::TempDir, newt_core::ConversationStore, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store =
+            newt_core::ConversationStore::new(tmp.path().join("state"), &workspace, 100).unwrap();
+        (tmp, store, newt_core::new_conversation_id())
+    }
+
+    #[test]
+    fn persistent_ingress_keeps_exact_raw_and_model_bytes_in_prompt_only_conversation() {
+        let (_tmp, store, conversation_id) = prompt_store();
+        let ephemeral_prompts = newt_core::agentic::SessionPromptStore::default();
+        let raw = b"  inspect src \\\nthen test  ";
+        let model = b"inspect src \nthen test";
+
+        let context = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "inspect src",
+            Some("coder"),
+            raw,
+            model,
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap();
+
+        let submitted = context.submitted_prompt().receipt();
+        assert_eq!(submitted.raw_text(), raw);
+        assert_eq!(submitted.model_text(), model);
+        assert_eq!(submitted.origin(), newt_core::PromptOrigin::Operator);
+        assert_eq!(submitted.root_prompt_id(), submitted.id());
+        submitted.verify_integrity().unwrap();
+
+        let record = store.load(&conversation_id).unwrap();
+        assert!(record.turns.is_empty(), "ingress precedes turn completion");
+        assert_eq!(record.title, "inspect src");
+        assert_eq!(record.persona.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn persistent_ingress_error_is_returned_before_a_prompt_can_run() {
+        let (_tmp, store, _conversation_id) = prompt_store();
+        let ephemeral_prompts = newt_core::agentic::SessionPromptStore::default();
+        let err = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            "../outside",
+            "unsafe id",
+            None,
+            b"do work",
+            b"do work",
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid"), "got: {err}");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ephemeral_ingress_has_equivalent_context_without_a_store() {
+        let conversation_id = newt_core::new_conversation_id();
+        let ephemeral_prompts = newt_core::agentic::SessionPromptStore::default();
+        let context = begin_model_prompt(
+            PromptIngress {
+                durable: None,
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "unused",
+            None,
+            b" raw ",
+            b"raw",
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap();
+
+        assert_eq!(context.submitted_prompt().receipt().raw_text(), b" raw ");
+        assert_eq!(context.active_operator_prompt().model_text(), b"raw");
+        assert_eq!(
+            context.submitted_prompt().receipt().origin(),
+            newt_core::PromptOrigin::Operator
+        );
+    }
+
+    #[test]
+    fn ephemeral_ingress_chains_attempts_and_fences_a_new_conversation() {
+        use newt_core::agentic::PromptSource as _;
+
+        let prompts = newt_core::agentic::SessionPromptStore::default();
+        let first_conversation = newt_core::new_conversation_id();
+        let first = begin_model_prompt(
+            PromptIngress {
+                durable: None,
+                ephemeral: &prompts,
+            },
+            &first_conversation,
+            "unused",
+            None,
+            b"first raw",
+            b"FIRST",
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap();
+        let second = begin_model_prompt(
+            PromptIngress {
+                durable: None,
+                ephemeral: &prompts,
+            },
+            &first_conversation,
+            "unused",
+            None,
+            b"second raw",
+            b"SECOND",
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap();
+        assert_eq!(
+            second.submitted().receipt().previous_prompt_id(),
+            Some(first.submitted().id())
+        );
+
+        let retry_one = begin_model_prompt(
+            PromptIngress {
+                durable: None,
+                ephemeral: &prompts,
+            },
+            &first_conversation,
+            "unused",
+            None,
+            b"retry one raw",
+            b"RETRY ONE",
+            &ModelInputOrigin::HarnessRetry {
+                parent: Box::new(second.clone()),
+            },
+        )
+        .unwrap();
+        let retry_two = begin_model_prompt(
+            PromptIngress {
+                durable: None,
+                ephemeral: &prompts,
+            },
+            &first_conversation,
+            "unused",
+            None,
+            b"retry two raw",
+            b"RETRY TWO",
+            &ModelInputOrigin::HarnessRetry {
+                parent: Box::new(retry_one.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            retry_two.submitted().receipt().previous_prompt_id(),
+            Some(retry_one.submitted().id())
+        );
+        assert_eq!(
+            retry_two.submitted().receipt().parent_prompt_id(),
+            Some(retry_one.submitted().id())
+        );
+        assert_eq!(
+            prompts
+                .source(&first_conversation)
+                .fetch_prompt(retry_one.submitted().id())
+                .unwrap()
+                .unwrap()
+                .model_text(),
+            b"RETRY ONE"
+        );
+
+        // `/new` changes this binding. Even though the process-local store
+        // retains the old receipts until exit, the new view cannot address
+        // them and therefore cannot leak the previous task.
+        let new_conversation = newt_core::new_conversation_id();
+        let fresh = begin_model_prompt(
+            PromptIngress {
+                durable: None,
+                ephemeral: &prompts,
+            },
+            &new_conversation,
+            "unused",
+            None,
+            b"fresh raw",
+            b"FRESH",
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap();
+        let fresh_source = prompts.source(&new_conversation);
+        assert!(fresh_source
+            .fetch_prompt(retry_one.submitted().id())
+            .unwrap()
+            .is_none());
+        assert!(fresh_source
+            .fetch_prompt(fresh.submitted().id())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn harness_retry_is_derived_and_keeps_operator_root_active() {
+        let (_tmp, store, conversation_id) = prompt_store();
+        let ephemeral_prompts = newt_core::agentic::SessionPromptStore::default();
+        let operator = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "fix the parser",
+            None,
+            b"fix the parser",
+            b"fix the parser",
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap();
+        let derived = ModelInputOrigin::HarnessRetry {
+            parent: Box::new(operator.clone()),
+        };
+        let retry = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "fix the parser",
+            None,
+            b"/exit",
+            b"/exit",
+            &derived,
+        )
+        .unwrap();
+
+        assert!(
+            !derived.is_operator(),
+            "retry must bypass human interceptors"
+        );
+        assert_eq!(
+            retry.submitted_prompt().receipt().origin(),
+            newt_core::PromptOrigin::HarnessRetry
+        );
+        assert_ne!(
+            retry.submitted_prompt().id(),
+            operator.submitted_prompt().id()
+        );
+        assert_eq!(
+            retry.submitted_prompt().receipt().parent_prompt_id(),
+            Some(operator.submitted_prompt().id())
+        );
+        assert_eq!(
+            retry.active_operator_prompt().id(),
+            operator.active_operator_prompt().id()
+        );
+        assert_eq!(
+            retry.active_operator_prompt().model_text(),
+            b"fix the parser"
+        );
+
+        let retry_again = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "fix the parser",
+            None,
+            b"ground it again",
+            b"ground it again",
+            &ModelInputOrigin::HarnessRetry {
+                parent: Box::new(retry.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            retry_again.submitted_prompt().receipt().parent_prompt_id(),
+            Some(retry.submitted_prompt().id()),
+            "attempt ancestry must not be flattened to the operator root"
+        );
+        assert_eq!(
+            retry_again.active_operator_prompt().id(),
+            operator.active_operator_prompt().id()
+        );
+        assert_eq!(
+            active_operator_task(Some(&retry_again), "ground it again"),
+            "fix the parser",
+            "derived memory must never relabel retry prose as the active task"
+        );
+    }
 }

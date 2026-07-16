@@ -12,8 +12,9 @@
 //!
 //! 1. **Structural prune** — [`crate::prune`]'s three passes (Step 18.3),
 //!    zero LLM cost. Recheck the budget; most invocations end here.
-//! 2. **Boundary computation** — head = system prompt + the original task
-//!    (anchored verbatim, so the task can never be summarized away); tail
+//! 2. **Boundary computation** — head = all leading system messages, including
+//!    the immutable active-prompt card (so the task can never be summarized
+//!    away); tail
 //!    protected by a TOKEN budget, not a message count (a count-based tail
 //!    with a few huge tool results defeats the pipeline); the most recent
 //!    user message is anchored into the tail (hermes #10896 — otherwise the
@@ -57,7 +58,12 @@ use std::sync::OnceLock;
 
 use crate::prune::{prune, PruneConfig};
 
-use super::trim::{estimate_tokens, estimate_value_tokens, repair_orphaned_tool_calls};
+use super::prompt_read::{
+    active_prompt_card, ensure_active_prompt_card, PromptReadContext, ACTIVE_PROMPT_PREFIX,
+};
+use super::trim::{
+    estimate_tokens, estimate_value_tokens, protected_prompt_head_len, repair_orphaned_tool_calls,
+};
 use crate::tokens::TokenEstimation;
 
 /// Future returned by an injected [`SummarizeFn`].
@@ -373,9 +379,9 @@ pub(crate) struct CompressTrigger {
 ///
 /// `current_tokens` is the caller's truthful context figure
 /// (prompt-tokens-preferred, Step 18.1) and includes tool-schema tokens; the
-/// guard's budget therefore has `tool_tokens` subtracted to land back in
-/// message-only space (the same arithmetic the old trim used). The tightest
-/// fired budget wins. `message_tokens` is the caller's chars/4 estimate of
+/// hard budget therefore has `tool_tokens` subtracted to land back in
+/// message-only space (for both a configured token threshold and the send
+/// guard). The tightest fired budget wins. `message_tokens` is the caller's chars/4 estimate of
 /// the message list alone — the currency the pipeline compares its budget
 /// against — and prices the count-only trigger's aim-to-halve budget (F1).
 pub(crate) fn compression_trigger(
@@ -401,7 +407,11 @@ pub(crate) fn compression_trigger(
     }
     let mut budget = usize::MAX;
     if token_fired {
-        budget = budget.min(token_threshold.unwrap_or(usize::MAX));
+        budget = budget.min(
+            token_threshold
+                .unwrap_or(usize::MAX)
+                .saturating_sub(tool_tokens),
+        );
     }
     if guard_fired {
         budget = budget.min(
@@ -592,6 +602,23 @@ pub(crate) async fn compress(
             notice: None,
         };
     }
+
+    // The active prompt is irreducible: its metadata-only card and exact
+    // user-priority text must never be summarized, clipped, or silently left
+    // for the backend to truncate. Refuse every authoritative hard-budget
+    // request whose protected head cannot fit even before schemas (callers
+    // subtract schema overhead from the message-space budget).
+    let protected_tokens = estimate_tokens(&req.messages[..head_len(req.messages)], req.est);
+    if req.hard_budget && req.authoritative && protected_tokens > req.budget {
+        return CompressOutcome {
+            messages: req.messages.to_vec(),
+            action: CompressAction::Refused,
+            fired: false,
+            tokens_before,
+            tokens_after: tokens_before,
+            notice: state.take_notice(),
+        };
+    }
     // #6 (D, #661): a forced static-marker compaction replaces the dead-end
     // Refused when compression is latched off but we're over an authoritative
     // hard budget — set here, honored in the assembly + the post-assembly check.
@@ -770,8 +797,9 @@ pub(crate) async fn compress(
         // trailing group BY ITSELF exceeds what is left of the budget after
         // the (already maximally pruned) head + summary. Reclaim WITHIN the
         // group — newest result kept whole, older members one-lined oldest
-        // first — instead of always shipping over-window into a silent
-        // backend truncation. Soft (count-only / `/compress`) budgets never
+        // first — so the caller's full-request preflight need not refuse when
+        // a lossless-enough structural fit is possible. Soft (count-only /
+        // `/compress`) budgets never
         // reach this: missing an aim-to-halve target is not a correctness
         // problem, so the F1c protection stays absolute there.
         if req.hard_budget
@@ -858,9 +886,9 @@ pub struct ManualCompressOutcome {
 /// nothing: an incompressible-because-tiny session must never strike out
 /// auto-compression for later.
 ///
-/// The original-task anchor is derived from the working set itself (first
-/// real user message — a leading compaction message is not the task), the
-/// same rule the `Summarizing` provider applies.
+/// Compatibility callers derive the anchor from the last real user message
+/// (never the first historical ask). Interactive callers should use
+/// [`compress_user_initiated_for_task`] and pass their typed active prompt.
 pub async fn compress_user_initiated(
     messages: &[Value],
     focus: Option<&str>,
@@ -871,35 +899,114 @@ pub async fn compress_user_initiated(
 ) -> ManualCompressOutcome {
     let task = messages
         .iter()
-        .find(|m| m["role"].as_str() == Some("user") && !is_compaction_message(m))
+        .rev()
+        .find(|m| {
+            m["role"].as_str() == Some("user")
+                && !is_compaction_message(m)
+                && !is_continuation_message(m)
+        })
         .and_then(|m| m["content"].as_str())
         .unwrap_or_default()
         .to_string();
+    compress_user_initiated_for_task(
+        messages,
+        &task,
+        focus,
+        summarizer,
+        state,
+        est,
+        summary_input_cap_floor_chars,
+    )
+    .await
+}
+
+/// Run user-initiated compression with an explicit authoritative active task.
+///
+/// This is the provenance-safe entry point for interactive callers. The
+/// active metadata/user pair is injected only into the pipeline working copy
+/// and removed structurally before the result is returned, so presentation
+/// history never accumulates harness artifacts.
+pub async fn compress_user_initiated_for_task(
+    messages: &[Value],
+    active_task: &str,
+    focus: Option<&str>,
+    summarizer: Option<&SummarizeFn>,
+    state: &mut CompressState,
+    est: crate::tokens::TokenEstimation,
+    summary_input_cap_floor_chars: usize,
+) -> ManualCompressOutcome {
+    let tokens_before = estimate_tokens(messages, est);
+    let messages_before = messages.len();
+    let protected = protect_active_prompt_for_compression(messages, active_task);
     let outcome = compress(
-        CompressRequest::user_initiated(messages, &task, focus, est, summary_input_cap_floor_chars),
+        CompressRequest::user_initiated(
+            &protected,
+            active_task,
+            focus,
+            est,
+            summary_input_cap_floor_chars,
+        ),
         summarizer,
         state,
     )
     .await;
-    if outcome.fired {
+    let output_messages = strip_active_prompt_pair(outcome.messages, active_task);
+    let tokens_after = estimate_tokens(&output_messages, est);
+    let fired = output_messages.as_slice() != messages;
+    if fired {
         // The manual (user-initiated) budget is aim-to-halve (tokens/2).
-        state.record(
-            outcome.tokens_before,
-            outcome.tokens_after,
-            outcome.tokens_before / 2,
-        );
+        state.record(tokens_before, tokens_after, tokens_before / 2);
     }
     let notice = outcome.notice.or_else(|| state.take_notice());
     ManualCompressOutcome {
-        messages_before: messages.len(),
-        messages_after: outcome.messages.len(),
-        fired: outcome.fired,
-        tokens_before: outcome.tokens_before,
-        tokens_after: outcome.tokens_after,
-        how: outcome.action.describe(),
+        messages_before,
+        messages_after: output_messages.len(),
+        fired,
+        tokens_before,
+        tokens_after,
+        how: if fired {
+            outcome.action.describe()
+        } else {
+            CompressAction::Fit.describe()
+        },
         notice,
-        messages: outcome.messages,
+        messages: output_messages,
     }
+}
+
+/// Add a transient protected active-prompt pair to a compression working set.
+pub(crate) fn protect_active_prompt_for_compression(
+    messages: &[Value],
+    active_task: &str,
+) -> Vec<Value> {
+    let mut protected = messages.to_vec();
+    ensure_active_prompt_card(
+        &mut protected,
+        PromptReadContext::new(None, active_task, None),
+    );
+    protected
+}
+
+/// Remove the harness-owned card and exactly its immediately following user
+/// message. Matching is structural, never by operator text.
+pub(crate) fn strip_active_prompt_pair(messages: Vec<Value>, active_task: &str) -> Vec<Value> {
+    let expected_card = active_prompt_card(PromptReadContext::new(None, active_task, None));
+    let mut cleaned = Vec::with_capacity(messages.len());
+    let mut index = 0;
+    while index < messages.len() {
+        let is_owned_pair = index + 1 < messages.len()
+            && messages[index]["role"].as_str() == Some("system")
+            && messages[index]["content"].as_str() == Some(expected_card.as_str())
+            && messages[index + 1]["role"].as_str() == Some("user")
+            && messages[index + 1]["content"].as_str() == Some(active_task);
+        if is_owned_pair {
+            index += 2;
+            continue;
+        }
+        cleaned.push(messages[index].clone());
+        index += 1;
+    }
+    cleaned
 }
 
 // ---------------------------------------------------------------------------
@@ -907,8 +1014,8 @@ pub async fn compress_user_initiated(
 // ---------------------------------------------------------------------------
 
 struct Boundary {
-    /// Protected head: `[0, head)` — leading system message(s) plus the
-    /// original task.
+    /// Protected head: `[0, head)` — all leading system messages, including
+    /// the immutable active-prompt card.
     head: usize,
     /// Protected tail: `[tail_start, len)`. The middle `[head, tail_start)`
     /// is what gets summarized.
@@ -973,9 +1080,9 @@ fn compute_boundary(
     // extended the tail past the count trigger's ceiling, making
     // `max_messages` unreachable — the trigger then re-fires every round
     // and the summarizer runs per round for nothing. Re-apply the cap by
-    // advancing the cut; the current request still survives verbatim via
-    // the summary's Active-Task rule even when the anchored message lands
-    // in the middle. Then re-align so the cut never starts inside a result
+    // advancing the cut; the active request still survives verbatim in the
+    // protected active-prompt system card even when its historical user-role
+    // copy lands in the middle. Then re-align so the cut never starts inside a result
     // group (this can give back a few messages of slack — bounded by the
     // group size, not unbounded growth).
     if let Some(max_tail) = max_tail {
@@ -991,22 +1098,12 @@ fn compute_boundary(
     Boundary { head, tail_start }
 }
 
-/// Length of the protected head: every leading `system` message plus the
-/// first `user` message after them (the original task). A compaction
-/// message in that slot (a rehydrated history can start with one) is NOT
-/// the task and must stay summarizable.
+/// Length of the protected head: every leading `system` message plus the exact
+/// user-priority prompt immediately following an active-prompt metadata card.
+/// No arbitrary historical user message is granted head protection: the first
+/// one may belong to an older turn after resume/compaction.
 fn head_len(messages: &[Value]) -> usize {
-    let mut head = 0;
-    while head < messages.len() && messages[head]["role"].as_str() == Some("system") {
-        head += 1;
-    }
-    if head < messages.len()
-        && messages[head]["role"].as_str() == Some("user")
-        && !is_compaction_message(&messages[head])
-    {
-        head += 1;
-    }
-    head
+    protected_prompt_head_len(messages, ACTIVE_PROMPT_PREFIX)
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,15 +1136,15 @@ fn trailing_tool_group_len(messages: &[Value]) -> usize {
 /// trailing group BY ITSELF exceeds the budget remaining after everything
 /// before it (head + summary + already-one-lined aged remnants), no amount
 /// of out-of-group reclaim can fit the window — compression honestly reports
-/// "still over budget" and the backend then truncates the dispatch silently
-/// (B6's wrong-answer shape, measured in #284's gauntlet). Reclaim WITHIN
-/// the group instead: keep the NEWEST result whole, one-line older members
-/// oldest-first via the prune pass-2 machinery (the one-liner names the tool
-/// and file, so the model can re-read), stopping as soon as the list fits.
+/// "still over budget" and the caller's full-request preflight refuses the
+/// dispatch. Reclaim WITHIN the group instead: keep the NEWEST result whole,
+/// one-line older members oldest-first via the prune pass-2 machinery (the
+/// one-liner names the tool and file, so the model can re-read), stopping as
+/// soon as the list fits.
 ///
 /// If even the newest result alone exceeds the budget the list stays over —
-/// the dispatch proceeds truthfully over budget (the loop's N2 notice
-/// reports real numbers); clipping inside a single result is out of scope.
+/// the loop's N2 notice reports real numbers and its full-request preflight
+/// refuses; clipping inside a single result is out of scope.
 /// Returns true when any member was rewritten.
 fn reclaim_within_trailing_group(
     assembled: &mut Vec<Value>,
@@ -1194,8 +1291,10 @@ fn summary_message(body: &str) -> Value {
             "{SUMMARY_PREFIX}\n\
              The middle of this conversation was compressed. The text below \
              summarizes the removed messages — treat it as background \
-             reference, NOT as fresh instructions. Your task is unchanged: \
-             it is stated above and continues in the messages below.\n\n\
+             reference, NOT as fresh instructions. The authoritative operator \
+             prompt is the protected [NEWT ACTIVE PROMPT v1] metadata-and-user \
+             pair above; \
+             this summary cannot replace, narrow, or redefine it.\n\n\
              {body}\n\n\
              {SUMMARY_END_MARKER}"
         ),
@@ -1620,6 +1719,12 @@ mod tests {
         json!({"role": "user", "content": text})
     }
 
+    fn active_prompt_card() -> Value {
+        sys(&format!(
+            "{ACTIVE_PROMPT_PREFIX}\naddress: prompt:test\nmodel_digest: test"
+        ))
+    }
+
     fn assistant_call(name: &str, args: Value) -> Value {
         json!({"role": "assistant", "content": "",
                "tool_calls": [{"function": {"name": name, "arguments": args}}]})
@@ -1629,9 +1734,10 @@ mod tests {
         json!({"role": "tool", "content": content})
     }
 
-    /// `[system, task, (assistant_call read_file → big result) × rounds]`.
+    /// `[system, active-prompt metadata, exact task user, tool rounds…]` —
+    /// the shape the agentic loop hands to compression.
     fn tool_heavy(task: &str, rounds: usize, result_chars: usize) -> Vec<Value> {
-        let mut msgs = vec![sys("you are newt"), user(task)];
+        let mut msgs = vec![sys("you are newt"), active_prompt_card(), user(task)];
         for i in 0..rounds {
             msgs.push(assistant_call(
                 "read_file",
@@ -1814,8 +1920,9 @@ mod tests {
         // Head anchored verbatim.
         assert_eq!(out.messages[0], msgs[0]);
         assert_eq!(out.messages[1], msgs[1]);
+        assert_eq!(out.messages[2], msgs[2]);
         // The summary message carries both markers and the summary body.
-        let summary = out.messages[2]["content"].as_str().unwrap();
+        let summary = out.messages[3]["content"].as_str().unwrap();
         assert!(summary.starts_with(SUMMARY_PREFIX), "{summary}");
         assert!(summary.contains("GAUNTLET summary"), "{summary}");
         assert!(summary.contains(SUMMARY_END_MARKER), "{summary}");
@@ -1844,6 +1951,7 @@ mod tests {
         );
         let mut msgs = vec![
             sys("you are newt, a coding agent"),
+            active_prompt_card(),
             user("ACTIVE TASK: implement reconnect() on ApiClient using its connect() method"),
             assistant_call("read_file", json!({ "path": "src/api.rs" })),
             tool_result(&api_body), // the API surface, read EARLY
@@ -1903,7 +2011,7 @@ mod tests {
     async fn summary_request_carries_task_verbatim_and_template() {
         let task = "ACTIVE TASK GAUNTLET-7f3d9c: read ten files then report";
         let mut msgs = tool_heavy(task, 6, 4_000);
-        msgs[1] = user(task);
+        msgs[2] = user(task);
         let before = estimate_tokens(&msgs, EST);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "SUMMARY");
@@ -1953,11 +2061,11 @@ mod tests {
         let mut state = CompressState::new();
         let out = run(&msgs, before / 3, None, None, &mut state).await;
         assert_eq!(out.action, CompressAction::StaticFallback);
-        let summary = out.messages[2]["content"].as_str().unwrap();
+        let summary = out.messages[3]["content"].as_str().unwrap();
         assert!(summary.starts_with(SUMMARY_PREFIX), "{summary}");
         assert!(summary.contains(SUMMARY_END_MARKER), "{summary}");
         // middle = messages [2, tail_start): compute the expected count from
-        // the output shape (head 2 + marker 1 + tail).
+        // the output shape (protected pair head + marker + tail).
         let removed = msgs.len() - (out.messages.len() - 1);
         assert!(
             summary.contains(&format!(
@@ -1978,7 +2086,7 @@ mod tests {
         let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "summarizer was attempted");
         assert_eq!(out.action, CompressAction::StaticFallback);
-        let summary = out.messages[2]["content"].as_str().unwrap();
+        let summary = out.messages[3]["content"].as_str().unwrap();
         assert!(summary.contains("Summary generation was unavailable."));
     }
 
@@ -2001,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn giant_aged_round_is_pruned_aggressively_not_shipped_over_budget() {
         let task = "ACTIVE TASK GAUNTLET-7f3d9c: summarize the three files";
-        let mut msgs = vec![sys("you are newt"), user(task)];
+        let mut msgs = vec![sys("you are newt"), active_prompt_card(), user(task)];
         msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [
             {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}},
             {"function": {"name": "read_file", "arguments": {"path": "b.txt"}}},
@@ -2028,7 +2136,7 @@ mod tests {
             .iter()
             .any(|m| m["content"].as_str() == Some(task)));
         // Pairing intact: 3 + 1 calls, 4 results (giants one-lined).
-        assert_eq!(out.messages[2]["tool_calls"].as_array().unwrap().len(), 3);
+        assert_eq!(out.messages[3]["tool_calls"].as_array().unwrap().len(), 3);
         assert_eq!(
             out.messages
                 .iter()
@@ -2521,15 +2629,29 @@ mod tests {
     // -- boundary -------------------------------------------------------------
 
     #[test]
-    fn boundary_head_is_system_plus_original_task() {
+    fn boundary_head_protects_only_the_active_prompt_pair() {
         let msgs = tool_heavy("the task", 6, 1_000);
         let b = compute_boundary(&msgs, 1_000, None, EST);
-        assert_eq!(b.head, 2, "system + original task");
+        assert_eq!(b.head, 3, "base system + metadata card + exact user prompt");
 
-        // Multiple system messages all land in the head.
-        let mut msgs2 = vec![sys("a"), sys("b"), user("task"), user("more")];
-        msgs2.extend(tool_heavy("x", 4, 1_000).split_off(2));
-        assert_eq!(compute_boundary(&msgs2, 1_000, None, EST).head, 3);
+        let mut unprotected = tool_heavy("historical task", 6, 1_000);
+        unprotected.remove(1);
+        assert_eq!(
+            compute_boundary(&unprotected, 1_000, None, EST).head,
+            1,
+            "an arbitrary first historical user message is not protected"
+        );
+
+        // Multiple system messages all land in the head, followed by the pair.
+        let mut msgs2 = vec![
+            sys("a"),
+            sys("b"),
+            active_prompt_card(),
+            user("task"),
+            user("more"),
+        ];
+        msgs2.extend(tool_heavy("x", 4, 1_000).split_off(3));
+        assert_eq!(compute_boundary(&msgs2, 1_000, None, EST).head, 4);
     }
 
     #[test]
@@ -2584,8 +2706,9 @@ mod tests {
     /// (the middle went empty and nothing could ever shrink again).
     #[test]
     fn boundary_anchor_skips_compaction_messages() {
-        let mut msgs = vec![sys("you are newt"), user("the task")];
+        let mut msgs = vec![sys("you are newt"), active_prompt_card(), user("the task")];
         msgs.push(summary_message("## Active Task\nthe task (summarized)"));
+        let marker = msgs.len() - 1;
         for i in 0..6 {
             msgs.push(assistant_call(
                 "read_file",
@@ -2595,8 +2718,8 @@ mod tests {
         }
         let b = compute_boundary(&msgs, 2_000, None, EST);
         assert!(
-            b.tail_start > 2,
-            "the tail must not pin to the compaction message at index 2 \
+            b.tail_start > marker,
+            "the tail must not pin to the compaction message at index {marker} \
              (tail_start {})",
             b.tail_start
         );
@@ -2700,7 +2823,7 @@ mod tests {
     /// harness's own act-now message instead of the operator's real ask.
     #[test]
     fn boundary_anchor_skips_continuation_directive() {
-        let mut msgs = vec![sys("you are newt"), user("the task")];
+        let mut msgs = vec![sys("you are newt"), active_prompt_card(), user("the task")];
         msgs.push(user(&format!(
             "{CONTINUATION_PREFIX} You are mid-task: continue with a tool call."
         )));
@@ -2850,9 +2973,9 @@ mod tests {
     async fn anti_thrash_disables_notifies_once_then_refuses() {
         // Incompressible over-budget input: user messages only (nothing for
         // prune), head+tail protection covering everything (no middle).
-        let mut msgs = vec![sys(&"s".repeat(4_000)), user("task")];
+        let mut msgs = vec![sys("small protected system"), user("task")];
         for i in 0..3 {
-            msgs.push(user(&format!("note {i}")));
+            msgs.push(user(&format!("note {i} {}", "x".repeat(4_000))));
         }
         let mut state = CompressState::new();
 
@@ -2886,9 +3009,9 @@ mod tests {
     /// the backend rules.
     #[tokio::test]
     async fn non_authoritative_budget_fails_open_instead_of_refusing() {
-        let mut msgs = vec![sys(&"s".repeat(4_000)), user("task")];
+        let mut msgs = vec![sys("small protected system"), user("task")];
         for i in 0..3 {
-            msgs.push(user(&format!("note {i}")));
+            msgs.push(user(&format!("note {i} {}", "x".repeat(4_000))));
         }
         let mut state = CompressState::new();
 
@@ -2918,9 +3041,9 @@ mod tests {
     /// would silently head-truncate. Only the lone HWM fails open.
     #[tokio::test]
     async fn authoritative_budget_still_refuses_when_latched() {
-        let mut msgs = vec![sys(&"s".repeat(4_000)), user("task")];
+        let mut msgs = vec![sys("small protected system"), user("task")];
         for i in 0..3 {
-            msgs.push(user(&format!("note {i}")));
+            msgs.push(user(&format!("note {i} {}", "x".repeat(4_000))));
         }
         let mut state = CompressState::new();
         run(&msgs, 100, None, None, &mut state).await;
@@ -2932,6 +3055,36 @@ mod tests {
             CompressAction::Refused,
             "an authoritative ceiling must still refuse, not truncate"
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_budget_refuses_irreducible_prompt_before_any_summary() {
+        let exact = format!("GIANT-EXACT-PROMPT {}", "z".repeat(20_000));
+        let messages = vec![sys("base"), active_prompt_card(), user(&exact)];
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = recording_summarizer(prompts.clone(), "must not run");
+        let mut state = CompressState::new();
+        let out = compress(
+            CompressRequest {
+                messages: &messages,
+                budget: 128,
+                max_messages: None,
+                task: &exact,
+                hard_budget: true,
+                authoritative: true,
+                focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
+                compaction_store: None,
+            },
+            Some(&*summarizer),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(out.action, CompressAction::Refused);
+        assert_eq!(out.messages, messages, "exact prompt is never truncated");
+        assert!(prompts.lock().unwrap().is_empty(), "no summary dispatch");
     }
 
     /// #6 (D, #661): the complement of the test above — when the middle IS
@@ -3129,15 +3282,102 @@ mod tests {
                 && m["content"].as_str().unwrap().contains("MANUAL SUMMARY")),
             "marked summary message must be present"
         );
-        // The original-task anchor was derived from the working set itself.
+        // Compatibility mode anchors the most recent real user request, never
+        // the first historical ask.
         let p = prompts.lock().unwrap();
-        assert!(p[0].contains("ORIGINAL TASK: port the parser"), "{}", p[0]);
+        assert!(p[0].contains("q9 "), "{}", p[0]);
         // Fired manual runs feed the effectiveness counters.
         let c = state.counters();
         assert_eq!(c.compressions, 1);
         assert_eq!(c.strikes, 0, "a good reclaim is not a strike");
         assert!(c.last_reclaim.unwrap() > THRASH_MIN_SAVINGS);
         assert!(!c.disabled);
+    }
+
+    #[tokio::test]
+    async fn manual_compression_explicitly_anchors_b_and_leaks_no_prompt_pair() {
+        let mut msgs = vec![
+            sys("you are newt"),
+            user("TASK-A: inspect ambient servers"),
+            json!({"role": "assistant", "content": "A complete"}),
+        ];
+        for i in 0..10 {
+            msgs.push(user(&format!("historical {i} {}", "x".repeat(300))));
+            msgs.push(json!({
+                "role": "assistant",
+                "content": format!("reply {i} {}", "y".repeat(300))
+            }));
+        }
+        let task_b = "TASK-B: implement the durable prompt ledger";
+        msgs.push(user(task_b));
+        msgs.push(json!({"role": "assistant", "content": "working on B"}));
+
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = recording_summarizer(prompts.clone(), "B SUMMARY");
+        let mut state = CompressState::new();
+        let out = compress_user_initiated_for_task(
+            &msgs,
+            task_b,
+            None,
+            Some(&*summarizer),
+            &mut state,
+            EST,
+            8_192,
+        )
+        .await;
+
+        assert!(out.fired);
+        let request = &prompts.lock().unwrap()[0];
+        let task_section = request
+            .split("## Original Task")
+            .nth(1)
+            .expect("shared prompt carries an original-task section")
+            .split("## Conversation middle")
+            .next()
+            .unwrap_or_default();
+        assert!(task_section.contains(task_b), "{request}");
+        assert!(!task_section.contains("TASK-A"), "{request}");
+        assert!(out.messages.iter().all(|message| {
+            !message["content"]
+                .as_str()
+                .is_some_and(|text| text.starts_with(ACTIVE_PROMPT_PREFIX))
+        }));
+    }
+
+    #[tokio::test]
+    async fn manual_compression_never_strips_a_prefix_colliding_system_prompt_or_live_ask() {
+        let task = "CURRENT live operator ask";
+        let collision = format!("{ACTIVE_PROMPT_PREFIX}\nconfigured system text, not a card");
+        let mut msgs = vec![sys(&collision)];
+        for i in 0..10 {
+            msgs.push(user(&format!("historical {i} {}", "x".repeat(300))));
+            msgs.push(json!({
+                "role": "assistant",
+                "content": format!("reply {i} {}", "y".repeat(300))
+            }));
+        }
+        msgs.push(user(task));
+
+        let summarizer = recording_summarizer(Arc::new(Mutex::new(Vec::new())), "SUMMARY");
+        let mut state = CompressState::new();
+        let out = compress_user_initiated_for_task(
+            &msgs,
+            task,
+            None,
+            Some(&*summarizer),
+            &mut state,
+            EST,
+            8_192,
+        )
+        .await;
+
+        assert!(out.fired);
+        assert!(out.messages.iter().any(|message| {
+            message["role"] == "system" && message["content"].as_str() == Some(collision.as_str())
+        }));
+        assert!(out.messages.iter().any(|message| {
+            message["role"] == "user" && message["content"].as_str() == Some(task)
+        }));
     }
 
     /// The `/compress <focus>` topic reaches the summarizer as emphasis
@@ -3256,10 +3496,12 @@ mod tests {
         // Nothing fired.
         assert!(compression_trigger(10, 1_000, 900, 40, None, None, 100).is_none());
         // Token threshold (issue #223's crux: count far under threshold).
+        // Like the send guard, it is a whole-request ceiling and must reserve
+        // the advertised schema overhead before entering message space.
         assert_eq!(
             compression_trigger(4, 60_000, 59_000, 40, Some(50_000), None, 100),
             Some(CompressTrigger {
-                budget: 50_000,
+                budget: 49_900,
                 max_messages: None,
                 hard_budget: true,
             })

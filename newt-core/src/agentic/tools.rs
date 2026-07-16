@@ -9,6 +9,7 @@ use super::mcp::McpTools;
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
+use super::prompt_read::{execute_prompt_read, PromptReadContext};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
 use super::spill::{self, SpillStore};
@@ -1841,6 +1842,65 @@ pub async fn execute_tool_with_offload(
     note_sink: Option<&mut dyn NoteSink>,
     recall_source: Option<&dyn RecallSource>,
     memory_source: Option<&dyn MemorySource>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
+    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    persona_tools: Option<&[String]>,
+) -> String {
+    execute_tool_with_offload_and_prompt(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        build_check_cmd,
+        note_sink,
+        recall_source,
+        memory_source,
+        None,
+        permission_gate,
+        exec_floor,
+        git_tool,
+        crew_runner,
+        scratchpad_store,
+        code_search,
+        experience_store,
+        step_ledger,
+        tool_offload,
+        spill_store,
+        persona_tools,
+    )
+    .await
+}
+
+/// Prompt-aware tool dispatcher used by inference loops.
+///
+/// The historical [`execute_tool_with_offload`] entry point remains
+/// source-compatible for embedders; only loops carrying a verified active
+/// prompt need this extended seam.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_with_offload_and_prompt(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
+    prompt_context: Option<PromptReadContext<'_>>,
     mut permission_gate: Option<&mut dyn PermissionGate>,
     exec_floor: Option<&crate::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
@@ -1984,6 +2044,14 @@ pub async fn execute_tool_with_offload(
     };
 
     match name {
+        // Exact prompt recovery is always available. Durable TUI sessions pass
+        // a conversation-fenced source; headless callers pass an ephemeral
+        // context and still recover the exact active task text.
+        "prompt_read" => match prompt_context {
+            Some(context) => execute_prompt_read(args, context, color, tool_output_lines),
+            None => "prompt_read error: no active prompt context in this session".to_string(),
+        },
+
         // Model-curated memory (Step 19.3): routes add / replace / remove
         // through the caller's NoteSink — the same MemoryManager → NoteStore
         // path as `/remember`, so the 19.1 char-cap curator error and the
@@ -2109,6 +2177,7 @@ pub async fn execute_tool_with_offload(
             recall_source,
             step_ledger,
             scratchpad_store,
+            prompt_context,
             color,
             tool_output_lines,
         ),
@@ -3274,6 +3343,9 @@ mod tests {
                 // #714: advertised ALWAYS (no presence gate), so it joins the
                 // base set even with every `with_*` flag off.
                 "resume_context",
+                // Exact prompt recovery is an invariant, independent of the
+                // optional general-memory disclosure surface.
+                "prompt_read",
                 // #725: advertised ALWAYS (a discovery tool must always be
                 // present), so it too joins the base set with every flag off.
                 "tool_search",
@@ -3335,6 +3407,7 @@ mod tests {
         }
         for infra in [
             "resume_context",
+            "prompt_read",
             "tool_search",
             "get_context_remaining",
             "request_user_input",

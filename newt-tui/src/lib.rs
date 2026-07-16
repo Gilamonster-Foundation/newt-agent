@@ -52,7 +52,7 @@ pub(crate) use chat::{InputSurface, ReadOutcome};
 pub use color::color_supported;
 use color::{color_enabled_for, resolve_color_mode};
 use newt_core::agentic::{
-    chat_complete, print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT,
+    chat_complete_with_prompt, print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT,
 };
 #[cfg(test)]
 use prompt::expand_prompt_tokens;
@@ -3372,17 +3372,18 @@ fn new_conversation_message(active_persona: Option<&Persona>) -> String {
 /// old "won't resume next launch" wording is retired — with fresh-on-launch
 /// nothing auto-resumes, so `/resume` is how you get back either way.
 ///
-/// `outgoing_persisted` is false for an empty conversation (no turn saved) or an
-/// ephemeral session: nothing was written, so the message makes NO "saved /
-/// stays open — /resume" promise it cannot keep — just the plain new line.
-pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_persisted: bool) -> String {
+/// `outgoing_durable` is true when a durable conversation row exists: an
+/// accepted prompt receipt, a completed turn, or an explicitly titled
+/// `/start`. A prompt-only failed/cancelled turn is therefore resumable. It is
+/// false only when nothing was recorded or the session is ephemeral.
+pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_durable: bool) -> String {
     // #1165/#1170: `/end` must LEAD with the ending regardless of whether the
-    // outgoing conversation was persisted — the operator typed "end" and
-    // expects ending language, not "Started a new conversation." An EMPTY
-    // conversation had nothing to save, so drop the "/resume to reopen" that
-    // it cannot honor; a persisted one keeps it.
+    // outgoing conversation was durable — the operator typed "end" and
+    // expects ending language, not "Started a new conversation." A truly
+    // untouched conversation had nothing to save, so drop the "/resume to
+    // reopen" that it cannot honor; prompt-only durable content keeps it.
     if reason == "end" {
-        return if outgoing_persisted {
+        return if outgoing_durable {
             "Conversation ended and saved — /resume to reopen it, /exit to leave newt. \
              (A fresh conversation is now open.)"
                 .to_string()
@@ -3391,7 +3392,7 @@ pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_persisted:
                 .to_string()
         };
     }
-    if !outgoing_persisted {
+    if !outgoing_durable {
         return started.to_string();
     }
     match reason {
@@ -3689,6 +3690,10 @@ struct ConversationCommandContext<'a> {
     /// a resumed `<plan>` block / `plan_get` returns the saved plan — with the
     /// correct active step and done statuses — instead of an empty ledger.
     step_ledger: &'a dyn newt_core::StepLedger,
+    /// Latest submitted prompt metadata for the active conversation. Restore
+    /// rehydrates it for addressability, but never turns it into queued input:
+    /// resuming a prompt-only conversation still waits for the operator.
+    active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
 }
 
 fn handle_conversation_command(
@@ -3743,6 +3748,13 @@ fn restore_conversation_into_session(
     id: &str,
 ) -> anyhow::Result<(newt_core::ConversationRecord, Option<String>)> {
     let record = ctx.store.load(id)?;
+    // Prompt receipts are a parallel immutable log, not presentation history.
+    // Resolve and verify them before mutating any live session state, so a
+    // corrupt receipt makes restore fail without partially switching memory.
+    let restored_prompt_context = match ctx.store.latest_prompt(&record.id)? {
+        Some(receipt) => ctx.store.turn_prompt_context(&record.id, receipt.id())?,
+        None => None,
+    };
     ctx.memory.restore_turns(&record.turns);
     // #713: re-hydrate the live scratchpad <state> store from the restored
     // record, right next to `restore_turns`, so an interrupt + auto-resume gives
@@ -3761,6 +3773,9 @@ fn restore_conversation_into_session(
     // restore is a conversation boundary) and reinstates the saved active step +
     // done statuses verbatim.
     ctx.step_ledger.restore(&record.plan);
+    // Rehydrate the verified metadata so prompt handles remain resolvable,
+    // while leaving the input queue untouched (no auto-execution).
+    *ctx.active_prompt_context = restored_prompt_context;
     let mut warning = None;
     match record.persona.as_deref() {
         Some(name) => match ctx.persona_store.load(name) {

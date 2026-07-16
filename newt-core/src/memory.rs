@@ -144,6 +144,20 @@ pub trait MemoryProvider: Send + Sync {
     /// chat loop never blocks on memory I/O.
     async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics);
 
+    /// Persist a completed submitted turn while separately identifying the
+    /// validated active operator task used by prompt-aware compression.
+    /// Providers that do not distinguish retry presentation from operator
+    /// authority retain the historical behavior through this default.
+    async fn sync_turn_with_active_task(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        metrics: &TurnMetrics,
+        _active_task: &str,
+    ) {
+        self.sync_turn(user, assistant, metrics).await;
+    }
+
     /// Clear conversation-local history while preserving provider configuration
     /// and system-prompt state. Used when the TUI starts a fresh conversation
     /// inside the same running process.
@@ -299,6 +313,22 @@ impl MemoryManager {
     pub async fn sync_all(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
         for p in &mut self.providers {
             p.sync_turn(user, assistant, metrics).await;
+        }
+    }
+
+    /// Persist submitted presentation text to every provider while allowing
+    /// prompt-aware providers to compress against validated operator authority.
+    pub async fn sync_all_with_active_task(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        metrics: &TurnMetrics,
+        active_task: &str,
+    ) {
+        for provider in &mut self.providers {
+            provider
+                .sync_turn_with_active_task(user, assistant, metrics, active_task)
+                .await;
         }
     }
 
@@ -1103,27 +1133,28 @@ impl Summarizing {
 
     /// Delegate one compression to the shared 18.4 pipeline and apply the
     /// assembled result back to pair-shaped history (Step 18.5, #247).
-    async fn compress_via_pipeline(&mut self) {
-        use crate::agentic::compress::{compress, CompressAction, CompressRequest};
+    async fn compress_via_pipeline(&mut self, active_task: &str) {
+        use crate::agentic::compress::{
+            compress, protect_active_prompt_for_compression, strip_active_prompt_pair,
+            CompressAction, CompressRequest,
+        };
         if self.history.is_empty() {
             return;
         }
         let messages: Vec<serde_json::Value> =
             self.history.iter().flat_map(SumTurn::to_wire).collect();
-        // The original-task anchor: the first REAL user message — a leading
-        // compaction message (rehydrated history) is not the task.
-        let task = self
-            .history
-            .iter()
-            .find(|t| !t.user.is_empty() && !is_compaction_text(&t.user))
-            .map(|t| t.user.clone())
-            .unwrap_or_default();
+        // Carry the just-synced operator prompt as a transient protected pair.
+        // It is removed structurally before the compressed wire form is
+        // converted back to pair-shaped presentation history, so provider
+        // compactions never accumulate harness cards or duplicate operator
+        // turns.
+        let protected = protect_active_prompt_for_compression(&messages, active_task);
         let outcome = compress(
             CompressRequest {
-                messages: &messages,
+                messages: &protected,
                 budget: self.budget() as usize,
                 max_messages: None,
-                task: &task,
+                task: active_task,
                 hard_budget: true,
                 // The memory budget is config-derived — authoritative, so
                 // refuse semantics are preserved here (Step 20.3).
@@ -1140,7 +1171,8 @@ impl Summarizing {
         if !outcome.fired {
             return;
         }
-        self.history = wire_to_history(&outcome.messages, self.est);
+        let messages = strip_active_prompt_pair(outcome.messages, active_task);
+        self.history = wire_to_history(&messages, self.est);
         // Reflect the content change against the backend anchor. The
         // pipeline's figures are chars/4 estimates over the wire shape —
         // the same currency the delta already tracks.
@@ -1165,6 +1197,36 @@ impl Summarizing {
             "Summarizing: compressed context via shared pipeline"
         );
     }
+
+    /// Persist the submitted presentation while compressing against the
+    /// independently validated operator task.  Retry/nudger text belongs in
+    /// ordinary presentation history, but must never replace operator
+    /// authority in the shared summarization prompt.
+    async fn record_turn_with_active_task(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        metrics: &TurnMetrics,
+        active_task: &str,
+    ) {
+        let est = turn_content_estimate(user, assistant, self.est);
+        self.history.push(SumTurn::new(user, assistant, self.est));
+        match metrics.usage {
+            Some(u) => {
+                // Anchor on the largest single prompt the backend evaluated
+                // this turn (Step 18.1); only the reply is not yet inside it.
+                self.last_prompt_tokens = Some(u.input_tokens);
+                self.delta_since_prompt = self.est.tokens_for_chars(assistant.len()) as i64;
+            }
+            None => self.delta_since_prompt += i64::from(est),
+        }
+        // Over budget -> the shared pipeline (which owns anti-thrash); the
+        // cheap is_disabled gate just avoids rebuilding the wire view for
+        // a call that would be refused anyway.
+        if self.used_tokens() > self.budget() && !self.state.is_disabled() {
+            self.compress_via_pipeline(active_task).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -1188,23 +1250,19 @@ impl MemoryProvider for Summarizing {
     }
 
     async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
-        let est = turn_content_estimate(user, assistant, self.est);
-        self.history.push(SumTurn::new(user, assistant, self.est));
-        match metrics.usage {
-            Some(u) => {
-                // Anchor on the largest single prompt the backend evaluated
-                // this turn (Step 18.1); only the reply is not yet inside it.
-                self.last_prompt_tokens = Some(u.input_tokens);
-                self.delta_since_prompt = self.est.tokens_for_chars(assistant.len()) as i64;
-            }
-            None => self.delta_since_prompt += i64::from(est),
-        }
-        // Over budget → the shared pipeline (which owns anti-thrash); the
-        // cheap is_disabled gate just avoids rebuilding the wire view for
-        // a call that would be refused anyway.
-        if self.used_tokens() > self.budget() && !self.state.is_disabled() {
-            self.compress_via_pipeline().await;
-        }
+        self.record_turn_with_active_task(user, assistant, metrics, user)
+            .await;
+    }
+
+    async fn sync_turn_with_active_task(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        metrics: &TurnMetrics,
+        active_task: &str,
+    ) {
+        self.record_turn_with_active_task(user, assistant, metrics, active_task)
+            .await;
     }
 
     fn reset(&mut self) {
@@ -1965,7 +2023,7 @@ mod tests {
     /// compaction message.
     #[tokio::test]
     async fn summarizing_compresses_when_over_budget() {
-        let mut s = Summarizing::new(100) // budget = 80 tokens
+        let mut s = Summarizing::new(512) // budget = 409 tokens
             .with_summarizer(stub_summarizer("SUMMARY"));
 
         let big = "x".repeat(200);
@@ -1975,7 +2033,7 @@ mod tests {
         }
         assert_eq!(s.compress_count, 0);
         // The reported prompt crosses the budget → delegate to the pipeline.
-        s.sync_turn(&big, &big, &metrics_with_input(120)).await;
+        s.sync_turn(&big, &big, &metrics_with_input(600)).await;
 
         assert!(s.compress_count >= 1, "compress_count={}", s.compress_count);
         // The chain head is the pipeline's marked compaction message.
@@ -2001,11 +2059,11 @@ mod tests {
     async fn summarizing_compresses_repeatedly() {
         // Verify that the provider compresses across many turns and doesn't
         // panic. The exact compress_count depends on savings/anti-thrash.
-        let mut s = Summarizing::new(100).with_summarizer(stub_summarizer("SUMMARY"));
+        let mut s = Summarizing::new(512).with_summarizer(stub_summarizer("SUMMARY"));
         let text = "x".repeat(120);
         for i in 0..20u32 {
             // Backend-reported prompt grows 50, 100, 150, … — repeatedly
-            // crossing the 80-token budget.
+            // crossing the 409-token budget.
             s.sync_turn(&text, &text, &metrics_with_input(50 * (i + 1)))
                 .await;
         }
@@ -2022,7 +2080,7 @@ mod tests {
     async fn summarizing_delegates_to_shared_pipeline() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let mut s =
-            Summarizing::new(100).with_summarizer(capturing_summarizer("PIPE-SUM", calls.clone()));
+            Summarizing::new(512).with_summarizer(capturing_summarizer("PIPE-SUM", calls.clone()));
         let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaa";
         let big = "x".repeat(200);
         // An early reply carries a credential — it lands in the summarized
@@ -2037,7 +2095,8 @@ mod tests {
             s.sync_turn(&big, &big, &metrics_with_input(11 + i)).await;
         }
         assert!(calls.lock().unwrap().is_empty(), "under budget — no calls");
-        s.sync_turn(&big, &big, &metrics_with_input(120)).await;
+        let current = "CURRENT-B: compress this conversation";
+        s.sync_turn(current, &big, &metrics_with_input(600)).await;
 
         let reqs = calls.lock().unwrap();
         assert_eq!(reqs.len(), 1, "exactly one summarizer call per compression");
@@ -2047,7 +2106,18 @@ mod tests {
             "must be the shared pipeline's request template"
         );
         assert!(req.contains("## Original Task"));
-        assert!(req.contains("the original task"), "task anchored verbatim");
+        let task_section = req
+            .split("## Original Task")
+            .nth(1)
+            .expect("shared prompt task section")
+            .split("## Conversation middle")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            task_section.contains(current),
+            "task anchored verbatim: {req}"
+        );
+        assert!(!task_section.contains("the original task"), "{req}");
         assert!(
             !req.contains(secret),
             "secret must not reach the summarizer"
@@ -2060,16 +2130,119 @@ mod tests {
         assert!(s.prev_summary.contains(crate::agentic::SUMMARY_END_MARKER));
     }
 
+    #[tokio::test]
+    async fn summarizing_anchors_latest_b_and_does_not_persist_harness_pair() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut provider =
+            Summarizing::new(512).with_summarizer(capturing_summarizer("B-SUMMARY", calls.clone()));
+        let bulk = "x".repeat(500);
+        let mut turns = vec![crate::ConversationTurn::new(
+            "TASK-A: inspect ambient services",
+            "A completed",
+        )];
+        for i in 0..8 {
+            turns.push(crate::ConversationTurn::new(
+                format!("history {i} {bulk}"),
+                format!("reply {i} {bulk}"),
+            ));
+        }
+        provider.restore_turns(&turns);
+
+        let task_b = "TASK-B: implement durable prompt provenance";
+        provider
+            .sync_turn(task_b, "working on B", &metrics_with_input(600))
+            .await;
+
+        let requests = calls.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let task_section = requests[0]
+            .split("## Original Task")
+            .nth(1)
+            .expect("shared prompt task section")
+            .split("## Conversation middle")
+            .next()
+            .unwrap_or_default();
+        assert!(task_section.contains(task_b), "{}", requests[0]);
+        assert!(!task_section.contains("TASK-A"), "{}", requests[0]);
+        drop(requests);
+        assert!(provider
+            .history
+            .iter()
+            .all(|turn| !turn.user.starts_with("[NEWT ACTIVE PROMPT v1]")));
+    }
+
+    #[tokio::test]
+    async fn summarizing_persists_retry_but_compresses_against_active_operator() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut provider = Summarizing::new(512)
+            .with_summarizer(capturing_summarizer("ACTIVE-SUMMARY", calls.clone()));
+        let active_operator = "ORIGINAL OPERATOR B: implement durable prompt provenance";
+        let bulk = "x".repeat(300);
+        let mut turns = vec![crate::ConversationTurn::new(
+            active_operator,
+            "original B reply",
+        )];
+        turns.extend((0..7).map(|i| {
+            crate::ConversationTurn::new(format!("history {i} {bulk}"), format!("reply {i} {bulk}"))
+        }));
+        provider.restore_turns(&turns);
+
+        let submitted_retry = "HARNESS RETRY: act now and do not summarize";
+        provider
+            .sync_turn_with_active_task(
+                submitted_retry,
+                "continuing the requested implementation",
+                &metrics_with_input(600),
+                active_operator,
+            )
+            .await;
+
+        let requests = calls.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one provider compression expected");
+        let task_section = requests[0]
+            .split("## Original Task")
+            .nth(1)
+            .expect("shared prompt task section")
+            .split("## Conversation middle")
+            .next()
+            .unwrap_or_default();
+        assert!(task_section.contains(active_operator), "{}", requests[0]);
+        assert!(!task_section.contains(submitted_retry), "{}", requests[0]);
+        drop(requests);
+
+        let retry_turn = provider
+            .history
+            .iter()
+            .find(|turn| turn.user == submitted_retry)
+            .expect("submitted retry presentation must remain ordinary history");
+        assert!(
+            retry_turn.assistant == "continuing the requested implementation",
+            "the retry reply must stay paired with the submitted retry; got assistant {:?}",
+            retry_turn.assistant
+        );
+        assert!(
+            provider.history.iter().all(|turn| {
+                turn.user != active_operator
+                    || turn.assistant != "continuing the requested implementation"
+            }),
+            "the transient active operator anchor must never be reinserted and paired with the retry reply"
+        );
+        assert!(provider
+            .history
+            .iter()
+            .all(|turn| !turn.user.starts_with("[NEWT ACTIVE PROMPT v1]")));
+    }
+
     /// The compaction record is offered for persistence exactly once.
     #[tokio::test]
     async fn summarizing_compaction_record_is_minted_once_and_drained() {
-        let mut s = Summarizing::new(100).with_summarizer(stub_summarizer("SUMMARY"));
+        let mut s = Summarizing::new(512).with_summarizer(stub_summarizer("SUMMARY"));
         assert!(s.take_compaction_record().is_none(), "nothing minted yet");
         let big = "x".repeat(200);
         for i in 0..5u32 {
             s.sync_turn(&big, &big, &metrics_with_input(10 + i)).await;
         }
-        s.sync_turn(&big, &big, &metrics_with_input(120)).await;
+        s.sync_turn(&big, &big, &metrics_with_input(600)).await;
         let record = s
             .take_compaction_record()
             .expect("compression must mint a record");
@@ -2086,13 +2259,13 @@ mod tests {
     async fn memory_manager_routes_take_compaction_record() {
         let mut mgr = MemoryManager::new();
         mgr.add_provider(RollingWindow::new(50)); // mints nothing
-        mgr.add_provider(Summarizing::new(100).with_summarizer(stub_summarizer("SUMMARY")));
+        mgr.add_provider(Summarizing::new(512).with_summarizer(stub_summarizer("SUMMARY")));
         assert!(mgr.take_compaction_record().is_none());
         let big = "x".repeat(200);
         for i in 0..5u32 {
             mgr.sync_all(&big, &big, &metrics_with_input(10 + i)).await;
         }
-        mgr.sync_all(&big, &big, &metrics_with_input(120)).await;
+        mgr.sync_all(&big, &big, &metrics_with_input(600)).await;
         let record = mgr
             .take_compaction_record()
             .expect("manager must surface the Summarizing provider's record");
@@ -2162,7 +2335,7 @@ mod tests {
     async fn restored_compaction_chains_into_next_compression() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let mut s =
-            Summarizing::new(100).with_summarizer(capturing_summarizer("NEW-SUM", calls.clone()));
+            Summarizing::new(512).with_summarizer(capturing_summarizer("NEW-SUM", calls.clone()));
         let marked = format!(
             "{}\nCHAIN-ME: facts from the first compaction\n{}",
             crate::agentic::SUMMARY_PREFIX,
@@ -2179,7 +2352,8 @@ mod tests {
         s.restore_turns(&turns);
 
         // One live over-budget turn → one pipeline compression.
-        s.sync_turn(&big, &big, &metrics_with_input(200)).await;
+        let current = "CURRENT-B: extend the restored compaction chain";
+        s.sync_turn(current, &big, &metrics_with_input(600)).await;
         let reqs = calls.lock().unwrap();
         assert_eq!(reqs.len(), 1, "one call through the shared path");
         assert!(
@@ -2187,16 +2361,17 @@ mod tests {
             "the previous summary must be summarizer INPUT (the chain), got: {}",
             reqs[0]
         );
-        // The Original-Task anchor (the text right under the header) must be
-        // the first REAL user message, not the compaction message.
+        // The Original-Task anchor (the text right under the header) is the
+        // explicit current prompt, not either the compaction message or an
+        // older historical user request.
         let anchored = reqs[0]
             .split("## Original Task")
             .nth(1)
             .and_then(|rest| rest.lines().nth(1).map(str::to_string))
             .unwrap_or_default();
         assert!(
-            anchored.starts_with("task 0"),
-            "task anchor must skip the compaction message, got: {anchored:?}"
+            anchored.starts_with(current),
+            "task anchor must be current B, got: {anchored:?}"
         );
         drop(reqs);
         // The old compaction message was replaced by the new one.
@@ -2411,12 +2586,12 @@ mod tests {
     /// summarised" placeholder is deleted with the rest of the legacy path.
     #[tokio::test]
     async fn summarizing_fallback_placeholder_when_no_summarizer() {
-        let mut s = Summarizing::new(10); // tiny budget (8) to trigger compression
+        let mut s = Summarizing::new(256); // 204-token budget; prompt pair fits
         for i in 0..6u32 {
             s.sync_turn(
                 &format!("question {i}"),
                 &format!("answer {i}"),
-                &metrics_with_input(6 + 4 * i),
+                &metrics_with_input(if i == 5 { 300 } else { 10 }),
             )
             .await;
         }
@@ -2445,7 +2620,7 @@ mod tests {
 
     #[tokio::test]
     async fn summarizing_on_pre_compress_returns_prev_summary() {
-        let mut s = Summarizing::new(10).with_summarizer(stub_summarizer("PRIOR SUMMARY"));
+        let mut s = Summarizing::new(256).with_summarizer(stub_summarizer("PRIOR SUMMARY"));
         // Build up history UNDER budget first: the pipeline's boundary needs
         // enough turns to leave a summarizable middle (Step 18.5 — head +
         // ≥3-message tail are protected), and a too-early trigger would burn
@@ -2454,8 +2629,8 @@ mod tests {
             s.sync_turn("question text", "answer text", &metrics_with_input(2))
                 .await;
         }
-        // Now cross the 8-token budget → compression sets prev_summary.
-        s.sync_turn("question text", "answer text", &metrics_with_input(50))
+        // Now cross the 204-token budget → compression sets prev_summary.
+        s.sync_turn("question text", "answer text", &metrics_with_input(300))
             .await;
         let pre = s.on_pre_compress(&[]).await;
         assert!(

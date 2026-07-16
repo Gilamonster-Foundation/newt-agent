@@ -19,6 +19,7 @@
 //! line rather than a dead end.
 
 use super::display::{print_tool_call, print_tool_output};
+use super::prompt_read::PromptReadContext;
 use super::recall::RecallSource;
 use super::scheduled::{plan_block, StepLedger};
 use super::scratchpad::{scratchpad_state_block, ScratchpadStore};
@@ -31,8 +32,10 @@ const RESUME_DEFAULT_TURNS: usize = 6;
 /// it names the three things it returns so the model knows it landed.
 const RESUME_CONTEXT_DESCRIPTION: &str =
     "Recover what you were working on — returns this conversation's recent \
-     turns, your current <plan>, and saved <state>. Use it after a resume or \
-     when you've lost the thread. No args.";
+     turns, the active prompt address/root/digest, the submitted receipt's \
+     origin and previous/parent/root links, your current <plan>, and saved \
+     <state>. Use prompt_read on a returned address for exact text. Use this \
+     after a resume or when you've lost the thread. No args.";
 
 /// The `resume_context` tool definition. Unlike `recall`, this is advertised
 /// ALWAYS (it is broadly useful and degrades gracefully when its sources are
@@ -60,36 +63,73 @@ pub(crate) fn execute_resume_context(
     recall_source: Option<&dyn RecallSource>,
     step_ledger: Option<&dyn StepLedger>,
     scratchpad_store: Option<&dyn ScratchpadStore>,
+    prompt_context: Option<PromptReadContext<'_>>,
     color: bool,
     tool_output_lines: usize,
 ) -> String {
     print_tool_call("resume_context", "", color);
 
-    let Some(source) = recall_source else {
-        // Headless / eval: no conversation store this session. Be explicit so
-        // the model switches strategy instead of re-probing a dead end.
-        let out = "no conversation history available this session — resume_context needs a \
-                   conversation store (headless / eval sessions have none)."
-            .to_string();
-        print_tool_output(&out, tool_output_lines, color);
-        return out;
-    };
-
     let mut out = String::from("Recovering what this conversation was working on.\n");
+
+    if let Some(context) = prompt_context {
+        if let Some(receipt) = context.active_receipt() {
+            out.push_str(&format!(
+                "\n— active operator prompt —\naddress: {}\nroot: {}\nmodel_digest: {}\n\
+                 exact text: prompt_read {{\"address\":\"current\"}}\n",
+                receipt.id(),
+                receipt.root_prompt_id(),
+                receipt.model_digest()
+            ));
+            if let Some(submitted) = context.submitted_receipt() {
+                out.push_str(&format!(
+                    "\n— submitted request receipt —\naddress: {}\norigin: {}\n\
+                     previous_address: {}\nparent_address: {}\nroot_address: {}\n\
+                     exact submitted text: prompt_read {{\"address\":\"submitted\"}}\n",
+                    submitted.id(),
+                    prompt_origin_name(submitted.origin()),
+                    display_optional_prompt_id(submitted.previous_prompt_id()),
+                    display_optional_prompt_id(submitted.parent_prompt_id()),
+                    submitted.root_prompt_id(),
+                ));
+                if submitted.previous_prompt_id().is_some() {
+                    out.push_str(
+                        "recover chronological predecessor: prompt_read \
+                         {\"address\":\"previous\"}\n",
+                    );
+                }
+                if submitted.parent_prompt_id().is_some() {
+                    out.push_str("recover semantic parent: prompt_read {\"address\":\"parent\"}\n");
+                }
+            }
+        } else {
+            out.push_str(
+                "\n— active operator prompt —\nexact text: prompt_read \
+                 {\"address\":\"current\"} (ephemeral; no durable address)\n\
+                 \n— submitted request receipt —\naddress: null\norigin: null\n\
+                 previous_address: null\nparent_address: null\nroot_address: null\n",
+            );
+        }
+    }
 
     // (a) THIS conversation's recent durable turns — the pre-interrupt work the
     //     live window may have dropped to compaction.
     out.push_str("\n— recent turns (oldest first) —\n");
-    match source.this_conversation_recent(RESUME_DEFAULT_TURNS) {
-        Ok(hits) if !hits.is_empty() => {
-            for h in &hits {
-                out.push_str(&format!("[{}] {}\n", h.seq, h.snippet));
+    match recall_source {
+        Some(source) => match source.this_conversation_recent(RESUME_DEFAULT_TURNS) {
+            Ok(hits) if !hits.is_empty() => {
+                for h in &hits {
+                    out.push_str(&format!("[{}] {}\n", h.seq, h.snippet));
+                }
             }
-        }
-        Ok(_) => out.push_str("(no earlier turns recorded yet)\n"),
-        // A backend failure is a note in the block, not a loop abort — the
-        // plan / state below may still orient the model.
-        Err(e) => out.push_str(&format!("(could not load earlier turns: {e})\n")),
+            Ok(_) => out.push_str("(no earlier turns recorded yet)\n"),
+            // A backend failure is a note in the block, not a loop abort — the
+            // plan / state below may still orient the model.
+            Err(e) => out.push_str(&format!("(could not load earlier turns: {e})\n")),
+        },
+        None => out.push_str(
+            "(no conversation history available this session — headless / eval \
+             sessions may have none)\n",
+        ),
     }
 
     // (b) the current <plan> checklist, read-only (omitted when empty).
@@ -109,6 +149,17 @@ pub(crate) fn execute_resume_context(
 
     print_tool_output(&out, tool_output_lines, color);
     out
+}
+
+fn display_optional_prompt_id(id: Option<crate::PromptId>) -> String {
+    id.map_or_else(|| "null".to_string(), |id| id.to_string())
+}
+
+fn prompt_origin_name(origin: crate::PromptOrigin) -> &'static str {
+    match origin {
+        crate::PromptOrigin::Operator => "operator",
+        crate::PromptOrigin::HarnessRetry => "harness_retry",
+    }
 }
 
 #[cfg(test)]
@@ -183,6 +234,7 @@ mod tests {
             Some(&source),
             Some(&ledger as &dyn StepLedger),
             Some(&scratch as &dyn ScratchpadStore),
+            None,
             false,
             20,
         );
@@ -209,7 +261,7 @@ mod tests {
 
     #[test]
     fn no_source_returns_clear_no_history_message() {
-        let out = execute_resume_context(None, None, None, false, 20);
+        let out = execute_resume_context(None, None, None, None, false, 20);
         assert!(
             out.contains("no conversation history available this session"),
             "{out}"
@@ -217,11 +269,46 @@ mod tests {
     }
 
     #[test]
+    fn resume_names_active_and_submitted_prompt_handles_without_copying_text() {
+        let operator = crate::TurnPromptContext::ephemeral_operator(
+            "conv",
+            "raw operator secret",
+            "exact operator secret",
+        );
+        let retry = crate::TurnPromptContext::ephemeral_harness_retry(
+            "conv",
+            "retry raw",
+            "please continue",
+            &operator,
+        )
+        .unwrap();
+        let context = PromptReadContext::new(Some(&retry), "wrong fallback", None);
+
+        let out = execute_resume_context(None, None, None, Some(context), false, 20);
+        assert!(out.contains(&operator.active().id().to_string()), "{out}");
+        assert!(out.contains(operator.active().model_digest()), "{out}");
+        assert!(out.contains(&retry.submitted().id().to_string()), "{out}");
+        assert!(out.contains("origin: harness_retry"), "{out}");
+        assert!(
+            out.contains(&format!("previous_address: {}", operator.submitted().id())),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("parent_address: {}", operator.submitted().id())),
+            "{out}"
+        );
+        assert!(out.contains("recover chronological predecessor"), "{out}");
+        assert!(out.contains("prompt_read"), "{out}");
+        assert!(!out.contains("exact operator secret"), "{out}");
+        assert!(!out.contains("please continue"), "{out}");
+    }
+
+    #[test]
     fn empty_sources_render_without_panicking() {
         // A source with no turns + no plan + no state → just the header and the
         // "no earlier turns" note; the plan / state sections are omitted.
         let source = RecentMock::default();
-        let out = execute_resume_context(Some(&source), None, None, false, 20);
+        let out = execute_resume_context(Some(&source), None, None, None, false, 20);
         assert!(out.contains("(no earlier turns recorded yet)"), "{out}");
         assert!(!out.contains("<plan>"), "{out}");
         assert!(!out.contains("<state>"), "{out}");
@@ -239,6 +326,7 @@ mod tests {
         let out = execute_resume_context(
             Some(&source),
             Some(&ledger as &dyn StepLedger),
+            None,
             None,
             false,
             20,

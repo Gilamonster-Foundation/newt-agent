@@ -140,6 +140,107 @@ async fn ollama_streams_final_answer_and_merges_usage() {
     assert_eq!(hallu, 0);
 }
 
+/// Records whether every inference request preserves normal multi-turn wire
+/// ordering while also carrying the protected recovery copy near the system
+/// prompt.
+struct ActivePromptWireOrderResponder {
+    exact_task: &'static str,
+    requests: Arc<AtomicUsize>,
+    order_valid: Arc<AtomicBool>,
+}
+
+impl Respond for ActivePromptWireOrderResponder {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body = body_json(req);
+        let messages = body["messages"].as_array().cloned().unwrap_or_default();
+        let card_index = messages.iter().position(|message| {
+            message["role"].as_str() == Some("system")
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX))
+        });
+        let protected_copy_is_earlier = card_index.is_some_and(|index| {
+            index + 1 < messages.len().saturating_sub(1)
+                && messages[index + 1]["role"].as_str() == Some("user")
+                && messages[index + 1]["content"].as_str() == Some(self.exact_task)
+        });
+        let live_task_is_newest = messages.last().is_some_and(|message| {
+            message["role"].as_str() == Some("user")
+                && message["content"].as_str() == Some(self.exact_task)
+        });
+        let exact_task_copies = messages
+            .iter()
+            .filter(|message| {
+                message["role"].as_str() == Some("user")
+                    && message["content"].as_str() == Some(self.exact_task)
+            })
+            .count();
+        self.order_valid.fetch_and(
+            protected_copy_is_earlier && live_task_is_newest && exact_task_copies == 2,
+            Ordering::SeqCst,
+        );
+        self.requests.fetch_add(1, Ordering::SeqCst);
+
+        if is_stream(req) {
+            ndjson(&[serde_json::json!({
+                "message": {"content": "wire order preserved"},
+                "done": true,
+                "prompt_eval_count": 20,
+                "eval_count": 4
+            })])
+        } else {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": "wire order preserved"},
+                "prompt_eval_count": 20,
+                "eval_count": 4
+            }))
+        }
+    }
+}
+
+#[tokio::test]
+async fn multi_turn_wire_keeps_live_operator_task_newest_after_protected_copy() {
+    const CURRENT_TASK: &str = "CURRENT OPERATOR TASK: report the exact wire ordering";
+    let server = MockServer::start().await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let order_valid = Arc::new(AtomicBool::new(true));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ActivePromptWireOrderResponder {
+            exact_task: CURRENT_TASK,
+            requests: requests.clone(),
+            order_valid: order_valid.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("an older operator request"),
+        MemMessage::assistant("the older request is complete"),
+        MemMessage::user(CURRENT_TASK),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.task = CURRENT_TASK;
+    let (reply, streamed, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("ordinary multi-turn request should complete");
+
+    assert_eq!(reply, "wire order preserved");
+    assert!(streamed);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "both the probe and streaming reissue reached the wire"
+    );
+    assert!(
+        order_valid.load(Ordering::SeqCst),
+        "every request must keep the protected copy earlier and the live task newest"
+    );
+}
+
 #[test]
 fn detects_tools_unsupported_400_phrasings() {
     assert!(is_tools_unsupported_error(&anyhow::anyhow!(
@@ -731,7 +832,7 @@ impl Respond for OverflowThenRecover {
             if self.probes.load(Ordering::SeqCst) <= 1 {
                 ndjson(&[serde_json::json!({
                     "message": {"content": ""}, "done": true,
-                    "prompt_eval_count": 90, "eval_count": 1
+                    "prompt_eval_count": 3_600, "eval_count": 1
                 })])
             } else {
                 ndjson(&[
@@ -747,7 +848,7 @@ impl Respond for OverflowThenRecover {
             if n == 1 {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "message": {"content": ""},
-                    "prompt_eval_count": 90, "eval_count": 1,
+                    "prompt_eval_count": 3_600, "eval_count": 1,
                 }))
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -775,12 +876,13 @@ async fn context_overflow_trims_and_retries_then_recovers() {
     let caveats = Caveats::top();
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
-    // Safe window of 100 input tokens: the empty round reported a 90-token
-    // prompt, and 90 ≥ 85% of 100, so it is classified as likely overflow.
+    // Safe window of 4,096 input tokens: the exact active prompt and expanded
+    // tool catalog fit, while the empty round's reported 3,600-token prompt
+    // is still ≥85% of the window and therefore likely overflow.
     // (Step 18.1: the check compares the largest single prompt against the
     // window — the old multi-round sum, 180 here, inflated past 85% after
     // two rounds on EVERY long turn, firing spurious overflow retries.)
-    c.safe_context = Some(100);
+    c.safe_context = Some(4_096);
     let (reply, streamed, usage, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("chat_complete should succeed");
@@ -796,7 +898,7 @@ async fn context_overflow_trims_and_retries_then_recovers() {
         usage
             .expect("accumulated usage survives the retry")
             .input_tokens,
-        90,
+        3_600,
         "largest single prompt across the overflowed + recovered rounds"
     );
 }
@@ -828,7 +930,7 @@ impl Respond for TrimObservingResponder {
         if contains(SUMMARY_PREFIX) && contains("Summary generation was unavailable.") {
             self.marker_seen.store(true, Ordering::SeqCst);
         }
-        if contains("earlier tool-call messages omitted") {
+        if body.get("tools").is_some() && contains("earlier tool-call messages omitted") {
             self.old_placeholder_seen.store(true, Ordering::SeqCst);
         }
         if body.get("tools").is_some() {
@@ -911,7 +1013,7 @@ impl Respond for OpenAiTaskAnchoringResponder {
             });
             if let Some(directive) = directive {
                 self.directive_seen.store(true, Ordering::SeqCst);
-                if directive.contains(CURRENT_TASK) {
+                if directive.contains("prompt_read") {
                     self.current_task_in_directive.store(true, Ordering::SeqCst);
                 }
                 if directive.contains(HISTORICAL_TASK) {
@@ -974,7 +1076,7 @@ async fn openai_mid_loop_compaction_anchors_the_current_turn_not_historical_prom
     c.max_tool_rounds = 3;
     // Four historical messages fit on round 0; the first tool exchange grows
     // the list past five, forcing the regression's MID-TURN compaction.
-    c.mid_loop_trim_threshold = 5;
+    c.mid_loop_trim_threshold = 7;
 
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
@@ -987,7 +1089,7 @@ async fn openai_mid_loop_compaction_anchors_the_current_turn_not_historical_prom
     );
     assert!(
         current_task_in_directive.load(Ordering::SeqCst),
-        "the wire continuation must quote current ChatCtx.task B"
+        "the wire continuation must point back to the protected current prompt"
     );
     assert!(
         !historical_task_in_directive.load(Ordering::SeqCst),
@@ -1505,16 +1607,17 @@ async fn question_turns_are_never_nudged() {
         })
         .mount(&server)
         .await;
+    let question =
+        "Give me your top 5 improvements to make LLM effectiveness better inside this harness please?";
     let messages = vec![
         MemMessage::system("you are a test"),
-        MemMessage::user(
-            "Give me your top 5 improvements to make LLM effectiveness better inside this harness please?",
-        ),
+        MemMessage::user(question),
     ];
     let caveats = Caveats::top();
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
+    c.task = question;
     c.narration_nudge_cap = 2; // budget available — the GATE must stop it
     let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
     assert_eq!(
@@ -1823,7 +1926,7 @@ fn post_compaction_continuation_reanchors_on_ground_truth() {
     // worktree is clean, start fresh", DISOWNED its own branch+commit and
     // repeated finished work. The continuation directive must order a
     // ground-truth re-anchor and state the clean-tree≠no-work rule.
-    let d = post_compaction_continuation(None, "");
+    let d = post_compaction_continuation(None, prompt_read::PromptReadContext::new(None, "", None));
     assert!(d.contains("re-anchor on ground truth"), "{d}");
     assert!(d.contains("git branch"), "{d}");
     assert!(
@@ -1848,7 +1951,10 @@ fn post_compaction_continuation_reinjects_the_full_plan_advance_not_rewrite() {
         "wire nudger profiles".to_string(),
     ]);
     ledger.advance(); // step 1 done, step 2 active
-    let d = post_compaction_continuation(Some(&ledger), "");
+    let d = post_compaction_continuation(
+        Some(&ledger),
+        prompt_read::PromptReadContext::new(None, "", None),
+    );
     // The full plan is present — including the not-yet-reached step.
     assert!(
         d.contains("wire the lazy-emission guard"),
@@ -1866,27 +1972,29 @@ fn post_compaction_continuation_reinjects_the_full_plan_advance_not_rewrite() {
     );
     assert!(d.contains("advance"), "{d}");
     // No plan → no plan clause (and no panic).
-    let empty = post_compaction_continuation(None, "");
+    let empty =
+        post_compaction_continuation(None, prompt_read::PromptReadContext::new(None, "", None));
     assert!(!empty.contains("active plan is below"), "{empty}");
 }
 
 #[test]
-fn post_compaction_continuation_quotes_the_operators_instruction() {
+fn post_compaction_continuation_points_to_the_immutable_prompt_without_quoting_it() {
     // Regression #1163 (second repro, corporate-box Opus 2026-07-14):
     // compaction summarized the middle and the model re-derived a WRONG
     // task ("deliver a report") from the summary, dropping the operator's
-    // actual instruction ("make a branch, write a commit for each") and
-    // confabulating. The directive must quote the instruction verbatim so
-    // the model re-anchors on what was ASKED, not a paraphrase.
+    // actual instruction and confabulating. The exact instruction now lives
+    // in a protected user-priority pair, so this directive points to its
+    // immutable receipt rather than injecting a truncated user-role quote.
+    let task = "make a plan, make a branch, write me a commit for each suggestion";
+    let turn = crate::TurnPromptContext::ephemeral_operator("conv", task, task);
     let d = post_compaction_continuation(
         None,
-        "make a plan, make a branch, write me a commit for each suggestion",
+        prompt_read::PromptReadContext::new(Some(&turn), task, None),
     );
-    assert!(
-        d.contains("make a plan, make a branch, write me a commit for each"),
-        "the instruction is quoted verbatim: {d}"
-    );
-    assert!(d.contains("keep executing THAT"), "{d}");
+    assert!(d.contains(&turn.active().id().to_string()), "{d}");
+    assert!(d.contains(turn.active().model_digest()), "{d}");
+    assert!(d.contains("prompt_read"), "{d}");
+    assert!(!d.contains(task), "must not duplicate operator text: {d}");
     assert!(d.contains("do not narrow the task"), "{d}");
 }
 
@@ -1899,6 +2007,8 @@ fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt(
     // the model to abandon the repository work and repeat the old probes.
     let old_task = "can you access any of the ambient MCP servers?";
     let current_task = "modify the newt-agent source code and implement MCP management";
+    let turn = crate::TurnPromptContext::ephemeral_operator("conv", current_task, current_task);
+    let prompt_context = prompt_read::PromptReadContext::new(Some(&turn), current_task, None);
     let mut messages = vec![
         serde_json::json!({"role": "system", "content": "you are newt"}),
         serde_json::json!({"role": "user", "content": old_task}),
@@ -1913,7 +2023,7 @@ fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt(
         &mut nudges,
         CompressAction::Summarized,
         None,
-        current_task,
+        prompt_context,
         true,
     );
 
@@ -1922,9 +2032,14 @@ fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt(
         .and_then(|message| message["content"].as_str())
         .expect("post-compaction continuation");
     assert!(
-        directive.contains(current_task),
-        "the continuation must preserve the current turn task: {directive}"
+        directive.contains(&turn.active().id().to_string()),
+        "{directive}"
     );
+    assert!(
+        directive.contains(turn.active().model_digest()),
+        "{directive}"
+    );
+    assert!(!directive.contains(current_task), "{directive}");
     assert!(
         !directive.contains(old_task),
         "the first conversation prompt must not be relabeled as current: {directive}"
@@ -1952,6 +2067,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         }),
     ];
     let mut nudges = 1usize;
+    let prompt_context = prompt_read::PromptReadContext::new(None, "do the thing", None);
 
     // Prune-only passes keep the corrective text: no refund, no anchor.
     apply_post_compaction_continuation(
@@ -1959,7 +2075,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         &mut nudges,
         CompressAction::Pruned,
         None,
-        "do the thing",
+        prompt_context,
         true,
     );
     assert_eq!(nudges, 1, "prune must not refund the rescue budget");
@@ -1973,7 +2089,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         &mut nudges,
         CompressAction::Summarized,
         None,
-        "do the thing",
+        prompt_context,
         false,
     );
     assert_eq!(nudges, 1, "round 0 must not touch the rescue budget");
@@ -1987,7 +2103,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         &mut nudges,
         CompressAction::Summarized,
         None,
-        "do the thing",
+        prompt_context,
         true,
     );
     assert_eq!(nudges, 0, "summarization refunds the rescue budget");

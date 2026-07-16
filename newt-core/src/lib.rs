@@ -33,6 +33,7 @@ pub mod ocap;
 pub mod ocap_store;
 pub mod plan;
 pub mod pricing;
+pub mod prompt;
 pub mod prune;
 pub mod reasoning;
 pub mod retry;
@@ -80,14 +81,16 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // the surface — the TUI implements the gate; headless callers pass None.
 pub use agentic::wrap_untrusted;
 pub use agentic::{
-    append_denial, chat_complete, compress_user_initiated, execute_tool, experience_block,
-    gather_code_files, index_files, load_denials, memory_fetch_tool_definition,
-    openai_chat_complete, plan_block, retrieve_evidence, transcript_lines, transcript_lines_styled,
-    trim_for_summary, widen_caveats, ChatCtx, CodeSearch, CompressCounters, CompressState,
-    DenialKind, Embedder, EmbeddingsClient, ExperienceStore, ManualCompressOutcome, McpTools,
-    MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
-    PermissionGate, PermissionRecord, PermissionRequest, PlanSnapshot, RecallSource,
-    RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
+    append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
+    compress_user_initiated_for_task, execute_tool, experience_block, gather_code_files,
+    index_files, load_denials, memory_fetch_tool_definition, openai_chat_complete,
+    openai_chat_complete_with_prompt, openai_responses_complete,
+    openai_responses_complete_with_prompt, plan_block, retrieve_evidence, transcript_lines,
+    transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CodeSearch,
+    CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ExperienceStore,
+    ManualCompressOutcome, McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink,
+    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PlanSnapshot,
+    RecallSource, RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
     SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, SessionStepLedger,
     ShellObservation, SpillStore, Step, StepLedger, StepStatus, StoreMemorySource,
     StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine, TranscriptRole,
@@ -133,6 +136,9 @@ pub use memory::{
 pub use metrics::{TokenUsage, TurnEndReason, TurnMetrics};
 pub use model_id::ModelId;
 pub use pricing::{ModelRate, PricingConfig};
+pub use prompt::{
+    ActivePrompt, NewPrompt, PromptId, PromptOrigin, PromptReceipt, TurnPromptContext,
+};
 pub use reasoning::{split_reasoning, ThinkFilter};
 pub use role_profile::{
     Altitude, CaveatProfile, NamedPermissionPreset, RoleProfile, ScopeKeyword, ScopeSpec,
