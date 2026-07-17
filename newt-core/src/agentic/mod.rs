@@ -4086,6 +4086,53 @@ async fn final_summary_ollama(
     }
 }
 
+/// Project the internal protected-head representation onto chat templates that
+/// accept exactly one system message at index zero.
+///
+/// Prompt provenance deliberately keeps the base prompt and active-prompt card
+/// as separate leading system messages internally. Coalesce only that leading
+/// run for the OpenAI Chat Completions wire; a genuinely late system message is
+/// malformed and must not be silently promoted across conversation history.
+fn openai_chat_wire_messages(
+    messages: &[serde_json::Value],
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let leading_systems = messages
+        .iter()
+        .take_while(|message| message["role"].as_str() == Some("system"))
+        .count();
+
+    if messages[leading_systems..]
+        .iter()
+        .any(|message| message["role"].as_str() == Some("system"))
+    {
+        anyhow::bail!(
+            "invalid OpenAI chat message order: system messages must precede conversation history"
+        );
+    }
+    if leading_systems <= 1 {
+        return Ok(messages.to_vec());
+    }
+
+    let content = messages[..leading_systems]
+        .iter()
+        .map(|message| {
+            message["content"].as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid OpenAI chat system message: content must be text before coalescing"
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .join("\n\n");
+    let mut system = messages[0].clone();
+    system["content"] = serde_json::Value::String(content);
+
+    let mut wire = Vec::with_capacity(messages.len() - leading_systems + 1);
+    wire.push(system);
+    wire.extend(messages[leading_systems..].iter().cloned());
+    Ok(wire)
+}
+
 /// Final tools-disabled completion for the OpenAI (`/v1/chat/completions`) path.
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
@@ -4113,6 +4160,7 @@ async fn final_summary_openai(
         "role": "user",
         "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
     }));
+    let messages = openai_chat_wire_messages(&messages)?;
     if preflight_full_message_request(
         &messages,
         None,
@@ -4641,11 +4689,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             }
         }
 
+        let wire_messages = openai_chat_wire_messages(&messages)?;
+
         // Mirror the Ollama full-request gate. A known authoritative ceiling
         // means the harness must not dispatch an impossible request,
         // especially after a giant exact prompt_read result.
         preflight_full_message_request(
-            &messages,
+            &wire_messages,
             tools_supported.then_some(&tools),
             authoritative_request_budget(
                 send_budget,
@@ -4659,14 +4709,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
         // Phase 20 §2.2: chars/4 estimate of exactly the request about to be
         // dispatched — mirrors the Ollama path.
-        let round_est_raw =
-            estimate_request_tokens(&messages, tools_supported.then_some(&tools), estimation);
+        let round_est_raw = estimate_request_tokens(
+            &wire_messages,
+            tools_supported.then_some(&tools),
+            estimation,
+        );
 
         // OpenAI-compatible endpoints don't use Ollama's `options.num_ctx` —
         // context limits are configured server-side (vLLM --max-model-len).
         let mut body = serde_json::json!({
             "model": model,
-            "messages": messages,
+            "messages": wire_messages,
             "tools": tools.clone(),
             "tool_choice": "auto",
             "stream": false,
@@ -7143,17 +7196,27 @@ mod tool_round_cap_tests {
 
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
             let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            let system_count = messages
+                .iter()
+                .filter(|message| message["role"].as_str() == Some("system"))
+                .count();
             let pair_seen = messages.windows(2).any(|pair| {
                 let card = pair[0]["role"].as_str() == Some("system")
                     && pair[0]["content"].as_str().is_some_and(|content| {
-                        content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX)
-                            && content.contains("address: prompt:")
+                        (if self.openai {
+                            content.contains(prompt_read::ACTIVE_PROMPT_PREFIX)
+                        } else {
+                            content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX)
+                        }) && content.contains("address: prompt:")
                             && !content.contains("<ephemeral-unrecorded>")
                     });
                 card && pair[1]["role"].as_str() == Some("user")
                     && pair[1]["content"].as_str() == Some(self.exact_task.as_str())
             });
-            self.pair_seen_on_final.store(pair_seen, Ordering::SeqCst);
+            self.pair_seen_on_final.store(
+                pair_seen && (!self.openai || system_count == 1),
+                Ordering::SeqCst,
+            );
             self.omission_seen_on_final.store(
                 messages.iter().any(|message| {
                     message["content"]
