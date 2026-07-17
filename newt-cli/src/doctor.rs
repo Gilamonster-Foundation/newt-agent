@@ -65,21 +65,17 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         None => {
             // #1243 Leg 1: the confined default is L3-gated and resolved
             // per-dispatch — report what THIS host resolves to right now, not a
-            // stale hardcoded default.
-            let resolved = newt_core::confined_default_engine(l3_active);
+            // stale hardcoded default. Keyed off the RESOLVED engine (not the
+            // raw fence bit) so the reason is consistent on platforms where the
+            // brush flip is not enabled (e.g. Windows keeps safe-subset).
+            let resolved = newt_core::resolved_confined_default();
+            let why = if resolved == newt_core::ShellEngine::Brush {
+                "kernel fence enforcing — brush confines dynamic constructs"
+            } else {
+                "no per-run kernel fence here — safe-subset refuses dynamic constructs"
+            };
             println!(
-                "  confined default (L2): {resolved} — L3-gated, resolved per run_command \
-                 ({} here, so {})",
-                if l3_active {
-                    "fence active"
-                } else {
-                    "no fence"
-                },
-                if l3_active {
-                    "brush confines dynamic constructs"
-                } else {
-                    "safe-subset refuses them"
-                }
+                "  confined default (L2): {resolved} — L3-gated, resolved per run_command ({why})"
             );
         }
     }

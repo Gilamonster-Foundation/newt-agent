@@ -110,7 +110,7 @@ pub use classifiers::{
 };
 pub use config::{
     confined_default_engine, derive_serving, full_access_default_engine, mcp_stdio_env_passthrough,
-    ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice,
+    ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
     shell_env_passthrough_default, write_backend_dropin, AgentsConfig, BackendConfig, BackendKind,
     BundleConfig, ChatStyle, ColorMode, CompactionTriggerPolicy, Config, ContextConfig,
     ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager, ConversationsConfig,

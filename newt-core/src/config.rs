@@ -2413,6 +2413,28 @@ pub fn confined_default_engine(l3_active: bool) -> ShellEngine {
     }
 }
 
+/// #1243 Leg 1: the confined default engine resolved for THIS host — the single
+/// source of truth for both `shell_engine()`'s dispatch and doctor's display.
+///
+/// The brush flip is scoped to platforms with a **real per-run kernel fence**:
+/// Linux (landlock) and macOS (seatbelt), where [`ocap_l3_backend`] is a live
+/// capability probe. Windows is deliberately left on `safe-subset`: its
+/// AppContainer backend reports active *unconditionally* (not a per-run probe),
+/// and brush is already the Windows `--full-access` default — a brush-confined
+/// Windows default is its own follow-up, not part of the landlock/seatbelt gate
+/// this leg proves. Evaluated live per call, so the fence is never cached.
+#[must_use]
+pub fn resolved_confined_default() -> ShellEngine {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        confined_default_engine(ocap_l3_backend().1)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        ShellEngine::SafeSubset
+    }
+}
+
 /// The OCAP **L3 backend** (the kernel fence) for this platform, and whether it
 /// is active on this host. This is the axis *separate* from the shell engine
 /// ([`ShellEngine`]): the engine parses/runs the command line (L2), the backend
