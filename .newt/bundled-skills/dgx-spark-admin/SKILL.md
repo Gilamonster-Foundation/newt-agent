@@ -113,7 +113,9 @@ unsloth/GLM-4.7-Flash-GGUF:UD-Q4_K_XL`. Router mode also discovers the
 ## Migrating off Ollama
 
 Two independent halves: the **models** and the **hosting**. Do the models
-first; keep Ollama running until the replacement passes its smoke test.
+first; keep Ollama running until the replacement passes its smoke test. (For
+operating Ollama itself — before, during, or instead of this migration — see
+the companion **`ollama-admin`** skill.)
 
 ### 1. Model migration — Ollama blobs ARE GGUFs
 
