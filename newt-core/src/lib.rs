@@ -109,13 +109,14 @@ pub use classifiers::{
     classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
 };
 pub use config::{
-    derive_serving, full_access_default_engine, mcp_stdio_env_passthrough, ocap_l3_backend,
-    resolve_shell_engine, shell_env_passthrough_default, write_backend_dropin, AgentsConfig,
-    BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, CompactionTriggerPolicy,
-    Config, ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager,
-    ConversationsConfig, CrewPolicyConfig, EditMode, FooterMode, Loadout, LoadoutSettings,
-    LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure,
-    OpenAiApi, PermissionPreset, PickVia, PlanConfig, PlanPruneConfig, ProfilePick, ProviderConfig,
+    confined_default_engine, derive_serving, full_access_default_engine, mcp_stdio_env_passthrough,
+    ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
+    shell_env_passthrough_default, write_backend_dropin, AgentsConfig, BackendConfig, BackendKind,
+    BundleConfig, ChatStyle, ColorMode, CompactionTriggerPolicy, Config, ContextConfig,
+    ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager, ConversationsConfig,
+    CrewPolicyConfig, EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MarkdownMode,
+    MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure, OpenAiApi,
+    PermissionPreset, PickVia, PlanConfig, PlanPruneConfig, ProfilePick, ProviderConfig,
     ScratchConfig, SemanticConfig, Serving, ShellConfig, ShellEngine, SkillsConfig,
     SummarizerConfig, ThinkingMode, ToolPermissions, TuiConfig,
 };

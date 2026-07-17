@@ -284,10 +284,14 @@ fn shell_engine() -> crate::ShellEngine {
     // `NEWT_FULL_ACCESS=1` alone still gets the full-grammar engine (`host` on
     // unix, `brush` on Windows).
     if full_access_requested() {
-        crate::full_access_default_engine()
-    } else {
-        crate::ShellEngine::default()
+        return crate::full_access_default_engine();
     }
+    // #1243 Leg 1: the CONFINED default is L3-gated and resolved HERE, per
+    // dispatch — `bridle_registry()` calls this on every run_command, so the
+    // fence state is re-checked at exec time and never cached at startup (the
+    // agent-bridle #239 TLA+ TOCTOU obligation). Brush when a kernel fence
+    // enforces on this host; safe-subset's structural refusal otherwise.
+    crate::confined_default_engine(crate::ocap_l3_backend().1)
 }
 
 /// agent-bridle's tool registry with the `"shell"` tool bound to the selected
@@ -9157,6 +9161,12 @@ mod disable_ocap_tests {
     async fn flag_off_run_command_keeps_the_confined_dispatch_verbatim() {
         let _l = env_lock().await;
         let _off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        // #1243 Leg 1: pin safe-subset. This test proves the disable-ocap FLOOR
+        // (engine-independent, runs before the engine); it must not depend on
+        // the L3-gated default (`echo` is a TRUE bash builtin under brush — it
+        // never spawns, so it isn't exec-gated, which is correct but would make
+        // this floor assertion box-dependent).
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_no_exec(ws.path());
         let out = run_tool(
@@ -9346,6 +9356,10 @@ mod disable_ocap_tests {
     async fn floor_blocks_disable_ocap_for_a_denied_exec() {
         let _l = env_lock().await;
         let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        // #1243 Leg 1: pin safe-subset — this asserts the exec FLOOR blocks the
+        // bypass (engine-independent); `echo` is a brush builtin, so the default
+        // engine would run it unspawned and make the floor test box-dependent.
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_no_exec(ws.path());
         // A readonly-triage preset clamp: exec denies everything.
@@ -9407,6 +9421,12 @@ mod disable_ocap_tests {
     async fn floor_refuses_bypass_for_a_compound_command() {
         let _l = env_lock().await;
         let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        // #1243 Leg 1: pin safe-subset so this confined-denial assertion is
+        // deterministic — shell_engine() reads NEWT_SHELL_ENGINE FIRST, so the
+        // test is immune to a NEWT_FULL_ACCESS leak from a concurrent test
+        // (which on Windows would select brush, whose `echo` builtin runs
+        // un-gated instead of the whole compound being atomically denied).
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_no_exec(ws.path());
         // `echo` is allow-listed, but the `&&` chains an unlisted `rm`.
@@ -9920,6 +9940,9 @@ mod disable_ocap_tests {
         let _l = env_lock().await;
         let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
         let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        // #1243 Leg 1: pin safe-subset (deterministic confined engine) so a
+        // concurrent NEWT_FULL_ACCESS leak can't flip this to brush on Windows.
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_no_exec(ws.path()); // fs_read scoped to ws only
         let out = run_tool(
@@ -10008,6 +10031,9 @@ mod disable_ocap_tests {
         let _l = env_lock().await;
         let _route_off = EnvVar::set("NEWT_NO_ROUTE", "1");
         let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        // #1243 Leg 1: pin safe-subset (deterministic confined engine) so a
+        // concurrent NEWT_FULL_ACCESS leak can't flip this to brush on Windows.
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         assert!(routing_disabled() && !ocap_disabled(), "L2 off, L3 on");
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_no_exec(ws.path());

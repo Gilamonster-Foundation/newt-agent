@@ -2362,11 +2362,78 @@ pub fn resolve_shell_engine(
     configured: Option<ShellEngine>,
     full_access: bool,
 ) -> ShellEngine {
-    cli.or(configured).unwrap_or(if full_access {
-        full_access_default_engine()
+    // Back-compat: the confined-auto case (`None`) collapses to safe-subset,
+    // exactly today's behavior for callers that want a concrete engine now.
+    resolve_shell_engine_choice(cli, configured, full_access).unwrap_or(ShellEngine::SafeSubset)
+}
+
+/// #1243 Leg 1: the engine CHOICE — `Some(engine)` when it is fixed at startup
+/// (an explicit `--shell-engine`/`[shell] engine`, or the `--full-access`
+/// auto-upgrade), and **`None` for the confined default**, which is
+/// deliberately NOT decided here.
+///
+/// The confined default is **L3-gated and resolved per-dispatch** by
+/// [`confined_default_engine`] against the *live* fence state, never cached at
+/// startup — the CLI publishes `NEWT_SHELL_ENGINE` only for the `Some` case, so
+/// the deep dispatch re-checks the fence at exec time. This closes the
+/// mechanized TOCTOU (agent-bridle #239 `EnforcementGate.tla`): a fence that
+/// dropped between a grant and an exec must not leave a stale brush selection
+/// running a dynamic construct advisory.
+#[must_use]
+pub fn resolve_shell_engine_choice(
+    cli: Option<ShellEngine>,
+    configured: Option<ShellEngine>,
+    full_access: bool,
+) -> Option<ShellEngine> {
+    if let Some(explicit) = cli.or(configured) {
+        return Some(explicit);
+    }
+    if full_access {
+        return Some(full_access_default_engine());
+    }
+    // Confined, no explicit choice: dispatch-time L3 gate decides.
+    None
+}
+
+/// #1243 Leg 1: the confined default engine, gated on whether an L3 kernel fence
+/// is enforcing on this host RIGHT NOW (`l3_active`, from [`ocap_l3_backend`]).
+///
+/// - **L3 enforcing ⇒ `Brush`** — the carried bash-in-Rust engine intercepts
+///   every real spawn at the primitive `before_exec` funnel (pipes, subshells,
+///   `$(…)`) and its dynamic constructs are actually confined by the kernel.
+/// - **No L3 ⇒ `SafeSubset`** — brush would run those constructs advisory-only
+///   (`sandbox_kind = None`), a honesty regression, so fall back to the static
+///   parser's STRUCTURAL REFUSAL of dynamic constructs (least authority by
+///   construction). Pure so the gate is unit-tested without a kernel.
+#[must_use]
+pub fn confined_default_engine(l3_active: bool) -> ShellEngine {
+    if l3_active {
+        ShellEngine::Brush
     } else {
         ShellEngine::SafeSubset
-    })
+    }
+}
+
+/// #1243 Leg 1: the confined default engine resolved for THIS host — the single
+/// source of truth for both `shell_engine()`'s dispatch and doctor's display.
+///
+/// The brush flip is scoped to platforms with a **real per-run kernel fence**:
+/// Linux (landlock) and macOS (seatbelt), where [`ocap_l3_backend`] is a live
+/// capability probe. Windows is deliberately left on `safe-subset`: its
+/// AppContainer backend reports active *unconditionally* (not a per-run probe),
+/// and brush is already the Windows `--full-access` default — a brush-confined
+/// Windows default is its own follow-up, not part of the landlock/seatbelt gate
+/// this leg proves. Evaluated live per call, so the fence is never cached.
+#[must_use]
+pub fn resolved_confined_default() -> ShellEngine {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        confined_default_engine(ocap_l3_backend().1)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        ShellEngine::SafeSubset
+    }
 }
 
 /// The OCAP **L3 backend** (the kernel fence) for this platform, and whether it
@@ -2399,8 +2466,8 @@ pub fn ocap_l3_backend() -> (&'static str, bool) {
 #[cfg(test)]
 mod shell_engine_tests {
     use super::{
-        full_access_default_engine, resolve_shell_engine, shell_env_passthrough_default,
-        ShellConfig, ShellEngine,
+        confined_default_engine, full_access_default_engine, resolve_shell_engine,
+        resolve_shell_engine_choice, shell_env_passthrough_default, ShellConfig, ShellEngine,
     };
 
     #[test]
@@ -2491,6 +2558,37 @@ mod shell_engine_tests {
             resolve_shell_engine(None, None, false),
             ShellEngine::SafeSubset
         );
+    }
+
+    /// #1243 Leg 1: the confined default is L3-gated — brush only where a
+    /// kernel fence enforces; safe-subset's structural refusal otherwise.
+    #[test]
+    fn confined_default_is_l3_gated() {
+        assert_eq!(confined_default_engine(true), ShellEngine::Brush);
+        assert_eq!(confined_default_engine(false), ShellEngine::SafeSubset);
+    }
+
+    /// #1243 Leg 1 (the TOCTOU-closing invariant): an explicit flag/config or
+    /// --full-access yields a FIXED `Some(engine)` published at startup, but
+    /// the confined default is `None` — deliberately unpublished so the deep
+    /// dispatch re-checks the live fence per command.
+    #[test]
+    fn choice_is_none_only_for_the_confined_default() {
+        // Explicit and full-access are fixed at startup.
+        assert_eq!(
+            resolve_shell_engine_choice(Some(ShellEngine::Brush), None, false),
+            Some(ShellEngine::Brush)
+        );
+        assert_eq!(
+            resolve_shell_engine_choice(None, Some(ShellEngine::Host), false),
+            Some(ShellEngine::Host)
+        );
+        assert_eq!(
+            resolve_shell_engine_choice(None, None, true),
+            Some(full_access_default_engine())
+        );
+        // The confined default is NOT fixed — the dispatch gate decides.
+        assert_eq!(resolve_shell_engine_choice(None, None, false), None);
     }
 
     #[test]

@@ -59,12 +59,26 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     // Shell engine + OCAP posture (#868 / #926): which engine parses run_command
     // (L2) and which kernel backend fences it (L3) — separate axes.
     println!("\nShell engine (OCAP):");
-    let engine = config
-        .shell
-        .as_ref()
-        .and_then(|s| s.engine)
-        .unwrap_or(newt_core::ShellEngine::SafeSubset);
-    println!("  configured engine (L2): {engine}");
+    let (backend, l3_active) = newt_core::ocap_l3_backend();
+    match config.shell.as_ref().and_then(|s| s.engine) {
+        Some(engine) => println!("  configured engine (L2): {engine} (explicit [shell] engine)"),
+        None => {
+            // #1243 Leg 1: the confined default is L3-gated and resolved
+            // per-dispatch — report what THIS host resolves to right now, not a
+            // stale hardcoded default. Keyed off the RESOLVED engine (not the
+            // raw fence bit) so the reason is consistent on platforms where the
+            // brush flip is not enabled (e.g. Windows keeps safe-subset).
+            let resolved = newt_core::resolved_confined_default();
+            let why = if resolved == newt_core::ShellEngine::Brush {
+                "kernel fence enforcing — brush confines dynamic constructs"
+            } else {
+                "no per-run kernel fence here — safe-subset refuses dynamic constructs"
+            };
+            println!(
+                "  confined default (L2): {resolved} — L3-gated, resolved per run_command ({why})"
+            );
+        }
+    }
     println!("    · safe-subset — refuses $(...)/dynamic constructs (portable default)");
     println!(
         "    · host        — real /bin/sh in the kernel jail (full grammar; --full-access auto-selects)"
@@ -73,10 +87,9 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         "    · brush       — carried bash-in-Rust + L2 interceptor (cross-platform; confines restricted exec too; Windows full-access default)"
     );
     println!("  override per-run: --shell-engine <safe-subset|host|brush>");
-    let (backend, active) = newt_core::ocap_l3_backend();
     println!(
         "  L3 kernel jail (this platform): {backend} — {}",
-        if active {
+        if l3_active {
             "available"
         } else {
             "NOT available → a restricted fs grant runs advisory-only (sandbox_kind=None)"
