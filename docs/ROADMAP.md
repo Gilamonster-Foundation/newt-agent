@@ -720,6 +720,28 @@ release assets.
 **Mocks:** none.
 **Estimated diff:** ~120 lines.
 
+## Step 11.4 — npm installer (`@gilamonster` shim) — **first npm release: 0.8.0**
+
+**PR:** [#1222 — feat(npm): newt-agent npm installer](https://github.com/Gilamonster-Foundation/newt-agent/pull/1222)
+(**draft — held on purpose**).
+**Touches:** `npm/` (shim package that installs the `newt` + `newt-mcp-server`
+binaries via npm).
+**Implements:** `npm i -g @gilamonster/newt`-style install that fetches the
+platform binary, as a third distribution channel alongside crates.io and PyPI.
+
+**Release decision (recorded 2026-07-17):** the **first npm publish ships with
+the `0.8.0` release** — not before. PR #1222 is kept in **draft** specifically
+to hold it back until 0.8.0; the draft state is the hold mechanism and must not
+be un-drafted or merged early (see the "Draft PRs are a hard stop" rule in the
+`gh` bundled skill). This note exists so the intent survives even if branch
+`feat/npm-shim` is closed or deleted by accident — revive from PR #1222, or
+re-cut the shim under `npm/` and target the 0.8.0 tag.
+
+**Tests:** install smoke on linux/mac/windows resolves the right binary;
+`newt --version` matches the published tag.
+**Mocks:** none (packaging step).
+**Estimated diff:** ~150 lines.
+
 ---
 
 # Phase 12 — Reference provider plugin (3 steps, separate sub-tree)
