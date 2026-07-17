@@ -3128,6 +3128,17 @@ async fn execute_tool_inner(
                     return denied_fs_result("fs_read", path);
                 }
             }
+            // #1176: shadow-OCAP — under --full-access the fs fence is top(), so
+            // this read runs unconfined; record the path a leash would have
+            // gated on (no-op unless recording is armed). `newt ocap propose`
+            // folds it into reviewable fs candidates.
+            if full_access_requested() {
+                crate::flight_recorder::log_observed(
+                    crate::flight_recorder::ShadowAxis::FsRead,
+                    &full_str,
+                    "read_file",
+                );
+            }
             match std::fs::read_to_string(&full) {
                 Ok(contents) => {
                     // #719: window + cap the MODEL-facing payload (the on-screen
@@ -3161,6 +3172,16 @@ async fn execute_tool_inner(
                 if !allowed {
                     return denied_fs_result("fs_write", path);
                 }
+            }
+            // #1176: shadow-OCAP — under --full-access the fs fence is top(), so
+            // this write runs unconfined; record the path (write=true) a leash
+            // would have gated on (no-op unless recording is armed).
+            if full_access_requested() {
+                crate::flight_recorder::log_observed(
+                    crate::flight_recorder::ShadowAxis::FsWrite,
+                    &full_str,
+                    "write_file",
+                );
             }
             // Capture provenance only after fs_write authorization. The
             // preimage digest is withheld unless this turn also has fs_read;
@@ -3393,6 +3414,14 @@ async fn execute_tool_inner(
                     return denied_fs_result("fs_write", path);
                 }
             }
+            // #1176: shadow-OCAP — edit is a write; record under --full-access.
+            if full_access_requested() {
+                crate::flight_recorder::log_observed(
+                    crate::flight_recorder::ShadowAxis::FsWrite,
+                    &full_str,
+                    "edit_file",
+                );
+            }
             if old_string.is_empty() {
                 return "error: old_string must not be empty — use write_file to create new files"
                     .to_string();
@@ -3534,6 +3563,14 @@ async fn execute_tool_inner(
                     return denied_fs_result("fs_read", path);
                 }
             }
+            // #1176: shadow-OCAP — record the listed dir under --full-access.
+            if full_access_requested() {
+                crate::flight_recorder::log_observed(
+                    crate::flight_recorder::ShadowAxis::FsRead,
+                    &full_str,
+                    "list_dir",
+                );
+            }
             match std::fs::read_dir(&full) {
                 Ok(entries) => {
                     let mut names: Vec<String> = entries
@@ -3562,6 +3599,15 @@ async fn execute_tool_inner(
                 if !allowed {
                     return denied_fs_result("fs_read", path);
                 }
+            }
+            // #1176: shadow-OCAP — record the search root under --full-access
+            // (the fuzzer's "find the 10 largest files" is a canonical case).
+            if full_access_requested() {
+                crate::flight_recorder::log_observed(
+                    crate::flight_recorder::ShadowAxis::FsRead,
+                    &full_str,
+                    "find",
+                );
             }
             let opts = find_opts_from_args(args);
             if !full.exists() {
@@ -3647,6 +3693,18 @@ async fn execute_tool_inner(
                 _ => None,
             };
             let effective_caveats = widened_for_net.as_ref().unwrap_or(caveats);
+            // #1176: shadow-OCAP — under --full-access the net leash is top(),
+            // so this fetch runs unconfined; record the host a leash would have
+            // gated on (no-op unless recording is armed).
+            if full_access_requested() {
+                if let Some(host) = host_of_url(url) {
+                    crate::flight_recorder::log_observed(
+                        crate::flight_recorder::ShadowAxis::Net,
+                        &host,
+                        url,
+                    );
+                }
+            }
             match agent_bridle::registry()
                 .dispatch("web_fetch", fetch_args, effective_caveats)
                 .await

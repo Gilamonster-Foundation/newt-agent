@@ -170,21 +170,41 @@ mod caveat_map {
 /// with recording on. Absent = recording off (the hook is a zero-cost no-op).
 pub const CAPTURE_PATH_ENV: &str = "NEWT_FLIGHT_RECORDER";
 
-/// Hook for the unconfined exec path (#1176): when a capture path is set,
+/// Hook for the unconfined **exec** path (#1176): when a capture path is set,
 /// append this command's would-be caveats as JSONL (one [`ShadowCaveat`] per
-/// line, dedup/fold happens at read time). Append-only, so concurrent shell
-/// dispatches never race a read-modify-write. A no-op — never an error to the
-/// caller — when recording is off or the write fails: the flight recorder must
-/// not perturb the session it observes.
+/// line, dedup/fold happens at read time). A no-op — never an error to the
+/// caller — when recording is off: the flight recorder must not perturb the
+/// session it observes.
 pub fn log_unconfined(command: &str) {
-    let Some(path) = std::env::var_os(CAPTURE_PATH_ENV) else {
-        return;
-    };
     let mut cap = FlightCapture::default();
     cap.observe_command(command);
+    append_capture(&cap);
+}
+
+/// Hook for the unconfined **fs / net** paths (#1176): record ONE observed
+/// caveat — an explicit `axis` + `target` (an fs path, or a net host) plus the
+/// `command`/tool-name repro fixture — the same append-only way as
+/// [`log_unconfined`]. Under `--full-access` the fs fence and net leash are
+/// `top()`, so these operations run unconfined and would otherwise leave no
+/// trace of the authority a real leash would have gated on. A no-op when
+/// recording is off or the target is empty.
+pub fn log_observed(axis: ShadowAxis, target: &str, command: &str) {
+    let mut cap = FlightCapture::default();
+    cap.observe(axis, target, command);
+    append_capture(&cap);
+}
+
+/// Append every caveat in `cap` to the armed capture file as JSONL (one
+/// [`ShadowCaveat`] per line). Append-only, so concurrent dispatches never race
+/// a read-modify-write; every error is swallowed — the recorder never perturbs
+/// the session. A no-op when recording is off (env unset) or `cap` is empty.
+fn append_capture(cap: &FlightCapture) {
     if cap.caveats.is_empty() {
         return;
     }
+    let Some(path) = std::env::var_os(CAPTURE_PATH_ENV) else {
+        return;
+    };
     use std::io::Write as _;
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -278,6 +298,49 @@ mod tests {
         let cap = read_capture_jsonl(lines);
         assert_eq!(cap.caveats.len(), 2);
         assert_eq!(cap.caveats[&(ShadowAxis::Exec, "cargo".into())].count, 2);
+    }
+
+    #[test]
+    fn fs_and_net_axes_fold_and_map_to_the_policy_classes() {
+        // #1176 fs/net axis: the fs (read/write) and net arms emit these
+        // ShadowCaveats via log_observed. Prove the JSONL they append folds
+        // back and maps to the policy capability classes the consumer reads —
+        // fs_read/fs_write → "fs", net → "net" — with counts summed.
+        let lines = concat!(
+            "{\"axis\":\"fs_read\",\"target\":\"/ws/src\",\"command\":\"read_file\",\"count\":1}\n",
+            "{\"axis\":\"fs_read\",\"target\":\"/ws/src\",\"command\":\"list_dir\",\"count\":1}\n",
+            "{\"axis\":\"fs_write\",\"target\":\"/ws/out\",\"command\":\"write_file\",\"count\":1}\n",
+            "{\"axis\":\"net\",\"target\":\"docs.rs\",\"command\":\"https://docs.rs/x\",\"count\":1}\n",
+        );
+        let cap = read_capture_jsonl(lines);
+        // read+read on the same path fold to one caveat (count 2); write is a
+        // distinct axis+target; net is its own.
+        assert_eq!(cap.caveats.len(), 3);
+        let read = &cap.caveats[&(ShadowAxis::FsRead, "/ws/src".into())];
+        assert_eq!(read.count, 2);
+        assert_eq!(read.axis.class(), "fs");
+        assert_eq!(
+            cap.caveats[&(ShadowAxis::FsWrite, "/ws/out".into())]
+                .axis
+                .class(),
+            "fs"
+        );
+        assert_eq!(
+            cap.caveats[&(ShadowAxis::Net, "docs.rs".into())]
+                .axis
+                .class(),
+            "net"
+        );
+    }
+
+    #[test]
+    fn log_observed_is_a_no_op_when_recording_is_off() {
+        // The hook must never panic or error when the capture env is unset —
+        // it's called on every fs/net op under --full-access. (Env is unset in
+        // the unit run; this asserts the guard, staying fs-free.)
+        assert!(std::env::var_os(CAPTURE_PATH_ENV).is_none());
+        log_observed(ShadowAxis::FsRead, "/ws/x", "read_file");
+        log_observed(ShadowAxis::Net, "example.com", "https://example.com");
     }
 
     #[test]
