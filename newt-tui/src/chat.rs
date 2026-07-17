@@ -481,6 +481,9 @@ pub(crate) fn run_chat(
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
     let mut markdown_override: Option<bool> = None;
+    // #1235: per-session live spill height. `None` follows `[tui].spill_lines`;
+    // `Some(0)` keeps completed output unbounded and disables the live frame.
+    let mut spill_lines_override: Option<usize> = None;
     // Human-only per-session override for the agentic loop's tool-call round
     // safety valve. `None` preserves config/model-tuning behavior exactly.
     let mut max_tool_rounds_override: Option<usize> = None;
@@ -1526,6 +1529,52 @@ pub(crate) fn run_chat(
                                 color,
                                 verbose,
                             );
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    if slash_md == "spill" || slash_md.starts_with("spill ") {
+                        let configured = spill_lines(&cfg);
+                        match parse_spill_command(&task) {
+                            Ok(SpillCommand::Status) => print_newt(
+                                &spill_status(
+                                    configured,
+                                    spill_lines_override,
+                                    live_spill_capable(),
+                                ),
+                                color,
+                                verbose,
+                            ),
+                            Ok(SpillCommand::Set(rows)) => {
+                                spill_lines_override = Some(rows);
+                                print_newt(
+                                    &spill_status(
+                                        configured,
+                                        spill_lines_override,
+                                        live_spill_capable(),
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(SpillCommand::Reset) => {
+                                spill_lines_override = None;
+                                print_newt(
+                                    &spill_status(
+                                        configured,
+                                        spill_lines_override,
+                                        live_spill_capable(),
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Err(e) => print_newt(
+                                &format!("error: {e} — use /spill [status|<rows>|reset]"),
+                                color,
+                                verbose,
+                            ),
                         }
                         surface.save_history();
                         println!();
@@ -3120,9 +3169,31 @@ pub(crate) fn run_chat(
                         .and_then(|_| git_head_short(workspace));
                     // #1235: publish the universal tool spill-view height for
                     // this turn (process-wide knob, output_budget precedent).
-                    newt_core::set_spill_lines(spill_lines(&cfg));
-                    let response =
-                        with_interrupt_watch(interruptible, &turn_cancel, &turn_hard, || {
+                    let resolved_spill_lines =
+                        effective_spill_lines(spill_lines(&cfg), spill_lines_override);
+                    newt_core::set_spill_lines(resolved_spill_lines);
+                    #[cfg(feature = "live-spill")]
+                    let live_spill = (resolved_spill_lines > 0 && live_spill_capable())
+                        .then_some(())
+                        .and_then(|()| {
+                            crate::live_spill::LiveSpillRenderer::stdout(
+                                resolved_spill_lines,
+                                color,
+                            )
+                            .map(std::sync::Arc::new)
+                        });
+                    #[cfg(feature = "live-spill")]
+                    let spill_input = live_spill
+                        .as_deref()
+                        .map(|spill| spill as &dyn crate::SpillInput);
+                    #[cfg(not(feature = "live-spill"))]
+                    let spill_input: Option<&dyn crate::SpillInput> = None;
+                    let response = with_live_spill_watch(
+                        interruptible,
+                        &turn_cancel,
+                        &turn_hard,
+                        spill_input,
+                        || {
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
@@ -3259,6 +3330,13 @@ pub(crate) fn run_chat(
                                         write_ledger: retry_ledger.as_ref(),
                                         // Esc-to-interrupt flag, tripped by the watcher.
                                         cancel: Some(&turn_cancel),
+                                        #[cfg(feature = "live-spill")]
+                                        live_tool_output: live_spill.as_ref().map(|spill| {
+                                            spill.clone()
+                                                as std::sync::Arc<dyn newt_core::LiveToolOutput>
+                                        }),
+                                        #[cfg(not(feature = "live-spill"))]
+                                        live_tool_output: None,
                                         // PR4 (#461): the embedded git tool, now
                                         // always advertised (carries `init` for a
                                         // not-yet-a-repo workspace).
@@ -3277,7 +3355,8 @@ pub(crate) fn run_chat(
                                     &mut mcp,
                                 ))
                             })
-                        });
+                        },
+                    );
 
                     let elapsed = t0.elapsed();
                     erase_line();

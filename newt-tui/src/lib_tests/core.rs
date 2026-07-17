@@ -436,6 +436,94 @@ fn tool_round_limit_override_resolves_and_reports() {
 }
 
 #[test]
+fn spill_commands_parse_expected_forms() {
+    assert_eq!(parse_spill_command("/spill").unwrap(), SpillCommand::Status);
+    assert_eq!(
+        parse_spill_command("/spill status").unwrap(),
+        SpillCommand::Status
+    );
+    assert_eq!(
+        parse_spill_command("/spill 7").unwrap(),
+        SpillCommand::Set(7)
+    );
+    assert_eq!(
+        parse_spill_command("/spill 0").unwrap(),
+        SpillCommand::Set(0)
+    );
+    assert_eq!(
+        parse_spill_command("/spill reset").unwrap(),
+        SpillCommand::Reset
+    );
+    assert!(parse_spill_command("/spillage 7").is_err());
+    assert!(parse_spill_command("/spill many").is_err());
+}
+
+#[test]
+fn spill_override_resolves_and_reports_live_capability() {
+    assert_eq!(effective_spill_lines(3, None), 3);
+    assert_eq!(effective_spill_lines(3, Some(7)), 7);
+    assert_eq!(effective_spill_lines(3, Some(0)), 0);
+    assert_eq!(
+        spill_status(3, None, true),
+        "spill rows: 3 (config default; live interaction available)"
+    );
+    assert_eq!(
+        spill_status(3, Some(7), false),
+        "spill rows: 7 this session (config default 3; live interaction unavailable)"
+    );
+    assert_eq!(
+        spill_status(3, Some(0), true),
+        "spill rows: unbounded this session (config default 3; live viewport disabled)"
+    );
+}
+
+#[test]
+fn live_spill_requires_a_supported_interactive_terminal() {
+    assert!(live_spill_capable_for(
+        true,
+        true,
+        true,
+        true,
+        Some("xterm-256color")
+    ));
+    assert!(!live_spill_capable_for(
+        false,
+        true,
+        true,
+        true,
+        Some("xterm")
+    ));
+    assert!(!live_spill_capable_for(
+        true,
+        false,
+        true,
+        true,
+        Some("xterm")
+    ));
+    assert!(!live_spill_capable_for(
+        true,
+        true,
+        false,
+        true,
+        Some("xterm")
+    ));
+    assert!(!live_spill_capable_for(
+        true,
+        true,
+        true,
+        false,
+        Some("xterm")
+    ));
+    assert!(!live_spill_capable_for(
+        true,
+        true,
+        true,
+        true,
+        Some("dumb")
+    ));
+}
+
+#[test]
 fn slash_help_returns_true() {
     assert!(dispatch_slash("/help", "/ws", false, false).unwrap());
 }
@@ -493,6 +581,7 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
         "mode",
         "loadout",
         "workspace",
+        "spill",
         "config",
         "prompt",
         "vi",
@@ -510,6 +599,10 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
     assert_eq!(command_help_page("restart"), command_help_page("new"));
     assert_eq!(command_help_page("emacs"), command_help_page("vi"));
     assert_eq!(command_help_page("quit"), command_help_page("exit"));
+    let spill_help = command_help_page("spill").expect("spill help page");
+    assert!(spill_help.contains("Space or Enter"));
+    assert!(spill_help.contains("⧉"));
+    assert!(spill_help.contains("▣"));
     // The unknown-topic miss is reported (returns false).
     assert!(!print_command_help("bogus", false, false));
 }

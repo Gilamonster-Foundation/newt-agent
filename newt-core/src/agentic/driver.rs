@@ -448,6 +448,7 @@ async fn run_one_turn(
         // The headless driver has no interactive keyboard to interrupt from;
         // a consumer that wants cancellation drives its own ChatCtx.
         cancel: None,
+        live_tool_output: None,
         git_tool: None,
         crew_runner: None,
     };

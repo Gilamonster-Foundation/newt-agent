@@ -1494,10 +1494,11 @@ pub struct TuiConfig {
     #[serde(default = "default_tool_output_lines")]
     pub tool_output_lines: usize,
 
-    /// #1235: height of every completed tool's SPILL VIEW — the tail-biased,
-    /// gutter-glyphed result block following its `⚙` audit line (▲ hidden-count
-    /// / ▒▓ gutter / … end marker). Default: 3. Set to 0 to show everything
-    /// raw. This is the authoritative completed-result height; the legacy
+    /// #1235: collapsed height of every tool's SPILL VIEW — the tail-biased,
+    /// gutter-glyphed result block following its `⚙` audit line. It bounds both
+    /// the live viewport and canonical completed result. An active TTY viewport
+    /// may expand retained output up to safe terminal capacity. Default: 3.
+    /// Set to 0 for unbounded completed output and no live viewport. The legacy
     /// `tool_output_lines` preview setting does not override it.
     #[serde(default = "default_spill_lines")]
     pub spill_lines: usize,

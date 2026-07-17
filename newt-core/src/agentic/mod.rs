@@ -448,6 +448,52 @@ pub enum RoundObservation {
     ThinkingOnly,
 }
 
+/// Source stream for one incremental shell-output chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutputStream {
+    /// Bytes captured from the tool's standard output stream.
+    Stdout,
+    /// Bytes captured from the tool's standard error stream.
+    Stderr,
+}
+
+/// Renderer-neutral, turn-scoped consumer for live tool output.
+///
+/// The interactive TUI supplies this only when both stdio handles are TTYs.
+/// Headless callers pass `None` and retain completion-only output exactly.
+/// Newt delivers accepted chunks serially on a bounded presentation worker;
+/// slow rendering cannot backpressure a child process or its timeout. Live-only
+/// chunks may be dropped when that queue is full. The independently captured
+/// result envelope remains authoritative and complete.
+pub trait LiveToolOutput: Send + Sync {
+    /// Begin a new active-tool frame. No terminal output is required until the
+    /// first chunk arrives. This runs on the bounded presentation worker, not
+    /// on the tool-execution task. An implementation must ignore a generation
+    /// that [`LiveToolOutput::abandon`] has already invalidated.
+    fn start(&self, generation: u64);
+
+    /// Consume one raw byte chunk. Display sanitization belongs to the sink;
+    /// the authoritative result envelope is captured independently. A
+    /// generation can be abandoned after a bounded completion wait, so a
+    /// post-finish, abandoned, or stale-generation write must be a no-op.
+    fn write(&self, generation: u64, stream: ToolOutputStream, chunk: &[u8]);
+
+    /// Erase/close the active frame before the canonical result is printed.
+    /// This is ordered after every accepted write on normal completion. Panics
+    /// are contained by the dispatcher; implementations should still leave the
+    /// terminal in a canonical state whenever possible.
+    fn finish(&self, generation: u64);
+
+    /// Invalidate a generation without producing terminal output.
+    ///
+    /// Cancellation and bounded teardown call this synchronously before the
+    /// canonical result may be rendered. It must be fast, idempotent, and must
+    /// make queued callbacks for `generation` no-ops. A later [`Self::start`]
+    /// must discard abandoned frame bookkeeping without trying to erase it
+    /// from the terminal's then-current cursor position.
+    fn abandon(&self, generation: u64);
+}
+
 /// Everything one agentic turn needs, resolved once by the caller (the TUI
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
@@ -711,6 +757,10 @@ pub struct ChatCtx<'a> {
     /// trips it from a keyboard watcher, and inspects it after the call to tell
     /// an interrupted turn from a genuinely empty reply.
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Optional TTY-owned live tool-output sink (#1235). Owned in an `Arc`
+    /// because shell stdout/stderr drains may publish from worker threads.
+    /// `None` is the mandatory headless/non-TTY path.
+    pub live_tool_output: Option<std::sync::Arc<dyn LiveToolOutput>>,
     /// The injected embedded-git capability (PR4, #461). `Some` ⇒ the `git`
     /// tool is advertised and dispatches through it (`LocalGitTool` in
     /// `newt-git`, injected by the binary). `None` (every headless / eval
@@ -1110,6 +1160,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         exec_floor,
         write_ledger,
         cancel,
+        live_tool_output,
         git_tool,
         crew_runner,
     } = ctx;
@@ -2597,6 +2648,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         prompt_disposition,
+                        live_tool_output.clone(),
                         cancel,
                     )
                     .await
@@ -4390,6 +4442,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         exec_floor,
         write_ledger,
         cancel,
+        live_tool_output,
         git_tool,
         crew_runner,
     } = ctx;
@@ -5339,6 +5392,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         prompt_disposition,
+                        live_tool_output.clone(),
                         cancel,
                     )
                     .await
@@ -5663,6 +5717,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         exec_floor,
         write_ledger,
         cancel,
+        live_tool_output,
         git_tool,
         crew_runner,
     } = ctx;
@@ -5949,6 +6004,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         prompt_disposition,
+                        live_tool_output.clone(),
                         cancel,
                     )
                     .await
@@ -7393,6 +7449,7 @@ mod tool_round_cap_tests {
             exec_floor: None,
             write_ledger: None,
             cancel: None,
+            live_tool_output: None,
             git_tool: None,
             crew_runner: None,
         }
@@ -7561,6 +7618,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -7859,6 +7917,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -7948,6 +8007,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: Some(&flag),
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -8533,6 +8593,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -8634,6 +8695,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -8744,6 +8806,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -8866,6 +8929,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -8980,6 +9044,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -9135,6 +9200,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -9300,6 +9366,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
             },
@@ -9426,6 +9493,7 @@ mod save_note_loop_tests {
             exec_floor: None,
             write_ledger: None,
             cancel: None,
+            live_tool_output: None,
             git_tool: None,
             crew_runner: None,
         }
@@ -9922,6 +9990,7 @@ mod compression_loop_tests {
             exec_floor: None,
             write_ledger: None,
             cancel: None,
+            live_tool_output: None,
             git_tool: None,
             crew_runner: None,
         }
@@ -11170,6 +11239,7 @@ mod observation_hook_tests {
             exec_floor: None,
             write_ledger: None,
             cancel: None,
+            live_tool_output: None,
             git_tool: None,
             crew_runner: None,
         }

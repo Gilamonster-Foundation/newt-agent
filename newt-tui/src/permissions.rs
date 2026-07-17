@@ -119,17 +119,64 @@ pub(crate) fn parse_permission_choice(input: &str) -> PromptChoice {
     }
 }
 
-static PROMPT_STDIN_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[derive(Default)]
+struct StdinOwnership {
+    prompt_owner: Option<std::thread::ThreadId>,
+    prompt_depth: usize,
+    watcher_reading: bool,
+}
 
-/// Whether a prompt currently owns stdin. Its only non-test reader is the
-/// `#[cfg(unix)]` interrupt watcher (`watch_for_interrupt`), so gate the reader the
-/// same way — otherwise Windows (which has no watcher) trips `-D warnings` on dead
-/// code. The depth counter itself stays cross-platform: `PromptStdinGuard` maintains
-/// it everywhere (its callers `prompt_permission_choice` / `prompt_user_input` are
-/// not `cfg`-gated), so the static is never dead.
-#[cfg(any(unix, test))]
+fn stdin_ownership() -> &'static (std::sync::Mutex<StdinOwnership>, std::sync::Condvar) {
+    static OWNERSHIP: std::sync::OnceLock<(std::sync::Mutex<StdinOwnership>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    OWNERSHIP.get_or_init(|| {
+        (
+            std::sync::Mutex::new(StdinOwnership::default()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+/// Whether a prompt currently owns stdin, exposed only for ownership tests.
+#[cfg(test)]
 pub(crate) fn prompt_stdin_active() -> bool {
-    PROMPT_STDIN_DEPTH.load(std::sync::atomic::Ordering::Acquire) > 0
+    stdin_ownership()
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .prompt_owner
+        .is_some()
+}
+
+/// Exclusive read token used by the turn watcher. A prompt cannot enter while
+/// this token exists, and the watcher cannot acquire it while any prompt owns
+/// stdin, closing the check-then-read race at permission transitions.
+#[cfg(unix)]
+pub(crate) struct WatcherStdinGuard;
+
+#[cfg(unix)]
+pub(crate) fn try_watch_stdin() -> Option<WatcherStdinGuard> {
+    let (ownership, _) = stdin_ownership();
+    let mut state = ownership
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.prompt_owner.is_some() || state.watcher_reading {
+        return None;
+    }
+    state.watcher_reading = true;
+    Some(WatcherStdinGuard)
+}
+
+#[cfg(unix)]
+impl Drop for WatcherStdinGuard {
+    fn drop(&mut self) {
+        let (ownership, wake) = stdin_ownership();
+        let mut state = ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.watcher_reading = false;
+        wake.notify_all();
+    }
 }
 
 /// While a permission or free-text prompt is active, stdin belongs to the
@@ -143,7 +190,24 @@ pub(crate) struct PromptStdinGuard {
 
 impl PromptStdinGuard {
     fn enter() -> Self {
-        PROMPT_STDIN_DEPTH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let thread = std::thread::current().id();
+        let (ownership, wake) = stdin_ownership();
+        let mut state = ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.watcher_reading
+            || state
+                .prompt_owner
+                .as_ref()
+                .is_some_and(|owner| *owner != thread)
+        {
+            state = wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.prompt_owner = Some(thread);
+        state.prompt_depth += 1;
+        drop(state);
         Self {
             #[cfg(unix)]
             restore: enter_prompt_line_mode().ok(),
@@ -159,7 +223,15 @@ impl Drop for PromptStdinGuard {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &prev);
             }
         }
-        PROMPT_STDIN_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let (ownership, wake) = stdin_ownership();
+        let mut state = ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.prompt_depth = state.prompt_depth.saturating_sub(1);
+        if state.prompt_depth == 0 {
+            state.prompt_owner = None;
+            wake.notify_all();
+        }
     }
 }
 
@@ -981,6 +1053,11 @@ mod permission_prompt_tests {
         );
         {
             let _guard = PromptStdinGuard::enter();
+            #[cfg(unix)]
+            assert!(
+                try_watch_stdin().is_none(),
+                "the watcher cannot read while a prompt owns stdin"
+            );
             assert!(
                 prompt_stdin_active(),
                 "active prompts must tell the interrupt watcher not to read stdin"
@@ -998,6 +1075,30 @@ mod permission_prompt_tests {
             !prompt_stdin_active(),
             "prompt stdin ownership must clear when the guard drops"
         );
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn watcher_read_token_blocks_prompt_entry_until_the_read_finishes() {
+        let watcher = try_watch_stdin().expect("watcher acquires idle stdin");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let prompt = std::thread::spawn(move || {
+            let _prompt = PromptStdinGuard::enter();
+            let _ = entered_tx.send(());
+        });
+
+        assert!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "prompt entered during the watcher's protected read"
+        );
+        drop(watcher);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("prompt enters once the watcher releases stdin");
+        prompt.join().unwrap();
     }
 
     #[test]

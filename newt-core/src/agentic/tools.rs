@@ -264,14 +264,12 @@ fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
     })
 }
 
-/// The shell engine selected for this process (ADR 0005 D2 seam). Resolved once
-/// at startup by the CLI ([`crate::resolve_shell_engine`] over the `[shell]
-/// engine` config, the `--shell-engine` flag, and the `--full-access`
-/// auto-upgrade) and published via `NEWT_SHELL_ENGINE`, so the deep
-/// `run_command` dispatch reads it without threading it through every signature
-/// — the same env-published pattern as [`ocap_disabled`] /
-/// [`full_access_requested`]. Absent or unparseable falls back to the
-/// `safe-subset` default.
+/// The shell engine selected for this dispatch (ADR 0005 D2 seam). An explicit
+/// `[shell] engine` / `--shell-engine` choice is published by the CLI through
+/// `NEWT_SHELL_ENGINE`, so deep `run_command` dispatch reads it without threading
+/// it through every signature. Full-access sessions retain their platform
+/// default; otherwise the confined default is resolved below from the current L3
+/// fence state rather than cached at startup.
 fn shell_engine() -> crate::ShellEngine {
     if let Some(engine) = std::env::var("NEWT_SHELL_ENGINE")
         .ok()
@@ -287,7 +285,7 @@ fn shell_engine() -> crate::ShellEngine {
         return crate::full_access_default_engine();
     }
     // #1243 Leg 1: the CONFINED default is L3-gated and resolved HERE, per
-    // dispatch — `bridle_registry()` calls this on every run_command, so the
+    // dispatch — `dispatch_bridled_shell()` calls this on every run_command, so the
     // fence state is re-checked at exec time and never cached at startup (the
     // agent-bridle #239 TLA+ TOCTOU obligation). Brush when a kernel fence
     // enforces on this host; safe-subset's structural refusal otherwise.
@@ -300,11 +298,26 @@ fn shell_engine() -> crate::ShellEngine {
 /// unchanged. Mirrors `agent_bridle::registry()` but swaps the shell engine so
 /// `[shell] engine = "host"` (or `--full-access`) routes `run_command` to the
 /// full-grammar, kernel-jailed sandbox-host engine instead of the safe subset.
-fn bridle_registry() -> agent_bridle::Registry {
+fn bridle_registry(
+    engine: crate::ShellEngine,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+) -> agent_bridle::Registry {
     use std::sync::Arc;
-    let shell: Arc<dyn agent_bridle::Tool> = match shell_engine() {
-        crate::ShellEngine::SafeSubset => Arc::new(agent_bridle::ShellTool::new()),
-        crate::ShellEngine::Host => Arc::new(agent_bridle::HostShellTool::new()),
+    let shell: Arc<dyn agent_bridle::Tool> = match engine {
+        crate::ShellEngine::SafeSubset => {
+            let mut tool = agent_bridle::ShellTool::new();
+            if let Some(observer) = live.clone() {
+                tool = tool.with_output_observer(observer);
+            }
+            Arc::new(tool)
+        }
+        crate::ShellEngine::Host => {
+            let mut tool = agent_bridle::HostShellTool::new();
+            if let Some(observer) = live.clone() {
+                tool = tool.with_output_observer(observer);
+            }
+            Arc::new(tool)
+        }
         crate::ShellEngine::Brush => {
             // The carried brush engine (agent-bridle 0.7): in-process bash + the
             // L2 CommandInterceptor. The cross-platform engine — and on Windows
@@ -323,7 +336,11 @@ fn bridle_registry() -> agent_bridle::Registry {
                     );
                 });
             }
-            Arc::new(agent_bridle::BrushShellTool::new())
+            let mut tool = agent_bridle::BrushShellTool::new();
+            if let Some(observer) = live {
+                tool = tool.with_output_observer(observer);
+            }
+            Arc::new(tool)
         }
     };
     agent_bridle::Registry::builder()
@@ -502,6 +519,337 @@ fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) 
 /// and render the envelope. Shared by the `run_command` and `lifecycle` (#891)
 /// arms so both honor **identical** exec caveats; the central presenter owns
 /// the tool-call and completed-result block.
+const LIVE_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
+const LIVE_OUTPUT_QUEUE_CHUNKS: usize = 32;
+const LIVE_OUTPUT_OBSERVER_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+const LIVE_OUTPUT_FINISH_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+const LIVE_OUTPUT_OPEN: u8 = 0;
+const LIVE_OUTPUT_FINISHING: u8 = 1;
+const LIVE_OUTPUT_CANCELLED: u8 = 2;
+const LIVE_OUTPUT_CLOSED: u8 = 3;
+
+enum LiveOutputDispatch {
+    Write(crate::agentic::ToolOutputStream, Vec<u8>),
+    Wake,
+}
+
+struct LiveOutputCompletion {
+    finished: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+struct LiveOutputRelay {
+    sender: std::sync::mpsc::SyncSender<LiveOutputDispatch>,
+    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    completion: std::sync::Arc<LiveOutputCompletion>,
+}
+
+impl LiveOutputRelay {
+    fn write(&self, stream: crate::agentic::ToolOutputStream, chunk: &[u8]) {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::TrySendError;
+
+        for part in chunk.chunks(LIVE_OUTPUT_CHUNK_BYTES) {
+            if self.phase.load(Ordering::Acquire) != LIVE_OUTPUT_OPEN {
+                break;
+            }
+            match self
+                .sender
+                .try_send(LiveOutputDispatch::Write(stream, part.to_vec()))
+            {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => break,
+                Err(TrySendError::Disconnected(_)) => {
+                    self.phase.store(LIVE_OUTPUT_CLOSED, Ordering::Release);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn request_finish(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .phase
+            .compare_exchange(
+                LIVE_OUTPUT_OPEN,
+                LIVE_OUTPUT_FINISHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let _ = self.sender.try_send(LiveOutputDispatch::Wake);
+        }
+    }
+
+    fn cancel(&self) {
+        use std::sync::atomic::Ordering;
+        let changed = self
+            .phase
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| {
+                (phase != LIVE_OUTPUT_CLOSED).then_some(LIVE_OUTPUT_CANCELLED)
+            })
+            .is_ok();
+        if changed {
+            let _ = self.sender.try_send(LiveOutputDispatch::Wake);
+        }
+    }
+
+    fn wait_finished(&self, timeout: std::time::Duration) -> bool {
+        let finished = self
+            .completion
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (finished, _) = self
+            .completion
+            .wake
+            .wait_timeout_while(finished, timeout, |finished| !*finished)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *finished
+    }
+}
+
+impl agent_bridle::ShellOutputObserver for LiveOutputRelay {
+    fn on_output(
+        &self,
+        _invocation: agent_bridle::ShellInvocationId,
+        stream: agent_bridle::ShellOutputStream,
+        chunk: &[u8],
+    ) {
+        let stream = match stream {
+            agent_bridle::ShellOutputStream::Stdout => crate::agentic::ToolOutputStream::Stdout,
+            agent_bridle::ShellOutputStream::Stderr => crate::agentic::ToolOutputStream::Stderr,
+        };
+        self.write(stream, chunk);
+    }
+
+    fn on_finish(&self, _invocation: agent_bridle::ShellInvocationId) {
+        self.request_finish();
+    }
+}
+
+struct LiveOutputSession {
+    relay: std::sync::Arc<LiveOutputRelay>,
+    sink: std::sync::Arc<dyn crate::agentic::LiveToolOutput>,
+    generation: u64,
+    closed: bool,
+}
+
+impl LiveOutputSession {
+    fn start(sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>) -> Option<Self> {
+        static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let sink = sink?;
+        let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<LiveOutputDispatch>(LIVE_OUTPUT_QUEUE_CHUNKS);
+        let phase = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LIVE_OUTPUT_OPEN));
+        let completion = std::sync::Arc::new(LiveOutputCompletion {
+            finished: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        let worker_phase = phase.clone();
+        let worker_completion = completion.clone();
+        let worker_sink = sink.clone();
+        if std::thread::Builder::new()
+            .name(format!("newt-live-output-{generation}"))
+            .spawn(move || {
+                run_live_output_dispatch(
+                    receiver,
+                    worker_sink,
+                    generation,
+                    &worker_phase,
+                    &worker_completion,
+                );
+            })
+            .is_err()
+        {
+            return None;
+        }
+        Some(Self {
+            relay: std::sync::Arc::new(LiveOutputRelay {
+                sender,
+                phase,
+                completion,
+            }),
+            sink,
+            generation,
+            closed: false,
+        })
+    }
+
+    fn relay(&self) -> std::sync::Arc<LiveOutputRelay> {
+        self.relay.clone()
+    }
+
+    fn finish(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.relay.request_finish();
+        if !self.relay.wait_finished(LIVE_OUTPUT_FINISH_WAIT) {
+            self.relay.cancel();
+            self.abandon_generation();
+        }
+        self.closed = true;
+    }
+
+    fn finish_after_observer(&mut self) {
+        if self.closed {
+            return;
+        }
+        if !self.relay.wait_finished(LIVE_OUTPUT_OBSERVER_WAIT) {
+            self.relay.request_finish();
+            if !self.relay.wait_finished(LIVE_OUTPUT_FINISH_WAIT) {
+                self.relay.cancel();
+                self.abandon_generation();
+            }
+        }
+        self.closed = true;
+    }
+
+    #[cfg(all(test, not(windows)))]
+    fn cancel(&mut self) {
+        if !self.closed {
+            self.relay.cancel();
+            self.abandon_generation();
+            self.closed = true;
+        }
+    }
+
+    fn abandon_generation(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.sink.abandon(self.generation);
+        }));
+    }
+}
+
+impl Drop for LiveOutputSession {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn run_live_output_dispatch(
+    receiver: std::sync::mpsc::Receiver<LiveOutputDispatch>,
+    sink: std::sync::Arc<dyn crate::agentic::LiveToolOutput>,
+    generation: u64,
+    phase: &std::sync::atomic::AtomicU8,
+    completion: &LiveOutputCompletion,
+) {
+    use std::sync::atomic::Ordering;
+
+    let abandon = || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sink.abandon(generation);
+        }));
+    };
+
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.start(generation))).is_err() {
+        phase.store(LIVE_OUTPUT_CANCELLED, Ordering::Release);
+        abandon();
+        phase.store(LIVE_OUTPUT_CLOSED, Ordering::Release);
+        mark_live_output_complete(completion);
+        return;
+    }
+
+    if phase.load(Ordering::Acquire) == LIVE_OUTPUT_CANCELLED {
+        abandon();
+        phase.store(LIVE_OUTPUT_CLOSED, Ordering::Release);
+        mark_live_output_complete(completion);
+        return;
+    }
+
+    let deliver = |stream, chunk: Vec<u8>| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sink.write(generation, stream, &chunk);
+        }))
+        .is_ok()
+    };
+
+    loop {
+        match receiver.recv() {
+            Ok(LiveOutputDispatch::Write(stream, chunk))
+                if phase.load(Ordering::Acquire) != LIVE_OUTPUT_CANCELLED =>
+            {
+                if !deliver(stream, chunk) {
+                    phase.store(LIVE_OUTPUT_CANCELLED, Ordering::Release);
+                }
+            }
+            Ok(LiveOutputDispatch::Write(_, _)) | Ok(LiveOutputDispatch::Wake) => {}
+            Err(_) => {
+                phase.store(LIVE_OUTPUT_CANCELLED, Ordering::Release);
+            }
+        }
+
+        match phase.load(Ordering::Acquire) {
+            LIVE_OUTPUT_OPEN => continue,
+            LIVE_OUTPUT_FINISHING => {
+                while phase.load(Ordering::Acquire) == LIVE_OUTPUT_FINISHING {
+                    let Ok(dispatch) = receiver.try_recv() else {
+                        break;
+                    };
+                    if let LiveOutputDispatch::Write(stream, chunk) = dispatch {
+                        if !deliver(stream, chunk) {
+                            phase.store(LIVE_OUTPUT_CANCELLED, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        break;
+    }
+
+    if phase.load(Ordering::Acquire) == LIVE_OUTPUT_FINISHING {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.finish(generation)))
+            .is_err()
+        {
+            abandon();
+        }
+    } else {
+        abandon();
+    }
+    phase.store(LIVE_OUTPUT_CLOSED, Ordering::Release);
+    mark_live_output_complete(completion);
+}
+
+fn mark_live_output_complete(completion: &LiveOutputCompletion) {
+    let mut finished = completion
+        .finished
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *finished = true;
+    completion.wake.notify_all();
+}
+
+async fn dispatch_bridled_shell(
+    args: serde_json::Value,
+    caveats: &crate::caveats::Caveats,
+    sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+) -> agent_bridle::ToolResult<serde_json::Value> {
+    let mut live = LiveOutputSession::start(sink);
+    let result = bridle_registry(shell_engine(), live.as_ref().map(LiveOutputSession::relay))
+        .dispatch("shell", args, caveats)
+        .await;
+    if let Some(live) = live.as_mut() {
+        let ordinary_completion = result
+            .as_ref()
+            .ok()
+            .and_then(|envelope| envelope.get("timed_out"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true);
+        if result.is_ok() && ordinary_completion {
+            live.finish_after_observer();
+        } else {
+            live.finish();
+        }
+    }
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn exec_confined_command(
     cmd: &str,
@@ -515,6 +863,7 @@ async fn exec_confined_command(
     permission_gate: Option<&mut dyn PermissionGate>,
     tool_offload: bool,
     spill_store: Option<&dyn SpillStore>,
+    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
 ) -> String {
     // Venv injection (#783): the confined shell carries the venv via
@@ -551,7 +900,17 @@ async fn exec_confined_command(
     }
 
     if host_bypass {
-        return match host_shell_dispatch(&cmd_with_venv, cwd).await {
+        let mut live = LiveOutputSession::start(live_tool_output);
+        let run = host_shell_dispatch(
+            &cmd_with_venv,
+            cwd,
+            live.as_ref().map(LiveOutputSession::relay),
+        )
+        .await;
+        if let Some(live) = live.as_mut() {
+            live.finish();
+        }
+        return match run {
             Ok(envelope) => shell_envelope_output(
                 &envelope,
                 tool_output_lines,
@@ -567,10 +926,7 @@ async fn exec_confined_command(
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
     let dispatch_args = confined_dispatch_args(cmd, cwd);
-    match bridle_registry()
-        .dispatch("shell", dispatch_args.clone(), caveats)
-        .await
-    {
+    match dispatch_bridled_shell(dispatch_args.clone(), caveats, live_tool_output.clone()).await {
         // The confined shell ran. Its envelope carries
         // `{ exit_code, stdout, stderr, timed_out, ... }` plus — when the leash
         // refused a capability — the STRUCTURED denial fields
@@ -592,9 +948,12 @@ async fn exec_confined_command(
                     exec_denial_requests(&envelope).or_else(|| net_denial_requests(&envelope))
                 {
                     if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
-                        return match bridle_registry()
-                            .dispatch("shell", dispatch_args, &widened)
-                            .await
+                        return match dispatch_bridled_shell(
+                            dispatch_args,
+                            &widened,
+                            live_tool_output,
+                        )
+                        .await
                         {
                             Ok(env2) if envelope_denied(&env2) => {
                                 denied_run_command_result(&env2, color)
@@ -628,8 +987,12 @@ async fn exec_confined_command(
     }
 }
 
-async fn host_shell_dispatch(cmd: &str, cwd: &str) -> std::io::Result<serde_json::Value> {
-    let run = host_shell_output(cmd, cwd).await?;
+async fn host_shell_dispatch(
+    cmd: &str,
+    cwd: &str,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+) -> std::io::Result<serde_json::Value> {
+    let run = host_shell_output(cmd, cwd, live).await?;
     Ok(serde_json::json!({
         "exit_code": run.exit_code,
         "stdout": decode_shell_stream(&run.stdout),
@@ -759,6 +1122,27 @@ fn parse_cat_v_meta_byte(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
     }
 }
 
+async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    stream: crate::agentic::ToolOutputStream,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if let Some(live) = live.as_ref() {
+            live.write(stream, &chunk[..read]);
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+}
+
 /// INTERIM (#297) host shell selection: `bash -c` with an `sh -c` fallback
 /// when bash is absent — the same sh-compatible free-form mode the confined
 /// shell ran, so [`venv_cmd_prefix`]'s `export …;` prefix works unchanged.
@@ -772,7 +1156,21 @@ fn parse_cat_v_meta_byte(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
 ///   and we return `timed_out: true` with exit code 124, matching the confined
 ///   path's envelope shape.
 #[cfg(not(windows))]
-async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun> {
+async fn host_shell_output(
+    cmd: &str,
+    cwd: &str,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+) -> std::io::Result<HostShellRun> {
+    host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout()).await
+}
+
+#[cfg(not(windows))]
+async fn host_shell_output_with_timeout(
+    cmd: &str,
+    cwd: &str,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout: std::time::Duration,
+) -> std::io::Result<HostShellRun> {
     use std::process::Stdio;
 
     fn shell(program: &str, cmd: &str, cwd: &str) -> tokio::process::Command {
@@ -795,15 +1193,36 @@ async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun
         c
     }
 
-    async fn run_one(child: tokio::process::Child) -> std::io::Result<HostShellRun> {
-        // `wait_with_output` consumes the child; if the timeout fires first the
-        // future is dropped and `kill_on_drop` reaps the whole group.
-        let timeout = host_exec_timeout();
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => Ok(HostShellRun {
-                exit_code: output.status.code().unwrap_or(-1) as i64,
-                stdout: output.stdout,
-                stderr: output.stderr,
+    async fn run_one(
+        mut child: tokio::process::Child,
+        live: Option<std::sync::Arc<LiveOutputRelay>>,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<HostShellRun> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("host shell stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
+        let completed = async {
+            let (status, stdout, stderr) = tokio::try_join!(
+                child.wait(),
+                drain_host_pipe(
+                    stdout,
+                    live.clone(),
+                    crate::agentic::ToolOutputStream::Stdout
+                ),
+                drain_host_pipe(stderr, live, crate::agentic::ToolOutputStream::Stderr),
+            )?;
+            Ok::<_, std::io::Error>((status, stdout, stderr))
+        };
+        match tokio::time::timeout(timeout, completed).await {
+            Ok(Ok((status, stdout, stderr))) => Ok(HostShellRun {
+                exit_code: status.code().unwrap_or(-1) as i64,
+                stdout,
+                stderr,
                 timed_out: false,
             }),
             Ok(Err(e)) => Err(e),
@@ -821,9 +1240,9 @@ async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun
     }
 
     match shell("bash", cmd, cwd).spawn() {
-        Ok(child) => run_one(child).await,
+        Ok(child) => run_one(child, live, timeout).await,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            run_one(shell("sh", cmd, cwd).spawn()?).await
+            run_one(shell("sh", cmd, cwd).spawn()?, live, timeout).await
         }
         Err(e) => Err(e),
     }
@@ -833,10 +1252,24 @@ async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun
 /// as [`build_check_shell`]. Bounded by [`host_exec_timeout`] with
 /// `kill_on_drop` so a hung child cannot wedge the turn.
 #[cfg(windows)]
-async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun> {
+async fn host_shell_output(
+    cmd: &str,
+    cwd: &str,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+) -> std::io::Result<HostShellRun> {
+    host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout()).await
+}
+
+#[cfg(windows)]
+async fn host_shell_output_with_timeout(
+    cmd: &str,
+    cwd: &str,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout: std::time::Duration,
+) -> std::io::Result<HostShellRun> {
     use std::process::Stdio;
 
-    let child = tokio::process::Command::new("cmd")
+    let mut child = tokio::process::Command::new("cmd")
         .args(["/C", cmd])
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -845,12 +1278,31 @@ async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun
         .kill_on_drop(true)
         .spawn()?;
 
-    let timeout = host_exec_timeout();
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => Ok(HostShellRun {
-            exit_code: output.status.code().unwrap_or(-1) as i64,
-            stdout: output.stdout,
-            stderr: output.stderr,
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("host shell stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
+    let completed = async {
+        let (status, stdout, stderr) = tokio::try_join!(
+            child.wait(),
+            drain_host_pipe(
+                stdout,
+                live.clone(),
+                crate::agentic::ToolOutputStream::Stdout
+            ),
+            drain_host_pipe(stderr, live, crate::agentic::ToolOutputStream::Stderr),
+        )?;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
+    };
+    match tokio::time::timeout(timeout, completed).await {
+        Ok(Ok((status, stdout, stderr))) => Ok(HostShellRun {
+            exit_code: status.code().unwrap_or(-1) as i64,
+            stdout,
+            stderr,
             timed_out: false,
         }),
         Ok(Err(e)) => Err(e),
@@ -2362,6 +2814,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         persona_tools,
         disposition,
         None,
+        None,
     )
     .await
     .expect("tool execution without a cancellation flag cannot be interrupted")
@@ -2398,6 +2851,7 @@ pub(crate) async fn execute_tool_with_offload_and_prompt_and_artifacts_cancellab
     spill_store: Option<&dyn SpillStore>,
     persona_tools: Option<&[String]>,
     disposition: PromptDisposition,
+    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<String> {
     let mut display = ToolDisplay::new(
@@ -2434,6 +2888,7 @@ pub(crate) async fn execute_tool_with_offload_and_prompt_and_artifacts_cancellab
         spill_store,
         persona_tools,
         disposition,
+        live_tool_output,
         cancel,
     )
     .await
@@ -2479,6 +2934,7 @@ async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
     spill_store: Option<&dyn SpillStore>,
     persona_tools: Option<&[String]>,
     disposition: PromptDisposition,
+    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<String> {
     let (presentation_name, presentation_detail) =
@@ -2513,6 +2969,7 @@ async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
             spill_store,
             persona_tools,
             disposition,
+            live_tool_output,
         );
         tokio::pin!(execution);
         tokio::select! {
@@ -2572,6 +3029,7 @@ async fn execute_tool_inner(
     // the boundary that refuses fabricated tool names before MCP routing,
     // aliases, or permission widening can run.
     disposition: PromptDisposition,
+    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> String {
     // Prompt-comprehension boundary: enforce the validated disposition BEFORE
     // every other routing or grant path. In particular, unknown names (including
@@ -3064,6 +3522,7 @@ async fn execute_tool_inner(
                 permission_gate,
                 tool_offload,
                 spill_store,
+                live_tool_output.clone(),
                 presentation,
             )
             .await
@@ -3126,6 +3585,7 @@ async fn execute_tool_inner(
                         permission_gate,
                         tool_offload,
                         spill_store,
+                        live_tool_output.clone(),
                         presentation,
                     )
                     .await
@@ -3781,6 +4241,665 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
 mod tests {
     use super::*;
     use crate::agentic::NoMcp;
+
+    #[derive(Default)]
+    struct RecordingLiveOutput {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::agentic::LiveToolOutput for RecordingLiveOutput {
+        fn start(&self, _generation: u64) {
+            self.events.lock().unwrap().push("start".into());
+        }
+
+        fn write(&self, _generation: u64, stream: crate::agentic::ToolOutputStream, chunk: &[u8]) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{stream:?}:{}", String::from_utf8_lossy(chunk)));
+        }
+
+        fn finish(&self, _generation: u64) {
+            self.events.lock().unwrap().push("finish".into());
+        }
+
+        fn abandon(&self, _generation: u64) {
+            self.events.lock().unwrap().push("abandon".into());
+        }
+    }
+
+    #[test]
+    fn live_output_session_closes_before_late_chunks() {
+        let sink = std::sync::Arc::new(RecordingLiveOutput::default());
+        let mut session = LiveOutputSession::start(Some(sink.clone())).expect("live session");
+        let relay = session.relay();
+        relay.write(crate::agentic::ToolOutputStream::Stdout, b"now");
+        session.finish();
+        relay.write(crate::agentic::ToolOutputStream::Stderr, b"late");
+
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            ["start", "Stdout:now", "finish"]
+        );
+    }
+
+    #[test]
+    fn live_output_slow_start_does_not_block_execution_and_is_abandoned_on_drop() {
+        struct BlockingStart {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            abandoned: std::sync::mpsc::Sender<()>,
+            writes: std::sync::atomic::AtomicUsize,
+            finishes: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::agentic::LiveToolOutput for BlockingStart {
+            fn start(&self, _generation: u64) {
+                let _ = self.entered.send(());
+                let _ = self.release.lock().unwrap().recv();
+            }
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                _chunk: &[u8],
+            ) {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn finish(&self, _generation: u64) {
+                self.finishes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn abandon(&self, _generation: u64) {
+                let _ = self.abandoned.send(());
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel();
+        let sink = std::sync::Arc::new(BlockingStart {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+            abandoned: abandoned_tx,
+            writes: std::sync::atomic::AtomicUsize::new(0),
+            finishes: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let (created_tx, created_rx) = std::sync::mpsc::channel();
+        let creator_sink = sink.clone();
+        let creator = std::thread::spawn(move || {
+            let session = LiveOutputSession::start(Some(creator_sink)).expect("live session");
+            let _ = created_tx.send(session);
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("presentation worker entered start");
+        let session = match created_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = release_tx.send(());
+                creator.join().unwrap();
+                panic!("arbitrary sink startup blocked tool execution: {error}");
+            }
+        };
+        creator.join().unwrap();
+        let relay = session.relay();
+        relay.write(crate::agentic::ToolOutputStream::Stdout, b"queued");
+        drop(session);
+        abandoned_rx
+            .try_recv()
+            .expect("drop invalidated the blocked startup synchronously");
+
+        release_tx.send(()).unwrap();
+        assert!(
+            relay.wait_finished(std::time::Duration::from_secs(1)),
+            "worker did not close after blocked startup returned"
+        );
+        assert_eq!(sink.writes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            sink.finishes.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "delayed startup queued a late erase"
+        );
+    }
+
+    #[test]
+    fn live_output_start_panic_is_contained_and_abandoned() {
+        struct PanickingStart {
+            abandoned: std::sync::mpsc::Sender<()>,
+        }
+        impl crate::agentic::LiveToolOutput for PanickingStart {
+            fn start(&self, _generation: u64) {
+                panic!("startup failed");
+            }
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                _chunk: &[u8],
+            ) {
+                panic!("failed startup must not receive writes");
+            }
+            fn finish(&self, _generation: u64) {
+                panic!("failed startup must not finish");
+            }
+            fn abandon(&self, _generation: u64) {
+                let _ = self.abandoned.send(());
+            }
+        }
+
+        let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel();
+        let mut session = LiveOutputSession::start(Some(std::sync::Arc::new(PanickingStart {
+            abandoned: abandoned_tx,
+        })))
+        .expect("worker creation succeeds independently of sink startup");
+        session
+            .relay()
+            .write(crate::agentic::ToolOutputStream::Stdout, b"ignored");
+        session.finish();
+
+        abandoned_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("startup panic invalidated its generation");
+    }
+
+    #[test]
+    fn live_output_finish_does_not_wait_for_an_inflight_write() {
+        struct BlockingOutput {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            finished: std::sync::mpsc::Sender<()>,
+            abandoned: std::sync::mpsc::Sender<()>,
+        }
+        impl crate::agentic::LiveToolOutput for BlockingOutput {
+            fn start(&self, _generation: u64) {}
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                _chunk: &[u8],
+            ) {
+                let _ = self.entered.send(());
+                let _ = self.release.lock().unwrap().recv();
+            }
+            fn finish(&self, _generation: u64) {
+                let _ = self.finished.send(());
+            }
+            fn abandon(&self, _generation: u64) {
+                let _ = self.abandoned.send(());
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel();
+        let sink = std::sync::Arc::new(BlockingOutput {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+            finished: finished_tx,
+            abandoned: abandoned_tx,
+        });
+        let mut session = LiveOutputSession::start(Some(sink)).unwrap();
+        let relay = session.relay();
+        let writer = std::thread::spawn(move || {
+            relay.write(crate::agentic::ToolOutputStream::Stdout, b"held");
+        });
+        entered_rx.recv().unwrap();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let finisher = std::thread::spawn(move || {
+            session.finish();
+            let _ = returned_tx.send(());
+        });
+
+        returned_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("session finish must not wait forever on an arbitrary observer callback");
+        abandoned_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("timed-out teardown invalidates the generation before returning");
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "timed-out teardown must not queue a late terminal erase"
+        );
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        finisher.join().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "worker erased the generation after canonical rendering could resume"
+        );
+    }
+
+    #[test]
+    fn live_output_timeout_invalidates_an_inflight_finish_before_returning() {
+        struct SlowFinish {
+            finish_entered: std::sync::mpsc::Sender<()>,
+            release_finish: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            generation_valid: std::sync::atomic::AtomicBool,
+            erased: std::sync::atomic::AtomicBool,
+        }
+        impl crate::agentic::LiveToolOutput for SlowFinish {
+            fn start(&self, _generation: u64) {
+                self.generation_valid
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                _chunk: &[u8],
+            ) {
+            }
+            fn finish(&self, _generation: u64) {
+                let _ = self.finish_entered.send(());
+                let _ = self.release_finish.lock().unwrap().recv();
+                if self
+                    .generation_valid
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    self.erased
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            fn abandon(&self, _generation: u64) {
+                self.generation_valid
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let (finish_entered_tx, finish_entered_rx) = std::sync::mpsc::channel();
+        let (release_finish_tx, release_finish_rx) = std::sync::mpsc::channel();
+        let sink = std::sync::Arc::new(SlowFinish {
+            finish_entered: finish_entered_tx,
+            release_finish: std::sync::Mutex::new(release_finish_rx),
+            generation_valid: std::sync::atomic::AtomicBool::new(false),
+            erased: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut session = LiveOutputSession::start(Some(sink.clone())).unwrap();
+        let relay = session.relay();
+        relay.write(crate::agentic::ToolOutputStream::Stdout, b"paint");
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let finisher = std::thread::spawn(move || {
+            session.finish();
+            let _ = returned_tx.send(());
+        });
+
+        finish_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker entered finish");
+        returned_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("bounded teardown returned after invalidating the generation");
+        assert!(
+            !sink
+                .generation_valid
+                .load(std::sync::atomic::Ordering::Acquire),
+            "canonical rendering resumed before generation invalidation"
+        );
+
+        release_finish_tx.send(()).unwrap();
+        assert!(relay.wait_finished(std::time::Duration::from_secs(1)));
+        finisher.join().unwrap();
+        assert!(
+            !sink.erased.load(std::sync::atomic::Ordering::Acquire),
+            "in-flight finish erased terminal output after canonical rendering resumed"
+        );
+    }
+
+    #[test]
+    fn live_output_cancel_stops_finishing_queue_drain() {
+        struct GatedOutput {
+            writes: std::sync::Mutex<Vec<Vec<u8>>>,
+            first_entered: std::sync::mpsc::Sender<()>,
+            release_first: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            held_entered: std::sync::mpsc::Sender<()>,
+            release_held: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            finished: std::sync::mpsc::Sender<()>,
+        }
+        impl crate::agentic::LiveToolOutput for GatedOutput {
+            fn start(&self, _generation: u64) {}
+
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                chunk: &[u8],
+            ) {
+                self.writes.lock().unwrap().push(chunk.to_vec());
+                match chunk {
+                    b"first" => {
+                        let _ = self.first_entered.send(());
+                        let _ = self.release_first.lock().unwrap().recv();
+                    }
+                    b"held" => {
+                        let _ = self.held_entered.send(());
+                        let _ = self.release_held.lock().unwrap().recv();
+                    }
+                    _ => {}
+                }
+            }
+
+            fn finish(&self, _generation: u64) {
+                let _ = self.finished.send(());
+            }
+
+            fn abandon(&self, _generation: u64) {}
+        }
+
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let (held_entered_tx, held_entered_rx) = std::sync::mpsc::channel();
+        let (release_held_tx, release_held_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let sink = std::sync::Arc::new(GatedOutput {
+            writes: std::sync::Mutex::new(Vec::new()),
+            first_entered: first_entered_tx,
+            release_first: std::sync::Mutex::new(release_first_rx),
+            held_entered: held_entered_tx,
+            release_held: std::sync::Mutex::new(release_held_rx),
+            finished: finished_tx,
+        });
+        let mut session = LiveOutputSession::start(Some(sink.clone())).unwrap();
+        let relay = session.relay();
+        relay.write(crate::agentic::ToolOutputStream::Stdout, b"first");
+        first_entered_rx.recv().unwrap();
+        relay.write(crate::agentic::ToolOutputStream::Stdout, b"held");
+        relay.write(crate::agentic::ToolOutputStream::Stdout, b"stale");
+
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let finisher = std::thread::spawn(move || {
+            session.finish();
+            let _ = returned_tx.send(());
+        });
+        while relay.phase.load(std::sync::atomic::Ordering::Acquire) != LIVE_OUTPUT_FINISHING {
+            std::thread::yield_now();
+        }
+        release_first_tx.send(()).unwrap();
+        held_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("finishing worker drained the next queued write");
+        returned_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("finish cancels after its bounded wait");
+        release_held_tx.send(()).unwrap();
+        finisher.join().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "cancelled queue drain must not finish after the bounded handoff"
+        );
+
+        assert_eq!(
+            *sink.writes.lock().unwrap(),
+            vec![b"first".to_vec(), b"held".to_vec()]
+        );
+    }
+
+    #[test]
+    fn live_output_write_panic_is_contained_and_abandons_the_generation() {
+        struct PanickingOutput(std::sync::mpsc::Sender<()>);
+        impl crate::agentic::LiveToolOutput for PanickingOutput {
+            fn start(&self, _generation: u64) {}
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                _chunk: &[u8],
+            ) {
+                panic!("presentation failed");
+            }
+            fn finish(&self, _generation: u64) {
+                panic!("cancelled generation must not finish");
+            }
+            fn abandon(&self, _generation: u64) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel();
+        let mut session =
+            LiveOutputSession::start(Some(std::sync::Arc::new(PanickingOutput(abandoned_tx))))
+                .unwrap();
+        session
+            .relay()
+            .write(crate::agentic::ToolOutputStream::Stdout, b"panic");
+        session.finish();
+
+        abandoned_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("panic teardown abandoned the live generation");
+    }
+
+    #[test]
+    fn dropping_live_output_session_finishes_before_returning() {
+        struct FinishSignal {
+            finished: std::sync::mpsc::Sender<()>,
+            abandoned: std::sync::mpsc::Sender<()>,
+        }
+        impl crate::agentic::LiveToolOutput for FinishSignal {
+            fn start(&self, _generation: u64) {}
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                _chunk: &[u8],
+            ) {
+            }
+            fn finish(&self, _generation: u64) {
+                let _ = self.finished.send(());
+            }
+            fn abandon(&self, _generation: u64) {
+                let _ = self.abandoned.send(());
+            }
+        }
+
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel();
+        let session = LiveOutputSession::start(Some(std::sync::Arc::new(FinishSignal {
+            finished: finished_tx,
+            abandoned: abandoned_tx,
+        })))
+        .unwrap();
+        drop(session);
+
+        finished_rx
+            .try_recv()
+            .expect("drop closed the live frame synchronously");
+        assert!(
+            abandoned_rx.try_recv().is_err(),
+            "a responsive sink should finish rather than be abandoned"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_live_sink_cannot_delay_host_timeout() {
+        struct BlockingOutput {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl crate::agentic::LiveToolOutput for BlockingOutput {
+            fn start(&self, _generation: u64) {}
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                _chunk: &[u8],
+            ) {
+                let _ = self.entered.send(());
+                let _ = self.release.lock().unwrap().recv();
+            }
+            fn finish(&self, _generation: u64) {}
+            fn abandon(&self, _generation: u64) {}
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sink = std::sync::Arc::new(BlockingOutput {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let mut session = LiveOutputSession::start(Some(sink)).unwrap();
+        let relay = session.relay();
+        let run = tokio::spawn(async move {
+            host_shell_output_with_timeout(
+                "printf ready; sleep 5",
+                ".",
+                Some(relay),
+                std::time::Duration::from_millis(100),
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(1))
+        })
+        .await
+        .unwrap()
+        .expect("renderer entered its blocking write");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), run).await;
+        if outcome.is_err() {
+            let _ = release_tx.send(());
+            panic!("blocked presentation defeated the host timeout");
+        }
+        let run = outcome.unwrap().unwrap().unwrap();
+        assert!(run.timed_out);
+        assert_eq!(run.exit_code, 124);
+
+        session.cancel();
+        release_tx.send(()).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_live_sink_cannot_backpressure_host_pipe_capture() {
+        struct BlockingOutput {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl crate::agentic::LiveToolOutput for BlockingOutput {
+            fn start(&self, _generation: u64) {}
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                _chunk: &[u8],
+            ) {
+                let _ = self.entered.send(());
+                let _ = self.release.lock().unwrap().recv();
+            }
+            fn finish(&self, _generation: u64) {}
+            fn abandon(&self, _generation: u64) {}
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sink = std::sync::Arc::new(BlockingOutput {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let mut session = LiveOutputSession::start(Some(sink)).unwrap();
+        let relay = session.relay();
+        let run = tokio::spawn(async move {
+            host_shell_output_with_timeout(
+                "head -c 262144 /dev/zero",
+                ".",
+                Some(relay),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(1))
+        })
+        .await
+        .unwrap()
+        .expect("renderer entered its blocking write");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
+        if outcome.is_err() {
+            let _ = release_tx.send(());
+            panic!("blocked presentation backpressured host pipe capture");
+        }
+        let run = outcome.unwrap().unwrap().unwrap();
+        assert!(!run.timed_out);
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.stdout.len(), 262_144);
+
+        session.cancel();
+        release_tx.send(()).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_bypass_publishes_output_before_command_completion() {
+        struct ChannelOutput(std::sync::mpsc::Sender<Vec<u8>>);
+        impl crate::agentic::LiveToolOutput for ChannelOutput {
+            fn start(&self, _generation: u64) {}
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                chunk: &[u8],
+            ) {
+                let _ = self.0.send(chunk.to_vec());
+            }
+            fn finish(&self, _generation: u64) {}
+            fn abandon(&self, _generation: u64) {}
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink = std::sync::Arc::new(ChannelOutput(tx));
+        let session = LiveOutputSession::start(Some(sink)).unwrap();
+        let relay = session.relay();
+        let handle = tokio::spawn(async move {
+            host_shell_output("printf ready; sleep 0.2; printf done", ".", Some(relay)).await
+        });
+
+        let first =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(2)))
+                .await
+                .unwrap()
+                .expect("first live host-shell chunk");
+        assert_eq!(first, b"ready");
+        assert!(
+            !handle.is_finished(),
+            "command completed before its live chunk"
+        );
+
+        let run = handle.await.unwrap().unwrap();
+        assert_eq!(run.stdout, b"readydone");
+        assert_eq!(run.exit_code, 0);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn bridled_shell_forwards_live_bytes_without_changing_the_envelope() {
+        let sink = std::sync::Arc::new(RecordingLiveOutput::default());
+        let caveats = crate::caveats::Caveats {
+            exec: crate::caveats::Scope::only(["echo".to_string()]),
+            ..crate::caveats::Caveats::top()
+        };
+
+        let envelope = dispatch_bridled_shell(
+            serde_json::json!({"cmd": "echo observed", "cwd": "."}),
+            &caveats,
+            Some(sink.clone()),
+        )
+        .await
+        .expect("confined echo dispatch");
+
+        assert_eq!(envelope["stdout"], "observed\n");
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            ["start", "Stdout:observed\n", "finish"]
+        );
+    }
 
     // ---- #717: classify_phantom_reach (pure, no fs) ----
 
@@ -6624,6 +7743,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             PromptDisposition::Act,
+            None,
             Some(&cancel),
         )
         .await;
@@ -6972,6 +8092,30 @@ mod execute_tool_branch_tests {
         prompt_context: Option<PromptReadContext<'_>>,
         artifact_context: Option<ArtifactReadContext<'_>>,
     ) -> (String, String) {
+        run_tool_captured_with_context_and_live(
+            name,
+            args,
+            ws,
+            caveats,
+            mcp,
+            prompt_context,
+            artifact_context,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_tool_captured_with_context_and_live(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        mcp: &mut dyn McpTools,
+        prompt_context: Option<PromptReadContext<'_>>,
+        artifact_context: Option<ArtifactReadContext<'_>>,
+        live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    ) -> (String, String) {
         let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3);
         let out = execute_tool_with_display_cancellable(
             &mut display,
@@ -7001,12 +8145,88 @@ mod execute_tool_branch_tests {
             None,
             None,
             PromptDisposition::Act,
+            live_tool_output,
             None,
         )
         .await
         .expect("uncancelled test dispatch should complete");
         let rendered = String::from_utf8(display.into_inner()).unwrap();
         (out, rendered)
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn live_shell_observation_does_not_change_headless_completion_bytes() {
+        #[derive(Default)]
+        struct CapturedLiveOutput {
+            events: std::sync::Mutex<Vec<String>>,
+        }
+        impl crate::agentic::LiveToolOutput for CapturedLiveOutput {
+            fn start(&self, _generation: u64) {
+                self.events.lock().unwrap().push("start".into());
+            }
+            fn write(
+                &self,
+                _generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                chunk: &[u8],
+            ) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(chunk).into_owned());
+            }
+            fn finish(&self, _generation: u64) {
+                self.events.lock().unwrap().push("finish".into());
+            }
+            fn abandon(&self, _generation: u64) {
+                self.events.lock().unwrap().push("abandon".into());
+            }
+        }
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats {
+            exec: crate::caveats::Scope::only(["echo".to_string()]),
+            ..caveats_rw(ws.path())
+        };
+        let args = serde_json::json!({"command": "echo byte-stable"});
+        let (headless_out, headless_rendered) = run_tool_captured_with_context_and_live(
+            "run_command",
+            args.clone(),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let sink = std::sync::Arc::new(CapturedLiveOutput::default());
+        let (live_out, live_rendered) = run_tool_captured_with_context_and_live(
+            "run_command",
+            args,
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            Some(sink.clone()),
+        )
+        .await;
+
+        assert_eq!(live_out, headless_out);
+        assert_eq!(live_rendered.as_bytes(), headless_rendered.as_bytes());
+        assert!(
+            !headless_rendered.as_bytes().contains(&0x1b),
+            "headless completion emitted cursor-control bytes: {headless_rendered:?}"
+        );
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.first().map(String::as_str), Some("start"));
+        assert_eq!(events.last().map(String::as_str), Some("finish"));
+        assert!(
+            events.iter().any(|event| event.contains("byte-stable")),
+            "live events: {events:?}; model output: {live_out:?}"
+        );
     }
 
     #[tokio::test]
@@ -8655,6 +9875,91 @@ mod execute_tool_branch_tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
+        #[derive(Default)]
+        struct LifecycleOutput(std::sync::Mutex<Vec<String>>);
+        impl crate::agentic::LiveToolOutput for LifecycleOutput {
+            fn start(&self, generation: u64) {
+                self.0.lock().unwrap().push(format!("start:{generation}"));
+            }
+            fn write(
+                &self,
+                generation: u64,
+                _stream: crate::agentic::ToolOutputStream,
+                chunk: &[u8],
+            ) {
+                self.0.lock().unwrap().push(format!(
+                    "write:{generation}:{}",
+                    String::from_utf8_lossy(chunk)
+                ));
+            }
+            fn finish(&self, generation: u64) {
+                self.0.lock().unwrap().push(format!("finish:{generation}"));
+            }
+            fn abandon(&self, generation: u64) {
+                self.0.lock().unwrap().push(format!("abandon:{generation}"));
+            }
+        }
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let denied = Caveats {
+            exec: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = MockGate::new(true, &denied);
+        let sink = std::sync::Arc::new(LifecycleOutput::default());
+        let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3);
+        let out = exec_confined_command(
+            // Use an external executable under every engine. Bare `echo` is a
+            // Brush builtin and therefore correctly needs no exec grant.
+            "/bin/echo retry-visible",
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            None,
+            Some(&mut gate),
+            false,
+            None,
+            Some(sink.clone()),
+            &mut display,
+        )
+        .await;
+
+        assert!(out.contains("retry-visible"), "retry result: {out}");
+        assert_eq!(gate.asks.len(), 1, "permission prompt count");
+        let events = sink.0.lock().unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event.starts_with("start:"))
+            .cloned()
+            .collect();
+        assert_eq!(starts.len(), 2, "one viewport per attempt: {events:?}");
+        let first_generation = starts[0].trim_start_matches("start:");
+        let retry_start = events
+            .iter()
+            .position(|event| event == &starts[1])
+            .expect("retry start event");
+        assert!(
+            events[..retry_start]
+                .iter()
+                .any(|event| event == &format!("finish:{first_generation}")),
+            "retry started before the denied generation finished: {events:?}"
+        );
+        let second_generation = starts[1].trim_start_matches("start:");
+        assert!(
+            events.iter().any(|event| {
+                event.starts_with(&format!("write:{second_generation}:"))
+                    && event.contains("retry-visible")
+            }),
+            "retry bytes were not delivered to its generation: {events:?}"
+        );
+        let expected_finish = format!("finish:{second_generation}");
+        assert_eq!(events.last(), Some(&expected_finish), "events: {events:?}");
+    }
+
     /// Gate denies → the result is the standard denial, bit-for-bit equal to
     /// the no-gate path (#263: deny = the current denial result).
     #[tokio::test]
@@ -9588,6 +10893,7 @@ mod disable_ocap_tests {
         let envelope = host_shell_dispatch(
             "echo out; echo err >&2; exit 3",
             &ws.path().to_string_lossy(),
+            None,
         )
         .await
         .expect("host shell runs");

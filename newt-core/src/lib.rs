@@ -90,14 +90,14 @@ pub use agentic::{
     openai_responses_complete_with_prompt, plan_block, retrieve_evidence, set_spill_lines,
     transcript_lines, transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx,
     CodeSearch, CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient,
-    ExperienceStore, ManualCompressOutcome, McpTools, MemAddr, MemPayload, MemorySource, NoMcp,
-    NoteNudge, NoteSink, PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest,
-    PlanSnapshot, RecallSource, RoundObservation, ScratchpadStore, SemanticIndex,
-    SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore,
-    SessionStepLedger, ShellObservation, SpillStore, Step, StepLedger, StepStatus,
-    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine,
-    TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome,
-    TurnStatus, EXPERIENCE_TOP_K,
+    ExperienceStore, LiveToolOutput, ManualCompressOutcome, McpTools, MemAddr, MemPayload,
+    MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision, PermissionGate, PermissionRecord,
+    PermissionRequest, PlanSnapshot, RecallSource, RoundObservation, ScratchpadStore,
+    SemanticIndex, SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex,
+    SessionSpillStore, SessionStepLedger, ShellObservation, SpillStore, Step, StepLedger,
+    StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
+    ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
+    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::ApiSurfaceProvider;

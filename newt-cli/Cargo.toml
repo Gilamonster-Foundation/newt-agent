@@ -48,9 +48,9 @@ tracing-subscriber.workspace = true
 # call, which breaks default CI.
 
 # Amphibian default: the `newt` binary ships the rich TTY inline surface
-# (issue #416) ON, and you strip DOWN for the water. `default = ["rich-tui"]`
-# means plain `cargo build` / `just install` give the ratatui inline editor on a
-# TTY; `cargo build --no-default-features` produces the lean crossterm build
+# (issue #416) and the live spill viewport (#1235) ON, and you strip DOWN for
+# the water. Plain `cargo build` / `just install` gives both interactive
+# surfaces on a TTY; `cargo build --no-default-features` produces the lean build
 # (the headless / wyvern tier). The `is_terminal()` runtime gate still falls back
 # to the lean crossterm box when piped/headless even in the rich build.
 [features]
@@ -60,8 +60,9 @@ tracing-subscriber.workspace = true
 # the turn, #979). This ships the candle deps in the default build, wyvern
 # included (the "lean build stays candle-free" doctrine is retired, pragmatically).
 # `--no-default-features` (install-lean) remains the explicit zero-candle opt-out.
-default = ["rich-tui", "embedded"]
+default = ["rich-tui", "live-spill", "embedded"]
 rich-tui = ["newt-tui/rich-tui"]
+live-spill = ["newt-tui/live-spill"]
 
 # In-process candle inference (#639), opt-in/default-off. CPU by default;
 # accelerators are opt-in and adapt to the host (NEWT_EMBEDDED_DEVICE).
