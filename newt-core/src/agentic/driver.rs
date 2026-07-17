@@ -88,7 +88,7 @@ pub struct TurnDriverConfig {
     /// Additional progress-aware rounds after `max_tool_rounds`; `0` makes the
     /// normal cap hard.
     pub workflow_grace_rounds: usize,
-    /// Max lines of tool output shown inline.
+    /// Legacy line limit for pre-execution tool previews.
     pub tool_output_lines: usize,
     /// Ollama `options.num_ctx` (ignored on the OpenAI path).
     pub num_ctx: Option<u32>,

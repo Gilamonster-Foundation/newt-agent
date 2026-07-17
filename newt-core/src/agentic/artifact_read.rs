@@ -9,6 +9,7 @@
 //! constructed for one conversation inside one already-opened workspace store;
 //! no model-supplied conversation or workspace key is accepted by this API.
 
+#[cfg(test)]
 use super::display::{print_tool_call, print_tool_output};
 use crate::artifact::{ArtifactId, NewPromptArtifact, PromptArtifact};
 use crate::{ConversationStore, PromptId, TurnPromptContext};
@@ -525,26 +526,52 @@ pub fn artifact_read_tool_definition() -> Value {
     })
 }
 
-/// Execute one bounded artifact read.
+/// The two projections of an `artifact_read` result.
+///
+/// `model` contains the bounded artifact projection. `display` is safe to show
+/// in the operator transcript: it carries only address and pagination metadata,
+/// never an artifact body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactReadOutput {
+    pub(crate) model: String,
+    pub(crate) display: String,
+}
+
+impl ArtifactReadOutput {
+    fn shared(output: String) -> Self {
+        Self {
+            display: output.clone(),
+            model: output,
+        }
+    }
+}
+
+fn artifact_read_address(args: &Value) -> Result<&str, String> {
+    match optional_string(args, "address", "current") {
+        Ok("") => Ok("current"),
+        Ok(address) => Ok(address),
+        Err(error) => Err(tool_error(&error)),
+    }
+}
+
+/// Execute one bounded artifact read without writing to the terminal.
 ///
 /// The source has already applied its conversation/workspace fence. This
 /// function applies independent output caps so a buggy or adversarial source
-/// cannot turn an index read into an unbounded context injection.
-pub(crate) fn execute_artifact_read(
+/// cannot turn an index read into an unbounded context injection. The central
+/// presenter can spill the safe `display` projection while returning `model`
+/// unchanged to the inference backend.
+pub(crate) fn execute_artifact_read_silent(
     args: &Value,
     context: ArtifactReadContext<'_>,
-    color: bool,
-    tool_output_lines: usize,
-) -> String {
-    let address = match optional_string(args, "address", "current") {
-        Ok("") => "current",
+) -> ArtifactReadOutput {
+    let address = match artifact_read_address(args) {
         Ok(address) => address,
-        Err(error) => return tool_error(&error),
+        Err(output) => return ArtifactReadOutput::shared(output),
     };
-    print_tool_call("artifact_read", address, color);
 
     let Some(source) = context.source() else {
-        return tool_error("no artifact source in this session");
+        return ArtifactReadOutput::shared(tool_error("no artifact source in this session"));
     };
     let output = match address {
         "current" | "active" => {
@@ -578,16 +605,27 @@ pub(crate) fn execute_artifact_read(
     };
 
     match output {
-        Ok((model_output, display)) => {
-            print_tool_output(&display, tool_output_lines, color);
-            model_output
-        }
-        Err(error) => {
-            let output = tool_error(&error);
-            print_tool_output(&output, tool_output_lines, color);
-            output
-        }
+        Ok((model, display)) => ArtifactReadOutput { model, display },
+        Err(error) => ArtifactReadOutput::shared(tool_error(&error)),
     }
+}
+
+/// Execute `artifact_read` through the historical direct-printing interface.
+/// New dispatch code should prefer [`execute_artifact_read_silent`] and present
+/// its two projections at the central tool boundary.
+#[cfg(test)]
+pub(crate) fn execute_artifact_read(
+    args: &Value,
+    context: ArtifactReadContext<'_>,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    if let Ok(address) = artifact_read_address(args) {
+        print_tool_call("artifact_read", address, color);
+    }
+    let output = execute_artifact_read_silent(args, context);
+    print_tool_output(&output.display, tool_output_lines, color);
+    output.model
 }
 
 fn execute_index(
@@ -1208,6 +1246,30 @@ mod tests {
         assert_eq!(output["next_body_offset"], 3);
         assert!(output["artifact"].get("tool_output").is_none());
         assert!(output["artifact"].get("events").is_none());
+    }
+
+    #[test]
+    fn silent_artifact_read_separates_model_payload_from_safe_display() {
+        let prompt = prompt_id(1);
+        let mut artifact = record(7, prompt, prompt, 1);
+        artifact.body = Some("artifact secret that must not be echoed".to_string());
+        let source = MockSource::default();
+        source.insert(artifact);
+
+        let presented = execute_artifact_read_silent(
+            &json!({"address": artifact_id(7).to_string()}),
+            ArtifactReadContext::new(Some(prompt), Some(prompt), Some(prompt), Some(&source)),
+        );
+
+        let model: Value = serde_json::from_str(&presented.model).unwrap();
+        assert_eq!(
+            model["artifact"]["body"],
+            "artifact secret that must not be echoed"
+        );
+        assert!(presented
+            .display
+            .contains("returned 39 of 39 body characters"));
+        assert!(!presented.display.contains("artifact secret"));
     }
 
     #[test]

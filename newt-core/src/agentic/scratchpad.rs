@@ -11,7 +11,6 @@
 //! end. Mirrors `spill.rs`: a `&self` interior-mutability trait + an in-memory
 //! impl, deterministic (a `BTreeMap` — sorted, no clock/uuid) for stable tests.
 
-use super::display::{print_tool_call, print_tool_output};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -181,12 +180,11 @@ pub fn state_clear_tool_definition() -> serde_json::Value {
 pub(crate) fn execute_state_set(
     args: &serde_json::Value,
     store: &dyn ScratchpadStore,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let key = args["key"].as_str().unwrap_or("").trim();
     let value = args["value"].as_str().unwrap_or("");
-    print_tool_call("state_set", key, color);
     if key.is_empty() {
         return "error: state_set requires a non-empty `key` (and a `value`)".to_string();
     }
@@ -197,7 +195,6 @@ pub(crate) fn execute_state_set(
     } else {
         format!("stored: {key}")
     };
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 
@@ -205,11 +202,10 @@ pub(crate) fn execute_state_set(
 pub(crate) fn execute_state_get(
     args: &serde_json::Value,
     store: &dyn ScratchpadStore,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let key = args["key"].as_str().unwrap_or("").trim();
-    print_tool_call("state_get", key, color);
     if key.is_empty() {
         return "error: state_get requires a non-empty `key`".to_string();
     }
@@ -217,21 +213,18 @@ pub(crate) fn execute_state_get(
         Some(v) => v,
         None => format!("no such key: {key}"),
     };
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 
 /// Execute a `state_clear` call (Step 26.4).
 pub(crate) fn execute_state_clear(
     store: &dyn ScratchpadStore,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
-    print_tool_call("state_clear", "", color);
     let n = store.keys_count();
     store.clear();
     let out = format!("cleared {n} entries");
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 

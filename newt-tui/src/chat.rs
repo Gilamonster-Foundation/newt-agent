@@ -3118,9 +3118,8 @@ pub(crate) fn run_chat(
                     let head_before_turn = active_roadmap_id
                         .as_ref()
                         .and_then(|_| git_head_short(workspace));
-                    // #1235: publish the spill-view height for this turn
-                    // (process-wide knob, output_budget precedent) so the
-                    // shell echo renders bounded + tail-biased.
+                    // #1235: publish the universal tool spill-view height for
+                    // this turn (process-wide knob, output_budget precedent).
                     newt_core::set_spill_lines(spill_lines(&cfg));
                     let response =
                         with_interrupt_watch(interruptible, &turn_cancel, &turn_hard, || {

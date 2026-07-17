@@ -6,6 +6,7 @@
 //! scoped durable source. `prompt_read` is deliberately independent of the
 //! optional general-memory disclosure surface.
 
+#[cfg(test)]
 use super::display::{print_tool_call, print_tool_output};
 use super::prompt_intake::{PromptIntake, PROMPT_COMPREHENSION_MODEL_CARD_PREFIX};
 use crate::{
@@ -557,52 +558,81 @@ pub(crate) fn active_prompt_card(context: PromptReadContext<'_>) -> String {
     )
 }
 
-/// Execute `prompt_read`. Every branch returns a labelled tool result.
-pub(crate) fn execute_prompt_read(
-    args: &serde_json::Value,
-    context: PromptReadContext<'_>,
-    color: bool,
-    tool_output_lines: usize,
-) -> String {
+/// The two projections of a `prompt_read` result.
+///
+/// `model` contains the exact bounded prompt page. `display` is safe to show in
+/// the operator transcript: it carries only receipt and pagination metadata,
+/// never the recovered prompt text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptReadOutput {
+    pub(crate) model: String,
+    pub(crate) display: String,
+}
+
+impl PromptReadOutput {
+    fn shared(output: String) -> Self {
+        Self {
+            display: output.clone(),
+            model: output,
+        }
+    }
+}
+
+fn prompt_read_selector(args: &serde_json::Value) -> Result<&str, String> {
     let selector = match args.get("address") {
         None | Some(serde_json::Value::Null) => "current",
         Some(serde_json::Value::String(value)) if value.trim().is_empty() => "current",
         Some(serde_json::Value::String(value)) => value.trim(),
-        Some(_) => return tool_error("prompt_read `address` must be a string"),
+        Some(_) => return Err(tool_error("prompt_read `address` must be a string")),
     };
-    print_tool_call("prompt_read", selector, color);
+    Ok(selector)
+}
+
+/// Execute `prompt_read` without writing to the terminal.
+///
+/// The central tool presenter uses this seam so it can spill the operator-safe
+/// `display` projection while returning the complete `model` projection to the
+/// inference backend.
+pub(crate) fn execute_prompt_read_silent(
+    args: &serde_json::Value,
+    context: PromptReadContext<'_>,
+) -> PromptReadOutput {
+    let selector = match prompt_read_selector(args) {
+        Ok(selector) => selector,
+        Err(output) => return PromptReadOutput::shared(output),
+    };
 
     let selected = match resolve_selector(selector, context) {
         Ok(selected) => selected,
-        Err(error) => {
-            let output = tool_error(&error.to_string());
-            print_tool_output(&output, tool_output_lines, color);
-            return output;
-        }
+        Err(error) => return PromptReadOutput::shared(tool_error(&error.to_string())),
     };
     let offset = match parse_nonnegative_usize(args, "offset", 0) {
         Ok(offset) => offset,
-        Err(error) => return tool_error(&error),
+        Err(error) => return PromptReadOutput::shared(tool_error(&error)),
     };
     let limit = match parse_nonnegative_usize(args, "limit", DEFAULT_PROMPT_READ_CHARS) {
-        Ok(0) => return tool_error("prompt_read `limit` must be at least 1"),
+        Ok(0) => {
+            return PromptReadOutput::shared(tool_error("prompt_read `limit` must be at least 1"))
+        }
         Ok(limit) => limit.min(MAX_PROMPT_READ_CHARS),
-        Err(error) => return tool_error(&error),
+        Err(error) => return PromptReadOutput::shared(tool_error(&error)),
     };
 
     let (address, origin, previous_address, parent_address, root_address, model_digest, model_text) =
         match selected {
             SelectedPrompt::Receipt(receipt) => {
                 if let Err(error) = receipt.verify_integrity() {
-                    return tool_error(&format!("prompt_read refused a corrupt receipt: {error}"));
+                    return PromptReadOutput::shared(tool_error(&format!(
+                        "prompt_read refused a corrupt receipt: {error}"
+                    )));
                 }
                 let text = match receipt.model_text_utf8() {
                     Ok(text) => text,
                     Err(_) => {
-                        return tool_error(&format!(
+                        return PromptReadOutput::shared(tool_error(&format!(
                             "prompt_read cannot render {} because its model text is not UTF-8",
                             receipt.id()
-                        ))
+                        )))
                     }
                 };
                 (
@@ -629,9 +659,9 @@ pub(crate) fn execute_prompt_read(
     });
     let total_chars = model_text.chars().count();
     if offset > total_chars {
-        return tool_error(&format!(
+        return PromptReadOutput::shared(tool_error(&format!(
             "prompt_read offset {offset} is past the prompt's {total_chars} Unicode characters"
-        ));
+        )));
     }
     let page: String = model_text.chars().skip(offset).take(limit).collect();
     let returned_chars = page.chars().count();
@@ -667,8 +697,28 @@ pub(crate) fn execute_prompt_read(
     // terminal as a single escaped JSON line. Besides defeating the normal
     // line cap, that could re-display credentials from an older prompt. The
     // operator-facing trace carries only address and pagination metadata.
-    print_tool_output(&display, tool_output_lines, color);
-    output
+    PromptReadOutput {
+        model: output,
+        display,
+    }
+}
+
+/// Execute `prompt_read` through the historical direct-printing interface.
+/// New dispatch code should prefer [`execute_prompt_read_silent`] and present
+/// its two projections at the central tool boundary.
+#[cfg(test)]
+pub(crate) fn execute_prompt_read(
+    args: &serde_json::Value,
+    context: PromptReadContext<'_>,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    if let Ok(selector) = prompt_read_selector(args) {
+        print_tool_call("prompt_read", selector, color);
+    }
+    let output = execute_prompt_read_silent(args, context);
+    print_tool_output(&output.display, tool_output_lines, color);
+    output.model
 }
 
 enum SelectedPrompt<'a> {
@@ -840,6 +890,23 @@ mod tests {
         assert_eq!(json["model_text"], exact);
         assert_eq!(json["complete"], true);
         assert_eq!(json["address"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn silent_prompt_read_separates_model_payload_from_safe_display() {
+        let exact = "operator secret that must not be echoed";
+        let presented = execute_prompt_read_silent(
+            &serde_json::json!({}),
+            PromptReadContext::new(None, exact, None),
+        );
+
+        let model: serde_json::Value = serde_json::from_str(&presented.model).unwrap();
+        assert_eq!(model["model_text"], exact);
+        assert_eq!(
+            presented.display,
+            "ephemeral prompt: returned 39 of 39 Unicode characters at offset 0 (complete)"
+        );
+        assert!(!presented.display.contains(exact));
     }
 
     #[test]

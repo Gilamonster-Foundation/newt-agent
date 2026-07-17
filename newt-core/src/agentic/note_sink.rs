@@ -25,8 +25,6 @@
 //!
 //! [`McpTools`]: super::McpTools
 
-use super::display::{print_tool_call, print_tool_output};
-
 /// Model-writable note store behind the `save_note` tool.
 ///
 /// Object-safe by design (the loop holds `&mut dyn NoteSink`). All write
@@ -126,22 +124,20 @@ fn excerpt(text: &str) -> String {
 /// Execute one `save_note` call against the sink and return the result text
 /// fed back to the model.
 ///
-/// Successful writes print `note saved: <first 60 chars>` through the same
-/// display path as every other tool, and append the sink's usage line so the
-/// model always sees how full memory is. Errors are returned verbatim
+/// Successful writes return `note saved: <first 60 chars>` and append the
+/// sink's usage line so the model always sees how full memory is. Errors are
+/// returned verbatim
 /// (prefixed `error: ` like every tool error) — the over-budget curator
 /// error and the 19.2 scan rejection are the model's coaching text.
 pub(crate) fn execute_save_note(
     args: &serde_json::Value,
     sink: &mut dyn NoteSink,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let action = args["action"].as_str().unwrap_or("").trim();
     let text = args["text"].as_str().unwrap_or("").trim();
     let selector = args["old_substring"].as_str().unwrap_or("").trim();
-
-    print_tool_call("save_note", action, color);
 
     let outcome: anyhow::Result<String> = match action {
         "add" => {
@@ -184,7 +180,6 @@ pub(crate) fn execute_save_note(
     match outcome {
         Ok(line) => {
             let out = format!("{line}\n{}", sink.usage_line());
-            print_tool_output(&out, tool_output_lines, color);
             out
         }
         // Verbatim: the over-budget error carries the full entry list and

@@ -31,7 +31,6 @@
 //! `redact_secrets` table `spill:` uses) and session-scoped; an absent/expired
 //! id resolves to labelled coaching, never a crash.
 
-use super::display::{print_tool_call, print_tool_output};
 use super::prompt_read::PromptSource;
 use crate::PromptId;
 
@@ -385,8 +384,8 @@ pub fn memory_fetch_tool_definition() -> serde_json::Value {
 pub(crate) fn execute_memory_fetch(
     args: &serde_json::Value,
     source: &dyn MemorySource,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let address = args["address"].as_str().unwrap_or("").trim();
     let grep = args
@@ -394,8 +393,6 @@ pub(crate) fn execute_memory_fetch(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty());
-
-    print_tool_call("memory_fetch", address, color);
 
     if address.is_empty() {
         return "error: memory_fetch requires `address` — e.g. `note:3` or \
@@ -408,7 +405,6 @@ pub(crate) fn execute_memory_fetch(
             let out = format!(
                 "{address:?} is not a valid prompt address — copy a `prompt:<uuid>` handle exactly as Newt showed it."
             );
-            print_tool_output(&out, tool_output_lines, color);
             return out;
         };
         source.fetch_prompt(id)
@@ -420,7 +416,6 @@ pub(crate) fn execute_memory_fetch(
              (a numbered note) or `turn:174856320012#7` (a conversation id \
              and `seq` from a recall hit). Copy one exactly as it was shown."
         );
-        print_tool_output(&out, tool_output_lines, color);
         return out;
     };
 
@@ -436,7 +431,6 @@ pub(crate) fn execute_memory_fetch(
         },
         MemPayload::NotFound { reason } => format!("no such memory item: {reason}"),
     };
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 

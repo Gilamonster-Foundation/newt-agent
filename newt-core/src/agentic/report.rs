@@ -13,11 +13,10 @@
 //! **How it honors the plain-scroller rule** (`docs/decisions/
 //! plain_scroller_tui.md`). This does NOT open a pane, alternate screen, or
 //! widget. It renders Markdown → ANSI through the same [`render_markdown`]
-//! emitter the assistant's own output uses and `println!`s the result into the
-//! terminal's own scrollback — line-oriented, copy-pasteable, and identical
-//! over SSH / tmux / pipe. With `color == false` (headless / `NO_COLOR` /
-//! non-TTY) it degrades to the raw Markdown source, the same honest passthrough
-//! as every other output path.
+//! emitter the assistant's own output uses, then hands the document to the
+//! central tool presenter for line-oriented terminal output. With
+//! `color == false` (headless / `NO_COLOR` / non-TTY) it degrades to the raw
+//! Markdown source, the same honest passthrough as every other output path.
 //!
 //! **Presence.** Unlike `save_note` / `recall`, this tool needs no injected
 //! capability — it only writes to the output sink every session already has —
@@ -26,9 +25,7 @@
 //!
 //! [`render_markdown`]: super::render_markdown
 
-use std::io::{self, Write};
-
-use super::display::{print_tool_call, term_cols};
+use super::display::term_cols;
 use super::{render_markdown, RenderOpts};
 
 /// A section / report status. `Ok` is the clean default; `Degraded` and `Error`
@@ -278,11 +275,12 @@ fn compose_document(args: &serde_json::Value) -> Result<(String, String), String
 /// the headless / `NO_COLOR` degrade). Errors are returned verbatim, prefixed
 /// `error: ` like every tool error — an empty title or unknown status is
 /// actionable coaching, not a failure to hide.
-pub(crate) fn execute_render_report(args: &serde_json::Value, color: bool) -> String {
+pub(crate) fn execute_render_report(
+    args: &serde_json::Value,
+    color: bool,
+) -> (String, Option<String>) {
     match compose_document(args) {
         Ok((markdown, ack)) => {
-            // The ⚙ header line, consistent with every other tool call.
-            print_tool_call("render_report", &ack, color);
             let rendered = render_markdown(
                 &markdown,
                 RenderOpts {
@@ -290,13 +288,9 @@ pub(crate) fn execute_render_report(args: &serde_json::Value, color: bool) -> St
                     cols: term_cols(),
                 },
             );
-            // render_markdown owns no trailing newline — the caller does.
-            let mut out = io::stdout();
-            let _ = writeln!(out, "{rendered}");
-            let _ = out.flush();
-            ack
+            (ack, Some(rendered))
         }
-        Err(e) => format!("error: {e}"),
+        Err(e) => (format!("error: {e}"), None),
     }
 }
 

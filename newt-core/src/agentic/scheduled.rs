@@ -16,7 +16,6 @@
 //! around the compiled view. v1 injects the `<plan>` view alongside the normal
 //! window rather than replacing it — honest + non-invasive.
 
-use super::display::{print_tool_call, print_tool_output};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -386,10 +385,9 @@ fn normalize_active(steps: &mut [Step]) {
 pub(crate) fn execute_update_plan(
     args: &serde_json::Value,
     ledger: &dyn StepLedger,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
-    print_tool_call("update_plan", "", color);
     let out = match args["plan"].as_array() {
         None => "error: update_plan requires a `plan` array of {\"step\",\"status\"} objects"
             .to_string(),
@@ -421,7 +419,6 @@ pub(crate) fn execute_update_plan(
             }
         }
     };
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 
@@ -430,19 +427,16 @@ pub(crate) fn execute_update_plan(
 /// working on". Empty plan → a hint to start one with `update_plan`.
 pub(crate) fn execute_plan_get(
     ledger: &dyn StepLedger,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
-    print_tool_call("plan_get", "", color);
-    let out = plan_block(ledger).unwrap_or_else(|| {
+    plan_block(ledger).unwrap_or_else(|| {
         "no active plan — if this is multi-step, ambiguous, resumed, or context-compacted work, \
          call update_plan next with a short 2-6 step ordered plan using statuses \
          pending/in_progress/completed; do not call plan_get again until you have created or \
          updated a plan"
             .to_string()
-    });
-    print_tool_output(&out, tool_output_lines, color);
-    out
+    })
 }
 
 #[cfg(test)]

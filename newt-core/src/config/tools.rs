@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 /// `read_file` (its char backstop) and `run_command` (its shell envelope) — so a
 /// verbose command or a huge file can't saturate a small local model's window
 /// and abandon the task. Mirrors Codex's `exec_command.max_output_tokens`.
-/// Distinct from `[tui] tool_output_lines`, which caps the on-screen DISPLAY by
-/// lines.
+/// Distinct from `[tui] spill_lines`, which bounds completed on-screen results,
+/// and the legacy `tool_output_lines` pre-execution preview limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {

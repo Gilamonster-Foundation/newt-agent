@@ -12,7 +12,6 @@
 //! embeddings), so the whole feature unit-tests with zero network/fs. Mirrors
 //! `scratchpad.rs`: a `&self` interior-mutability trait + an in-memory impl.
 
-use super::display::{print_tool_call, print_tool_output};
 use std::sync::Mutex;
 
 /// One recorded experience: a task, its outcome, and the lesson learned.
@@ -247,13 +246,12 @@ pub fn experience_recall_tool_definition() -> serde_json::Value {
 pub(crate) fn execute_experience_record(
     args: &serde_json::Value,
     store: &dyn ExperienceStore,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let task = args["task"].as_str().unwrap_or("").trim();
     let outcome = args["outcome"].as_str().unwrap_or("").trim();
     let lesson = args["lesson"].as_str().unwrap_or("").trim();
-    print_tool_call("experience_record", task, color);
     let out = if store.record(task, outcome, lesson) {
         "recorded experience".to_string()
     } else {
@@ -261,7 +259,6 @@ pub(crate) fn execute_experience_record(
             "not recorded — needs a non-empty task + outcome and a lesson of ≥{MIN_LESSON_CHARS} chars"
         )
     };
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 
@@ -270,18 +267,15 @@ pub(crate) fn execute_experience_recall(
     args: &serde_json::Value,
     store: &dyn ExperienceStore,
     top_k: usize,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let query = args["query"].as_str().unwrap_or("").trim();
-    print_tool_call("experience_recall", query, color);
     if query.is_empty() {
         return "error: experience_recall requires a non-empty `query`".to_string();
     }
-    let out = build_experience_block(store, query, top_k, EXPERIENCE_TOTAL_CAP)
-        .unwrap_or_else(|| "no relevant experience recorded yet".to_string());
-    print_tool_output(&out, tool_output_lines, color);
-    out
+    build_experience_block(store, query, top_k, EXPERIENCE_TOTAL_CAP)
+        .unwrap_or_else(|| "no relevant experience recorded yet".to_string())
 }
 
 #[cfg(test)]
