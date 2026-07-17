@@ -129,6 +129,14 @@ fn venv_env_map() -> std::collections::BTreeMap<String, String> {
             map.insert(var, val);
         }
     }
+    // File-sourced import (#1243 Leg 2): the `~/.newt/shell-env/` drop-in dir —
+    // deliberate, allowlisted tokens/support vars whose VALUES live in files,
+    // never in config.toml or newt's own process env. Merged over the ambient
+    // passthrough (explicit operator intent wins); the engine-critical vars
+    // (SHELL/VIRTUAL_ENV/PATH) set below still win over a same-named token file.
+    if let Some(config_path) = crate::Config::user_config_path() {
+        map.extend(crate::shell_env::from_config_dir(&config_path));
+    }
     // Identify the confined engine so `env` / scripts can tell they're in newt's
     // shell (e.g. `SHELL=safe-subset` / `brush` / `host`), not the login shell.
     map.insert("SHELL".to_string(), shell_engine().as_str().to_string());
