@@ -830,12 +830,19 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // dispatch to read (same env pattern as NEWT_FULL_ACCESS).
             {
                 let shell_cfg = newt_core::Config::resolve().ok().and_then(|c| c.shell);
-                let engine = newt_core::resolve_shell_engine(
+                // #1243 Leg 1: publish NEWT_SHELL_ENGINE only for a FIXED choice
+                // (explicit flag/config or the --full-access auto-upgrade). The
+                // confined default is intentionally left UNPUBLISHED so the deep
+                // dispatch resolves it per-command against the live L3 fence
+                // (confined_default_engine) — never caching the startup fence
+                // state (the agent-bridle #239 TOCTOU obligation).
+                if let Some(engine) = newt_core::resolve_shell_engine_choice(
                     cli.shell_engine,
                     shell_cfg.as_ref().and_then(|s| s.engine),
                     cli.full_access,
-                );
-                unsafe { std::env::set_var("NEWT_SHELL_ENGINE", engine.as_str()) };
+                ) {
+                    unsafe { std::env::set_var("NEWT_SHELL_ENGINE", engine.as_str()) };
+                }
                 // Confined-shell env passthrough (so `~` expands — brush needs
                 // HOME): `[shell] env_passthrough` (default HOME+USER), published
                 // colon-separated for newt-core's confined dispatch to seed.

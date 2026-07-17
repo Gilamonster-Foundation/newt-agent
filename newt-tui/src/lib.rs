@@ -8109,6 +8109,11 @@ mod disable_ocap_session_tests {
     async fn floor_wins_over_disable_ocap_at_the_tui_seam() {
         let _env = crate::test_env_guard::env_write_guard_async().await;
         let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        // #1243 Leg 1: pin safe-subset — this asserts the exec FLOOR wins over
+        // --disable-ocap (engine-independent); `echo` is a brush builtin (never
+        // spawns → not exec-gated), so the L3-gated default would make this
+        // box-dependent.
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let ws = tempfile::TempDir::new().unwrap();
         let base = caveats_no_exec(ws.path());
         // The readonly-triage preset clamp the active mode supplies.
