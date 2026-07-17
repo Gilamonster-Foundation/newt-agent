@@ -84,6 +84,19 @@ pub fn run_setup(color: bool) -> anyhow::Result<()> {
     setup::run(color)
 }
 
+/// Detect and configure every inference endpoint reachable through `target`.
+/// This is the scriptable `newt setup <host-or-url>` path; the no-target
+/// interactive wizard remains [`run_setup`].
+pub async fn run_setup_target(
+    target: &str,
+    token_env: Option<&str>,
+    token_file: Option<&std::path::Path>,
+    yes: bool,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    setup::run_target(target, token_env, token_file, yes, config_path).await
+}
+
 /// Run the interactive crew-settings form — used by `newt crew --edit [name]`
 /// and the in-session `/crew edit`. Prompts field-by-field (planner/navigator/
 /// triage loadouts, control loop, test command, budgets), previews, and writes

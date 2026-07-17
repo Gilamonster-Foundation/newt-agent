@@ -20,6 +20,32 @@
 
 use crate::config::{BackendConfig, BackendKind, Serving};
 
+/// HTTP status returned by a model-list probe. Keeping the status typed lets
+/// endpoint detection distinguish authentication and unsupported APIs from a
+/// host that could not be reached, while preserving the existing `HTTP ...`
+/// display consumed by `newt doctor`.
+#[derive(Debug)]
+struct ProbeHttpStatus(reqwest::StatusCode);
+
+impl std::fmt::Display for ProbeHttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}", self.0)
+    }
+}
+
+impl std::error::Error for ProbeHttpStatus {}
+
+#[derive(Debug)]
+struct ProbeResponseShape(&'static str);
+
+impl std::fmt::Display for ProbeResponseShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid model-list response: missing `{}` array", self.0)
+    }
+}
+
+impl std::error::Error for ProbeResponseShape {}
+
 /// One backend API's wire behavior — how it lists models, reads its context
 /// window, and derives its serving axis. Each [`BackendKind`] has one impl, so
 /// callers ASK THE BACKEND (`api_for(kind).list_models(…)`) instead of matching
@@ -77,17 +103,16 @@ impl BackendApi for OllamaApi {
         let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
         let resp = client.get(&url).send().await?;
         if !resp.status().is_success() {
-            anyhow::bail!("HTTP {}", resp.status());
+            return Err(ProbeHttpStatus(resp.status()).into());
         }
         let json: serde_json::Value = resp.json().await?;
-        Ok(json["models"]
+        let models = json["models"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m["name"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default())
+            .ok_or(ProbeResponseShape("models"))?;
+        Ok(models
+            .iter()
+            .filter_map(|m| m["name"].as_str().map(str::to_string))
+            .collect())
     }
 
     async fn context_window(
@@ -124,14 +149,11 @@ impl BackendApi for OpenAiApi {
         api_key: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
         let json = openai_models_json(client, endpoint, api_key).await?;
-        Ok(json["data"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m["id"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default())
+        let models = json["data"].as_array().ok_or(ProbeResponseShape("data"))?;
+        Ok(models
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect())
     }
 
     async fn context_window(
@@ -202,9 +224,169 @@ async fn openai_models_json(
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
-        anyhow::bail!("HTTP {}", resp.status());
+        return Err(ProbeHttpStatus(resp.status()).into());
     }
     Ok(resp.json().await?)
+}
+
+/// The protocol and served models discovered at one HTTP endpoint.
+///
+/// `endpoint` is the caller's base URL with trailing slashes removed so it can
+/// be persisted directly: request paths are appended by the selected
+/// [`BackendApi`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointProbeResult {
+    pub endpoint: String,
+    pub kind: BackendKind,
+    pub models: Vec<String>,
+    pub serving: Serving,
+}
+
+#[derive(Debug)]
+struct ProbeFailure {
+    status: Option<reqwest::StatusCode>,
+    reached_http_service: bool,
+    detail: String,
+}
+
+impl ProbeFailure {
+    fn from_error(error: anyhow::Error) -> Self {
+        if let Some(status) = error.downcast_ref::<ProbeHttpStatus>() {
+            return Self {
+                status: Some(status.0),
+                reached_http_service: true,
+                detail: error.to_string(),
+            };
+        }
+
+        if error.downcast_ref::<ProbeResponseShape>().is_some() {
+            return Self {
+                status: None,
+                reached_http_service: true,
+                detail: error.to_string(),
+            };
+        }
+
+        let reached_http_service = error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_decode() || error.status().is_some());
+        Self {
+            status: None,
+            reached_http_service,
+            detail: error.to_string(),
+        }
+    }
+
+    fn is_auth_failure(&self) -> bool {
+        matches!(
+            self.status,
+            Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN)
+        )
+    }
+
+    fn authentication_error(&self, endpoint: &str, supplied_key: bool) -> Option<anyhow::Error> {
+        if !self.is_auth_failure() {
+            return None;
+        }
+        if supplied_key {
+            Some(anyhow::anyhow!(
+                "authentication rejected by OpenAI-compatible inference endpoint {endpoint} \
+                 (GET /v1/models returned {}); check the bearer token",
+                self.detail
+            ))
+        } else {
+            Some(anyhow::anyhow!(
+                "authentication required by OpenAI-compatible inference endpoint {endpoint} \
+                 (GET /v1/models returned {}); supply a bearer token",
+                self.detail
+            ))
+        }
+    }
+}
+
+/// Detect whether `endpoint` speaks Ollama or an OpenAI-compatible API.
+///
+/// Both cheap model-list probes run concurrently. Ollama wins when both APIs
+/// answer because Ollama's native surface carries more backend-specific
+/// behavior than its OpenAI compatibility shim. The optional bearer token is
+/// sent only to the OpenAI-compatible probe.
+pub async fn detect_endpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<EndpointProbeResult> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let ollama_api = api_for(BackendKind::Ollama);
+    let openai_api = api_for(BackendKind::Openai);
+    let (ollama, openai) = tokio::join!(
+        ollama_api.list_models(client, endpoint, None),
+        openai_api.list_models(client, endpoint, api_key),
+    );
+
+    match (ollama, openai) {
+        (Ok(ollama_models), Ok(openai_models))
+            if ollama_models.is_empty() && !openai_models.is_empty() =>
+        {
+            Ok(EndpointProbeResult {
+                endpoint: endpoint.to_string(),
+                kind: BackendKind::Openai,
+                serving: openai_api.serving(openai_models.len()),
+                models: openai_models,
+            })
+        }
+        (Ok(models), Err(openai_error)) if models.is_empty() => {
+            let openai = ProbeFailure::from_error(openai_error);
+            if let Some(error) = openai
+                .authentication_error(endpoint, api_key.is_some_and(|key| !key.trim().is_empty()))
+            {
+                return Err(error);
+            }
+            Ok(EndpointProbeResult {
+                endpoint: endpoint.to_string(),
+                kind: BackendKind::Ollama,
+                serving: ollama_api.serving(models.len()),
+                models,
+            })
+        }
+        (Ok(models), _) => Ok(EndpointProbeResult {
+            endpoint: endpoint.to_string(),
+            kind: BackendKind::Ollama,
+            serving: ollama_api.serving(models.len()),
+            models,
+        }),
+        (Err(_), Ok(models)) => Ok(EndpointProbeResult {
+            endpoint: endpoint.to_string(),
+            kind: BackendKind::Openai,
+            serving: openai_api.serving(models.len()),
+            models,
+        }),
+        (Err(ollama_error), Err(openai_error)) => {
+            let ollama = ProbeFailure::from_error(ollama_error);
+            let openai = ProbeFailure::from_error(openai_error);
+            if let Some(error) = openai
+                .authentication_error(endpoint, api_key.is_some_and(|key| !key.trim().is_empty()))
+            {
+                return Err(error);
+            }
+
+            if ollama.reached_http_service || openai.reached_http_service {
+                anyhow::bail!(
+                    "unsupported inference endpoint {endpoint}: neither Ollama GET /api/tags nor \
+                     OpenAI-compatible GET /v1/models succeeded \
+                     (Ollama: {}; OpenAI-compatible: {})",
+                    ollama.detail,
+                    openai.detail
+                );
+            }
+
+            anyhow::bail!(
+                "unreachable inference endpoint {endpoint}: both protocol probes failed \
+                 (Ollama GET /api/tags: {}; OpenAI-compatible GET /v1/models: {})",
+                ollama.detail,
+                openai.detail
+            );
+        }
+    }
 }
 
 /// Extract the context window from an Ollama `/api/show` response: the
@@ -365,6 +547,9 @@ pub async fn fetch_openai_models(
 mod tests {
     use super::*;
     use crate::config::BackendKind;
+    use std::time::Duration;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn openai_backend(model: Option<&str>, serving: Option<Serving>) -> BackendConfig {
         BackendConfig {
@@ -381,6 +566,290 @@ mod tests {
         Served {
             models: models.iter().map(|m| m.to_string()).collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_prefers_ollama_when_both_protocols_answer() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "qwen3:30b"}, {"name": "llama3.1:8b"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "openai-shim-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_endpoint(&reqwest::Client::new(), &format!("{}/", server.uri()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.endpoint, server.uri());
+        assert_eq!(result.kind, BackendKind::Ollama);
+        assert_eq!(result.models, vec!["qwen3:30b", "llama3.1:8b"]);
+        assert_eq!(result.serving, Serving::Multiplexer);
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_prefers_the_nonempty_openai_surface() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "served-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_endpoint(&reqwest::Client::new(), &server.uri(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.kind, BackendKind::Openai);
+        assert_eq!(result.models, vec!["served-model"]);
+        assert_eq!(result.serving, Serving::Instance);
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_finds_authenticated_openai_instance() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer secret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "ornith-35b"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_endpoint(&reqwest::Client::new(), &server.uri(), Some("secret-token"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.kind, BackendKind::Openai);
+        assert_eq!(result.models, vec!["ornith-35b"]);
+        assert_eq!(result.serving, Serving::Instance);
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_derives_openai_gateway_as_multiplexer() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "model-a"}, {"id": "model-b"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_endpoint(&reqwest::Client::new(), &server.uri(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.kind, BackendKind::Openai);
+        assert_eq!(result.models, vec!["model-a", "model-b"]);
+        assert_eq!(result.serving, Serving::Multiplexer);
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_ignores_success_with_the_wrong_protocol_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "ok"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "real-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_endpoint(&reqwest::Client::new(), &server.uri(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.kind, BackendKind::Openai);
+        assert_eq!(result.models, vec!["real-model"]);
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_reports_authentication_required_without_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let error = detect_endpoint(&reqwest::Client::new(), &server.uri(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("authentication required"), "{error}");
+        assert!(error.contains("401"), "{error}");
+        assert!(error.contains("bearer token"), "{error}");
+        assert!(error.contains(&server.uri()), "{error}");
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_reports_openai_auth_when_ollama_lists_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let error = detect_endpoint(&reqwest::Client::new(), &server.uri(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("authentication required"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_never_sends_the_openai_token_to_ollama() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .and(header("authorization", "Bearer secret-token"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "ollama-model"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer secret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "openai-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_endpoint(&reqwest::Client::new(), &server.uri(), Some("secret-token"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.kind, BackendKind::Ollama);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_reports_authentication_rejected_with_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer wrong-token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let error = detect_endpoint(&reqwest::Client::new(), &server.uri(), Some("wrong-token"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("authentication rejected"), "{error}");
+        assert!(error.contains("403"), "{error}");
+        assert!(error.contains("check the bearer token"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_reports_unsupported_http_service() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let error = detect_endpoint(&reqwest::Client::new(), &server.uri(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unsupported inference endpoint"), "{error}");
+        assert!(error.contains("/api/tags"), "{error}");
+        assert!(error.contains("/v1/models"), "{error}");
+        assert!(error.contains("HTTP 404"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_reports_unreachable_when_probes_time_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({"models": []})),
+            )
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap();
+
+        let error = detect_endpoint(&client, &server.uri(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unreachable inference endpoint"), "{error}");
+        assert!(error.contains(&server.uri()), "{error}");
     }
 
     #[test]
