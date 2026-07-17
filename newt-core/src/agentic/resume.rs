@@ -18,7 +18,6 @@
 //! present (headless / eval), it degrades to a clear "no history this session"
 //! line rather than a dead end.
 
-use super::display::{print_tool_call, print_tool_output};
 use super::prompt_read::PromptReadContext;
 use super::recall::RecallSource;
 use super::scheduled::{plan_block, StepLedger};
@@ -66,11 +65,9 @@ pub(crate) fn execute_resume_context(
     step_ledger: Option<&dyn StepLedger>,
     scratchpad_store: Option<&dyn ScratchpadStore>,
     prompt_context: Option<PromptReadContext<'_>>,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
-    print_tool_call("resume_context", "", color);
-
     let mut out = String::from("Recovering what this conversation was working on.\n");
     out.push_str(
         "For prompt-rooted work, recover this objective's artifact chain with \
@@ -153,7 +150,6 @@ pub(crate) fn execute_resume_context(
         out.push('\n');
     }
 
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 

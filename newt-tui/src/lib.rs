@@ -5476,7 +5476,8 @@ fn effective_mid_loop_trim_tokens(
     model_override.or(global).filter(|&t| t > 0)
 }
 
-/// Read the tool-output line limit from config (default 20, 0 = unlimited).
+/// Read the legacy pre-execution preview limit (default 20, 0 = unlimited).
+/// Completed results use `[tui] spill_lines`.
 fn tool_output_lines(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.tool_output_lines).unwrap_or(20)
 }

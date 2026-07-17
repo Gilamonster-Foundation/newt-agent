@@ -9,7 +9,6 @@
 //! the whole subsystem in the fully-mocked unit tier. The real
 //! [`EmbeddingsClient`] (Ollama `/api/embeddings`) is wiremock-tested here.
 
-use super::display::{print_tool_call, print_tool_output};
 use async_trait::async_trait;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -562,11 +561,10 @@ pub fn code_search_tool_definition() -> serde_json::Value {
 pub(crate) async fn execute_code_search(
     args: &serde_json::Value,
     search: CodeSearch<'_>,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let query = args["query"].as_str().unwrap_or("").trim();
-    print_tool_call("code_search", query, color);
     if query.is_empty() {
         return "error: code_search requires a non-empty `query`".to_string();
     }
@@ -576,7 +574,6 @@ pub(crate) async fn execute_code_search(
                  unavailable; use read_file/find if you already know the path"
             .to_string(),
     };
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 

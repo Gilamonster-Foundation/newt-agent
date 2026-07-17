@@ -534,9 +534,8 @@ pub struct ChatCtx<'a> {
     /// content-free model card inside the protected active-prompt card;
     /// headless compatibility callers can leave it `None`.
     pub prompt_intake: Option<&'a PromptIntake>,
-    /// Max lines of tool output shown inline (from `[tui].tool_output_lines`,
-    /// default 20). Resolved once per turn and threaded to `execute_tool` so
-    /// the tool loop never re-reads config from disk.
+    /// Legacy line limit for pre-execution previews. Completed tool results use
+    /// the `[tui].spill_lines` height published once per turn.
     pub tool_output_lines: usize,
     /// Enable per-round diagnostic output. Set via `NEWT_DEBUG=1` or the
     /// `[tui] debug = true` config key.
@@ -903,6 +902,40 @@ async fn cancellable<F: std::future::Future>(
         _ = cancelled(cancel) => None,
         v = fut => Some(v),
     }
+}
+
+fn present_synthetic_tool_result<W: std::io::Write>(
+    display: &mut display::ToolDisplay<W>,
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &std::path::Path,
+    result: &str,
+) {
+    let (name, detail) = tools::tool_presentation(name, args, workspace);
+    display.call(&name, &detail);
+    display.result(result);
+}
+
+fn print_synthetic_tool_result(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    result: &str,
+    color: bool,
+) {
+    let mut tool_display = display::ToolDisplay::new(
+        io::stdout(),
+        color,
+        display::term_cols(),
+        display::spill_lines(),
+    );
+    present_synthetic_tool_result(
+        &mut tool_display,
+        name,
+        args,
+        std::path::Path::new(workspace),
+        result,
+    );
 }
 
 /// Drive `fut` while animating the thinking line in place (~8 fps), so a slow
@@ -2477,6 +2510,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // instead of re-executing a dead or already-useful call. The bogus
             // emission is still counted above; we just don't run it again.
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
+                print_synthetic_tool_result(name, &args, workspace, &steer, color);
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -2512,8 +2546,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     input_ceiling_pct as usize,
                     low_budget_pct,
                 );
-                display::print_tool_call("get_context_remaining", "", color);
-                display::print_tool_output(&report, tool_output_lines, color);
+                print_synthetic_tool_result(name, &args, workspace, &report, color);
                 report
             } else {
                 // #297 follow-up: race the tool dispatch against the turn's
@@ -2525,54 +2558,52 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 // host-exec timeout ceiling. `is_cancelled` between rounds still
                 // catches the abandoned turn; this closes the *during-a-tool*
                 // window that a foreground child on the tty used to wedge.
-                let dispatch = execute_tool_with_offload_and_prompt_and_artifacts(
-                    name,
-                    &args,
-                    workspace,
-                    color,
-                    tool_output_lines,
-                    caveats,
-                    mcp,
-                    build_check_cmd.as_deref(),
-                    // Reborrow + re-coerce: shortens the trait-object lifetime to
-                    // this call (Option<&mut dyn _> is invariant, so the longer
-                    // ChatCtx lifetime can't unify directly).
-                    note_sink
-                        .as_deref_mut()
-                        .map(|s| &mut *s as &mut dyn NoteSink),
-                    recall_source,
-                    memory_source,
-                    Some(prompt_context),
-                    artifact_context,
-                    artifact_sink,
-                    // #263 prompted grants — same reborrow pattern as note_sink.
-                    permission_gate
-                        .as_deref_mut()
-                        .map(|g| &mut *g as &mut dyn PermissionGate),
-                    // #307: the active preset's exec floor (the bypass ceiling).
-                    exec_floor,
-                    // PR4: the injected embedded-git capability (None for headless).
-                    git_tool,
-                    // #479: the injected crew/team orchestration (None for headless).
-                    crew_runner,
-                    scratchpad_store,
-                    code_search,
-                    experience_store,
-                    step_ledger,
-                    tool_offload,
-                    spill_store,
-                    persona_tools,
-                    prompt_disposition,
-                );
-                // If the turn was cancelled mid-tool, `cancellable` returns
-                // None and the dispatch future above is already dropped (its
-                // child reaped via kill_on_drop). Synthesize a cancellation
-                // result so the loop unwinds cleanly on the next `is_cancelled`
-                // check instead of pretending the tool produced output.
-                match cancellable(cancel, dispatch).await {
-                    Some(r) => r,
-                    None => format!("error: {name} interrupted — tool cancelled before completion"),
-                }
+                let Some(result) =
+                    tools::execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
+                        name,
+                        &args,
+                        workspace,
+                        color,
+                        tool_output_lines,
+                        caveats,
+                        mcp,
+                        build_check_cmd.as_deref(),
+                        // Reborrow + re-coerce: shortens the trait-object lifetime to
+                        // this call (Option<&mut dyn _> is invariant, so the longer
+                        // ChatCtx lifetime can't unify directly).
+                        note_sink
+                            .as_deref_mut()
+                            .map(|s| &mut *s as &mut dyn NoteSink),
+                        recall_source,
+                        memory_source,
+                        Some(prompt_context),
+                        artifact_context,
+                        artifact_sink,
+                        // #263 prompted grants — same reborrow pattern as note_sink.
+                        permission_gate
+                            .as_deref_mut()
+                            .map(|g| &mut *g as &mut dyn PermissionGate),
+                        // #307: the active preset's exec floor (the bypass ceiling).
+                        exec_floor,
+                        // PR4: the injected embedded-git capability (None for headless).
+                        git_tool,
+                        // #479: the injected crew/team orchestration (None for headless).
+                        crew_runner,
+                        scratchpad_store,
+                        code_search,
+                        experience_store,
+                        step_ledger,
+                        tool_offload,
+                        spill_store,
+                        persona_tools,
+                        prompt_disposition,
+                        cancel,
+                    )
+                    .await
+                else {
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                };
+                result
             };
             // 17.6: record the call for the turn's events column — args are
             // digested (never stored raw), duration is a display claim.
@@ -4536,10 +4567,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             messages.push(serde_json::json!({ "role": "user", "content": nudge }));
         }
         // Interrupt checkpoint (Esc / Ctrl-C), same contract as the Ollama path:
-        // bail at the round boundary with an empty reply; the caller treats the
-        // turn as abandoned. (The OpenAI path's per-request awaits are not yet
-        // individually raced — round granularity is enough for the opt-in
-        // provider plugin; the Ollama first-class path cancels mid-await.)
+        // bail at the round boundary with an empty reply; tool dispatches below
+        // are also raced so an interrupt can stop a hung command mid-round.
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
@@ -5234,6 +5263,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // Ollama path; Responses uses function_call_output). Counted as a
             // hallucination above first when applicable.
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
+                print_synthetic_tool_result(name, &args, workspace, &steer, color);
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -5267,50 +5297,55 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     input_ceiling_pct as usize,
                     low_budget_pct,
                 );
-                display::print_tool_call("get_context_remaining", "", color);
-                display::print_tool_output(&report, tool_output_lines, color);
+                print_synthetic_tool_result(name, &args, workspace, &report, color);
                 report
             } else {
-                execute_tool_with_offload_and_prompt_and_artifacts(
-                    name,
-                    &args,
-                    workspace,
-                    color,
-                    tool_output_lines,
-                    caveats,
-                    mcp,
-                    build_check_cmd.as_deref(),
-                    // Reborrow + re-coerce: shortens the trait-object lifetime to
-                    // this call (Option<&mut dyn _> is invariant, so the longer
-                    // ChatCtx lifetime can't unify directly).
-                    note_sink
-                        .as_deref_mut()
-                        .map(|s| &mut *s as &mut dyn NoteSink),
-                    recall_source,
-                    memory_source,
-                    Some(prompt_context),
-                    artifact_context,
-                    artifact_sink,
-                    // #263 prompted grants — same reborrow pattern as note_sink.
-                    permission_gate
-                        .as_deref_mut()
-                        .map(|g| &mut *g as &mut dyn PermissionGate),
-                    // #307: the active preset's exec floor (the bypass ceiling).
-                    exec_floor,
-                    // PR4: the injected embedded-git capability (None for headless).
-                    git_tool,
-                    // #479: the injected crew/team orchestration (None for headless).
-                    crew_runner,
-                    scratchpad_store,
-                    code_search,
-                    experience_store,
-                    step_ledger,
-                    tool_offload,
-                    spill_store,
-                    persona_tools,
-                    prompt_disposition,
-                )
-                .await
+                let Some(result) =
+                    tools::execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
+                        name,
+                        &args,
+                        workspace,
+                        color,
+                        tool_output_lines,
+                        caveats,
+                        mcp,
+                        build_check_cmd.as_deref(),
+                        // Reborrow + re-coerce: shortens the trait-object lifetime to
+                        // this call (Option<&mut dyn _> is invariant, so the longer
+                        // ChatCtx lifetime can't unify directly).
+                        note_sink
+                            .as_deref_mut()
+                            .map(|s| &mut *s as &mut dyn NoteSink),
+                        recall_source,
+                        memory_source,
+                        Some(prompt_context),
+                        artifact_context,
+                        artifact_sink,
+                        // #263 prompted grants — same reborrow pattern as note_sink.
+                        permission_gate
+                            .as_deref_mut()
+                            .map(|g| &mut *g as &mut dyn PermissionGate),
+                        // #307: the active preset's exec floor (the bypass ceiling).
+                        exec_floor,
+                        // PR4: the injected embedded-git capability (None for headless).
+                        git_tool,
+                        // #479: the injected crew/team orchestration (None for headless).
+                        crew_runner,
+                        scratchpad_store,
+                        code_search,
+                        experience_store,
+                        step_ledger,
+                        tool_offload,
+                        spill_store,
+                        persona_tools,
+                        prompt_disposition,
+                        cancel,
+                    )
+                    .await
+                else {
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                };
+                result
             };
             if debug {
                 let excerpt: String = result.chars().take(120).collect();
@@ -5849,6 +5884,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // shape: echo a function_call_output with the steer).
             // Counted as a hallucination above first when applicable.
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
+                print_synthetic_tool_result(name, &args, workspace, &steer, color);
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -5878,43 +5914,48 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     input_ceiling_pct as usize,
                     low_budget_pct,
                 );
-                display::print_tool_call("get_context_remaining", "", color);
-                display::print_tool_output(&report, tool_output_lines, color);
+                print_synthetic_tool_result(name, &args, workspace, &report, color);
                 report
             } else {
-                execute_tool_with_offload_and_prompt_and_artifacts(
-                    name,
-                    &args,
-                    workspace,
-                    color,
-                    tool_output_lines,
-                    caveats,
-                    mcp,
-                    build_check_cmd.as_deref(),
-                    note_sink
-                        .as_deref_mut()
-                        .map(|s| &mut *s as &mut dyn NoteSink),
-                    recall_source,
-                    memory_source,
-                    Some(prompt_context),
-                    artifact_context,
-                    artifact_sink,
-                    permission_gate
-                        .as_deref_mut()
-                        .map(|g| &mut *g as &mut dyn PermissionGate),
-                    exec_floor,
-                    git_tool,
-                    crew_runner,
-                    scratchpad_store,
-                    code_search,
-                    experience_store,
-                    step_ledger,
-                    tool_offload,
-                    spill_store,
-                    persona_tools,
-                    prompt_disposition,
-                )
-                .await
+                let Some(result) =
+                    tools::execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
+                        name,
+                        &args,
+                        workspace,
+                        color,
+                        tool_output_lines,
+                        caveats,
+                        mcp,
+                        build_check_cmd.as_deref(),
+                        note_sink
+                            .as_deref_mut()
+                            .map(|s| &mut *s as &mut dyn NoteSink),
+                        recall_source,
+                        memory_source,
+                        Some(prompt_context),
+                        artifact_context,
+                        artifact_sink,
+                        permission_gate
+                            .as_deref_mut()
+                            .map(|g| &mut *g as &mut dyn PermissionGate),
+                        exec_floor,
+                        git_tool,
+                        crew_runner,
+                        scratchpad_store,
+                        code_search,
+                        experience_store,
+                        step_ledger,
+                        tool_offload,
+                        spill_store,
+                        persona_tools,
+                        prompt_disposition,
+                        cancel,
+                    )
+                    .await
+                else {
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                };
+                result
             };
             if debug {
                 let excerpt: String = result.chars().take(120).collect();
@@ -6269,6 +6310,48 @@ async fn stream_response(
 #[cfg(test)]
 mod repeat_call_guard_tests {
     use super::*;
+
+    #[test]
+    fn loop_owned_tool_results_share_one_complete_spill_block() {
+        let mut repeated = Vec::new();
+        {
+            let mut display = display::ToolDisplay::new(&mut repeated, false, 80, 3);
+            present_synthetic_tool_result(
+                &mut display,
+                "find",
+                &serde_json::json!({"path": ".", "name": "*.rs", "type": "f"}),
+                std::path::Path::new("."),
+                "a.rs\nb.rs\nc.rs\nd.rs",
+            );
+        }
+        assert_eq!(
+            String::from_utf8(repeated).unwrap(),
+            "⚙  find: . (name=*.rs, type=f)\n\
+             ▲ 1 more lines above\n\
+             ▒ b.rs\n\
+             ▒ c.rs\n\
+             ▓ d.rs\n\
+             …\n"
+        );
+
+        let mut budget = Vec::new();
+        {
+            let mut display = display::ToolDisplay::new(&mut budget, false, 80, 3);
+            present_synthetic_tool_result(
+                &mut display,
+                "tokens_left",
+                &serde_json::json!({}),
+                std::path::Path::new("."),
+                "context budget: 75% remaining",
+            );
+        }
+        assert_eq!(
+            String::from_utf8(budget).unwrap(),
+            "⚙  get_context_remaining: \n\
+             ▒ context budget: 75% remaining\n\
+             …\n"
+        );
+    }
 
     #[test]
     fn short_circuits_exact_repeat_and_escalates() {

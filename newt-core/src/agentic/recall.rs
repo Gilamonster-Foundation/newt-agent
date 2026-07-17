@@ -16,7 +16,6 @@
 //! recaps), and the 17.3 sanitizer pre-flight so a query of pure
 //! operators comes back as coaching, never as a loop-aborting error.
 
-use super::display::{print_tool_call, print_tool_output};
 use crate::store::SearchHit;
 
 /// Default hit count when the model omits `limit`.
@@ -222,8 +221,8 @@ pub fn recall_tool_definition() -> serde_json::Value {
 pub(crate) fn execute_recall(
     args: &serde_json::Value,
     source: &dyn RecallSource,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let query = args["query"].as_str().unwrap_or("").trim();
     // Absent / non-integer limit → default; present → clamped to [1, max].
@@ -236,8 +235,6 @@ pub(crate) fn execute_recall(
         })
         .unwrap_or(RECALL_DEFAULT_LIMIT);
 
-    print_tool_call("recall", query, color);
-
     if query.is_empty() {
         return "error: recall requires `query` — plain keywords describing what to find"
             .to_string();
@@ -249,7 +246,6 @@ pub(crate) fn execute_recall(
             "no searchable terms in {query:?} — every term was search syntax or \
              punctuation; try plain keywords (e.g. 'tokio panic retry')"
         );
-        print_tool_output(&out, tool_output_lines, color);
         return out;
     }
 
@@ -267,7 +263,6 @@ pub(crate) fn execute_recall(
             "no matches in past conversations for {query:?} — try different keywords. \
              To recover THIS conversation's own earlier work, call resume_context."
         );
-        print_tool_output(&out, tool_output_lines, color);
         return out;
     }
 
@@ -290,7 +285,6 @@ pub(crate) fn execute_recall(
             readable_snippet(&hit.snippet),
         ));
     }
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 

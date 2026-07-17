@@ -9,7 +9,7 @@ use crossterm::{
     execute,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
 };
-use std::io::{self, Write as _};
+use std::io::{self, Write};
 
 /// The newt logo orange as a crossterm color (matches the TUI splash).
 pub const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
@@ -417,56 +417,28 @@ pub(crate) fn print_retry_indicator(attempt: u32, delay: std::time::Duration, co
     io::stdout().flush().ok();
 }
 
-/// Print a tool-call header so the user can see what the agent is doing.
-pub(crate) fn print_tool_call(name: &str, detail: &str, color: bool) {
+fn tool_call_lines(name: &str, detail: &str, cols: usize) -> Vec<String> {
     // #1153: WORD-WRAP the full detail across as many lines as it needs — the
     // operator must be able to audit exactly what command/path ran, so the
     // command is never truncated with `…`. Continuation lines are indented to
     // align under the detail. Keep the "⚙  {name}: " prefix whole (it's short).
-    let cols = term_cols();
     let prefix_w = 3 + name.chars().count() + 2; // "⚙  " + name + ": "
     let detail_w = cols.saturating_sub(prefix_w).max(8);
     let wrapped = wrap_to_width(detail, detail_w);
     let indent = " ".repeat(prefix_w);
-    if color {
-        for (i, line) in wrapped.iter().enumerate() {
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
             if i == 0 {
-                execute!(
-                    io::stdout(),
-                    SetForegroundColor(NEWT_ORANGE_CT),
-                    Print(format!("⚙  {name}")),
-                    ResetColor,
-                    SetForegroundColor(CtColor::DarkGrey),
-                    Print(format!(": {line}")),
-                    ResetColor,
-                    Print("\n"),
-                )
-                .ok();
+                format!("⚙  {name}: {line}")
             } else {
-                execute!(
-                    io::stdout(),
-                    SetForegroundColor(CtColor::DarkGrey),
-                    Print(format!("{indent}{line}")),
-                    ResetColor,
-                    Print("\n"),
-                )
-                .ok();
+                format!("{indent}{line}")
             }
-        }
-    } else {
-        for (i, line) in wrapped.iter().enumerate() {
-            if i == 0 {
-                println!("⚙  {name}: {line}");
-            } else {
-                println!("{indent}{line}");
-            }
-        }
-    }
-    io::stdout().flush().ok();
+        })
+        .collect()
 }
 
-/// Print tool output truncated to the configured line limit.
-/// The model always receives the full content regardless.
 /// #1235: the SPILL VIEW — a bounded, TAIL-biased rendering of completed
 /// tool output. Pure: returns the exact lines to print (gutter glyphs
 /// included) so the unit tier tests the geometry without a terminal.
@@ -476,10 +448,10 @@ pub(crate) fn print_tool_call(name: &str, detail: &str, color: bool) {
 /// overflows, the LAST `view` lines are shown (the tail is where grep hits
 /// and errors live), the `▲` boundary line carries the hidden count, and the
 /// `▓` thumb marks the tail position. `view == 0` means unbounded (no gutter
-/// — the raw historical behavior). This is the completion-time "first round
-/// fix"; the live tail-follow variant is gated on a superseding decision doc
-/// (plain_scroller_tui.md bans multi-line redraws) and a streaming dispatch
-/// seam — see #1235 for the ladder.
+/// — the raw historical behavior). This is the completion-time foundation;
+/// live tail-follow and interactive scrolling are gated on a superseding
+/// decision doc (plain_scroller_tui.md bans multi-line redraws) plus a streaming
+/// dispatch seam — see #1235 for the ladder.
 /// #1235: the resolved spill-view height — a process-wide knob following the
 /// `output_budget` atomics precedent (set at per-turn config resolve, read at
 /// the display site) so the value reaches the shell echo without threading a
@@ -523,94 +495,163 @@ pub(crate) fn spill_view_lines(output: &str, view: usize) -> Vec<String> {
     out
 }
 
-/// Print the #1235 spill view dim, one line at a time (scrolled lines only —
-/// no repaint, no region; the plain-scroller doctrine's happy path).
-pub(crate) fn print_spill_view(output: &str, view: usize, color: bool) {
-    if output.is_empty() {
-        return;
-    }
-    let rendered = spill_view_lines(output, view).join("\n");
-    if color {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(CtColor::DarkGrey),
-            Print(format!("{rendered}\n")),
-            ResetColor,
-        )
-        .ok();
-    } else {
-        println!("{rendered}");
-    }
-    io::stdout().flush().ok();
+/// Injected writer for one tool's operator-facing audit block. Production uses
+/// stdout; tests use a `Vec<u8>` so dispatcher routing can be verified without
+/// process-wide fd redirection.
+pub(crate) struct ToolDisplay<W: Write> {
+    writer: W,
+    color: bool,
+    cols: usize,
+    spill_lines: usize,
+    result_override: Option<String>,
 }
 
-pub(crate) fn print_tool_output(output: &str, max_lines: usize, color: bool) {
-    if output.is_empty() {
-        return;
-    }
-    let max = max_lines;
-    let lines: Vec<&str> = output.lines().collect();
-    let shown = if max == 0 {
-        lines.len()
-    } else {
-        lines.len().min(max)
-    };
-    let hidden = lines.len().saturating_sub(shown);
-
-    let display = lines[..shown].join("\n");
-
-    if color {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(CtColor::DarkGrey),
-            Print(format!("{display}\n")),
-            ResetColor,
-        )
-        .ok();
-    } else {
-        println!("{display}");
+impl<W: Write> ToolDisplay<W> {
+    pub(crate) fn new(writer: W, color: bool, cols: usize, spill_lines: usize) -> Self {
+        Self {
+            writer,
+            color,
+            cols,
+            spill_lines,
+            result_override: None,
+        }
     }
 
-    if hidden > 0 {
-        // Just print the count and keep going — no blocking prompt.
-        // The user can scroll back; the model always gets the full content.
-        if color {
+    pub(crate) fn call(&mut self, name: &str, detail: &str) {
+        let lines = tool_call_lines(name, detail, self.cols);
+        for (i, line) in lines.iter().enumerate() {
+            if self.color {
+                if i == 0 {
+                    let prefix = format!("⚙  {name}");
+                    let suffix = line.strip_prefix(&prefix).unwrap_or(line);
+                    execute!(
+                        &mut self.writer,
+                        SetForegroundColor(NEWT_ORANGE_CT),
+                        Print(prefix),
+                        ResetColor,
+                        SetForegroundColor(CtColor::DarkGrey),
+                        Print(suffix),
+                        ResetColor,
+                        Print("\n"),
+                    )
+                    .ok();
+                } else {
+                    execute!(
+                        &mut self.writer,
+                        SetForegroundColor(CtColor::DarkGrey),
+                        Print(line),
+                        ResetColor,
+                        Print("\n"),
+                    )
+                    .ok();
+                }
+            } else {
+                writeln!(&mut self.writer, "{line}").ok();
+            }
+        }
+        self.writer.flush().ok();
+    }
+
+    pub(crate) fn result(&mut self, output: &str) {
+        let overridden = self.result_override.take();
+        let output = overridden.as_deref().unwrap_or(output);
+        let output = if output.trim().is_empty() {
+            "(no output)"
+        } else {
+            output
+        };
+        let rendered = spill_view_lines(output, self.spill_lines).join("\n");
+        if self.color {
             execute!(
-                io::stdout(),
+                &mut self.writer,
                 SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("  … ({hidden} more lines hidden)\n")),
+                Print(format!("{rendered}\n")),
                 ResetColor,
             )
             .ok();
         } else {
-            println!("  … ({hidden} more lines hidden)");
+            writeln!(&mut self.writer, "{rendered}").ok();
         }
+        self.writer.flush().ok();
     }
-    io::stdout().flush().ok();
+
+    #[cfg(test)]
+    pub(crate) fn into_inner(self) -> W {
+        self.writer
+    }
 }
 
-/// Print a capability-denial notice to the user.
-pub(crate) fn print_denied(axis: &str, target: &str, color: bool) {
-    if color {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(CtColor::DarkGrey),
-            Print(format!(
-                "⊘  capability denied: {axis} does not permit '{target}'\n"
-            )),
-            ResetColor,
-        )
-        .ok();
-    } else {
-        println!("⊘  capability denied: {axis} does not permit '{target}'");
+/// Non-final presentation events available to the execution layer. Header and
+/// completed-result rendering are intentionally absent: the outer dispatcher
+/// owns those exactly once for every return path.
+pub(crate) trait ToolPresentation: Send {
+    fn preview(&mut self, output: &str, max_lines: usize);
+    fn document(&mut self, output: &str);
+    fn override_result(&mut self, output: String);
+}
+
+impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
+    fn preview(&mut self, output: &str, max_lines: usize) {
+        let lines: Vec<&str> = output.lines().collect();
+        let shown = if max_lines == 0 {
+            lines.len()
+        } else {
+            lines.len().min(max_lines)
+        };
+        let mut rendered = lines[..shown].join("\n");
+        let hidden = lines.len().saturating_sub(shown);
+        if hidden > 0 {
+            if !rendered.is_empty() {
+                rendered.push('\n');
+            }
+            rendered.push_str(&format!("  … ({hidden} more lines hidden)"));
+        }
+        if rendered.is_empty() {
+            return;
+        }
+        if self.color {
+            execute!(
+                &mut self.writer,
+                SetForegroundColor(CtColor::DarkGrey),
+                Print(format!("{rendered}\n")),
+                ResetColor,
+            )
+            .ok();
+        } else {
+            writeln!(&mut self.writer, "{rendered}").ok();
+        }
+        self.writer.flush().ok();
     }
-    io::stdout().flush().ok();
+
+    fn document(&mut self, output: &str) {
+        writeln!(&mut self.writer, "{output}").ok();
+        self.writer.flush().ok();
+    }
+
+    fn override_result(&mut self, output: String) {
+        self.result_override = Some(output);
+    }
+}
+
+/// Print a tool-call header so the user can see what the agent is doing.
+#[cfg(test)]
+pub(crate) fn print_tool_call(name: &str, detail: &str, color: bool) {
+    ToolDisplay::new(io::stdout(), color, term_cols(), spill_lines()).call(name, detail);
+}
+
+/// Print completed tool output using the universal #1235 spill height. The
+/// legacy `tool_output_lines` argument remains in compatibility signatures but
+/// no longer overrides `[tui].spill_lines`.
+#[cfg(test)]
+pub(crate) fn print_tool_output(output: &str, _tool_output_lines: usize, color: bool) {
+    ToolDisplay::new(io::stdout(), color, term_cols(), spill_lines()).result(output);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         fit_line, fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_view_lines,
+        tool_call_lines,
     };
 
     /// #1235: the spill view is TAIL-biased with the issue's gutter glyphs —
@@ -635,6 +676,26 @@ mod tests {
         assert_eq!(spill_view_lines("x\ny", 0), vec!["x", "y"]);
         // Empty: nothing.
         assert!(spill_view_lines("", 3).is_empty());
+    }
+
+    #[test]
+    fn completed_tool_output_uses_the_spill_view() {
+        let output = "l1\nl2\nl3\nl4\nl5";
+
+        assert_eq!(
+            spill_view_lines(output, 3),
+            vec!["▲ 2 more lines above", "▒ l3", "▒ l4", "▓ l5", "…"]
+        );
+        let raw: Vec<String> = output.lines().map(str::to_string).collect();
+        assert_eq!(spill_view_lines(output, 0), raw);
+    }
+
+    #[test]
+    fn tool_call_lines_wrap_without_losing_the_command() {
+        assert_eq!(
+            tool_call_lines("find", ". (name=*.rs, type=f)", 80),
+            vec!["⚙  find: . (name=*.rs, type=f)"]
+        );
     }
 
     #[test]

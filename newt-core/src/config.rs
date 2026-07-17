@@ -1488,16 +1488,17 @@ pub struct TuiConfig {
     #[serde(default)]
     pub thinking: ThinkingMode,
 
-    /// Maximum lines of tool output shown inline before offering "show all?".
-    /// Default: 20. Set to 0 to always show everything.
+    /// Legacy line limit retained for pre-execution previews such as
+    /// `write_file`. Completed tool results use `[tui].spill_lines` instead.
+    /// Default: 20. Set to 0 to show the full preview.
     #[serde(default = "default_tool_output_lines")]
     pub tool_output_lines: usize,
 
-    /// #1235: height of the shell-output SPILL VIEW — the tail-biased,
-    /// gutter-glyphed rendering of a completed `run_command`'s output
-    /// (▲ hidden-count / ▒▓ gutter / … end marker). Default: 3. Set to 0 to
-    /// show everything raw. Distinct from `tool_output_lines`, which caps the
-    /// head-only echo of NON-shell tool output.
+    /// #1235: height of every completed tool's SPILL VIEW — the tail-biased,
+    /// gutter-glyphed result block following its `⚙` audit line (▲ hidden-count
+    /// / ▒▓ gutter / … end marker). Default: 3. Set to 0 to show everything
+    /// raw. This is the authoritative completed-result height; the legacy
+    /// `tool_output_lines` preview setting does not override it.
     #[serde(default = "default_spill_lines")]
     pub spill_lines: usize,
 

@@ -2,16 +2,16 @@
 //! Moved verbatim from `newt-tui` in Step 9.7 — the Caveats enforcement,
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 
-use super::artifact_read::{execute_artifact_read, ArtifactReadContext};
+use super::artifact_read::{execute_artifact_read_silent, ArtifactReadContext};
 use super::crew_tool::CrewRunner;
-use super::display::{print_denied, print_tool_call, print_tool_output};
+use super::display::{ToolDisplay, ToolPresentation};
 use super::git_tool::GitTool;
 use super::mcp::McpTools;
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use super::prompt_intake::PromptDisposition;
-use super::prompt_read::{execute_prompt_read, PromptReadContext};
+use super::prompt_read::{execute_prompt_read_silent, PromptReadContext};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
 use super::spill::{self, SpillStore};
@@ -480,8 +480,8 @@ fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) 
 /// the venv env seam, the `--disable-ocap` host bypass under the #307 exec
 /// floor, the agent-bridle confined shell, and the #263 permission-gate re-ask —
 /// and render the envelope. Shared by the `run_command` and `lifecycle` (#891)
-/// arms so both honor **identical** exec caveats; the caller prints the
-/// tool-call line first.
+/// arms so both honor **identical** exec caveats; the central presenter owns
+/// the tool-call and completed-result block.
 #[allow(clippy::too_many_arguments)]
 async fn exec_confined_command(
     cmd: &str,
@@ -495,6 +495,7 @@ async fn exec_confined_command(
     permission_gate: Option<&mut dyn PermissionGate>,
     tool_offload: bool,
     spill_store: Option<&dyn SpillStore>,
+    presentation: &mut dyn ToolPresentation,
 ) -> String {
     // Venv injection (#783): the confined shell carries the venv via
     // agent-bridle's structured `env` seam (see `confined_dispatch_args` /
@@ -529,6 +530,7 @@ async fn exec_confined_command(
                 color,
                 tool_offload,
                 spill_store,
+                Some(&mut *presentation),
             ),
             Err(e) => format!("error: {e}"),
         };
@@ -575,6 +577,7 @@ async fn exec_confined_command(
                                 color,
                                 tool_offload,
                                 spill_store,
+                                Some(&mut *presentation),
                             ),
                             Err(e) => format!("error: {e}"),
                         };
@@ -589,6 +592,7 @@ async fn exec_confined_command(
             color,
             tool_offload,
             spill_store,
+            Some(&mut *presentation),
         ),
         // An argv-mode leash denial, or an error from inside the tool — surface
         // the reason; the dispatch error Display is safe to show.
@@ -1066,10 +1070,10 @@ fn denied_fs_result(kind: &str, path: &str) -> String {
 ///
 /// 1. The bare denial `reason` (a full sentence from the leash, e.g.
 ///    `exec of "export" is not within the granted authority`) is NO LONGER
-///    stuffed into [`print_denied`]'s bare `'{target}'` slot. Doing so produced
+///    stuffed into the old `print_denied` bare `'{target}'` slot. Doing so produced
 ///    the garbled `capability denied: exec does not permit '<whole reason
 ///    sentence> - add it via …>'` — a denial sentence nested inside another.
-///    [`print_denied`] now receives only the BARE command target, matching its
+///    That notice path received only the BARE command target, matching its
 ///    `{axis} does not permit '{target}'` contract (the same shape the fs path
 ///    uses via [`denied_fs_result`]).
 /// 2. The stale `extra_exec` config hint is gone from the model-facing message.
@@ -1080,15 +1084,7 @@ fn denied_fs_result(kind: &str, path: &str) -> String {
 ///
 /// The #263 prompt path still falls back here on deny (and on a second denial
 /// after a re-execution).
-fn denied_run_command_result(envelope: &serde_json::Value, color: bool) -> String {
-    // Human transcript NOTICE: the bare denied command(s), never the reason
-    // sentence (stuffing a sentence into print_denied's `'{target}'` slot was
-    // the garble — see #775 above).
-    print_denied(
-        denial_axis_label(envelope),
-        &exec_denial_target_label(envelope),
-        color,
-    );
+fn denied_run_command_result(envelope: &serde_json::Value, _color: bool) -> String {
     // Model-facing message: composed exactly once — and it names the exact
     // recovery call (#1160), since the envelope carries axis + target.
     format!(
@@ -1105,7 +1101,7 @@ fn denied_run_command_result(envelope: &serde_json::Value, color: bool) -> Strin
 /// the leash refused, NEVER the reason sentence. Joins multiple targets with
 /// `, `; falls back to a generic label so the notice always prints one clean
 /// `{axis} does not permit '{target}'` line. (#775 — restores
-/// [`print_denied`]'s bare-`'{target}'` contract.)
+/// the former denial notice's bare-`'{target}'` contract.)
 fn exec_denial_target_label(envelope: &serde_json::Value) -> String {
     let targets: Vec<&str> = envelope
         .get("denials")
@@ -1124,15 +1120,16 @@ fn exec_denial_target_label(envelope: &serde_json::Value) -> String {
     }
 }
 
-/// The standard `run_command` success path: print + return stdout/stderr,
-/// or `(exit N)` when the command produced no output. Factored verbatim so
+/// The standard `run_command` success path: return stdout/stderr, or `(exit N)`
+/// when the command produced no output. Factored verbatim so
 /// the #263 re-execution path shares one formatter with the first dispatch.
 fn shell_envelope_output(
     envelope: &serde_json::Value,
-    tool_output_lines: usize,
-    color: bool,
+    _tool_output_lines: usize,
+    _color: bool,
     tool_offload: bool,
     spill_store: Option<&dyn SpillStore>,
+    presentation: Option<&mut dyn ToolPresentation>,
 ) -> String {
     let stdout = envelope
         .get("stdout")
@@ -1143,12 +1140,6 @@ fn shell_envelope_output(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let out = format!("{stdout}{stderr}");
-    // DISPLAY path (#1235): shell output renders as the tail-biased SPILL
-    // VIEW (▲/▒▓/… gutter, `[tui] spill_lines` high, default 3) — grep hits
-    // and errors live at the END of output, and unbounded dim dumps fill
-    // operator attention. `tool_output_lines` keeps governing non-shell echo.
-    let _ = tool_output_lines;
-    super::display::print_spill_view(&out, super::display::spill_lines(), color);
     if out.trim().is_empty() {
         let code = envelope
             .get("exit_code")
@@ -1156,6 +1147,11 @@ fn shell_envelope_output(
             .unwrap_or(-1);
         format!("(exit {code})")
     } else {
+        // The terminal follows the full output tail even when the model-facing
+        // payload below is token-capped or replaced by a spill handle.
+        if let Some(presentation) = presentation {
+            presentation.override_result(out.clone());
+        }
         // #726/#945: the MODEL-facing payload is capped by the shared TOKEN
         // budget using head+tail. When tool_offload is on, spill the FULL
         // redacted output before capping so the true tail and elided middle stay
@@ -1449,28 +1445,22 @@ fn parse_capability(s: &str) -> Option<DenialKind> {
 fn execute_request_permissions(
     args: &serde_json::Value,
     gate: Option<&mut dyn PermissionGate>,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
     let reason = args["reason"].as_str().unwrap_or("").trim();
-    print_tool_call("request_permissions", capability, color);
-
     let Some(kind) = parse_capability(capability) else {
-        let out = format!(
+        return format!(
             "request_permissions: unknown capability '{capability}'. Use one of: \
              exec, fs_read, fs_write, net."
         );
-        print_tool_output(&out, tool_output_lines, color);
-        return out;
     };
     if target.is_empty() {
-        let out = "request_permissions: 'target' is required — the command name (exec), \
+        return "request_permissions: 'target' is required — the command name (exec), \
                    the path (fs_read/fs_write), or the host (net)."
             .to_string();
-        print_tool_output(&out, tool_output_lines, color);
-        return out;
     }
 
     let request = PermissionRequest {
@@ -1509,7 +1499,6 @@ fn execute_request_permissions(
              take a different approach for now."
         ),
     };
-    print_tool_output(&out, tool_output_lines, color);
     out
 }
 
@@ -1535,29 +1524,24 @@ const HEADLESS_NO_HUMAN: &str = "no human available this session (running headle
 fn execute_request_user_input(
     args: &serde_json::Value,
     gate: Option<&mut dyn PermissionGate>,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let question = args["question"].as_str().unwrap_or("").trim();
-    print_tool_call("request_user_input", question, color);
 
     if question.is_empty() {
-        let out = "request_user_input: 'question' is required — the free-text \
+        return "request_user_input: 'question' is required — the free-text \
                    question to ask the human."
             .to_string();
-        print_tool_output(&out, tool_output_lines, color);
-        return out;
     }
 
     // `Some(answer)` from the gate → return it verbatim; a `None` gate (headless)
     // OR an `ask_question` that returns `None` (no human to consult) → the
     // recoverable headless message. Either way we never block without an answer.
-    let out = match gate.and_then(|g| g.ask_question(question)) {
+    match gate.and_then(|g| g.ask_question(question)) {
         Some(answer) => answer,
         None => HEADLESS_NO_HUMAN.to_string(),
-    };
-    print_tool_output(&out, tool_output_lines, color);
-    out
+    }
 }
 
 /// Best-effort host extraction for the #263 net pre-check. This only gates
@@ -1638,6 +1622,146 @@ fn find_detail(path: &str, opts: &FindOpts) -> String {
     } else {
         format!("{path} ({})", parts.join(", "))
     }
+}
+
+fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
+    FindOpts {
+        name: args["name"].as_str(),
+        type_filter: match args["type"].as_str() {
+            Some("f") => FindType::Files,
+            Some("d") => FindType::Dirs,
+            _ => FindType::Any,
+        },
+        max_depth: args["max_depth"].as_u64().map(|d| d as usize),
+        max_results: args["max_results"]
+            .as_u64()
+            .map(|m| m as usize)
+            .unwrap_or(1000),
+        respect_gitignore: args["respect_gitignore"].as_bool().unwrap_or(true),
+        case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
+    }
+}
+
+/// Stable detail for the universal tool audit header. This is deliberately
+/// value-aware for known tools, so content-bearing arguments are summarized
+/// instead of copied into the terminal transcript.
+fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path::Path) -> String {
+    let string = |key: &str, default: &str| {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(default)
+            .to_string()
+    };
+    match name {
+        "run_command" => string("command", ""),
+        "write_file" => {
+            let path = string("path", "");
+            let bytes = args["content"].as_str().unwrap_or("").len();
+            format!("{path} ({bytes} bytes)")
+        }
+        "read_file" | "edit_file" | "delete_file" => string("path", ""),
+        "list_dir" => string("path", "."),
+        "find" => {
+            let path = args["path"].as_str().unwrap_or(".");
+            find_detail(path, &find_opts_from_args(args))
+        }
+        "use_skill" => string("name", ""),
+        "web_fetch" => string("url", ""),
+        "request_permissions" => string("capability", ""),
+        "request_user_input" => string("question", ""),
+        "prompt_read" | "artifact_read" => string("address", "current"),
+        "tool_search" | "recall" | "code_search" | "experience_recall" => string("query", ""),
+        "memory_fetch" => string("address", ""),
+        "save_note" => string("action", ""),
+        "git" => string("op", ""),
+        "state_set" | "state_get" => string("key", ""),
+        "experience_record" => string("task", ""),
+        "lifecycle" => {
+            let phase = string("phase", "");
+            let action = string("action", "run");
+            let resolved = crate::tooling::Phase::from_key(&phase)
+                .map(|phase| crate::tooling::resolved_phase_commands(workspace, phase))
+                .unwrap_or_default();
+            if resolved.is_empty() {
+                format!("{phase} ({action})")
+            } else {
+                format!("{phase} ({action}) → {}", resolved.join(" && "))
+            }
+        }
+        "render_report" => string("title", ""),
+        "resume_context"
+        | "state_clear"
+        | "update_plan"
+        | "plan_get"
+        | "get_context_remaining"
+        | "enter_plan_mode"
+        | "exit_plan_mode" => String::new(),
+        _ => args.to_string(),
+    }
+}
+
+fn correction_alias_detail(args: &serde_json::Value) -> String {
+    if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
+        if let Some(content) = args.get("content").and_then(serde_json::Value::as_str) {
+            return format!("{path} ({} bytes)", content.len());
+        }
+        let mut sizes = Vec::new();
+        for key in ["old_string", "new_string"] {
+            if let Some(value) = args.get(key).and_then(serde_json::Value::as_str) {
+                sizes.push(format!("{key}={} bytes", value.len()));
+            }
+        }
+        if sizes.is_empty() {
+            return path.to_string();
+        }
+        return format!("{path} ({})", sizes.join(", "));
+    }
+    let keys = args
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if keys.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("arguments: {}", keys.join(", "))
+    }
+}
+
+/// Resolve the operator-facing name and detail before execution while keeping
+/// the executor's raw-name security checks intact. Transparent aliases and
+/// shell reads use the canonical governed tool; corrective aliases retain the
+/// attempted name but never echo content-bearing values.
+pub(crate) fn tool_presentation(
+    raw_name: &str,
+    raw_args: &serde_json::Value,
+    workspace: &std::path::Path,
+) -> (String, String) {
+    let (name, correction) = match resolve_tool_alias(raw_name) {
+        Some(AliasOutcome::Rewrite(canonical)) => (canonical, false),
+        Some(AliasOutcome::Correct(_)) => (raw_name, true),
+        None => (raw_name, false),
+    };
+    if correction {
+        return (name.to_string(), correction_alias_detail(raw_args));
+    }
+
+    if name == "run_command" && !routing_disabled() {
+        let command = raw_args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if let super::routing::RouteDecision::Route { tool, args } =
+            super::routing::RouteTable::builtin().classify(command)
+        {
+            let detail = tool_call_detail(tool, &args, workspace);
+            return (tool.to_string(), detail);
+        }
+    }
+
+    (
+        name.to_string(),
+        tool_call_detail(name, raw_args, workspace),
+    )
 }
 
 /// Translate a shell-style basename glob (`*`, `?`) into an anchored regex.
@@ -1959,8 +2083,8 @@ fn record_governed_file_change(
     operation: &'static str,
     before: Option<super::artifact_hooks::ArtifactFileState>,
     after: super::artifact_hooks::ArtifactFileState,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let (Some(sink), Some(context), Some(before)) = (sink, context, before) else {
         return String::new();
@@ -1969,7 +2093,6 @@ fn record_governed_file_change(
         Ok(_) => String::new(),
         Err(error) => {
             let warning = format!("warning: failed to record file-change artifact: {error}");
-            print_tool_output(&warning, tool_output_lines, color);
             format!("\n{warning}")
         }
     }
@@ -1978,12 +2101,11 @@ fn record_governed_file_change(
 fn artifact_postcondition_warning(
     path: &str,
     detail: &str,
-    color: bool,
-    tool_output_lines: usize,
+    _color: bool,
+    _tool_output_lines: usize,
 ) -> String {
     let warning =
         format!("warning: {path} changed, but no file-change artifact was recorded: {detail}");
-    print_tool_output(&warning, tool_output_lines, color);
     format!("\n{warning}")
 }
 
@@ -2171,6 +2293,236 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     prompt_context: Option<PromptReadContext<'_>>,
     artifact_context: Option<ArtifactReadContext<'_>>,
     artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
+    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    persona_tools: Option<&[String]>,
+    disposition: PromptDisposition,
+) -> String {
+    execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        build_check_cmd,
+        note_sink,
+        recall_source,
+        memory_source,
+        prompt_context,
+        artifact_context,
+        artifact_sink,
+        permission_gate,
+        exec_floor,
+        git_tool,
+        crew_runner,
+        scratchpad_store,
+        code_search,
+        experience_store,
+        step_ledger,
+        tool_offload,
+        spill_store,
+        persona_tools,
+        disposition,
+        None,
+    )
+    .await
+    .expect("tool execution without a cancellation flag cannot be interrupted")
+}
+
+/// Cancellation-aware loop entry point. The header is written synchronously
+/// before the cancel-first race begins; an already-set interrupt therefore
+/// closes a complete audit block without ever polling the tool body.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
+    prompt_context: Option<PromptReadContext<'_>>,
+    artifact_context: Option<ArtifactReadContext<'_>>,
+    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
+    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    persona_tools: Option<&[String]>,
+    disposition: PromptDisposition,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<String> {
+    let mut display = ToolDisplay::new(
+        std::io::stdout(),
+        color,
+        super::display::term_cols(),
+        super::display::spill_lines(),
+    );
+    execute_tool_with_display_cancellable(
+        &mut display,
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        build_check_cmd,
+        note_sink,
+        recall_source,
+        memory_source,
+        prompt_context,
+        artifact_context,
+        artifact_sink,
+        permission_gate,
+        exec_floor,
+        git_tool,
+        crew_runner,
+        scratchpad_store,
+        code_search,
+        experience_store,
+        step_ledger,
+        tool_offload,
+        spill_store,
+        persona_tools,
+        disposition,
+        cancel,
+    )
+    .await
+}
+
+async fn wait_for_tool_cancellation(cancel: Option<&std::sync::atomic::AtomicBool>) {
+    match cancel {
+        None => std::future::pending::<()>().await,
+        Some(flag) => {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
+    display: &mut ToolDisplay<W>,
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
+    prompt_context: Option<PromptReadContext<'_>>,
+    artifact_context: Option<ArtifactReadContext<'_>>,
+    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
+    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    persona_tools: Option<&[String]>,
+    disposition: PromptDisposition,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<String> {
+    let (presentation_name, presentation_detail) =
+        tool_presentation(name, args, std::path::Path::new(workspace));
+    display.call(&presentation_name, &presentation_detail);
+    let result = {
+        let execution = execute_tool_inner(
+            display,
+            name,
+            args,
+            workspace,
+            color,
+            tool_output_lines,
+            caveats,
+            mcp,
+            build_check_cmd,
+            note_sink,
+            recall_source,
+            memory_source,
+            prompt_context,
+            artifact_context,
+            artifact_sink,
+            permission_gate,
+            exec_floor,
+            git_tool,
+            crew_runner,
+            scratchpad_store,
+            code_search,
+            experience_store,
+            step_ledger,
+            tool_offload,
+            spill_store,
+            persona_tools,
+            disposition,
+        );
+        tokio::pin!(execution);
+        tokio::select! {
+            biased;
+            _ = wait_for_tool_cancellation(cancel) => None,
+            result = &mut execution => Some(result),
+        }
+    };
+    match result {
+        Some(result) => {
+            display.result(&result);
+            Some(result)
+        }
+        None => {
+            let result = format!("error: {name} interrupted — tool cancelled before completion");
+            display.result(&result);
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_inner(
+    presentation: &mut dyn ToolPresentation,
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
+    prompt_context: Option<PromptReadContext<'_>>,
+    artifact_context: Option<ArtifactReadContext<'_>>,
+    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
     mut permission_gate: Option<&mut dyn PermissionGate>,
     exec_floor: Option<&crate::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
@@ -2199,8 +2551,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     // there is no safe way to infer a remote tool's authority from its name.
     if !tool_allowed(disposition, name) {
         let msg = disposition_tool_denied_message(disposition, name);
-        print_tool_call(name, &args.to_string(), color);
-        print_tool_output(&msg, tool_output_lines, color);
         return msg;
     }
 
@@ -2222,8 +2572,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     // past — and only the exec TARGET is matched, so the same words quoted in a
     // coach's question or a runbook note are untouched.
     if let Some(denied) = super::deny::deny_check(name, args) {
-        print_tool_call(name, &args.to_string(), color);
-        print_tool_output(&denied.reason, tool_output_lines, color);
         return denied.reason;
     }
 
@@ -2244,8 +2592,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         };
         if !persona_tool_allowed(canonical, allow) && !mcp.handles(name) {
             let msg = persona_tool_denied_message(canonical);
-            print_tool_call(name, &args.to_string(), color);
-            print_tool_output(&msg, tool_output_lines, color);
             return msg;
         }
     }
@@ -2281,15 +2627,11 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 };
                 if !granted {
                     let msg = persona_tool_denied_message(name);
-                    print_tool_call(name, &args.to_string(), color);
-                    print_tool_output(&msg, tool_output_lines, color);
                     return msg;
                 }
             }
         }
-        print_tool_call(name, &args.to_string(), color);
         let out = mcp.call(name, args).await;
-        print_tool_output(&out, tool_output_lines, color);
         return out;
     }
 
@@ -2344,7 +2686,11 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         // a conversation-fenced source; headless callers pass an ephemeral
         // context and still recover the exact active task text.
         "prompt_read" => match prompt_context {
-            Some(context) => execute_prompt_read(args, context, color, tool_output_lines),
+            Some(context) => {
+                let output = execute_prompt_read_silent(args, context);
+                presentation.override_result(output.display);
+                output.model
+            }
             None => "prompt_read error: no active prompt context in this session".to_string(),
         },
 
@@ -2352,7 +2698,11 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         // only harness-owned prompt ids and an already conversation/workspace-
         // fenced source; model arguments can select an address, never a fence.
         "artifact_read" => match artifact_context {
-            Some(context) => execute_artifact_read(args, context, color, tool_output_lines),
+            Some(context) => {
+                let output = execute_artifact_read_silent(args, context);
+                presentation.override_result(output.display);
+                output.model
+            }
             None => "error: artifact_read: no active artifact context in this session".to_string(),
         },
 
@@ -2449,7 +2799,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                             {
                                 let warning =
                                     format!("warning: failed to record plan artifact: {error}");
-                                print_tool_output(&warning, tool_output_lines, color);
                                 out.push('\n');
                                 out.push_str(&warning);
                             }
@@ -2467,23 +2816,17 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         // clamp takes effect on the NEXT turn; this turn's remaining calls stay
         // under the current authority.
         "enter_plan_mode" => {
-            print_tool_call("enter_plan_mode", "", color);
             // SAFETY: single-threaded session tool dispatch; the TUI reads it
             // between turns (same pattern as NEWT_FULL_ACCESS / NEWT_DISABLE_OCAP).
             unsafe { std::env::set_var("NEWT_PLAN_PHASE", "1") };
-            let out = "entered PLAN MODE (read-only): writes are denied until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute."
-                .to_string();
-            print_tool_output(&out, tool_output_lines, color);
-            out
+            "entered PLAN MODE (read-only): writes are denied until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute."
+                .to_string()
         }
         "exit_plan_mode" => {
-            print_tool_call("exit_plan_mode", "", color);
             // SAFETY: as above.
             unsafe { std::env::remove_var("NEWT_PLAN_PHASE") };
-            let out = "exited PLAN MODE: writes re-enabled. Execute your plan step by step, marking each done with update_plan as you go."
-                .to_string();
-            print_tool_output(&out, tool_output_lines, color);
-            out
+            "exited PLAN MODE: writes re-enabled. Execute your plan step by step, marking each done with update_plan as you go."
+                .to_string()
         }
         // #716: read-only plan view (the alias target for "what was I doing?"
         // probes) — same presence gate as update_plan.
@@ -2533,11 +2876,10 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         // from which optional capabilities this call was handed), so the search
         // reflects exactly what was advertised — built-ins, presence-gated tools,
         // AND the connected MCP `server__tool` entries. The matcher
-        // ([`super::tool_search::execute_tool_search`]) is pure; the print + the
-        // catalog build live here.
+        // ([`super::tool_search::execute_tool_search`]) is pure; the catalog
+        // build lives here and presentation stays at the dispatcher boundary.
         "tool_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            print_tool_call("tool_search", query, color);
             // FR-1 part 2 (#997): search only what THIS persona may call, so
             // discovery never surfaces a tool the executor would then refuse.
             let catalog = filter_advertised_tools(
@@ -2556,9 +2898,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 persona_tools,
             );
             let catalog = filter_tools_for_disposition(catalog, disposition);
-            let out = super::tool_search::execute_tool_search(query, &catalog);
-            print_tool_output(&out, tool_output_lines, color);
-            out
+            super::tool_search::execute_tool_search(query, &catalog)
         }
 
         // Embedded git (PR4, #461): dispatch through the injected GitTool
@@ -2570,7 +2910,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
             Some(tool) => {
                 let gc = crate::git_caveats::GitCaveats::from_session(caveats);
                 let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("");
-                print_tool_call("git", op, color);
                 // #1191: data-loss ops (stash-drop / branch-delete) are gated
                 // ALWAYS — even under --full-access — because they destroy work
                 // irrecoverably. A confused (e.g. post-compaction) model must
@@ -2588,7 +2927,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                              dropping; do NOT delete a branch that holds unmerged work. \
                              The operator must confirm any data-loss git op."
                         );
-                        print_tool_output(&refusal, tool_output_lines, color);
                         return refusal;
                     }
                 }
@@ -2617,7 +2955,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                         };
                     }
                 }
-                print_tool_output(&out, tool_output_lines, color);
                 out
             }
             None => "unknown tool: git (no git surface in this session)".to_string(),
@@ -2631,12 +2968,10 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         // toggle) — without an injected impl the tools were never advertised.
         "compose_roster" | "crew" => match crew_runner {
             Some(runner) => {
-                print_tool_call(name, &args.to_string(), color);
                 let out = match runner.dispatch(name, args, caveats).await {
                     Ok(rendered) => rendered,
                     Err(e) => format!("error: {e}"),
                 };
-                print_tool_output(&out, tool_output_lines, color);
                 out
             }
             // #479 (G4): replace the flat dead-end with a recoverable coach —
@@ -2681,8 +3016,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 );
             }
 
-            print_tool_call("run_command", cmd, color);
-
             // Route the WHOLE command through agent-bridle's confined shell
             // (free-form `cmd` mode) under the SAME Caveats the TUI resolved from
             // `[tui].permissions`. The confined-exec core is shared with the
@@ -2703,6 +3036,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 permission_gate,
                 tool_offload,
                 spill_store,
+                presentation,
             )
             .await
         }
@@ -2713,9 +3047,15 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         // confined exec path as run_command. `action=list` returns the resolved
         // command WITHOUT running it — a pure discovery read.
         // #1004: present collected findings as a rendered Markdown document in
-        // the plain scroller. Always-on (no injected capability); self-prints
-        // the rendered block and returns a short ack to the model.
-        "render_report" => execute_render_report(args, color),
+        // the plain scroller. Always-on (no injected capability); hands the
+        // rendered block to the presenter and returns a short ack to the model.
+        "render_report" => {
+            let (result, document) = execute_render_report(args, color);
+            if let Some(document) = document {
+                presentation.document(&document);
+            }
+            result
+        }
 
         "lifecycle" => {
             let phase_key = args.get("phase").and_then(|v| v.as_str()).unwrap_or("");
@@ -2748,11 +3088,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
                 "run" => {
-                    print_tool_call(
-                        "lifecycle",
-                        &format!("{} → {joined}", phase.as_str()),
-                        color,
-                    );
                     exec_confined_command(
                         &joined,
                         workspace,
@@ -2763,6 +3098,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                         permission_gate,
                         tool_offload,
                         spill_store,
+                        presentation,
                     )
                     .await
                 }
@@ -2785,12 +3121,9 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     })
                 });
                 if !allowed {
-                    let msg = denied_fs_result("fs_read", path);
-                    print_denied("fs_read", path, color);
-                    return msg;
+                    return denied_fs_result("fs_read", path);
                 }
             }
-            print_tool_call("read_file", path, color);
             match std::fs::read_to_string(&full) {
                 Ok(contents) => {
                     // #719: window + cap the MODEL-facing payload (the on-screen
@@ -2800,9 +3133,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     let limit = args["limit"].as_u64().map(|n| n as usize);
                     // #726: char backstop now derives from the shared token
                     // budget so read_file and run_command share one cap.
-                    let out = paginate_read(&contents, offset, limit, max_output_tokens());
-                    print_tool_output(&out, tool_output_lines, color);
-                    out
+                    paginate_read(&contents, offset, limit, max_output_tokens())
                 }
                 Err(e) => format!("error reading {path}: {e}"),
             }
@@ -2824,9 +3155,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     })
                 });
                 if !allowed {
-                    let msg = denied_fs_result("fs_write", path);
-                    print_denied("fs_write", path, color);
-                    return msg;
+                    return denied_fs_result("fs_write", path);
                 }
             }
             // Capture provenance only after fs_write authorization. The
@@ -2857,24 +3186,16 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                          (-{pct}%). This is likely unintentional. Use edit_file to make targeted \
                          changes, or ensure your content includes the full file."
                     );
-                    print_denied("shrink-guard", path, color);
                     return msg;
                 }
             }
 
-            print_tool_call(
-                "write_file",
-                &format!("{path} ({} bytes)", content.len()),
-                color,
-            );
-
             // Show first 20 lines as preview.
             let preview: String = content.lines().take(20).collect::<Vec<_>>().join("\n");
             let has_more = content.lines().count() > 20;
-            print_tool_output(
+            presentation.preview(
                 &format!("{preview}{}", if has_more { "\n…" } else { "" }),
                 tool_output_lines,
-                color,
             );
 
             // Auto-write when the caveat explicitly scopes fs_write (the
@@ -2895,7 +3216,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 match std::fs::write(&full, content) {
                     Ok(_) => {
                         let line_count = content.lines().count();
-                        println!("✓ wrote {path} ({line_count} lines)");
                         // Verify exactly the bytes this governed tool submitted
                         // before an arbitrary build-check command can touch the
                         // workspace. A mismatch emits no false provenance.
@@ -2949,7 +3269,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     Err(e) => format!("error writing {path}: {e}"),
                 }
             } else {
-                println!("skipped");
                 format!("user declined to write {path}")
             }
         }
@@ -2972,9 +3291,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     })
                 });
                 if !allowed {
-                    let msg = denied_fs_result("fs_write", path);
-                    print_denied("fs_write", path, color);
-                    return msg;
+                    return denied_fs_result("fs_write", path);
                 }
             }
 
@@ -2998,7 +3315,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
             });
 
-            print_tool_call("delete_file", path, color);
             let confirmed = confirm_unrestricted_fs_mutation(
                 caveats,
                 &mut permission_gate,
@@ -3006,13 +3322,11 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
             );
 
             if !confirmed {
-                println!("skipped");
                 return format!("user declined to delete {path}");
             }
 
             match std::fs::remove_file(&full) {
                 Ok(_) => {
-                    println!("✓ deleted {path}");
                     let artifact = if !artifact_tracking {
                         String::new()
                     } else if !artifact_path_within
@@ -3072,9 +3386,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     })
                 });
                 if !allowed {
-                    let msg = denied_fs_result("fs_write", path);
-                    print_denied("fs_write", path, color);
-                    return msg;
+                    return denied_fs_result("fs_write", path);
                 }
             }
             if old_string.is_empty() {
@@ -3148,10 +3460,8 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
             } else {
                 format!("{delta}")
             };
-            print_tool_call("edit_file", &format!("{path} ({delta_str} lines)"), color);
             match std::fs::write(&full, &updated) {
                 Ok(_) => {
-                    println!("✓ edited {path} ({delta_str} lines, now {new_lines} total)");
                     let artifact = if !artifact_tracking {
                         String::new()
                     } else if !artifact_path_within
@@ -3217,12 +3527,9 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     })
                 });
                 if !allowed {
-                    let msg = denied_fs_result("fs_read", path);
-                    print_denied("fs_read", path, color);
-                    return msg;
+                    return denied_fs_result("fs_read", path);
                 }
             }
-            print_tool_call("list_dir", path, color);
             match std::fs::read_dir(&full) {
                 Ok(entries) => {
                     let mut names: Vec<String> = entries
@@ -3230,9 +3537,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                         .map(|e| e.file_name().to_string_lossy().into_owned())
                         .collect();
                     names.sort();
-                    let listing = names.join("\n");
-                    print_tool_output(&listing, tool_output_lines, color);
-                    listing
+                    names.join("\n")
                 }
                 Err(e) => format!("error: {e}"),
             }
@@ -3251,29 +3556,10 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     fs_gate_allows(gate, "find", DenialKind::FsRead, &full_str, |c| &c.fs_read)
                 });
                 if !allowed {
-                    let msg = denied_fs_result("fs_read", path);
-                    print_denied("fs_read", path, color);
-                    return msg;
+                    return denied_fs_result("fs_read", path);
                 }
             }
-            let opts = FindOpts {
-                name: args["name"].as_str(),
-                type_filter: match args["type"].as_str() {
-                    Some("f") => FindType::Files,
-                    Some("d") => FindType::Dirs,
-                    _ => FindType::Any,
-                },
-                max_depth: args["max_depth"].as_u64().map(|d| d as usize),
-                max_results: args["max_results"]
-                    .as_u64()
-                    .map(|m| m as usize)
-                    .unwrap_or(1000),
-                respect_gitignore: args["respect_gitignore"].as_bool().unwrap_or(true),
-                case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
-            };
-            // #529: echo the active filters, not a bare `find: .` — two very
-            // different searches must not render identically in the trace.
-            print_tool_call("find", &find_detail(path, &opts), color);
+            let opts = find_opts_from_args(args);
             if !full.exists() {
                 return format!("error: no such path '{path}'");
             }
@@ -3285,9 +3571,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 full.canonicalize(),
             ) {
                 if !root_canon.starts_with(&ws_canon) {
-                    let msg = denied_fs_result("fs_read", path);
-                    print_denied("fs_read", path, color);
-                    return msg;
+                    return denied_fs_result("fs_read", path);
                 }
             }
             match find_walk(&full, std::path::Path::new(workspace), &opts) {
@@ -3301,7 +3585,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                         listing
                             .push_str(&format!("\n… (truncated at {} matches)", opts.max_results));
                     }
-                    print_tool_output(&listing, tool_output_lines, color);
                     listing
                 }
                 Err(e) => format!("error: {e}"),
@@ -3310,7 +3593,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
 
         "use_skill" => {
             let skill_name = args["name"].as_str().unwrap_or("");
-            print_tool_call("use_skill", skill_name, color);
             // Reads from the configured skill search path. This is a read of
             // trusted operator config (procedural knowledge), not an exec of
             // arbitrary code, so it is NOT leash-gated — any SCRIPTS the skill
@@ -3322,17 +3604,13 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 .map(|c| c.skill_search_dirs())
                 .unwrap_or_default();
             match newt_skills::load_body_from(&dirs, skill_name) {
-                Ok(body) => {
-                    print_tool_output(&body, tool_output_lines, color);
-                    body
-                }
+                Ok(body) => body,
                 Err(e) => format!("error: {e}"),
             }
         }
 
         "web_fetch" => {
             let url = args["url"].as_str().unwrap_or("");
-            print_tool_call("web_fetch", url, color);
 
             // Route through agent-bridle's `web_fetch` tool under the SAME
             // Caveats. The `net` axis gates which hosts are reachable (host
@@ -3387,7 +3665,6 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                     } else {
                         format!("# {title}\n{final_url}\n\n{markdown}")
                     };
-                    print_tool_output(&out, tool_output_lines, color);
                     out
                 }
                 // A `net`-axis leash denial, or a fetch error (SSRF screen,
@@ -4545,7 +4822,7 @@ mod tests {
             "stderr": "remote: Create a pull request for 'fix/foo' on GitHub by visiting:\n\
                        remote:      https://github.com/OWNER/REPO/pull/new/fix/foo\n",
         });
-        let out = shell_envelope_output(&push, 50, false, false, None);
+        let out = shell_envelope_output(&push, 50, false, false, None, None);
         assert!(out.contains("gh pr create --fill"), "hint missing: {out}");
         assert!(
             out.contains("https://github.com/OWNER/REPO/pull/new/fix/foo"),
@@ -4554,7 +4831,7 @@ mod tests {
 
         // Ordinary output: no hint, payload unchanged.
         let plain = serde_json::json!({ "exit_code": 0, "stdout": "hello\n", "stderr": "" });
-        let out = shell_envelope_output(&plain, 50, false, false, None);
+        let out = shell_envelope_output(&plain, 50, false, false, None, None);
         assert!(!out.contains("gh pr create"), "spurious hint: {out}");
         assert_eq!(out, "hello\n");
     }
@@ -4572,7 +4849,11 @@ mod tests {
             "stderr": "",
         });
         let store = spill::SessionSpillStore::default();
-        let out = shell_envelope_output(&envelope, 50, false, true, Some(&store));
+        let mut display = ToolDisplay::new(Vec::new(), false, 80, 3);
+        display.call("run_command", "large-output-command");
+        let out =
+            shell_envelope_output(&envelope, 50, false, true, Some(&store), Some(&mut display));
+        display.result(&out);
 
         assert!(out.contains("HEAD_ONLY_MARKER"), "head dropped: {out}");
         assert!(out.contains("TAIL_ONLY_MARKER"), "tail dropped: {out}");
@@ -4590,6 +4871,34 @@ mod tests {
             "spilled payload was capped before storage"
         );
         assert!(stored.ends_with("TAIL_ONLY_MARKER\n"));
+        let rendered = String::from_utf8(display.into_inner()).unwrap();
+        assert!(
+            rendered.contains("▓ TAIL_ONLY_MARKER\n…\n"),
+            "operator spill lost the raw shell tail: {rendered}"
+        );
+        assert!(
+            !rendered.contains("memory_fetch(\"spill:s0\")"),
+            "operator saw the model teaser instead of raw shell output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn shell_envelope_without_streams_commits_the_exit_result() {
+        let envelope = serde_json::json!({
+            "exit_code": 3,
+            "stdout": "",
+            "stderr": "",
+        });
+        let mut display = ToolDisplay::new(Vec::new(), false, 80, 3);
+        display.call("run_command", "exit 3");
+        let out = shell_envelope_output(&envelope, 50, false, false, None, Some(&mut display));
+        display.result(&out);
+
+        assert_eq!(out, "(exit 3)");
+        assert_eq!(
+            String::from_utf8(display.into_inner()).unwrap(),
+            "⚙  run_command: exit 3\n▒ (exit 3)\n…\n"
+        );
     }
 
     #[test]
@@ -4635,9 +4944,9 @@ mod tests {
         assert_eq!(exec_allowlist_name("C:\\tools\\env.exe"), "env.exe");
     }
 
-    /// #775 (§2.5): the human exec-denial NOTICE shows the BARE command
-    /// target(s), never the reason sentence — restoring [`print_denied`]'s
-    /// `'{target}'` contract. Stuffing the full reason there produced the
+    /// #775 (§2.5): denial recovery uses the BARE command target(s), never the
+    /// reason sentence. Stuffing the full reason into the former notice's
+    /// `'{target}'` field produced the
     /// field-report garble `capability denied: exec does not permit '<whole
     /// reason sentence>'`.
     #[test]
@@ -5354,8 +5663,10 @@ mod tests {
 mod execute_tool_branch_tests {
     use super::super::NoMcp;
     use super::*;
-    use crate::agentic::{ArtifactReadContext, ArtifactReadRecord, PromptArtifactSink};
-    use crate::artifact::{ArtifactId, ArtifactKind, NewPromptArtifact};
+    use crate::agentic::{
+        ArtifactReadContext, ArtifactReadRecord, PromptArtifactSink, SessionArtifactStore,
+    };
+    use crate::artifact::{ArtifactId, ArtifactKind, ArtifactRelation, NewPromptArtifact};
     use crate::caveats::{Caveats, CountBound, Scope};
     use crate::PromptId;
     use std::sync::Mutex;
@@ -5990,6 +6301,342 @@ mod execute_tool_branch_tests {
         );
     }
 
+    /// #1235: every tool invocation goes through one display boundary. The
+    /// operator sees the command plus a bounded tail, while the model-facing
+    /// result remains complete.
+    #[tokio::test]
+    async fn find_command_and_full_result_share_the_spill_boundary() {
+        let ws = tempfile::TempDir::new().unwrap();
+        for f in ["e.rs", "b.rs", "d.rs", "a.rs", "c.rs"] {
+            touch(ws.path(), f);
+        }
+        let args = serde_json::json!({
+            "path": ".",
+            "name": "*.rs",
+            "type": "f",
+        });
+        let caveats = caveats_rw(ws.path());
+        let (out, rendered) =
+            run_tool_captured("find", args, ws.path(), &caveats, &mut NoMcp).await;
+
+        assert_eq!(out, "a.rs\nb.rs\nc.rs\nd.rs\ne.rs");
+        assert_eq!(
+            rendered,
+            "⚙  find: . (name=*.rs, type=f)\n\
+             ▲ 2 more lines above\n\
+             ▒ c.rs\n\
+             ▒ d.rs\n\
+             ▓ e.rs\n\
+             …\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_find_uses_the_governed_tool_in_the_audit_header() {
+        let ws = tempfile::TempDir::new().unwrap();
+        for f in ["b.rs", "a.rs"] {
+            touch(ws.path(), f);
+        }
+        let caveats = caveats_rw(ws.path());
+        let (out, rendered) = run_tool_captured(
+            "run_command",
+            serde_json::json!({"command": "find . -name '*.rs' -type f"}),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+        )
+        .await;
+
+        assert_eq!(out, "a.rs\nb.rs");
+        assert!(
+            rendered.starts_with("⚙  find: . (name=*.rs, type=f)\n"),
+            "routed action was not audited canonically: {rendered}"
+        );
+        assert!(!rendered.contains("⚙  run_command:"));
+    }
+
+    #[tokio::test]
+    async fn correction_alias_header_never_echoes_file_content() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let secret = "PRIVATE_BODY_MUST_NOT_APPEAR_IN_HEADER";
+        let (out, rendered) = run_tool_captured(
+            "create_file",
+            serde_json::json!({"path": "secret.txt", "content": secret}),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+        )
+        .await;
+
+        assert!(out.contains("write_file"), "got: {out}");
+        assert!(
+            rendered.starts_with(&format!(
+                "⚙  create_file: secret.txt ({} bytes)\n",
+                secret.len()
+            )),
+            "unsafe or unhelpful alias audit: {rendered}"
+        );
+        assert!(!rendered.contains(secret));
+    }
+
+    #[test]
+    fn lifecycle_audit_names_the_resolved_command() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            ws.path().join("Cargo.toml"),
+            "[package]\nname='audit-fixture'\n",
+        )
+        .unwrap();
+        let (name, detail) = tool_presentation(
+            "lifecycle",
+            &serde_json::json!({"phase": "test", "action": "run"}),
+            ws.path(),
+        );
+        let resolved =
+            crate::tooling::resolved_phase_commands(ws.path(), crate::tooling::Phase::Test);
+
+        assert_eq!(name, "lifecycle");
+        assert!(!resolved.is_empty());
+        assert_eq!(detail, format!("test (run) → {}", resolved.join(" && ")));
+    }
+
+    #[test]
+    fn audit_preserves_whitespace_in_real_paths() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let (name, detail) = tool_presentation(
+            "read_file",
+            &serde_json::json!({"path": " leading and trailing "}),
+            ws.path(),
+        );
+
+        assert_eq!(name, "read_file");
+        assert_eq!(detail, " leading and trailing ");
+
+        let (name, detail) = tool_presentation(
+            "run_command",
+            &serde_json::json!({"command": "cd nested && printf exact-command"}),
+            ws.path(),
+        );
+        assert_eq!(name, "run_command");
+        assert_eq!(detail, "cd nested && printf exact-command");
+    }
+
+    #[tokio::test]
+    async fn find_error_uses_the_same_spill_boundary() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let (out, rendered) = run_tool_captured(
+            "find",
+            serde_json::json!({"path": "missing", "name": "*.rs", "type": "f"}),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+        )
+        .await;
+
+        assert_eq!(out, "error: no such path 'missing'");
+        assert_eq!(
+            rendered,
+            "⚙  find: missing (name=*.rs, type=f)\n\
+             ▒ error: no such path 'missing'\n\
+             …\n"
+        );
+    }
+
+    struct EmptyRemote;
+
+    #[async_trait::async_trait]
+    impl McpTools for EmptyRemote {
+        fn handles(&self, name: &str) -> bool {
+            name == "test__empty"
+        }
+
+        fn tool_defs(&self) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+
+        async fn call(&mut self, _name: &str, _args: &serde_json::Value) -> String {
+            String::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_tool_result_still_commits_a_complete_spill_block() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let (out, rendered) = run_tool_captured(
+            "test__empty",
+            serde_json::json!({}),
+            ws.path(),
+            &caveats,
+            &mut EmptyRemote,
+        )
+        .await;
+
+        assert!(out.is_empty());
+        assert_eq!(
+            rendered,
+            "⚙  test__empty: {}\n\
+             ▒ (no output)\n\
+             …\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_has_exactly_one_complete_audit_block() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let (out, rendered) = run_tool_captured(
+            "definitely_unknown",
+            serde_json::json!({}),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+        )
+        .await;
+
+        assert!(out.contains("unknown tool"), "got: {out}");
+        assert_eq!(rendered.matches("⚙  definitely_unknown:").count(), 1);
+        assert_eq!(rendered.matches("…\n").count(), 1);
+        assert_eq!(rendered.matches("▒ unknown tool:").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_set_cancellation_closes_the_block_without_polling_a_mutation() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let args = serde_json::json!({"path": "must-not-exist.txt", "content": "blocked"});
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3);
+
+        let out = execute_tool_with_display_cancellable(
+            &mut display,
+            "write_file",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            PromptDisposition::Act,
+            Some(&cancel),
+        )
+        .await;
+
+        assert!(out.is_none());
+        assert!(!ws.path().join("must-not-exist.txt").exists());
+        assert_eq!(
+            String::from_utf8(display.into_inner()).unwrap(),
+            "⚙  write_file: must-not-exist.txt (7 bytes)\n\
+             ▒ error: write_file interrupted — tool cancelled before completion\n\
+             …\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_read_central_display_never_echoes_recovered_prompt_text() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let exact = "operator secret that must reach only the model";
+        let context = PromptReadContext::new(None, exact, None);
+        let (out, rendered) = run_tool_captured_with_context(
+            "prompt_read",
+            serde_json::json!({}),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+            Some(context),
+            None,
+        )
+        .await;
+
+        let model: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(model["model_text"], exact);
+        assert_eq!(rendered.matches("⚙  prompt_read:").count(), 1);
+        assert!(rendered.contains("ephemeral prompt: returned"));
+        assert!(!rendered.contains(exact));
+    }
+
+    #[tokio::test]
+    async fn artifact_read_central_display_never_echoes_recovered_body() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let prompt = PromptId::new();
+        let secret = "artifact body that must reach only the model";
+        let store = SessionArtifactStore::new("central-display-test").unwrap();
+        let record = store
+            .append_artifact(
+                prompt,
+                prompt,
+                NewPromptArtifact::new(ArtifactKind::Decision, ArtifactRelation::DerivedFrom)
+                    .with_body(secret),
+            )
+            .unwrap();
+        let context =
+            ArtifactReadContext::new(Some(prompt), Some(prompt), Some(prompt), Some(&store));
+        let (out, rendered) = run_tool_captured_with_context(
+            "artifact_read",
+            serde_json::json!({"address": record.id.to_string()}),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+            None,
+            Some(context),
+        )
+        .await;
+
+        let model: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(model["artifact"]["body"], secret);
+        assert_eq!(rendered.matches("⚙  artifact_read:").count(), 1);
+        assert!(rendered.contains(&format!(
+            "returned {} of {} body characters",
+            secret.chars().count(),
+            secret.chars().count()
+        )));
+        assert!(!rendered.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn render_report_has_one_header_document_and_ack_block() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let (out, rendered) = run_tool_captured(
+            "render_report",
+            serde_json::json!({
+                "title": "Build status",
+                "body": "All required checks passed."
+            }),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+        )
+        .await;
+
+        assert!(out.starts_with("report rendered:"), "got: {out}");
+        assert_eq!(rendered.matches("⚙  render_report:").count(), 1);
+        assert_eq!(rendered.matches("All required checks passed.").count(), 1);
+        assert_eq!(rendered.matches("▒ report rendered:").count(), 1);
+    }
+
     /// `type` restricts to files or directories.
     #[tokio::test]
     async fn find_type_filter() {
@@ -6218,6 +6865,62 @@ mod execute_tool_branch_tests {
             None, // step_ledger
         )
         .await
+    }
+
+    async fn run_tool_captured(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        mcp: &mut dyn McpTools,
+    ) -> (String, String) {
+        run_tool_captured_with_context(name, args, ws, caveats, mcp, None, None).await
+    }
+
+    async fn run_tool_captured_with_context(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        mcp: &mut dyn McpTools,
+        prompt_context: Option<PromptReadContext<'_>>,
+        artifact_context: Option<ArtifactReadContext<'_>>,
+    ) -> (String, String) {
+        let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3);
+        let out = execute_tool_with_display_cancellable(
+            &mut display,
+            name,
+            &args,
+            &ws.to_string_lossy(),
+            false,
+            20,
+            caveats,
+            mcp,
+            None, // build_check_cmd
+            None, // note_sink
+            None, // recall_source
+            None, // memory_source
+            prompt_context,
+            artifact_context,
+            None, // artifact_sink
+            None, // permission_gate
+            None, // exec_floor
+            None, // git_tool
+            None, // crew_runner
+            None, // scratchpad_store
+            None, // code_search
+            None, // experience_store
+            None, // step_ledger
+            false,
+            None,
+            None,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .expect("uncancelled test dispatch should complete");
+        let rendered = String::from_utf8(display.into_inner()).unwrap();
+        (out, rendered)
     }
 
     #[tokio::test]
@@ -7413,8 +8116,7 @@ mod execute_tool_branch_tests {
         assert!(out.starts_with("capability denied:"), "got: {out}");
         assert!(out.contains("request_permissions"), "got: {out}");
         // #775: the stale `extra_exec` config hint is GONE from the model-facing
-        // message (it leaked in before; the human transcript carries the bare
-        // command via print_denied instead).
+        // message (it leaked in before).
         assert!(
             !out.contains("extra_exec"),
             "the model message must not carry the stale config hint: {out}"
@@ -7424,7 +8126,7 @@ mod execute_tool_branch_tests {
     /// #775 (§2.5) regression: the model-facing `run_command` denial is ONE
     /// clean level and never a denial sentence NESTED inside another. Before
     /// the fix, `denied_run_command_result` appended the `extra_exec` config
-    /// hint to the reason (and `print_denied` stuffed that whole sentence into
+    /// hint to the reason (and the former notice stuffed that whole sentence into
     /// its bare `'{target}'` slot), yielding `capability denied: exec does not
     /// permit '<reason> - add it via …>'`. The model-facing return now carries
     /// exactly one `capability denied:`, the bare reason, and the recovery hint.
@@ -8777,7 +9479,7 @@ mod disable_ocap_tests {
         assert!(!envelope_denied(&envelope));
         // And the shared formatter renders it like any confined result.
         assert_eq!(
-            shell_envelope_output(&envelope, 20, false, false, None),
+            shell_envelope_output(&envelope, 20, false, false, None, None),
             "out\nerr\n"
         );
     }
