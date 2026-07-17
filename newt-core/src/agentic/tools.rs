@@ -383,6 +383,22 @@ pub fn full_access_requested() -> bool {
     std::env::var("NEWT_FULL_ACCESS").is_ok_and(|v| v == "1")
 }
 
+/// #1176: should an about-to-run command be shadow-recorded? Exactly when it
+/// runs UNCONFINED — via either of the two unconfined routes:
+/// - `host_bypass` — the `--yolo`/`--disable-ocap` host-shell bypass, or
+/// - `full_access` — a `--full-access` session, whose caveats are
+///   `Caveats::top()`, so the confined bridle dispatch runs effectively
+///   unconfined and would otherwise learn nothing.
+///
+/// A genuinely confined session (`host_bypass == false` and no full-access) is
+/// NOT recorded: its leash is real, so there is no shadow to catch. Pure over
+/// the two booleans so the gating is unit-tested without a live shell. Before
+/// #1176's full-access parity, only the host-bypass arm recorded — a bare
+/// `--full-access` run armed the recorder yet never wrote.
+fn shadow_records(host_bypass: bool, full_access: bool) -> bool {
+    host_bypass || full_access
+}
+
 /// #1193: is the session in the read-only PLAN phase? Set by `enter_plan_mode`,
 /// cleared by `exit_plan_mode`. Env-signalled like [`ocap_disabled`] /
 /// [`full_access_requested`] so the TUI can read it when resolving per-turn
@@ -521,12 +537,20 @@ async fn exec_confined_command(
     // command's leading token; else it falls through to the confined shell,
     // which enforces the already-clamped `caveats`. `None` keeps the bypass
     // bit-for-bit.
-    if ocap_disabled() && exec_floor_permits(exec_floor, cmd) {
-        // #1176: shadow-OCAP — the command is about to run UNCONFINED. Record
-        // the authority a leash would have gated on (no-op unless recording
-        // is armed), so a --full-access session builds its own policy-gap
-        // catalog + bridle repro fixtures instead of learning nothing.
+    let host_bypass = ocap_disabled() && exec_floor_permits(exec_floor, cmd);
+
+    // #1176: shadow-OCAP — record the authority a leash WOULD have gated on
+    // whenever this command runs UNCONFINED: the yolo/disable-ocap host bypass
+    // above, OR a --full-access session (its caveats are `Caveats::top()`, so
+    // the confined bridle dispatch below runs effectively unconfined and would
+    // otherwise learn nothing). A genuinely confined session is not recorded —
+    // its leash is real. No-op unless recording is armed (NEWT_FLIGHT_RECORDER).
+    // `newt ocap propose` folds the capture into reviewable policy candidates.
+    if shadow_records(host_bypass, full_access_requested()) {
         crate::flight_recorder::log_unconfined(cmd);
+    }
+
+    if host_bypass {
         return match host_shell_dispatch(&cmd_with_venv, cwd).await {
             Ok(envelope) => shell_envelope_output(
                 &envelope,
@@ -9149,6 +9173,27 @@ mod disable_ocap_tests {
                 "NEWT_FULL_ACCESS={value:?} must read as {expected}"
             );
         }
+    }
+
+    /// #1176 shadow-OCAP recording gate. The decision table, which
+    /// `exec_confined_command` consults before dispatch:
+    /// - host-bypass (yolo) → record (unconfined host shell);
+    /// - full-access on the confined path → record (caveats are top()) —
+    ///   THE PARITY FIX: before it, a bare `--full-access` run armed the
+    ///   recorder yet the confined dispatch never wrote;
+    /// - a genuinely confined session (neither) → do NOT record (real leash).
+    #[test]
+    fn shadow_records_iff_the_run_is_unconfined() {
+        assert!(shadow_records(true, false), "yolo host bypass records");
+        assert!(
+            shadow_records(false, true),
+            "--full-access confined dispatch records (the #1176 parity fix)"
+        );
+        assert!(shadow_records(true, true), "both routes still record");
+        assert!(
+            !shadow_records(false, false),
+            "a genuinely confined session has a real leash — nothing to shadow"
+        );
     }
 
     /// FLAG OFF ⇒ the command goes to the confined dispatch, which governs it.
