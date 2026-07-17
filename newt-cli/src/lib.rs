@@ -23,6 +23,7 @@ mod doctor;
 mod identity_cmd;
 mod models_cmd;
 mod new_project;
+mod ocap_cmd;
 mod skills;
 pub mod stack;
 pub mod stdio_guard;
@@ -399,6 +400,14 @@ pub enum Command {
         /// refused and reported (exit 2).
         #[arg(long = "sign-ocap")]
         sign_ocap: bool,
+    },
+    /// Manage the `~/.newt/ocap/` durable-policy store. `propose` folds the
+    /// flight-recorder capture of a `--full-access` session into reviewable,
+    /// unsigned `approve.toml` candidates (bless them with
+    /// `newt doctor --sign-ocap`).
+    Ocap {
+        #[command(subcommand)]
+        cmd: ocap_cmd::OcapCmd,
     },
     /// Print resolved config.
     Config,
@@ -1021,6 +1030,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             } else {
                 doctor::run(cli.config.as_deref()).await
             }
+        }
+        Command::Ocap { cmd } => {
+            let code = ocap_cmd::run(cmd, cli.config.as_deref())?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Command::Config => config_cmd::run(cli.config.as_deref()),
         Command::Compaction => compaction_cmd::run(cli.config.as_deref()),

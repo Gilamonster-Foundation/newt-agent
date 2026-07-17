@@ -31,6 +31,7 @@ pub mod notes;
 pub mod notes_scan;
 pub mod nudger;
 pub mod ocap;
+pub mod ocap_propose;
 pub mod ocap_store;
 pub mod plan;
 pub mod pricing;

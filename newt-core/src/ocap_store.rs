@@ -30,13 +30,14 @@
 use std::path::Path;
 
 pub use agent_bridle::policy::{
-    ApproveVerifier, CapabilityClass, Ed25519ApproveVerifier, PolicyFile, PolicySet, Verdict,
+    ApproveVerifier, CapabilityClass, Ed25519ApproveVerifier, ExecEntry, FsEntry, NetEntry,
+    PolicyFile, PolicySet, Verdict,
 };
 
 use crate::agentic::DenialKind;
 
 /// The four verdicts in load order — every store read walks exactly these.
-const VERDICTS: [Verdict; 4] = [
+pub const VERDICTS: [Verdict; 4] = [
     Verdict::Deny,
     Verdict::Passkey,
     Verdict::Ask,
