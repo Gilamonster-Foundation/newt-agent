@@ -8719,6 +8719,12 @@ mod disable_ocap_tests {
     async fn floor_refuses_bypass_for_a_compound_command() {
         let _l = env_lock().await;
         let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        // #1243 Leg 1: pin safe-subset so this confined-denial assertion is
+        // deterministic — shell_engine() reads NEWT_SHELL_ENGINE FIRST, so the
+        // test is immune to a NEWT_FULL_ACCESS leak from a concurrent test
+        // (which on Windows would select brush, whose `echo` builtin runs
+        // un-gated instead of the whole compound being atomically denied).
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_no_exec(ws.path());
         // `echo` is allow-listed, but the `&&` chains an unlisted `rm`.
@@ -9232,6 +9238,9 @@ mod disable_ocap_tests {
         let _l = env_lock().await;
         let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
         let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        // #1243 Leg 1: pin safe-subset (deterministic confined engine) so a
+        // concurrent NEWT_FULL_ACCESS leak can't flip this to brush on Windows.
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_no_exec(ws.path()); // fs_read scoped to ws only
         let out = run_tool(
@@ -9320,6 +9329,9 @@ mod disable_ocap_tests {
         let _l = env_lock().await;
         let _route_off = EnvVar::set("NEWT_NO_ROUTE", "1");
         let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        // #1243 Leg 1: pin safe-subset (deterministic confined engine) so a
+        // concurrent NEWT_FULL_ACCESS leak can't flip this to brush on Windows.
+        let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         assert!(routing_disabled() && !ocap_disabled(), "L2 off, L3 on");
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_no_exec(ws.path());
