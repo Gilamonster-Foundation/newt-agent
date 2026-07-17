@@ -1231,6 +1231,104 @@ async fn chat_complete_dispatches_openai_kind_and_returns_first_round_answer() {
     assert_eq!(hallu, 0);
 }
 
+/// Mirrors vLLM chat templates that accept exactly one system message and
+/// require it to be the first message in the request.
+struct StrictVllmSystemResponder;
+
+impl Respond for StrictVllmSystemResponder {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body = body_json(req);
+        let messages = body["messages"].as_array().cloned().unwrap_or_default();
+        let system_messages: Vec<(usize, &serde_json::Value)> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message["role"].as_str() == Some("system"))
+            .collect();
+        let valid_system = system_messages.len() == 1
+            && system_messages[0].0 == 0
+            && system_messages[0].1["content"]
+                .as_str()
+                .is_some_and(|content| {
+                    content.contains("you are a test")
+                        && content.contains(prompt_read::ACTIVE_PROMPT_PREFIX)
+                });
+        let expected_tail = [
+            ("user", "hello"),
+            ("user", "an earlier request"),
+            ("assistant", "the earlier request is complete"),
+            ("user", "hello"),
+        ];
+        let valid_tail = messages.get(1..).is_some_and(|tail| {
+            tail.len() == expected_tail.len()
+                && tail
+                    .iter()
+                    .zip(expected_tail)
+                    .all(|(message, (role, content))| {
+                        message["role"].as_str() == Some(role)
+                            && message["content"].as_str() == Some(content)
+                    })
+        });
+
+        if !valid_system || !valid_tail {
+            return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "System message must be at the beginning.",
+                    "type": "BadRequestError"
+                }
+            }));
+        }
+
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "strict vllm accepted the request"}}]
+        }))
+    }
+}
+
+#[tokio::test]
+async fn openai_chat_coalesces_system_cards_for_strict_vllm_templates() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(StrictVllmSystemResponder)
+        .mount(&server)
+        .await;
+
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("an earlier request"),
+        MemMessage::assistant("the earlier request is complete"),
+        MemMessage::user("hello"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.task = "hello";
+
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("strict vLLM chat template should accept the next message after a backend switch");
+
+    assert_eq!(reply, "strict vllm accepted the request");
+}
+
+#[test]
+fn openai_chat_rejects_system_messages_after_conversation_history() {
+    let messages = vec![
+        serde_json::json!({"role": "system", "content": "base policy"}),
+        serde_json::json!({"role": "user", "content": "hello"}),
+        serde_json::json!({"role": "system", "content": "late policy"}),
+    ];
+
+    let error = openai_chat_wire_messages(&messages)
+        .expect_err("a late system message must not be promoted across user history");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid OpenAI chat message order: system messages must precede conversation history"
+    );
+}
+
 #[tokio::test]
 async fn openai_strips_inline_think_and_never_returns_reasoning_content() {
     // #857: a reasoning model served with the parser OFF puts its CoT inline as
