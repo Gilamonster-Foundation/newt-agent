@@ -155,7 +155,7 @@ pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, print_harness_notice, print_list_item,
-    print_newt, GaugeLevel, NEWT_ORANGE_CT,
+    print_newt, set_spill_lines, GaugeLevel, NEWT_ORANGE_CT,
 };
 pub use driver::{
     TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,

@@ -1493,6 +1493,14 @@ pub struct TuiConfig {
     #[serde(default = "default_tool_output_lines")]
     pub tool_output_lines: usize,
 
+    /// #1235: height of the shell-output SPILL VIEW — the tail-biased,
+    /// gutter-glyphed rendering of a completed `run_command`'s output
+    /// (▲ hidden-count / ▒▓ gutter / … end marker). Default: 3. Set to 0 to
+    /// show everything raw. Distinct from `tool_output_lines`, which caps the
+    /// head-only echo of NON-shell tool output.
+    #[serde(default = "default_spill_lines")]
+    pub spill_lines: usize,
+
     /// Maximum number of tool-call rounds the model may take within a single
     /// turn before the agent forces a final, tools-disabled completion. Each
     /// round is one model response that may emit tool calls; once this many
@@ -1679,6 +1687,10 @@ pub struct TuiConfig {
     /// navigation + inspection only until the operator opts in.
     #[serde(default = "default_allow_shell_mutations")]
     pub allow_shell_mutations: bool,
+}
+
+fn default_spill_lines() -> usize {
+    3
 }
 
 fn default_tool_output_lines() -> usize {
@@ -2748,6 +2760,7 @@ impl Default for TuiConfig {
             color: ColorMode::Auto,
             thinking: ThinkingMode::Stream,
             tool_output_lines: default_tool_output_lines(),
+            spill_lines: default_spill_lines(),
             max_tool_rounds: default_max_tool_rounds(),
             workflow_grace_rounds: default_workflow_grace_rounds(),
             narration_nudge_cap: default_narration_nudge_cap(),
@@ -6245,6 +6258,17 @@ net = [\"already.example.com\"]
             expand_tilde("relative/path"),
             PathBuf::from("relative/path")
         );
+    }
+
+    /// #1235: the spill-view height defaults to 3, parses when absent, and
+    /// overrides from `[tui]`.
+    #[test]
+    fn spill_lines_defaults_to_3_and_overrides() {
+        assert_eq!(TuiConfig::default().spill_lines, 3);
+        let empty: TuiConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.spill_lines, 3);
+        let set: TuiConfig = toml::from_str("spill_lines = 7").unwrap();
+        assert_eq!(set.spill_lines, 7);
     }
 
     #[test]
