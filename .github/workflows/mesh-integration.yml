@@ -72,7 +72,7 @@ env:
 jobs:
   check-mesh:
     name: agent-mesh ↔ newt-mesh contract
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       # Side-by-side layout matching local development:
       #   $GITHUB_WORKSPACE/newt-agent   (this repo)
