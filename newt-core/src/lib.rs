@@ -49,6 +49,7 @@ pub mod scope_grounding;
 pub mod scratch;
 pub mod session;
 pub mod settings;
+pub mod shell_env;
 pub mod ssh_caveats;
 pub mod store;
 pub mod symbols;
