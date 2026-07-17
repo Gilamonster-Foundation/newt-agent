@@ -41,8 +41,21 @@ If it doesn't find its day in the sun, it was fun anyway.
 git clone https://github.com/Gilamonster-Foundation/newt-agent
 cd newt-agent
 just install          # release binaries → ~/bin/newt, ~/bin/newt-mcp-server
+newt setup dgx1.home.lab  # probe configured ports and select detected inference
 newt code             # TUI coder in the current directory
 ```
+
+Bare setup hosts are probed anonymously across the configured discovery ports
+(including 8000 and 8080 by default). For an authenticated endpoint, use its
+exact HTTPS URL and store only a secret reference:
+
+```bash
+newt setup https://inference.example.net:8000 --token-env INFERENCE_TOKEN
+newt setup https://inference.example.net:8080 --token-file ~/.config/newt/token
+```
+
+Detected endpoints are stored as `~/.newt/backends/*.toml`; the main
+`~/.newt/config.toml` only records the selected `default_backend`.
 
 Run `newt --help` for every mode (worker, MCP server, doctor, config, …) —
 the binary is the authority on its own surface, this file is not. Python

@@ -2871,7 +2871,9 @@ impl Default for Discovery {
         Self {
             hosts: vec!["localhost".into()],
             ollama_ports: vec![11434],
-            vllm_ports: vec![8000, 8001, 8002, 8003],
+            // vLLM convention first, then llama.cpp router mode; the remaining
+            // adjacent ports cover operators hosting one vLLM instance per model.
+            vllm_ports: vec![8000, 8080, 8001, 8002, 8003],
         }
     }
 }
@@ -3728,6 +3730,44 @@ impl Config {
         }
         let text = toml::to_string_pretty(self).map_err(|e| NewtError::Config(e.to_string()))?;
         std::fs::write(path, text).map_err(NewtError::Io)
+    }
+
+    /// Set the top-level `default_backend` key while preserving the rest of the
+    /// TOML document, including comments and formatting. Pure: the caller owns
+    /// any filesystem write.
+    pub fn with_default_backend(text: &str, name: &str) -> Result<String> {
+        if name.trim().is_empty() {
+            return Err(NewtError::Config(
+                "default backend name cannot be empty".to_string(),
+            ));
+        }
+
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let root = doc.as_table_mut();
+        if let Some(item) = root.get_mut("default_backend") {
+            let existing = item.as_str().ok_or_else(|| {
+                NewtError::Config("`default_backend` is not a string".to_string())
+            })?;
+            if existing == name {
+                return Ok(doc.to_string());
+            }
+
+            let decor = item
+                .as_value()
+                .expect("a string item is always a value")
+                .decor()
+                .clone();
+            *item = toml_edit::value(name);
+            *item
+                .as_value_mut()
+                .expect("toml_edit::value always creates a value")
+                .decor_mut() = decor;
+        } else {
+            root.insert("default_backend", toml_edit::value(name));
+        }
+        Ok(doc.to_string())
     }
 
     /// #904: append `host` to `[tui.permissions] net` in the TOML `text`,
@@ -4800,7 +4840,7 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.discovery.hosts, vec!["localhost".to_string()]);
         assert_eq!(cfg.discovery.ollama_ports, vec![11434]);
-        assert_eq!(cfg.discovery.vllm_ports, vec![8000, 8001, 8002, 8003]);
+        assert_eq!(cfg.discovery.vllm_ports, vec![8000, 8080, 8001, 8002, 8003]);
         assert_eq!(cfg.default_backend, None);
 
         // Declared values override wholesale (no merge magic).
@@ -5874,6 +5914,76 @@ max_tool_rounds = 25
         let d: crate::mcp::McpServerEntry =
             toml::from_str("name = \"x\"\ncommand = \"x\"\nenabled = false\n").unwrap();
         assert!(!d.enabled);
+    }
+
+    // ---- comment-preserving default-backend writer ----
+
+    #[test]
+    fn with_default_backend_updates_value_and_preserves_unrelated_content() {
+        let original = "\
+# hand-authored config
+default_backend = \"old\" # keep this selection note
+
+[discovery]
+hosts = [\"localhost\", \"dgx1.home.lab\"]
+
+[custom]
+operator_note = \"leave me alone\" # custom inline comment
+";
+
+        let out = Config::with_default_backend(original, "dgx1-openai-8000").unwrap();
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+
+        assert_eq!(
+            parsed.get("default_backend").and_then(toml::Value::as_str),
+            Some("dgx1-openai-8000")
+        );
+        assert!(
+            out.contains("# hand-authored config"),
+            "top comment lost: {out}"
+        );
+        assert!(
+            out.contains("# keep this selection note"),
+            "target inline comment lost: {out}"
+        );
+        assert!(
+            out.contains("dgx1.home.lab"),
+            "discovery table changed: {out}"
+        );
+        assert!(
+            out.contains("leave me alone"),
+            "custom table changed: {out}"
+        );
+        assert!(
+            out.contains("# custom inline comment"),
+            "unrelated inline comment lost: {out}"
+        );
+    }
+
+    #[test]
+    fn with_default_backend_creates_key_and_is_idempotent() {
+        let original = "# config without a default\n[discovery]\nhosts = [\"localhost\"]\n";
+        let once = Config::with_default_backend(original, "local").unwrap();
+        let twice = Config::with_default_backend(&once, "local").unwrap();
+
+        let parsed: toml::Value = toml::from_str(&once).unwrap();
+        assert_eq!(
+            parsed.get("default_backend").and_then(toml::Value::as_str),
+            Some("local")
+        );
+        assert_eq!(twice, once, "reapplying the same default changed output");
+        assert_eq!(twice.matches("default_backend").count(), 1);
+    }
+
+    #[test]
+    fn with_default_backend_rejects_empty_name() {
+        assert!(Config::with_default_backend("", "").is_err());
+        assert!(Config::with_default_backend("", "   ").is_err());
+    }
+
+    #[test]
+    fn with_default_backend_rejects_invalid_toml() {
+        assert!(Config::with_default_backend("this = = not toml", "local").is_err());
     }
 
     // ---- #904: comment-preserving "allow permanently" net writer ----

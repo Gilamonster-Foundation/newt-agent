@@ -414,10 +414,37 @@ pub enum Command {
     /// Run (or re-run) the setup wizard: probe Ollama + write ~/.newt/config.toml.
     /// Edit that file directly for everything else — newt has no settings UI.
     Init,
-    /// Interactive first-run setup: choose Ollama or DGX, pick a model from the
-    /// endpoint, preview, and write ~/.newt/config.toml. Unlike `init` (which
-    /// silently auto-probes Ollama), this prompts the human through each choice.
-    Setup,
+    /// Configure an inference backend from a target, or run the interactive
+    /// first-run wizard when no target is supplied.
+    Setup {
+        /// Backend hostname or URL to probe. Bare hosts expand through the
+        /// configured discovery ports; URLs and host:port targets are singular.
+        target: Option<String>,
+
+        /// Environment variable containing the backend bearer token. Requires
+        /// an explicit HTTPS URL (HTTP is allowed only for loopback).
+        #[arg(
+            long,
+            visible_alias = "api-key-env",
+            conflicts_with = "token_file",
+            requires = "target"
+        )]
+        token_env: Option<String>,
+
+        /// File containing the backend bearer token. Requires an explicit HTTPS
+        /// URL (HTTP only for loopback); relative paths become absolute.
+        #[arg(
+            long,
+            visible_alias = "api-key-file",
+            conflicts_with = "token_env",
+            requires = "target"
+        )]
+        token_file: Option<PathBuf>,
+
+        /// Write the detected backend configuration without confirmation.
+        #[arg(long, short = 'y', requires = "target")]
+        yes: bool,
+    },
     /// Scaffold a NEW project for an ecosystem, already wired for its lifecycle
     /// phases. `newt new pyo3 mypkg` lays down a minimal, buildable Rust+PyO3
     /// (maturin) project; `python` and `rust` too. Templates are DATA (built-in
@@ -992,7 +1019,24 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Compaction => compaction_cmd::run(cli.config.as_deref()),
         Command::Identity => identity_cmd::run(cli.config.as_deref()),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
-        Command::Setup => newt_tui::run_setup(newt_tui::color_supported()),
+        Command::Setup {
+            target,
+            token_env,
+            token_file,
+            yes,
+        } => match target {
+            Some(target) => {
+                newt_tui::run_setup_target(
+                    &target,
+                    token_env.as_deref(),
+                    token_file.as_deref(),
+                    yes,
+                    cli.config.as_deref(),
+                )
+                .await
+            }
+            None => newt_tui::run_setup(newt_tui::color_supported()),
+        },
         Command::Auth { server } => auth_cmd::run(server),
         Command::New {
             ecosystem,
@@ -1535,6 +1579,110 @@ mod tests {
         let cli = Cli::try_parse_from(["newt", "--splash", "--no-splash"]).unwrap();
         assert!(cli.no_splash);
         assert!(!cli.splash);
+    }
+
+    #[test]
+    fn parses_setup_target_token_env_and_yes() {
+        let cli = Cli::try_parse_from([
+            "newt",
+            "setup",
+            "https://dgx1.home.lab:8000",
+            "--token-env",
+            "DGX_TOKEN",
+            "--yes",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Setup {
+                target,
+                token_env,
+                token_file,
+                yes,
+            }) => {
+                assert_eq!(target.as_deref(), Some("https://dgx1.home.lab:8000"));
+                assert_eq!(token_env.as_deref(), Some("DGX_TOKEN"));
+                assert_eq!(token_file, None);
+                assert!(yes);
+            }
+            other => panic!("expected setup command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_token_reference_aliases() {
+        let env_cli = Cli::try_parse_from([
+            "newt",
+            "setup",
+            "https://dgx1.home.lab:8000",
+            "--api-key-env",
+            "DGX_TOKEN",
+        ])
+        .unwrap();
+        assert!(matches!(
+            env_cli.command,
+            Some(Command::Setup {
+                token_env: Some(ref value),
+                ..
+            }) if value == "DGX_TOKEN"
+        ));
+
+        let file_cli = Cli::try_parse_from([
+            "newt",
+            "setup",
+            "https://dgx1.home.lab:8080",
+            "--api-key-file",
+            "/tmp/dgx-token",
+        ])
+        .unwrap();
+        assert!(matches!(
+            file_cli.command,
+            Some(Command::Setup {
+                token_file: Some(ref value),
+                ..
+            }) if value == std::path::Path::new("/tmp/dgx-token")
+        ));
+    }
+
+    #[test]
+    fn setup_token_references_conflict() {
+        let err = Cli::try_parse_from([
+            "newt",
+            "setup",
+            "dgx1.home.lab",
+            "--token-env",
+            "DGX_TOKEN",
+            "--token-file",
+            "/tmp/dgx-token",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_setup_without_target_for_interactive_wizard() {
+        let cli = Cli::try_parse_from(["newt", "setup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Setup {
+                target: None,
+                token_env: None,
+                token_file: None,
+                yes: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn setup_target_only_flags_require_a_target() {
+        for args in [
+            vec!["newt", "setup", "--yes"],
+            vec!["newt", "setup", "--token-env", "DGX_TOKEN"],
+            vec!["newt", "setup", "--token-file", "/tmp/dgx-token"],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
     }
 
     #[test]
