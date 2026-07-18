@@ -190,6 +190,23 @@ pub struct PromptIntake {
 }
 
 impl PromptIntake {
+    /// Analyze a new operator prompt before any model-visible work begins,
+    /// classifying its disposition against `lexicon` (#1260 — the operator's
+    /// `[intake]` overrides; [`DispositionLexicon::default`] = built-ins).
+    pub fn analyze_with(prompt: &str, lexicon: &DispositionLexicon) -> Self {
+        let mut intake = Self::analyze(prompt);
+        if prompt.trim().is_empty() {
+            return intake; // the empty-prompt Ask terminal is not lexicon-driven
+        }
+        // Re-derive only the lexicon-driven part; asks/decisions are unchanged.
+        intake.post_lock_disposition = infer_disposition_with(prompt, lexicon);
+        if intake.disposition != PromptDisposition::Ask {
+            intake.disposition = intake.post_lock_disposition;
+        }
+        debug_assert!(intake.validate().is_ok());
+        intake
+    }
+
     /// Analyze a new operator prompt before any model-visible work begins.
     pub fn analyze(prompt: &str) -> Self {
         if prompt.trim().is_empty() {
@@ -505,33 +522,50 @@ fn strip_list_marker(line: &str) -> &str {
     line
 }
 
-fn infer_disposition(prompt: &str) -> PromptDisposition {
-    let lower = prompt.to_ascii_lowercase();
-    let action = contains_any(
-        &lower,
-        &[
-            "implement",
-            "modify",
-            "change",
-            "create",
-            "write",
-            "edit",
-            "delete",
-            "fix",
-            "build",
-            "run ",
-            "execute",
-            "commit",
-            "push",
-            "open a pr",
-            "open pr",
-            "merge",
-        ],
-    );
-    if !action
-        && contains_any(
-            &lower,
-            &[
+/// The pure-data needle table driving [`infer_disposition`] (#1260, three-Cs):
+/// the English phrase lists and the trailing-`?` fallback are LANGUAGE
+/// knowledge, so they live in droppable/overridable data — the lexicon
+/// convention (`api_surface.rs` language packs) — never hardcoded in logic.
+/// Built-in defaults via [`Default`]; the `[intake]` config table overrides any
+/// list wholesale and retargets the `?` fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispositionLexicon {
+    /// Needles that force **Act** (checked first; any match wins).
+    pub action: Vec<String>,
+    /// Needles classifying **Research** (checked before explain).
+    pub research: Vec<String>,
+    /// Needles classifying **Explain**.
+    pub explain: Vec<String>,
+    /// Where a prompt that matches NO list but ends with `?` lands — the
+    /// fallback cliff made visible and tunable (#1257: "What are the 10 largest
+    /// Rust files…?" classified Explain SOLELY through this).
+    pub question_mark_disposition: PromptDisposition,
+}
+
+impl Default for DispositionLexicon {
+    fn default() -> Self {
+        Self {
+            action: [
+                "implement",
+                "modify",
+                "change",
+                "create",
+                "write",
+                "edit",
+                "delete",
+                "fix",
+                "build",
+                "run ",
+                "execute",
+                "commit",
+                "push",
+                "open a pr",
+                "open pr",
+                "merge",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            research: [
                 "research",
                 "investigate",
                 "look up",
@@ -541,15 +575,16 @@ fn infer_disposition(prompt: &str) -> PromptDisposition {
                 "audit",
                 "explore",
                 "compare",
-            ],
-        )
-    {
-        return PromptDisposition::Research;
-    }
-    if !action
-        && (contains_any(
-            &lower,
-            &[
+                // #1260: evidence-gathering phrasings from the diagnosed #1257
+                // session ("the 10 largest Rust files") — data additions, so
+                // such prompts classify by CONTENT, not the `?` cliff.
+                "largest",
+                "biggest",
+                "smallest",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            explain: [
                 "explain",
                 "summarize",
                 "describe",
@@ -557,10 +592,39 @@ fn infer_disposition(prompt: &str) -> PromptDisposition {
                 "why ",
                 "how does",
                 "how do",
-            ],
-        ) || lower.trim_end().ends_with('?'))
-    {
+                // #1260: plural/interrogative forms the old list missed ("what
+                // is" ≠ "what are" was half the #1257 cliff).
+                "what are",
+                "which are",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            question_mark_disposition: PromptDisposition::Explain,
+        }
+    }
+}
+
+fn infer_disposition(prompt: &str) -> PromptDisposition {
+    infer_disposition_with(prompt, &DispositionLexicon::default())
+}
+
+/// Classify a prompt's disposition against `lexicon` (#1260) — pure, no I/O.
+/// Precedence is unchanged from the historical logic: an action needle wins
+/// outright; else research; else explain; else the `?` fallback; else Act.
+fn infer_disposition_with(prompt: &str, lexicon: &DispositionLexicon) -> PromptDisposition {
+    let lower = prompt.to_ascii_lowercase();
+    let hit = |needles: &[String]| needles.iter().any(|n| !n.is_empty() && lower.contains(n));
+    if hit(&lexicon.action) {
+        return PromptDisposition::Act;
+    }
+    if hit(&lexicon.research) {
+        return PromptDisposition::Research;
+    }
+    if hit(&lexicon.explain) {
         return PromptDisposition::Explain;
+    }
+    if lower.trim_end().ends_with('?') {
+        return lexicon.question_mark_disposition;
     }
     PromptDisposition::Act
 }
@@ -713,8 +777,8 @@ fn digest_metadata(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        PromptDisposition, PromptIntake, MAX_ATOMIC_ASKS, MAX_CONCRETE_DECISIONS,
-        PROMPT_COMPREHENSION_MODEL_CARD_PREFIX,
+        DispositionLexicon, PromptDisposition, PromptIntake, MAX_ATOMIC_ASKS,
+        MAX_CONCRETE_DECISIONS, PROMPT_COMPREHENSION_MODEL_CARD_PREFIX,
     };
 
     #[test]
@@ -866,5 +930,151 @@ mod tests {
             super::explicit_answer_indices("1: one\n2: two", &[2, 6]),
             Some(vec![2, 6])
         );
+    }
+
+    // ── #1260: disposition inference as pure data ───────────────────────────
+
+    /// The #1257 canonical prompt. Today's defaults classify it Research by
+    /// CONTENT ("largest" is evidence-phrasing data) — not the `?` cliff.
+    const LARGEST_FILES_PROMPT: &str = "What are the 10 largest Rust files in this workspace?";
+
+    /// The pre-#1260 lists, reconstructed as an override — documents the cliff
+    /// durably: under the OLD data this prompt matched NOTHING ("what is" ≠
+    /// "what are"; research had "find out", not "largest") and was classified
+    /// Explain SOLELY by the trailing `?`, while the identical prompt minus its
+    /// `?` fell to Act. Any future change to this coupling is now deliberate.
+    fn pre_1260_lexicon() -> DispositionLexicon {
+        DispositionLexicon {
+            action: [
+                "implement",
+                "modify",
+                "change",
+                "create",
+                "write",
+                "edit",
+                "delete",
+                "fix",
+                "build",
+                "run ",
+                "execute",
+                "commit",
+                "push",
+                "open a pr",
+                "open pr",
+                "merge",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            research: [
+                "research",
+                "investigate",
+                "look up",
+                "find out",
+                "analyze",
+                "diagnose",
+                "audit",
+                "explore",
+                "compare",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            explain: [
+                "explain",
+                "summarize",
+                "describe",
+                "what is",
+                "why ",
+                "how does",
+                "how do",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            question_mark_disposition: PromptDisposition::Explain,
+        }
+    }
+
+    #[test]
+    fn largest_files_question_classified_explain_via_question_mark_fallback_pre_1260() {
+        let old = pre_1260_lexicon();
+        assert_eq!(
+            super::infer_disposition_with(LARGEST_FILES_PROMPT, &old),
+            PromptDisposition::Explain,
+            "under the OLD data the ? fallback alone decided"
+        );
+        assert_eq!(
+            super::infer_disposition_with(LARGEST_FILES_PROMPT.trim_end_matches('?'), &old),
+            PromptDisposition::Act,
+            "…and the same prompt minus its ? fell off the cliff to Act"
+        );
+    }
+
+    #[test]
+    fn new_defaults_classify_evidence_questions_by_content_not_the_cliff() {
+        // "largest" (research data) decides — with or without the `?`.
+        let with_q = PromptIntake::analyze(LARGEST_FILES_PROMPT);
+        assert_eq!(with_q.disposition(), PromptDisposition::Research);
+        let without_q =
+            PromptIntake::analyze("What are the 10 largest Rust files in this workspace");
+        assert_eq!(
+            without_q.disposition(),
+            PromptDisposition::Research,
+            "content decides; removing the ? no longer flips the disposition"
+        );
+        // "what are" (explain data) catches the plural interrogative the old
+        // list missed.
+        let plural = PromptIntake::analyze("What are the tradeoffs of this design?");
+        assert_eq!(plural.disposition(), PromptDisposition::Explain);
+        // A bare statement matching nothing still defaults to Act.
+        let act = PromptIntake::analyze("update the release notes for 0.8.0");
+        assert_eq!(act.disposition(), PromptDisposition::Act);
+    }
+
+    #[test]
+    fn lexicon_overrides_drive_inference_table_driven() {
+        // A dropped-in override list REPLACES its default wholesale.
+        let custom = DispositionLexicon {
+            explain: vec!["kerfuffle".to_string()],
+            question_mark_disposition: PromptDisposition::Research,
+            ..DispositionLexicon::default()
+        };
+        for (prompt, want) in [
+            ("tell me about the kerfuffle", PromptDisposition::Explain),
+            // The default explain needles are GONE (replaced), so "what is…?"
+            // now reaches the retargeted ? fallback → Research.
+            ("what is a monad?", PromptDisposition::Research),
+            // Action still wins outright.
+            ("fix the kerfuffle", PromptDisposition::Act),
+            // No needle, no ?: Act.
+            ("status report", PromptDisposition::Act),
+        ] {
+            assert_eq!(
+                super::infer_disposition_with(prompt, &custom),
+                want,
+                "{prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_with_applies_the_lexicon_and_keeps_ask_precedence() {
+        // The lexicon changes the classification vs the defaults…
+        let lex = DispositionLexicon {
+            research: vec!["kerfuffle".to_string()],
+            ..DispositionLexicon::default()
+        };
+        let intake = PromptIntake::analyze_with("tell me about the kerfuffle", &lex);
+        assert_eq!(intake.disposition(), PromptDisposition::Research);
+        // …but an unresolved decision still forces the Ask terminal, with the
+        // lexicon-derived value preserved as the post-lock disposition.
+        let asky = PromptIntake::analyze_with(
+            "Investigate either the kerfuffle or the brouhaha; compare them.",
+            &lex,
+        );
+        if asky.manifest().pending_decision_count() > 0 {
+            assert_eq!(asky.disposition(), PromptDisposition::Ask);
+        }
+        // The empty-prompt Ask terminal is untouched by any lexicon.
+        let empty = PromptIntake::analyze_with("   ", &lex);
+        assert_eq!(empty.disposition(), PromptDisposition::Ask);
     }
 }
