@@ -6,9 +6,12 @@
 //! agent loop: it advertises the remote tools (namespaced `server__tool`) in the
 //! tool list, and routes a namespaced call to the right server.
 //!
-//! It connects **stdio** and **streamable-HTTP** servers, and carries **no
-//! Caveats leash** on the remote tools — they run with whatever authority their
-//! own server has.
+//! It connects **stdio** and **streamable-HTTP** servers. A spawned **stdio**
+//! server now runs *inside* the session's Caveats leash (#1243 Leg 3): its
+//! process is confined by [`agent_bridle::ConfinedCommand`] to the same
+//! authority as a `run_command`, instead of running ambient with the host's
+//! full authority. (Remote **HTTP** tools still run with whatever authority
+//! their own server has; only their egress host is net-gated, #1156.)
 
 use newt_core::mcp::{McpServerEntry, TransportKind};
 use newt_mcp_client::{connect_http, connect_stdio, namespaced, split_namespaced, ConnectedServer};
@@ -17,12 +20,54 @@ use serde_json::{json, Value};
 /// Per-server launch outcome for the `/mcp` surface (#1149).
 #[derive(Debug, Clone)]
 pub(crate) enum McpStatus {
-    /// Connected, with this many tools registered.
-    Connected(usize),
+    /// Connected, with this many tools registered and the confinement posture
+    /// achieved (#1243 Leg 3).
+    Connected {
+        tools: usize,
+        confinement: Confinement,
+    },
     /// Skipped at launch (auth failure, timeout, spawn error, legacy SSE…).
     Skipped(String),
     /// `enabled = false` in config — not attempted.
     Disabled,
+}
+
+/// The local confinement posture of a connected server, for the `/mcp` table
+/// (#1243 Leg 3). A spawned stdio server runs inside the session's OCAP boundary;
+/// a remote HTTP server has no local process to confine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Confinement {
+    /// A spawned stdio server confined by a kernel OS sandbox — the achieved
+    /// `SandboxKind` name (e.g. `Landlock`, `Seatbelt`).
+    Confined(String),
+    /// A spawned stdio server that ran through the `ConfinedCommand` boundary but
+    /// with no OS sandbox enforcing the leash — advisory only (a `top()` grant,
+    /// or a host without Landlock/Seatbelt).
+    Advisory,
+    /// A remote (HTTP) server — no local process to confine.
+    Remote,
+}
+
+impl Confinement {
+    /// Map a connection's achieved [`newt_mcp_client::SandboxKind`] into the
+    /// posture shown in `/mcp`. `None` = remote (no local process).
+    pub(crate) fn from_sandbox(kind: Option<newt_mcp_client::SandboxKind>) -> Self {
+        match kind {
+            None => Self::Remote,
+            Some(newt_mcp_client::SandboxKind::None) => Self::Advisory,
+            Some(k) => Self::Confined(format!("{k:?}")),
+        }
+    }
+
+    /// The suffix shown after the tool count in the `/mcp` table — empty for a
+    /// remote server (its confinement is the server's own concern).
+    pub(crate) fn note(&self) -> String {
+        match self {
+            Self::Confined(kind) => format!(" — confined: {kind}"),
+            Self::Advisory => " — advisory (no OS sandbox)".to_string(),
+            Self::Remote => String::new(),
+        }
+    }
 }
 
 /// The session's connected MCP servers.
@@ -162,10 +207,11 @@ impl Mcp {
         cfg_servers: &[McpServerEntry],
         sanitize_server_names: bool,
         allow_insecure_hosts: &[String],
-        // #1156: the session's net capability — an HTTP MCP server's egress is
-        // gated by the SAME net allow-list as a shell `curl`, so a confined
-        // session can't reach an un-granted host via a rogue MCP config.
-        net: &newt_core::caveats::Scope<String>,
+        // The session's Caveats leash. #1156: an HTTP MCP server's egress is
+        // gated by its `net` axis (same allow-list as a shell `curl`), so a
+        // confined session can't reach an un-granted host via a rogue MCP config.
+        // #1243 Leg 3: a spawned stdio server is confined to this whole leash.
+        caveats: &newt_core::caveats::Caveats,
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let entries = newt_core::mcp::discover(
@@ -184,14 +230,14 @@ impl Mcp {
             // GET event-stream + POST endpoint) is not implemented; modern
             // servers use streamable-HTTP (`type: "http"`).
             let result = match entry.transport {
-                TransportKind::Stdio => connect_stdio(entry).await,
+                TransportKind::Stdio => connect_stdio(entry, caveats).await,
                 TransportKind::Http => {
                     // #1156: net-gate egress. A loopback host is the dev
                     // exception (never leaves the box); any other host must be
                     // permitted by the session net scope or the server is
                     // skipped (shown in /mcp), never silently dialed.
                     let (_scheme, host) = parse_scheme_host(entry.url.as_deref());
-                    if !http_egress_permitted(net, &host) {
+                    if !http_egress_permitted(&caveats.net, &host) {
                         tracing::warn!(
                             "MCP server `{}`: egress to {host} is outside the session net \
                              allow-list — skipped (grant it in [tui.permissions] net)",
@@ -237,7 +283,10 @@ impl Mcp {
                 Ok(connected) => {
                     statuses.push((
                         entry.name.clone(),
-                        McpStatus::Connected(connected.tools.len()),
+                        McpStatus::Connected {
+                            tools: connected.tools.len(),
+                            confinement: Confinement::from_sandbox(connected.sandbox_kind),
+                        },
                     ));
                     servers.push(connected);
                 }
@@ -385,6 +434,33 @@ mod tests {
         assert!(mcp.is_empty());
         assert!(!mcp.handles("git__status"));
         assert!(mcp.tool_defs().is_empty());
+    }
+
+    #[test]
+    fn confinement_maps_sandbox_kind_to_posture() {
+        use newt_mcp_client::SandboxKind;
+        // No local process (HTTP) → Remote.
+        assert_eq!(Confinement::from_sandbox(None), Confinement::Remote);
+        // Spawned but nothing kernel-confined → Advisory.
+        assert_eq!(
+            Confinement::from_sandbox(Some(SandboxKind::None)),
+            Confinement::Advisory
+        );
+        // A real OS sandbox → Confined, carrying the achieved kind's name.
+        assert_eq!(
+            Confinement::from_sandbox(Some(SandboxKind::Landlock)),
+            Confinement::Confined("Landlock".to_string())
+        );
+    }
+
+    #[test]
+    fn confinement_note_renders_each_posture() {
+        assert_eq!(Confinement::Remote.note(), "");
+        assert_eq!(Confinement::Advisory.note(), " — advisory (no OS sandbox)");
+        assert_eq!(
+            Confinement::Confined("Landlock".to_string()).note(),
+            " — confined: Landlock"
+        );
     }
 
     // ── transport security: the OAuth Bearer must never go over plaintext ──

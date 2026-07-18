@@ -648,7 +648,9 @@ pub(crate) fn run_chat(
             &cfg_mcp_servers,
             sanitize_mcp,
             &allow_insecure_hosts,
-            &cap.caveats().net,
+            // #1243 Leg 3: the full session leash (not just its net axis) so a
+            // spawned stdio MCP server is confined to the session's authority.
+            cap.caveats(),
         ))
     });
     if !mcp.is_empty() {
@@ -1221,8 +1223,14 @@ pub(crate) fn run_chat(
                                         print_newt("MCP servers:", color, verbose);
                                         for (n, st) in &mcp.statuses {
                                             let line = match st {
-                                                crate::mcp::McpStatus::Connected(t) => {
-                                                    format!("  {n}  ✓ connected ({t} tools)")
+                                                crate::mcp::McpStatus::Connected {
+                                                    tools,
+                                                    confinement,
+                                                } => {
+                                                    format!(
+                                                        "  {n}  ✓ connected ({tools} tools){}",
+                                                        confinement.note()
+                                                    )
                                                 }
                                                 crate::mcp::McpStatus::Skipped(r) => {
                                                     let hint = if r.contains("401")

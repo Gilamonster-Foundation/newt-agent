@@ -107,23 +107,30 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     if servers.is_empty() {
         println!("  (none discovered)");
     }
+    // The leash `doctor` spawns stdio servers under — the SAME confinement the
+    // live session applies, derived from the operator's configured preset (else a
+    // read-only default), NEVER `Caveats::top()` (#94: no top() in a dispatch
+    // path). So the diagnostic shows each server under its real confinement.
+    let mcp_caveats = mcp_probe_caveats(&config, &workspace);
     // For stdio servers we actually CONNECT (spawn + initialize + tools/list)
     // so you can see whether each is reachable and which tools it offers.
     for s in &servers {
         match s.transport {
-            newt_core::mcp::TransportKind::Stdio => match newt_mcp_client::connect_stdio(s).await {
-                Ok(connected) => {
-                    let names: Vec<&str> =
-                        connected.tools.iter().map(|t| t.name.as_str()).collect();
-                    let list = if names.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        names.join(", ")
-                    };
-                    println!("  {} [stdio] — OK, {} tool(s): {list}", s.name, names.len());
+            newt_core::mcp::TransportKind::Stdio => {
+                match newt_mcp_client::connect_stdio(s, &mcp_caveats).await {
+                    Ok(connected) => {
+                        let names: Vec<&str> =
+                            connected.tools.iter().map(|t| t.name.as_str()).collect();
+                        let list = if names.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            names.join(", ")
+                        };
+                        println!("  {} [stdio] — OK, {} tool(s): {list}", s.name, names.len());
+                    }
+                    Err(e) => println!("  {} [stdio] — ERROR: {e}", s.name),
                 }
-                Err(e) => println!("  {} [stdio] — ERROR: {e}", s.name),
-            },
+            }
             newt_core::mcp::TransportKind::Sse | newt_core::mcp::TransportKind::Http => {
                 let kind = if matches!(s.transport, newt_core::mcp::TransportKind::Sse) {
                     "sse"
@@ -140,6 +147,27 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The confined leash `doctor` spawns stdio MCP servers under: the operator's
+/// configured `[tui]` permissions preset, or a read-only default when none is
+/// configured — mirroring the session's "safe by default, never `top()`" rule
+/// (#94). The diagnostic thus shows each server under its real confinement.
+fn mcp_probe_caveats(config: &Config, workspace: &Path) -> newt_core::caveats::Caveats {
+    let ws = workspace.to_string_lossy();
+    config
+        .tui
+        .as_ref()
+        .map(|t| t.permissions.to_caveats(&ws))
+        .unwrap_or_else(|| {
+            newt_core::ToolPermissions {
+                preset: newt_core::PermissionPreset::ReadOnly,
+                extra_exec: Vec::new(),
+                net: Vec::new(),
+                prompt: false,
+            }
+            .to_caveats(&ws)
+        })
 }
 
 async fn probe_dgx(dgx: &DgxConfig) {

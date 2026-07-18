@@ -12,11 +12,25 @@
 //! is unit-tested against an in-memory mock — no subprocess needed.
 
 use anyhow::{anyhow, Context, Result};
+use newt_core::caveats::Caveats;
 use newt_core::mcp::{McpServerEntry, TransportKind};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+// The OS-sandbox posture a stdio server achieved (honest record on
+// `ConnectedServer`, surfaced by `/mcp`). Re-exported so consumers can name it
+// without a direct agent-bridle dependency.
+pub use agent_bridle::SandboxKind;
+// Confined stdio spawn (Unix): the child's stdio comes back as tokio pipe ends
+// from `agent_bridle::ConfinedCommand::spawn_tokio`.
+#[cfg(unix)]
+use agent_bridle::{ConfinedCommand, ConfinedTokioChild, Gate, Tool, ToolContext, ToolResult};
+#[cfg(unix)]
+use tokio::net::unix::pipe;
+// Non-Unix has no OS-sandbox spawn primitive yet, so the stdio child is spawned
+// via tokio's process API (advisory confinement — env-scrubbed, no kernel jail).
+#[cfg(not(unix))]
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// MCP protocol version we advertise (matches `newt-mcp-server`).
@@ -183,45 +197,238 @@ impl<T: Transport> McpConnection<T> {
     }
 }
 
+/// Assemble a confined stdio MCP child's **entire** environment as explicit
+/// grants. A `ConfinedCommand` child starts env-EMPTY (the external-boundary
+/// invariant), so everything the server needs must be granted explicitly.
+///
+/// Pure: the caller supplies the already-resolved inputs, so this is fully
+/// unit-testable with no env/fs reads. Precedence is low→high (a later source
+/// overrides an earlier same-named key):
+/// 1. the closed passthrough allow-list ([`newt_core::mcp_stdio_env_passthrough`]
+///    values read from the parent env — what a child needs to *execute*);
+/// 2. the file-sourced `~/.newt/shell-env/` drop-in ([`newt_core::shell_env`],
+///    #1243 Leg 2 — deliberate operator tokens whose values live in files);
+/// 3. the server entry's own `env` map (server-specific config/secrets win).
+fn assemble_env_grants(
+    passthrough: &[(String, String)],
+    shell_env: &BTreeMap<String, String>,
+    entry_env: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in passthrough {
+        map.insert(k.clone(), v.clone());
+    }
+    for (k, v) in shell_env {
+        map.insert(k.clone(), v.clone());
+    }
+    for (k, v) in entry_env {
+        map.insert(k.clone(), v.clone());
+    }
+    map.into_iter().collect()
+}
+
+/// Resolve the three env-grant sources from the live environment (parent env +
+/// the shell-env dir + the entry) and fold them via [`assemble_env_grants`].
+/// The impure edge — kept tiny so the assembly logic itself stays pure/tested.
+fn resolve_env_grants(entry: &McpServerEntry) -> Vec<(String, String)> {
+    let passthrough: Vec<(String, String)> = newt_core::mcp_stdio_env_passthrough()
+        .iter()
+        .filter_map(|k| {
+            std::env::var_os(k).map(|v| (k.to_string(), v.to_string_lossy().into_owned()))
+        })
+        .collect();
+    let shell_env = newt_core::Config::user_config_path()
+        .map(|p| newt_core::shell_env::from_config_dir(&p))
+        .unwrap_or_default();
+    assemble_env_grants(&passthrough, &shell_env, &entry.env)
+}
+
+/// A throwaway [`Tool`] used only to mint the spawn [`ToolContext`] through the
+/// gate. The confined spawn admission-checks the *program*, not this tool's
+/// name, so the identity is immaterial. Module-scoped (not a local type) so its
+/// trivial trait impl is unit-testable.
+#[cfg(unix)]
+struct McpSpawnTool;
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl Tool for McpSpawnTool {
+    fn name(&self) -> &str {
+        "mcp_spawn"
+    }
+    fn schema(&self) -> Value {
+        json!({})
+    }
+    async fn invoke(&self, _args: Value, _cx: &ToolContext) -> ToolResult<Value> {
+        Ok(Value::Null)
+    }
+}
+
+/// Mint the spawn [`ToolContext`] the only legitimate way — through the gate —
+/// bounded by the session `caveats`.
+#[cfg(unix)]
+fn mint_spawn_context(caveats: &Caveats) -> Result<ToolContext> {
+    Gate::new(0)
+        .authorize(&McpSpawnTool, caveats)
+        .map_err(|e| anyhow!("gate authorize failed: {e}"))
+}
+
+/// The session leash, widened to admit exec of THIS server's `command`.
+///
+/// A configured MCP server is operator-authorized infrastructure: the operator
+/// declared it in their config, so *spawning it* must not require its command in
+/// the session's exec allow-list (the agent never chose to run it). Only the
+/// command itself is granted — the child's RUNTIME authority stays exactly the
+/// session leash: `fs_write` remains Landlock-enforced, and `net` / the exec of
+/// anything the server itself spawns are unchanged. An `exec: All` leash is
+/// already unrestricted, so it is left untouched.
+#[cfg(unix)]
+fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
+    use newt_core::caveats::Scope;
+    let mut caveats = session.clone();
+    if let Scope::Only(ref mut set) = caveats.exec {
+        set.extend([command.to_string()]);
+    }
+    caveats
+}
+
+/// Log the confinement actually achieved — honest, never over-claimed.
+/// [`SandboxKind::None`] means the leash on this child is advisory only (no OS
+/// sandbox enforced it on this host). Surfacing this in `/mcp` is a follow-up.
+#[cfg(unix)]
+fn log_confinement(name: &str, kind: SandboxKind) {
+    if kind == SandboxKind::None {
+        tracing::warn!(
+            "MCP server `{name}`: spawned ADVISORY-only — no OS sandbox enforced the session \
+             leash on this host (restrictions are not kernel-confined)"
+        );
+    } else {
+        tracing::info!("MCP server `{name}`: spawned confined ({kind:?})");
+    }
+}
+
 /// Stdio transport: a spawned subprocess speaking newline-delimited JSON-RPC.
+///
+/// On Unix the child is launched through [`agent_bridle::ConfinedCommand`] so it
+/// runs *inside* the same OCAP boundary as `run_command` — the exec admission-
+/// check, the OS sandbox (Landlock/Seatbelt), and the env scrub all apply
+/// (#1243 Leg 3). Its stdio is the tokio pipe ends of a kill-on-drop
+/// [`ConfinedTokioChild`].
+#[cfg(unix)]
+pub struct StdioTransport {
+    /// Kept alive so the child is killed and reaped when this transport drops
+    /// (`ConfinedTokioChild`'s kill-on-drop).
+    _child: ConfinedTokioChild,
+    stdin: pipe::Sender,
+    stdout: tokio::io::Lines<BufReader<pipe::Receiver>>,
+    /// The OS sandbox actually applied to the child (honest posture for `/mcp`).
+    sandbox_kind: SandboxKind,
+}
+
+/// Stdio transport (non-Unix): `ConfinedCommand::spawn_tokio` (Landlock/Seatbelt)
+/// is Unix-only, so the child is spawned via tokio's process API with a scrubbed
+/// environment but WITHOUT an OS sandbox — advisory confinement (see #1255 honest
+/// limitations; Windows AppContainer pipe bridging is a future concern).
+#[cfg(not(unix))]
 pub struct StdioTransport {
     /// Kept alive so the child is not reaped while we hold its pipes
     /// (`kill_on_drop` tears it down when this transport drops).
     _child: Child,
     stdin: ChildStdin,
     stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    /// Always `None` off Unix — no OS sandbox confined the spawn here.
+    sandbox_kind: SandboxKind,
 }
 
 impl StdioTransport {
-    /// Spawn a stdio MCP server from a discovered entry. The child gets a
-    /// CLEARED environment overlaid with a closed allow-list
-    /// ([`newt_core::mcp_stdio_env_passthrough`]) plus the entry's own explicit
-    /// `env` — NEVER newt's full inherited environment (newt#1155: inheriting
-    /// it leaked every API key/token to the subprocess, making a stdio MCP
-    /// server less confined than a shell command). Its stderr is discarded so
-    /// server logging cannot corrupt the JSON-RPC stream.
-    pub fn spawn(entry: &McpServerEntry) -> Result<Self> {
+    /// The OS sandbox actually applied to this stdio child — the honest
+    /// confinement posture surfaced by `/mcp`. [`SandboxKind::None`] means the
+    /// leash was advisory only (a `top()` grant, or a host without the sandbox).
+    #[must_use]
+    pub fn sandbox_kind(&self) -> SandboxKind {
+        self.sandbox_kind
+    }
+}
+
+#[cfg(unix)]
+impl StdioTransport {
+    /// Spawn a stdio MCP server **confined** by the session `caveats`.
+    ///
+    /// The child runs inside the same OCAP boundary as `run_command`: its
+    /// environment starts EMPTY and is rebuilt from explicit grants
+    /// ([`assemble_env_grants`]) — never newt's full inherited environment
+    /// (#1155) — and `agent_bridle::ConfinedCommand::spawn_tokio` applies the
+    /// exec admission-check, the OS sandbox, and fails closed if a restricted fs
+    /// axis cannot be kernel-enforced. `stderr` is discarded so server logging
+    /// cannot corrupt the JSON-RPC stream.
+    pub fn spawn(entry: &McpServerEntry, caveats: &Caveats) -> Result<Self> {
         let command = entry
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
-        // Closed allow-list from the parent env (what a child needs to exec),
-        // then the entry's explicit env on top (where server secrets belong).
-        let allow = newt_core::mcp_stdio_env_passthrough();
-        let inherited = allow.iter().filter_map(|k| {
-            std::env::var_os(k).map(|v| (k.to_string(), v.to_string_lossy().into_owned()))
-        });
+        let grants = resolve_env_grants(entry);
+        // Admit exec of the configured server command; keep its runtime authority
+        // (fs/net) the session leash.
+        let cx = mint_spawn_context(&spawn_caveats(caveats, command)).with_context(|| {
+            format!("authorizing confined spawn of MCP server `{}`", entry.name)
+        })?;
+
+        let mut cmd = ConfinedCommand::new(command).args(&entry.args);
+        for (k, v) in &grants {
+            cmd = cmd.env(k, v);
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn_tokio(&cx)
+            .with_context(|| {
+                format!("spawning MCP server `{}` ({command}) confined", entry.name)
+            })?;
+        let sandbox_kind = child.sandbox_kind;
+        log_confinement(&entry.name, sandbox_kind);
+
+        let stdin = child
+            .take_stdin()
+            .ok_or_else(|| anyhow!("MCP server `{}`: no stdin pipe", entry.name))?;
+        let stdout = child
+            .take_stdout()
+            .ok_or_else(|| anyhow!("MCP server `{}`: no stdout pipe", entry.name))?;
+        Ok(Self {
+            _child: child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+            sandbox_kind,
+        })
+    }
+}
+
+#[cfg(not(unix))]
+impl StdioTransport {
+    /// Spawn a stdio MCP server (non-Unix): env-scrubbed but WITHOUT an OS
+    /// sandbox — the confined `spawn_tokio` primitive is Unix-only. `caveats` is
+    /// accepted for signature parity and to keep the boundary explicit; it does
+    /// not yet kernel-confine here.
+    pub fn spawn(entry: &McpServerEntry, _caveats: &Caveats) -> Result<Self> {
+        let command = entry
+            .command
+            .as_deref()
+            .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
+        let grants = resolve_env_grants(entry);
         let mut child = Command::new(command)
             .args(&entry.args)
             .env_clear()
-            .envs(inherited)
-            .envs(&entry.env)
+            .envs(grants)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning MCP server `{}` ({command})", entry.name))?;
+        tracing::warn!(
+            "MCP server `{}`: spawned ADVISORY-only — the OS-sandbox confined spawn is Unix-only",
+            entry.name
+        );
         let stdin = child
             .stdin
             .take()
@@ -234,6 +441,7 @@ impl StdioTransport {
             _child: child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
+            sandbox_kind: SandboxKind::None,
         })
     }
 }
@@ -465,12 +673,18 @@ pub struct ConnectedServer {
     pub conn: McpConnection<AnyTransport>,
     /// Tools discovered via `tools/list`.
     pub tools: Vec<RemoteTool>,
+    /// The OS-sandbox posture of the connection (#1243 Leg 3). `Some(kind)` for a
+    /// spawned **stdio** server — the confinement its process actually achieved
+    /// ([`SandboxKind::None`] = advisory); `None` for a remote **HTTP** server
+    /// (no local process to confine).
+    pub sandbox_kind: Option<SandboxKind>,
 }
 
 /// Initialize a transport and list its tools into a [`ConnectedServer`].
 async fn finish_connect(
     entry: &McpServerEntry,
     transport: AnyTransport,
+    sandbox_kind: Option<SandboxKind>,
 ) -> Result<ConnectedServer> {
     let timeout = resolve_timeout(entry);
     let mut conn = McpConnection::new_with_timeout(transport, timeout);
@@ -485,20 +699,26 @@ async fn finish_connect(
         name: entry.name.clone(),
         conn,
         tools,
+        sandbox_kind,
     })
 }
 
-/// Connect to one discovered **stdio** server: spawn, initialize, list tools.
-pub async fn connect_stdio(entry: &McpServerEntry) -> Result<ConnectedServer> {
+/// Connect to one discovered **stdio** server: spawn (confined by `caveats`),
+/// initialize, list tools. The child runs inside the session's OCAP boundary —
+/// see [`StdioTransport::spawn`].
+pub async fn connect_stdio(entry: &McpServerEntry, caveats: &Caveats) -> Result<ConnectedServer> {
     if entry.transport != TransportKind::Stdio {
         return Err(anyhow!(
             "server `{}`: connect_stdio called for a non-stdio transport",
             entry.name
         ));
     }
+    let transport = StdioTransport::spawn(entry, caveats)?;
+    let sandbox_kind = Some(transport.sandbox_kind());
     finish_connect(
         entry,
-        AnyTransport::Stdio(Box::new(StdioTransport::spawn(entry)?)),
+        AnyTransport::Stdio(Box::new(transport)),
+        sandbox_kind,
     )
     .await
 }
@@ -513,7 +733,13 @@ pub async fn connect_http(entry: &McpServerEntry) -> Result<ConnectedServer> {
             entry.name
         ));
     }
-    finish_connect(entry, AnyTransport::Http(HttpTransport::connect(entry)?)).await
+    // No local process → no local confinement posture.
+    finish_connect(
+        entry,
+        AnyTransport::Http(HttpTransport::connect(entry)?),
+        None,
+    )
+    .await
 }
 
 /// Namespace a remote tool name as `server__tool`.
@@ -625,6 +851,10 @@ impl McpToolset {
         workspace: &str,
         cfg_servers: &[McpServerEntry],
         sanitize_server_names: bool,
+        // #1243 Leg 3: a spawned stdio MCP server runs *inside* this session
+        // leash — the SAME `Caveats` a `run_command` dispatches under — instead
+        // of as an ambient child with the host's full authority.
+        caveats: &Caveats,
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let entries = newt_core::mcp::discover(
@@ -635,7 +865,7 @@ impl McpToolset {
         let mut servers = Vec::new();
         for entry in &entries {
             let result = match entry.transport {
-                TransportKind::Stdio => connect_stdio(entry).await,
+                TransportKind::Stdio => connect_stdio(entry, caveats).await,
                 TransportKind::Http => {
                     warn_on_insecure_transport(entry);
                     connect_http(entry).await
@@ -807,6 +1037,7 @@ mod toolset_tests {
                     description: String::new(),
                     input_schema: json!({}),
                 }],
+                sandbox_kind: None,
             }],
             sanitize_server_names: true,
         };
@@ -844,6 +1075,7 @@ mod toolset_tests {
                     r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"3 dirty trees"}]}}"#,
                 ]))),
                 tools: vec![],
+                sandbox_kind: None,
             }],
             sanitize_server_names: true,
         };
@@ -1015,6 +1247,163 @@ mod tests {
     }
 }
 
+#[cfg(all(unix, test))]
+mod confined_spawn_helper_tests {
+    use super::*;
+    use newt_core::mcp::{McpServerEntry, TransportKind};
+
+    #[tokio::test]
+    async fn mcp_spawn_tool_is_a_trivial_minting_stub() {
+        let tool = McpSpawnTool;
+        assert_eq!(tool.name(), "mcp_spawn");
+        assert_eq!(tool.schema(), json!({}));
+        let cx = mint_spawn_context(&Caveats::top()).expect("mint");
+        // Identity stub: ignores args/cx, returns Null.
+        assert_eq!(
+            tool.invoke(json!({"x": 1}), &cx).await.unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn mint_spawn_context_authorizes_any_leash() {
+        use newt_core::caveats::Scope;
+        assert!(mint_spawn_context(&Caveats::top()).is_ok());
+        let restricted = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        };
+        assert!(
+            mint_spawn_context(&restricted).is_ok(),
+            "minting never denies — the SPAWN admission-checks the program, not the mint"
+        );
+    }
+
+    #[test]
+    fn spawn_caveats_admits_command_but_keeps_runtime_leash() {
+        use newt_core::caveats::Scope;
+        // An Only-exec leash gains the server command; the rest is preserved.
+        let session = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        };
+        let widened = spawn_caveats(&session, "/opt/bin/modulex-mcp");
+        match widened.exec {
+            Scope::Only(set) => {
+                assert!(set.iter().any(|s| s == "echo"), "existing grant kept");
+                assert!(
+                    set.iter().any(|s| s == "/opt/bin/modulex-mcp"),
+                    "the configured server command is admitted"
+                );
+            }
+            other => panic!("expected Only, got {other:?}"),
+        }
+        // An already-unrestricted exec leash is left untouched.
+        assert!(matches!(
+            spawn_caveats(&Caveats::top(), "x").exec,
+            Scope::All
+        ));
+    }
+
+    #[test]
+    fn log_confinement_covers_advisory_and_confined() {
+        // Both branches — smoke (no panic); the honest posture the surface reads.
+        log_confinement("advisory-server", SandboxKind::None);
+        log_confinement("confined-server", SandboxKind::Landlock);
+    }
+
+    #[test]
+    fn resolve_env_grants_includes_the_entry_env() {
+        // The entry's own env is a deterministic grant regardless of ambient env
+        // or the shell-env dir (both of which vary by host).
+        let entry = McpServerEntry {
+            name: "probe".into(),
+            enabled: true,
+            transport: TransportKind::Stdio,
+            command: Some("true".into()),
+            args: vec![],
+            env: BTreeMap::from([("MCP_SERVER_ONLY".to_string(), "v".to_string())]),
+            url: None,
+            headers: BTreeMap::new(),
+            request_timeout_secs: None,
+        };
+        let grants = resolve_env_grants(&entry);
+        assert!(
+            grants
+                .iter()
+                .any(|(k, v)| k == "MCP_SERVER_ONLY" && v == "v"),
+            "the entry's explicit env must reach the grants"
+        );
+    }
+}
+
+#[cfg(test)]
+mod env_grant_assembly_tests {
+    use super::*;
+
+    fn pairs(kvs: &[(&str, &str)]) -> Vec<(String, String)> {
+        kvs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+    fn map(kvs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kvs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn merges_all_three_sources() {
+        let got = assemble_env_grants(
+            &pairs(&[("PATH", "/usr/bin")]),
+            &map(&[("GITHUB_TOKEN", "tok")]),
+            &map(&[("MODULEX_STORE", "/s")]),
+        );
+        assert_eq!(
+            got,
+            pairs(&[
+                ("GITHUB_TOKEN", "tok"),
+                ("MODULEX_STORE", "/s"),
+                ("PATH", "/usr/bin"),
+            ]),
+            "all sources present, deterministic (BTreeMap) key order"
+        );
+    }
+
+    #[test]
+    fn precedence_is_passthrough_then_shell_env_then_entry() {
+        // Same key in all three: the entry wins, then shell-env, then passthrough.
+        let got = assemble_env_grants(
+            &pairs(&[("K", "from_passthrough"), ("P", "keep")]),
+            &map(&[("K", "from_shell_env")]),
+            &map(&[("K", "from_entry")]),
+        );
+        assert_eq!(
+            got,
+            pairs(&[("K", "from_entry"), ("P", "keep")]),
+            "entry.env overrides shell-env overrides passthrough; unshared keys survive"
+        );
+    }
+
+    #[test]
+    fn shell_env_overrides_passthrough_when_entry_absent() {
+        let got = assemble_env_grants(
+            &pairs(&[("K", "from_passthrough")]),
+            &map(&[("K", "from_shell_env")]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(got, pairs(&[("K", "from_shell_env")]));
+    }
+
+    #[test]
+    fn empty_sources_yield_no_grants() {
+        assert!(
+            assemble_env_grants(&[], &BTreeMap::new(), &BTreeMap::new()).is_empty(),
+            "a confined child with nothing granted starts env-EMPTY"
+        );
+    }
+}
+
 #[cfg(test)]
 mod env_isolation_tests {
     use super::*;
@@ -1039,7 +1428,10 @@ mod env_isolation_tests {
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
         };
-        let mut t = StdioTransport::spawn(&entry).expect("spawn");
+        // top() = advisory leash: `sh` is permitted (exec unrestricted) and the
+        // env is still scrubbed to the explicit grants, so this validates the
+        // confined path's env isolation without a fail-closed on a restricted axis.
+        let mut t = StdioTransport::spawn(&entry, &Caveats::top()).expect("spawn");
         let mut leaked = false;
         let mut saw_path = false;
         while let Ok(Some(line)) = t.stdout.next_line().await {

@@ -82,9 +82,26 @@ async fn connect_persona(
     let profile = newt_core::RoleProfile::load_from_dir(name, &newt_core::Config::personas_dir())?;
     let cfg = newt_core::Config::resolve().unwrap_or_default();
     let workspace = std::env::current_dir().unwrap_or_default();
-    let toolset =
-        newt_mcp_client::McpToolset::connect(&workspace.to_string_lossy(), &cfg.mcp_servers, true)
-            .await;
+    // #1243 Leg 3: a spawned stdio server is confined by the ACTIVATED PERSONA's
+    // authority (its `CaveatProfile`), or a read-only default when the persona
+    // declares none — the #94 rule: derive the leash from identity, never
+    // `Caveats::top()`. This composes with a server's own inner leash (e.g.
+    // modulex): outer-persona-jail ∘ inner-server-leash.
+    let ws = workspace.to_string_lossy();
+    let caveats = profile
+        .caveats
+        .as_ref()
+        .map(newt_core::CaveatProfile::to_caveats)
+        .unwrap_or_else(|| {
+            newt_core::ToolPermissions {
+                preset: newt_core::PermissionPreset::ReadOnly,
+                extra_exec: Vec::new(),
+                net: Vec::new(),
+                prompt: false,
+            }
+            .to_caveats(&ws)
+        });
+    let toolset = newt_mcp_client::McpToolset::connect(&ws, &cfg.mcp_servers, true, &caveats).await;
     tracing::info!(
         persona = name,
         connected_servers = toolset.summary().len(),
