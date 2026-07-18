@@ -2549,13 +2549,27 @@ pub(crate) fn run_chat(
                         &model_input_origin,
                         ModelInputOrigin::OperatorContinuation { .. }
                     );
+                    // #1260: disposition inference honors the operator's
+                    // `[intake]` lexicon overrides (built-in defaults when
+                    // unset) — the keyword lists and `?`-fallback are config,
+                    // not code.
+                    let intake_lexicon = cfg
+                        .intake
+                        .as_ref()
+                        .map(newt_core::IntakeConfig::to_lexicon)
+                        .unwrap_or_default();
                     let prompt_intake = if is_clarification_answer {
                         pending_clarification
                             .as_ref()
                             .map(|pending| pending.intake.resolve_with_operator_answer(&task))
-                            .unwrap_or_else(|| newt_core::agentic::PromptIntake::analyze(&task))
+                            .unwrap_or_else(|| {
+                                newt_core::agentic::PromptIntake::analyze_with(
+                                    &task,
+                                    &intake_lexicon,
+                                )
+                            })
                     } else {
-                        newt_core::agentic::PromptIntake::analyze(&task)
+                        newt_core::agentic::PromptIntake::analyze_with(&task, &intake_lexicon)
                     };
 
                     // The manifest artifact deliberately contains only bounded

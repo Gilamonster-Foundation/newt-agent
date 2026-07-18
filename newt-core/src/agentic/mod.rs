@@ -169,8 +169,8 @@ pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
-    AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, PromptComprehensionManifest,
-    PromptDisposition, PromptIntake,
+    AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
+    PromptComprehensionManifest, PromptDisposition, PromptIntake,
 };
 pub use prompt_read::{
     prompt_read_tool_definition, PromptReadContext, PromptSource, SessionPromptSource,

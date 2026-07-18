@@ -106,6 +106,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<ShellConfig>,
 
+    /// `[intake]` — prompt-disposition inference overrides (#1260). `None` →
+    /// the built-in [`crate::agentic::DispositionLexicon`] defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake: Option<IntakeConfig>,
+
     /// `[context]` — context-management strategy selection (Step 24.8, #559).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextConfig>,
@@ -2280,6 +2285,65 @@ impl std::str::FromStr for ShellEngine {
 
 /// `[shell]` — engine selection for `run_command`. `engine = None` (the field
 /// unset) is deliberately distinct from an explicit choice: an unset engine lets
+/// `[intake]` — operator overrides for prompt-disposition inference (#1260).
+///
+/// Disposition inference is three needle lists + a trailing-`?` fallback,
+/// held as pure data ([`crate::agentic::DispositionLexicon`]). This table
+/// lets an operator retune it without a code change — the three-Cs shape.
+/// Each present list REPLACES its built-in default wholesale (droppable,
+/// predictable — no merge ambiguity); an absent list keeps the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IntakeConfig {
+    /// Needles that force an **Act** turn (full catalog). Replaces the default
+    /// list when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<Vec<String>>,
+    /// Needles classifying **Research** (bounded evidence loop). Replaces the
+    /// default list when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research: Option<Vec<String>>,
+    /// Needles classifying **Explain** (read-only evidence set). Replaces the
+    /// default list when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<Vec<String>>,
+    /// Where a prompt matching NO list but ending in `?` lands:
+    /// `"explain"` (default), `"research"`, or `"act"` — the #1257 fallback
+    /// cliff, made explicit and tunable. Unknown values fall back to explain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_mark_disposition: Option<String>,
+}
+
+impl IntakeConfig {
+    /// Resolve this table over the built-in defaults into the lexicon
+    /// [`crate::agentic::PromptIntake::analyze_with`] consumes.
+    #[must_use]
+    pub fn to_lexicon(&self) -> crate::agentic::DispositionLexicon {
+        let mut lex = crate::agentic::DispositionLexicon::default();
+        if let Some(list) = &self.action {
+            lex.action = list.clone();
+        }
+        if let Some(list) = &self.research {
+            lex.research = list.clone();
+        }
+        if let Some(list) = &self.explain {
+            lex.explain = list.clone();
+        }
+        match self.question_mark_disposition.as_deref() {
+            Some("research") => {
+                lex.question_mark_disposition = crate::agentic::PromptDisposition::Research;
+            }
+            Some("act") => {
+                lex.question_mark_disposition = crate::agentic::PromptDisposition::Act;
+            }
+            // "explain", unset, and unknown values all keep the default —
+            // fall back predictably rather than erroring at config load.
+            _ => {}
+        }
+        lex
+    }
+}
+
 /// `--full-access` auto-upgrade to `host` (see [`resolve_shell_engine`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -2468,7 +2532,8 @@ pub fn ocap_l3_backend() -> (&'static str, bool) {
 mod shell_engine_tests {
     use super::{
         confined_default_engine, full_access_default_engine, resolve_shell_engine,
-        resolve_shell_engine_choice, shell_env_passthrough_default, ShellConfig, ShellEngine,
+        resolve_shell_engine_choice, shell_env_passthrough_default, Config, IntakeConfig,
+        ShellConfig, ShellEngine,
     };
 
     #[test]
@@ -2598,6 +2663,71 @@ mod shell_engine_tests {
         assert_eq!(cfg.engine, Some(ShellEngine::Host));
         let cfg: ShellConfig = toml::from_str("engine = \"safe-subset\"").unwrap();
         assert_eq!(cfg.engine, Some(ShellEngine::SafeSubset));
+    }
+
+    // ── #1260: the `[intake]` disposition-inference table ───────────────────
+
+    #[test]
+    fn intake_config_defaults_are_all_unset_and_resolve_to_builtin_lexicon() {
+        let cfg: IntakeConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg, IntakeConfig::default());
+        assert_eq!(
+            cfg.to_lexicon(),
+            crate::agentic::DispositionLexicon::default(),
+            "an empty [intake] must resolve to exactly the built-in defaults"
+        );
+    }
+
+    #[test]
+    fn intake_config_overrides_round_trip_and_resolve() {
+        let cfg: IntakeConfig = toml::from_str(
+            r#"
+                explain = ["tell me about"]
+                question_mark_disposition = "research"
+            "#,
+        )
+        .unwrap();
+        // Round-trip: the knob names survive serialize → parse (never silently
+        // lost by a rename).
+        let echoed: IntakeConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(echoed, cfg);
+
+        let lex = cfg.to_lexicon();
+        assert_eq!(
+            lex.explain,
+            vec!["tell me about".to_string()],
+            "a present list REPLACES its default wholesale"
+        );
+        assert_eq!(
+            lex.action,
+            crate::agentic::DispositionLexicon::default().action,
+            "an absent list keeps the built-in default"
+        );
+        assert_eq!(
+            lex.question_mark_disposition,
+            crate::agentic::PromptDisposition::Research
+        );
+        // Unknown fallback values degrade to the default, never error.
+        let odd: IntakeConfig = toml::from_str("question_mark_disposition = \"bogus\"").unwrap();
+        assert_eq!(
+            odd.to_lexicon().question_mark_disposition,
+            crate::agentic::PromptDisposition::Explain
+        );
+    }
+
+    #[test]
+    fn config_root_parses_the_intake_table() {
+        let cfg: Config = toml::from_str(
+            r#"
+                [intake]
+                action = ["deploy"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.intake.as_ref().and_then(|i| i.action.clone()),
+            Some(vec!["deploy".to_string()])
+        );
     }
 }
 
@@ -3366,6 +3496,7 @@ impl Default for Config {
             dgx: None,
             tui: None,
             shell: None,
+            intake: None,
             context: None,
             tools: None,
             pricing: None,
