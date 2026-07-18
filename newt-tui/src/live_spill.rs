@@ -864,7 +864,7 @@ mod tests {
         controls_thread.join().unwrap();
         assert_eq!(
             renderer.snapshot_lines().last().map(String::as_str),
-            Some("▣"),
+            Some("▣ Space collapses · ↑↓ scroll"),
             "the toggle must update model state while terminal output is blocked"
         );
 
@@ -940,7 +940,13 @@ mod tests {
         renderer.write(1, ToolOutputStream::Stdout, b"a\nb\nc\nd\n");
         assert_eq!(
             renderer.snapshot_lines(),
-            ["▲ 1 more line above", "▒ b", "▒ c", "▓ d", "⧉"]
+            [
+                "▲ 1 more line above",
+                "▒ b",
+                "▒ c",
+                "▓ d",
+                "⧉ Space expands · ↑↓ scroll"
+            ]
         );
 
         renderer.finish(1);
@@ -1100,8 +1106,11 @@ mod tests {
             assert!(display_width(&line) < 8, "row escaped width: {line:?}");
         }
         let rendered = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
+        // #1263: the boundary rows now carry the key legend (~27 cols), so at
+        // the shrunken width 8 the OLD frame reflows to 14 physical rows —
+        // the erase must cover all of them (was 8 with bare-glyph boundaries).
         assert!(
-            rendered.contains("\u{1b}[8A"),
+            rendered.contains("\u{1b}[14A"),
             "old reflowed frame was not fully erased before resize: {rendered:?}"
         );
     }
@@ -1186,8 +1195,14 @@ mod tests {
 
         assert!(renderer.toggle_expanded());
         let expanded = renderer.snapshot_lines();
-        assert_eq!(expanded.first().map(String::as_str), Some("▣"));
-        assert_eq!(expanded.last().map(String::as_str), Some("▣"));
+        assert_eq!(
+            expanded.first().map(String::as_str),
+            Some("▣ Space collapses · ↑↓ scroll")
+        );
+        assert_eq!(
+            expanded.last().map(String::as_str),
+            Some("▣ Space collapses · ↑↓ scroll")
+        );
         assert_eq!(expanded.len(), 8);
         assert!(expanded.iter().all(|line| !line.starts_with('▓')));
 
@@ -1195,7 +1210,7 @@ mod tests {
         assert_eq!(renderer.snapshot_lines().len(), 5);
         assert_eq!(
             renderer.snapshot_lines().last().map(String::as_str),
-            Some("⧉")
+            Some("⧉ Space expands · ↑↓ scroll")
         );
     }
 
@@ -1240,7 +1255,7 @@ mod tests {
         control.join().unwrap();
         assert_eq!(
             renderer.snapshot_lines().last().map(String::as_str),
-            Some("▣")
+            Some("▣ Space collapses · ↑↓ scroll")
         );
     }
 }

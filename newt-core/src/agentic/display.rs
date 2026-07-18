@@ -485,7 +485,13 @@ pub(crate) fn spill_view_lines(output: &str, view: usize) -> Vec<String> {
         return out;
     }
     let hidden = lines.len() - view;
-    out.push(format!("▲ {hidden} more lines above"));
+    // #1263: this excerpt is PLAIN PRINTED TEXT — it deliberately shares the
+    // ▲/▒/▓ glyphs with the live viewport, so without this hint it masqueraded
+    // as the interactive scroller (the diagnosed operator tried to expand it in
+    // scrollback). Name the real recovery path at the point of use.
+    out.push(format!(
+        "▲ {hidden} more lines above · /spill N raises this view"
+    ));
     let tail = &lines[hidden..];
     for (i, l) in tail.iter().enumerate() {
         let glyph = if i + 1 == tail.len() { '▓' } else { '▒' };
@@ -669,7 +675,13 @@ mod tests {
         let big = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3);
         assert_eq!(
             big,
-            vec!["▲ 2 more lines above", "▒ l3", "▒ l4", "▓ l5", "…"]
+            vec![
+                "▲ 2 more lines above · /spill N raises this view",
+                "▒ l3",
+                "▒ l4",
+                "▓ l5",
+                "…"
+            ]
         );
 
         // Unbounded: raw lines, no gutter.
@@ -684,10 +696,37 @@ mod tests {
 
         assert_eq!(
             spill_view_lines(output, 3),
-            vec!["▲ 2 more lines above", "▒ l3", "▒ l4", "▓ l5", "…"]
+            vec![
+                "▲ 2 more lines above · /spill N raises this view",
+                "▒ l3",
+                "▒ l4",
+                "▓ l5",
+                "…"
+            ]
         );
         let raw: Vec<String> = output.lines().map(str::to_string).collect();
         assert_eq!(spill_view_lines(output, 0), raw);
+    }
+
+    /// #1263: the COMPLETED excerpt names its real recovery path at the point
+    /// of use — it is plain printed text sharing the live viewport's glyphs, so
+    /// without the hint it masqueraded as the interactive scroller (the
+    /// diagnosed operator tried to expand it in scrollback and could not).
+    #[test]
+    fn completed_excerpt_names_its_recovery_path() {
+        let lines = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3);
+        assert!(
+            lines[0].contains("/spill N raises this view"),
+            "the ▲ boundary must carry the recovery hint: {:?}",
+            lines[0]
+        );
+        // #1263 fingerprint pin (the other half lives in the spill_view tests):
+        // the completed excerpt's last row is the INERT `…` — never the live
+        // frame's ⧉/▣ boundary.
+        assert_eq!(lines.last().map(String::as_str), Some("…"));
+        // The fits-entirely form is inert-terminated too.
+        let small = spill_view_lines("a\nb", 3);
+        assert_eq!(small.last().map(String::as_str), Some("…"));
     }
 
     #[test]

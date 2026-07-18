@@ -555,6 +555,12 @@ fn boundary_text(gutter: Gutter) -> String {
     match gutter {
         Gutter::HiddenAbove(lines) => hidden_text(lines, "above"),
         Gutter::HiddenBelow(lines) => hidden_text(lines, "below"),
+        // #1263: the LIVE viewport advertises its keys at the point of use —
+        // the bare ⧉/▣ glyph told nobody the frame was interactive (its keys
+        // were hinted only in /help), so the inert completed excerpt could
+        // masquerade as this scroller. Honest labeling, still a plain scroller.
+        Gutter::Expand => "Space expands · ↑↓ scroll".to_string(),
+        Gutter::Collapse => "Space collapses · ↑↓ scroll".to_string(),
         _ => String::new(),
     }
 }
@@ -570,15 +576,12 @@ fn rendered_row(gutter: Gutter, text: &str, width: usize) -> RenderedRow {
     // an extra row on the next write.
     let width = width.saturating_sub(1);
     let prefix = gutter.glyph().to_string();
-    let clipped = if matches!(gutter, Gutter::Expand | Gutter::Collapse) {
-        String::new()
-    } else {
-        clip_to_width(text, width.saturating_sub(2))
-    };
+    // #1263: Expand/Collapse rows carry the key legend now (from
+    // `boundary_text`); every boundary row width-clips the same way.
+    let clipped = clip_to_width(text, width.saturating_sub(2));
     let line = match width {
         0 => String::new(),
         1 => prefix,
-        _ if matches!(gutter, Gutter::Expand | Gutter::Collapse) => prefix,
         _ if clipped.is_empty() => format!("{prefix} "),
         _ => format!("{prefix} {clipped}"),
     };
@@ -668,7 +671,13 @@ mod tests {
         assert_eq!(frame.content.len(), 3);
         assert_eq!(
             frame.lines(),
-            ["▲ 2 more lines above", "▒ l3", "▒ l4", "▓ l5", "⧉",]
+            [
+                "▲ 2 more lines above",
+                "▒ l3",
+                "▒ l4",
+                "▓ l5",
+                "⧉ Space expands · ↑↓ scroll",
+            ]
         );
     }
 
@@ -695,7 +704,13 @@ mod tests {
         let frame = view.frame();
         assert_eq!(
             frame.lines(),
-            ["⧉", "▓ l1", "▒ l2", "▒ l3", "▼ 2 more lines below",]
+            [
+                "⧉ Space expands · ↑↓ scroll",
+                "▓ l1",
+                "▒ l2",
+                "▒ l3",
+                "▼ 2 more lines below",
+            ]
         );
 
         view.scroll_down();
@@ -832,14 +847,14 @@ mod tests {
                 "▒ fourth",
                 "▒ fifth",
                 "▓ sixth",
-                "⧉"
+                "⧉ Space expands · ↑↓ scroll"
             ]
         );
 
         view.toggle_expanded();
         let expanded = view.frame();
-        assert_eq!(expanded.top.line, "▣");
-        assert_eq!(expanded.bottom.line, "▣");
+        assert_eq!(expanded.top.line, "▣ Space collapses · ↑↓ scroll");
+        assert_eq!(expanded.bottom.line, "▣ Space collapses · ↑↓ scroll");
         assert_eq!(expanded.content.len(), 6);
         assert!(expanded
             .content
@@ -848,7 +863,54 @@ mod tests {
 
         view.toggle_expanded();
         assert_eq!(view.frame().content.len(), 3);
-        assert_eq!(view.frame().bottom.line, "⧉");
+        assert_eq!(view.frame().bottom.line, "⧉ Space expands · ↑↓ scroll");
+    }
+
+    /// #1263: the LIVE boundary rows advertise their keys at the point of use
+    /// — the interactivity legend, not a bare glyph nobody can decode.
+    #[test]
+    fn live_boundary_row_advertises_expand_key() {
+        let mut view = SpillView::new(80);
+        feed_lines(&mut view, &["l1", "l2", "l3", "l4", "l5"]);
+        let frame = view.frame();
+        assert!(
+            frame.bottom.line.contains("Space expands"),
+            "collapsed boundary must carry the key legend: {:?}",
+            frame.bottom.line
+        );
+        view.toggle_expanded();
+        assert!(
+            view.frame().bottom.line.contains("Space collapses"),
+            "expanded boundary must carry the collapse legend"
+        );
+    }
+
+    /// #1263: the interactivity fingerprint, pinned — a live frame's boundary
+    /// leads with ⧉/▣ (plus its legend); the completed excerpt's last row is
+    /// the inert `…` (asserted in display.rs). The distinction cannot regress
+    /// silently.
+    #[test]
+    fn live_frame_boundary_leads_with_the_interactive_glyph() {
+        let mut view = SpillView::new(80);
+        feed_lines(&mut view, &["l1", "l2", "l3", "l4", "l5"]);
+        assert!(view.frame().bottom.line.starts_with('⧉'));
+        view.toggle_expanded();
+        assert!(view.frame().bottom.line.starts_with('▣'));
+    }
+
+    /// #1263: the legend width-clips on narrow terminals like any boundary
+    /// text — never escaping the row or panicking.
+    #[test]
+    fn legend_clips_to_narrow_widths() {
+        for width in [0usize, 1, 2, 8, 12] {
+            let mut view = SpillView::new(width);
+            feed_lines(&mut view, &["l1", "l2", "l3", "l4", "l5"]);
+            let line = view.frame().bottom.line.clone();
+            assert!(
+                display_width(&line) < width.max(1),
+                "width {width}: row escaped its budget: {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -880,13 +942,25 @@ mod tests {
         assert_eq!(view.line_count(), 4);
         assert_eq!(
             view.frame().lines(),
-            ["▲ 1 more line above", "▒ l4", "▒ l5", "▓ l6", "⧉",]
+            [
+                "▲ 1 more line above",
+                "▒ l4",
+                "▒ l5",
+                "▓ l6",
+                "⧉ Space expands · ↑↓ scroll",
+            ]
         );
 
         view.scroll_up();
         assert_eq!(
             view.frame().lines(),
-            ["⧉", "▓ l3", "▒ l4", "▒ l5", "▼ 1 more line below",]
+            [
+                "⧉ Space expands · ↑↓ scroll",
+                "▓ l3",
+                "▒ l4",
+                "▒ l5",
+                "▼ 1 more line below",
+            ]
         );
 
         // A partial live line also consumes one bounded history slot.
