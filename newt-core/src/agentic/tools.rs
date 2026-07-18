@@ -5640,6 +5640,26 @@ mod tests {
         // gated tool that would re-box the diagnosed session).
         assert!(tool_allowed(PromptDisposition::Explain, "find"));
         assert!(tool_allowed(PromptDisposition::Research, "find"));
+        // #1259: the formal ask-the-human escalation IS admitted in evidence
+        // turns — a boxed-in model ends as a question, not penalized narration…
+        assert!(tool_allowed(
+            PromptDisposition::Explain,
+            "request_user_input"
+        ));
+        assert!(tool_allowed(
+            PromptDisposition::Research,
+            "request_user_input"
+        ));
+        // …but the capability-GRANT path stays excluded: an evidence turn must
+        // never mint caveats (the #1259 security boundary, pinned).
+        assert!(!tool_allowed(
+            PromptDisposition::Explain,
+            "request_permissions"
+        ));
+        assert!(!tool_allowed(
+            PromptDisposition::Research,
+            "request_permissions"
+        ));
         assert_eq!(
             filter_tools_for_disposition(
                 serde_json::json!({ "not": "a catalog" }),

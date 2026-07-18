@@ -1636,6 +1636,82 @@ async fn run_openai_script(script: Vec<serde_json::Value>) -> (String, usize) {
     run_openai_script_with_ledger(script, None).await
 }
 
+/// #1259: `request_user_input` is a legitimate escalation in an **Explain**
+/// turn — the boxed-in model formally asks the human instead of being forced
+/// into penalized narration (the #1257 double-bind). Headless (no gate), the
+/// dispatch returns the recoverable no-human message — never the
+/// disposition-refusal, never a hang — and the turn completes normally.
+/// Contrast pin in the same run: an Act-only tool (`run_command`) under the
+/// same Explain turn still gets the disposition refusal (the boundary holds).
+#[tokio::test]
+async fn explain_turn_request_user_input_dispatches_and_completes() {
+    let server = MockServer::start().await;
+    let round = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedOpenAi {
+            round: round.clone(),
+            script: vec![
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c1", "type": "function",
+                        "function": { "name": "request_user_input",
+                                       "arguments": "{\"question\":\"Which directory should I size?\"}" }
+                    }]
+                }),
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c2", "type": "function",
+                        "function": { "name": "run_command",
+                                       "arguments": "{\"command\":\"du -sh .\"}" }
+                    }]
+                }),
+                serde_json::json!({ "content": "Understood — proceeding with the workspace root." }),
+            ],
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.prompt_disposition = PromptDisposition::Explain;
+    let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("an Explain turn asking the human completes, never errors");
+    assert!(
+        reply.contains("proceeding with the workspace root"),
+        "the turn ends on the final answer: {reply}"
+    );
+
+    // Wire-level: what the loop fed back for each tool call.
+    let requests = server.received_requests().await.expect("recorded");
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    let all = bodies.join("\n---\n");
+    // The escalation DISPATCHED: its result is the recoverable headless
+    // message, not the disposition refusal.
+    assert!(
+        all.contains("no human available this session"),
+        "request_user_input must dispatch (headless => the recoverable no-human message): {all}"
+    );
+    assert!(
+        !all.contains("Tool `request_user_input` is unavailable"),
+        "request_user_input must NOT be disposition-refused in an Explain turn"
+    );
+    // The boundary still holds for Act-only tools in the SAME turn.
+    assert!(
+        all.contains("Tool `run_command` is unavailable"),
+        "run_command must stay disposition-refused in an Explain turn: {all}"
+    );
+}
+
 /// Like [`run_openai_script`] but with a configured narrate-then-stop
 /// rescue budget (`[tui] narration_nudge_cap`, lever L3).
 async fn run_openai_script_with_cap(

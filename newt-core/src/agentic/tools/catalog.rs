@@ -437,6 +437,15 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
                 | "tool_search"
                 | "get_context_remaining"
                 | "render_report"
+                // #1259: the formal ask-the-human escalation. An evidence turn
+                // that is genuinely boxed in (no capable tool) ends as a
+                // legitimate QUESTION instead of penalized narration — the
+                // #1257 double-bind. Free-text Q&A only: `request_permissions`
+                // stays excluded (evidence turns must not mint capability
+                // grants), and the dispatch is side-effect-free under the
+                // nulled non-Act permission gate (headless → a recoverable
+                // no-human message, never a grant, never a hang).
+                | "request_user_input"
         ),
     }
 }
