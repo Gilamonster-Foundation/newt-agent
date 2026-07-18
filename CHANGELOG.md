@@ -5,6 +5,22 @@ Notable changes to the newt-agent workspace. Format follows
 (`0.MINOR.PATCH`, pre-1.0). The workspace version in the top-level `Cargo.toml`
 is inherited by all internal crates.
 
+## [Unreleased]
+
+### Added
+
+- **`newt mcp` management verbs — no more hand-editing `[[mcp_servers]]`.**
+  `newt mcp add <name> --command … [--arg …] [--transport stdio|sse|http]
+  [--url …] [--env K=V] [--timeout-secs N]` and `newt mcp remove <name>` edit
+  the user config (or `.newt/config.toml` with `--project`) through pure,
+  comment-preserving `toml_edit` writers — duplicate adds and absent removes
+  error loudly. `newt mcp list` renders the merged discovery view (newt config
+  + Claude Code overlays) with per-row source attribution, flagging entries
+  discovery would drop. `newt mcp install <name>` resolves a curated pure-data
+  catalog (bundled `scrybe` entry; overridable via `~/.newt/mcp-catalog.toml`
+  and project `.newt/mcp-catalog.toml` drop-ins, merged by name). Bare
+  `newt mcp` still serves newt-as-an-MCP-server over stdio, unchanged.
+
 ## [0.7.3] — 2026-07-11
 
 **Theme: release-pipeline repair.** v0.7.2's crates.io publish stage broke at
