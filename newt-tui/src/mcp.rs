@@ -20,12 +20,54 @@ use serde_json::{json, Value};
 /// Per-server launch outcome for the `/mcp` surface (#1149).
 #[derive(Debug, Clone)]
 pub(crate) enum McpStatus {
-    /// Connected, with this many tools registered.
-    Connected(usize),
+    /// Connected, with this many tools registered and the confinement posture
+    /// achieved (#1243 Leg 3).
+    Connected {
+        tools: usize,
+        confinement: Confinement,
+    },
     /// Skipped at launch (auth failure, timeout, spawn error, legacy SSE…).
     Skipped(String),
     /// `enabled = false` in config — not attempted.
     Disabled,
+}
+
+/// The local confinement posture of a connected server, for the `/mcp` table
+/// (#1243 Leg 3). A spawned stdio server runs inside the session's OCAP boundary;
+/// a remote HTTP server has no local process to confine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Confinement {
+    /// A spawned stdio server confined by a kernel OS sandbox — the achieved
+    /// `SandboxKind` name (e.g. `Landlock`, `Seatbelt`).
+    Confined(String),
+    /// A spawned stdio server that ran through the `ConfinedCommand` boundary but
+    /// with no OS sandbox enforcing the leash — advisory only (a `top()` grant,
+    /// or a host without Landlock/Seatbelt).
+    Advisory,
+    /// A remote (HTTP) server — no local process to confine.
+    Remote,
+}
+
+impl Confinement {
+    /// Map a connection's achieved [`newt_mcp_client::SandboxKind`] into the
+    /// posture shown in `/mcp`. `None` = remote (no local process).
+    pub(crate) fn from_sandbox(kind: Option<newt_mcp_client::SandboxKind>) -> Self {
+        match kind {
+            None => Self::Remote,
+            Some(newt_mcp_client::SandboxKind::None) => Self::Advisory,
+            Some(k) => Self::Confined(format!("{k:?}")),
+        }
+    }
+
+    /// The suffix shown after the tool count in the `/mcp` table — empty for a
+    /// remote server (its confinement is the server's own concern).
+    pub(crate) fn note(&self) -> String {
+        match self {
+            Self::Confined(kind) => format!(" — confined: {kind}"),
+            Self::Advisory => " — advisory (no OS sandbox)".to_string(),
+            Self::Remote => String::new(),
+        }
+    }
 }
 
 /// The session's connected MCP servers.
@@ -241,7 +283,10 @@ impl Mcp {
                 Ok(connected) => {
                     statuses.push((
                         entry.name.clone(),
-                        McpStatus::Connected(connected.tools.len()),
+                        McpStatus::Connected {
+                            tools: connected.tools.len(),
+                            confinement: Confinement::from_sandbox(connected.sandbox_kind),
+                        },
                     ));
                     servers.push(connected);
                 }
@@ -389,6 +434,33 @@ mod tests {
         assert!(mcp.is_empty());
         assert!(!mcp.handles("git__status"));
         assert!(mcp.tool_defs().is_empty());
+    }
+
+    #[test]
+    fn confinement_maps_sandbox_kind_to_posture() {
+        use newt_mcp_client::SandboxKind;
+        // No local process (HTTP) → Remote.
+        assert_eq!(Confinement::from_sandbox(None), Confinement::Remote);
+        // Spawned but nothing kernel-confined → Advisory.
+        assert_eq!(
+            Confinement::from_sandbox(Some(SandboxKind::None)),
+            Confinement::Advisory
+        );
+        // A real OS sandbox → Confined, carrying the achieved kind's name.
+        assert_eq!(
+            Confinement::from_sandbox(Some(SandboxKind::Landlock)),
+            Confinement::Confined("Landlock".to_string())
+        );
+    }
+
+    #[test]
+    fn confinement_note_renders_each_posture() {
+        assert_eq!(Confinement::Remote.note(), "");
+        assert_eq!(Confinement::Advisory.note(), " — advisory (no OS sandbox)");
+        assert_eq!(
+            Confinement::Confined("Landlock".to_string()).note(),
+            " — confined: Landlock"
+        );
     }
 
     // ── transport security: the OAuth Bearer must never go over plaintext ──

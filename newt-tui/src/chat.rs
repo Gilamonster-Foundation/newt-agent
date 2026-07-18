@@ -1223,8 +1223,14 @@ pub(crate) fn run_chat(
                                         print_newt("MCP servers:", color, verbose);
                                         for (n, st) in &mcp.statuses {
                                             let line = match st {
-                                                crate::mcp::McpStatus::Connected(t) => {
-                                                    format!("  {n}  ✓ connected ({t} tools)")
+                                                crate::mcp::McpStatus::Connected {
+                                                    tools,
+                                                    confinement,
+                                                } => {
+                                                    format!(
+                                                        "  {n}  ✓ connected ({tools} tools){}",
+                                                        confinement.note()
+                                                    )
                                                 }
                                                 crate::mcp::McpStatus::Skipped(r) => {
                                                     let hint = if r.contains("401")

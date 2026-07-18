@@ -18,12 +18,14 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+// The OS-sandbox posture a stdio server achieved (honest record on
+// `ConnectedServer`, surfaced by `/mcp`). Re-exported so consumers can name it
+// without a direct agent-bridle dependency.
+pub use agent_bridle::SandboxKind;
 // Confined stdio spawn (Unix): the child's stdio comes back as tokio pipe ends
 // from `agent_bridle::ConfinedCommand::spawn_tokio`.
 #[cfg(unix)]
-use agent_bridle::{
-    ConfinedCommand, ConfinedTokioChild, Gate, SandboxKind, Tool, ToolContext, ToolResult,
-};
+use agent_bridle::{ConfinedCommand, ConfinedTokioChild, Gate, Tool, ToolContext, ToolResult};
 #[cfg(unix)]
 use tokio::net::unix::pipe;
 // Non-Unix has no OS-sandbox spawn primitive yet, so the stdio child is spawned
@@ -293,6 +295,8 @@ pub struct StdioTransport {
     _child: ConfinedTokioChild,
     stdin: pipe::Sender,
     stdout: tokio::io::Lines<BufReader<pipe::Receiver>>,
+    /// The OS sandbox actually applied to the child (honest posture for `/mcp`).
+    sandbox_kind: SandboxKind,
 }
 
 /// Stdio transport (non-Unix): `ConfinedCommand::spawn_tokio` (Landlock/Seatbelt)
@@ -306,6 +310,18 @@ pub struct StdioTransport {
     _child: Child,
     stdin: ChildStdin,
     stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    /// Always `None` off Unix — no OS sandbox confined the spawn here.
+    sandbox_kind: SandboxKind,
+}
+
+impl StdioTransport {
+    /// The OS sandbox actually applied to this stdio child — the honest
+    /// confinement posture surfaced by `/mcp`. [`SandboxKind::None`] means the
+    /// leash was advisory only (a `top()` grant, or a host without the sandbox).
+    #[must_use]
+    pub fn sandbox_kind(&self) -> SandboxKind {
+        self.sandbox_kind
+    }
 }
 
 #[cfg(unix)]
@@ -341,7 +357,8 @@ impl StdioTransport {
             .with_context(|| {
                 format!("spawning MCP server `{}` ({command}) confined", entry.name)
             })?;
-        log_confinement(&entry.name, child.sandbox_kind);
+        let sandbox_kind = child.sandbox_kind;
+        log_confinement(&entry.name, sandbox_kind);
 
         let stdin = child
             .take_stdin()
@@ -353,6 +370,7 @@ impl StdioTransport {
             _child: child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
+            sandbox_kind,
         })
     }
 }
@@ -395,6 +413,7 @@ impl StdioTransport {
             _child: child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
+            sandbox_kind: SandboxKind::None,
         })
     }
 }
@@ -626,12 +645,18 @@ pub struct ConnectedServer {
     pub conn: McpConnection<AnyTransport>,
     /// Tools discovered via `tools/list`.
     pub tools: Vec<RemoteTool>,
+    /// The OS-sandbox posture of the connection (#1243 Leg 3). `Some(kind)` for a
+    /// spawned **stdio** server — the confinement its process actually achieved
+    /// ([`SandboxKind::None`] = advisory); `None` for a remote **HTTP** server
+    /// (no local process to confine).
+    pub sandbox_kind: Option<SandboxKind>,
 }
 
 /// Initialize a transport and list its tools into a [`ConnectedServer`].
 async fn finish_connect(
     entry: &McpServerEntry,
     transport: AnyTransport,
+    sandbox_kind: Option<SandboxKind>,
 ) -> Result<ConnectedServer> {
     let timeout = resolve_timeout(entry);
     let mut conn = McpConnection::new_with_timeout(transport, timeout);
@@ -646,6 +671,7 @@ async fn finish_connect(
         name: entry.name.clone(),
         conn,
         tools,
+        sandbox_kind,
     })
 }
 
@@ -659,9 +685,12 @@ pub async fn connect_stdio(entry: &McpServerEntry, caveats: &Caveats) -> Result<
             entry.name
         ));
     }
+    let transport = StdioTransport::spawn(entry, caveats)?;
+    let sandbox_kind = Some(transport.sandbox_kind());
     finish_connect(
         entry,
-        AnyTransport::Stdio(Box::new(StdioTransport::spawn(entry, caveats)?)),
+        AnyTransport::Stdio(Box::new(transport)),
+        sandbox_kind,
     )
     .await
 }
@@ -676,7 +705,13 @@ pub async fn connect_http(entry: &McpServerEntry) -> Result<ConnectedServer> {
             entry.name
         ));
     }
-    finish_connect(entry, AnyTransport::Http(HttpTransport::connect(entry)?)).await
+    // No local process → no local confinement posture.
+    finish_connect(
+        entry,
+        AnyTransport::Http(HttpTransport::connect(entry)?),
+        None,
+    )
+    .await
 }
 
 /// Namespace a remote tool name as `server__tool`.
@@ -974,6 +1009,7 @@ mod toolset_tests {
                     description: String::new(),
                     input_schema: json!({}),
                 }],
+                sandbox_kind: None,
             }],
             sanitize_server_names: true,
         };
@@ -1011,6 +1047,7 @@ mod toolset_tests {
                     r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"3 dirty trees"}]}}"#,
                 ]))),
                 tools: vec![],
+                sandbox_kind: None,
             }],
             sanitize_server_names: true,
         };

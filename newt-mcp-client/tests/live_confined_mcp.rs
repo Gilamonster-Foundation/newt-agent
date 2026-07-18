@@ -84,10 +84,7 @@ async fn confined_stdio_server_connects_lists_and_calls() {
         .map(|t| t.name.clone())
         .expect("at least one tool");
 
-    let res = connected
-        .conn
-        .call_tool(&tool, serde_json::json!({}))
-        .await;
+    let res = connected.conn.call_tool(&tool, serde_json::json!({})).await;
     match &res {
         Ok(v) => println!("tool `{tool}` returned OK: {v}"),
         Err(e) => println!("tool `{tool}` returned a server error: {e}"),
@@ -97,8 +94,12 @@ async fn confined_stdio_server_connects_lists_and_calls() {
     // `tools/call`" means the server received it and replied (only the args were
     // wrong) — both are end-to-end round-trips. A TRANSPORT failure (timeout /
     // closed pipe / spawn error) would be a different error and fail here.
-    let ok_or_server_reply =
-        res.is_ok() || res.as_ref().unwrap_err().to_string().contains("server error on");
+    let ok_or_server_reply = res.is_ok()
+        || res
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("server error on");
     assert!(
         ok_or_server_reply,
         "tool call must round-trip over the confined transport (got a transport-level failure)"
