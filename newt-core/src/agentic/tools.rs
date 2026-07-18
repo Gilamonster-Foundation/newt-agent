@@ -2340,10 +2340,14 @@ fn glob_to_regex(glob: &str, case_sensitive: bool) -> Result<regex::Regex, Strin
 /// subprocess) — the whole point of #496. Never follows symlinked directories
 /// (avoids cycles and workspace escapes). Returns `(matches, truncated)` where
 /// `truncated` is true if `max_results` was reached and more existed.
+/// `on_hit` (#1264): called once per accepted match, in DISCOVERY order, with
+/// the workspace-relative path — the live-viewport producer seam. Presentation
+/// only: the returned listing is still ordered/truncated by [`finalize_find`].
 fn find_walk(
     root: &std::path::Path,
     workspace_root: &std::path::Path,
     opts: &FindOpts<'_>,
+    mut on_hit: impl FnMut(&str),
 ) -> Result<(Vec<String>, bool), String> {
     let pattern = match opts.name {
         Some(g) if !g.is_empty() => Some(glob_to_regex(g, opts.case_sensitive)?),
@@ -2420,7 +2424,9 @@ fn find_walk(
             .path()
             .strip_prefix(workspace_root)
             .unwrap_or_else(|_| entry.path());
-        entries.push((size, rel.to_string_lossy().replace('\\', "/")));
+        let rel_display = rel.to_string_lossy().replace('\\', "/");
+        on_hit(&rel_display);
+        entries.push((size, rel_display));
     }
     Ok(finalize_find(entries, opts))
 }
@@ -4179,7 +4185,26 @@ async fn execute_tool_inner(
                     return denied_fs_result("fs_read", path);
                 }
             }
-            match find_walk(&full, std::path::Path::new(workspace), &opts) {
+            // #1264: stream hits through the LIVE viewport as the walk
+            // discovers them — the first built-in on the #1235 machinery (the
+            // diagnosed session watched 339 lines spill with no live window at
+            // any moment). The live frame shows DISCOVERY order (presentation
+            // only); the canonical listing below stays ordered/truncated by
+            // `finalize_find` — the authoritative envelope is unchanged.
+            let mut live = LiveOutputSession::start(live_tool_output.clone());
+            let relay = live.as_ref().map(LiveOutputSession::relay);
+            let on_hit = |line: &str| {
+                if let Some(relay) = &relay {
+                    let mut chunk = line.as_bytes().to_vec();
+                    chunk.push(b'\n');
+                    relay.write(crate::agentic::ToolOutputStream::Stdout, &chunk);
+                }
+            };
+            let walked = find_walk(&full, std::path::Path::new(workspace), &opts, on_hit);
+            if let Some(live) = live.as_mut() {
+                live.finish();
+            }
+            match walked {
                 Ok((hits, truncated)) => {
                     let mut listing = if hits.is_empty() {
                         "no matches".to_string()
@@ -4444,6 +4469,57 @@ mod tests {
         assert_eq!(
             *sink.events.lock().unwrap(),
             ["start", "Stdout:now", "finish"]
+        );
+    }
+
+    /// #1264: the `find` live-stream protocol — the dispatch arm's per-hit
+    /// producer (each discovery framed as one `line\n` chunk through the
+    /// relay) emits start → incremental writes in DISCOVERY order → finish.
+    /// Fully mocked (no fs): the walk's `on_hit` seam is driven directly with
+    /// the same closure shape the arm wires.
+    #[test]
+    fn find_live_stream_emits_start_incremental_writes_then_finish() {
+        let sink = std::sync::Arc::new(RecordingLiveOutput::default());
+        let mut session = LiveOutputSession::start(Some(sink.clone())).expect("live session");
+        let relay = session.relay();
+        let on_hit = |line: &str| {
+            let mut chunk = line.as_bytes().to_vec();
+            chunk.push(b'\n');
+            relay.write(crate::agentic::ToolOutputStream::Stdout, &chunk);
+        };
+        // Discovery order (deliberately not sorted — the live frame shows the
+        // walk as it happens; the canonical listing is ordered separately).
+        for hit in ["src/b.rs", "src/a.rs", "src/c.rs"] {
+            on_hit(hit);
+        }
+        session.finish();
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            [
+                "start",
+                "Stdout:src/b.rs\n",
+                "Stdout:src/a.rs\n",
+                "Stdout:src/c.rs\n",
+                "finish"
+            ]
+        );
+    }
+
+    /// #1264: after finish, a straggler hit must never reopen the frame — the
+    /// abandon/no-reopen contract the arm relies on when the walk outruns the
+    /// presentation worker.
+    #[test]
+    fn find_live_stream_hit_after_finish_is_dropped() {
+        let sink = std::sync::Arc::new(RecordingLiveOutput::default());
+        let mut session = LiveOutputSession::start(Some(sink.clone())).expect("live session");
+        let relay = session.relay();
+        relay.write(crate::agentic::ToolOutputStream::Stdout, b"early.rs\n");
+        session.finish();
+        relay.write(crate::agentic::ToolOutputStream::Stdout, b"late.rs\n");
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            ["start", "Stdout:early.rs\n", "finish"],
+            "a post-finish hit must be a no-op"
         );
     }
 
