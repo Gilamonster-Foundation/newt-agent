@@ -6184,6 +6184,54 @@ mod tests {
         assert_eq!(run_command_redirect(""), None);
     }
 
+    /// #1262: a command with shell COMPOSITION is a real shell program the
+    /// embedded tools cannot serve — it must never be redirected (the diagnosed
+    /// session's legitimate pipeline was bounced + miscounted as a corrected
+    /// hallucination). Bare servable forms keep redirecting.
+    #[test]
+    fn run_command_redirect_passes_composed_commands_through() {
+        // The exact diagnosed pipeline.
+        assert_eq!(
+            run_command_redirect(
+                "find . -name \"*.rs\" -type f -print0 | xargs -0 du -k | sort -rn | head 20"
+            ),
+            None,
+            "a pipeline leading with `find` is not a misdirected find call"
+        );
+        // Redirects and sequencing are composition too.
+        assert_eq!(run_command_redirect("find . -name '*.log' > out.txt"), None);
+        assert_eq!(run_command_redirect("git status && git diff"), None);
+        assert_eq!(run_command_redirect("list_dir . ; echo done"), None);
+        assert_eq!(run_command_redirect("read_file $(pick_file)"), None);
+        assert_eq!(run_command_redirect("read_file `pick_file`"), None);
+        // Bare servable forms still redirect (the true positives hold).
+        assert_eq!(run_command_redirect("find . -name \"*.rs\""), Some("find"));
+        assert_eq!(run_command_redirect("list_dir src"), Some("list_dir"));
+        assert_eq!(run_command_redirect("git status"), Some("git"));
+    }
+
+    /// #1262: the loop's `hallucination_count` increments exactly on
+    /// `is_hallucination` (mod.rs call classification), so this pure pin IS the
+    /// turn-metrics behavior: the diagnosed pipeline counts ZERO hallucinations;
+    /// a bare misdirected call still counts one.
+    #[test]
+    fn pipeline_is_never_counted_as_a_hallucination() {
+        assert!(!is_hallucination(
+            "run_command",
+            &serde_json::json!({"command":
+                "find . -name \"*.rs\" -type f -print0 | xargs -0 du -k | sort -rn | head 20"})
+        ));
+        assert!(!is_hallucination(
+            "run_command",
+            &serde_json::json!({"command": "git status && git diff"})
+        ));
+        // The true positive holds: a bare misdirected call still counts.
+        assert!(is_hallucination(
+            "run_command",
+            &serde_json::json!({"command": "list_dir ."})
+        ));
+    }
+
     /// #898 regression: a real `git push` at run_command must NOT be counted as
     /// a hallucination (it now runs), while a local `git status` still is.
     #[test]
