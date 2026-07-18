@@ -21,6 +21,7 @@ pub mod dgx_status;
 pub mod dgx_vllm;
 mod doctor;
 mod identity_cmd;
+mod mcp_cmd;
 mod models_cmd;
 mod new_project;
 mod ocap_cmd;
@@ -317,8 +318,12 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         allow_no_key: bool,
     },
-    /// MCP server (stdio JSON-RPC, no TUI).
-    Mcp,
+    /// MCP server (stdio JSON-RPC, no TUI); subcommands manage the
+    /// `[[mcp_servers]]` registrations (`add` / `remove` / `list` / `install`).
+    Mcp {
+        #[command(subcommand)]
+        cmd: Option<mcp_cmd::McpCmd>,
+    },
     /// Run a multi-LLM crew on a task (navigate → plan → verify → triage), in an
     /// isolated git worktree. Exit 0 = passed, 2 = needs human review, 1 = error.
     Crew {
@@ -947,7 +952,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         } => run_worker(coder, operator_key_path, allow_no_key).await,
         // #1021 PR 5.3: `--persona` is already a global flag (parsed for
         // every subcommand); it was just silently dropped here before now.
-        Command::Mcp => run_mcp(cli.persona.as_deref()).await,
+        // Bare `newt mcp` (no subcommand) serves over stdio exactly as before.
+        Command::Mcp { cmd: None } => run_mcp(cli.persona.as_deref()).await,
+        Command::Mcp { cmd: Some(cmd) } => mcp_cmd::run(cmd, cli.config.as_deref()),
         Command::Crew {
             task,
             edit,
