@@ -2063,6 +2063,15 @@ enum FindType {
     Any,
 }
 
+/// Result ordering for the embedded `find` tool (#1258). `Name` is the historical
+/// default (paths ascending); `Size` orders by byte size descending so an
+/// evidence-only turn can answer "the N largest files" without shell access.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FindSort {
+    Name,
+    Size,
+}
+
 /// Parsed, validated options for one `find` invocation.
 struct FindOpts<'a> {
     /// Glob matched against each basename; `None` matches everything.
@@ -2076,6 +2085,10 @@ struct FindOpts<'a> {
     /// Honour .gitignore + skip .git/target/node_modules/hidden dirs.
     respect_gitignore: bool,
     case_sensitive: bool,
+    /// Prefix each line with the entry's byte size + a tab (#1258).
+    show_size: bool,
+    /// Result ordering (#1258): [`FindSort::Name`] (default) or size-descending.
+    sort: FindSort,
 }
 
 /// One-line summary of a `find` invocation for the tool trace (#529): the path
@@ -2105,6 +2118,12 @@ fn find_detail(path: &str, opts: &FindOpts) -> String {
     if !opts.case_sensitive {
         parts.push("icase".to_string());
     }
+    if matches!(opts.sort, FindSort::Size) {
+        parts.push("sort=size".to_string());
+    }
+    if opts.show_size {
+        parts.push("size".to_string());
+    }
     if parts.is_empty() {
         path.to_string()
     } else {
@@ -2127,7 +2146,46 @@ fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
             .unwrap_or(1000),
         respect_gitignore: args["respect_gitignore"].as_bool().unwrap_or(true),
         case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
+        show_size: args["show_size"].as_bool().unwrap_or(false),
+        sort: match args["sort"].as_str() {
+            Some("size") => FindSort::Size,
+            _ => FindSort::Name,
+        },
     }
+}
+
+/// Pure: order, de-duplicate, truncate, and format the collected `(size, path)`
+/// matches per `opts` (#1258). Split out of [`find_walk`] so the ordering /
+/// truncation / formatting is unit-testable without touching the filesystem.
+///
+/// - [`FindSort::Name`]: paths ascending (the historical default).
+/// - [`FindSort::Size`]: byte size **descending**, path breaking ties so the
+///   order is deterministic.
+///
+/// `show_size` prefixes each line with the byte size and a tab. Truncation to
+/// `max_results` happens AFTER ordering (so `sort=size` yields the true top-N,
+/// not the first-N-walked), and reports whether any match was dropped.
+fn finalize_find(mut entries: Vec<(u64, String)>, opts: &FindOpts<'_>) -> (Vec<String>, bool) {
+    // De-duplicate by path (defensive — the walk shouldn't repeat) via a path
+    // sort, which also establishes the Name ordering.
+    entries.sort_by(|a, b| a.1.cmp(&b.1));
+    entries.dedup_by(|a, b| a.1 == b.1);
+    if matches!(opts.sort, FindSort::Size) {
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    }
+    let truncated = entries.len() > opts.max_results;
+    entries.truncate(opts.max_results);
+    let lines = entries
+        .into_iter()
+        .map(|(size, path)| {
+            if opts.show_size {
+                format!("{size}\t{path}")
+            } else {
+                path
+            }
+        })
+        .collect();
+    (lines, truncated)
 }
 
 /// Stable detail for the universal tool audit header. This is deliberately
@@ -2323,8 +2381,12 @@ fn find_walk(
         }
     }
 
-    let mut out: Vec<String> = Vec::new();
-    let mut truncated = false;
+    // Collect every match as `(byte size, workspace-relative path)`. The whole
+    // match set is gathered (not truncated mid-walk) so `sort=size` can order the
+    // full set and return the TRUE top-N; `finalize_find` then orders, truncates,
+    // and formats. The walk still prunes target/node_modules/gitignored paths, so
+    // the collected set stays bounded for a source workspace.
+    let mut entries: Vec<(u64, String)> = Vec::new();
     for result in builder.build() {
         let entry = match result {
             Ok(e) => e,
@@ -2347,19 +2409,20 @@ fn find_walk(
                 continue;
             }
         }
-        if out.len() >= opts.max_results {
-            truncated = true;
-            break;
-        }
+        // Size is read only when it will be used (shown or sorted on) — an
+        // unreadable metadata falls back to 0 rather than dropping the match.
+        let size = if opts.show_size || matches!(opts.sort, FindSort::Size) {
+            entry.metadata().map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
         let rel = entry
             .path()
             .strip_prefix(workspace_root)
             .unwrap_or_else(|_| entry.path());
-        out.push(rel.to_string_lossy().replace('\\', "/"));
+        entries.push((size, rel.to_string_lossy().replace('\\', "/")));
     }
-    out.sort();
-    out.dedup();
-    Ok((out, truncated))
+    Ok(finalize_find(entries, opts))
 }
 
 /// Execute a single tool call and return the result string sent back to the model.
@@ -4250,6 +4313,99 @@ mod tests {
     use super::*;
     use crate::agentic::NoMcp;
 
+    // ── #1258: the embedded `find` size column (pure, fs-free) ──────────────
+
+    /// A `FindOpts` for the finalize/parse tests: defaults except the fields a
+    /// test overrides.
+    fn find_opts(max_results: usize, show_size: bool, sort: FindSort) -> FindOpts<'static> {
+        FindOpts {
+            name: None,
+            type_filter: FindType::Any,
+            max_depth: None,
+            max_results,
+            respect_gitignore: true,
+            case_sensitive: true,
+            show_size,
+            sort,
+        }
+    }
+
+    #[test]
+    fn find_opts_parses_size_column_options() {
+        let sized = serde_json::json!({ "show_size": true, "sort": "size" });
+        let opts = find_opts_from_args(&sized);
+        assert!(opts.show_size);
+        assert_eq!(opts.sort, FindSort::Size);
+        // Defaults: no size column, name order.
+        let empty = serde_json::json!({});
+        let d = find_opts_from_args(&empty);
+        assert!(!d.show_size);
+        assert_eq!(d.sort, FindSort::Name);
+        // An unknown sort value falls back to name (never errors).
+        let bogus = serde_json::json!({ "sort": "bogus" });
+        let bad = find_opts_from_args(&bogus);
+        assert_eq!(bad.sort, FindSort::Name);
+    }
+
+    #[test]
+    fn finalize_find_name_sort_is_paths_ascending() {
+        let entries = vec![
+            (10, "src/b.rs".to_string()),
+            (99, "src/a.rs".to_string()),
+            (1, "src/c.rs".to_string()),
+        ];
+        let (lines, truncated) = finalize_find(entries, &find_opts(1000, false, FindSort::Name));
+        assert_eq!(lines, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+        assert!(!truncated, "under the cap");
+    }
+
+    #[test]
+    fn finalize_find_size_sort_is_bytes_descending_with_show_size() {
+        let entries = vec![
+            (10, "small.rs".to_string()),
+            (900, "big.rs".to_string()),
+            (50, "mid.rs".to_string()),
+        ];
+        let (lines, _) = finalize_find(entries, &find_opts(1000, true, FindSort::Size));
+        assert_eq!(
+            lines,
+            vec!["900\tbig.rs", "50\tmid.rs", "10\tsmall.rs"],
+            "byte size descending, each line prefixed '<size>\\t<path>'"
+        );
+    }
+
+    #[test]
+    fn finalize_find_size_ties_break_by_path_for_determinism() {
+        let entries = vec![(42, "z.rs".to_string()), (42, "a.rs".to_string())];
+        let (lines, _) = finalize_find(entries, &find_opts(1000, false, FindSort::Size));
+        assert_eq!(lines, vec!["a.rs", "z.rs"], "equal sizes → path ascending");
+    }
+
+    #[test]
+    fn finalize_find_size_sort_truncates_to_true_top_n() {
+        // The N largest, not the first-N-walked: order THEN truncate.
+        let entries = vec![
+            (1, "a".to_string()),
+            (100, "b".to_string()),
+            (50, "c".to_string()),
+            (200, "d".to_string()),
+        ];
+        let (lines, truncated) = finalize_find(entries, &find_opts(2, true, FindSort::Size));
+        assert_eq!(lines, vec!["200\td", "100\tb"]);
+        assert!(truncated, "two matches dropped past the cap");
+    }
+
+    #[test]
+    fn finalize_find_dedups_by_path() {
+        let entries = vec![
+            (10, "dup.rs".to_string()),
+            (10, "dup.rs".to_string()),
+            (20, "other.rs".to_string()),
+        ];
+        let (lines, _) = finalize_find(entries, &find_opts(1000, false, FindSort::Name));
+        assert_eq!(lines, vec!["dup.rs", "other.rs"]);
+    }
+
     #[derive(Default)]
     struct RecordingLiveOutput {
         events: std::sync::Mutex<Vec<String>>,
@@ -5249,6 +5405,8 @@ mod tests {
             max_results: 1000,
             respect_gitignore: true,
             case_sensitive: true,
+            show_size: false,
+            sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ".");
     }
@@ -5262,6 +5420,8 @@ mod tests {
             max_results: 50,
             respect_gitignore: false,
             case_sensitive: false,
+            show_size: false,
+            sort: FindSort::Name,
         };
         assert_eq!(
             find_detail("src", &opts),
@@ -5278,8 +5438,28 @@ mod tests {
             max_results: 1000,
             respect_gitignore: true,
             case_sensitive: true,
+            show_size: false,
+            sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ". (type=d)");
+    }
+
+    #[test]
+    fn find_detail_notes_the_size_column_and_size_sort() {
+        let opts = FindOpts {
+            name: Some("*.rs"),
+            type_filter: FindType::Files,
+            max_depth: None,
+            max_results: 10,
+            respect_gitignore: true,
+            case_sensitive: true,
+            show_size: true,
+            sort: FindSort::Size,
+        };
+        assert_eq!(
+            find_detail(".", &opts),
+            ". (name=*.rs, type=f, max=10, sort=size, size)"
+        );
     }
 
     #[test]
@@ -5454,6 +5634,12 @@ mod tests {
         assert!(!tool_allowed(PromptDisposition::Research, "incident__read"));
         assert!(!tool_allowed(PromptDisposition::Ask, "read_file"));
         assert!(tool_allowed(PromptDisposition::Act, "incident__write"));
+        // #1258: `find` carries the size column (sort=size/show_size), so an
+        // evidence-only turn answers "largest files" through it — pin that it
+        // stays in the Explain/Research set (guards against a future move to a
+        // gated tool that would re-box the diagnosed session).
+        assert!(tool_allowed(PromptDisposition::Explain, "find"));
+        assert!(tool_allowed(PromptDisposition::Research, "find"));
         assert_eq!(
             filter_tools_for_disposition(
                 serde_json::json!({ "not": "a catalog" }),
