@@ -1969,6 +1969,57 @@ async fn accepted_narration_reports_cap_exhausted_end_reason() {
 }
 
 #[tokio::test]
+async fn explain_turn_narration_reports_completed_not_cap_exhausted() {
+    // #1261 regression (the diagnosed ornith:35b footer): in a NON-Act turn the
+    // narration rescue can never arm (`action_nudges` is forced false, so
+    // `action_turn` is false) — the budget is untouched and no cap value could
+    // change anything. Ending on pending-action-looking prose is therefore this
+    // turn's LEGITIMATE completion. Before the fix the end reason was computed
+    // WITHOUT the gate's `action_turn` guard, reporting NarrationCapExhausted —
+    // rendered as "⚠ ended on narration (rescue budget spent)", blaming the
+    // model for a harness decision.
+    let server = MockServer::start().await;
+    let round = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedOpenAi {
+            round: round.clone(),
+            script: vec![
+                // The same pending-action phrasing the Act-turn test uses — the
+                // classifier sees "pending action" either way; only the turn
+                // type differs.
+                serde_json::json!({ "content": "Let me keep editing now." }),
+            ],
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut end_reason: Option<crate::TurnEndReason> = None;
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.prompt_disposition = PromptDisposition::Explain;
+    c.end_reason = Some(&mut end_reason);
+    let _ = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    assert_eq!(
+        end_reason,
+        Some(crate::TurnEndReason::Completed),
+        "a non-Act turn ending on prose is a completion, never 'rescue budget spent'"
+    );
+    // The footer stays clean too — the ⚠ never renders for Completed.
+    let metrics = crate::TurnMetrics {
+        end_reason,
+        ..Default::default()
+    };
+    assert!(
+        !metrics.display_line().contains('⚠'),
+        "no warning may render: {}",
+        metrics.display_line()
+    );
+}
+
+#[tokio::test]
 async fn genuine_completion_reports_completed_end_reason() {
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
