@@ -85,7 +85,7 @@ async fn http_json_response_lists_and_calls_tools() {
     headers.insert("Authorization".to_string(), "Bearer secret".to_string());
     let entry = http_entry(format!("{}/mcp", server.uri()), headers);
 
-    let mut connected = connect_http(&entry)
+    let mut connected = connect_http(&entry, &newt_core::caveats::Caveats::top())
         .await
         .expect("connect_http should succeed");
     assert_eq!(connected.name, "test-http");
@@ -122,7 +122,7 @@ async fn http_sse_response_is_parsed() {
         .await;
 
     let entry = http_entry(format!("{}/mcp", server.uri()), BTreeMap::new());
-    let connected = connect_http(&entry)
+    let connected = connect_http(&entry, &newt_core::caveats::Caveats::top())
         .await
         .expect("connect_http (SSE) should succeed");
     assert_eq!(connected.tools.len(), 1);
@@ -140,9 +140,50 @@ async fn http_error_status_surfaces() {
         .await;
 
     let entry = http_entry(format!("{}/mcp", server.uri()), BTreeMap::new());
-    let err = connect_http(&entry)
+    let err = connect_http(&entry, &newt_core::caveats::Caveats::top())
         .await
         .err()
         .expect("500 must surface as an error");
     assert!(err.to_string().contains("500"), "{err}");
+}
+
+/// #1243 Leg 4: the HTTP client is bound to the loopback egress proxy exactly
+/// when the `net` grant warrants one (a general remote-host allow-list) — so
+/// per-call traffic + redirects are gated, not just the connect-time host. No
+/// network here: `HttpTransport::connect` only builds the client (and binds a
+/// loopback proxy for the gated case). The proxy's per-host refusal itself is
+/// proven in agent-bridle.
+#[test]
+fn http_connect_wires_the_egress_proxy_only_under_a_remote_host_grant() {
+    use newt_core::caveats::{Caveats, Scope};
+    use newt_mcp_client::HttpTransport;
+
+    let entry = http_entry("http://example.com/mcp".to_string(), BTreeMap::new());
+
+    // A general remote-host grant engages the proxy.
+    let granted = Caveats {
+        net: Scope::only(["api.example.com".to_string()]),
+        ..Caveats::top()
+    };
+    assert!(
+        HttpTransport::connect(&entry, &granted)
+            .expect("build")
+            .egress_proxied(),
+        "a remote-host net grant must route the client through the proxy"
+    );
+
+    // `net: All` (top) warrants no proxy — egress advisory.
+    assert!(!HttpTransport::connect(&entry, &Caveats::top())
+        .expect("build")
+        .egress_proxied());
+
+    // Deny-all warrants no proxy either (it is kernel-fenced elsewhere; the
+    // HTTP client simply has none wired).
+    let deny = Caveats {
+        net: Scope::only([] as [String; 0]),
+        ..Caveats::top()
+    };
+    assert!(!HttpTransport::connect(&entry, &deny)
+        .expect("build")
+        .egress_proxied());
 }
