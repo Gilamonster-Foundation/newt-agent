@@ -35,6 +35,32 @@ pub enum TransportKind {
     /// Streamable-HTTP endpoint.
     Http,
 }
+
+impl TransportKind {
+    /// The lowercase config keyword for this transport (the `type` field).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Sse => "sse",
+            Self::Http => "http",
+        }
+    }
+
+    /// Parse a config keyword (`stdio` / `sse` / `http`) — the inverse of
+    /// [`as_str`](Self::as_str). Keeps newt-core clap-free: the CLI's
+    /// `--transport` value parser delegates here (the `ColorMode` pattern).
+    #[must_use]
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s {
+            "stdio" => Some(Self::Stdio),
+            "sse" => Some(Self::Sse),
+            "http" => Some(Self::Http),
+            _ => None,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -166,6 +192,19 @@ pub fn discover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_keywords_round_trip() {
+        for kind in [
+            TransportKind::Stdio,
+            TransportKind::Sse,
+            TransportKind::Http,
+        ] {
+            assert_eq!(TransportKind::from_keyword(kind.as_str()), Some(kind));
+        }
+        assert_eq!(TransportKind::Stdio.as_str(), "stdio");
+        assert_eq!(TransportKind::from_keyword("grpc"), None);
+    }
 
     #[test]
     fn parses_claude_stdio_and_sse_entries() {
