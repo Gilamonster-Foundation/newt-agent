@@ -20,9 +20,20 @@ newt-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+# `net` supplies `tokio::net::unix::pipe` — the tokio pipe ends returned by
+# `agent_bridle::ConfinedCommand::spawn_tokio` for the confined stdio transport
+# (Unix). `net` is also pulled transitively via agent-bridle's `spawn-tokio`, but
+# name it here so a `-p newt-mcp-client` build carries it regardless of scope.
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 reqwest.workspace = true
+# The confinement boundary for spawned stdio MCP servers (#1243 Leg 3, #1180):
+# `spawn-tokio` = the tokio-native confined spawn; `os-sandbox` = the real OS
+# sandbox backends (Landlock/Seatbelt/AppContainer) so the leash actually
+# kernel-enforces regardless of build scope, not just advisory.
+agent-bridle = { version = "0.7.7", features = ["spawn-tokio", "os-sandbox"] }
+# The throwaway `Tool` used to mint the spawn `ToolContext` through the gate.
+async-trait.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

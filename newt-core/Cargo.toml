@@ -62,14 +62,13 @@ tokio.workspace = true
 # `host-shell` = the sandboxed-host engine (`/bin/sh -c` in the L3 jail, ADR 0019)
 # selectable via `[shell] engine = "host"`; `os-sandbox` enables every OS L3
 # backend (Landlock/Seatbelt/AppContainer — each inert off its target OS).
-# #1235 depends on the additive output-observer API from agent-bridle PR #246
-# (branch feat/tool-output-observer, commit 47430ca), which is not yet in a
-# published release (0.7.6 does not include it — see agent-bridle #246/#248).
-# Keep the exact source on this direct dependency (rather than a workspace-root
-# patch) so external workspaces that consume newt-core by path resolve the same
-# reviewed revision. Replace this pin with the next published bridle release
-# once #246 lands upstream (also picks up the 0.7.6 env-seam fix, #1252).
-agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "47430ca665d35ec382ec4d95f0de060270946324", version = "0.7.5", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519"] }
+# agent-bridle 0.7.7 (published) — this REPLACES the earlier git pin to the
+# unpublished output-observer branch (#1235 / agent-bridle PR #246, rev 47430ca):
+# the 0.7.7 release was cut AFTER #246 merged, so it carries BOTH that
+# output-observer API (#1235's need) AND `spawn_tokio` (#254) for the confined
+# stdio-MCP boundary (#1243 Leg 3). `spawn-tokio` = the tokio-native confined
+# spawn newt-mcp-client uses; the rest are the confined shell/web engines.
+agent-bridle = { version = "0.7.7", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "spawn-tokio"] }
 
 # Step 25.1 (#568 follow-on): Markdown → ANSI rendering for assistant output,
 # behind the default `markdown` feature. Stripped under --no-default-features

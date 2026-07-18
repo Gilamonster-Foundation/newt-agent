@@ -82,9 +82,17 @@ async fn connect_persona(
     let profile = newt_core::RoleProfile::load_from_dir(name, &newt_core::Config::personas_dir())?;
     let cfg = newt_core::Config::resolve().unwrap_or_default();
     let workspace = std::env::current_dir().unwrap_or_default();
-    let toolset =
-        newt_mcp_client::McpToolset::connect(&workspace.to_string_lossy(), &cfg.mcp_servers, true)
-            .await;
+    // #1243 Leg 3: spawned stdio servers are confined by this leash. The headless
+    // server has no interactive session leash, so spawn under an advisory top()
+    // for now (parity with prior behavior); wiring the persona's caveats here is
+    // a follow-up.
+    let toolset = newt_mcp_client::McpToolset::connect(
+        &workspace.to_string_lossy(),
+        &cfg.mcp_servers,
+        true,
+        &newt_core::caveats::Caveats::top(),
+    )
+    .await;
     tracing::info!(
         persona = name,
         connected_servers = toolset.summary().len(),

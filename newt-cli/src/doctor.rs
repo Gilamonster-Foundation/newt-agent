@@ -111,19 +111,25 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     // so you can see whether each is reachable and which tools it offers.
     for s in &servers {
         match s.transport {
-            newt_core::mcp::TransportKind::Stdio => match newt_mcp_client::connect_stdio(s).await {
-                Ok(connected) => {
-                    let names: Vec<&str> =
-                        connected.tools.iter().map(|t| t.name.as_str()).collect();
-                    let list = if names.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        names.join(", ")
-                    };
-                    println!("  {} [stdio] — OK, {} tool(s): {list}", s.name, names.len());
+            // `doctor` is a connectivity diagnostic, not a leashed run: spawn
+            // under an advisory top() leash so a restrictive fs axis can't
+            // fail-closed and mask a genuinely reachable server. The real
+            // session leash confines the actual agent path (see chat.rs).
+            newt_core::mcp::TransportKind::Stdio => {
+                match newt_mcp_client::connect_stdio(s, &newt_core::caveats::Caveats::top()).await {
+                    Ok(connected) => {
+                        let names: Vec<&str> =
+                            connected.tools.iter().map(|t| t.name.as_str()).collect();
+                        let list = if names.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            names.join(", ")
+                        };
+                        println!("  {} [stdio] — OK, {} tool(s): {list}", s.name, names.len());
+                    }
+                    Err(e) => println!("  {} [stdio] — ERROR: {e}", s.name),
                 }
-                Err(e) => println!("  {} [stdio] — ERROR: {e}", s.name),
-            },
+            }
             newt_core::mcp::TransportKind::Sse | newt_core::mcp::TransportKind::Http => {
                 let kind = if matches!(s.transport, newt_core::mcp::TransportKind::Sse) {
                     "sse"

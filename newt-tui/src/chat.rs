@@ -648,7 +648,9 @@ pub(crate) fn run_chat(
             &cfg_mcp_servers,
             sanitize_mcp,
             &allow_insecure_hosts,
-            &cap.caveats().net,
+            // #1243 Leg 3: the full session leash (not just its net axis) so a
+            // spawned stdio MCP server is confined to the session's authority.
+            cap.caveats(),
         ))
     });
     if !mcp.is_empty() {

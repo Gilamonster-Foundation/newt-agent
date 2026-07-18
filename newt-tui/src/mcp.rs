@@ -6,9 +6,12 @@
 //! agent loop: it advertises the remote tools (namespaced `server__tool`) in the
 //! tool list, and routes a namespaced call to the right server.
 //!
-//! It connects **stdio** and **streamable-HTTP** servers, and carries **no
-//! Caveats leash** on the remote tools — they run with whatever authority their
-//! own server has.
+//! It connects **stdio** and **streamable-HTTP** servers. A spawned **stdio**
+//! server now runs *inside* the session's Caveats leash (#1243 Leg 3): its
+//! process is confined by [`agent_bridle::ConfinedCommand`] to the same
+//! authority as a `run_command`, instead of running ambient with the host's
+//! full authority. (Remote **HTTP** tools still run with whatever authority
+//! their own server has; only their egress host is net-gated, #1156.)
 
 use newt_core::mcp::{McpServerEntry, TransportKind};
 use newt_mcp_client::{connect_http, connect_stdio, namespaced, split_namespaced, ConnectedServer};
@@ -162,10 +165,11 @@ impl Mcp {
         cfg_servers: &[McpServerEntry],
         sanitize_server_names: bool,
         allow_insecure_hosts: &[String],
-        // #1156: the session's net capability — an HTTP MCP server's egress is
-        // gated by the SAME net allow-list as a shell `curl`, so a confined
-        // session can't reach an un-granted host via a rogue MCP config.
-        net: &newt_core::caveats::Scope<String>,
+        // The session's Caveats leash. #1156: an HTTP MCP server's egress is
+        // gated by its `net` axis (same allow-list as a shell `curl`), so a
+        // confined session can't reach an un-granted host via a rogue MCP config.
+        // #1243 Leg 3: a spawned stdio server is confined to this whole leash.
+        caveats: &newt_core::caveats::Caveats,
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let entries = newt_core::mcp::discover(
@@ -184,14 +188,14 @@ impl Mcp {
             // GET event-stream + POST endpoint) is not implemented; modern
             // servers use streamable-HTTP (`type: "http"`).
             let result = match entry.transport {
-                TransportKind::Stdio => connect_stdio(entry).await,
+                TransportKind::Stdio => connect_stdio(entry, caveats).await,
                 TransportKind::Http => {
                     // #1156: net-gate egress. A loopback host is the dev
                     // exception (never leaves the box); any other host must be
                     // permitted by the session net scope or the server is
                     // skipped (shown in /mcp), never silently dialed.
                     let (_scheme, host) = parse_scheme_host(entry.url.as_deref());
-                    if !http_egress_permitted(net, &host) {
+                    if !http_egress_permitted(&caveats.net, &host) {
                         tracing::warn!(
                             "MCP server `{}`: egress to {host} is outside the session net \
                              allow-list — skipped (grant it in [tui.permissions] net)",
