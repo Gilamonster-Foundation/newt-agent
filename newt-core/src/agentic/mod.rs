@@ -2106,7 +2106,19 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         // WHY — before this, a narration acceptance was
                         // indistinguishable from a normal completion, even
                         // under NEWT_DEBUG (2026-07-08 ornith:35b forensics).
-                        let accepted_reason = if nudge_classification.is_pending_action() {
+                        //
+                        // #1261: the reason MIRRORS the rescue gate above —
+                        // including its `action_turn` guard. On a turn where
+                        // the rescue can never arm (non-Act disposition forces
+                        // `action_nudges = false`, or the prompt does not
+                        // invite action), prose is this turn's LEGITIMATE
+                        // ending: reporting "rescue budget spent" there blamed
+                        // the model for a harness decision — the budget was
+                        // untouched and no cap value could have changed
+                        // anything (the diagnosed ornith:35b Explain turn).
+                        let accepted_reason = if nudge_classification.is_pending_action()
+                            && action_turn
+                        {
                             if round + 1 >= current_tool_round_limit {
                                 crate::TurnEndReason::NarrationFinalRound
                             } else {
@@ -5200,12 +5212,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 );
             }
             // Acceptance forensics (mirrors the Ollama macro): record WHY
-            // this no-tool reply ends the turn.
+            // this no-tool reply ends the turn. #1261: includes the gate's
+            // `action_turn` guard — where the rescue can never arm (non-Act
+            // turn / non-action-inviting prompt), prose is the legitimate
+            // ending, never a "budget spent" anomaly.
             let accepted_reason = if content.is_empty() {
                 crate::TurnEndReason::Empty
             } else if nudge_classification
                 .as_ref()
                 .is_some_and(|c| c.is_pending_action())
+                && action_turn
             {
                 if round + 1 >= current_tool_round_limit {
                     crate::TurnEndReason::NarrationFinalRound
