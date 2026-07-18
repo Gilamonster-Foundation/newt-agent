@@ -16,9 +16,8 @@
 # An explicit (empty) workspace table: this crate is its own workspace root.
 # The parent's `exclude = ["newt-mesh"]` already implies this in the normal
 # side-by-side layout, but the explicit table makes it hold from any path
-# (e.g. a git worktree nested under the main checkout) — which the
-# [patch.crates-io] block below depends on, since patches only apply at a
-# workspace root.
+# (e.g. a git worktree nested under the main checkout) and gives the mesh
+# integration its own reproducible lockfile.
 [workspace]
 
 [package]
@@ -105,6 +104,5 @@ lto           = "thin"
 codegen-units = 1
 strip         = true
 
-# agent-bridle is a published crates.io dep as of 0.7.0 (see ../Cargo.toml) — no
-# git patch needed here anymore. newt-core (this crate's path dep) pulls
-# `agent-bridle = "0.7"` from crates.io directly.
+# newt-core carries its agent-bridle source pin directly, so this standalone
+# workspace resolves the same exact revision without its own workspace patch.

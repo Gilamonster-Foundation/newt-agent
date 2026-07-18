@@ -4,15 +4,19 @@
 2026-06-17** by #416 — a two-mode deviation adds an opt-in rich inline input
 surface on a TTY (see the carve-out below); **refined 2026-06-20** by #527 — the
 chat surface now wears two presentation morphologies (LeanTUI / RichTUI), see
-`docs/decisions/lean_rich_tui_morphologies.md`. The plain-scroller rule still
-governs the piped/headless path and all output.
-**Date:** 2026-06-12 (amended 2026-06-17, refined 2026-06-20)
+`docs/decisions/lean_rich_tui_morphologies.md`; **partially superseded
+2026-07-16** by `docs/decisions/live_spill_viewport.md` for one TTY-only,
+turn-scoped active-tool output block. The plain-scroller rule still governs the
+piped/headless path and all committed output.
+**Date:** 2026-06-12 (amended 2026-06-17, refined 2026-06-20, partially
+superseded 2026-07-16)
 **Related:** newt-agent#89 ("is a rich interactive TUI in-scope for newt's
 'sharp minimal binary' identity?" — closed by the newt / gilamonster-agent
 split; this doc records the standing answer), PR #301 (the preamble always
 shows), #416 (two-mode rich inline input — the amendment), PR #419 (the
 `InputSurface` seam that makes it severable), `docs/decisions/mesh_integration.md`
-(newt as a mesh worker).
+(newt as a mesh worker), `docs/decisions/live_spill_viewport.md` (the narrow
+active-tool live-output exception).
 
 ---
 
@@ -22,7 +26,9 @@ newt is deliberately a **simple line-scrolling terminal application** — like
 bash. The chat surface is rustyline input plus `println!` output; the
 terminal's own scrollback buffer is the history. There is no alternate
 screen in the chat path, no custom scroll region, no panes, no status bars,
-no widgets, no mouse handling.
+no widgets, no mouse handling. The one active-tool exception is the bounded,
+TTY-only live spill viewport; it is erased before canonical output is committed
+to terminal scrollback.
 
 This is not a temporary limitation. It is a load-bearing design choice:
 **newt is amphibious** — the same agent serves a human at a terminal *and*
@@ -37,7 +43,7 @@ the middle of it:
 | Tier | Agent | Surface | Authority (ocap) |
 |------|-------|---------|------------------|
 | Flight (headless swarm) | **wyvern-agent** | None. A very stripped-down version of this same agent design, built for "flight": no TUI creature comforts at all, very light, fully headless. Communicates **only via agent-mesh**. | **Locked into the embedded brush.** No escape hatch, no mechanism to ask for privileges — there is no human on the other end to ask. |
-| Amphibious (human + headless) | **newt-agent** | Plain scroller. One code path that works identically for a human over SSH/tmux *and* piped/headless in swarm contexts. | ocap by default, with a deliberate escape hatch (`--disable-ocap` / `--yolo`, #297) **for usability testing** — a human-in-the-loop affordance only. |
+| Amphibious (human + headless) | **newt-agent** | Plain scroller with severable TTY-only input and active-tool spill projections; piped/headless runs keep canonical line output. | ocap by default, with a deliberate escape hatch (`--disable-ocap` / `--yolo`, #297) **for usability testing** — a human-in-the-loop affordance only. |
 | Swarm control | **drake-agent** | The interface point for wyvern-agent meshes: like newt-agent, but built specifically for controlling agentic swarms of wyvern-agents organized into flights. | Human-side control plane (its own decision doc when built). |
 | Human-facing rich UI | **gilamonster-agent**, monitor agents | Advanced TUI: panes, live status, dashboards, the feature matrix. | n/a here. |
 
@@ -61,16 +67,18 @@ hatch welded shut.
 
 The practical wins compound with the architectural one:
 
-- **SSH/tmux/pipe parity.** No alt screen and no custom scroll means newt
-  behaves identically over SSH, inside tmux, and when stdin/stdout are
-  pipes. (See the chat-section comment in `newt-tui/src/lib.rs`.)
-- **Scrollback is the log.** Everything the agent ever printed is in the
-  terminal's own history — searchable, copy-pasteable, capturable with
-  `script`/asciinema, never destroyed by a redraw.
+- **Canonical SSH/tmux/pipe parity.** No persistent alt screen or custom scroll
+  region means committed chat output remains line-oriented across SSH, tmux,
+  and pipes. TTY-only projections are erased before canonical commit. (See the
+  chat-section comment in `newt-tui/src/lib.rs`.)
+- **Scrollback is the canonical log.** Committed agent output is in the
+  terminal's own history — searchable, copy-pasteable, and capturable with
+  `script`/asciinema. An active spill frame may redraw only until its canonical
+  completed block is committed.
 - **Degrades to dumb terminals.** `NO_COLOR`, `TERM=dumb`, and non-TTY
   stdout all drop to plain text (`color_supported`).
-- **Small surface, small deps.** A scroller has no layout engine to
-  maintain and no resize/redraw bug class at all.
+- **Small surface, small deps.** The committed scroller has no general layout
+  engine; the narrowly bounded TTY surfaces own their resize/redraw tests.
 
 ## Decision
 
@@ -79,7 +87,8 @@ The practical wins compound with the architectural one:
 2. **No advanced TUI in newt.** The following do not get added to the chat
    path: alternate screen, raw-mode UI loops, scroll regions, panes/splits,
    persistent status bars, full-screen widget frameworks (ratatui, cursive,
-   …), mouse handling, live-updating dashboards, multi-line redraws.
+   …), mouse handling, or live-updating dashboards. Multi-line redraws are
+   limited to the standing carve-outs below.
 3. **Feature pressure gets redirected, not absorbed.** Wants for richer UI
    belong in **gilamonster-agent** (the feature-rich agent matrix that
    inherits newt's published crates) or the **monitor-agent** repos. If a
@@ -184,33 +193,38 @@ The practical wins compound with the architectural one:
   - **Inline, not alt-screen.** `Viewport::Inline` pins a bottom region with no
     alternate screen; submitted turns and model output go to **real scrollback**
     (`insert_before`), preserving the SSH/tmux/pipe/`script` parity above.
-  - **Off by default + `is_terminal`-gated.** The feature is absent from the
-    default and headless builds, and even when present it only activates on a
-    TTY with the rich footer. Piped/`newt worker`/headless and **wyvern-agent**
-    keep the rustyline surface unchanged — rustyline is also retained for the
-    `\r`-erased spinners.
+  - **Severable + `is_terminal`-gated.** The `newt-tui` crate feature remains
+    opt-in, while the default `newt` binary enables it. Even when compiled it
+    activates only on a TTY with the rich footer. `--no-default-features`,
+    piped/`newt worker`/headless, and **wyvern-agent** keep the lean surface —
+    rustyline is also retained for the `\r`-erased spinners.
   - **Severable by construction.** Both surfaces implement the `InputSurface`
     trait (PR #419); the rich one is a feature-gated module so wyvern strips it
     at compile time. This is the "strippability is a requirement" rule (4)
     satisfied, not bent.
   The plain-scroller decision still governs **output** and the non-TTY path;
   this carve-out is scoped to the *interactive TTY input widget* only.
+- **The active-tool live spill viewport** — a TTY-only, turn-scoped bounded
+  frame beneath one tool's committed audit line. It may redraw retained shell
+  output, scroll with Up/Down, and toggle `⧉` expand / `▣` collapse with Space
+  or Enter. It is erased before one canonical completed spill is committed;
+  pipes, `TERM=dumb`, and builds without `live-spill` never receive its cursor
+  controls. Full rationale: `docs/decisions/live_spill_viewport.md`.
 
 ## Consequences
 
 - PR review guidance: a diff that introduces `EnterAlternateScreen`,
   ratatui, or raw-mode event loops anywhere outside the splash, the `/plan`
-  editor, or the feature-gated `rich-tui` input surface (the three standing
-  carve-outs) is rejected or redirected to gilamonster-agent / monitor repos,
-  citing this decision. The rich surface is inline-only (no alt screen) and
-  must stay `is_terminal`-gated + behind the `rich-tui` feature.
-- No live progress panes in newt — long-running work reports by printing
-  lines (which is also exactly what a headless flight wants in its logs).
+  editor, the feature-gated `rich-tui` input surface, or the active-tool live
+  spill viewport (the four standing UI-surface carve-outs) is rejected or
+  redirected to gilamonster-agent / monitor repos, citing this decision. The
+  rich surfaces must stay runtime-TTY-gated and compile-time severable.
+- No persistent or multi-tool live progress panes in newt. The active-tool
+  spill is bounded and ephemeral; canonical completion remains printed lines,
+  which is also what a headless flight receives in its logs.
 - The `run_pilot` stub in `newt-tui` stays a stub here: a full-screen
   pilot/monitor surface is precisely the kind of thing this decision sends
-  to the monitor-agent repos. Follow-up: the `newt-tui` crate description
-  ("ratatui: code mode + pilot mode") overstates the role ratatui plays and
-  should be reworded when next touched.
+  to the monitor-agent repos.
 - Revisit trigger: if newt genuinely cannot express a needed interaction as
   scrolled lines, write a new decision doc that supersedes this one — do
   not land the surface change first.

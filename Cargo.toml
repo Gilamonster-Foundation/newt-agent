@@ -272,10 +272,3 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-
-# agent-bridle is a published crates.io dependency (`= "0.7"`) as of the 0.7.0
-# release — the real confined shell (brush + host-shell + carried coreutils +
-# AppContainer) ships there, so newt no longer needs a git `[patch.crates-io]`
-# pin or the `shell-real`/`shell-stub`/`shell-check` stub apparatus (all retired).
-# Resolves newt #300 (confined shell restored) + #660 (drop the pin). A bugfix
-# rolls as agent-bridle 0.7.1.

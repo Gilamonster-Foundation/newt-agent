@@ -46,6 +46,10 @@ getrandom.workspace = true
 tui-textarea = { version = "0.7.0", optional = true }
 
 [features]
+# TTY-only active-tool viewport (#1235). It has no dependency cost, but remains
+# independently severable from headless/wyvern builds.
+live-spill = []
+
 # The TTY rich inline input surface (ratatui Viewport::Inline + tui-textarea):
 # status row, live clock, multi-line vi/emacs editing. OFF by default — the
 # lean crossterm box is the only surface compiled unless this is enabled, and

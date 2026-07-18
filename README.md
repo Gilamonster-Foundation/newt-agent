@@ -57,6 +57,23 @@ newt setup https://inference.example.net:8080 --token-file ~/.config/newt/token
 Detected endpoints are stored as `~/.newt/backends/*.toml`; the main
 `~/.newt/config.toml` only records the selected `default_backend`.
 
+### Tool output scrollback
+
+Completed tool results use a bounded, tail-biased spill (`[tui]
+spill_lines = 3` by default). On Unix, the default interactive build also
+streams an active shell tool into that bounded frame when both stdin and stdout
+are terminals and `TERM` is not `dumb`. Up/Down scroll retained lines; Space or
+Enter toggles `⧉` expand and `▣` collapse. Expansion never exceeds safe terminal
+capacity, and each tool still commits one canonical completed block to normal
+terminal scrollback.
+
+Use `/spill <N>` for a session-only row count, `/spill reset` to restore
+configuration, or `/spill 0` for unbounded completed output with live display
+disabled. The default `newt` binary enables `live-spill`; a
+`--no-default-features` build strips it. See the
+[TUI README](./newt-tui/README.md) and
+[decision record](./docs/decisions/live_spill_viewport.md).
+
 Run `newt --help` for every mode (worker, MCP server, doctor, config, …) —
 the binary is the authority on its own surface, this file is not. Python
 bindings live in [`newt-agent-py/`](./newt-agent-py/) (`pip install

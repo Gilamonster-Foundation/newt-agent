@@ -16,8 +16,12 @@ mod crew_form;
 mod commands;
 mod danger;
 pub mod dgx_probe;
+#[cfg(feature = "live-spill")]
+mod live_spill;
 mod permissions;
 mod prompt;
+#[cfg(feature = "live-spill")]
+mod spill_view;
 // OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).
 mod mcp;
 mod mcp_token;
@@ -349,17 +353,13 @@ pub fn run_pilot(_flight_id: &str) -> anyhow::Result<()> {
 // The first-run setup / provisioning screen (`SetupEvent`, `SetupHandle`,
 // the spinner render loop) lives in `setup_tui.rs` — the UI of the setup step.
 // (`setup.rs` is the config wizard logic; `wizard.rs` is the silent prober.)
+pub use crate::permissions::ocap_high_danger_predicate;
+#[cfg(unix)]
+use crate::permissions::try_watch_stdin;
 use crate::permissions::{
     permission_prompting_configured, production_danger_table, prompt_permission_choice,
     should_prompt_permissions, PermissionPromptState, PromptChoice, PromptPermissionGate,
 };
-// `prompt_stdin_active` is defined `#[cfg(any(unix, test))]` and its only
-// consumer in this crate is the `#[cfg(unix)]` interrupt watcher
-// (`watch_for_interrupt`). Gate the import to match, or a Windows build trips
-// `-D warnings` on the unresolved import / an unused import under `test`.
-pub use crate::permissions::ocap_high_danger_predicate;
-#[cfg(unix)]
-use crate::permissions::prompt_stdin_active;
 use crate::setup_tui::{run_setup_inline, run_setup_screen};
 pub use crate::setup_tui::{SetupEvent, SetupHandle};
 
@@ -5488,6 +5488,89 @@ fn spill_lines(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.spill_lines).unwrap_or(3)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpillCommand {
+    Status,
+    Set(usize),
+    Reset,
+}
+
+fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
+    let body = input.trim().trim_start_matches('/').trim();
+    let Some(rest) = body.strip_prefix("spill") else {
+        anyhow::bail!("not a spill command");
+    };
+    if !rest.is_empty()
+        && !rest
+            .chars()
+            .next()
+            .map(char::is_whitespace)
+            .unwrap_or(false)
+    {
+        anyhow::bail!("not a spill command");
+    }
+
+    let arg = rest.trim();
+    match arg.to_ascii_lowercase().as_str() {
+        "" | "show" | "status" => Ok(SpillCommand::Status),
+        "reset" | "default" | "config" | "auto" => Ok(SpillCommand::Reset),
+        _ => arg
+            .parse::<usize>()
+            .map(SpillCommand::Set)
+            .map_err(|_| anyhow::anyhow!("unknown /spill argument '{arg}'")),
+    }
+}
+
+fn effective_spill_lines(configured: usize, session_override: Option<usize>) -> usize {
+    session_override.unwrap_or(configured)
+}
+
+fn spill_status(configured: usize, session_override: Option<usize>, live_capable: bool) -> String {
+    let effective = effective_spill_lines(configured, session_override);
+    let rows = if effective == 0 {
+        "unbounded".to_string()
+    } else {
+        effective.to_string()
+    };
+    let source = match session_override {
+        Some(_) => format!(" this session (config default {configured}"),
+        None => " (config default".to_string(),
+    };
+    let live = if effective == 0 {
+        "live viewport disabled"
+    } else if live_capable {
+        "live interaction available"
+    } else {
+        "live interaction unavailable"
+    };
+    format!("spill rows: {rows}{source}; {live})")
+}
+
+fn live_spill_capable() -> bool {
+    let term = std::env::var("TERM").ok();
+    live_spill_capable_for(
+        cfg!(unix),
+        cfg!(feature = "live-spill"),
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        term.as_deref(),
+    )
+}
+
+fn live_spill_capable_for(
+    platform_supported: bool,
+    feature_enabled: bool,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    term: Option<&str>,
+) -> bool {
+    platform_supported
+        && feature_enabled
+        && stdin_terminal
+        && stdout_terminal
+        && term != Some("dumb")
+}
+
 /// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
 /// Defaults to 25 when there's no `[tui]` table or no config file.
 fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
@@ -6360,9 +6443,135 @@ fn is_ctrl_c(bytes: &[u8]) -> bool {
     bytes == [0x03]
 }
 
+// The trait itself stays available on every platform: `chat.rs` names
+// `Option<&dyn SpillInput>` unconditionally to type the spill handle it
+// threads through `with_live_spill_watch`. Only its methods — driven by the
+// unix-only keyboard watcher (`dispatch_turn_keys`, `watch_for_interrupt_fd`)
+// — are unix-gated, so a non-unix build never has an unused-method warning.
+pub(crate) trait SpillInput: Sync {
+    #[cfg(unix)]
+    fn scroll_up(&self) -> bool;
+    #[cfg(unix)]
+    fn scroll_down(&self) -> bool;
+    #[cfg(unix)]
+    fn toggle_expanded(&self) -> bool;
+    #[cfg(unix)]
+    fn refresh_geometry(&self) -> bool;
+}
+
+#[cfg(feature = "live-spill")]
+impl SpillInput for live_spill::LiveSpillRenderer {
+    #[cfg(unix)]
+    fn scroll_up(&self) -> bool {
+        self.scroll_up()
+    }
+
+    #[cfg(unix)]
+    fn scroll_down(&self) -> bool {
+        self.scroll_down()
+    }
+
+    #[cfg(unix)]
+    fn toggle_expanded(&self) -> bool {
+        self.toggle_expanded()
+    }
+
+    #[cfg(unix)]
+    fn refresh_geometry(&self) -> bool {
+        self.refresh_geometry()
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnKey {
+    Up,
+    Down,
+    ToggleExpanded,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TurnKeyState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    Ss3,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct TurnKeyDecoder {
+    state: TurnKeyState,
+}
+
+#[cfg(unix)]
+impl TurnKeyDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<TurnKey> {
+        let mut keys = Vec::new();
+        for &byte in bytes {
+            self.state = match self.state {
+                TurnKeyState::Ground if byte == 0x1b => TurnKeyState::Escape,
+                TurnKeyState::Ground if matches!(byte, b' ' | b'\r' | b'\n') => {
+                    keys.push(TurnKey::ToggleExpanded);
+                    TurnKeyState::Ground
+                }
+                TurnKeyState::Ground => TurnKeyState::Ground,
+                TurnKeyState::Escape if byte == b'[' => TurnKeyState::Csi,
+                TurnKeyState::Escape if byte == b'O' => TurnKeyState::Ss3,
+                TurnKeyState::Escape if byte == 0x1b => TurnKeyState::Escape,
+                TurnKeyState::Escape => TurnKeyState::Ground,
+                TurnKeyState::Csi if (0x40..=0x7e).contains(&byte) => {
+                    match byte {
+                        b'A' => keys.push(TurnKey::Up),
+                        b'B' => keys.push(TurnKey::Down),
+                        _ => {}
+                    }
+                    TurnKeyState::Ground
+                }
+                TurnKeyState::Csi if byte == 0x1b => TurnKeyState::Escape,
+                TurnKeyState::Csi => TurnKeyState::Csi,
+                TurnKeyState::Ss3 => {
+                    match byte {
+                        b'A' => keys.push(TurnKey::Up),
+                        b'B' => keys.push(TurnKey::Down),
+                        _ => {}
+                    }
+                    TurnKeyState::Ground
+                }
+            };
+        }
+        keys
+    }
+}
+
+#[cfg(unix)]
+fn dispatch_turn_keys(decoder: &mut TurnKeyDecoder, bytes: &[u8], spill: Option<&dyn SpillInput>) {
+    let Some(spill) = spill else {
+        let _ = decoder.feed(bytes);
+        return;
+    };
+    for key in decoder.feed(bytes) {
+        match key {
+            TurnKey::Up => {
+                spill.scroll_up();
+            }
+            TurnKey::Down => {
+                spill.scroll_down();
+            }
+            TurnKey::ToggleExpanded => {
+                spill.toggle_expanded();
+            }
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod interrupt_tests {
-    use super::{is_ctrl_c, is_lone_esc};
+    use super::{
+        is_ctrl_c, is_lone_esc, watch_for_interrupt_fd, SpillInput, TurnKey, TurnKeyDecoder,
+    };
 
     #[test]
     fn lone_esc_interrupts_but_sequences_and_chords_do_not() {
@@ -6387,6 +6596,95 @@ mod interrupt_tests {
         assert!(!is_ctrl_c(b"c"), "the letter c is not Ctrl-C");
         assert!(!is_ctrl_c(&[]), "nothing");
     }
+
+    #[test]
+    fn arrow_decoder_preserves_fragmented_csi_and_ss3_sequences() {
+        let mut decoder = TurnKeyDecoder::default();
+        assert!(decoder.feed(&[0x1b]).is_empty());
+        assert!(decoder.feed(b"[").is_empty());
+        assert_eq!(decoder.feed(b"A"), [TurnKey::Up]);
+
+        assert!(decoder.feed(&[0x1b, b'O']).is_empty());
+        assert_eq!(decoder.feed(b"B"), [TurnKey::Down]);
+        assert_eq!(
+            decoder.feed(&[0x1b, b'[', b'1', b';', b'2', b'A']),
+            [TurnKey::Up]
+        );
+        assert!(decoder.feed(&[0x1b, b'x']).is_empty(), "Alt chord");
+        assert_eq!(decoder.feed(b" "), [TurnKey::ToggleExpanded]);
+        assert_eq!(decoder.feed(b"\r"), [TurnKey::ToggleExpanded]);
+    }
+
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        #[derive(Default)]
+        struct RecordingSpill {
+            up: AtomicUsize,
+            toggled: AtomicUsize,
+        }
+        impl SpillInput for RecordingSpill {
+            fn scroll_up(&self) -> bool {
+                self.up.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            fn scroll_down(&self) -> bool {
+                true
+            }
+            fn toggle_expanded(&self) -> bool {
+                self.toggled.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            fn refresh_geometry(&self) -> bool {
+                true
+            }
+        }
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let cancel = AtomicBool::new(false);
+        let hard = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        let spill = RecordingSpill::default();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                watch_for_interrupt_fd(pipe[0], &cancel, &hard, &stop, Some(&spill), 10, 100);
+            });
+            let write = |bytes: &[u8]| {
+                assert_eq!(
+                    unsafe { libc::write(pipe[1], bytes.as_ptr().cast(), bytes.len()) },
+                    bytes.len() as isize
+                );
+            };
+            write(&[0x1b]);
+            std::thread::sleep(Duration::from_millis(10));
+            write(b"[");
+            std::thread::sleep(Duration::from_millis(10));
+            write(b"A ");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while (spill.up.load(Ordering::Relaxed) == 0
+                || spill.toggled.load(Ordering::Relaxed) == 0)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::Relaxed);
+            write(b"x");
+        });
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+
+        assert_eq!(spill.up.load(Ordering::Relaxed), 1);
+        assert_eq!(spill.toggled.load(Ordering::Relaxed), 1);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(!hard.load(Ordering::Relaxed));
+    }
 }
 
 /// Run `f` (the in-place turn) with an Esc watcher active, returning `f`'s value.
@@ -6394,10 +6692,11 @@ mod interrupt_tests {
 /// cbreak, it simply runs `f` with no watcher. The terminal mode is always
 /// restored before returning (RAII), and the watcher thread is joined.
 #[cfg(unix)]
-pub(crate) fn with_interrupt_watch<T>(
+pub(crate) fn with_live_spill_watch<T>(
     enabled: bool,
     cancel: &std::sync::atomic::AtomicBool,
     hard: &std::sync::atomic::AtomicBool,
+    spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
 ) -> T {
     use std::sync::atomic::Ordering;
@@ -6409,7 +6708,7 @@ pub(crate) fn with_interrupt_watch<T>(
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
-        s.spawn(|| watch_for_interrupt(cancel, hard, &stop));
+        s.spawn(|| watch_for_interrupt(cancel, hard, &stop, spill));
         let out = f();
         // Tell the watcher to exit; it polls with a 100 ms timeout, so it wakes
         // and returns promptly, and the scope joins it before restoring the tty.
@@ -6419,14 +6718,24 @@ pub(crate) fn with_interrupt_watch<T>(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn with_interrupt_watch<T>(
+pub(crate) fn with_live_spill_watch<T>(
     _enabled: bool,
     _cancel: &std::sync::atomic::AtomicBool,
     _hard: &std::sync::atomic::AtomicBool,
+    _spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
 ) -> T {
     // No termios on non-unix; the interrupt watcher is unix-only for now.
     f()
+}
+
+pub(crate) fn with_interrupt_watch<T>(
+    enabled: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+    hard: &std::sync::atomic::AtomicBool,
+    f: impl FnOnce() -> T,
+) -> T {
+    with_live_spill_watch(enabled, cancel, hard, None, f)
 }
 
 /// Poll stdin while the turn runs; trip `cancel` on the first interrupt (a lone
@@ -6438,29 +6747,43 @@ fn watch_for_interrupt(
     cancel: &std::sync::atomic::AtomicBool,
     hard: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
+    spill: Option<&dyn SpillInput>,
+) {
+    watch_for_interrupt_fd(libc::STDIN_FILENO, cancel, hard, stop, spill, 100, 200);
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn watch_for_interrupt_fd(
+    fd: libc::c_int,
+    cancel: &std::sync::atomic::AtomicBool,
+    hard: &std::sync::atomic::AtomicBool,
+    stop: &std::sync::atomic::AtomicBool,
+    spill: Option<&dyn SpillInput>,
+    poll_timeout_ms: libc::c_int,
+    escape_grace_ms: libc::c_int,
 ) {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-    let fd = libc::STDIN_FILENO;
     let mut buf = [0u8; 64];
     let mut presses = 0u32;
+    let mut decoder = TurnKeyDecoder::default();
     while !stop.load(Ordering::Relaxed) {
-        if prompt_stdin_active() {
+        if let Some(spill) = spill {
+            spill.refresh_geometry();
+        }
+        let Some(_stdin) = try_watch_stdin() else {
             std::thread::sleep(Duration::from_millis(10));
             continue;
-        }
+        };
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        let n = unsafe { libc::poll(&mut pfd, 1, 100) };
+        let n = unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms) };
         if n <= 0 || pfd.revents & libc::POLLIN == 0 {
             continue; // timeout or spurious — re-check `stop`
-        }
-        if prompt_stdin_active() {
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
         }
         let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if r <= 0 {
@@ -6477,14 +6800,20 @@ fn watch_for_interrupt(
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let m = unsafe { libc::poll(&mut pfd2, 1, 30) };
+            let m = unsafe { libc::poll(&mut pfd2, 1, escape_grace_ms) };
             if m <= 0 {
                 interrupt = true;
             } else {
-                // A continuation arrived — drain it and treat the burst as a
-                // sequence (ignore), keep watching.
-                let _ = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                // Feed Esc and its continuation through one persistent decoder;
+                // `[A`/`[B` may themselves be split across later reads.
+                dispatch_turn_keys(&mut decoder, bytes, spill);
+                let r2 = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if r2 > 0 {
+                    dispatch_turn_keys(&mut decoder, &buf[..r2 as usize], spill);
+                }
             }
+        } else if !interrupt {
+            dispatch_turn_keys(&mut decoder, bytes, spill);
         }
         if interrupt {
             presses += 1;
@@ -6800,6 +7129,18 @@ actually resolved to, so you can see why the session is configured as it is."
 The workspace fences conversations, recall, and NOTES. It's the directory newt
 was launched in unless overridden."
         }
+        "spill" => {
+            "\
+/spill [status|N|reset] — control bounded tool-output rows for this session
+
+  /spill                 show the effective row count and live availability
+  /spill <N>             set collapsed live and completed rows for later tools
+  /spill reset           return to the configured [tui] spill_lines value
+  /spill 0               disable live display; show completed output unbounded
+
+While a tool is active, Up/Down scroll retained output. Space or Enter toggles
+the boundary: ⧉ expands up to the terminal's safe capacity; ▣ collapses it."
+        }
         "config" => {
             "\
 /config — dump the resolved configuration (secrets redacted)
@@ -6973,6 +7314,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /loadout                 - show the active loadout: declared axes vs what resolved",
         "  /workspace               - show current workspace path",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
+        "  /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
@@ -6981,6 +7323,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent",
         "  /cd [dir]                - change the session working dir (shown in prompt), confined below the start dir; bare /cd returns to the root — use ! for pwd/ls/rm/…",
         "  Esc                      - while the agent is working: interrupt the turn, back to your prompt",
+        "  Up/Down                  - while a tool is active: scroll its retained output",
+        "  Space/Enter              - while a tool is active: toggle ⧉ expand / ▣ collapse",
         "  /exit  /quit  exit  quit - leave the session",
         "",
         "  Add --help (or -h) to any command — or /help <command> — for its detail page.",
@@ -8925,6 +9269,7 @@ mod tool_round_cap_tests {
                     exec_floor: None,
                     write_ledger: None,
                     cancel: None,
+                    live_tool_output: None,
                     git_tool: None,
                     crew_runner: None,
                 },

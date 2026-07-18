@@ -50,13 +50,10 @@ agent-mesh-protocol.workspace = true
 # (`denied: bool` + `denials: [{kind,target,reason}]`) is read directly —
 # never stderr string-matching.
 #
-# NOTE: the shell tool is temporarily a stub pending reubeno/brush#1184 (the
-# CommandInterceptor hook). invoke() returns a clear error; schema is preserved.
-# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
-#
-# The workspace [patch.crates-io] satisfies this dep from the stub-shell git
-# branch until agent-bridle 0.1.0 is indexed on crates.io.
-agent-bridle = { version = "0.7", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils"] }
+# Keep this direct consumer on the same reviewed source as newt-core. The old
+# workspace patch provided this source implicitly; spelling it here preserves a
+# single bridle type universe after that non-transitive patch is removed.
+agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "47430ca665d35ec382ec4d95f0de060270946324", version = "0.7.5", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils"] }
 
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.
