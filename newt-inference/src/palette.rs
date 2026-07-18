@@ -178,6 +178,46 @@ pub fn local_gguf_path(m: &MiniModel) -> Option<std::path::PathBuf> {
     models_dir().map(|d| d.join(m.name).join(m.gguf_file))
 }
 
+// --- Embedding model (semantic retrieval, #1279) ---------------------------
+// The default on-host embedding model. Kept here (not in the feature-gated
+// `embed` module) so `newt models pull-embed`, the config-resolution path, and
+// `newt doctor` can name and locate it without pulling in candle. `embed.rs`
+// references these as its single source of truth.
+
+/// Hugging Face repo hosting the default candle-clean standard-BERT embedder.
+pub const EMBED_HF_REPO: &str = "BAAI/bge-small-en-v1.5";
+
+/// `~/.newt/models/` subdir `newt models pull-embed` writes the model to.
+pub const EMBED_MODEL_DIR: &str = "bge-small-en-v1.5";
+
+/// Files a candle standard-BERT model dir must hold (config + tokenizer +
+/// safetensors weights) — one source of truth for the puller, the presence
+/// check, and the embedder's own validation.
+pub const EMBED_REQUIRED_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
+
+/// `~/.newt/models/bge-small-en-v1.5` — where `newt models pull-embed` stores
+/// the default embedding model. `None` if the home dir is unknown.
+#[must_use]
+pub fn embed_model_dir() -> Option<std::path::PathBuf> {
+    models_dir().map(|d| d.join(EMBED_MODEL_DIR))
+}
+
+/// Does `dir` hold every required embed-model file? (Thin fs check.)
+#[must_use]
+pub fn embed_model_present_in(dir: &std::path::Path) -> bool {
+    EMBED_REQUIRED_FILES.iter().all(|f| dir.join(f).is_file())
+}
+
+/// The default embedding-model dir IFF fully present — the auto-resolution
+/// source (#1279): once `newt models pull-embed` has run, on-host semantic
+/// retrieval works with zero config. `None` when unpulled (the caller then
+/// coaches `newt models pull-embed`).
+#[must_use]
+pub fn embed_model_dir_if_present() -> Option<std::path::PathBuf> {
+    let dir = embed_model_dir()?;
+    embed_model_present_in(&dir).then_some(dir)
+}
+
 /// The on-disk `tokenizer.json` path for a palette model, beside its GGUF:
 /// `~/.newt/models/<alias>/tokenizer.json`. Candle loads this next to the GGUF,
 /// so `newt models pull` fetches it from [`MiniModel::tokenizer_repo`].

@@ -1736,6 +1736,20 @@ fn embeddings_backend_is_embedded(cfg: &newt_core::SemanticConfig) -> bool {
         || (cfg.embeddings_api.is_none() && cfg.embeddings_endpoint.is_none())
 }
 
+/// #1279 precedence for the embedded model dir: an explicit
+/// `[context.semantic].embedding_model_path` wins; otherwise the pulled default
+/// model dir (`newt models pull-embed`) when it is present. Pure — the caller
+/// supplies `default_present` from the fs check
+/// (`newt_inference::palette::embed_model_dir_if_present`), so this stays
+/// unit-testable. `None` ⇒ no model available anywhere (the caller coaches the
+/// pull command).
+fn effective_embedding_model_path(
+    explicit: Option<String>,
+    default_present: Option<std::path::PathBuf>,
+) -> Option<String> {
+    explicit.or_else(|| default_present.map(|d| d.to_string_lossy().into_owned()))
+}
+
 /// Build the semantic embedder (#720). By default, or when
 /// `embeddings_api = "embedded"`, the in-process candle embedder runs on the
 /// laptop so retrieval never touches the DGX chat model's VRAM. HTTP
@@ -1787,8 +1801,9 @@ fn semantic_embedder_unavailable_reason(cfg: &newt_core::SemanticConfig) -> Opti
     {
         let Some(path) = cfg.embedding_model_path.as_deref() else {
             return Some(
-                "embedded semantic retrieval needs [context.semantic].embedding_model_path \
-                 pointing at a local candle-clean standard-BERT model dir"
+                "embedded semantic retrieval has no model — run `newt models pull-embed` to \
+                 fetch the default on-host model (bge-small), or set \
+                 [context.semantic].embedding_model_path to a local candle-clean standard-BERT dir"
                     .to_string(),
             );
         };
@@ -1826,8 +1841,9 @@ fn make_embedded_embedder(
     {
         let Some(path) = model_path else {
             return Box::new(FailingEmbedder {
-                msg: "embeddings_api=embedded needs `[context.semantic].embedding_model_path` \
-                      (a local candle-clean standard-BERT model dir, e.g. bge-small-en-v1.5)"
+                msg: "embedded semantic retrieval has no model — run `newt models pull-embed` \
+                      (fetches bge-small), or set `[context.semantic].embedding_model_path` to a \
+                      local candle-clean standard-BERT model dir"
                     .to_string(),
             });
         };
@@ -1850,10 +1866,10 @@ fn make_embedded_embedder(
 
 fn semantic_zero_index_hint(cfg: &newt_core::SemanticConfig) -> String {
     if embeddings_backend_is_embedded(cfg) {
-        return "semantic: indexed 0 chunks — embedded embeddings are unavailable; check \
-                [context.semantic].embedding_model_path points at a local candle-clean \
-                standard-BERT model dir and this binary was built with the embedded feature \
-                (retrieval is a no-op until embeddings work)"
+        return "semantic: indexed 0 chunks — no embedding model; run `newt models pull-embed` \
+                to fetch the default on-host model (bge-small), or set \
+                [context.semantic].embedding_model_path to a local candle-clean standard-BERT \
+                model dir (retrieval is a no-op until embeddings work)"
             .to_string();
     }
     let target = cfg

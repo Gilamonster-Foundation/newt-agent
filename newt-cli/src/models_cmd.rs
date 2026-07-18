@@ -28,6 +28,12 @@ pub enum ModelsCmd {
         /// Palette alias. Omit for the summarizer default.
         alias: Option<String>,
     },
+    /// Download the default embedding model (bge-small) to
+    /// ~/.newt/models/bge-small-en-v1.5/ — the explicit fetch that lights up
+    /// on-host semantic retrieval (#1279). Like `pull`, an operator action: no
+    /// silent download (#639). Once fetched, semantic retrieval uses it
+    /// automatically (no config).
+    PullEmbed,
 }
 
 pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
@@ -35,7 +41,37 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
         ModelsCmd::List => list(),
         ModelsCmd::Pull { alias } => pull(alias.as_deref()).await,
         ModelsCmd::Path { alias } => print_path(alias.as_deref()),
+        ModelsCmd::PullEmbed => pull_embed().await,
     }
+}
+
+/// Fetch the default embedding model's files (config + tokenizer + safetensors)
+/// into `~/.newt/models/bge-small-en-v1.5/` (#1279). Reuses [`fetch_if_absent`]
+/// so a half-provisioned dir completes in place; each file is skipped when
+/// already present. The dir + files are exactly what `CandleEmbedder::new`
+/// validates and what the config-resolution path auto-detects.
+async fn pull_embed() -> anyhow::Result<()> {
+    let dir = palette::embed_model_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve ~/.newt/models (no home dir)"))?;
+    std::fs::create_dir_all(&dir)?;
+    write_models_readme(&dir);
+    println!(
+        "Provisioning {} -> {}",
+        palette::EMBED_HF_REPO,
+        dir.display()
+    );
+    for file in palette::EMBED_REQUIRED_FILES {
+        let url = format!(
+            "https://huggingface.co/{}/resolve/main/{file}",
+            palette::EMBED_HF_REPO
+        );
+        fetch_if_absent(&url, &dir.join(file), file).await?;
+    }
+    println!(
+        "OK {} fully provisioned — semantic retrieval will use it automatically",
+        palette::EMBED_HF_REPO
+    );
+    Ok(())
 }
 
 fn resolve(alias: Option<&str>) -> anyhow::Result<&'static MiniModel> {
@@ -77,6 +113,16 @@ fn list() -> anyhow::Result<()> {
     println!(
         "\nSummarizer default: {}   (fetch with: newt models pull [alias])",
         palette::default_model().name
+    );
+    let embed_installed = if palette::embed_model_dir_if_present().is_some() {
+        "yes"
+    } else {
+        "no"
+    };
+    println!(
+        "Embedding model (semantic retrieval): {}   installed: {}   (fetch with: newt models pull-embed)",
+        palette::EMBED_HF_REPO,
+        embed_installed
     );
     Ok(())
 }
