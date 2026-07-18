@@ -935,6 +935,11 @@ profile-gate disable, with the small-window arm (§6.3) tuning the threshold.
 
 ## 11. Relations
 
+- `ide-project-model.md` — **the substrate this surface derives over** (the
+  "IDE for LLMs" frame, epic #1277): the project model + drift-cache the map
+  (SC-L4) renders and the resolvers (`where_is`, `code_search`) read. SC-L1
+  governs its pack merging; SC-L4·i / SC-L5 bind its PM-L4. Its PO-A/B/C/E are
+  mechanized (`formal/ProjectModel/Basic.lean`, checked, `sorry`-free).
 - newt-agent#1216 — this spec's issue; #548 — the bench; #1214 — mechanical
   honesty / claim-check; #669 — frozen-head stable base; #1199 — window
   discovery; #852 / #1218 — model cards and family chain; #1219 — lean-config

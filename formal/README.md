@@ -26,6 +26,25 @@ that is proven, once, for the algebra everything else composes from.
 - **Composition** — `delegation_chain_bounded`: any chain of delegations stays
   `⊑` the original caller (the *global* property sampling can't certify).
 
+`ProjectModel/Basic.lean` — the "IDE for LLMs" project model + drift-cache
+(#1277, `docs/spec/ide-project-model.md`). newt derives a project model on
+launch, caches it, and re-derives only the units that *drifted*. The drift-only
+rescan is a performance CHEAT; these theorems make it SOUND:
+
+- **PO-A** `po_a_derive_congr` — derivation is a pure function of (pack, tree)
+  (the basis of caching).
+- **PO-B** `po_b_drift_complete` — a derived-model change implies content-keyed
+  drift flags the unit: **no false-clean**, so the cache never serves stale
+  navigation (SC-L5).
+- **PO-C** `po_c_incremental_eq_full` (the keystone) — the drift-updated model
+  **equals** a from-scratch rebuild: `applyDrift(derive t₁, drift t₁ t₂, t₂) =
+  derive t₂`. This is what makes *freshness by verification* true.
+- **PO-E** `po_e_non_match_empty` — a pack that doesn't detect its build system
+  derives the empty model (no phantom project).
+
+Self-contained (no Mathlib), `sorry`-free. PO-D (no LLM authoring the model) is a
+dep-graph/map lint, not a theorem.
+
 ## How to check it
 
 Needs a Lean toolchain (via [`elan`](https://github.com/leanprover/elan); the
