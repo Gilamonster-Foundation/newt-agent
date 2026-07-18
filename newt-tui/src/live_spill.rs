@@ -624,7 +624,9 @@ mod tests {
     use crate::spill_view::display_width;
     use newt_core::{LiveToolOutput, ToolOutputStream};
     use std::io::Write;
-    use std::sync::{Arc, Condvar, Mutex};
+    #[cfg(unix)]
+    use std::sync::Condvar;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
