@@ -243,27 +243,53 @@ fn resolve_env_grants(entry: &McpServerEntry) -> Vec<(String, String)> {
     assemble_env_grants(&passthrough, &shell_env, &entry.env)
 }
 
+/// A throwaway [`Tool`] used only to mint the spawn [`ToolContext`] through the
+/// gate. The confined spawn admission-checks the *program*, not this tool's
+/// name, so the identity is immaterial. Module-scoped (not a local type) so its
+/// trivial trait impl is unit-testable.
+#[cfg(unix)]
+struct McpSpawnTool;
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl Tool for McpSpawnTool {
+    fn name(&self) -> &str {
+        "mcp_spawn"
+    }
+    fn schema(&self) -> Value {
+        json!({})
+    }
+    async fn invoke(&self, _args: Value, _cx: &ToolContext) -> ToolResult<Value> {
+        Ok(Value::Null)
+    }
+}
+
 /// Mint the spawn [`ToolContext`] the only legitimate way — through the gate —
-/// bounded by the session `caveats`. A throwaway tool is fine: the confined
-/// spawn admission-checks the *program*, not the tool's name.
+/// bounded by the session `caveats`.
 #[cfg(unix)]
 fn mint_spawn_context(caveats: &Caveats) -> Result<ToolContext> {
-    struct McpSpawn;
-    #[async_trait::async_trait]
-    impl Tool for McpSpawn {
-        fn name(&self) -> &str {
-            "mcp_spawn"
-        }
-        fn schema(&self) -> Value {
-            json!({})
-        }
-        async fn invoke(&self, _args: Value, _cx: &ToolContext) -> ToolResult<Value> {
-            Ok(Value::Null)
-        }
-    }
     Gate::new(0)
-        .authorize(&McpSpawn, caveats)
+        .authorize(&McpSpawnTool, caveats)
         .map_err(|e| anyhow!("gate authorize failed: {e}"))
+}
+
+/// The session leash, widened to admit exec of THIS server's `command`.
+///
+/// A configured MCP server is operator-authorized infrastructure: the operator
+/// declared it in their config, so *spawning it* must not require its command in
+/// the session's exec allow-list (the agent never chose to run it). Only the
+/// command itself is granted — the child's RUNTIME authority stays exactly the
+/// session leash: `fs_write` remains Landlock-enforced, and `net` / the exec of
+/// anything the server itself spawns are unchanged. An `exec: All` leash is
+/// already unrestricted, so it is left untouched.
+#[cfg(unix)]
+fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
+    use newt_core::caveats::Scope;
+    let mut caveats = session.clone();
+    if let Scope::Only(ref mut set) = caveats.exec {
+        set.extend([command.to_string()]);
+    }
+    caveats
 }
 
 /// Log the confinement actually achieved — honest, never over-claimed.
@@ -341,7 +367,9 @@ impl StdioTransport {
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
         let grants = resolve_env_grants(entry);
-        let cx = mint_spawn_context(caveats).with_context(|| {
+        // Admit exec of the configured server command; keep its runtime authority
+        // (fs/net) the session leash.
+        let cx = mint_spawn_context(&spawn_caveats(caveats, command)).with_context(|| {
             format!("authorizing confined spawn of MCP server `{}`", entry.name)
         })?;
 
@@ -1215,6 +1243,96 @@ mod tests {
         assert!(
             err.to_string().contains("timed out awaiting `tools/list`"),
             "{err}"
+        );
+    }
+}
+
+#[cfg(all(unix, test))]
+mod confined_spawn_helper_tests {
+    use super::*;
+    use newt_core::mcp::{McpServerEntry, TransportKind};
+
+    #[tokio::test]
+    async fn mcp_spawn_tool_is_a_trivial_minting_stub() {
+        let tool = McpSpawnTool;
+        assert_eq!(tool.name(), "mcp_spawn");
+        assert_eq!(tool.schema(), json!({}));
+        let cx = mint_spawn_context(&Caveats::top()).expect("mint");
+        // Identity stub: ignores args/cx, returns Null.
+        assert_eq!(
+            tool.invoke(json!({"x": 1}), &cx).await.unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn mint_spawn_context_authorizes_any_leash() {
+        use newt_core::caveats::Scope;
+        assert!(mint_spawn_context(&Caveats::top()).is_ok());
+        let restricted = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        };
+        assert!(
+            mint_spawn_context(&restricted).is_ok(),
+            "minting never denies — the SPAWN admission-checks the program, not the mint"
+        );
+    }
+
+    #[test]
+    fn spawn_caveats_admits_command_but_keeps_runtime_leash() {
+        use newt_core::caveats::Scope;
+        // An Only-exec leash gains the server command; the rest is preserved.
+        let session = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        };
+        let widened = spawn_caveats(&session, "/opt/bin/modulex-mcp");
+        match widened.exec {
+            Scope::Only(set) => {
+                assert!(set.iter().any(|s| s == "echo"), "existing grant kept");
+                assert!(
+                    set.iter().any(|s| s == "/opt/bin/modulex-mcp"),
+                    "the configured server command is admitted"
+                );
+            }
+            other => panic!("expected Only, got {other:?}"),
+        }
+        // An already-unrestricted exec leash is left untouched.
+        assert!(matches!(
+            spawn_caveats(&Caveats::top(), "x").exec,
+            Scope::All
+        ));
+    }
+
+    #[test]
+    fn log_confinement_covers_advisory_and_confined() {
+        // Both branches — smoke (no panic); the honest posture the surface reads.
+        log_confinement("advisory-server", SandboxKind::None);
+        log_confinement("confined-server", SandboxKind::Landlock);
+    }
+
+    #[test]
+    fn resolve_env_grants_includes_the_entry_env() {
+        // The entry's own env is a deterministic grant regardless of ambient env
+        // or the shell-env dir (both of which vary by host).
+        let entry = McpServerEntry {
+            name: "probe".into(),
+            enabled: true,
+            transport: TransportKind::Stdio,
+            command: Some("true".into()),
+            args: vec![],
+            env: BTreeMap::from([("MCP_SERVER_ONLY".to_string(), "v".to_string())]),
+            url: None,
+            headers: BTreeMap::new(),
+            request_timeout_secs: None,
+        };
+        let grants = resolve_env_grants(&entry);
+        assert!(
+            grants
+                .iter()
+                .any(|(k, v)| k == "MCP_SERVER_ONLY" && v == "v"),
+            "the entry's explicit env must reach the grants"
         );
     }
 }
