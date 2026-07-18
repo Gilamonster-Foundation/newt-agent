@@ -9452,6 +9452,11 @@ mod artifact_provenance_tests;
 #[cfg(test)]
 #[path = "mod_tests/http_loop.rs"]
 mod http_loop_tests;
+// #1265: EPIC #1257's acceptance gate — the "10 largest Rust files" session
+// replayed end-to-end (BAT tier: scripted backend, simulated workspace).
+#[cfg(test)]
+#[path = "mod_tests/bat_largest_files.rs"]
+mod bat_largest_files_tests;
 
 // ---------------------------------------------------------------------------
 // save_note tool + memory nudge — loop integration (Step 19.3, #248)
