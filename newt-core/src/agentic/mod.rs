@@ -7223,6 +7223,30 @@ mod cap_exit_unit_tests {
 // (The companion test that recovers a hard context-window 400 via the
 // `recover_cw_400` hook lives in newt-tui — it exercises the TUI-side probe
 // cache persistence under a HOME env guard.)
+
+/// Token weight of the builtin tool catalog the loop advertises at
+/// `disposition` (default advertise flags, no MCP) — the same
+/// `merged_tool_definitions` → `filter_tools_for_disposition` →
+/// `estimate_value_tokens` pipeline `chat_complete` runs over its advertised
+/// tools each turn (see the loop setup near the top of `chat_complete`).
+///
+/// Token-budget fixtures size their `safe_context` / `num_ctx` / trim
+/// thresholds RELATIVE to this live figure plus a scenario-specific,
+/// catalog-INDEPENDENT message/headroom offset — so adding a tool or a schema
+/// property shifts the catalog and the derived budget together, preserving each
+/// fixture's fit-vs-refuse intent instead of tipping it over a pinned magic
+/// number.
+#[cfg(test)]
+pub(crate) fn builtin_catalog_tokens(disposition: PromptDisposition) -> usize {
+    let tools = filter_tools_for_disposition(
+        merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false,
+        ),
+        disposition,
+    );
+    estimate_value_tokens(&tools, crate::tokens::TokenEstimation::default())
+}
+
 #[cfg(test)]
 mod tool_round_cap_tests {
     use super::*;
@@ -8108,16 +8132,24 @@ mod tool_round_cap_tests {
         vec![MemMessage::system("base policy"), MemMessage::user(task)]
     }
 
-    const MID_SIZED_PAIR_BUDGET: usize = 5_500;
-
     fn mid_sized_pair_task(label: &str) -> String {
         format!("{label} {}", "x".repeat(6_000))
     }
 
-    /// Prove the regression fixture isolates the live-tail duplicate: the
+    /// Prove the regression fixture isolates the live-tail duplicate — the
     /// protected recovery copy and schemas fit, but the irreducible complete
-    /// request (recovery copy + newest user presentation) does not.
-    fn assert_mid_sized_pair_fixture(task: &str, responses_wire: bool) {
+    /// request (recovery copy + newest user presentation) does not — and
+    /// RETURN the `safe_context` budget the run should use.
+    ///
+    /// The budget is DERIVED from the live catalog, not pinned: both `one_copy`
+    /// (protected head + advertised schemas) and `complete` (+ the duplicated
+    /// live-tail presentation) already track the catalog, and the gap between
+    /// them is one catalog-independent ~1.5k-token task copy. Sizing the budget
+    /// at their midpoint keeps `one_copy <= budget < complete` under any catalog
+    /// growth, so the fixture always exercises "one copy fits, the irreducible
+    /// pair does not → refuse". Returning it makes the guard below and the
+    /// actual `chat_complete` run agree on the same number.
+    fn mid_sized_pair_budget(task: &str, responses_wire: bool) -> usize {
         let mut messages = vec![
             serde_json::json!({"role": "system", "content": "base policy"}),
             serde_json::json!({"role": "user", "content": task}),
@@ -8138,14 +8170,18 @@ mod tool_round_cap_tests {
         let estimation = crate::tokens::TokenEstimation::default();
         let one_copy = estimate_request_tokens(&messages[..head], Some(&tools), estimation);
         let complete = estimate_request_tokens(&messages, Some(&tools), estimation);
+        // Strictly between one_copy and complete (their gap is the ~1.5k-token
+        // live-tail task copy), so one protected copy fits but the pair cannot.
+        let budget = (one_copy + complete) / 2;
         assert!(
-            one_copy <= MID_SIZED_PAIR_BUDGET,
-            "fixture invalid: one protected copy needs {one_copy} tokens"
+            one_copy <= budget,
+            "fixture invalid: one protected copy needs {one_copy} tokens, budget {budget}"
         );
         assert!(
-            complete > MID_SIZED_PAIR_BUDGET,
-            "fixture invalid: the irreducible pair needs only {complete} tokens"
+            complete > budget,
+            "fixture invalid: the irreducible pair needs {complete} tokens, budget {budget}"
         );
+        budget
     }
 
     fn assert_irreducible_refusal(error: &anyhow::Error) {
@@ -8230,12 +8266,12 @@ mod tool_round_cap_tests {
     async fn ollama_mid_sized_irreducible_prompt_pair_refuses_before_dispatch() {
         let server = MockServer::start().await;
         let task = mid_sized_pair_task("OLLAMA-MID-PAIR");
-        assert_mid_sized_pair_fixture(&task, false);
+        let budget = mid_sized_pair_budget(&task, false);
         let messages = giant_prompt_messages(&task);
         let caveats = Caveats::top();
         let uri = server.uri();
         let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Ollama);
-        ctx.safe_context = Some(MID_SIZED_PAIR_BUDGET as u32);
+        ctx.safe_context = Some(budget as u32);
         let error = chat_complete(ctx, &mut NoMcp)
             .await
             .expect_err("the two irreducible prompt presentations exceed the window");
@@ -8247,12 +8283,12 @@ mod tool_round_cap_tests {
     async fn openai_chat_mid_sized_irreducible_prompt_pair_refuses_before_dispatch() {
         let server = MockServer::start().await;
         let task = mid_sized_pair_task("OPENAI-CHAT-MID-PAIR");
-        assert_mid_sized_pair_fixture(&task, false);
+        let budget = mid_sized_pair_budget(&task, false);
         let messages = giant_prompt_messages(&task);
         let caveats = Caveats::top();
         let uri = server.uri();
         let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
-        ctx.safe_context = Some(MID_SIZED_PAIR_BUDGET as u32);
+        ctx.safe_context = Some(budget as u32);
         let error = openai_chat_complete(ctx, &mut NoMcp)
             .await
             .expect_err("the two irreducible prompt presentations exceed the window");
@@ -8264,12 +8300,12 @@ mod tool_round_cap_tests {
     async fn responses_mid_sized_irreducible_prompt_pair_refuses_before_dispatch() {
         let server = MockServer::start().await;
         let task = mid_sized_pair_task("RESPONSES-MID-PAIR");
-        assert_mid_sized_pair_fixture(&task, true);
+        let budget = mid_sized_pair_budget(&task, true);
         let messages = giant_prompt_messages(&task);
         let caveats = Caveats::top();
         let uri = server.uri();
         let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
-        ctx.safe_context = Some(MID_SIZED_PAIR_BUDGET as u32);
+        ctx.safe_context = Some(budget as u32);
         let error = openai_responses_complete(ctx, &mut NoMcp)
             .await
             .expect_err("the two irreducible prompt presentations exceed the window");
@@ -10151,11 +10187,13 @@ mod compression_loop_tests {
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
         // The trigger is a complete-request ceiling, including the expanded
-        // builtin tool catalog. Leave about 5k message tokens after schema
-        // overhead so the first zero-cost prune remains observable on wire
-        // before the summarizing pass; the >40% reclaim assertion below still
-        // measures actual dispatched requests.
-        c.mid_loop_trim_tokens = Some(9_400);
+        // builtin tool catalog. Derive it as the live catalog weight plus ~5k
+        // message tokens of headroom (a catalog-INDEPENDENT offset) so the
+        // first zero-cost prune remains observable on wire before the
+        // summarizing pass; catalog growth shifts the threshold with it. The
+        // >40% reclaim assertion below still measures actual dispatched
+        // requests.
+        c.mid_loop_trim_tokens = Some(builtin_catalog_tokens(PromptDisposition::Act) + 5_600);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _streamed, _usage, hallu) = chat_complete(c, &mut NoMcp)
@@ -10262,10 +10300,20 @@ mod compression_loop_tests {
         c.safe_context = None;
         c.mid_loop_trim_tokens = None;
         // The expanded always-on catalog plus the exact prompt/card needs
-        // ~3.5k tokens by itself. A 6,144-token window leaves a truthful
-        // 4,915-token input budget while still forcing this ~12k-token full
-        // request through compression before its first dispatch.
-        c.num_ctx = Some(6_144);
+        // ~3.5k tokens by itself. Derive the window from the live catalog:
+        // reserve ~1,130 tokens of headroom above it (a catalog-INDEPENDENT
+        // figure sized for the compressed head/card/summary/tail) as the input
+        // ceiling, then back out the num_ctx that yields it. So the truthful
+        // input budget tracks catalog growth while still forcing this ~12k-token
+        // full request through compression before its first dispatch. (At
+        // today's catalog this reproduces the historical 6,144 num_ctx /
+        // 4,915-token ceiling.)
+        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act) + 1_130;
+        let num_ctx = (input_ceiling * 100).div_ceil(c.input_ceiling_pct as usize) as u32;
+        // The actual ceiling the loop derives (`num_ctx_input_ceiling`), reused
+        // by the fit assertion below so budget and check stay in lockstep.
+        let ceiling = num_ctx as usize * c.input_ceiling_pct as usize / 100;
+        c.num_ctx = Some(num_ctx);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
@@ -10296,14 +10344,14 @@ mod compression_loop_tests {
              pre-#282 it went out raw at ~9k tokens"
         );
 
-        // And the COMPLETE request dispatched under the ceiling: 80% of
-        // 6,144 = 4,915 input tokens (the same reply headroom the probe math
-        // reserves). Counting only messages here would hide the catalog cost.
+        // And the COMPLETE request dispatched under the ceiling
+        // (`input_ceiling_pct`% of the derived num_ctx). Counting only messages
+        // here would hide the catalog cost.
         assert!(
-            first_request_tokens <= 4_915,
+            first_request_tokens <= ceiling,
             "first dispatch must fit the num_ctx input ceiling \
              (got ~{first_request_tokens} est. full-request tokens, \
-              including ~{first_message_tokens} message tokens, > 4,915)"
+              including ~{first_message_tokens} message tokens, > {ceiling})"
         );
 
         // Summarize-don't-discard still holds on the turn-1 path.
@@ -10368,10 +10416,13 @@ mod compression_loop_tests {
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
         // The complete-request gate now honestly includes the advertised
-        // schemas. Leave a sliver of room for the static fallback marker so
-        // this test continues to isolate summarizer failure rather than an
-        // irreducible-window refusal.
-        c.mid_loop_trim_tokens = Some(5_600);
+        // schemas. Derive the threshold as the live catalog weight plus a
+        // ~1.8k-token sliver (a catalog-INDEPENDENT offset) that holds the task
+        // plus the static fallback marker, so this test keeps isolating a
+        // summarizer failure rather than tipping into an irreducible-window
+        // refusal as the catalog grows. (Reproduces the historical 5,600 at
+        // today's catalog size.)
+        c.mid_loop_trim_tokens = Some(builtin_catalog_tokens(PromptDisposition::Act) + 1_815);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -11535,13 +11586,17 @@ mod observation_hook_tests {
     /// no budget raise.
     struct TruncationSuspectResponder {
         tools_rounds: Arc<AtomicUsize>,
+        /// Reported prompt size for every round — set ≥95% of the request's
+        /// `num_ctx` so each round reads as truncation-suspect.
+        suspect_prompt: u32,
     }
     impl Respond for TruncationSuspectResponder {
         fn respond(&self, req: &Request) -> ResponseTemplate {
+            let suspect_prompt = self.suspect_prompt;
             if is_stream(req) {
                 return ndjson(&[serde_json::json!({
                     "message": {"content": "suspect answer"}, "done": true,
-                    "prompt_eval_count": 4_000, "eval_count": 5
+                    "prompt_eval_count": suspect_prompt, "eval_count": 5
                 })]);
             }
             let n = self.tools_rounds.fetch_add(1, Ordering::SeqCst);
@@ -11550,13 +11605,13 @@ mod observation_hook_tests {
                     "message": {"content": "", "tool_calls": [{
                         "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
                     }]},
-                    // 5,000 ≥ 95% of 5,120 (4,864) — truncation suspect.
-                    "prompt_eval_count": 5_000, "eval_count": 5,
+                    // ≥95% of num_ctx — truncation suspect.
+                    "prompt_eval_count": suspect_prompt, "eval_count": 5,
                 }))
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "message": {"content": "suspect answer"},
-                    "prompt_eval_count": 5_000, "eval_count": 5,
+                    "prompt_eval_count": suspect_prompt, "eval_count": 5,
                 }))
             }
         }
@@ -11565,11 +11620,24 @@ mod observation_hook_tests {
     #[tokio::test]
     async fn truncation_suspect_rounds_emit_nothing() {
         let server = MockServer::start().await;
+        // Derive the window from the live catalog. The exact prompt + schemas
+        // must fit the input ceiling (input_ceiling_pct% of num_ctx), so reserve
+        // ~311 tokens of headroom above the catalog (a catalog-INDEPENDENT
+        // figure for the tiny system/card/user messages) and back out num_ctx.
+        // The reported prompt is then pinned at ≥95% of that num_ctx, so every
+        // round stays truncation-suspect no matter how the catalog grows.
+        // (Reproduces the historical 5,120 num_ctx / 4,096 ceiling / ~5,000
+        // report at today's catalog size.)
+        const INPUT_CEILING_PCT: usize = 80; // matches ctx() default below
+        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act) + 311;
+        let num_ctx = (input_ceiling * 100).div_ceil(INPUT_CEILING_PCT) as u32;
+        let suspect_prompt = num_ctx * 98 / 100; // ≥95% of num_ctx → suspect
         let tools_rounds = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(TruncationSuspectResponder {
                 tools_rounds: tools_rounds.clone(),
+                suspect_prompt,
             })
             .mount(&server)
             .await;
@@ -11583,10 +11651,11 @@ mod observation_hook_tests {
         let mut observations: Vec<RoundObservation> = Vec::new();
         let mut hook = |obs: RoundObservation| observations.push(obs);
         let mut c = ctx(&uri, &messages, &caveats);
-        // The exact prompt + schemas fit inside the 4,096-token input share;
-        // the backend's 5,000-token report is nevertheless within 5% of the
-        // complete 5,120-token context and remains truncation-suspect.
-        c.num_ctx = Some(5_120);
+        assert_eq!(
+            c.input_ceiling_pct as usize, INPUT_CEILING_PCT,
+            "derived num_ctx assumes the ctx() input-ceiling percentage"
+        );
+        c.num_ctx = Some(num_ctx);
         c.on_round_usage = Some(&mut hook);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
             .await
@@ -11719,8 +11788,13 @@ mod observation_hook_tests {
         let mut observations: Vec<RoundObservation> = Vec::new();
         let mut hook = |obs: RoundObservation| observations.push(obs);
         let mut c = ctx(&uri, &messages, &caveats);
-        // 8_734 ≥ 85% of 4_000 (3_400) → the silent-overflow gate fires.
-        c.safe_context = Some(4_000);
+        // Derive the window from the live catalog: catalog weight plus ~215
+        // tokens (a catalog-INDEPENDENT offset covering the tiny system/card/
+        // user messages plus headroom) so the exact request keeps fitting as
+        // the catalog grows. The reported 8_734-token prompt stays far above
+        // 85% of this window, so the silent-overflow gate still fires.
+        // (Reproduces the historical 4_000 at today's catalog size.)
+        c.safe_context = Some((builtin_catalog_tokens(PromptDisposition::Act) + 215) as u32);
         c.on_round_usage = Some(&mut hook);
         let (_reply, streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
             .await

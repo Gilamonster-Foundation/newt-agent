@@ -828,15 +828,19 @@ async fn suspicious_empty_generated_output_reports_targeted_diagnostic() {
 /// Second round: a real answer.
 struct OverflowThenRecover {
     probes: Arc<AtomicUsize>,
+    /// Reported prompt size of the empty overflow round — set ≥85% of the
+    /// safe-context window so the silent-overflow gate fires.
+    overflow_prompt: u32,
 }
 impl Respond for OverflowThenRecover {
     fn respond(&self, req: &Request) -> ResponseTemplate {
+        let overflow_prompt = self.overflow_prompt;
         if is_stream(req) {
             // Streams mirror the probe sequence: empty first, content after.
             if self.probes.load(Ordering::SeqCst) <= 1 {
                 ndjson(&[serde_json::json!({
                     "message": {"content": ""}, "done": true,
-                    "prompt_eval_count": 3_600, "eval_count": 1
+                    "prompt_eval_count": overflow_prompt, "eval_count": 1
                 })])
             } else {
                 ndjson(&[
@@ -852,7 +856,7 @@ impl Respond for OverflowThenRecover {
             if n == 1 {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "message": {"content": ""},
-                    "prompt_eval_count": 3_600, "eval_count": 1,
+                    "prompt_eval_count": overflow_prompt, "eval_count": 1,
                 }))
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -867,11 +871,24 @@ impl Respond for OverflowThenRecover {
 #[tokio::test]
 async fn context_overflow_trims_and_retries_then_recovers() {
     let server = MockServer::start().await;
+    // Derive the safe window from the live catalog: the exact active prompt and
+    // expanded tool catalog must fit, so reserve ~311 tokens of headroom above
+    // the catalog (a catalog-INDEPENDENT figure for the tiny messages/card) as
+    // the window. The empty round's reported prompt is then pinned at 88% of
+    // that window — comfortably ≥85% — so the silent-overflow gate keeps firing
+    // as the catalog grows. (Reproduces the historical 4,096 window / ~3,600
+    // report at today's catalog size.)
+    // (Step 18.1: the check compares the largest single prompt against the
+    // window — the old multi-round sum, 180 here, inflated past 85% after
+    // two rounds on EVERY long turn, firing spurious overflow retries.)
+    let safe_context = (builtin_catalog_tokens(PromptDisposition::Act) + 311) as u32;
+    let overflow_prompt = safe_context * 88 / 100; // ≥85% of the window
     let probes = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(OverflowThenRecover {
             probes: probes.clone(),
+            overflow_prompt,
         })
         .mount(&server)
         .await;
@@ -880,13 +897,7 @@ async fn context_overflow_trims_and_retries_then_recovers() {
     let caveats = Caveats::top();
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
-    // Safe window of 4,096 input tokens: the exact active prompt and expanded
-    // tool catalog fit, while the empty round's reported 3,600-token prompt
-    // is still ≥85% of the window and therefore likely overflow.
-    // (Step 18.1: the check compares the largest single prompt against the
-    // window — the old multi-round sum, 180 here, inflated past 85% after
-    // two rounds on EVERY long turn, firing spurious overflow retries.)
-    c.safe_context = Some(4_096);
+    c.safe_context = Some(safe_context);
     let (reply, streamed, usage, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("chat_complete should succeed");
@@ -902,7 +913,7 @@ async fn context_overflow_trims_and_retries_then_recovers() {
         usage
             .expect("accumulated usage survives the retry")
             .input_tokens,
-        3_600,
+        overflow_prompt,
         "largest single prompt across the overflowed + recovered rounds"
     );
 }
