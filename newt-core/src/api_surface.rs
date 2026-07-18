@@ -137,6 +137,34 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
                 ),
             ],
         },
+        // Dart + TypeScript: the symbol side of the project packs the "IDE for
+        // LLMs" ships out of the box (#1288). Regex is the bootstrap (AST later).
+        LanguagePack {
+            name: "dart".into(),
+            extensions: vec!["dart".into()],
+            entry_points: vec!["lib.dart".into()],
+            // Top-level (column 0) public (non-`_`) declarations.
+            symbols: vec![
+                rule(r"^(?:abstract\s+)?class\s+([A-Za-z]\w*)", "class"),
+                rule(r"^mixin\s+([A-Za-z]\w*)", "mixin"),
+                rule(r"^enum\s+([A-Za-z]\w*)", "enum"),
+                rule(r"^(?:[\w<>\[\],\s\?]+\s+)?([A-Za-z]\w*)\s*\(", "fn"),
+            ],
+        },
+        LanguagePack {
+            name: "typescript".into(),
+            extensions: vec!["ts".into(), "tsx".into()],
+            entry_points: vec!["index.ts".into(), "*.d.ts".into()],
+            // Exported declarations are the public surface.
+            symbols: vec![
+                rule(r"^export\s+(?:abstract\s+)?class\s+(\w+)", "class"),
+                rule(r"^export\s+interface\s+(\w+)", "interface"),
+                rule(r"^export\s+(?:async\s+)?function\s+(\w+)", "fn"),
+                rule(r"^export\s+type\s+(\w+)", "type"),
+                rule(r"^export\s+enum\s+(\w+)", "enum"),
+                rule(r"^export\s+const\s+(\w+)", "const"),
+            ],
+        },
     ]
 }
 
