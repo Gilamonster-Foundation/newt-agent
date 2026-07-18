@@ -20,11 +20,12 @@ use serde_json::{json, Value};
 /// Per-server launch outcome for the `/mcp` surface (#1149).
 #[derive(Debug, Clone)]
 pub(crate) enum McpStatus {
-    /// Connected, with this many tools registered and the confinement posture
-    /// achieved (#1243 Leg 3).
+    /// Connected, with this many tools registered and the confinement (#1243
+    /// Leg 3) + network-egress (Leg 4) postures achieved.
     Connected {
         tools: usize,
         confinement: Confinement,
+        net: NetGate,
     },
     /// Skipped at launch (auth failure, timeout, spawn error, legacy SSE…).
     Skipped(String),
@@ -46,6 +47,35 @@ pub(crate) enum Confinement {
     Advisory,
     /// A remote (HTTP) server — no local process to confine.
     Remote,
+}
+
+/// The network-egress posture of a connected server, for the `/mcp` table
+/// (#1243 Leg 4). Orthogonal to [`Confinement`] (the fs/exec sandbox): a server
+/// can be fs-confined yet net-advisory, or net-gated with an advisory fs jail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetGate {
+    /// Egress routed through the loopback proxy against an `n`-host allow-list.
+    Gated(usize),
+    /// No egress proxy — outbound network is advisory only.
+    Advisory,
+}
+
+impl NetGate {
+    pub(crate) fn from_posture(posture: newt_mcp_client::NetPosture) -> Self {
+        match posture {
+            newt_mcp_client::NetPosture::Gated(n) => Self::Gated(n),
+            newt_mcp_client::NetPosture::Advisory => Self::Advisory,
+        }
+    }
+
+    /// The `/mcp` suffix — always shown (net is a real axis for every server,
+    /// remote or local).
+    pub(crate) fn note(&self) -> String {
+        match self {
+            Self::Gated(n) => format!(" · net: gated ({n} host{})", if *n == 1 { "" } else { "s" }),
+            Self::Advisory => " · net: advisory".to_string(),
+        }
+    }
 }
 
 impl Confinement {
@@ -264,7 +294,10 @@ impl Mcp {
                     // https / loopback / an explicitly allow-listed host
                     // (docs/decisions/mcp_transport_security.md).
                     apply_transport_security(&mut enriched, token, allow_insecure_hosts);
-                    connect_http(&enriched).await
+                    // #1243 Leg 4: route the HTTP client through the session's
+                    // egress proxy so per-call traffic + redirects are net-gated,
+                    // not just the connect-time host (#1156).
+                    connect_http(&enriched, caveats).await
                 }
                 TransportKind::Sse => {
                     tracing::warn!(
@@ -286,6 +319,7 @@ impl Mcp {
                         McpStatus::Connected {
                             tools: connected.tools.len(),
                             confinement: Confinement::from_sandbox(connected.sandbox_kind),
+                            net: NetGate::from_posture(connected.net_posture),
                         },
                     ));
                     servers.push(connected);
@@ -461,6 +495,24 @@ mod tests {
             Confinement::Confined("Landlock".to_string()).note(),
             " — confined: Landlock"
         );
+    }
+
+    #[test]
+    fn net_gate_maps_posture_and_renders_note() {
+        use newt_mcp_client::NetPosture;
+        // Mapping from the client posture.
+        assert_eq!(
+            NetGate::from_posture(NetPosture::Advisory),
+            NetGate::Advisory
+        );
+        assert_eq!(
+            NetGate::from_posture(NetPosture::Gated(3)),
+            NetGate::Gated(3)
+        );
+        // Rendered `/mcp` suffixes — singular/plural, always shown.
+        assert_eq!(NetGate::Advisory.note(), " · net: advisory");
+        assert_eq!(NetGate::Gated(1).note(), " · net: gated (1 host)");
+        assert_eq!(NetGate::Gated(2).note(), " · net: gated (2 hosts)");
     }
 
     // ── transport security: the OAuth Bearer must never go over plaintext ──

@@ -1226,10 +1226,12 @@ pub(crate) fn run_chat(
                                                 crate::mcp::McpStatus::Connected {
                                                     tools,
                                                     confinement,
+                                                    net,
                                                 } => {
                                                     format!(
-                                                        "  {n}  ✓ connected ({tools} tools){}",
-                                                        confinement.note()
+                                                        "  {n}  ✓ connected ({tools} tools){}{}",
+                                                        confinement.note(),
+                                                        net.note()
                                                     )
                                                 }
                                                 crate::mcp::McpStatus::Skipped(r) => {

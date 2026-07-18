@@ -22,6 +22,36 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 // `ConnectedServer`, surfaced by `/mcp`). Re-exported so consumers can name it
 // without a direct agent-bridle dependency.
 pub use agent_bridle::SandboxKind;
+
+/// The network-egress posture a connected MCP server actually achieved (#1243
+/// Leg 4). Honest — never over-claimed: `Gated(n)` means outbound traffic is
+/// routed through the loopback egress proxy enforcing an `n`-host allow-list
+/// (a non-granted host is refused, not silently dialed); `Advisory` means no
+/// proxy is in force — either an `All` net grant, or (for a spawned stdio
+/// child) a host where the loopback fence is not emittable (e.g. Linux
+/// Landlock, which cannot address-fence), so the child's egress is unmediated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetPosture {
+    /// Egress fenced through the proxy against an `n`-host allow-list.
+    Gated(usize),
+    /// No egress proxy — outbound network is advisory only.
+    Advisory,
+}
+
+/// The net posture for a connection: `Gated(host-count)` when the egress proxy
+/// engaged, else `Advisory`. The host count is the granted remote allow-list
+/// size ([`agent_bridle::net_egress_proxy_hosts`]).
+fn net_posture(caveats: &Caveats, proxied: bool) -> NetPosture {
+    if proxied {
+        NetPosture::Gated(
+            agent_bridle::net_egress_proxy_hosts(caveats)
+                .map(|h| h.len())
+                .unwrap_or(0),
+        )
+    } else {
+        NetPosture::Advisory
+    }
+}
 // Confined stdio spawn (Unix): the child's stdio comes back as tokio pipe ends
 // from `agent_bridle::ConfinedCommand::spawn_tokio`.
 #[cfg(unix)]
@@ -348,6 +378,38 @@ impl StdioTransport {
     pub fn sandbox_kind(&self) -> SandboxKind {
         self.sandbox_kind
     }
+
+    /// Whether the child's network egress is fenced through the loopback proxy
+    /// (#1243 Leg 4). `spawn_tokio` engages the proxy automatically under a
+    /// remote-host `net` grant — but ONLY where the loopback fence is emittable
+    /// (macOS Seatbelt today; Linux Landlock cannot address-fence, so it stays
+    /// `false` there and the child's egress is honestly advisory). Always
+    /// `false` off Unix.
+    #[must_use]
+    pub fn egress_proxied(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self._child.egress_proxied()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// The off-allow-list hosts the child tried to reach through the proxy and
+    /// was refused (#196) — the exfil-attempt signal, empty when unproxied.
+    #[must_use]
+    pub fn refused_hosts(&self) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            self._child.refused_hosts()
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -483,13 +545,23 @@ pub struct HttpTransport {
     session_id: Option<String>,
     /// JSON-RPC messages parsed from `POST` responses, awaiting `recv`.
     inbox: VecDeque<String>,
+    /// #1243 Leg 4: the loopback egress proxy the `client` routes through, when
+    /// the net grant warranted one. Held for the transport's lifetime (dropping
+    /// it tears the proxy down); `Some` iff egress is per-host gated.
+    _proxy: Option<agent_bridle::ProxyHandle>,
 }
 
 impl HttpTransport {
     /// Build a streamable-HTTP transport from a discovered entry. Configured
     /// `entry.headers` (e.g. `Authorization: Bearer …`) are sent on every
     /// request. Does no network I/O — the handshake happens in `initialize`.
-    pub fn connect(entry: &McpServerEntry) -> Result<Self> {
+    ///
+    /// #1243 Leg 4: under a general remote-host `net` grant the client is bound
+    /// to the loopback egress proxy ([`agent_bridle::start_egress_proxy`]) via
+    /// `reqwest::Proxy::all`, so per-call traffic AND redirects are enforced
+    /// against the allow-list — not only the connect-time host (#1156). A
+    /// deny-all / `All` / loopback-only grant starts no proxy (unchanged).
+    pub fn connect(entry: &McpServerEntry, caveats: &Caveats) -> Result<Self> {
         let url = entry
             .url
             .clone()
@@ -508,8 +580,18 @@ impl HttpTransport {
             })?;
             headers.insert(name, val);
         }
-        let client = reqwest::Client::builder()
-            .timeout(resolve_timeout(entry))
+        // Fail-closed: a grant that WARRANTS a proxy but whose loopback listener
+        // cannot bind must refuse the connection, never dial unmediated.
+        let proxy = agent_bridle::start_egress_proxy(caveats)
+            .with_context(|| format!("MCP server `{}`: starting egress proxy", entry.name))?;
+        let mut builder = reqwest::Client::builder().timeout(resolve_timeout(entry));
+        if let Some(handle) = &proxy {
+            let addr = format!("http://{}", handle.addr());
+            builder = builder.proxy(reqwest::Proxy::all(&addr).with_context(|| {
+                format!("MCP server `{}`: routing through egress proxy", entry.name)
+            })?);
+        }
+        let client = builder
             .build()
             .with_context(|| format!("building HTTP client for MCP server `{}`", entry.name))?;
         Ok(Self {
@@ -518,7 +600,16 @@ impl HttpTransport {
             headers,
             session_id: None,
             inbox: VecDeque::new(),
+            _proxy: proxy,
         })
+    }
+
+    /// Whether this client's egress is fenced through the loopback proxy
+    /// (#1243 Leg 4) — cross-platform (the client points itself at the proxy;
+    /// no kernel fence needed).
+    #[must_use]
+    pub fn egress_proxied(&self) -> bool {
+        self._proxy.is_some()
     }
 }
 
@@ -641,7 +732,7 @@ impl Transport for MockTransport {
 /// instead of spawning a subprocess or dialing a socket.
 pub enum AnyTransport {
     Stdio(Box<StdioTransport>),
-    Http(HttpTransport),
+    Http(Box<HttpTransport>),
     #[cfg(test)]
     Mock(MockTransport),
 }
@@ -678,6 +769,10 @@ pub struct ConnectedServer {
     /// ([`SandboxKind::None`] = advisory); `None` for a remote **HTTP** server
     /// (no local process to confine).
     pub sandbox_kind: Option<SandboxKind>,
+    /// The network-egress posture of the connection (#1243 Leg 4): `Gated(n)`
+    /// when outbound traffic is routed through the loopback egress proxy
+    /// enforcing an `n`-host allow-list, else `Advisory`.
+    pub net_posture: NetPosture,
 }
 
 /// Initialize a transport and list its tools into a [`ConnectedServer`].
@@ -685,6 +780,7 @@ async fn finish_connect(
     entry: &McpServerEntry,
     transport: AnyTransport,
     sandbox_kind: Option<SandboxKind>,
+    net_posture: NetPosture,
 ) -> Result<ConnectedServer> {
     let timeout = resolve_timeout(entry);
     let mut conn = McpConnection::new_with_timeout(transport, timeout);
@@ -700,6 +796,7 @@ async fn finish_connect(
         conn,
         tools,
         sandbox_kind,
+        net_posture,
     })
 }
 
@@ -715,10 +812,15 @@ pub async fn connect_stdio(entry: &McpServerEntry, caveats: &Caveats) -> Result<
     }
     let transport = StdioTransport::spawn(entry, caveats)?;
     let sandbox_kind = Some(transport.sandbox_kind());
+    // #1243 Leg 4: spawn_tokio engaged the egress proxy iff the child's egress
+    // is fenced (a remote-host grant on a fence-capable host); its posture is
+    // gated with the granted host count, else advisory.
+    let net = net_posture(caveats, transport.egress_proxied());
     finish_connect(
         entry,
         AnyTransport::Stdio(Box::new(transport)),
         sandbox_kind,
+        net,
     )
     .await
 }
@@ -726,20 +828,22 @@ pub async fn connect_stdio(entry: &McpServerEntry, caveats: &Caveats) -> Result<
 /// Connect to one discovered **streamable-HTTP** server: dial, initialize, list
 /// tools. Use this for `TransportKind::Http` entries (the legacy SSE-only
 /// transport is not supported).
-pub async fn connect_http(entry: &McpServerEntry) -> Result<ConnectedServer> {
+///
+/// #1243 Leg 4: under a general remote-host `net` grant the client is routed
+/// through the loopback egress proxy, so EVERY request and redirect is subject
+/// to the per-host allow-list — not just the one connect-time host check
+/// (#1156). A non-granted host is refused per-call.
+pub async fn connect_http(entry: &McpServerEntry, caveats: &Caveats) -> Result<ConnectedServer> {
     if entry.transport != TransportKind::Http {
         return Err(anyhow!(
             "server `{}`: connect_http called for a non-http transport",
             entry.name
         ));
     }
-    // No local process → no local confinement posture.
-    finish_connect(
-        entry,
-        AnyTransport::Http(HttpTransport::connect(entry)?),
-        None,
-    )
-    .await
+    let transport = HttpTransport::connect(entry, caveats)?;
+    let net = net_posture(caveats, transport.egress_proxied());
+    // No local process → no local OS-sandbox posture; net posture is real.
+    finish_connect(entry, AnyTransport::Http(Box::new(transport)), None, net).await
 }
 
 /// Namespace a remote tool name as `server__tool`.
@@ -868,7 +972,7 @@ impl McpToolset {
                 TransportKind::Stdio => connect_stdio(entry, caveats).await,
                 TransportKind::Http => {
                     warn_on_insecure_transport(entry);
-                    connect_http(entry).await
+                    connect_http(entry, caveats).await
                 }
                 TransportKind::Sse => {
                     tracing::warn!(
@@ -1038,6 +1142,7 @@ mod toolset_tests {
                     input_schema: json!({}),
                 }],
                 sandbox_kind: None,
+                net_posture: crate::NetPosture::Advisory,
             }],
             sanitize_server_names: true,
         };
@@ -1076,6 +1181,7 @@ mod toolset_tests {
                 ]))),
                 tools: vec![],
                 sandbox_kind: None,
+                net_posture: crate::NetPosture::Advisory,
             }],
             sanitize_server_names: true,
         };
@@ -1334,6 +1440,35 @@ mod confined_spawn_helper_tests {
                 .any(|(k, v)| k == "MCP_SERVER_ONLY" && v == "v"),
             "the entry's explicit env must reach the grants"
         );
+    }
+}
+
+#[cfg(test)]
+mod net_posture_tests {
+    use super::*;
+    use newt_core::caveats::Scope;
+
+    #[test]
+    fn gated_reports_the_granted_remote_host_count() {
+        let caveats = Caveats {
+            net: Scope::only(["api.github.com".to_string(), "gitlab.com".to_string()]),
+            ..Caveats::top()
+        };
+        // Proxy engaged → Gated with the allow-list size.
+        assert_eq!(net_posture(&caveats, true), NetPosture::Gated(2));
+        // Not engaged (fence not emittable on this host) → advisory, honestly.
+        assert_eq!(net_posture(&caveats, false), NetPosture::Advisory);
+    }
+
+    #[test]
+    fn all_and_deny_all_are_advisory_when_unproxied() {
+        // `net: All` never warrants a proxy.
+        assert_eq!(net_posture(&Caveats::top(), false), NetPosture::Advisory);
+        let deny = Caveats {
+            net: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        };
+        assert_eq!(net_posture(&deny, false), NetPosture::Advisory);
     }
 }
 
