@@ -532,16 +532,42 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
 /// keep redirecting to the embedded tool when it can serve them.
 const GIT_PASSTHROUGH_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "clone", "rm"];
 
+/// Shell composition/metacharacter markers (#1262): a command containing any of
+/// these is a real SHELL program — pipes, redirects, sequencing, substitution —
+/// that no embedded direct tool can serve. Pure data (three-Cs): extending what
+/// counts as composition is a data edit.
+const SHELL_COMPOSITION_MARKERS: &[&str] = &["|", ">", "<", ";", "&&", "||", "$(", "`", "&"];
+
+/// Whether `command` uses shell composition ([`SHELL_COMPOSITION_MARKERS`]) —
+/// in which case it must fall through to the confined shell as-is.
+fn uses_shell_composition(command: &str) -> bool {
+    SHELL_COMPOSITION_MARKERS
+        .iter()
+        .any(|m| command.contains(m))
+}
+
 /// Decide whether a `run_command` invocation is really a misdirected call to a
 /// direct tool (`list_dir`/`read_file`/…/`git`), and if so which one — so the
 /// executor can bounce it with a correction and [`is_hallucination`] can count
 /// it. Returns `None` when the command should run in the shell as-is.
+///
+/// #1262: a command with shell COMPOSITION (`find … | xargs du | sort`,
+/// `git status && git diff`, `find … > out.txt`) is never a misdirected tool
+/// call — the embedded tools cannot serve pipes/redirects/sequencing, and
+/// bouncing it produced false "hallucination corrected" counts for commands
+/// that were exactly right (the diagnosed ornith:35b pipeline). Only a BARE
+/// invocation redirects. Generalizes the [`GIT_PASSTHROUGH_SUBCOMMANDS`]
+/// judgment ("the embedded tool can't serve this — fall through") to command
+/// shape.
 ///
 /// `git` is special (#898/#1022): only its built-in-served LOCAL ops redirect
 /// to the embedded git tool; its passthrough ops
 /// ([`GIT_PASSTHROUGH_SUBCOMMANDS`]) fall through so the model can actually
 /// push a branch, run `git rm`, and read any PR-creation URL git prints.
 pub(super) fn run_command_redirect(command: &str) -> Option<&'static str> {
+    if uses_shell_composition(command) {
+        return None;
+    }
     let mut tokens = command.split_ascii_whitespace();
     let first = tokens.next().unwrap_or("");
     if first == "git" {
