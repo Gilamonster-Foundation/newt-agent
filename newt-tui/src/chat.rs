@@ -2837,11 +2837,19 @@ pub(crate) fn run_chat(
                     // serves the turn-head indexing/injection (26.5.4) AND the
                     // code_search tool's ChatCtx searcher (26.5.5), so it must
                     // outlive the ChatCtx below.
-                    let semantic_cfg = cfg
+                    let mut semantic_cfg = cfg
                         .context
                         .as_ref()
                         .map(|c| c.semantic.clone())
                         .unwrap_or_default();
+                    // #1279: with no explicit embedding_model_path, adopt the
+                    // pulled default model (`newt models pull-embed`) if present,
+                    // so on-host semantic retrieval works with zero config. The
+                    // fs presence check lives here; the precedence is pure.
+                    semantic_cfg.embedding_model_path = effective_embedding_model_path(
+                        semantic_cfg.embedding_model_path.take(),
+                        newt_inference::palette::embed_model_dir_if_present(),
+                    );
                     // #720: the embedder is a `Box<dyn Embedder>` so it can be
                     // EITHER the HTTP `EmbeddingsClient` OR the in-process candle
                     // embedder (when `embeddings_api = "embedded"`) — the latter

@@ -42,11 +42,13 @@ use tokenizers::Tokenizer;
 
 /// The default candle-clean embedding model — a standard BERT in safetensors
 /// (384-dim). Named in the no-files error so the human knows what to place.
-pub const DEFAULT_EMBED_HF_REPO: &str = "BAAI/bge-small-en-v1.5";
+/// Single source of truth lives in the always-compiled `palette` module (so
+/// `newt models pull-embed` + config-resolution can name it without candle).
+pub const DEFAULT_EMBED_HF_REPO: &str = crate::palette::EMBED_HF_REPO;
 
 /// Files a candle standard-BERT model dir must contain (config + tokenizer +
 /// safetensors weights). Checked in `new` so the no-download contract is total.
-const REQUIRED_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
+const REQUIRED_FILES: &[&str] = crate::palette::EMBED_REQUIRED_FILES;
 
 /// One embed request handed to the worker thread, with a one-shot reply channel.
 struct EmbedJob {

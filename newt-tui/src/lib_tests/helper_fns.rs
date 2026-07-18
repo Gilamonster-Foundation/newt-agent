@@ -760,7 +760,8 @@ fn embeddings_backend_is_embedded_by_default_or_embedded_api() {
 fn semantic_zero_index_hint_matches_embedder_path() {
     let embedded = newt_core::SemanticConfig::default();
     let hint = semantic_zero_index_hint(&embedded);
-    assert!(hint.contains("embedded embeddings"), "got: {hint}");
+    // #1279: the honest remediation names the explicit fetch command.
+    assert!(hint.contains("newt models pull-embed"), "got: {hint}");
     assert!(hint.contains("embedding_model_path"), "got: {hint}");
 
     let http = newt_core::SemanticConfig {
@@ -782,6 +783,39 @@ fn semantic_embedder_preflight_skips_unavailable_embedded_path() {
     );
     #[cfg(feature = "embedded")]
     assert!(reason.contains("embedding_model_path"), "got: {reason}");
+}
+
+#[test]
+fn effective_embedding_model_path_precedence() {
+    use std::path::PathBuf;
+    // #1279: an explicit config path wins over the pulled default.
+    assert_eq!(
+        effective_embedding_model_path(
+            Some("/explicit/path".to_string()),
+            Some(PathBuf::from("/pulled/default"))
+        ),
+        Some("/explicit/path".to_string())
+    );
+    // No explicit path → adopt the pulled default when present.
+    assert_eq!(
+        effective_embedding_model_path(None, Some(PathBuf::from("/pulled/default"))),
+        Some("/pulled/default".to_string())
+    );
+    // Neither present → None (the caller coaches `newt models pull-embed`).
+    assert_eq!(effective_embedding_model_path(None, None), None);
+}
+
+#[test]
+fn semantic_zero_index_and_unavailable_reason_name_the_pull_command() {
+    // #1279: with the embedded path selected and no model, both the preflight
+    // reason and the zero-index hint coach the explicit fetch (never silent-off).
+    let embedded = newt_core::SemanticConfig::default();
+    #[cfg(feature = "embedded")]
+    {
+        let reason = semantic_embedder_unavailable_reason(&embedded).expect("no model → a reason");
+        assert!(reason.contains("newt models pull-embed"), "got: {reason}");
+    }
+    assert!(semantic_zero_index_hint(&embedded).contains("newt models pull-embed"));
 }
 
 #[test]
