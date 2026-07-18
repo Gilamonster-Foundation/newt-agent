@@ -7790,7 +7790,7 @@ mod execute_tool_branch_tests {
         assert_eq!(
             rendered,
             "⚙  find: . (name=*.rs, type=f)\n\
-             ▲ 2 more lines above\n\
+             ▲ 2 more lines above · /spill N raises this view\n\
              ▒ c.rs\n\
              ▒ d.rs\n\
              ▓ e.rs\n\

@@ -6399,7 +6399,7 @@ mod repeat_call_guard_tests {
         assert_eq!(
             String::from_utf8(repeated).unwrap(),
             "⚙  find: . (name=*.rs, type=f)\n\
-             ▲ 1 more lines above\n\
+             ▲ 1 more lines above · /spill N raises this view\n\
              ▒ b.rs\n\
              ▒ c.rs\n\
              ▓ d.rs\n\
