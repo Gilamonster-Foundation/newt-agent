@@ -122,7 +122,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "find",
-                "description": "Find files and directories by name under the workspace, recursively, WITHOUT a shell (use this instead of the `find` shell command). Returns matching paths relative to the workspace root, one per line, already sorted — no need to pipe to `sort`. Respects .gitignore and skips noise (.git, target, node_modules) by default.",
+                "description": "Find files and directories by name under the workspace, recursively, WITHOUT a shell (use this instead of the `find` shell command). Returns matching paths relative to the workspace root, one per line, already sorted — no need to pipe to `sort`. Respects .gitignore and skips noise (.git, target, node_modules) by default. To answer size questions (e.g. the largest files) set `sort: \"size\"` + `show_size: true` — no `du`/pipeline needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -132,7 +132,9 @@ pub fn tool_definitions() -> serde_json::Value {
                         "max_depth": { "type": "integer", "description": "Maximum directory depth below `path` (1 = immediate children only). Omit for unlimited." },
                         "max_results": { "type": "integer", "description": "Cap on the number of matches returned. Default 1000; output notes when truncated." },
                         "respect_gitignore": { "type": "boolean", "description": "When true (default) skip .gitignored paths plus .git/target/node_modules/hidden dirs. Set false to search everything." },
-                        "case_sensitive": { "type": "boolean", "description": "Case-sensitive basename match. Default true." }
+                        "case_sensitive": { "type": "boolean", "description": "Case-sensitive basename match. Default true." },
+                        "sort": { "type": "string", "enum": ["name", "size"], "description": "Result order: 'name' (default, paths ascending) or 'size' (byte size descending — combine with max_results for the N largest and show_size to see the bytes)." },
+                        "show_size": { "type": "boolean", "description": "Prefix each result with its byte size and a tab ('<size>\\t<path>'). Default false. Use with sort='size' to answer 'largest files' questions without a shell." }
                     },
                     "required": []
                 }
