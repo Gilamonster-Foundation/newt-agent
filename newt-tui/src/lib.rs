@@ -6443,35 +6443,40 @@ fn is_ctrl_c(bytes: &[u8]) -> bool {
     bytes == [0x03]
 }
 
+// The trait itself stays available on every platform: `chat.rs` names
+// `Option<&dyn SpillInput>` unconditionally to type the spill handle it
+// threads through `with_live_spill_watch`. Only its methods — driven by the
+// unix-only keyboard watcher (`dispatch_turn_keys`, `watch_for_interrupt_fd`)
+// — are unix-gated, so a non-unix build never has an unused-method warning.
 pub(crate) trait SpillInput: Sync {
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn scroll_up(&self) -> bool;
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn scroll_down(&self) -> bool;
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn toggle_expanded(&self) -> bool;
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn refresh_geometry(&self) -> bool;
 }
 
 #[cfg(feature = "live-spill")]
 impl SpillInput for live_spill::LiveSpillRenderer {
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn scroll_up(&self) -> bool {
         self.scroll_up()
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn scroll_down(&self) -> bool {
         self.scroll_down()
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn toggle_expanded(&self) -> bool {
         self.toggle_expanded()
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn refresh_geometry(&self) -> bool {
         self.refresh_geometry()
     }

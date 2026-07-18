@@ -170,7 +170,9 @@ impl LiveSpillRenderer {
         self.scroll(SpillView::toggle_expanded)
     }
 
-    #[cfg(any(unix, test))]
+    // Only reached through the unix-only keyboard watcher (`SpillInput::refresh_geometry`
+    // in lib.rs); no test calls this directly, unlike scroll_up/scroll_down/toggle_expanded.
+    #[cfg(unix)]
     pub(crate) fn refresh_geometry(&self) -> bool {
         let Some(mut state) = self.try_lock_state() else {
             return false;
@@ -774,11 +776,15 @@ mod tests {
         }
     }
 
+    // Only exercised by the unix-only `blocked_terminal_write_does_not_block_*`
+    // regression below (it drives `crate::watch_for_interrupt_fd`, itself unix-only).
+    #[cfg(unix)]
     #[derive(Clone, Default)]
     struct BlockingWriter {
         gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
     }
 
+    #[cfg(unix)]
     impl BlockingWriter {
         fn wait_until_blocked(&self) {
             let (state, wake) = &*self.gate;
@@ -795,6 +801,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Write for BlockingWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             let (state, wake) = &*self.gate;
