@@ -23,6 +23,7 @@ pub mod git_caveats;
 pub mod kit;
 pub mod lazy_emission;
 pub mod mcp;
+pub mod mcp_catalog;
 pub mod memory;
 pub mod metrics;
 pub mod model_card;

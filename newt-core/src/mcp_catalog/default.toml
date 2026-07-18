@@ -1,0 +1,14 @@
+# Curated MCP server catalog — resolved by `newt mcp install <name>`.
+#
+# Pure data (three-Cs): add or override entries WITHOUT touching code by
+# dropping a file at ~/.newt/mcp-catalog.toml (user) or .newt/mcp-catalog.toml
+# (project). Entries merge by `name`; later layers win (bundled < user <
+# project). Each entry is a `description` plus the same fields as a
+# `[[mcp_servers]]` registration (`command`/`args`/`env` for stdio;
+# `type` + `url`/`headers` for sse/http; `request_timeout_secs`).
+
+[[servers]]
+name = "scrybe"
+description = "Scrybe Markdown editor — document tools over MCP"
+command = "scrybe-mcp-server"
+args = ["stdio"]
