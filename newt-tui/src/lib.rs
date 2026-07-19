@@ -6645,10 +6645,14 @@ impl TurnKeyDecoder {
     }
 
     /// Decode an SGR-mouse event from the accumulated params + terminal byte:
-    /// `ESC [ < btn ; col ; row (M|m)`. Wheel-up = 64 → scroll toward older,
-    /// wheel-down = 65 → scroll toward newer; only the press form (`M`) reports
-    /// (the wheel has no release). Non-wheel events return `None` here (clicks
-    /// are handled separately).
+    /// `ESC [ < btn ; col ; row (M|m)`. Only the press form (`M`) reports —
+    /// wheels have no release and a click's release (`m`) is a deliberate no-op,
+    /// so one click = one toggle. Wheel-up = 64 → scroll toward older, wheel-down
+    /// = 65 → scroll toward newer, plain left-press = 0 → expand/collapse. A
+    /// bare left click toggles regardless of which frame row it lands on:
+    /// per-glyph hit-testing (the `⧉`/`▣`/`▲`/`▼` targets) needs the renderer's
+    /// screen geometry, a refinement seam left for a follow-up. Right/middle
+    /// buttons and drag/motion (button ≥ 32) are ignored.
     #[cfg(feature = "live-spill")]
     fn mouse_key_for(&self, final_byte: u8) -> Option<TurnKey> {
         if final_byte != b'M' {
@@ -6662,6 +6666,7 @@ impl TurnKeyDecoder {
             .parse::<u32>()
             .ok()?;
         match btn {
+            0 => Some(TurnKey::ToggleExpanded),
             64 => Some(TurnKey::Up),
             65 => Some(TurnKey::Down),
             _ => None,
@@ -6708,7 +6713,17 @@ mod mouse_decode_tests {
     #[test]
     fn sgr_non_wheel_events_are_ignored_by_the_wheel_tier() {
         let mut d = TurnKeyDecoder::default();
-        // A left-button press/release is not a wheel event → no scroll keys.
+        // A left-button RELEASE emits no key; a right/middle click is ignored.
+        assert_eq!(d.feed(b"\x1b[<0;3;3m"), vec![]);
+        assert_eq!(d.feed(b"\x1b[<2;3;3M"), vec![]);
+    }
+
+    #[test]
+    fn left_click_press_toggles_expand() {
+        let mut d = TurnKeyDecoder::default();
+        // SGR left-button PRESS toggles expand/collapse; the release is a no-op,
+        // so one click = one toggle.
+        assert_eq!(d.feed(b"\x1b[<0;3;3M"), vec![TurnKey::ToggleExpanded]);
         assert_eq!(d.feed(b"\x1b[<0;3;3m"), vec![]);
     }
 
