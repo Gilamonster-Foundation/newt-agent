@@ -28,7 +28,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
 use newt_core::mcp::{McpServerEntry, TransportKind};
-use newt_core::mcp_catalog::{builtin_catalog, merge_catalogs, parse_catalog, McpCatalogEntry};
+use newt_core::mcp_catalog::{
+    builtin_catalog, merge_catalog_layers, parse_catalog, McpCatalogEntry,
+};
 use newt_core::Config;
 
 #[derive(Subcommand, Debug)]
@@ -125,14 +127,15 @@ pub fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
         McpCmd::List => cmd_list(config_path, &mut out),
         McpCmd::Install { name, project } => {
             let catalog = resolve_catalog()?;
-            let Some(chosen) = catalog.iter().find(|e| e.name == name) else {
-                let names: Vec<&str> = catalog.iter().map(|e| e.name.as_str()).collect();
+            let Some((chosen, origin)) = catalog.iter().find(|(e, _)| e.name == name) else {
+                let names: Vec<&str> = catalog.iter().map(|(e, _)| e.name.as_str()).collect();
                 bail!(
                     "no `{name}` in the MCP catalog (available: {})",
                     names.join(", ")
                 );
             };
-            let path = add_to_config(&chosen.server(), config_path, project)?;
+            let server = installable_server(chosen, origin)?;
+            let path = add_to_config(&server, config_path, project)?;
             writeln!(
                 out,
                 "Installed MCP server '{}' ({}) in {}",
@@ -422,22 +425,64 @@ fn load_claude_json(path: &Path) -> Vec<McpServerEntry> {
         .unwrap_or_default()
 }
 
+/// Where a resolved catalog entry came from — so an error about a broken
+/// entry can name the file to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatalogOrigin {
+    Bundled,
+    DropIn(PathBuf),
+}
+
+impl std::fmt::Display for CatalogOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bundled => write!(f, "the bundled catalog"),
+            Self::DropIn(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+/// The server registration a catalog entry installs, validated. Pure. A
+/// broken drop-in entry (e.g. a stdio server with no `command`) errors here,
+/// naming the entry and the catalog it came from — not deep in the config
+/// writer with no provenance.
+fn installable_server(
+    chosen: &McpCatalogEntry,
+    origin: &CatalogOrigin,
+) -> anyhow::Result<McpServerEntry> {
+    let server = chosen.server();
+    if !server.is_valid() {
+        let need = match server.transport {
+            TransportKind::Stdio => "a `command`",
+            TransportKind::Sse | TransportKind::Http => "a `url`",
+        };
+        bail!(
+            "catalog entry `{}` (from {origin}) is not installable: a {} server requires {need}",
+            chosen.name,
+            server.transport.as_str()
+        );
+    }
+    Ok(server)
+}
+
 /// Resolve the effective catalog: bundled < `~/.newt/mcp-catalog.toml` <
-/// `.newt/mcp-catalog.toml`, merged by name. A present-but-malformed drop-in
-/// is a loud error (installing from a half-read catalog would be worse), a
+/// `.newt/mcp-catalog.toml`, merged by name with each entry keeping the
+/// origin of the layer that won it. A present-but-malformed drop-in is a
+/// loud error (installing from a half-read catalog would be worse), a
 /// missing one is simply skipped.
-fn resolve_catalog() -> anyhow::Result<Vec<McpCatalogEntry>> {
-    let mut layers = vec![builtin_catalog()];
+fn resolve_catalog() -> anyhow::Result<Vec<(McpCatalogEntry, CatalogOrigin)>> {
+    let mut layers = vec![(CatalogOrigin::Bundled, builtin_catalog())];
     let user = Config::user_config_dir().map(|d| d.join("mcp-catalog.toml"));
     let project = std::env::current_dir()
         .ok()
         .map(|d| d.join(".newt").join("mcp-catalog.toml"));
     for path in [user, project].into_iter().flatten() {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            layers.push(parse_catalog(&text).with_context(|| format!("in {}", path.display()))?);
+            let entries = parse_catalog(&text).with_context(|| format!("in {}", path.display()))?;
+            layers.push((CatalogOrigin::DropIn(path), entries));
         }
     }
-    Ok(merge_catalogs(layers))
+    Ok(merge_catalog_layers(layers))
 }
 
 #[cfg(test)]
@@ -609,6 +654,28 @@ mod tests {
         assert_eq!(got.get("EMPTY").map(String::as_str), Some(""));
         assert!(parse_env_pairs(&["NOEQUALS".into()]).is_err());
         assert!(parse_env_pairs(&["=value".into()]).is_err());
+    }
+
+    #[test]
+    fn installable_server_names_the_entry_and_the_catalog_it_came_from() {
+        // A drop-in entry that parses but can never connect must error at
+        // install time, pointing at the file to fix — not surface as a bare
+        // config-writer error with no provenance.
+        let broken = &parse_catalog("[[servers]]\nname = \"half\"\n").unwrap()[0];
+        let origin = CatalogOrigin::DropIn(PathBuf::from("/proj/.newt/mcp-catalog.toml"));
+        let err = installable_server(broken, &origin).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("half"), "names the entry: {msg}");
+        assert!(msg.contains("mcp-catalog.toml"), "names the file: {msg}");
+        assert!(msg.contains("command"), "names the missing field: {msg}");
+        // Bundled origin is named as such.
+        let err = installable_server(broken, &CatalogOrigin::Bundled).unwrap_err();
+        assert!(err.to_string().contains("bundled"), "{err}");
+        // A valid entry passes through with its name filled in.
+        let good = &parse_catalog("[[servers]]\nname = \"ok\"\ncommand = \"ok-mcp\"\n").unwrap()[0];
+        let server = installable_server(good, &origin).unwrap();
+        assert_eq!(server.name, "ok");
+        assert_eq!(server.command.as_deref(), Some("ok-mcp"));
     }
 
     #[test]

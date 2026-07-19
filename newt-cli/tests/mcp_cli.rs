@@ -170,6 +170,73 @@ fn install_unknown_name_lists_the_available_catalog() {
 }
 
 #[test]
+fn catalog_drop_ins_layer_user_over_bundled_and_project_over_user() {
+    let sb = sandbox();
+    // User drop-in overrides the bundled scrybe entry.
+    std::fs::write(
+        sb.config_dir.join("mcp-catalog.toml"),
+        "[[servers]]\nname = \"scrybe\"\ncommand = \"scrybe-user\"\nargs = [\"stdio\"]\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "install", "scrybe"])
+        .assert()
+        .success();
+    let cfg = load_config(&sb.config_dir.join("config.toml"));
+    assert_eq!(cfg.mcp_servers[0].command.as_deref(), Some("scrybe-user"));
+    newt(&sb)
+        .args(["mcp", "remove", "scrybe"])
+        .assert()
+        .success();
+
+    // Project drop-in overrides the user drop-in.
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    std::fs::write(
+        sb.cwd.join(".newt").join("mcp-catalog.toml"),
+        "[[servers]]\nname = \"scrybe\"\ncommand = \"scrybe-proj\"\nargs = [\"stdio\"]\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "install", "scrybe"])
+        .assert()
+        .success();
+    let cfg = load_config(&sb.config_dir.join("config.toml"));
+    assert_eq!(cfg.mcp_servers[0].command.as_deref(), Some("scrybe-proj"));
+}
+
+#[test]
+fn malformed_catalog_drop_in_fails_install_loudly() {
+    let sb = sandbox();
+    std::fs::write(sb.config_dir.join("mcp-catalog.toml"), "not toml [").unwrap();
+    newt(&sb)
+        .args(["mcp", "install", "scrybe"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mcp-catalog.toml"));
+    assert!(!sb.config_dir.join("config.toml").exists());
+}
+
+#[test]
+fn broken_catalog_drop_in_entry_fails_install_naming_the_file() {
+    let sb = sandbox();
+    // Parses fine, but a stdio server with no command can never connect.
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    std::fs::write(
+        sb.cwd.join(".newt").join("mcp-catalog.toml"),
+        "[[servers]]\nname = \"half\"\ndescription = \"broken on purpose\"\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "install", "half"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("half"))
+        .stderr(predicate::str::contains("mcp-catalog.toml"))
+        .stderr(predicate::str::contains("command"));
+    assert!(!sb.config_dir.join("config.toml").exists());
+}
+
+#[test]
 fn add_aborts_on_an_unreadable_config_without_truncating_it() {
     let sb = sandbox();
     let cfg_path = sb.config_dir.join("config.toml");
