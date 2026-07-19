@@ -241,6 +241,7 @@ env = { ROOT = "/tmp" }
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         }
     }
 

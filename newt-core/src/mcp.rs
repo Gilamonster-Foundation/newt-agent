@@ -69,6 +69,69 @@ fn default_true() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Trust boundary on secret resolution (#1301 security review)
+// ---------------------------------------------------------------------------
+
+/// Whether a discovered [`McpServerEntry`] came from a **newt-owned** config
+/// source or a **borrowed** Claude/project overlay — the trust boundary that
+/// governs how its `env` / `headers` secrets resolve.
+///
+/// newt-owned config (a `[[mcp_servers]]` in `config.toml`, or `~/.newt/mcp.toml`)
+/// is the operator's own machine config, exactly like a line in their shell
+/// profile: it may name a command to run (`${cmd:…}` / `{ cmd = … }`), a file to
+/// read (`${file:…}` / `{ file = … }`), or an env var, and newt resolves all of
+/// it host-side.
+///
+/// A discovered Claude/project overlay (`~/.claude.json`,
+/// `<workspace>/.mcp.json`) is attacker-reachable — a freshly cloned repo can
+/// ship a hostile `.mcp.json`. So for an **untrusted** entry the literal
+/// env/header values pass to the child **verbatim** (NO `${…}` interpolation, NO
+/// `cmd:`/`file:` execution or read — the pre-#1301 behavior, which also restores
+/// Claude-overlay compatibility), and a structured `{ env | file | cmd }`
+/// reference is **rejected**: untrusted config must never be able to name a
+/// command to run or a file to read on the host.
+///
+/// The marker is set at discovery ([`discover`] / [`parse_claude_mcp`]); it is
+/// never serialized (it is provenance, not config the user writes) and defaults
+/// to [`McpTrust::Trusted`] so an entry constructed in newt's own code
+/// (`newt mcp add`/`install`/`probe`, catalog installs) is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpTrust {
+    /// newt-owned config — full `${…}` interpolation and `{env|file|cmd}` refs.
+    #[default]
+    Trusted,
+    /// A borrowed Claude/project overlay — literals pass verbatim, refs rejected.
+    Untrusted,
+}
+
+/// Resolve one `env` / `headers` value to its plaintext [`Secret`] under a trust
+/// level — the single choke point for the #1301 trust boundary.
+///
+/// - [`McpTrust::Trusted`] (newt-owned config): the value is resolved fully via
+///   [`SecretValue::resolve`] — `${…}` interpolation for a literal, the
+///   `{env|file|cmd}` machinery for a reference.
+/// - [`McpTrust::Untrusted`] (a discovered Claude/project overlay): a
+///   [`SecretValue::Literal`] passes through **verbatim** (never interpolated,
+///   so a `${cmd:…}` in an untrusted value is inert text, not a host command),
+///   and a [`SecretValue::Ref`] is a hard error — untrusted config may not name
+///   a command to run or a file to read.
+pub fn resolve_secret_under_trust(value: &SecretValue, trust: McpTrust) -> Result<Secret> {
+    match trust {
+        McpTrust::Trusted => value.resolve(),
+        McpTrust::Untrusted => match value {
+            SecretValue::Literal(s) => Ok(Secret::new(s.clone())),
+            SecretValue::Ref(_) => Err(NewtError::Config(
+                "a discovered (untrusted) MCP config source (a project `.mcp.json` or \
+                 `~/.claude.json`) may not use a `{ env | file | cmd }` secret reference — \
+                 only newt-owned config (`config.toml`, `~/.newt/mcp.toml`) may name a command \
+                 to run or a file to read. `newt mcp import` this server to adopt it as trusted."
+                    .to_string(),
+            )),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Secret-bearing MCP config values (`env` / `headers`)
 // ---------------------------------------------------------------------------
 
@@ -175,48 +238,88 @@ impl InterpToken {
     }
 }
 
-/// Classify the text inside a `${...}` token. Pure. A bare `${NAME}` (no scheme
-/// prefix) is an env var; an unknown `scheme:` prefix is a loud error rather
-/// than a silently-wrong lookup.
-fn classify_token(inner: &str) -> Result<InterpToken> {
+/// Whether `s` is a valid bare env-var reference for `${NAME}` — an identifier
+/// `^[A-Za-z_][A-Za-z0-9_]*$`. This is the user's intended inline form (e.g.
+/// `Bearer ${MY_TOKEN}`); anything else inside `${…}` is left verbatim.
+fn is_env_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Classify the text inside a `${...}` token. Pure. `Some` only for a token newt
+/// actually interpolates: a known scheme (`env:` / `file:` / `cmd:`) or a bare
+/// `${NAME}` where `NAME` is a valid identifier. `None` for anything else —
+/// a colon without a known scheme (`${VAR:-default}`), a non-identifier
+/// (`${.field}`) — which the caller then passes through **verbatim** (a
+/// conservative contract, #1301: an unrecognized `${…}` is NOT an error, so a
+/// pre-existing literal that merely contains `${…}` keeps working).
+fn classify_token(inner: &str) -> Option<InterpToken> {
     match inner.split_once(':') {
-        None => Ok(InterpToken::Env(inner.to_string())),
-        Some(("env", rest)) => Ok(InterpToken::Env(rest.to_string())),
-        Some(("file", rest)) => Ok(InterpToken::File(rest.to_string())),
-        Some(("cmd", rest)) => Ok(InterpToken::Cmd(rest.to_string())),
-        Some((scheme, _)) => Err(NewtError::Config(format!(
-            "unknown interpolation scheme `{scheme}:` in `${{{inner}}}` \
-             (expected `env:`, `file:`, `cmd:`, or a bare `${{VAR}}`)"
-        ))),
+        Some(("env", rest)) => Some(InterpToken::Env(rest.to_string())),
+        Some(("file", rest)) => Some(InterpToken::File(rest.to_string())),
+        Some(("cmd", rest)) => Some(InterpToken::Cmd(rest.to_string())),
+        // A colon with an unknown scheme (`${VAR:-default}`, `${x:y}`) is NOT a
+        // newt token — pass it through verbatim, never a hard error.
+        Some(_) => None,
+        // No colon: a bare `${NAME}` interpolates only when NAME is a valid
+        // identifier; otherwise (`${.field}`) it is verbatim.
+        None => is_env_identifier(inner).then(|| InterpToken::Env(inner.to_string())),
     }
 }
 
 /// The pure core of [`interpolate`]: split `template` into literal runs and
-/// `${...}` tokens, resolving each token through the injected `resolve`. Literal
-/// text around tokens is preserved verbatim. An unterminated `${` is an error.
-/// Kept generic over the resolver so the parsing/reassembly is unit-tested with
-/// literals — no env/fs/subprocess.
+/// `${...}` tokens, resolving each RECOGNIZED token through the injected
+/// `resolve`. Literal text around tokens — and any UNRECOGNIZED `${…}` (unknown
+/// scheme, non-identifier) — is preserved **verbatim** (the #1301 conservative
+/// contract: an unrecognized `${…}` is never a hard error). `$${` is an escape
+/// yielding a literal `${` (so an operator can express a literal `${`). An
+/// unterminated `${` is the one hard error, and its message references NO value
+/// (redaction-safe, #1301). Kept generic over the resolver so the
+/// parsing/reassembly is unit-tested with literals — no env/fs/subprocess.
 fn interpolate_with<F>(template: &str, resolve: F) -> Result<String>
 where
     F: Fn(&InterpToken) -> Result<String>,
 {
     // Fast path: the overwhelmingly common literal (a path, a log level, an
-    // org id) carries no token and is returned byte-for-byte.
+    // org id) carries no `${` and is returned byte-for-byte. (`$${` contains
+    // `${`, so an escaped value correctly falls through to the scanner.)
     if !template.contains("${") {
         return Ok(template.to_string());
     }
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("${") {
+        // `$${` escape: emit a literal `${` and resume AFTER it, so the brace
+        // that follows is treated as ordinary text, not a token opener.
+        if start >= 1 && rest.as_bytes()[start - 1] == b'$' {
+            out.push_str(&rest[..start - 1]);
+            out.push_str("${");
+            rest = &rest[start + 2..];
+            continue;
+        }
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let Some(end) = after.find('}') else {
-            return Err(NewtError::Config(format!(
-                "unterminated `${{` in MCP value `{template}`"
-            )));
+            // Redaction-safe: reference the shape of the error, NEVER the value
+            // (which may carry literal secret material before the stray `${`).
+            return Err(NewtError::Config(
+                "unterminated `${` in an MCP env/header value (missing closing `}`)".to_string(),
+            ));
         };
-        let token = classify_token(&after[..end])?;
-        out.push_str(&resolve(&token)?);
+        let inner = &after[..end];
+        match classify_token(inner) {
+            Some(token) => out.push_str(&resolve(&token)?),
+            // Not a newt token — reassemble the `${…}` verbatim.
+            None => {
+                out.push_str("${");
+                out.push_str(inner);
+                out.push('}');
+            }
+        }
         rest = &after[end + 1..];
     }
     out.push_str(rest);
@@ -242,11 +345,15 @@ fn resolve_token_live(token: &InterpToken) -> Result<String> {
 /// or empty reference is a hard error.
 ///
 /// SECURITY: a `${cmd:...}` token runs a program host-side, at the operator's
-/// own trust level — it is config the operator authored, exactly like a line in
-/// their shell profile. Resolution happens in newt's own (unconfined) process,
-/// just before the child env / HTTP headers are built, and the result is wrapped
-/// in [`Secret`]; it is never written back to config and never enters newt's own
-/// process env.
+/// own trust level. This is only ever reached for **newt-owned (TRUSTED)** config
+/// (see [`resolve_secret_under_trust`] / [`McpTrust`]) — config the operator
+/// authored, exactly like a line in their shell profile. A borrowed
+/// Claude/project overlay is UNTRUSTED and never reaches interpolation (its
+/// literals pass verbatim, its refs are rejected), so a hostile `.mcp.json`
+/// cannot smuggle a `${cmd:…}` onto the host. Resolution happens in newt's own
+/// (unconfined) process, just before the child env / HTTP headers are built, and
+/// the result is wrapped in [`Secret`]; it is never written back to config and
+/// never enters newt's own process env.
 pub fn interpolate(template: &str) -> Result<String> {
     interpolate_with(template, resolve_token_live)
 }
@@ -304,6 +411,14 @@ pub struct McpServerEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub request_timeout_secs: Option<u64>,
+
+    /// Provenance / trust marker (#1301): whether this entry came from newt-owned
+    /// config (TRUSTED — full secret resolution) or a borrowed Claude/project
+    /// overlay (UNTRUSTED — literals verbatim, refs rejected). Set at discovery
+    /// ([`discover`] / [`parse_claude_mcp`]); **never serialized** (`#[serde(skip)]`)
+    /// and defaults to [`McpTrust::Trusted`] — see [`McpTrust`].
+    #[serde(skip)]
+    pub trust: McpTrust,
 }
 
 impl McpServerEntry {
@@ -428,6 +543,10 @@ pub fn parse_claude_mcp(value: &serde_json::Value) -> Vec<McpServerEntry> {
             let mut parsed: McpServerEntry = serde_json::from_value(entry.clone()).ok()?;
             // The name lives in the map key, not the entry body.
             parsed.name = name.clone();
+            // A Claude/project overlay is borrowed, attacker-reachable config —
+            // mark it UNTRUSTED at the single parse funnel so its secrets never
+            // interpolate / execute a `${cmd:…}` or `{ cmd = … }` (#1301).
+            parsed.trust = McpTrust::Untrusted;
             Some(parsed)
         })
         .collect()
@@ -503,15 +622,34 @@ pub fn discover(
     home: Option<&Path>,
     workspace: &Path,
 ) -> Vec<McpServerEntry> {
+    // Provenance is stamped at each merge point (the #1301 trust boundary):
+    // the two newt-owned sources are TRUSTED, the two borrowed Claude overlays
+    // are UNTRUSTED (also enforced at the `parse_claude_mcp` funnel).
+    let trusted = |mut e: McpServerEntry| {
+        e.trust = McpTrust::Trusted;
+        e
+    };
+    let untrusted = |mut e: McpServerEntry| {
+        e.trust = McpTrust::Untrusted;
+        e
+    };
     let mut sources: Vec<McpServerEntry> = Vec::new();
-    sources.extend(newt_servers.iter().cloned());
+    sources.extend(newt_servers.iter().cloned().map(trusted));
     if let Some(path) = newt_mcp_toml {
-        sources.extend(load_newt_mcp_toml(path));
+        sources.extend(load_newt_mcp_toml(path).into_iter().map(trusted));
     }
     if let Some(home) = home {
-        sources.extend(load_claude_file(&home.join(".claude.json")));
+        sources.extend(
+            load_claude_file(&home.join(".claude.json"))
+                .into_iter()
+                .map(untrusted),
+        );
     }
-    sources.extend(load_claude_file(&workspace.join(".mcp.json")));
+    sources.extend(
+        load_claude_file(&workspace.join(".mcp.json"))
+            .into_iter()
+            .map(untrusted),
+    );
     dedup_valid_first_wins(sources)
 }
 
@@ -576,6 +714,7 @@ mod tests {
             url: None,
             headers: BTreeMap::new(),
             request_timeout_secs: None,
+            trust: McpTrust::Trusted,
         };
         let sse_no_url = McpServerEntry {
             transport: TransportKind::Sse,
@@ -608,6 +747,7 @@ mod tests {
                 url: None,
                 headers: BTreeMap::new(),
                 request_timeout_secs: None,
+                trust: McpTrust::Trusted,
             },
             McpServerEntry {
                 enabled: true,
@@ -619,6 +759,7 @@ mod tests {
                 url: None,
                 headers: BTreeMap::new(),
                 request_timeout_secs: None,
+                trust: McpTrust::Trusted,
             },
         ];
         let got = discover(&newt, None, None, Path::new("/nonexistent"));
@@ -774,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_token_maps_schemes_and_rejects_unknown() {
+    fn classify_token_maps_schemes_and_leaves_unrecognized_verbatim() {
         assert_eq!(
             classify_token("VAR").unwrap(),
             InterpToken::Env("VAR".into())
@@ -791,8 +932,61 @@ mod tests {
             classify_token("cmd:vault kv get -field=token secret/x").unwrap(),
             InterpToken::Cmd("vault kv get -field=token secret/x".into())
         );
-        // Unknown scheme is a loud error, not a silently-wrong lookup.
-        assert!(classify_token("bogus:thing").is_err());
+        // #1301 conservative contract: an unknown scheme is NOT a token (it is
+        // passed through verbatim by the caller), never a hard error.
+        assert!(classify_token("bogus:thing").is_none());
+        // A shell-style default (`${VAR:-default}`) — colon, unknown scheme →
+        // verbatim.
+        assert!(classify_token("VAR:-https://api.example.com").is_none());
+        // A non-identifier bare token (a jq filter `${.field}`) → verbatim.
+        assert!(classify_token(".field").is_none());
+        assert!(classify_token("1abc").is_none());
+        assert!(classify_token("a b").is_none());
+        // A valid identifier IS a bare env token.
+        assert_eq!(
+            classify_token("_MY_TOKEN2").unwrap(),
+            InterpToken::Env("_MY_TOKEN2".into())
+        );
+    }
+
+    #[test]
+    fn interpolate_passes_unrecognized_tokens_through_verbatim() {
+        // The resolver must NEVER fire for an unrecognized `${…}`; the whole
+        // token text is reassembled byte-for-byte (backward-compat, #1301).
+        let never = |_: &InterpToken| -> Result<String> { panic!("must not resolve") };
+        assert_eq!(
+            interpolate_with("${API_BASE:-https://api.example.com}", never).unwrap(),
+            "${API_BASE:-https://api.example.com}"
+        );
+        assert_eq!(interpolate_with("${.field}", never).unwrap(), "${.field}");
+        // A recognized token still resolves, with an unrecognized one left as-is.
+        let out = interpolate_with("${env:A}-${x:y}", |t| {
+            Ok(match t {
+                InterpToken::Env(v) => format!("E<{v}>"),
+                _ => unreachable!(),
+            })
+        })
+        .unwrap();
+        assert_eq!(out, "E<A>-${x:y}");
+    }
+
+    #[test]
+    fn interpolate_double_dollar_escapes_a_literal_dollar_brace() {
+        let never = |_: &InterpToken| -> Result<String> { panic!("must not resolve") };
+        // `$${` yields a literal `${` and the following text stays literal.
+        assert_eq!(
+            interpolate_with("price $${cmd:evil}", never).unwrap(),
+            "price ${cmd:evil}"
+        );
+        assert_eq!(interpolate_with("$${VAR}", never).unwrap(), "${VAR}");
+        // A lone `$` before other text is untouched; a real token after it still
+        // resolves.
+        let out = interpolate_with("$5 then ${env:A}", |t| match t {
+            InterpToken::Env(v) => Ok(format!("<{v}>")),
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(out, "$5 then <A>");
     }
 
     #[test]
@@ -807,8 +1001,107 @@ mod tests {
     }
 
     #[test]
-    fn interpolate_unterminated_token_is_an_error() {
-        assert!(interpolate_with("Bearer ${cmd:oops", |_| Ok("x".into())).is_err());
+    fn interpolate_unterminated_token_errors_without_leaking_the_value() {
+        // FIX 6 (#1301): the unterminated-`${` error must reference NO value —
+        // a stray `${` after literal secret material must not leak it.
+        let err = interpolate_with("sk-live-DEADBEEF ${", |_| Ok("x".into())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unterminated"), "{msg}");
+        assert!(
+            !msg.contains("sk-live-DEADBEEF"),
+            "the raw value leaked into the error: {msg}"
+        );
+    }
+
+    // ---- #1301 trust boundary: resolve_secret_under_trust ----
+
+    #[test]
+    fn untrusted_literal_with_cmd_token_passes_through_verbatim_no_execution() {
+        // The heart of the #1301 fix: an UNTRUSTED source's literal is handed to
+        // the child VERBATIM — a `${cmd:…}` is inert text, never interpolated,
+        // so the resolver / a subprocess is never reached. Pure: the untrusted
+        // branch structurally cannot execute anything.
+        let value = SecretValue::literal("${cmd:touch /tmp/newt-1301-should-not-exist}");
+        let got = resolve_secret_under_trust(&value, McpTrust::Untrusted).unwrap();
+        assert_eq!(
+            got.expose(),
+            "${cmd:touch /tmp/newt-1301-should-not-exist}",
+            "an untrusted ${{cmd:…}} literal must reach the child verbatim, not run"
+        );
+        // A bare `${VAR}` in an untrusted value is likewise inert.
+        let bare = SecretValue::literal("Bearer ${SOME_VAR}");
+        assert_eq!(
+            resolve_secret_under_trust(&bare, McpTrust::Untrusted)
+                .unwrap()
+                .expose(),
+            "Bearer ${SOME_VAR}"
+        );
+    }
+
+    #[test]
+    fn untrusted_structured_ref_is_rejected() {
+        // An UNTRUSTED source may not name a command to run or a file to read.
+        for r in [
+            SecretRef {
+                cmd: Some("touch /tmp/pwned".into()),
+                ..Default::default()
+            },
+            SecretRef {
+                file: Some("/etc/passwd".into()),
+                ..Default::default()
+            },
+            SecretRef {
+                env: Some("HOME".into()),
+                ..Default::default()
+            },
+        ] {
+            let err = resolve_secret_under_trust(&SecretValue::Ref(r), McpTrust::Untrusted)
+                .expect_err("an untrusted {env|file|cmd} ref must be rejected");
+            assert!(
+                format!("{err}").contains("untrusted"),
+                "error should name the trust violation: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_literal_without_token_resolves_verbatim() {
+        // A trusted literal with no token is a pure pass-through (no subprocess);
+        // the token-bearing trusted path (the Vault `${cmd:…}`) is proven in the
+        // integration tier (mcp_secret_resolution.rs) since it runs a real command.
+        assert_eq!(
+            resolve_secret_under_trust(&SecretValue::literal("plain"), McpTrust::Trusted)
+                .unwrap()
+                .expose(),
+            "plain"
+        );
+    }
+
+    #[test]
+    fn discover_marks_newt_sources_trusted_and_claude_untrusted() {
+        // Trust provenance is stamped by discover(): the in-memory newt source is
+        // trusted; a Claude project overlay is untrusted.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join(".mcp.json"),
+            r#"{ "mcpServers": { "proj": { "command": "p" } } }"#,
+        )
+        .unwrap();
+        let got = discover(&[stdio("owned", "o")], None, None, ws);
+        let owned = got.iter().find(|e| e.name == "owned").unwrap();
+        let proj = got.iter().find(|e| e.name == "proj").unwrap();
+        assert_eq!(owned.trust, McpTrust::Trusted);
+        assert_eq!(proj.trust, McpTrust::Untrusted);
+    }
+
+    #[test]
+    fn parse_claude_mcp_marks_every_entry_untrusted() {
+        let cfg = serde_json::json!({
+            "mcpServers": { "x": { "command": "c", "env": { "K": "v" } } }
+        });
+        let got = parse_claude_mcp(&cfg);
+        assert!(got.iter().all(|e| e.trust == McpTrust::Untrusted));
     }
 
     // ---- ~/.newt/mcp.toml source: parse + precedence ----
@@ -824,6 +1117,7 @@ mod tests {
             url: None,
             headers: BTreeMap::new(),
             request_timeout_secs: None,
+            trust: McpTrust::Trusted,
         }
     }
 

@@ -521,6 +521,7 @@ mod tests {
             url: Some(url.into()),
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: newt_core::mcp::McpTrust::Trusted,
         }
     }
 

@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use clap::Args;
 use newt_core::caveats::Caveats;
-use newt_core::mcp::{McpServerEntry, SecretValue, TransportKind};
+use newt_core::mcp::{McpServerEntry, McpTrust, SecretValue, TransportKind};
 use newt_core::mcp_probe::{builtin_probe_rules, parse_probe_rules, ProbeRules};
 use newt_core::Config;
 use newt_mcp_client::{ConnectedServer, NetPosture, SandboxKind, ServerInfo};
@@ -609,6 +609,8 @@ async fn probe_stdio(
             url: None,
             headers: BTreeMap::new(),
             request_timeout_secs: args.timeout_secs,
+            // Operator-typed on the CLI — newt-owned, trusted config.
+            trust: McpTrust::Trusted,
         };
         let cmdline = render_cmdline(command, &candidate);
         eprintln!("probing `{cmdline}` …");
@@ -663,6 +665,8 @@ async fn probe_url(
         url: Some(url.to_string()),
         headers: BTreeMap::new(),
         request_timeout_secs: args.timeout_secs,
+        // Operator-typed on the CLI — newt-owned, trusted config.
+        trust: McpTrust::Trusted,
     };
     eprintln!("probing {url} …");
     match newt_mcp_client::connect_http(&entry, &caveats).await {
@@ -1027,6 +1031,7 @@ mod tests {
                 url: None,
                 headers: BTreeMap::new(),
                 request_timeout_secs: None,
+                trust: McpTrust::Trusted,
             },
             description: "Scrybe Markdown editor".into(),
             tools: vec!["open".into(), "edit".into()],

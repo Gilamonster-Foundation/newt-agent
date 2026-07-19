@@ -6,7 +6,7 @@
 //! integration tier: env vars are uniquely named per test and cleaned up.
 
 use newt_core::agent_identity::SecretRef;
-use newt_core::mcp::{interpolate, SecretValue};
+use newt_core::mcp::{interpolate, resolve_secret_under_trust, McpTrust, SecretValue};
 
 #[test]
 fn literal_without_tokens_resolves_verbatim() {
@@ -61,4 +61,59 @@ fn file_scheme_and_ref_read_the_first_non_empty_line() {
         ..Default::default()
     });
     assert_eq!(v.resolve().unwrap().expose(), "file-secret");
+}
+
+/// The #1301 CRITICAL acceptance test, end-to-end with a REAL subprocess
+/// side-effect: a `${cmd:…}` (and a `{ cmd = … }` ref) runs on the host ONLY for
+/// a TRUSTED source, NEVER for an UNTRUSTED (discovered Claude/project) source.
+/// A marker file is the observable side effect; its (non-)creation is the proof.
+#[test]
+fn cmd_executes_only_for_trusted_sources_never_for_untrusted() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // (1) TRUSTED literal `${cmd:touch <marker>}` → the command RUNS (Vault path
+    // stays working) and its stdout is the resolved secret.
+    let trusted_marker = dir.path().join("trusted.marker");
+    let trusted_val = SecretValue::literal(format!(
+        "${{cmd:touch '{}' && printf tok}}",
+        trusted_marker.display()
+    ));
+    let resolved = resolve_secret_under_trust(&trusted_val, McpTrust::Trusted)
+        .expect("a trusted ${cmd:…} must resolve");
+    assert_eq!(resolved.expose(), "tok");
+    assert!(
+        trusted_marker.exists(),
+        "the trusted ${{cmd:…}} must have executed on the host"
+    );
+
+    // (2) UNTRUSTED literal with the same `${cmd:…}` → passes VERBATIM, the
+    // command NEVER runs, no marker appears.
+    let untrusted_marker = dir.path().join("untrusted.marker");
+    let literal = format!(
+        "${{cmd:touch '{}' && printf tok}}",
+        untrusted_marker.display()
+    );
+    let got = resolve_secret_under_trust(&SecretValue::literal(&literal), McpTrust::Untrusted)
+        .expect("an untrusted literal passes through, never errors");
+    assert_eq!(got.expose(), literal, "the child gets the literal verbatim");
+    assert!(
+        !untrusted_marker.exists(),
+        "an untrusted ${{cmd:…}} must NOT execute on the host"
+    );
+
+    // (3) UNTRUSTED structured `{ cmd = … }` ref → REJECTED, command never runs.
+    let ref_marker = dir.path().join("ref.marker");
+    let err = resolve_secret_under_trust(
+        &SecretValue::Ref(SecretRef {
+            cmd: Some(format!("touch '{}'", ref_marker.display())),
+            ..Default::default()
+        }),
+        McpTrust::Untrusted,
+    )
+    .expect_err("an untrusted {cmd=…} ref must be rejected");
+    assert!(format!("{err}").contains("untrusted"), "{err}");
+    assert!(
+        !ref_marker.exists(),
+        "a rejected untrusted {{cmd=…}} ref must NOT execute on the host"
+    );
 }
