@@ -208,7 +208,7 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                 path.display()
             )?;
             if let Some(cmd) = &server.command {
-                if cmd.contains(std::path::MAIN_SEPARATOR) {
+                if cmd.contains(['/', '\\']) {
                     writeln!(out, "Resolved command to {cmd}")?;
                 }
             }
@@ -925,7 +925,10 @@ fn finalize_install_command(
     let Some(command) = server.command.clone() else {
         return Ok(());
     };
-    if command.contains(std::path::MAIN_SEPARATOR) {
+    // Respect an already-pathed command as-is. Check BOTH separators: a Windows
+    // path may use `/` or `\`, and config authored on (or copied from) unix uses
+    // `/` — `std::path::MAIN_SEPARATOR` alone (`\` on Windows) would miss it.
+    if command.contains(['/', '\\']) {
         return Ok(());
     }
     match first_existing(&install_binary_candidates(&command), |p| p.is_file()) {
