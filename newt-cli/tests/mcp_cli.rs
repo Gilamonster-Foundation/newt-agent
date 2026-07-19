@@ -77,7 +77,10 @@ fn add_then_list_shows_the_entry_with_its_source() {
     assert_eq!(entry.command.as_deref(), Some("scrybe-mcp-server"));
     assert_eq!(entry.args, vec!["stdio"]);
     assert_eq!(
-        entry.env.get("SCRYBE_LOG").map(String::as_str),
+        entry
+            .env
+            .get("SCRYBE_LOG")
+            .and_then(newt_core::mcp::SecretValue::as_literal),
         Some("info")
     );
     assert_eq!(entry.request_timeout_secs, Some(120));
@@ -138,23 +141,49 @@ fn remove_deletes_the_entry_and_an_absent_name_errors() {
 }
 
 #[test]
-fn install_scrybe_writes_the_catalog_registration() {
+fn install_scrybe_resolves_the_binary_to_an_absolute_path() {
+    // scrybe smart-install: with the binary present on PATH, it is registered
+    // by ABSOLUTE path so the server survives later PATH changes.
     let sb = sandbox();
+    let bin = sb.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let scrybe_bin = bin.join("scrybe-mcp-server");
+    std::fs::write(&scrybe_bin, "#!/bin/sh\n").unwrap();
+
     newt(&sb)
+        .env("PATH", &bin)
         .args(["mcp", "install", "scrybe"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Installed MCP server 'scrybe'"))
         .stdout(predicate::str::contains("Scrybe Markdown editor"))
+        .stdout(predicate::str::contains("Resolved command to"))
         .stdout(predicate::str::contains("newt doctor"));
 
     let cfg = load_config(&sb.config_dir.join("config.toml"));
     assert_eq!(cfg.mcp_servers.len(), 1);
     let entry = &cfg.mcp_servers[0];
     assert_eq!(entry.name, "scrybe");
-    assert_eq!(entry.command.as_deref(), Some("scrybe-mcp-server"));
+    assert_eq!(entry.command.as_deref(), Some(scrybe_bin.to_str().unwrap()));
     assert_eq!(entry.args, vec!["stdio"]);
     assert!(entry.enabled);
+}
+
+#[test]
+fn install_scrybe_without_the_binary_hints_pip() {
+    // The bundled scrybe entry with NO binary anywhere is a hard error naming
+    // the pip package — the "special relationship" that removes setup friction.
+    let sb = sandbox();
+    let empty = sb.home.join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    newt(&sb)
+        .env("PATH", &empty)
+        .args(["mcp", "install", "scrybe"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("pip install scrybe.ai"));
+    // Nothing was registered.
+    assert!(!sb.config_dir.join("config.toml").exists());
 }
 
 #[test]
@@ -172,6 +201,11 @@ fn install_unknown_name_lists_the_available_catalog() {
 #[test]
 fn catalog_drop_ins_layer_user_over_bundled_and_project_over_user() {
     let sb = sandbox();
+    // Pin an empty PATH: a user/project drop-in that overrides scrybe keeps its
+    // own bare command when the binary is absent (only the BUNDLED scrybe entry
+    // hard-fails with a pip hint), so this exercises catalog layering cleanly.
+    let empty = sb.home.join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
     // User drop-in overrides the bundled scrybe entry.
     std::fs::write(
         sb.config_dir.join("mcp-catalog.toml"),
@@ -179,6 +213,7 @@ fn catalog_drop_ins_layer_user_over_bundled_and_project_over_user() {
     )
     .unwrap();
     newt(&sb)
+        .env("PATH", &empty)
         .args(["mcp", "install", "scrybe"])
         .assert()
         .success();
@@ -197,6 +232,7 @@ fn catalog_drop_ins_layer_user_over_bundled_and_project_over_user() {
     )
     .unwrap();
     newt(&sb)
+        .env("PATH", &empty)
         .args(["mcp", "install", "scrybe"])
         .assert()
         .success();
@@ -441,5 +477,157 @@ fn add_project_writes_the_project_config_not_the_user_config() {
     assert!(
         !sb.config_dir.join("config.toml").exists(),
         "--project must not touch the user config"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ~/.newt/mcp.toml — broken-out source: write-target preference + list source
+// ---------------------------------------------------------------------------
+
+#[test]
+fn add_prefers_an_existing_mcp_toml_over_config_toml() {
+    let sb = sandbox();
+    // Once the operator has broken config out, `add` lands in ~/.newt/mcp.toml.
+    let mcp_toml = sb.config_dir.join("mcp.toml");
+    std::fs::write(&mcp_toml, "# broken-out MCP config\n").unwrap();
+    newt(&sb)
+        .args(["mcp", "add", "fs", "--command", "mcp-fs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mcp.toml"));
+
+    let text = std::fs::read_to_string(&mcp_toml).unwrap();
+    assert!(
+        text.contains("# broken-out MCP config"),
+        "comment kept: {text}"
+    );
+    assert!(
+        text.contains("name = \"fs\""),
+        "entry written to mcp.toml: {text}"
+    );
+    assert!(
+        !sb.config_dir.join("config.toml").exists(),
+        "config.toml must stay untouched when mcp.toml exists"
+    );
+
+    // `list` attributes the row to the mcp.toml source.
+    newt(&sb)
+        .args(["mcp", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fs"))
+        .stdout(predicate::str::contains("newt mcp.toml"));
+}
+
+#[test]
+fn add_uses_config_toml_when_no_mcp_toml_exists() {
+    let sb = sandbox();
+    newt(&sb)
+        .args(["mcp", "add", "fs", "--command", "mcp-fs"])
+        .assert()
+        .success();
+    // Default (no mcp.toml) keeps #1291 behavior: user config.toml.
+    let cfg = load_config(&sb.config_dir.join("config.toml"));
+    assert_eq!(cfg.mcp_servers[0].name, "fs");
+    assert!(!sb.config_dir.join("mcp.toml").exists());
+}
+
+#[test]
+fn import_writes_a_claude_json_into_the_broken_out_mcp_toml() {
+    let sb = sandbox();
+    let claude = sb.cwd.join("claude.json");
+    std::fs::write(
+        &claude,
+        r#"{ "mcpServers": {
+              "fs": { "command": "npx", "args": ["-y", "@mcp/fs"], "env": { "ROOT": "/tmp" } },
+              "gh": { "command": "gh-mcp", "env": { "GH_TOKEN": "${MY_GH_TOKEN}" } }
+        } }"#,
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args(["mcp", "import", claude.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Imported 2 MCP server(s)"))
+        .stdout(predicate::str::contains("mcp.toml"));
+
+    // import breaks config out to ~/.newt/mcp.toml (created), NOT config.toml.
+    let mcp_toml = sb.config_dir.join("mcp.toml");
+    assert!(mcp_toml.is_file(), "import created ~/.newt/mcp.toml");
+    assert!(!sb.config_dir.join("config.toml").exists());
+    let servers = newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&mcp_toml).unwrap());
+    let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["fs", "gh"]);
+    // Claude's `${VAR}` is imported VERBATIM as a literal (newt interpolates it
+    // host-side at spawn) — the reference lives on disk, not a resolved secret.
+    let gh = servers.iter().find(|s| s.name == "gh").unwrap();
+    assert_eq!(
+        gh.env
+            .get("GH_TOKEN")
+            .and_then(newt_core::mcp::SecretValue::as_literal),
+        Some("${MY_GH_TOKEN}")
+    );
+}
+
+#[test]
+fn import_dedup_errors_on_clash_unless_force_or_merge() {
+    let sb = sandbox();
+    let claude = sb.cwd.join("c.json");
+    std::fs::write(
+        &claude,
+        r#"{ "mcpServers": { "fs": { "command": "v2-cmd" } } }"#,
+    )
+    .unwrap();
+    // Pre-seed an mcp.toml with a clashing `fs`.
+    std::fs::write(
+        sb.config_dir.join("mcp.toml"),
+        "[[mcp_servers]]\nname = \"fs\"\ncommand = \"v1-cmd\"\n",
+    )
+    .unwrap();
+
+    // Default: a clash is a loud error, nothing overwritten.
+    newt(&sb)
+        .args(["mcp", "import", claude.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+    let servers = newt_core::mcp::parse_newt_mcp_toml(
+        &std::fs::read_to_string(sb.config_dir.join("mcp.toml")).unwrap(),
+    );
+    assert_eq!(
+        servers[0].command.as_deref(),
+        Some("v1-cmd"),
+        "unchanged on error"
+    );
+
+    // --merge: keep the existing entry, skip the import.
+    newt(&sb)
+        .args(["mcp", "import", claude.to_str().unwrap(), "--merge"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped"));
+    let servers = newt_core::mcp::parse_newt_mcp_toml(
+        &std::fs::read_to_string(sb.config_dir.join("mcp.toml")).unwrap(),
+    );
+    assert_eq!(
+        servers[0].command.as_deref(),
+        Some("v1-cmd"),
+        "merge kept existing"
+    );
+
+    // --force: overwrite the existing entry.
+    newt(&sb)
+        .args(["mcp", "import", claude.to_str().unwrap(), "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Overwrote"));
+    let servers = newt_core::mcp::parse_newt_mcp_toml(
+        &std::fs::read_to_string(sb.config_dir.join("mcp.toml")).unwrap(),
+    );
+    assert_eq!(
+        servers[0].command.as_deref(),
+        Some("v2-cmd"),
+        "force overwrote"
     );
 }

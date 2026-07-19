@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
-use newt_core::mcp::{McpServerEntry, TransportKind};
+use newt_core::mcp::{McpServerEntry, SecretValue, TransportKind};
 use newt_core::mcp_catalog::{
     builtin_catalog, merge_catalog_layers, parse_catalog, McpCatalogEntry,
 };
@@ -91,6 +91,28 @@ pub enum McpCmd {
     /// unambiguous manual way to serve; bare `newt mcp` serves too when its
     /// stdin is piped (an MCP client), but prints this menu at a terminal.
     Serve,
+    /// Import MCP servers from a Claude-Code `mcpServers` JSON, writing the
+    /// equivalent newt TOML — breaking config out to `~/.newt/mcp.toml`
+    /// (created if absent). Secret-bearing values (incl. Claude's `${VAR}`) are
+    /// imported verbatim; newt resolves `${…}` host-side at spawn.
+    Import {
+        /// Path to a Claude-format JSON (`~/.claude.json`, a project `.mcp.json`,
+        /// or a pasted `mcp.json`). Omit when using `--from-claude`.
+        #[arg(required_unless_present = "from_claude")]
+        path: Option<PathBuf>,
+        /// Import from `~/.claude.json`.
+        #[arg(long = "from-claude")]
+        from_claude: bool,
+        /// Overwrite entries whose name already exists (default: error on a clash).
+        #[arg(long)]
+        force: bool,
+        /// Keep existing entries — import only names not already present (no error).
+        #[arg(long, conflicts_with = "force")]
+        merge: bool,
+        /// Write to the project config instead of the user `~/.newt/mcp.toml`.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 /// What bare `newt mcp` (no subcommand) should do, decided purely from
@@ -153,11 +175,7 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
             print_next_steps(&mut out)
         }
         McpCmd::Remove { name, project } => {
-            let path = write_target(config_path, project)?;
-            let text = read_config_text(&path)?;
-            let updated = Config::with_mcp_server_removed(&text, &name)?;
-            std::fs::write(&path, updated)
-                .with_context(|| format!("writing {}", path.display()))?;
+            let path = remove_server(&name, config_path, project)?;
             writeln!(out, "Removed MCP server '{name}' from {}", path.display())?;
             Ok(())
         }
@@ -172,7 +190,15 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                     names.join(", ")
                 );
             };
-            let server = installable_server(chosen, origin)?;
+            let mut server = installable_server(chosen, origin)?;
+            // scrybe.ai "special relationship": resolve the binary to an
+            // absolute path (PATH → ~/venv/bin) so the registration survives
+            // PATH changes; a missing bundled-scrybe binary is a clear pip hint.
+            finalize_install_command(
+                &mut server,
+                &chosen.name,
+                matches!(origin, CatalogOrigin::Bundled),
+            )?;
             let path = add_to_config(&server, config_path, project)?;
             writeln!(
                 out,
@@ -181,6 +207,11 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                 chosen.description,
                 path.display()
             )?;
+            if let Some(cmd) = &server.command {
+                if cmd.contains(std::path::MAIN_SEPARATOR) {
+                    writeln!(out, "Resolved command to {cmd}")?;
+                }
+            }
             print_next_steps(&mut out)
         }
         // `serve` runs newt-as-a-server, which needs the persona (a global
@@ -188,6 +219,21 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         // owns. lib.rs intercepts `Some(McpCmd::Serve)` before delegating
         // here, so this arm is never reached.
         McpCmd::Serve => unreachable!("`newt mcp serve` is dispatched to run_mcp in lib.rs"),
+        McpCmd::Import {
+            path,
+            from_claude,
+            force,
+            merge,
+            project,
+        } => cmd_import(
+            path.as_deref(),
+            from_claude,
+            force,
+            merge,
+            config_path,
+            project,
+            &mut out,
+        ),
     }
 }
 
@@ -212,28 +258,68 @@ pub(crate) fn print_next_steps(out: &mut dyn Write) -> anyhow::Result<()> {
 /// - else `./newt.toml` when it exists (resolve()'s next base candidate);
 /// - else the user config (`$NEWT_CONFIG_DIR/config.toml` / `~/.newt/…`).
 pub(crate) fn write_target(config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
+    if let Some(explicit) = explicit_write_target(config_path, project)? {
+        return Ok(explicit);
+    }
+    Config::user_config_path().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))
+}
+
+/// The explicit, non-user-level write targets every mcp verb shares:
+/// `--project` > `--config` > `$NEWT_CONFIG` > `./newt.toml`. Returns `Ok(None)`
+/// when none apply — the caller then resolves the user-level target (either the
+/// user `config.toml` or the broken-out `~/.newt/mcp.toml`).
+pub(crate) fn explicit_write_target(
+    config_path: Option<&Path>,
+    project: bool,
+) -> anyhow::Result<Option<PathBuf>> {
     if project {
         if let Some(existing) = Config::project_config_path() {
-            return Ok(existing);
+            return Ok(Some(existing));
         }
-        return Ok(std::env::current_dir()
-            .context("cannot resolve the current directory")?
-            .join(".newt")
-            .join("config.toml"));
+        return Ok(Some(
+            std::env::current_dir()
+                .context("cannot resolve the current directory")?
+                .join(".newt")
+                .join("config.toml"),
+        ));
     }
     if let Some(explicit) = config_path {
-        return Ok(explicit.to_path_buf());
+        return Ok(Some(explicit.to_path_buf()));
     }
     if let Some(env_cfg) = std::env::var_os("NEWT_CONFIG").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(env_cfg));
+        return Ok(Some(PathBuf::from(env_cfg)));
     }
     let local = std::env::current_dir()
         .context("cannot resolve the current directory")?
         .join("newt.toml");
     if local.is_file() {
-        return Ok(local);
+        return Ok(Some(local));
     }
-    Config::user_config_path().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))
+    Ok(None)
+}
+
+/// The write target for `newt mcp add|install|import`, extending
+/// [`write_target`] with the broken-out `~/.newt/mcp.toml` preference. Explicit
+/// targets (`--project` / `--config` / `$NEWT_CONFIG` / `./newt.toml`) win first,
+/// exactly as #1291. Otherwise, at the user level, the newt-owned
+/// `~/.newt/mcp.toml` is preferred when it already **exists** — or **created**,
+/// when `create` is set (the `import` / break-out gesture) — else the user
+/// `config.toml` (#1291's current behavior).
+pub(crate) fn mcp_write_target(
+    config_path: Option<&Path>,
+    project: bool,
+    create: bool,
+) -> anyhow::Result<PathBuf> {
+    if let Some(explicit) = explicit_write_target(config_path, project)? {
+        return Ok(explicit);
+    }
+    let dir =
+        Config::user_config_dir().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))?;
+    let mcp_toml = dir.join("mcp.toml");
+    if create || mcp_toml.is_file() {
+        return Ok(mcp_toml);
+    }
+    Ok(dir.join("config.toml"))
 }
 
 /// Read the write-target's current text. Only a MISSING file maps to empty
@@ -274,15 +360,56 @@ pub(crate) fn add_to_config(
     config_path: Option<&Path>,
     project: bool,
 ) -> anyhow::Result<PathBuf> {
-    let path = write_target(config_path, project)?;
+    // `add`/`install` prefer an EXISTING `~/.newt/mcp.toml` (create=false) — they
+    // never spontaneously break config out; only `import` does that.
+    let path = mcp_write_target(config_path, project, false)?;
     let text = read_config_text(&path)?;
     let updated = Config::with_mcp_server_added(&text, entry)?;
+    write_back(&path, &updated)?;
+    Ok(path)
+}
+
+/// Write `text` to `path`, creating parent dirs. Shared by every mcp write verb.
+fn write_back(path: &Path, text: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&path, updated).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Whether TOML `text` carries a `[[mcp_servers]]` entry named `name`.
+fn config_has_mcp_server(text: &str, name: &str) -> bool {
+    newt_core::mcp::parse_newt_mcp_toml(text)
+        .iter()
+        .any(|e| e.name == name)
+}
+
+/// Remove `name`, resolving the target the same way `add` does. An explicit
+/// target (`--project`/`--config`/`$NEWT_CONFIG`/`./newt.toml`) is acted on
+/// directly. At the user level the entry may live in either the broken-out
+/// `~/.newt/mcp.toml` or `~/.newt/config.toml`, so the first of those that
+/// actually contains the name is edited — a `remove` never fails just because
+/// the operator has broken some servers out and left others inline.
+fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
+    if let Some(explicit) = explicit_write_target(config_path, project)? {
+        let text = read_config_text(&explicit)?;
+        let updated = Config::with_mcp_server_removed(&text, name)?;
+        write_back(&explicit, &updated)?;
+        return Ok(explicit);
+    }
+    let dir =
+        Config::user_config_dir().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))?;
+    for candidate in [dir.join("mcp.toml"), dir.join("config.toml")] {
+        if let Some(text) = read_optional(&candidate)? {
+            if config_has_mcp_server(&text, name) {
+                let updated = Config::with_mcp_server_removed(&text, name)?;
+                write_back(&candidate, &updated)?;
+                return Ok(candidate);
+            }
+        }
+    }
+    bail!("no MCP server named `{name}` in ~/.newt/mcp.toml or ~/.newt/config.toml");
 }
 
 /// Assemble a validated [`McpServerEntry`] from the `add` flags. Pure.
@@ -331,14 +458,17 @@ fn build_entry(
 }
 
 /// Parse repeated `--env K=V` flags. Pure. Rejects a pair with no `=` or an
-/// empty key; the value may be empty (explicitly unsetting is legitimate).
-pub(crate) fn parse_env_pairs(pairs: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+/// empty key; the value may be empty (explicitly unsetting is legitimate). Each
+/// value becomes a [`SecretValue::Literal`] — so an operator can pass a `${...}`
+/// interpolation (`--env "TOKEN=${cmd:vault kv get …}"`), resolved host-side at
+/// spawn.
+pub(crate) fn parse_env_pairs(pairs: &[String]) -> anyhow::Result<BTreeMap<String, SecretValue>> {
     let mut env = BTreeMap::new();
     for pair in pairs {
         let Some((key, value)) = pair.split_once('=').filter(|(k, _)| !k.is_empty()) else {
             bail!("invalid --env '{pair}' (expected K=V)");
         };
-        env.insert(key.to_string(), value.to_string());
+        env.insert(key.to_string(), SecretValue::literal(value));
     }
     Ok(env)
 }
@@ -348,6 +478,8 @@ pub(crate) fn parse_env_pairs(pairs: &[String]) -> anyhow::Result<BTreeMap<Strin
 enum McpSource {
     /// newt's own `[[mcp_servers]]` (user + project config layers).
     NewtConfig,
+    /// The newt-owned broken-out source: `~/.newt/mcp.toml`.
+    NewtMcpToml,
     /// Claude Code user config: `~/.claude.json` → `mcpServers`.
     ClaudeUser,
     /// Claude Code project config: `./.mcp.json` → `mcpServers`.
@@ -358,6 +490,7 @@ impl McpSource {
     fn label(self) -> &'static str {
         match self {
             Self::NewtConfig => "newt config",
+            Self::NewtMcpToml => "newt mcp.toml",
             Self::ClaudeUser => "claude-code (user)",
             Self::ClaudeProject => "claude-code (project)",
         }
@@ -384,11 +517,13 @@ struct McpRow {
 /// Pure.
 fn merged_rows(
     newt: &[McpServerEntry],
+    mcp_toml: &[McpServerEntry],
     claude_user: &[McpServerEntry],
     claude_project: &[McpServerEntry],
 ) -> Vec<McpRow> {
     let sources = [
         (McpSource::NewtConfig, newt),
+        (McpSource::NewtMcpToml, mcp_toml),
         (McpSource::ClaudeUser, claude_user),
         (McpSource::ClaudeProject, claude_project),
     ];
@@ -462,13 +597,16 @@ fn cmd_list(config_path: Option<&Path>, out: &mut dyn Write) -> anyhow::Result<(
         Some(p) => Config::load(p)?,
         None => Config::resolve()?,
     };
+    let mcp_toml = Config::user_config_dir()
+        .map(|d| load_newt_mcp_toml(&d.join("mcp.toml")))
+        .unwrap_or_default();
     let claude_user = crate::home_dir()
         .map(|h| load_claude_json(&h.join(".claude.json")))
         .unwrap_or_default();
     let claude_project = std::env::current_dir()
         .map(|d| load_claude_json(&d.join(".mcp.json")))
         .unwrap_or_default();
-    let rows = merged_rows(&cfg.mcp_servers, &claude_user, &claude_project);
+    let rows = merged_rows(&cfg.mcp_servers, &mcp_toml, &claude_user, &claude_project);
     render_rows(&rows, out)
 }
 
@@ -479,6 +617,16 @@ fn load_claude_json(path: &Path) -> Vec<McpServerEntry> {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .map(|value| newt_core::mcp::parse_claude_mcp(&value))
+        .unwrap_or_default()
+}
+
+/// Best-effort read of a newt-owned `~/.newt/mcp.toml` (`[[mcp_servers]]`) —
+/// missing or malformed yields an empty list, the same contract as discovery.
+fn load_newt_mcp_toml(path: &Path) -> Vec<McpServerEntry> {
+    read_optional(path)
+        .ok()
+        .flatten()
+        .map(|text| newt_core::mcp::parse_newt_mcp_toml(&text))
         .unwrap_or_default()
 }
 
@@ -540,6 +688,174 @@ fn resolve_catalog() -> anyhow::Result<Vec<(McpCatalogEntry, CatalogOrigin)>> {
         }
     }
     Ok(merge_catalog_layers(layers))
+}
+
+// ---------------------------------------------------------------------------
+// `newt mcp import` — Claude JSON → newt TOML bridge
+// ---------------------------------------------------------------------------
+
+/// Resolve the JSON source for `import`: `--from-claude` → `~/.claude.json`,
+/// otherwise the explicit `path`.
+fn resolve_import_source(path: Option<&Path>, from_claude: bool) -> anyhow::Result<PathBuf> {
+    if from_claude {
+        let home =
+            crate::home_dir().ok_or_else(|| anyhow!("cannot resolve $HOME for --from-claude"))?;
+        return Ok(home.join(".claude.json"));
+    }
+    match path {
+        Some(p) => Ok(p.to_path_buf()),
+        None => bail!("provide a path to a Claude mcpServers JSON, or pass --from-claude"),
+    }
+}
+
+/// `newt mcp import` — read a Claude-Code `mcpServers` JSON and write each server
+/// as a `[[mcp_servers]]` block via the comment-preserving writer. Dedup-by-name:
+/// a clash is an error by default, `--force` overwrites, `--merge` skips existing.
+/// Default target is the broken-out `~/.newt/mcp.toml` (created if absent).
+fn cmd_import(
+    path: Option<&Path>,
+    from_claude: bool,
+    force: bool,
+    merge: bool,
+    config_path: Option<&Path>,
+    project: bool,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let source = resolve_import_source(path, from_claude)?;
+    let text = std::fs::read_to_string(&source)
+        .with_context(|| format!("reading {}", source.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", source.display()))?;
+    let mut imported = newt_core::mcp::parse_claude_mcp(&value);
+    if imported.is_empty() {
+        bail!("no `mcpServers` entries found in {}", source.display());
+    }
+    // Deterministic order (map iteration is not) so output + writes are stable.
+    imported.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // import is the break-out gesture: create ~/.newt/mcp.toml when at the user
+    // level (create=true), unless an explicit target overrides.
+    let target = mcp_write_target(config_path, project, true)?;
+    let mut doc = read_config_text(&target)?;
+    let existing: std::collections::BTreeSet<String> = newt_core::mcp::parse_newt_mcp_toml(&doc)
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+
+    let mut added = 0usize;
+    let mut overwritten = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    for entry in &imported {
+        if existing.contains(&entry.name) {
+            if merge {
+                skipped.push(entry.name.clone());
+                continue;
+            }
+            if force {
+                doc = Config::with_mcp_server_removed(&doc, &entry.name)?;
+                doc = Config::with_mcp_server_added(&doc, entry)?;
+                overwritten += 1;
+                continue;
+            }
+            bail!(
+                "MCP server `{}` already exists in {} — use --force to overwrite, \
+                 or --merge to skip existing",
+                entry.name,
+                target.display()
+            );
+        }
+        doc = Config::with_mcp_server_added(&doc, entry)?;
+        added += 1;
+    }
+    write_back(&target, &doc)?;
+
+    writeln!(
+        out,
+        "Imported {added} MCP server(s) from {} into {}",
+        source.display(),
+        target.display()
+    )?;
+    if overwritten > 0 {
+        writeln!(out, "Overwrote {overwritten} existing server(s).")?;
+    }
+    if !skipped.is_empty() {
+        writeln!(
+            out,
+            "Skipped {} already present: {}",
+            skipped.len(),
+            skipped.join(", ")
+        )?;
+    }
+    print_next_steps(out)
+}
+
+// ---------------------------------------------------------------------------
+// scrybe.ai smart-install — binary resolution
+// ---------------------------------------------------------------------------
+
+/// Build the ordered candidate paths for `command`: every `$PATH` dir first,
+/// then `~/venv/bin`. Pure over the injected dirs so the resolution ORDER is
+/// unit-tested without touching the real filesystem/PATH.
+fn binary_candidates_in(
+    path_dirs: &[PathBuf],
+    venv_bin: Option<&Path>,
+    command: &str,
+) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = path_dirs.iter().map(|d| d.join(command)).collect();
+    if let Some(v) = venv_bin {
+        candidates.push(v.join(command));
+    }
+    candidates
+}
+
+/// The first candidate that `exists`. Pure — order + existence predicate both
+/// injected, so "PATH before ~/venv, earliest present wins" is unit-tested.
+fn first_existing(candidates: &[PathBuf], exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    candidates.iter().find(|p| exists(p)).cloned()
+}
+
+/// Live candidate list for `command`: every `$PATH` entry, then `~/venv/bin`.
+fn install_binary_candidates(command: &str) -> Vec<PathBuf> {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let venv_bin = crate::home_dir().map(|h| h.join("venv").join("bin"));
+    binary_candidates_in(&path_dirs, venv_bin.as_deref(), command)
+}
+
+/// Resolve a stdio catalog entry's bare `command` to an absolute path (PATH →
+/// `~/venv/bin`), so the registration survives PATH changes. For the blessed
+/// **bundled** `scrybe` entry an unresolved binary is a hard error naming the
+/// pip package (the "special relationship" — remove the setup friction). Any
+/// other entry — including a user/project drop-in that overrides scrybe — keeps
+/// its bare command when the binary is absent (its author owns resolution). A
+/// command that already carries a path separator is respected as-is.
+fn finalize_install_command(
+    server: &mut McpServerEntry,
+    catalog_name: &str,
+    bundled: bool,
+) -> anyhow::Result<()> {
+    if server.transport != TransportKind::Stdio {
+        return Ok(());
+    }
+    let Some(command) = server.command.clone() else {
+        return Ok(());
+    };
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return Ok(());
+    }
+    match first_existing(&install_binary_candidates(&command), |p| p.is_file()) {
+        Some(abs) => {
+            server.command = Some(abs.to_string_lossy().into_owned());
+            Ok(())
+        }
+        None if catalog_name == "scrybe" && bundled => bail!(
+            "`{command}` was not found on your PATH or in ~/venv/bin.\n\
+             Install the Scrybe MCP server with `pip install scrybe.ai` (it provides \
+             `{command}`), then re-run `newt mcp install scrybe`."
+        ),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -725,7 +1041,10 @@ mod tests {
         assert_eq!(entry.command.as_deref(), Some("scrybe-mcp-server"));
         assert_eq!(entry.args, vec!["stdio"]);
         assert_eq!(
-            entry.env.get("SCRYBE_LOG").map(String::as_str),
+            entry
+                .env
+                .get("SCRYBE_LOG")
+                .and_then(SecretValue::as_literal),
             Some("info")
         );
         assert_eq!(entry.request_timeout_secs, Some(120));
@@ -735,9 +1054,9 @@ mod tests {
     #[test]
     fn env_pairs_split_on_the_first_equals_and_reject_malformed() {
         let got = parse_env_pairs(&["A=1".into(), "B=x=y".into(), "EMPTY=".into()]).unwrap();
-        assert_eq!(got.get("A").map(String::as_str), Some("1"));
-        assert_eq!(got.get("B").map(String::as_str), Some("x=y"));
-        assert_eq!(got.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(got.get("A").and_then(SecretValue::as_literal), Some("1"));
+        assert_eq!(got.get("B").and_then(SecretValue::as_literal), Some("x=y"));
+        assert_eq!(got.get("EMPTY").and_then(SecretValue::as_literal), Some(""));
         assert!(parse_env_pairs(&["NOEQUALS".into()]).is_err());
         assert!(parse_env_pairs(&["=value".into()]).is_err());
     }
@@ -775,15 +1094,27 @@ mod tests {
             e.enabled = false;
             e
         }];
+        let mcp_toml = vec![
+            stdio_entry("brokenout", Some("bo")),
+            stdio_entry("dup", Some("shadowed-by-config")),
+        ];
         let claude_project = vec![stdio_entry("proj-only", Some("p"))];
-        let rows = merged_rows(&newt, &claude_user, &claude_project);
+        let rows = merged_rows(&newt, &mcp_toml, &claude_user, &claude_project);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["dup", "broken", "user-only", "proj-only"]);
-        assert_eq!(rows[0].source, McpSource::NewtConfig, "newt wins the dup");
+        assert_eq!(
+            names,
+            vec!["dup", "broken", "brokenout", "user-only", "proj-only"]
+        );
+        assert_eq!(rows[0].source, McpSource::NewtConfig, "config wins the dup");
         assert!(!rows[1].valid, "invalid entries are shown, flagged");
-        assert_eq!(rows[2].source, McpSource::ClaudeUser);
-        assert!(!rows[2].enabled);
-        assert_eq!(rows[3].source, McpSource::ClaudeProject);
+        assert_eq!(
+            rows[2].source,
+            McpSource::NewtMcpToml,
+            "the broken-out mcp.toml source is attributed"
+        );
+        assert_eq!(rows[3].source, McpSource::ClaudeUser);
+        assert!(!rows[3].enabled);
+        assert_eq!(rows[4].source, McpSource::ClaudeProject);
     }
 
     #[test]
@@ -794,7 +1125,7 @@ mod tests {
         // the valid row that actually wins — never hide the winner.
         let newt = vec![stdio_entry("x", None)]; // invalid: stdio, no command
         let claude_user = vec![stdio_entry("x", Some("claude-wins"))];
-        let rows = merged_rows(&newt, &claude_user, &[]);
+        let rows = merged_rows(&newt, &[], &claude_user, &[]);
         assert_eq!(
             rows.len(),
             2,
@@ -807,6 +1138,7 @@ mod tests {
         // A valid claimant still shadows a later VALID duplicate.
         let rows = merged_rows(
             &[stdio_entry("y", Some("newt-wins"))],
+            &[],
             &[stdio_entry("y", Some("shadowed"))],
             &[],
         );
@@ -818,6 +1150,7 @@ mod tests {
     fn render_rows_lists_name_transport_enabled_and_source() {
         let rows = merged_rows(
             &[stdio_entry("scrybe", Some("scrybe-mcp-server"))],
+            &[stdio_entry("brokenout", Some("bo-mcp"))],
             &[stdio_entry("broken", None)],
             &[],
         );
@@ -828,6 +1161,7 @@ mod tests {
         assert!(text.contains("stdio"), "{text}");
         assert!(text.contains("yes"), "{text}");
         assert!(text.contains("newt config"), "{text}");
+        assert!(text.contains("newt mcp.toml"), "{text}");
         assert!(text.contains("claude-code (user)"), "{text}");
         assert!(
             text.contains("invalid"),
@@ -842,5 +1176,119 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("newt mcp add"), "{text}");
         assert!(text.contains("newt mcp install"), "{text}");
+    }
+
+    // ---- scrybe smart-install: binary resolution order (injected paths) ----
+
+    #[test]
+    fn binary_candidates_try_path_dirs_before_venv() {
+        let cands = binary_candidates_in(
+            &[PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")],
+            Some(Path::new("/home/u/venv/bin")),
+            "scrybe-mcp-server",
+        );
+        assert_eq!(
+            cands,
+            vec![
+                PathBuf::from("/usr/local/bin/scrybe-mcp-server"),
+                PathBuf::from("/usr/bin/scrybe-mcp-server"),
+                PathBuf::from("/home/u/venv/bin/scrybe-mcp-server"),
+            ]
+        );
+        // No venv → PATH candidates only.
+        assert_eq!(
+            binary_candidates_in(&[PathBuf::from("/bin")], None, "x"),
+            vec![PathBuf::from("/bin/x")]
+        );
+    }
+
+    #[test]
+    fn first_existing_returns_the_earliest_present_candidate() {
+        let cands = vec![
+            PathBuf::from("/a/x"),               // missing → skipped
+            PathBuf::from("/b/x"),               // present → the winner
+            PathBuf::from("/home/u/venv/bin/x"), // present too, but later
+        ];
+        let present: std::collections::BTreeSet<PathBuf> =
+            [PathBuf::from("/b/x"), PathBuf::from("/home/u/venv/bin/x")]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            first_existing(&cands, |p| present.contains(p)),
+            Some(PathBuf::from("/b/x")),
+            "PATH resolves before ~/venv/bin; earliest present wins"
+        );
+        // Nothing present → None (the pip-hint path).
+        assert_eq!(first_existing(&cands, |_| false), None);
+    }
+
+    #[test]
+    fn finalize_install_leaves_an_explicit_path_and_non_stdio_untouched() {
+        // A command that already carries a path separator is respected as-is —
+        // even for the bundled scrybe entry.
+        let mut abs = stdio_entry("scrybe", Some("/opt/scrybe/bin/scrybe-mcp-server"));
+        finalize_install_command(&mut abs, "scrybe", true).unwrap();
+        assert_eq!(
+            abs.command.as_deref(),
+            Some("/opt/scrybe/bin/scrybe-mcp-server")
+        );
+        // A non-stdio server has no binary to resolve.
+        let mut http = McpServerEntry {
+            transport: TransportKind::Http,
+            command: None,
+            url: Some("https://x/mcp".into()),
+            ..stdio_entry("remote", None)
+        };
+        finalize_install_command(&mut http, "remote", true).unwrap();
+        assert!(http.command.is_none());
+    }
+
+    // ---- `newt mcp import` source resolution ----
+
+    #[test]
+    fn import_source_resolves_explicit_path_and_requires_one() {
+        assert_eq!(
+            resolve_import_source(Some(Path::new("/tmp/mcp.json")), false).unwrap(),
+            PathBuf::from("/tmp/mcp.json")
+        );
+        // Neither a path nor --from-claude → a loud usage error.
+        assert!(resolve_import_source(None, false).is_err());
+    }
+
+    #[test]
+    fn mcp_add_import_parses() {
+        let cli =
+            crate::Cli::try_parse_from(["newt", "mcp", "import", "/tmp/claude.json", "--force"])
+                .unwrap();
+        let Some(crate::Command::Mcp {
+            cmd:
+                Some(McpCmd::Import {
+                    path,
+                    from_claude,
+                    force,
+                    merge,
+                    project,
+                }),
+        }) = cli.command
+        else {
+            panic!("expected mcp import");
+        };
+        assert_eq!(path.as_deref(), Some(Path::new("/tmp/claude.json")));
+        assert!(!from_claude);
+        assert!(force);
+        assert!(!merge);
+        assert!(!project);
+        // --from-claude makes the path optional.
+        assert!(crate::Cli::try_parse_from(["newt", "mcp", "import", "--from-claude"]).is_ok());
+        // --force and --merge are mutually exclusive.
+        assert!(crate::Cli::try_parse_from([
+            "newt",
+            "mcp",
+            "import",
+            "/tmp/c.json",
+            "--force",
+            "--merge"
+        ])
+        .is_err());
     }
 }
