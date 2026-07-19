@@ -740,6 +740,10 @@ mod tests {
             match (body, final_byte) {
                 ("?7", 'l') => self.wrap = false,
                 ("?7", 'h') => self.wrap = true,
+                // #1303 (§8.4): mouse-mode private sequences (set/reset) alter
+                // input reporting, not the visible grid — no-op them so a frame
+                // captured while mouse capture toggles doesn't panic.
+                ("?1000" | "?1002" | "?1003" | "?1006" | "?1015", 'h' | 'l') => {}
                 (_, 'A') => self.cursor_row = self.cursor_row.saturating_sub(amount),
                 (_, 'G') => self.cursor_col = amount.saturating_sub(1),
                 ("2", 'K') => {
@@ -1054,6 +1058,74 @@ mod tests {
             !next_frame.contains("\u{1b}[5A") && !next_frame.contains("\u{1b}[J"),
             "a new generation must not erase an abandoned frame from the new cursor: {next_frame:?}"
         );
+    }
+
+    // #1303 acceptance 2 (clause B / rule 7): the abandon/teardown-miss path
+    // releases mouse capture with NO renderer I/O. Because `abandon` emits
+    // nothing through the renderer, the release is asserted on the GUARD's own
+    // Drop side-effect handle — a sink independent of the renderer writer.
+    #[test]
+    fn rule7_abandon_releases_mouse_capture_without_renderer_io() {
+        use crate::mouse::{MouseCaptureGuard, MouseSink};
+        use std::sync::{Arc, Mutex};
+
+        let renderer_writer = SharedWriter::default();
+        let renderer = LiveSpillRenderer::with_writer(renderer_writer.clone(), 80, 3, false);
+        let mouse_sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let released =
+            || String::from_utf8_lossy(&mouse_sink.lock().unwrap()).contains("\u{1b}[?1006l");
+
+        renderer.start(1);
+        renderer.write(1, ToolOutputStream::Stdout, b"stalled frame\n");
+        let before_abandon = renderer_writer.0.lock().unwrap().len();
+
+        {
+            // Capture is live for the turn.
+            let _capture = MouseCaptureGuard::enable(MouseSink::Shared(mouse_sink.clone()));
+            assert!(
+                String::from_utf8_lossy(&mouse_sink.lock().unwrap()).contains("\u{1b}[?1006h"),
+                "capture enabled on the mouse tier"
+            );
+
+            // The rule-7 teardown-miss: atomic, I/O-free abandon then a delayed
+            // finish. Neither may touch the renderer writer...
+            renderer.abandon(1);
+            renderer.finish(1);
+            assert_eq!(
+                renderer_writer.0.lock().unwrap().len(),
+                before_abandon,
+                "abandon + delayed finish performed renderer I/O"
+            );
+            // ...and capture stays held until the turn scope unwinds.
+            assert!(!released(), "capture must stay held inside the turn scope");
+        }
+
+        // Scope exit dropped the guard → capture released via the guard's OWN
+        // handle, with the renderer writer still untouched.
+        assert!(
+            released(),
+            "mouse capture released on the abandon/teardown path"
+        );
+        assert_eq!(
+            renderer_writer.0.lock().unwrap().len(),
+            before_abandon,
+            "release must not have ridden the renderer writer"
+        );
+    }
+
+    // #1303 (§8.4): the hand-rolled CSI interpreter must tolerate mouse-capture
+    // enable/disable sequences so a golden/frame test never panics on them.
+    #[test]
+    fn screen_model_tolerates_mouse_capture_sequences() {
+        let mut screen = ScreenModel::new(20);
+        screen.apply(b"hi");
+        let mut enable = Vec::new();
+        let _ = crossterm::queue!(enable, crossterm::event::EnableMouseCapture);
+        let mut disable = Vec::new();
+        let _ = crossterm::queue!(disable, crossterm::event::DisableMouseCapture);
+        screen.apply(&enable);
+        screen.apply(&disable);
+        assert_eq!(screen.nonempty_rows(), vec!["hi".to_string()]);
     }
 
     #[test]
