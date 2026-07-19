@@ -34,6 +34,12 @@ mod workspace_state;
 mod rich_input;
 #[cfg(feature = "rich-tui")]
 mod vi;
+// The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
+// only when an interactive surface is on — the wyvern/lean build never links it.
+#[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+mod mouse;
+#[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+pub use mouse::install_panic_release_hook;
 // The lean input surface (issue #527): a dead-simple word-wrapped text box, the
 // flight/wyvern morphology. Always built — it is the footer-off / lean tier.
 mod lean_input;
@@ -5587,6 +5593,54 @@ fn live_spill_capable_for(
         && term != Some("dumb")
 }
 
+/// #1303: the mouse-tier opt-in — `[tui] mouse_viewport` (default false).
+/// Mirrors [`spill_lines`]; the config field is always compiled, but this
+/// accessor and the capability gate only exist under `live-spill` (the mouse
+/// tier rides the spill viewport's own feature, stripped from the wyvern build).
+#[cfg(feature = "live-spill")]
+fn mouse_viewport(cfg: &newt_core::Config) -> bool {
+    cfg.tui.as_ref().map(|t| t.mouse_viewport).unwrap_or(false)
+}
+
+/// #1303: the mouse-tier capability gate — layered strictly ON TOP of
+/// `live_spill_capable()` plus an explicit opt-in. Mouse events arrive on
+/// **stdin**, so both stdin and stdout must be terminals (a stdin-piped session
+/// never enables capture even when stdout is a TTY).
+#[cfg(feature = "live-spill")]
+fn mouse_capable(opt_in: bool) -> bool {
+    let term = std::env::var("TERM").ok();
+    mouse_capable_for(
+        cfg!(unix),
+        cfg!(feature = "live-spill"),
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        term.as_deref(),
+        opt_in,
+    )
+}
+
+/// Pure predicate behind [`mouse_capable`]: the opt-in AND the full
+/// `live_spill_capable_for` predicate. Injected-bool seam for the acceptance-1a
+/// table test.
+#[cfg(feature = "live-spill")]
+fn mouse_capable_for(
+    platform_supported: bool,
+    feature_enabled: bool,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    term: Option<&str>,
+    opt_in: bool,
+) -> bool {
+    opt_in
+        && live_spill_capable_for(
+            platform_supported,
+            feature_enabled,
+            stdin_terminal,
+            stdout_terminal,
+            term,
+        )
+}
+
 /// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
 /// Defaults to 25 when there's no `[tui]` table or no config file.
 fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
@@ -6712,6 +6766,7 @@ pub(crate) fn with_live_spill_watch<T>(
     enabled: bool,
     cancel: &std::sync::atomic::AtomicBool,
     hard: &std::sync::atomic::AtomicBool,
+    mouse: bool,
     spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
 ) -> T {
@@ -6722,6 +6777,15 @@ pub(crate) fn with_live_spill_watch<T>(
     let Ok(_cbreak) = CbreakGuard::enter() else {
         return f();
     };
+    // #1303: mouse capture is turn-scoped and released on EVERY exit path. The
+    // guard drops when this scope unwinds — normal return, `?`, or panic — and
+    // its `Drop` is a direct stdout write (NOT a renderer write), so the rule-7
+    // abandon path (contractually I/O-free through the renderer) still releases.
+    // `None` on the keyboard tier / opt-out; nothing is emitted then.
+    #[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+    let _mouse_capture = crate::mouse::MouseCaptureGuard::maybe(mouse);
+    #[cfg(not(any(feature = "rich-tui", feature = "live-spill")))]
+    let _ = mouse;
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| watch_for_interrupt(cancel, hard, &stop, spill));
@@ -6738,6 +6802,7 @@ pub(crate) fn with_live_spill_watch<T>(
     _enabled: bool,
     _cancel: &std::sync::atomic::AtomicBool,
     _hard: &std::sync::atomic::AtomicBool,
+    _mouse: bool,
     _spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
 ) -> T {
@@ -6751,7 +6816,8 @@ pub(crate) fn with_interrupt_watch<T>(
     hard: &std::sync::atomic::AtomicBool,
     f: impl FnOnce() -> T,
 ) -> T {
-    with_live_spill_watch(enabled, cancel, hard, None, f)
+    // No live spill viewport ⇒ no mouse tier.
+    with_live_spill_watch(enabled, cancel, hard, false, None, f)
 }
 
 /// Poll stdin while the turn runs; trip `cancel` on the first interrupt (a lone

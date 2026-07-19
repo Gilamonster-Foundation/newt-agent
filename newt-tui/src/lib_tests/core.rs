@@ -523,6 +523,91 @@ fn live_spill_requires_a_supported_interactive_terminal() {
     ));
 }
 
+// #1303 acceptance 1a: the mouse tier is `live_spill_capable()` AND an explicit
+// opt-in — a strict superset gate. Mouse events arrive on stdin, so a
+// stdin-piped session (stdin_terminal=false) must never enable capture even
+// when stdout is a TTY.
+#[cfg(feature = "live-spill")]
+#[test]
+fn mouse_tier_requires_optin_and_a_supported_interactive_terminal() {
+    // Every predicate satisfied — INCLUDING the explicit opt-in — is the only
+    // way the mouse tier turns on.
+    assert!(mouse_capable_for(
+        true,
+        true,
+        true,
+        true,
+        Some("xterm-256color"),
+        true
+    ));
+    // Opt-in off ⇒ never capable, even on a flawless interactive TTY.
+    assert!(!mouse_capable_for(
+        true,
+        true,
+        true,
+        true,
+        Some("xterm"),
+        false
+    ));
+    // Each base predicate false-flips to incapable (opt-in held on).
+    assert!(!mouse_capable_for(
+        false,
+        true,
+        true,
+        true,
+        Some("xterm"),
+        true
+    )); // platform
+    assert!(!mouse_capable_for(
+        true,
+        false,
+        true,
+        true,
+        Some("xterm"),
+        true
+    )); // feature
+    assert!(!mouse_capable_for(
+        true,
+        true,
+        false,
+        true,
+        Some("xterm"),
+        true
+    )); // stdin TTY
+    assert!(!mouse_capable_for(
+        true,
+        true,
+        true,
+        false,
+        Some("xterm"),
+        true
+    )); // stdout TTY
+    assert!(!mouse_capable_for(
+        true,
+        true,
+        true,
+        true,
+        Some("dumb"),
+        true
+    )); // TERM=dumb
+}
+
+// #1303: the opt-in reads from `[tui] mouse_viewport`, default off.
+#[cfg(feature = "live-spill")]
+#[test]
+fn mouse_viewport_optin_reads_from_config_default_off() {
+    let empty = newt_core::Config::default();
+    assert!(!mouse_viewport(&empty), "default is off");
+    let opted_in = newt_core::Config {
+        tui: Some(newt_core::TuiConfig {
+            mouse_viewport: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(mouse_viewport(&opted_in));
+}
+
 #[test]
 fn slash_help_returns_true() {
     assert!(dispatch_slash("/help", "/ws", false, false).unwrap());

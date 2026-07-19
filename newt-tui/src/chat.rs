@@ -3246,6 +3246,15 @@ pub(crate) fn run_chat(
                         .map(|spill| spill as &dyn crate::SpillInput);
                     #[cfg(not(feature = "live-spill"))]
                     let spill_input: Option<&dyn crate::SpillInput> = None;
+                    // #1303: the mouse tier is `mouse_capable()` (both TTYs +
+                    // TERM + platform/feature) AND the `[tui] mouse_viewport`
+                    // opt-in — a strict superset of the keyboard tier, read here
+                    // mirroring `spill_lines(&cfg)`. Always false on the lean /
+                    // non-interactive / opted-out path (Clause A / E).
+                    #[cfg(feature = "live-spill")]
+                    let mouse_tier = mouse_capable(mouse_viewport(&cfg));
+                    #[cfg(not(feature = "live-spill"))]
+                    let mouse_tier = false;
                     // #1285: build the model-free where_is index once per session
                     // (the gather is a capped, cheap structural walk — no model,
                     // no network). The typed-verdict lookup then rides this turn.
@@ -3258,6 +3267,7 @@ pub(crate) fn run_chat(
                         interruptible,
                         &turn_cancel,
                         &turn_hard,
+                        mouse_tier,
                         spill_input,
                         || {
                             tokio::task::block_in_place(|| {
