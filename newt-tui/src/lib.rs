@@ -6574,6 +6574,11 @@ enum TurnKeyState {
 #[derive(Default)]
 struct TurnKeyDecoder {
     state: TurnKeyState,
+    // #1303: accumulated CSI parameter bytes, for SGR-mouse decode. Only ever
+    // populated under `live-spill` — the wyvern build never enables capture, so
+    // never sees mouse bytes, so this field does not exist there.
+    #[cfg(feature = "live-spill")]
+    params: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -6588,20 +6593,29 @@ impl TurnKeyDecoder {
                     TurnKeyState::Ground
                 }
                 TurnKeyState::Ground => TurnKeyState::Ground,
-                TurnKeyState::Escape if byte == b'[' => TurnKeyState::Csi,
+                TurnKeyState::Escape if byte == b'[' => {
+                    // A fresh CSI — reset the mouse-parameter accumulator.
+                    #[cfg(feature = "live-spill")]
+                    self.params.clear();
+                    TurnKeyState::Csi
+                }
                 TurnKeyState::Escape if byte == b'O' => TurnKeyState::Ss3,
                 TurnKeyState::Escape if byte == 0x1b => TurnKeyState::Escape,
                 TurnKeyState::Escape => TurnKeyState::Ground,
                 TurnKeyState::Csi if (0x40..=0x7e).contains(&byte) => {
-                    match byte {
-                        b'A' => keys.push(TurnKey::Up),
-                        b'B' => keys.push(TurnKey::Down),
-                        _ => {}
-                    }
+                    self.push_csi_terminal(byte, &mut keys);
                     TurnKeyState::Ground
                 }
                 TurnKeyState::Csi if byte == 0x1b => TurnKeyState::Escape,
-                TurnKeyState::Csi => TurnKeyState::Csi,
+                TurnKeyState::Csi => {
+                    // Accumulate parameter/intermediate bytes (`0x20..=0x3f`,
+                    // e.g. `<`, digits, `;`) for the SGR-mouse terminal decode.
+                    #[cfg(feature = "live-spill")]
+                    if (0x20..=0x3f).contains(&byte) {
+                        self.params.push(byte);
+                    }
+                    TurnKeyState::Csi
+                }
                 TurnKeyState::Ss3 => {
                     match byte {
                         b'A' => keys.push(TurnKey::Up),
@@ -6613,6 +6627,45 @@ impl TurnKeyDecoder {
             };
         }
         keys
+    }
+
+    /// A CSI terminal byte closed the sequence: an SGR-mouse event (when the
+    /// accumulated params carry a `<` intro) or a plain arrow.
+    fn push_csi_terminal(&self, byte: u8, keys: &mut Vec<TurnKey>) {
+        #[cfg(feature = "live-spill")]
+        if let Some(key) = self.mouse_key_for(byte) {
+            keys.push(key);
+            return;
+        }
+        match byte {
+            b'A' => keys.push(TurnKey::Up),
+            b'B' => keys.push(TurnKey::Down),
+            _ => {}
+        }
+    }
+
+    /// Decode an SGR-mouse event from the accumulated params + terminal byte:
+    /// `ESC [ < btn ; col ; row (M|m)`. Wheel-up = 64 → scroll toward older,
+    /// wheel-down = 65 → scroll toward newer; only the press form (`M`) reports
+    /// (the wheel has no release). Non-wheel events return `None` here (clicks
+    /// are handled separately).
+    #[cfg(feature = "live-spill")]
+    fn mouse_key_for(&self, final_byte: u8) -> Option<TurnKey> {
+        if final_byte != b'M' {
+            return None;
+        }
+        let params = std::str::from_utf8(&self.params).ok()?;
+        let btn = params
+            .strip_prefix('<')?
+            .split(';')
+            .next()?
+            .parse::<u32>()
+            .ok()?;
+        match btn {
+            64 => Some(TurnKey::Up),
+            65 => Some(TurnKey::Down),
+            _ => None,
+        }
     }
 }
 
@@ -6634,6 +6687,44 @@ fn dispatch_turn_keys(decoder: &mut TurnKeyDecoder, bytes: &[u8], spill: Option<
                 spill.toggle_expanded();
             }
         }
+    }
+}
+
+// #1303 step 3/4/5: SGR-mouse + editor-mode keyboard decode is `live-spill`
+// mouse code — stripped from the wyvern build, so these tests are too.
+#[cfg(all(test, unix, feature = "live-spill"))]
+mod mouse_decode_tests {
+    use super::{TurnKey, TurnKeyDecoder};
+
+    #[test]
+    fn sgr_wheel_up_and_down_map_to_scroll_keys() {
+        let mut d = TurnKeyDecoder::default();
+        // SGR wheel up: ESC [ < 64 ; col ; row M
+        assert_eq!(d.feed(b"\x1b[<64;10;5M"), vec![TurnKey::Up]);
+        // SGR wheel down: button 65
+        assert_eq!(d.feed(b"\x1b[<65;10;5M"), vec![TurnKey::Down]);
+    }
+
+    #[test]
+    fn sgr_non_wheel_events_are_ignored_by_the_wheel_tier() {
+        let mut d = TurnKeyDecoder::default();
+        // A left-button press/release is not a wheel event → no scroll keys.
+        assert_eq!(d.feed(b"\x1b[<0;3;3m"), vec![]);
+    }
+
+    #[test]
+    fn wheel_sequence_split_across_reads_still_decodes() {
+        let mut d = TurnKeyDecoder::default();
+        assert_eq!(d.feed(b"\x1b[<64;"), vec![]);
+        assert_eq!(d.feed(b"10;5M"), vec![TurnKey::Up]);
+    }
+
+    #[test]
+    fn arrow_and_space_still_decode_alongside_mouse_params() {
+        let mut d = TurnKeyDecoder::default();
+        assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up]);
+        assert_eq!(d.feed(b"\x1b[B"), vec![TurnKey::Down]);
+        assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded]);
     }
 }
 
