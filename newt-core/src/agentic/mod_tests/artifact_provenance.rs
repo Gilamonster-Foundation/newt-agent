@@ -37,6 +37,7 @@ fn ctx<'a>(
         scratchpad: false,
         scratchpad_store: None,
         code_search: None,
+        where_is: None,
         experience_store: None,
         step_ledger: None,
         caveats,

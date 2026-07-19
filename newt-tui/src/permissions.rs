@@ -2136,6 +2136,7 @@ mod permission_prompt_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None,
             None, // code_search
             None, // experience_store
             None, // step_ledger
@@ -2162,6 +2163,7 @@ mod permission_prompt_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None,
             None, // code_search
             None, // experience_store
             None, // step_ledger
@@ -2218,6 +2220,7 @@ mod permission_prompt_tests {
                 None, // git_tool
                 None, // crew_runner
                 None, // scratchpad_store
+                None,
                 None, // code_search
                 None, // experience_store
                 None, // step_ledger

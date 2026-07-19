@@ -537,6 +537,11 @@ pub struct ChatCtx<'a> {
     /// Semantic searcher for the `code_search` tool (Step 26.5.5). `None` = the
     /// tool is not advertised (semantic off / no index). Bundles embedder+index.
     pub code_search: Option<crate::agentic::semantic::CodeSearch<'a>>,
+    /// #1285: the retained `where_is` symbol index for the exact typed-verdict
+    /// lookup tool. `None` = no index built (the tool degrades honestly). Built
+    /// from the honest gather + language packs — model-free, so it can ride
+    /// every session.
+    pub where_is: Option<&'a crate::where_is::WhereIsIndex>,
     /// Experiential store for the record/recall tools (Step 26.6a). `None` = the
     /// tools are not advertised (experiential off). Shared `&dyn` (interior mut).
     pub experience_store: Option<&'a dyn crate::agentic::experiential::ExperienceStore>,
@@ -1119,6 +1124,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         scratchpad,
         scratchpad_store,
         code_search,
+        where_is,
         experience_store,
         step_ledger,
         caveats,
@@ -2655,6 +2661,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         crew_runner,
                         scratchpad_store,
                         code_search,
+                        where_is,
                         experience_store,
                         step_ledger,
                         tool_offload,
@@ -4413,6 +4420,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         scratchpad,
         scratchpad_store,
         code_search,
+        where_is,
         experience_store,
         step_ledger,
         caveats,
@@ -5403,6 +5411,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         crew_runner,
                         scratchpad_store,
                         code_search,
+                        where_is,
                         experience_store,
                         step_ledger,
                         tool_offload,
@@ -5688,6 +5697,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         scratchpad,
         scratchpad_store,
         code_search,
+        where_is,
         experience_store,
         step_ledger,
         caveats,
@@ -6015,6 +6025,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         crew_runner,
                         scratchpad_store,
                         code_search,
+                        where_is,
                         experience_store,
                         step_ledger,
                         tool_offload,
@@ -7448,6 +7459,7 @@ mod tool_round_cap_tests {
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
+            where_is: None,
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -7617,6 +7629,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -7916,6 +7929,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8006,6 +8020,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8604,6 +8619,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8706,6 +8722,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8817,6 +8834,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8940,6 +8958,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9055,6 +9074,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9144,6 +9164,7 @@ mod tool_round_cap_tests {
                 None, // crew_runner
                 None, // scratchpad_store
                 None, // code_search
+                None, // where_is
                 None, // experience_store
                 None, // step_ledger
             )
@@ -9211,6 +9232,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9377,6 +9399,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                where_is: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9509,6 +9532,7 @@ mod save_note_loop_tests {
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
+            where_is: None,
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -10004,6 +10028,7 @@ mod compression_loop_tests {
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
+            where_is: None,
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -11269,6 +11294,7 @@ mod observation_hook_tests {
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
+            where_is: None,
             experience_store: None,
             step_ledger: None,
             caveats,

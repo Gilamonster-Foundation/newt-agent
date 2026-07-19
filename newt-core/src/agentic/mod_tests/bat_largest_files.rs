@@ -116,6 +116,7 @@ async fn run_scenario(
         scratchpad: false,
         scratchpad_store: None,
         code_search: None,
+        where_is: None,
         experience_store: None,
         step_ledger: None,
         caveats: &caveats,
