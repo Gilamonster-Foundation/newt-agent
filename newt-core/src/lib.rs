@@ -35,6 +35,7 @@ pub mod ocap_propose;
 pub mod ocap_store;
 pub mod plan;
 pub mod pricing;
+pub mod project_model;
 pub mod prompt;
 pub mod prune;
 pub mod reasoning;
