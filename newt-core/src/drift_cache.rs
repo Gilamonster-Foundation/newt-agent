@@ -308,10 +308,18 @@ mod tests {
 
     #[test]
     fn store_path_is_repo_scoped_under_index_dir() {
+        // Path-component assertions (not string slashes) so this holds on
+        // Windows too, where the separator is `\`.
         let p = store_path(Path::new("/home/x/.newt"), Path::new("/repo/foo"), "model");
-        let s = p.to_string_lossy();
-        assert!(s.starts_with("/home/x/.newt/index/"), "{s}");
-        assert!(s.ends_with("/model.json"), "{s}");
+        let comps: Vec<String> = p
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert!(comps.contains(&"index".to_string()), "{p:?}");
+        assert_eq!(p.file_name().and_then(|f| f.to_str()), Some("model.json"));
+        // The repo-hash dir sits between `index` and the file, and is stable.
+        let idx = comps.iter().position(|c| c == "index").unwrap();
+        assert_eq!(comps[idx + 1].len(), 16, "16-char repo hash: {p:?}");
     }
 
     #[test]
