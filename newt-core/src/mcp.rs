@@ -128,6 +128,74 @@ impl McpServerEntry {
     }
 }
 
+/// Validate an entry for a comment-preserving write — shared by the config's
+/// `[[mcp_servers]]` writer and the catalog's `[[servers]]` writer. An empty
+/// name can never be addressed again; an entry failing [`McpServerEntry::is_valid`]
+/// could never connect.
+pub(crate) fn validate_entry_for_write(entry: &McpServerEntry) -> crate::error::Result<()> {
+    if entry.name.trim().is_empty() {
+        return Err(crate::error::NewtError::Config(
+            "MCP server name cannot be empty".to_string(),
+        ));
+    }
+    if !entry.is_valid() {
+        let need = match entry.transport {
+            TransportKind::Stdio => "a `command`",
+            TransportKind::Sse | TransportKind::Http => "a `url`",
+        };
+        return Err(crate::error::NewtError::Config(format!(
+            "a {} MCP server requires {need}",
+            entry.transport.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// Render an entry as a `toml_edit` table — the shape both writers append.
+/// `description` (the catalog form) lands right after `name`. Defaults stay
+/// implicit (no `enabled = true`, no `type = "stdio"`) so files stay minimal.
+pub(crate) fn entry_to_toml_table(
+    entry: &McpServerEntry,
+    description: Option<&str>,
+) -> crate::error::Result<toml_edit::Table> {
+    let mut table = toml_edit::Table::new();
+    table["name"] = toml_edit::value(&entry.name);
+    if let Some(description) = description {
+        table["description"] = toml_edit::value(description);
+    }
+    if !entry.enabled {
+        table["enabled"] = toml_edit::value(false);
+    }
+    if entry.transport != TransportKind::Stdio {
+        table["type"] = toml_edit::value(entry.transport.as_str());
+    }
+    if let Some(command) = &entry.command {
+        table["command"] = toml_edit::value(command);
+    }
+    if !entry.args.is_empty() {
+        table["args"] = toml_edit::value(toml_edit::Array::from_iter(&entry.args));
+    }
+    if !entry.env.is_empty() {
+        table["env"] = toml_edit::value(toml_edit::InlineTable::from_iter(
+            entry.env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        ));
+    }
+    if let Some(url) = &entry.url {
+        table["url"] = toml_edit::value(url);
+    }
+    if !entry.headers.is_empty() {
+        table["headers"] = toml_edit::value(toml_edit::InlineTable::from_iter(
+            entry.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        ));
+    }
+    if let Some(secs) = entry.request_timeout_secs {
+        table["request_timeout_secs"] = toml_edit::value(i64::try_from(secs).map_err(|_| {
+            crate::error::NewtError::Config(format!("request timeout {secs}s is out of range"))
+        })?);
+    }
+    Ok(table)
+}
+
 /// Parse the `mcpServers` object out of a Claude Code config value
 /// (`~/.claude.json` or a project `.mcp.json`). The server name is taken from
 /// each map key. Unparseable entries are skipped, not fatal.

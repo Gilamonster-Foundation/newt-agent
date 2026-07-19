@@ -111,7 +111,8 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     // live session applies, derived from the operator's configured preset (else a
     // read-only default), NEVER `Caveats::top()` (#94: no top() in a dispatch
     // path). So the diagnostic shows each server under its real confinement.
-    let mcp_caveats = mcp_probe_caveats(&config, &workspace);
+    // Shared with `newt mcp probe` (#1292) via Config::mcp_probe_caveats.
+    let mcp_caveats = config.mcp_probe_caveats(&workspace);
     // For stdio servers we actually CONNECT (spawn + initialize + tools/list)
     // so you can see whether each is reachable and which tools it offers.
     for s in &servers {
@@ -147,27 +148,6 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// The confined leash `doctor` spawns stdio MCP servers under: the operator's
-/// configured `[tui]` permissions preset, or a read-only default when none is
-/// configured — mirroring the session's "safe by default, never `top()`" rule
-/// (#94). The diagnostic thus shows each server under its real confinement.
-fn mcp_probe_caveats(config: &Config, workspace: &Path) -> newt_core::caveats::Caveats {
-    let ws = workspace.to_string_lossy();
-    config
-        .tui
-        .as_ref()
-        .map(|t| t.permissions.to_caveats(&ws))
-        .unwrap_or_else(|| {
-            newt_core::ToolPermissions {
-                preset: newt_core::PermissionPreset::ReadOnly,
-                extra_exec: Vec::new(),
-                net: Vec::new(),
-                prompt: false,
-            }
-            .to_caveats(&ws)
-        })
 }
 
 async fn probe_dgx(dgx: &DgxConfig) {

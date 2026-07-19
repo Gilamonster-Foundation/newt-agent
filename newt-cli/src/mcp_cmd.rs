@@ -74,6 +74,10 @@ pub enum McpCmd {
     },
     /// List the merged discovery view: newt config + Claude Code overlays.
     List,
+    /// Probe a candidate MCP server: spawn a command (confined, consented)
+    /// or dial an http(s) URL, initialize, list tools, and derive its
+    /// registration. Verify-and-enrich only — the target is always explicit.
+    Probe(crate::mcp_probe_cmd::ProbeArgs),
     /// Install a server from the curated catalog (bundled + drop-in overlays).
     Install {
         /// Catalog entry name (e.g. `scrybe`).
@@ -92,7 +96,7 @@ fn parse_transport(s: &str) -> Result<TransportKind, String> {
 }
 
 /// Entry point dispatched from `newt mcp <subcommand>`.
-pub fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
+pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
     let mut out = std::io::stdout();
     match cmd {
         McpCmd::Add {
@@ -125,6 +129,7 @@ pub fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
             Ok(())
         }
         McpCmd::List => cmd_list(config_path, &mut out),
+        McpCmd::Probe(probe) => crate::mcp_probe_cmd::run(probe, config_path).await,
         McpCmd::Install { name, project } => {
             let catalog = resolve_catalog()?;
             let Some((chosen, origin)) = catalog.iter().find(|(e, _)| e.name == name) else {
@@ -149,7 +154,7 @@ pub fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
 }
 
 /// The post-add pointer to the verification surfaces.
-fn print_next_steps(out: &mut dyn Write) -> anyhow::Result<()> {
+pub(crate) fn print_next_steps(out: &mut dyn Write) -> anyhow::Result<()> {
     writeln!(
         out,
         "Verify with `newt doctor`; in the TUI, `/mcp` shows live status."
@@ -168,7 +173,7 @@ fn print_next_steps(out: &mut dyn Write) -> anyhow::Result<()> {
 /// - else `$NEWT_CONFIG`;
 /// - else `./newt.toml` when it exists (resolve()'s next base candidate);
 /// - else the user config (`$NEWT_CONFIG_DIR/config.toml` / `~/.newt/…`).
-fn write_target(config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
+pub(crate) fn write_target(config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
     if project {
         if let Some(existing) = Config::project_config_path() {
             return Ok(existing);
@@ -197,7 +202,21 @@ fn write_target(config_path: Option<&Path>, project: bool) -> anyhow::Result<Pat
 /// text (the first-write case); any other read failure — permissions, a
 /// non-UTF-8 byte — aborts loudly. Treating those as empty would rewrite the
 /// user's whole config as just the appended entry: silent data loss.
-fn read_config_text(path: &Path) -> anyhow::Result<String> {
+/// Read an OPTIONAL drop-in file: `Ok(None)` when it does not exist, its text
+/// when it does, and a loud error naming the path for any other read failure
+/// (permissions, a non-UTF-8 byte). Silently skipping a present-but-unreadable
+/// drop-in would act on config the operator believes they have overridden —
+/// the same read-safety contract as [`read_config_text`].
+pub(crate) fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("cannot read drop-in {}", path.display())),
+    }
+}
+
+pub(crate) fn read_config_text(path: &Path) -> anyhow::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -212,7 +231,7 @@ fn read_config_text(path: &Path) -> anyhow::Result<String> {
 
 /// Shared add/install write path: read the target (missing file = empty),
 /// append through the pure writer, create parent dirs, write back.
-fn add_to_config(
+pub(crate) fn add_to_config(
     entry: &McpServerEntry,
     config_path: Option<&Path>,
     project: bool,
@@ -275,7 +294,7 @@ fn build_entry(
 
 /// Parse repeated `--env K=V` flags. Pure. Rejects a pair with no `=` or an
 /// empty key; the value may be empty (explicitly unsetting is legitimate).
-fn parse_env_pairs(pairs: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+pub(crate) fn parse_env_pairs(pairs: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
     for pair in pairs {
         let Some((key, value)) = pair.split_once('=').filter(|(k, _)| !k.is_empty()) else {
@@ -477,7 +496,7 @@ fn resolve_catalog() -> anyhow::Result<Vec<(McpCatalogEntry, CatalogOrigin)>> {
         .ok()
         .map(|d| d.join(".newt").join("mcp-catalog.toml"));
     for path in [user, project].into_iter().flatten() {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(text) = read_optional(&path)? {
             let entries = parse_catalog(&text).with_context(|| format!("in {}", path.display()))?;
             layers.push((CatalogOrigin::DropIn(path), entries));
         }

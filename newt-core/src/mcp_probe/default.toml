@@ -1,0 +1,14 @@
+# Probe rules for `newt mcp probe <command>` (#1292) — pure data (three-Cs).
+#
+# When no --arg is given, the probe spawns the command once per candidate
+# below (in order, under the confined probe leash) until one speaks MCP.
+# Override by dropping a mcp-probe-rules.toml into ~/.newt/ or a project's
+# .newt/ (project wins; the file REPLACES this list wholesale — it is an
+# ordered trial list, not a merge-by-name set).
+
+arg_candidates = [
+    ["stdio"],   # scrybe-mcp-server stdio; common "transport as positional"
+    [],          # servers that just speak MCP on stdin/stdout when run bare
+    ["mcp"],     # `<tool> mcp` subcommand convention (newt itself does this)
+    ["serve"],   # `<tool> serve` convention
+]

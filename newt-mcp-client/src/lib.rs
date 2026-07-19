@@ -101,6 +101,86 @@ pub trait Transport {
     async fn recv(&mut self) -> Result<Option<String>>;
 }
 
+/// The server's self-reported identity from the `initialize` result
+/// (`serverInfo`). All fields are best-effort: a server may omit any of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerInfo {
+    /// The server's programmatic name.
+    #[serde(default)]
+    pub name: String,
+    /// Human-facing display title (MCP 2025-06-18 addition).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The server's version string.
+    #[serde(default)]
+    pub version: String,
+}
+
+/// What the `initialize` handshake reported back — previously discarded
+/// (#1292 prerequisite). `newt mcp probe` derives a registration's name and
+/// description from this; other callers may ignore it.
+#[derive(Debug, Clone, Default)]
+pub struct InitializeInfo {
+    /// `serverInfo`, when the server sent one.
+    pub server_info: Option<ServerInfo>,
+    /// Server-authored usage `instructions`, when present.
+    pub instructions: Option<String>,
+    /// The raw server `capabilities` object — kept as `Value` because its
+    /// shape varies by protocol revision.
+    pub capabilities: Value,
+    /// The negotiated `protocolVersion`.
+    pub protocol_version: Option<String>,
+}
+
+/// A non-2xx HTTP response from an MCP endpoint, as a **typed** error so a
+/// caller can match on the status (`newt mcp probe`'s "needs `newt auth`"
+/// detection) instead of string-matching a message that could drift.
+/// Downcast it out of an `anyhow` chain via `err.chain()`.
+#[derive(Debug)]
+pub struct HttpStatusError {
+    /// The HTTP status code (e.g. `401`).
+    pub status: u16,
+    /// The canonical reason phrase (`Unauthorized`), possibly empty.
+    reason: String,
+    /// The (trimmed) response body.
+    body: String,
+}
+
+impl HttpStatusError {
+    #[must_use]
+    pub fn new(status: u16, reason: &str, body: &str) -> Self {
+        Self {
+            status,
+            reason: reason.to_string(),
+            body: body.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The exact pre-typed wording — consumers log this text.
+        write!(f, "MCP server returned HTTP {}", self.status)?;
+        if !self.reason.is_empty() {
+            write!(f, " {}", self.reason)?;
+        }
+        write!(f, ": {}", self.body)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
+/// A short, single-line sketch of a JSON value for error messages (a wrong
+/// initialize result may be arbitrarily large or hostile — never echo it all).
+fn summarize_value(v: &Value) -> String {
+    let mut s = v.to_string().replace(['\n', '\r'], " ");
+    if s.chars().count() > 120 {
+        s = s.chars().take(120).collect::<String>() + "…";
+    }
+    s
+}
+
 /// A tool advertised by a remote MCP server.
 #[derive(Debug, Clone)]
 pub struct RemoteTool {
@@ -174,19 +254,55 @@ impl<T: Transport> McpConnection<T> {
         self.transport.send(serde_json::to_string(&note)?).await
     }
 
-    /// Perform the MCP `initialize` handshake + `notifications/initialized`.
-    pub async fn initialize(&mut self) -> Result<()> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "newt", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        )
-        .await?;
+    /// Perform the MCP `initialize` handshake + `notifications/initialized`,
+    /// returning what the server reported about itself (previously discarded —
+    /// the #1292 probe prerequisite).
+    ///
+    /// The result is **validated as a real handshake** before anything else:
+    /// it must be a JSON object carrying `protocolVersion` (a string) and
+    /// `capabilities` — both required in the spec's InitializeResult. Without
+    /// this, any process that echoes stdin (`/bin/cat`) "initializes"
+    /// successfully: the echoed request has our id and no `error`, so
+    /// [`request`](Self::request) yields `Null` — and the probe/doctor would
+    /// certify a non-server. A non-handshake result is a loud error, and no
+    /// `notifications/initialized` is sent to it.
+    pub async fn initialize(&mut self) -> Result<InitializeInfo> {
+        let result = self
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "newt", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            )
+            .await?;
+        let is_handshake = result.as_object().is_some_and(|obj| {
+            obj.get("protocolVersion").is_some_and(Value::is_string)
+                && obj.contains_key("capabilities")
+        });
+        if !is_handshake {
+            return Err(anyhow!(
+                "not an MCP server: no valid initialize response (expected an object with \
+                 `protocolVersion` and `capabilities`, got: {})",
+                summarize_value(&result)
+            ));
+        }
         self.notify("notifications/initialized", json!({})).await?;
-        Ok(())
+        Ok(InitializeInfo {
+            server_info: result
+                .get("serverInfo")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            instructions: result
+                .get("instructions")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            capabilities: result.get("capabilities").cloned().unwrap_or(Value::Null),
+            protocol_version: result
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
     }
 
     /// List the server's tools.
@@ -650,10 +766,11 @@ impl Transport for HttpTransport {
             .context("reading MCP HTTP response body")?;
 
         if !status.is_success() {
-            return Err(anyhow!(
-                "MCP server returned HTTP {status}: {}",
-                body.trim()
-            ));
+            return Err(anyhow::Error::new(HttpStatusError::new(
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                body.trim(),
+            )));
         }
         if is_sse {
             self.inbox.extend(parse_sse_messages(&body));
@@ -773,6 +890,10 @@ pub struct ConnectedServer {
     /// when outbound traffic is routed through the loopback egress proxy
     /// enforcing an `n`-host allow-list, else `Advisory`.
     pub net_posture: NetPosture,
+    /// The server's self-reported identity (`serverInfo`), when it sent one.
+    pub server_info: Option<ServerInfo>,
+    /// Server-authored usage `instructions` from the handshake, when present.
+    pub instructions: Option<String>,
 }
 
 /// Initialize a transport and list its tools into a [`ConnectedServer`].
@@ -784,7 +905,7 @@ async fn finish_connect(
 ) -> Result<ConnectedServer> {
     let timeout = resolve_timeout(entry);
     let mut conn = McpConnection::new_with_timeout(transport, timeout);
-    tokio::time::timeout(timeout, conn.initialize())
+    let init = tokio::time::timeout(timeout, conn.initialize())
         .await
         .with_context(|| format!("initializing MCP server `{}`", entry.name))??;
     let tools = conn
@@ -797,6 +918,8 @@ async fn finish_connect(
         tools,
         sandbox_kind,
         net_posture,
+        server_info: init.server_info,
+        instructions: init.instructions,
     })
 }
 
@@ -891,7 +1014,14 @@ fn server_prefix(name: &str, sanitize: bool) -> String {
 /// stripped, IPv6 brackets removed. Empty strings when absent/unparseable (which
 /// the policy treats as insecure → no token). Manual parse to avoid a url dep;
 /// good enough for the scheme+host decision below.
-fn parse_scheme_host(url: Option<&str>) -> (String, String) {
+///
+/// The **canonical** implementation for MCP transport-policy decisions —
+/// `newt mcp probe` and the TUI's Bearer/egress gates delegate here so the
+/// split rules cannot diverge. The authority ends at the first of `/ ? #`,
+/// and userinfo is stripped from the *authority only* — an `@` inside a query
+/// must never smuggle a fake host past a gate.
+#[must_use]
+pub fn parse_scheme_host(url: Option<&str>) -> (String, String) {
     let Some(url) = url else {
         return (String::new(), String::new());
     };
@@ -906,9 +1036,17 @@ fn parse_scheme_host(url: Option<&str>) -> (String, String) {
     (scheme.to_ascii_lowercase(), host.to_ascii_lowercase())
 }
 
-/// A loopback host — the dev exception that needs no https and emits no warning.
-fn host_is_loopback(host: &str) -> bool {
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+/// A loopback host — the dev exception that needs no https and emits no
+/// warning. Loopback is an **IP property**, never a string prefix: a
+/// `starts_with("127.")` check certified `127.0.0.1.evil.com` (a perfectly
+/// valid public DNS name) as loopback and let cleartext through the gate.
+/// A non-IP host other than `localhost` is NOT loopback.
+#[must_use]
+pub fn host_is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Warn on every non-loopback unencrypted (non-`https`) connection — the same
@@ -1143,6 +1281,8 @@ mod toolset_tests {
                 }],
                 sandbox_kind: None,
                 net_posture: crate::NetPosture::Advisory,
+                server_info: None,
+                instructions: None,
             }],
             sanitize_server_names: true,
         };
@@ -1182,6 +1322,8 @@ mod toolset_tests {
                 tools: vec![],
                 sandbox_kind: None,
                 net_posture: crate::NetPosture::Advisory,
+                server_info: None,
+                instructions: None,
             }],
             sanitize_server_names: true,
         };
@@ -1230,6 +1372,112 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "search");
         assert_eq!(tools[0].description, "find");
+    }
+
+    #[tokio::test]
+    async fn initialize_captures_server_identity_and_instructions() {
+        let mut conn = McpConnection::new(MockTransport::new([
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"scrybe","title":"Scrybe","version":"1.2.3"},"instructions":"Edit Markdown documents."}}"#,
+        ]));
+        let info = conn.initialize().await.unwrap();
+        let si = info.server_info.expect("serverInfo captured");
+        assert_eq!(si.name, "scrybe");
+        assert_eq!(si.title.as_deref(), Some("Scrybe"));
+        assert_eq!(si.version, "1.2.3");
+        assert_eq!(
+            info.instructions.as_deref(),
+            Some("Edit Markdown documents.")
+        );
+        assert_eq!(info.protocol_version.as_deref(), Some("2024-11-05"));
+        assert!(info.capabilities.get("tools").is_some());
+    }
+
+    #[tokio::test]
+    async fn initialize_tolerates_a_minimal_but_compliant_result() {
+        // A server reporting nothing beyond protocol compliance still
+        // initializes; identity fields are simply absent, never an error.
+        let mut conn = McpConnection::new(MockTransport::new([
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#,
+        ]));
+        let info = conn.initialize().await.unwrap();
+        assert!(info.server_info.is_none());
+        assert!(info.instructions.is_none());
+        assert_eq!(info.protocol_version.as_deref(), Some("2024-11-05"));
+    }
+
+    #[test]
+    fn scheme_host_authority_ends_at_slash_query_or_fragment() {
+        assert_eq!(
+            parse_scheme_host(Some("https://mcp.example?key=v")),
+            ("https".into(), "mcp.example".into())
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://evil.example?@127.0.0.1/")),
+            ("http".into(), "evil.example".into()),
+            "an @ inside the query must not smuggle a fake host"
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://user@[::1]:8080/x#f")),
+            ("http".into(), "::1".into())
+        );
+    }
+
+    #[test]
+    fn http_status_error_keeps_the_established_wording_and_downcasts() {
+        let err = HttpStatusError::new(401, "Unauthorized", "token missing");
+        assert_eq!(
+            err.to_string(),
+            "MCP server returned HTTP 401 Unauthorized: token missing"
+        );
+        let chained = anyhow::Error::new(err).context("initializing MCP server `x`");
+        let found = chained
+            .chain()
+            .find_map(|c| c.downcast_ref::<HttpStatusError>())
+            .expect("typed error survives an anyhow context chain");
+        assert_eq!(found.status, 401);
+    }
+
+    #[test]
+    fn loopback_is_an_ip_property() {
+        for yes in ["localhost", "127.0.0.1", "127.9.8.7", "::1"] {
+            assert!(host_is_loopback(yes), "{yes}");
+        }
+        for no in ["127.0.0.1.evil.com", "127.evil.example", "mcp.example", ""] {
+            assert!(!host_is_loopback(no), "{no}");
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_an_echoed_request_as_not_an_mcp_server() {
+        // `/bin/cat` echoes our own initialize REQUEST back: id matches, no
+        // `error`, no `result`. request() then yields Null — which must NOT
+        // count as a handshake, or the probe would certify any stdin-echoing
+        // process as an MCP server (and save it).
+        let mut conn = McpConnection::new(MockTransport::new([
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
+        ]));
+        let err = conn.initialize().await.unwrap_err();
+        assert!(err.to_string().contains("not an MCP server"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_non_handshake_results() {
+        // A result that is not an InitializeResult object (array / scalar /
+        // object missing protocolVersion or capabilities) is not a handshake.
+        for result in [
+            r#"{"jsonrpc":"2.0","id":1,"result":[1,2]}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#,
+        ] {
+            let mut conn = McpConnection::new(MockTransport::new([result]));
+            let err = conn.initialize().await.unwrap_err();
+            assert!(
+                err.to_string().contains("not an MCP server"),
+                "{result} → {err}"
+            );
+        }
     }
 
     #[tokio::test]
