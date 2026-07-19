@@ -3583,6 +3583,14 @@ impl Config {
     /// first-match behavior. Returns `Config::default()` if nothing is found.
     pub fn resolve() -> Result<Self> {
         let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
+        // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
+        // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
+        // root — `cd repo && newt` → same host-RCE class as the walk-up) rather
+        // than an operator-explicit base? Only `$NEWT_CONFIG` can pin a base here
+        // (the `--config` flag routes through `Config::load`, never `resolve`);
+        // if it points AT `./newt.toml` that is the operator's explicit choice
+        // (Trusted). Every other `./newt.toml` base is ambient → Untrusted.
+        let base_ambient = base_is_ambient_newt_toml(base_path.as_deref());
         // A project-local config that *is* the base (e.g. cwd is the project and
         // its `.newt/config.toml` already matched) must not be merged onto itself.
         let project_path =
@@ -3628,6 +3636,17 @@ impl Config {
                 cfg
             }
         };
+        // #1301 trust boundary (ambient `./newt.toml` base): when the base is the
+        // cwd-relative `./newt.toml` fallthrough it is itself attacker-reachable,
+        // so EVERY entry it contributed — plus any ambient project overlay already
+        // merged on top — is UNTRUSTED. This only ever downgrades; a trusted base
+        // (user home config, `/etc`, or an explicit `$NEWT_CONFIG`) is untouched
+        // and its project overlay was handled by `mark_project_mcp_untrusted`.
+        if base_ambient {
+            for entry in &mut cfg.mcp_servers {
+                entry.trust = crate::mcp::McpTrust::Untrusted;
+            }
+        }
         // Per-file backends (the endpoint control surface): drop a
         // `~/.newt/backends/<name>.toml` to add/override a backend — no
         // `config.toml` edit, and no overlapping inline `[[backends]]` to
@@ -4508,6 +4527,30 @@ fn mark_project_mcp_untrusted(
     };
     for entry in &mut servers[start..] {
         entry.trust = crate::mcp::McpTrust::Untrusted;
+    }
+}
+
+/// Whether the resolved base config is the AMBIENT cwd-relative `./newt.toml`
+/// candidate (a freshly cloned repo can ship one at its root — the #1301 sibling
+/// of the walked-up `.newt/config.toml` vector), as opposed to an
+/// operator-explicit base.
+///
+/// The only base a caller can pin explicitly *through [`Config::resolve`]* is
+/// `$NEWT_CONFIG` (the `--config` flag routes through [`Config::load`], which
+/// never reaches `resolve`, so it is Trusted without touching this path). So the
+/// `./newt.toml` base is explicit — Trusted — ONLY when `$NEWT_CONFIG` points AT
+/// it; the implicit fallthrough to the `./newt.toml` candidate (`$NEWT_CONFIG`
+/// unset, or set to some other/broken path) is ambient — Untrusted.
+fn base_is_ambient_newt_toml(base: Option<&Path>) -> bool {
+    let ambient_candidate = Path::new("./newt.toml");
+    if base != Some(ambient_candidate) {
+        return false;
+    }
+    // Mirror `candidate_paths`' `env::var("NEWT_CONFIG")` read: only a
+    // `$NEWT_CONFIG` that *is* `./newt.toml` selected this base explicitly.
+    match std::env::var("NEWT_CONFIG") {
+        Ok(explicit) => Path::new(&explicit) != ambient_candidate,
+        Err(_) => true,
     }
 }
 
@@ -6210,6 +6253,22 @@ tiers = ["COMPLEX"]
         let mut servers = vec![mcp_entry("a")];
         mark_project_mcp_untrusted(&mut servers, ArrayMergeStrategy::Replace, None);
         assert_eq!(servers[0].trust, crate::mcp::McpTrust::Trusted);
+    }
+
+    #[test]
+    fn base_is_ambient_newt_toml_false_for_non_newt_toml_base() {
+        // A base that isn't the cwd `./newt.toml` candidate is never ambient,
+        // regardless of `$NEWT_CONFIG` — the user home config, `/etc`, and an
+        // explicit non-`newt.toml` base all stay trusted. (The env-dependent
+        // `./newt.toml` branches are covered end-to-end in
+        // tests/mcp_project_trust.rs, which controls `$NEWT_CONFIG`.)
+        assert!(!base_is_ambient_newt_toml(None));
+        assert!(!base_is_ambient_newt_toml(Some(Path::new(
+            "/etc/newt/config.toml"
+        ))));
+        assert!(!base_is_ambient_newt_toml(Some(Path::new(
+            "./newt-other.toml"
+        ))));
     }
 
     #[test]

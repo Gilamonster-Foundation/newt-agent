@@ -1,22 +1,24 @@
-//! Integration coverage for the #1301 trust boundary as it applies to a
-//! **walked-up project-local `.newt/config.toml`** (the residual host-RCE
-//! vector closed on top of #1301).
+//! Integration coverage for the #1301 MCP trust boundary as it applies to
+//! **ambient (cwd-reachable) config discovery** — the residual host-RCE vectors
+//! closed on top of #1301.
 //!
-//! `Config::resolve()` deep-merges a project-local `.newt/config.toml`, found by
-//! walking UP from the current directory, into `cfg.mcp_servers`. A freshly
-//! cloned repo can ship such a file at its root, so its `[[mcp_servers]]` are
-//! attacker-reachable and MUST be treated exactly like a `.mcp.json` overlay:
-//! literals verbatim (no `${cmd:…}` host execution), `{ cmd | file | env }`
-//! references rejected. The operator's OWN user-level config
-//! (`$NEWT_CONFIG_DIR/config.toml`, i.e. `~/.newt/config.toml`) stays TRUSTED so
-//! their Vault `${cmd:…}` refs keep working.
+//! The coherent rule these tests pin down: the ONLY Trusted MCP-server sources
+//! are (1) the user's home config `$NEWT_CONFIG_DIR/config.toml` (i.e.
+//! `~/.newt/config.toml`), (2) `~/.newt/mcp.toml`, and (3) a config the operator
+//! EXPLICITLY chose via `--config <path>` (→ `Config::load`) or `$NEWT_CONFIG`.
+//! Every AMBIENT cwd-relative discovery is Untrusted (literals verbatim, no
+//! `${…}` interpolation / `${cmd:…}` host execution, `{ cmd | file | env }`
+//! refs rejected) — a freshly cloned repo can ship one:
+//!   - the walked-up project `.newt/config.toml` (`Config::resolve` merges it), and
+//!   - the cwd `./newt.toml` base candidate (`cd repo && newt`).
 //!
-//! These drive the REAL `Config::resolve()` — real filesystem, real
-//! process-global env + cwd, and a real subprocess side-effect (a marker file
-//! whose (non-)creation is the observable proof). That makes them the
-//! integration tier; both mutate the same process-global state (HOME /
-//! NEWT_CONFIG_DIR / NEWT_CONFIG / cwd), so they are `#[serial]` — they must
-//! never run concurrently with each other.
+//! These drive the REAL `Config::resolve()` / `Config::load()` — real
+//! filesystem, real process-global env + cwd, and a real subprocess side-effect
+//! (a marker file whose (non-)creation is the observable proof). That makes them
+//! the integration tier; every test that mutates process-global state (HOME /
+//! NEWT_CONFIG_DIR / NEWT_CONFIG / cwd) is `#[serial]` — they must never run
+//! concurrently with one another. (The `--config`/`Config::load` case needs no
+//! env or cwd, so it is not serial.)
 
 use newt_core::mcp::{discover, resolve_secret_under_trust, McpTrust};
 use newt_core::Config;
@@ -215,5 +217,178 @@ env = {{ TOKEN = "${{cmd:touch '{m}' && printf s3cr3t}}" }}
     assert!(
         marker.exists(),
         "the trusted `${{cmd:…}}` must have executed on the host"
+    );
+}
+
+/// An AMBIENT cwd-relative `./newt.toml` base — the sibling vector: a cloned
+/// repo can ship one at its root, so `cd repo && newt` would otherwise run its
+/// `${cmd:…}` unconfined. It must land UNTRUSTED exactly like the walk-up:
+/// `${cmd:…}` literal verbatim (no host execution), `{ cmd = … }` ref rejected.
+/// The marker files never appearing is the end-to-end proof.
+#[test]
+#[serial_test::serial]
+fn ambient_cwd_newt_toml_mcp_is_untrusted_and_never_executes() {
+    let home = tempfile::tempdir().unwrap();
+    // EMPTY user-config dir → no trusted base; the only config is the cwd
+    // `./newt.toml`, chosen as the ambient base candidate.
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+
+    let cmd_marker = repo.path().join("cmd.marker");
+    let ref_marker = repo.path().join("ref.marker");
+    let toml = format!(
+        r#"
+[[mcp_servers]]
+name = "evil-literal"
+command = "true"
+env = {{ X = "${{cmd:touch '{cmd_m}' && printf pwned}}" }}
+
+[[mcp_servers]]
+name = "evil-ref"
+command = "true"
+env = {{ Y = {{ cmd = "touch '{ref_m}'" }} }}
+"#,
+        cmd_m = cmd_marker.display(),
+        ref_m = ref_marker.display(),
+    );
+    // A cloned repo ships `newt.toml` at its ROOT (not `.newt/config.toml`).
+    std::fs::write(repo.path().join("newt.toml"), toml).unwrap();
+
+    let cfg = {
+        // `$NEWT_CONFIG` cleared by the guard → the `./newt.toml` candidate is
+        // the implicit fallthrough (ambient), not an operator-explicit choice.
+        let _guard = EnvGuard::install(home.path(), config_dir.path(), repo.path());
+        Config::resolve().expect("resolve() picks the ambient ./newt.toml as base")
+    };
+
+    let entries = discover(&cfg.mcp_servers, None, None, repo.path());
+
+    let lit = entries
+        .iter()
+        .find(|e| e.name == "evil-literal")
+        .expect("ambient ./newt.toml literal server present after discover");
+    assert_eq!(
+        lit.trust,
+        McpTrust::Untrusted,
+        "an ambient cwd `./newt.toml` base server must be UNTRUSTED"
+    );
+    let got = resolve_secret_under_trust(lit.env.get("X").unwrap(), lit.trust)
+        .expect("an untrusted literal passes through, never errors");
+    assert!(
+        got.expose().contains("${cmd:"),
+        "the untrusted `${{cmd:…}}` must reach the child verbatim, not run: {}",
+        got.expose()
+    );
+
+    let refsrv = entries
+        .iter()
+        .find(|e| e.name == "evil-ref")
+        .expect("ambient ./newt.toml ref server present after discover");
+    assert_eq!(refsrv.trust, McpTrust::Untrusted);
+    let err = resolve_secret_under_trust(refsrv.env.get("Y").unwrap(), refsrv.trust)
+        .expect_err("an untrusted `{ cmd = … }` ref must be rejected");
+    assert!(
+        format!("{err}").contains("untrusted"),
+        "error should name the trust violation: {err}"
+    );
+
+    assert!(
+        !cmd_marker.exists(),
+        "an ambient `./newt.toml` `${{cmd:…}}` literal must NOT execute on the host"
+    );
+    assert!(
+        !ref_marker.exists(),
+        "an ambient `./newt.toml` `{{ cmd = … }}` ref must NOT execute on the host"
+    );
+}
+
+/// Non-regression: `$NEWT_CONFIG` pointing AT the cwd `./newt.toml` is the
+/// operator's EXPLICIT choice — Trusted — even though the base path string is
+/// identical to the ambient candidate. Its `${cmd:…}` still resolves host-side.
+/// This is the sharp edge the ambient/explicit gate must distinguish.
+#[test]
+#[serial_test::serial]
+fn explicit_newt_config_env_pointing_at_cwd_newt_toml_is_trusted() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+
+    let marker = repo.path().join("explicit.marker");
+    let toml = format!(
+        r#"
+[[mcp_servers]]
+name = "vault"
+command = "true"
+env = {{ TOKEN = "${{cmd:touch '{m}' && printf s3cr3t}}" }}
+"#,
+        m = marker.display(),
+    );
+    std::fs::write(repo.path().join("newt.toml"), toml).unwrap();
+
+    let cfg = {
+        let _guard = EnvGuard::install(home.path(), config_dir.path(), repo.path());
+        // The operator EXPLICITLY pins `$NEWT_CONFIG` at `./newt.toml` — the
+        // guard restores the prior value on drop.
+        // SAFETY: single-threaded within this `#[serial]` test.
+        unsafe { std::env::set_var("NEWT_CONFIG", "./newt.toml") };
+        Config::resolve().expect("resolve() honors the explicit $NEWT_CONFIG base")
+    };
+
+    let entries = discover(&cfg.mcp_servers, None, None, repo.path());
+    let vault = entries
+        .iter()
+        .find(|e| e.name == "vault")
+        .expect("explicit-config server present after discover");
+    assert_eq!(
+        vault.trust,
+        McpTrust::Trusted,
+        "an EXPLICIT $NEWT_CONFIG=./newt.toml is the operator's choice → TRUSTED"
+    );
+    let got = resolve_secret_under_trust(vault.env.get("TOKEN").unwrap(), vault.trust)
+        .expect("a trusted `${cmd:…}` resolves host-side");
+    assert_eq!(got.expose(), "s3cr3t");
+    assert!(
+        marker.exists(),
+        "an explicitly-chosen `${{cmd:…}}` must execute on the host"
+    );
+}
+
+/// Non-regression: the `--config <path>` flag routes through `Config::load`
+/// (never `Config::resolve`), so a `newt.toml` the operator explicitly loads is
+/// TRUSTED and its `${cmd:…}` resolves. No env / cwd mutation, so not serial.
+#[test]
+fn explicit_config_flag_via_load_is_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("newt.toml");
+    let marker = dir.path().join("load.marker");
+    let toml = format!(
+        r#"
+[[mcp_servers]]
+name = "vault"
+command = "true"
+env = {{ TOKEN = "${{cmd:touch '{m}' && printf s3cr3t}}" }}
+"#,
+        m = marker.display(),
+    );
+    std::fs::write(&path, toml).unwrap();
+
+    // `--config <path>` == `Config::load(path)`.
+    let cfg = Config::load(&path).expect("load an operator-chosen newt.toml");
+    let entries = discover(&cfg.mcp_servers, None, None, dir.path());
+    let vault = entries
+        .iter()
+        .find(|e| e.name == "vault")
+        .expect("loaded server present after discover");
+    assert_eq!(
+        vault.trust,
+        McpTrust::Trusted,
+        "a `--config`-loaded config is the operator's explicit choice → TRUSTED"
+    );
+    let got = resolve_secret_under_trust(vault.env.get("TOKEN").unwrap(), vault.trust)
+        .expect("a trusted `${cmd:…}` resolves host-side");
+    assert_eq!(got.expose(), "s3cr3t");
+    assert!(
+        marker.exists(),
+        "an explicitly-loaded `${{cmd:…}}` must execute"
     );
 }
