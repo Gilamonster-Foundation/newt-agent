@@ -10,6 +10,7 @@
 //! [`EmbeddingsClient`] (Ollama `/api/embeddings`) is wiremock-tested here.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -485,40 +486,180 @@ pub async fn retrieve_evidence(
 /// it reads the real filesystem); the pure chunk/embed/index logic it feeds is
 /// the fully-mocked part above. Reuses the `ignore` crate (newt-core's `find`
 /// tool already depends on it).
-/// Gather up to `MAX_FILES` source files whose extension is in `extensions`
-/// (each ≤ `MAX_BYTES`), as `(relative_path, contents)`.
-///
-/// The extension allow-list is a **parameter**, not a hardcoded `rs`/`py` literal
-/// (#956): the API-surface caller derives it from the *resolved language packs*
-/// (so `bash`/`c_cpp`/`go`/`java` and any drop-in pack are actually read), while
-/// the semantic embedding index passes its own narrower set to bound how many
-/// files it embeds (blast radius). An empty `extensions` gathers nothing.
-pub fn gather_code_files(workspace: &str, extensions: &[String]) -> Vec<(String, String)> {
-    const MAX_FILES: usize = 400;
-    const MAX_BYTES: u64 = 200_000;
-    let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(workspace).build().flatten() {
-        if out.len() >= MAX_FILES {
-            break;
+/// The gather caps, lifted out of silent consts (#1281 / spec PR-0 §5.0). The
+/// scan floor everything (the API surface, the embedding chunker, the project
+/// model) sits on: a **degradation curve measured over a silently corrupted
+/// gather pins nothing**, so the caps are *declared* and reported in the
+/// [`GatherManifest`], not hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatherCaps {
+    /// Max files kept (in lexicographic order). Default 400.
+    pub max_files: usize,
+    /// Max bytes per file; larger files are cut, not silently skipped. Default 200_000.
+    pub max_bytes: u64,
+}
+
+impl Default for GatherCaps {
+    fn default() -> Self {
+        Self {
+            max_files: 400,
+            max_bytes: 200_000,
         }
+    }
+}
+
+/// Why a candidate was cut from the gather.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutClass {
+    /// Larger than [`GatherCaps::max_bytes`].
+    TooLarge,
+    /// Beyond [`GatherCaps::max_files`] in lexicographic order.
+    OverFileCap,
+}
+
+/// One candidate the caps dropped — the honest record (path + why).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cut {
+    pub path: String,
+    pub class: CutClass,
+}
+
+/// The manifest of a gather (#1281 / spec WF-4): a hash over the **full
+/// candidate walk** (so a re-gather over the same tree is provably identical —
+/// the double-gather vector), the declared caps, and the cut list. A silently
+/// order-unstable or truncated gather can no longer masquerade as complete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatherManifest {
+    /// Files that matched the extension allow-list (before caps).
+    pub candidate_count: usize,
+    /// blake3 hex over the sorted candidate paths — the full-walk identity.
+    pub candidate_hash: String,
+    pub max_files: usize,
+    pub max_bytes: u64,
+    /// The dropped candidates, in lexicographic order.
+    pub cuts: Vec<Cut>,
+}
+
+impl GatherManifest {
+    /// Per-top-dir rollup of cuts — the operator-facing "crate X lost N files"
+    /// honesty line (spec PR-0). Groups by the first path segment; sorted.
+    #[must_use]
+    pub fn cut_rollup(&self) -> Vec<(String, usize)> {
+        use std::collections::BTreeMap;
+        let mut by_dir: BTreeMap<String, usize> = BTreeMap::new();
+        for cut in &self.cuts {
+            let top = cut
+                .path
+                .split(['/', '\\'])
+                .find(|s| !s.is_empty())
+                .unwrap_or(".")
+                .to_string();
+            *by_dir.entry(top).or_default() += 1;
+        }
+        by_dir.into_iter().collect()
+    }
+}
+
+/// **Pure** gather planner (#1281 / WF-4): given the candidate `(path, size)`
+/// list and caps, produce the KEPT paths **deterministically** — lexicographic
+/// sort THEN cap — plus the [`GatherManifest`] (full-walk hash + cut list).
+///
+/// Sorting *before* the cap is the fix: the `ignore` crate's walk order is not
+/// stable, so the old `break at MAX_FILES` kept a different 400 files each run,
+/// and every downstream artifact was built on a silently different gather. A
+/// too-large file is cut (`TooLarge`) and does not consume the file budget.
+#[must_use]
+pub fn plan_gather(
+    candidates: &[(String, u64)],
+    caps: GatherCaps,
+) -> (Vec<String>, GatherManifest) {
+    let mut cands: Vec<(String, u64)> = candidates.to_vec();
+    cands.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = blake3::Hasher::new();
+    for (path, _) in &cands {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\n");
+    }
+    let candidate_hash = hasher.finalize().to_hex().to_string();
+
+    let mut kept = Vec::new();
+    let mut cuts = Vec::new();
+    for (path, size) in &cands {
+        if *size > caps.max_bytes {
+            cuts.push(Cut {
+                path: path.clone(),
+                class: CutClass::TooLarge,
+            });
+        } else if kept.len() >= caps.max_files {
+            cuts.push(Cut {
+                path: path.clone(),
+                class: CutClass::OverFileCap,
+            });
+        } else {
+            kept.push(path.clone());
+        }
+    }
+    (
+        kept,
+        GatherManifest {
+            candidate_count: cands.len(),
+            candidate_hash,
+            max_files: caps.max_files,
+            max_bytes: caps.max_bytes,
+            cuts,
+        },
+    )
+}
+
+/// Gather source files whose extension is in `extensions`, honestly (#1281):
+/// walk → collect matching candidates with sizes → [`plan_gather`] (sort + cap)
+/// → read the kept files, returning `(files, manifest)`. The manifest records
+/// the full-walk hash + what the caps dropped.
+///
+/// The extension allow-list is a **parameter**, not a hardcoded `rs`/`py`
+/// literal (#956): the API-surface caller derives it from the *resolved language
+/// packs*; the embedding index passes its own narrower set (blast radius). An
+/// empty `extensions` gathers nothing.
+#[must_use]
+pub fn gather_with_manifest(
+    workspace: &str,
+    extensions: &[String],
+    caps: GatherCaps,
+) -> (Vec<(String, String)>, GatherManifest) {
+    let root = std::path::Path::new(workspace);
+    let mut candidates: Vec<(String, u64)> = Vec::new();
+    for entry in ignore::WalkBuilder::new(workspace).build().flatten() {
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
         if !ext.is_some_and(|e| extensions.iter().any(|x| x == e)) {
             continue;
         }
-        if path.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_BYTES {
-            continue;
-        }
-        if let Ok(src) = std::fs::read_to_string(path) {
-            let rel = path
-                .strip_prefix(workspace)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-            out.push((rel, src));
+        let size = path.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        candidates.push((rel, size));
+    }
+    let (kept, manifest) = plan_gather(&candidates, caps);
+    let mut files = Vec::with_capacity(kept.len());
+    for rel in &kept {
+        if let Ok(src) = std::fs::read_to_string(root.join(rel)) {
+            files.push((rel.clone(), src));
         }
     }
-    out
+    (files, manifest)
+}
+
+/// Deterministic gather (default caps), returning just the files — the stable
+/// entry point for the API surface + embedding index. See [`gather_with_manifest`]
+/// for the manifest (#1281). Now sorted, so a re-gather is reproducible.
+#[must_use]
+pub fn gather_code_files(workspace: &str, extensions: &[String]) -> Vec<(String, String)> {
+    gather_with_manifest(workspace, extensions, GatherCaps::default()).0
 }
 
 // --- Step 26.5.5: the code_search tool (model-callable retrieval) -----------
@@ -584,6 +725,78 @@ mod tests {
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    fn cand(paths: &[(&str, u64)]) -> Vec<(String, u64)> {
+        paths.iter().map(|(p, s)| (p.to_string(), *s)).collect()
+    }
+
+    #[test]
+    fn plan_gather_sorts_before_capping() {
+        // #1281 / WF-4: the fix. Unstable walk order in, deterministic kept out —
+        // the file cap takes the lexicographically-first N, not a random N.
+        let caps = GatherCaps {
+            max_files: 2,
+            max_bytes: 1000,
+        };
+        let (kept, m) = plan_gather(&cand(&[("z.rs", 1), ("a.rs", 1), ("m.rs", 1)]), caps);
+        assert_eq!(kept, vec!["a.rs".to_string(), "m.rs".to_string()]);
+        assert_eq!(m.candidate_count, 3);
+        // z.rs is cut by the file cap and named honestly.
+        assert_eq!(
+            m.cuts,
+            vec![Cut {
+                path: "z.rs".into(),
+                class: CutClass::OverFileCap
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_gather_is_deterministic_and_double_gather_matches() {
+        // The double-gather vector: same tree ⇒ identical manifest (hash + cuts).
+        let c = cand(&[("b.rs", 5), ("a.rs", 5)]);
+        let (k1, m1) = plan_gather(&c, GatherCaps::default());
+        // Re-input in a different order → identical result (sort makes it stable).
+        let (k2, m2) = plan_gather(&cand(&[("a.rs", 5), ("b.rs", 5)]), GatherCaps::default());
+        assert_eq!(k1, k2);
+        assert_eq!(m1, m2);
+        assert_eq!(m1.candidate_hash.len(), 64, "blake3 hex");
+    }
+
+    #[test]
+    fn plan_gather_cuts_oversized_files_without_spending_the_file_budget() {
+        // A too-large file is TooLarge (not silently skipped) and does NOT consume
+        // the file cap — so a small file after it is still kept.
+        let caps = GatherCaps {
+            max_files: 1,
+            max_bytes: 100,
+        };
+        let (kept, m) = plan_gather(&cand(&[("big.rs", 500), ("small.rs", 10)]), caps);
+        assert_eq!(kept, vec!["small.rs".to_string()]);
+        assert_eq!(
+            m.cuts,
+            vec![Cut {
+                path: "big.rs".into(),
+                class: CutClass::TooLarge
+            }]
+        );
+    }
+
+    #[test]
+    fn cut_rollup_groups_by_top_dir() {
+        let caps = GatherCaps {
+            max_files: 0,
+            max_bytes: 1000,
+        };
+        let (_, m) = plan_gather(
+            &cand(&[("core/a.rs", 1), ("core/b.rs", 1), ("tui/c.rs", 1)]),
+            caps,
+        );
+        assert_eq!(
+            m.cut_rollup(),
+            vec![("core".to_string(), 2), ("tui".to_string(), 1)]
+        );
+    }
 
     #[test]
     fn gather_code_files_honors_the_extension_allowlist_956() {
