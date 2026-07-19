@@ -22,6 +22,7 @@ pub mod dgx_vllm;
 mod doctor;
 mod identity_cmd;
 mod mcp_cmd;
+mod mcp_probe_cmd;
 mod models_cmd;
 mod new_project;
 mod ocap_cmd;
@@ -954,7 +955,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // every subcommand); it was just silently dropped here before now.
         // Bare `newt mcp` (no subcommand) serves over stdio exactly as before.
         Command::Mcp { cmd: None } => run_mcp(cli.persona.as_deref()).await,
-        Command::Mcp { cmd: Some(cmd) } => mcp_cmd::run(cmd, cli.config.as_deref()),
+        Command::Mcp { cmd: Some(cmd) } => mcp_cmd::run(cmd, cli.config.as_deref()).await,
         Command::Crew {
             task,
             edit,
