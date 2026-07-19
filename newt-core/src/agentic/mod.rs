@@ -182,8 +182,9 @@ pub use scheduled::{
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
     chunk_source, code_evidence_block, code_search_tool_definition, cosine, gather_code_files,
-    index_files, retrieve_evidence, CodeChunk, CodeSearch, Embedder, EmbeddingsClient,
-    SemanticIndex, SessionSemanticIndex,
+    gather_with_manifest, index_files, plan_gather, retrieve_evidence, CodeChunk, CodeSearch, Cut,
+    CutClass, Embedder, EmbeddingsClient, GatherCaps, GatherManifest, SemanticIndex,
+    SessionSemanticIndex,
 };
 pub use spill::{SessionSpillStore, SpillStore};
 
