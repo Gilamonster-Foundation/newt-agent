@@ -809,6 +809,10 @@ pub(crate) fn run_chat(
                 .map(|c| c.api_surface.clone())
                 .unwrap_or_default();
             mgr.add_provider(newt_core::ApiSurfaceProvider::from_config(&api_cfg));
+            // #1284: the untruncatable project map (crate/package units + curated
+            // purposes) — the navigation floor of the "IDE for LLMs" spine. A
+            // no-op on a non-project dir; drift-cached so a re-launch is cheap.
+            mgr.add_provider(newt_core::ProjectMapProvider::new());
         }
         // History provider based on config.
         match mem_cfg.provider {
