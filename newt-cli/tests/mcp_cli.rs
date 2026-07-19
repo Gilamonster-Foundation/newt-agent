@@ -405,6 +405,26 @@ fn list_attributes_claude_code_overlays_to_their_files() {
     );
 }
 
+/// Bare `newt mcp` with PIPED stdin (not a TTY) must SERVE — the
+/// backward-compatible path every `claude mcp add newt -- newt mcp`
+/// config relies on. Feeding a single `initialize` and closing stdin
+/// (EOF) must yield a JSON-RPC response and a clean exit — never a hang.
+#[test]
+fn bare_mcp_with_piped_stdin_serves_and_does_not_hang() {
+    let sb = sandbox();
+    let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
+    newt(&sb)
+        // Unreachable Ollama: with the verbatim contract, discover() does
+        // not probe and `initialize` never touches it (stdout_purity.rs).
+        .env("OLLAMA_HOST", "http://127.0.0.1:1")
+        .arg("mcp")
+        .write_stdin(init)
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"jsonrpc\""));
+}
+
 #[test]
 fn add_project_writes_the_project_config_not_the_user_config() {
     let sb = sandbox();

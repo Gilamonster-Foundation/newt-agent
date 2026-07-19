@@ -33,6 +33,7 @@ mod summarizer_cmd;
 mod tuning_cmd;
 
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 /// clap value parser for `--shell-engine`. Delegates to [`newt_core::ShellEngine`]'s
@@ -319,8 +320,14 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         allow_no_key: bool,
     },
-    /// MCP server (stdio JSON-RPC, no TUI); subcommands manage the
-    /// `[[mcp_servers]]` registrations (`add` / `remove` / `list` / `install`).
+    /// Manage MCP servers, or run newt as one. Subcommands manage the
+    /// `[[mcp_servers]]` registrations (`add` / `remove` / `list` /
+    /// `install` / `probe`); `serve` runs newt as an MCP server over stdio.
+    ///
+    /// Bare `newt mcp` is TTY-aware: with piped stdin (an MCP client) it
+    /// serves over stdio as before; at an interactive terminal it prints
+    /// this subcommand menu instead of blocking as a server. Use `newt mcp
+    /// serve` to serve unconditionally.
     Mcp {
         #[command(subcommand)]
         cmd: Option<mcp_cmd::McpCmd>,
@@ -953,8 +960,21 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         } => run_worker(coder, operator_key_path, allow_no_key).await,
         // #1021 PR 5.3: `--persona` is already a global flag (parsed for
         // every subcommand); it was just silently dropped here before now.
-        // Bare `newt mcp` (no subcommand) serves over stdio exactly as before.
-        Command::Mcp { cmd: None } => run_mcp(cli.persona.as_deref()).await,
+        //
+        // Bare `newt mcp` (no subcommand) is TTY-aware: piped stdin (an MCP
+        // client, or the stdout-purity tests) serves over stdio exactly as
+        // before; an interactive terminal prints the subcommand menu instead
+        // of blocking as a server on a human's stdin. `newt mcp serve` always
+        // serves regardless of TTY. See `mcp_cmd::bare_mcp_action`.
+        Command::Mcp { cmd: None } => {
+            match mcp_cmd::bare_mcp_action(std::io::stdin().is_terminal()) {
+                mcp_cmd::BareMcpAction::Serve => run_mcp(cli.persona.as_deref()).await,
+                mcp_cmd::BareMcpAction::Help => print_mcp_help(),
+            }
+        }
+        Command::Mcp {
+            cmd: Some(mcp_cmd::McpCmd::Serve),
+        } => run_mcp(cli.persona.as_deref()).await,
         Command::Mcp { cmd: Some(cmd) } => mcp_cmd::run(cmd, cli.config.as_deref()).await,
         Command::Crew {
             task,
@@ -1221,6 +1241,25 @@ fn maybe_start_metrics_server() -> Option<std::sync::Arc<newt_acp_worker::NewtMe
 /// restricts the advertised `tools/list` to the persona's `tools:`
 /// allow-list — the same enforcement the TUI applies, reused via
 /// `newt_core::agentic::filter_advertised_tools`.
+/// Print the `mcp` subcommand menu for an interactive human who typed bare
+/// `newt mcp` at a terminal — instead of blocking as a stdio server on their
+/// keyboard. The verb list is rendered from clap's own help for the `mcp`
+/// subcommand so it can never drift from the parser, followed by a one-line
+/// pointer to the two ways to actually serve. Returns `Ok` (exit 0).
+fn print_mcp_help() -> anyhow::Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    if let Some(mcp) = cmd.find_subcommand_mut("mcp") {
+        // `render_long_help` lists each verb with its description — the menu.
+        print!("{}", mcp.render_long_help());
+    }
+    println!(
+        "\nTo run newt as an MCP server for a client, invoke it with piped \
+         stdio (e.g. `claude mcp add newt -- newt mcp`) or run `newt mcp serve`."
+    );
+    Ok(())
+}
+
 async fn run_mcp(persona: Option<&str>) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
