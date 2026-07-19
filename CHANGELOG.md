@@ -12,9 +12,11 @@ is inherited by all internal crates.
 - **`newt mcp` management verbs — no more hand-editing `[[mcp_servers]]`.**
   `newt mcp add <name> --command … [--arg …] [--transport stdio|sse|http]
   [--url …] [--env K=V] [--timeout-secs N]` and `newt mcp remove <name>` edit
-  the user config (or `.newt/config.toml` with `--project`) through pure,
-  comment-preserving `toml_edit` writers — duplicate adds and absent removes
-  error loudly. `newt mcp list` renders the merged discovery view (newt config
+  the same config file `Config::resolve()` reads as its base (`--config` >
+  `$NEWT_CONFIG` > `./newt.toml` > user config; `--project` → the nearest
+  ancestor `.newt/config.toml`) through pure, comment-preserving `toml_edit`
+  writers — duplicate adds, absent removes, and an unreadable existing config
+  error loudly (never rewriting a file that cannot be read back). `newt mcp list` renders the merged discovery view (newt config
   + Claude Code overlays) with per-row source attribution, flagging entries
   discovery would drop. `newt mcp install <name>` resolves a curated pure-data
   catalog (bundled `scrybe` entry; overridable via `~/.newt/mcp-catalog.toml`
