@@ -106,6 +106,42 @@ pub fn builtin_catalog() -> Vec<McpCatalogEntry> {
     parse_catalog(BUNDLED_CATALOG).expect("bundled MCP catalog must parse")
 }
 
+/// Upsert a `[[servers]]` catalog entry into catalog TOML `text`, preserving
+/// comments and formatting (`newt mcp probe --to-catalog`, #1292). PURE (no
+/// I/O) like `Config::with_mcp_server_added`; the caller does the read/write.
+/// A same-name entry is **replaced in place** — the catalog merge is
+/// later-wins-by-name, so a probe re-run refreshes the entry rather than
+/// erroring — and other entries are untouched. Rejects an unnamed or
+/// uninstallable server (`McpServerEntry::is_valid`).
+pub fn with_catalog_entry(
+    text: &str,
+    description: &str,
+    server: &McpServerEntry,
+) -> Result<String> {
+    crate::mcp::validate_entry_for_write(server)?;
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| NewtError::Config(format!("MCP catalog is not valid TOML: {e}")))?;
+    let servers = doc
+        .as_table_mut()
+        .entry("servers")
+        .or_insert(toml_edit::Item::ArrayOfTables(
+            toml_edit::ArrayOfTables::new(),
+        ));
+    let arr = servers
+        .as_array_of_tables_mut()
+        .ok_or_else(|| NewtError::Config("[[servers]] is not an array of tables".to_string()))?;
+    let table = crate::mcp::entry_to_toml_table(server, Some(description))?;
+    let existing = arr
+        .iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(server.name.as_str()));
+    match existing {
+        Some(slot) => *slot = table,
+        None => arr.push(table),
+    }
+    Ok(doc.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +211,78 @@ env = { ROOT = "/tmp" }
         // the "no half-read catalog" contract.
         assert!(parse_catalog("[[server]]\nname = \"x\"\ncommand = \"y\"\n").is_err());
         assert!(parse_catalog("[[Servers]]\nname = \"x\"\ncommand = \"y\"\n").is_err());
+    }
+
+    fn stdio_server(name: &str, command: &str) -> crate::mcp::McpServerEntry {
+        crate::mcp::McpServerEntry {
+            name: name.into(),
+            enabled: true,
+            transport: TransportKind::Stdio,
+            command: Some(command.into()),
+            args: vec!["stdio".into()],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn with_catalog_entry_appends_preserving_comments() {
+        let text = "# curated\n[[servers]]\nname = \"keep\"\ncommand = \"keep-mcp\" # note\n";
+        let out = with_catalog_entry(
+            text,
+            "Scrybe Markdown editor — document tools over MCP",
+            &stdio_server("scrybe", "scrybe-mcp-server"),
+        )
+        .unwrap();
+        assert!(out.contains("# curated"), "comment lost: {out}");
+        assert!(out.contains("# note"), "inline comment lost: {out}");
+        let parsed = parse_catalog(&out).unwrap();
+        assert_eq!(parsed.len(), 2);
+        let scrybe = parsed.iter().find(|e| e.name == "scrybe").unwrap();
+        assert_eq!(
+            scrybe.description,
+            "Scrybe Markdown editor — document tools over MCP"
+        );
+        let server = scrybe.server();
+        assert_eq!(server.command.as_deref(), Some("scrybe-mcp-server"));
+        assert_eq!(server.args, vec!["stdio"]);
+    }
+
+    #[test]
+    fn with_catalog_entry_replaces_a_same_name_entry_in_place() {
+        let text = "[[servers]]\nname = \"a\"\ncommand = \"a-v1\"\n\
+                    [[servers]]\nname = \"b\"\ncommand = \"b-v1\"\n";
+        let out = with_catalog_entry(text, "refreshed", &stdio_server("a", "a-v2")).unwrap();
+        let parsed = parse_catalog(&out).unwrap();
+        let names: Vec<&str> = parsed.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "position kept, no duplicate added");
+        assert_eq!(parsed[0].server().command.as_deref(), Some("a-v2"));
+        assert_eq!(parsed[0].description, "refreshed");
+        assert_eq!(out.matches("name = \"a\"").count(), 1);
+        assert!(out.contains("b-v1"), "unrelated entry untouched");
+    }
+
+    #[test]
+    fn with_catalog_entry_creates_the_section_in_empty_text() {
+        let out = with_catalog_entry("", "desc", &stdio_server("fs", "mcp-fs")).unwrap();
+        let parsed = parse_catalog(&out).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "fs");
+    }
+
+    #[test]
+    fn with_catalog_entry_rejects_uninstallable_and_unnamed_servers() {
+        let mut broken = stdio_server("half", "x");
+        broken.command = None;
+        let err = with_catalog_entry("", "d", &broken).unwrap_err();
+        assert!(err.to_string().contains("command"), "{err}");
+        let unnamed = crate::mcp::McpServerEntry {
+            name: "  ".into(),
+            ..stdio_server("x", "x-mcp")
+        };
+        assert!(with_catalog_entry("", "d", &unnamed).is_err());
     }
 
     #[test]
