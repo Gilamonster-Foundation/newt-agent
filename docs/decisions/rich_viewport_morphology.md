@@ -1,6 +1,6 @@
 # Decision: a rich, mouse-driven spill viewport — an opt-in TTY capability tier
 
-**Status:** Proposed (decided by Shawn Hartsock, 2026-07-19)
+**Status:** Accepted (ratified by merge of #1303, 2026-07-19)
 **Amends:** `live_spill_viewport.md` (its "post-completion scrollback" and "no mouse input" non-goals), `plain_scroller_tui.md` (the "no mouse handling" prohibition — now scoped to the non-interactive path + the base tiers), `lean_rich_tui_morphologies.md` (#527 — clarifies that this is orthogonal to the input morphology).
 **Related:** #1235 / #1253 (bounded live-spill scrollback, keyboard), #416 / #527 (input morphologies), #771 (OSC-8 hyperlinks — the only prior clickable affordance).
 
