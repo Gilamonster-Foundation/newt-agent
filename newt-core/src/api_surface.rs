@@ -263,11 +263,40 @@ fn glob_match(pattern: &str, filename: &str) -> bool {
     }
 }
 
+/// SC-L2 / SC-PO-2 — the tier-2 surface-budget resolver.
+///
+/// A **total, monotone, clamped** pure function of the resolved session send
+/// budget `w` (tokens), the *static* chars/token ratio, and the surface config:
+///
+/// ```text
+/// b = clamp(floor_chars, ⌊pct_of_budget/100 · w⌋ · chars_per_token, ceiling_chars)
+/// ```
+///
+/// A present `max_block_chars` is honored as the legacy operator pin
+/// (`floor == ceiling == max_block_chars`, spec §3 "Legacy"). The ratio is the
+/// static `[context.estimation] chars_per_token`, never the live calibrated
+/// ratio, so `b` is fixed for the session. WF-3 (`floor ≤ ceiling`) is enforced
+/// here as well so the clamp is total even under a misconfigured profile.
+#[must_use]
+pub fn resolve_surface_budget(
+    w_tokens: usize,
+    chars_per_token: usize,
+    cfg: &ApiSurfaceConfig,
+) -> usize {
+    if let Some(pin) = cfg.max_block_chars {
+        return pin;
+    }
+    let ceiling = cfg.ceiling_chars.max(cfg.floor_chars);
+    let proportional_tokens = w_tokens.saturating_mul(cfg.pct_of_budget) / 100;
+    let proportional_chars = proportional_tokens.saturating_mul(chars_per_token);
+    proportional_chars.clamp(cfg.floor_chars, ceiling)
+}
+
 /// Injects the workspace's public API surface into the system prompt, driven by a
 /// resolved set of language packs.
 pub struct ApiSurfaceProvider {
     packs: Vec<CompiledPack>,
-    max_block_chars: usize,
+    budget_chars: usize,
     max_symbols_per_file: usize,
     block: Option<String>,
 }
@@ -275,14 +304,28 @@ pub struct ApiSurfaceProvider {
 impl ApiSurfaceProvider {
     /// Construct from already-resolved packs (built-ins + drop-in dirs + inline,
     /// merged by the caller via [`merge_packs`]) and the surface budget.
+    ///
+    /// The budget here is the *no-window* default: a legacy `max_block_chars`
+    /// pin if the operator set one, else the SC-L2 `floor_chars`. The frozen-head
+    /// wiring resolves the proportional budget from the session's send budget and
+    /// applies it via [`with_budget`](Self::with_budget).
     #[must_use]
     pub fn new(packs: Vec<LanguagePack>, cfg: &ApiSurfaceConfig) -> Self {
         Self {
             packs: compile(packs),
-            max_block_chars: cfg.max_block_chars,
+            budget_chars: cfg.max_block_chars.unwrap_or(cfg.floor_chars),
             max_symbols_per_file: cfg.max_symbols_per_file,
             block: None,
         }
+    }
+
+    /// Apply a window-resolved tier-2 budget (see [`resolve_surface_budget`]).
+    /// The TUI computes `b` from the session's resolved send budget `w` at the
+    /// mem_budget site and threads it here, replacing the no-window default.
+    #[must_use]
+    pub fn with_budget(mut self, budget_chars: usize) -> Self {
+        self.budget_chars = budget_chars;
+        self
     }
 
     /// Convenience for the common case: built-in packs + inline config packs (no
@@ -351,7 +394,7 @@ impl ApiSurfaceProvider {
              for signatures.]\n",
         );
         for (path, syms) in entries {
-            if out.len() >= self.max_block_chars {
+            if out.len() >= self.budget_chars {
                 out.push_str("- … (surface truncated to fit the budget)\n");
                 break;
             }
@@ -528,17 +571,76 @@ mod tests {
 
     #[test]
     fn render_is_bounded() {
-        let p = provider(builtin_packs());
+        let budget = 3_000;
+        let p = provider(builtin_packs()).with_budget(budget);
         let files: Vec<(String, String)> = (0..500)
             .map(|i| (format!("m{i:03}.rs"), format!("pub fn f{i}() {{}}")))
             .collect();
         let block = p.render(&files).expect("a surface");
         assert!(
-            block.len() <= ApiSurfaceConfig::default().max_block_chars + 100,
+            block.len() <= budget + 100,
             "bounded: {} chars",
             block.len()
         );
         assert!(block.contains("surface truncated"), "names the truncation");
+    }
+
+    // ---- resolve_surface_budget: SC-L2 / SC-PO-2 ----
+
+    #[test]
+    fn budget_floor_dominates_at_small_window() {
+        // The DEFAULT_CONTEXT_TOKENS=8,192 fallback: 8192·5%·4 = 1,638 < floor.
+        let cfg = ApiSurfaceConfig::default();
+        assert_eq!(resolve_surface_budget(8_192, 4, &cfg), cfg.floor_chars);
+    }
+
+    #[test]
+    fn budget_ceiling_caps_large_window() {
+        // A 262k-window send budget (~168k tokens): 168k·5%·4 ≫ ceiling.
+        let cfg = ApiSurfaceConfig::default();
+        assert_eq!(resolve_surface_budget(167_772, 4, &cfg), cfg.ceiling_chars);
+    }
+
+    #[test]
+    fn budget_is_proportional_between_the_clamps() {
+        // A mid window lands strictly inside (floor, ceiling): 40k·5%·4 = 8,000.
+        let cfg = ApiSurfaceConfig::default();
+        let b = resolve_surface_budget(40_000, 4, &cfg);
+        assert_eq!(b, 8_000);
+        assert!(b > cfg.floor_chars && b < cfg.ceiling_chars);
+    }
+
+    #[test]
+    fn budget_is_monotone_nondecreasing_in_window() {
+        let cfg = ApiSurfaceConfig::default();
+        let mut prev = 0;
+        for w in (0..300_000).step_by(4_096) {
+            let b = resolve_surface_budget(w, 4, &cfg);
+            assert!(b >= prev, "monotone: w={w} gave {b} < {prev}");
+            prev = b;
+        }
+    }
+
+    #[test]
+    fn budget_legacy_pin_overrides_proportional() {
+        // A present max_block_chars is the operator pin: floor == ceiling == pin.
+        let cfg = ApiSurfaceConfig {
+            max_block_chars: Some(3_000),
+            ..ApiSurfaceConfig::default()
+        };
+        assert_eq!(resolve_surface_budget(8_192, 4, &cfg), 3_000);
+        assert_eq!(resolve_surface_budget(500_000, 4, &cfg), 3_000);
+    }
+
+    #[test]
+    fn budget_is_total_under_floor_above_ceiling_misconfig() {
+        // WF-3 guard: a floor > ceiling profile must not panic the clamp.
+        let cfg = ApiSurfaceConfig {
+            floor_chars: 5_000,
+            ceiling_chars: 1_000,
+            ..ApiSurfaceConfig::default()
+        };
+        assert_eq!(resolve_surface_budget(1_000_000, 4, &cfg), 5_000);
     }
 
     #[test]

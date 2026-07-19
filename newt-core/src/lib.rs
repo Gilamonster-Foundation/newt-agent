@@ -106,7 +106,7 @@ pub use agentic::{
     TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
 };
 pub use agents::AgentsProvider;
-pub use api_surface::ApiSurfaceProvider;
+pub use api_surface::{resolve_surface_budget, ApiSurfaceProvider};
 pub use artifact::{
     ArtifactId, ArtifactKind, ArtifactRelation, NewPromptArtifact, PromptArtifact,
     MAX_ARTIFACT_BODY_BYTES, MAX_ARTIFACT_LOCATOR_BYTES, MAX_ARTIFACT_METADATA_BYTES,
