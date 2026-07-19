@@ -7,9 +7,12 @@
 //! writers ([`Config::with_mcp_server_added`] / [`Config::with_mcp_server_removed`]);
 //! the only filesystem work here is the read/write of the target file.
 //!
-//! Write target: the user config (`Config::user_config_path()`, honoring
-//! `NEWT_CONFIG_DIR`) by default; `--project` targets `.newt/config.toml`
-//! relative to the current directory, created if missing.
+//! Write target: the same file `Config::resolve()` reads as its base
+//! (`--config` flag > `$NEWT_CONFIG` > `./newt.toml` if present > the user
+//! config honoring `NEWT_CONFIG_DIR`) so a write is always visible to the
+//! readers; `--project` targets the nearest ancestor `.newt/config.toml`,
+//! creating one under the current directory only when no ancestor has one.
+//! See [`write_target`].
 //!
 //! `list` is the *merged discovery view* — newt's own `[[mcp_servers]]` plus
 //! the Claude Code overlays (`~/.claude.json`, `./.mcp.json`) that
@@ -53,8 +56,9 @@ pub enum McpCmd {
         /// Per-request timeout override, in seconds.
         #[arg(long, value_name = "N")]
         timeout_secs: Option<u64>,
-        /// Write to the project config (`.newt/config.toml` under the current
-        /// directory) instead of the user config.
+        /// Write to the project config: the nearest ancestor
+        /// `.newt/config.toml`, created under the current directory when no
+        /// ancestor has one.
         #[arg(long)]
         project: bool,
     },
@@ -100,7 +104,7 @@ pub fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
             project,
         } => {
             let entry = build_entry(name, command, args, transport, url, &env, timeout_secs)?;
-            let path = add_to_config(&entry, project)?;
+            let path = add_to_config(&entry, config_path, project)?;
             writeln!(
                 out,
                 "Registered MCP server '{}' in {}",
@@ -110,8 +114,8 @@ pub fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
             print_next_steps(&mut out)
         }
         McpCmd::Remove { name, project } => {
-            let path = write_target(project)?;
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let path = write_target(config_path, project)?;
+            let text = read_config_text(&path)?;
             let updated = Config::with_mcp_server_removed(&text, &name)?;
             std::fs::write(&path, updated)
                 .with_context(|| format!("writing {}", path.display()))?;
@@ -128,7 +132,7 @@ pub fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
                     names.join(", ")
                 );
             };
-            let path = add_to_config(&chosen.server(), project)?;
+            let path = add_to_config(&chosen.server(), config_path, project)?;
             writeln!(
                 out,
                 "Installed MCP server '{}' ({}) in {}",
@@ -150,25 +154,68 @@ fn print_next_steps(out: &mut dyn Write) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the config file a write-verb targets. `--project` →
-/// `.newt/config.toml` under the current directory; default → the user config
-/// (`$NEWT_CONFIG_DIR/config.toml` or `~/.newt/config.toml`).
-fn write_target(project: bool) -> anyhow::Result<PathBuf> {
+/// Resolve the config file a write-verb targets — the SAME file the reader
+/// ([`Config::resolve`]) will consult as its base, so an add is always
+/// visible to `newt mcp list` / `newt doctor` afterwards:
+/// - `--project`: the nearest ancestor `.newt/config.toml` (the walk-up
+///   [`Config::project_config_path`]); `cwd/.newt/config.toml` only when NO
+///   ancestor has one — never forking a nested config that would shadow the
+///   repo root's from a subtree;
+/// - else the global `--config` flag;
+/// - else `$NEWT_CONFIG`;
+/// - else `./newt.toml` when it exists (resolve()'s next base candidate);
+/// - else the user config (`$NEWT_CONFIG_DIR/config.toml` / `~/.newt/…`).
+fn write_target(config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
     if project {
-        Ok(std::env::current_dir()
+        if let Some(existing) = Config::project_config_path() {
+            return Ok(existing);
+        }
+        return Ok(std::env::current_dir()
             .context("cannot resolve the current directory")?
             .join(".newt")
-            .join("config.toml"))
-    } else {
-        Config::user_config_path().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))
+            .join("config.toml"));
+    }
+    if let Some(explicit) = config_path {
+        return Ok(explicit.to_path_buf());
+    }
+    if let Some(env_cfg) = std::env::var_os("NEWT_CONFIG").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(env_cfg));
+    }
+    let local = std::env::current_dir()
+        .context("cannot resolve the current directory")?
+        .join("newt.toml");
+    if local.is_file() {
+        return Ok(local);
+    }
+    Config::user_config_path().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))
+}
+
+/// Read the write-target's current text. Only a MISSING file maps to empty
+/// text (the first-write case); any other read failure — permissions, a
+/// non-UTF-8 byte — aborts loudly. Treating those as empty would rewrite the
+/// user's whole config as just the appended entry: silent data loss.
+fn read_config_text(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(anyhow::Error::new(e)).with_context(|| {
+            format!(
+                "cannot read {} (refusing to rewrite a config that cannot be read back)",
+                path.display()
+            )
+        }),
     }
 }
 
 /// Shared add/install write path: read the target (missing file = empty),
 /// append through the pure writer, create parent dirs, write back.
-fn add_to_config(entry: &McpServerEntry, project: bool) -> anyhow::Result<PathBuf> {
-    let path = write_target(project)?;
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+fn add_to_config(
+    entry: &McpServerEntry,
+    config_path: Option<&Path>,
+    project: bool,
+) -> anyhow::Result<PathBuf> {
+    let path = write_target(config_path, project)?;
+    let text = read_config_text(&path)?;
     let updated = Config::with_mcp_server_added(&text, entry)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
