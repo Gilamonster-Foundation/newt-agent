@@ -797,6 +797,70 @@ fn draw_overhang(
     }
 }
 
+/// The dim chevron marking a committed prompt in scrollback: `›` + two spaces.
+const ECHO_CHEVRON: &str = "›  ";
+
+/// One physical row of a committed prompt echo. `lead` marks the single row that
+/// carries the `›` chevron (the first row of the first logical line); every other
+/// row hangs under it.
+#[derive(Debug, PartialEq, Eq)]
+struct EchoRow {
+    lead: bool,
+    text: String,
+}
+
+/// Build the body rows for a committed prompt echo, wrapped to the terminal
+/// `width` so a line longer than the terminal is CARRIED onto continuation rows
+/// rather than clipped at the right edge by ratatui's fixed-height paint (the
+/// reported truncation bug). `hang` is the continuation indent in columns. Pure
+/// so the unit tier proves no content is dropped without a terminal.
+fn echo_body_rows(body: &str, hang: usize, width: usize) -> Vec<EchoRow> {
+    // Mirror the interactive surface's geometry (`overhang_rows`): the first
+    // logical line's first row wears the `›` chevron; later logical lines and
+    // wrapped continuations hang-indent by `hang`. Reserving that marker from the
+    // wrap width guarantees no rendered row overruns the terminal.
+    let chevron = ECHO_CHEVRON.chars().count();
+    let cont_w = width.saturating_sub(hang).max(1);
+    let mut rows = Vec::new();
+    for (li, logical) in body.lines().enumerate() {
+        let first_indent = if li == 0 { chevron } else { hang };
+        let first_w = width.saturating_sub(first_indent).max(1);
+        for (si, (_, seg)) in wrap_segments(logical, first_w, cont_w)
+            .into_iter()
+            .enumerate()
+        {
+            rows.push(EchoRow {
+                lead: li == 0 && si == 0,
+                text: seg,
+            });
+        }
+    }
+    if rows.is_empty() {
+        rows.push(EchoRow {
+            lead: true,
+            text: String::new(),
+        });
+    }
+    rows
+}
+
+/// Wrap a scrollback note (`:command` output) to `width`, carrying long lines
+/// onto continuation rows instead of clipping them. Always returns at least one
+/// row (empty for empty input), preserving blank lines. Pure for the unit tier.
+fn note_rows(note: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    for line in note.lines() {
+        for (_, seg) in wrap_segments(line, width, width) {
+            rows.push(seg);
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
 /// Emit a submitted turn into real scrollback (above the inline region), so the
 /// conversation log shows what the user typed — the inline widget itself is
 /// cleared on submit. Continuation lines hang-indent by the SAME gutter the
@@ -805,41 +869,43 @@ fn draw_overhang(
 fn echo_submitted(terminal: &mut Term, body: &str, gutter: Option<u16>) -> io::Result<()> {
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let width = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
-    let hang = " ".repeat(resolve_gutter(gutter, width) as usize);
-    let n = body.lines().count().max(1) as u16;
+    let hang_cols = resolve_gutter(gutter, width) as usize;
+    let hang = " ".repeat(hang_cols);
     let dim = Style::default().fg(Color::DarkGray);
     // Two-line committed form (#527): the full-datetime header on its own row,
     // then the body behind a DIMMED `›` — the live `❯` frozen into an at-rest
-    // log marker. Header (1) + one row per body line.
-    terminal.insert_before(n + 1, |buf| {
-        let mut lines: Vec<Line> = vec![Line::from(Span::styled(format!("[{stamp}]"), dim))];
-        for (i, l) in body.lines().enumerate() {
-            let prefix = if i == 0 {
-                Span::styled("›  ", dim)
-            } else {
-                Span::raw(hang.clone())
-            };
-            lines.push(Line::from(vec![prefix, Span::raw(l.to_string())]));
-        }
+    // log marker. The body is WRAPPED to the terminal width (via `echo_body_rows`,
+    // the same `wrap_segments` the live input surface uses), so a line wider than
+    // the terminal is carried onto hang-indented continuation rows instead of
+    // being clipped at the right edge. Height = header (1) + the wrapped rows.
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(format!("[{stamp}]"), dim))];
+    for row in echo_body_rows(body, hang_cols, width as usize) {
+        let prefix = if row.lead {
+            Span::styled(ECHO_CHEVRON, dim)
+        } else {
+            Span::raw(hang.clone())
+        };
+        lines.push(Line::from(vec![prefix, Span::raw(row.text)]));
+    }
+    let height = lines.len() as u16;
+    terminal.insert_before(height, move |buf| {
         Paragraph::new(lines).render(buf.area, buf);
     })
 }
 
 /// Print a note (one or more `\n`-separated lines, e.g. `:jumps`/`:help` output)
-/// into scrollback above the input region.
+/// into scrollback above the input region. Each line is WRAPPED to the terminal
+/// width (via `note_rows`) so a long note — e.g. a capability-denied diagnostic —
+/// carries onto continuation rows instead of being clipped at the right edge.
 fn echo_note(terminal: &mut Term, note: &str) -> io::Result<()> {
-    let rows: Vec<&str> = note.lines().collect();
-    let n = rows.len().max(1) as u16;
-    terminal.insert_before(n, |buf| {
-        let lines: Vec<Line> = rows
-            .iter()
-            .map(|r| {
-                Line::from(Span::styled(
-                    r.to_string(),
-                    Style::default().fg(Color::Gray),
-                ))
-            })
-            .collect();
+    let width = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80) as usize;
+    let gray = Style::default().fg(Color::Gray);
+    let lines: Vec<Line> = note_rows(note, width)
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(seg, gray)))
+        .collect();
+    let height = lines.len() as u16;
+    terminal.insert_before(height, move |buf| {
         Paragraph::new(lines).render(buf.area, buf);
     })
 }
@@ -1138,6 +1204,96 @@ mod tests {
         // Concatenating the segments reproduces the line exactly.
         let joined: String = segs.iter().map(|(_, s)| s.as_str()).collect();
         assert_eq!(joined, "hello world foo");
+    }
+
+    #[test]
+    fn committed_prompt_echo_wraps_a_long_line_without_clipping() {
+        // The reported bug: a committed `› <prompt>` line wider than the
+        // terminal was CLIPPED at the right edge (its tail lost). The echo must
+        // instead carry the overflow onto continuation rows, exactly as the
+        // interactive input surface already does via `wrap_segments`.
+        let width = 24;
+        let hang = 1;
+        let body = "the quick brown fox jumps over the lazy dog and keeps on running east";
+        let rows = echo_body_rows(body, hang, width);
+        // Every row fits within the terminal once its leading marker is added,
+        // so ratatui's fixed-height paint never truncates it.
+        for r in &rows {
+            let marker = if r.lead {
+                ECHO_CHEVRON.chars().count()
+            } else {
+                hang
+            };
+            assert!(
+                marker + r.text.chars().count() <= width,
+                "row overruns width {width} (lead={}): {:?}",
+                r.lead,
+                r.text
+            );
+        }
+        // Nothing is dropped: the wrapped segments reassemble the whole prompt.
+        let joined: String = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, body, "the full prompt survives the wrap");
+        assert!(
+            rows.len() > 1,
+            "a line wider than the terminal actually wraps"
+        );
+        assert!(rows[0].lead, "the first row carries the chevron");
+        assert!(
+            rows[1..].iter().all(|r| !r.lead),
+            "continuations hang under it — no second chevron"
+        );
+    }
+
+    #[test]
+    fn committed_prompt_echo_is_unchanged_when_the_line_fits() {
+        // A prompt that fits the width is a single lead row carrying the whole
+        // text — byte-identical to the pre-fix single-row form (0.7.x preserved).
+        let rows = echo_body_rows("ship it", 1, 40);
+        assert_eq!(
+            rows,
+            vec![EchoRow {
+                lead: true,
+                text: "ship it".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn committed_prompt_echo_preserves_multiline_input() {
+        // Multi-line input keeps one lead row (chevron) then hang rows —
+        // unchanged from the historical per-line layout when nothing overflows.
+        let rows = echo_body_rows("alpha\nbeta", 1, 40);
+        assert_eq!(
+            rows,
+            vec![
+                EchoRow {
+                    lead: true,
+                    text: "alpha".to_string(),
+                },
+                EchoRow {
+                    lead: false,
+                    text: "beta".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn committed_note_wraps_long_lines_without_clipping() {
+        // The sibling emitter: a `:command` note (e.g. a capability-denied
+        // diagnostic) wider than the terminal must wrap, not clip.
+        let width = 16;
+        let note = "capability denied: fs_write does not permit '/etc/hosts'";
+        let rows = note_rows(note, width);
+        for r in &rows {
+            assert!(
+                r.chars().count() <= width,
+                "note row overruns width {width}: {r:?}"
+            );
+        }
+        assert_eq!(rows.join(""), note, "the full note survives the wrap");
+        assert!(rows.len() > 1, "a long note line actually wraps");
     }
 
     #[test]
