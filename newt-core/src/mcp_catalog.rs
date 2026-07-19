@@ -44,8 +44,11 @@ impl McpCatalogEntry {
     }
 }
 
-/// On-disk catalog shape: a `[[servers]]` list.
+/// On-disk catalog shape: a `[[servers]]` list. `deny_unknown_fields` keeps
+/// the strict contract honest: a typo'd section (`[[server]]`, `[[Servers]]`)
+/// must be a loud parse error, never a silently empty catalog.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpCatalog {
     #[serde(default)]
     servers: Vec<McpCatalogEntry>,
@@ -65,15 +68,29 @@ pub fn parse_catalog(text: &str) -> Result<Vec<McpCatalogEntry>> {
 /// first-seen order. The same contract as `api_surface::merge_packs`.
 #[must_use]
 pub fn merge_catalogs(layers: Vec<Vec<McpCatalogEntry>>) -> Vec<McpCatalogEntry> {
+    merge_catalog_layers(layers.into_iter().map(|layer| ((), layer)).collect())
+        .into_iter()
+        .map(|(entry, ())| entry)
+        .collect()
+}
+
+/// [`merge_catalogs`] with per-layer provenance: each layer carries a tag
+/// (e.g. "bundled" / the drop-in path) and every merged entry keeps the tag
+/// of the layer that won it — so an error about a broken entry can name the
+/// file to fix. Pure.
+#[must_use]
+pub fn merge_catalog_layers<T: Clone>(
+    layers: Vec<(T, Vec<McpCatalogEntry>)>,
+) -> Vec<(McpCatalogEntry, T)> {
     let mut order: Vec<String> = Vec::new();
-    let mut by_name: std::collections::HashMap<String, McpCatalogEntry> =
+    let mut by_name: std::collections::HashMap<String, (McpCatalogEntry, T)> =
         std::collections::HashMap::new();
-    for layer in layers {
+    for (tag, layer) in layers {
         for entry in layer {
             if !by_name.contains_key(&entry.name) {
                 order.push(entry.name.clone());
             }
-            by_name.insert(entry.name.clone(), entry);
+            by_name.insert(entry.name.clone(), (entry, tag.clone()));
         }
     }
     order
@@ -150,6 +167,35 @@ env = { ROOT = "/tmp" }
     fn parse_catalog_is_strict_but_tolerates_an_empty_document() {
         assert!(parse_catalog("not toml [").is_err());
         assert!(parse_catalog("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_catalog_rejects_unknown_top_level_sections() {
+        // A typo'd section must be a loud error, never an empty catalog —
+        // the "no half-read catalog" contract.
+        assert!(parse_catalog("[[server]]\nname = \"x\"\ncommand = \"y\"\n").is_err());
+        assert!(parse_catalog("[[Servers]]\nname = \"x\"\ncommand = \"y\"\n").is_err());
+    }
+
+    #[test]
+    fn merge_catalog_layers_carries_the_winning_origin() {
+        let base = parse_catalog(
+            "[[servers]]\nname = \"a\"\ncommand = \"a-v1\"\n\
+             [[servers]]\nname = \"b\"\ncommand = \"b-v1\"\n",
+        )
+        .unwrap();
+        let overlay = parse_catalog("[[servers]]\nname = \"b\"\ncommand = \"b-v2\"\n").unwrap();
+        let merged = merge_catalog_layers(vec![("bundled", base), ("user", overlay)]);
+        let tagged: Vec<(&str, &str)> = merged
+            .iter()
+            .map(|(e, tag)| (e.name.as_str(), *tag))
+            .collect();
+        assert_eq!(tagged, vec![("a", "bundled"), ("b", "user")]);
+        assert_eq!(
+            merged[1].0.server().command.as_deref(),
+            Some("b-v2"),
+            "the origin follows the winning entry"
+        );
     }
 
     #[test]

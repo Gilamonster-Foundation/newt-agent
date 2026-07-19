@@ -4193,11 +4193,16 @@ impl Config {
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
             .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
-        let arr = doc
+        // Distinguish "no section" (→ the entry is absent) from "a section this
+        // writer cannot edit" (e.g. the inline-array form, which the serde
+        // reader accepts) — misreporting the latter as absent would be a lie.
+        let item = doc
             .as_table_mut()
             .get_mut("mcp_servers")
-            .and_then(toml_edit::Item::as_array_of_tables_mut)
             .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
+        let arr = item.as_array_of_tables_mut().ok_or_else(|| {
+            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+        })?;
         let before = arr.len();
         arr.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
         if arr.len() == before {
@@ -6513,6 +6518,54 @@ command = \"drop-mcp\"
         assert_eq!(cfg.mcp_servers.len(), 1);
         assert_eq!(cfg.mcp_servers[0].name, "keep");
         assert!(!out.contains("drop-mcp"));
+    }
+
+    #[test]
+    fn with_mcp_server_removed_reports_a_non_array_section_accurately() {
+        // The inline-array form is valid TOML the serde reader accepts; the
+        // writer must say it cannot edit that shape, not falsely claim the
+        // entry is absent.
+        let text = "mcp_servers = [ { name = \"x\", command = \"y\" } ]\n";
+        let err = Config::with_mcp_server_removed(text, "x").unwrap_err();
+        assert!(
+            err.to_string().contains("not an array of tables"),
+            "wrong-shape section misreported: {err}"
+        );
+        let err = Config::with_mcp_server_removed("mcp_servers = 3\n", "x").unwrap_err();
+        assert!(
+            err.to_string().contains("not an array of tables"),
+            "scalar section misreported: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_writer_error_branches_are_loud() {
+        let entry = crate::mcp::McpServerEntry {
+            name: "x".into(),
+            enabled: true,
+            transport: crate::mcp::TransportKind::Stdio,
+            command: Some("x-mcp".into()),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+        };
+        // Invalid TOML input text.
+        let err = Config::with_mcp_server_added("not toml [", &entry).unwrap_err();
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+        let err = Config::with_mcp_server_removed("not toml [", "x").unwrap_err();
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+        // A section that is not an array of tables.
+        let err = Config::with_mcp_server_added("mcp_servers = 3\n", &entry).unwrap_err();
+        assert!(err.to_string().contains("not an array of tables"), "{err}");
+        // A timeout that does not fit TOML's i64 integers.
+        let oversized = crate::mcp::McpServerEntry {
+            request_timeout_secs: Some(u64::MAX),
+            ..entry
+        };
+        let err = Config::with_mcp_server_added("", &oversized).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
     }
 
     #[test]
