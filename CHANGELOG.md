@@ -9,6 +9,24 @@ is inherited by all internal crates.
 
 ### Added
 
+- **`newt mcp probe` — derive a server's registration by asking the server
+  (#1292).** Probing is verify-and-enrich, never discovery-by-scanning: the
+  operator names a stdio command or an `http(s)://` URL. A stdio candidate is
+  spawned under the **shared confined probe leash** (`Config::mcp_probe_caveats`
+  — doctor's policy, never `top()`; exec widened by exactly the probed
+  command, #1256), trying the pure-data arg-spelling rules (`stdio`, none,
+  `mcp`, `serve`; overridable via `mcp-probe-rules.toml`) when `--arg` is
+  omitted. A URL is dialed as streamable-HTTP through the egress proxy with
+  the `net` axis widened by exactly the typed host (#1267); non-loopback
+  plain-http needs `--allow-http` and still warns, HTTP 401/403 reports "run
+  `newt auth <name>`", and a rejected initialize is flagged as a likely
+  legacy-SSE-only server. The report carries the server's self-reported
+  identity (`newt-mcp-client` now captures the `initialize` result —
+  serverInfo + instructions — instead of discarding it), tools, and the
+  honest sandbox/net posture; `--json` is machine-readable. `--save` writes
+  through the `newt mcp add` path; `--to-catalog` upserts a comment-preserving
+  `mcp-catalog.toml` entry that `newt mcp install` can replay. Execution and
+  writes confirm `[Y/n]` (`--yes` to skip; non-TTY fails closed).
 - **`newt mcp` management verbs — no more hand-editing `[[mcp_servers]]`.**
   `newt mcp add <name> --command … [--arg …] [--transport stdio|sse|http]
   [--url …] [--env K=V] [--timeout-secs N]` and `newt mcp remove <name>` edit
