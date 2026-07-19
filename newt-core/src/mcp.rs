@@ -629,13 +629,27 @@ pub fn discover(
         e.trust = McpTrust::Trusted;
         e
     };
+    // `newt_servers` come from `Config::resolve`, which already stamps a
+    // walked-up project `.newt/config.toml`'s entries UNTRUSTED (a cloned repo
+    // can ship one — the residual #1301 vector). PRESERVE that mark; only a
+    // genuinely newt-owned entry (default-Trusted, or a hand-built one) is
+    // (re-)stamped Trusted. This closure must never re-elevate an Untrusted
+    // entry back to Trusted.
+    let preserve_or_trust = |mut e: McpServerEntry| {
+        if e.trust != McpTrust::Untrusted {
+            e.trust = McpTrust::Trusted;
+        }
+        e
+    };
     let untrusted = |mut e: McpServerEntry| {
         e.trust = McpTrust::Untrusted;
         e
     };
     let mut sources: Vec<McpServerEntry> = Vec::new();
-    sources.extend(newt_servers.iter().cloned().map(trusted));
+    sources.extend(newt_servers.iter().cloned().map(preserve_or_trust));
     if let Some(path) = newt_mcp_toml {
+        // `~/.newt/mcp.toml` is a purely user-owned source (never a walk-up),
+        // so its entries are unconditionally TRUSTED.
         sources.extend(load_newt_mcp_toml(path).into_iter().map(trusted));
     }
     if let Some(home) = home {
@@ -1093,6 +1107,35 @@ mod tests {
         let proj = got.iter().find(|e| e.name == "proj").unwrap();
         assert_eq!(owned.trust, McpTrust::Trusted);
         assert_eq!(proj.trust, McpTrust::Untrusted);
+    }
+
+    #[test]
+    fn discover_preserves_untrusted_project_origin_and_does_not_re_elevate() {
+        // #1301 residual vector: `Config::resolve` stamps a walked-up project
+        // `.newt/config.toml`'s entries UNTRUSTED before handing `cfg.mcp_servers`
+        // to discover() as `newt_servers`. discover() must PRESERVE that mark —
+        // never re-elevate it to Trusted — while still stamping a genuine
+        // newt-owned entry Trusted.
+        let mut project_origin = stdio("proj", "p");
+        project_origin.trust = McpTrust::Untrusted;
+        let owned = stdio("owned", "o"); // default Trusted
+
+        let got = discover(
+            &[project_origin, owned],
+            None,
+            None,
+            Path::new("/nonexistent"),
+        );
+        assert_eq!(
+            got.iter().find(|e| e.name == "proj").unwrap().trust,
+            McpTrust::Untrusted,
+            "a project-origin Untrusted mark must survive discover(), not be re-elevated"
+        );
+        assert_eq!(
+            got.iter().find(|e| e.name == "owned").unwrap().trust,
+            McpTrust::Trusted,
+            "a genuine newt-owned entry is (still) trusted"
+        );
     }
 
     #[test]

@@ -3605,10 +3605,27 @@ impl Config {
                 // it wants to be merged (`[merge] arrays = ...`), else the global
                 // config's setting, else the built-in default (Replace).
                 let strategy = array_merge_strategy(&project_val, &merged);
+                // #1301 trust boundary: a project-local `.newt/config.toml` is
+                // found by walking UP from cwd, so a freshly cloned repo can ship
+                // one — its `[[mcp_servers]]` are attacker-reachable and must be
+                // UNTRUSTED (literals verbatim, `${cmd:…}` never runs, refs
+                // rejected), exactly like a `.mcp.json` overlay. The merge below
+                // folds those entries into `mcp_servers`, indistinguishable from
+                // the trusted base's; capture how many project entries there are
+                // BEFORE the merge so provenance can be reconstructed after.
+                let project_mcp_count = project_val
+                    .get("mcp_servers")
+                    .and_then(toml::Value::as_array)
+                    .map(Vec::len);
                 merge_toml(&mut merged, project_val, strategy);
-                merged
+                let mut cfg: Self = merged
                     .try_into()
-                    .map_err(|e| NewtError::Config(e.to_string()))?
+                    .map_err(|e| NewtError::Config(e.to_string()))?;
+                // `trust` is `#[serde(skip)]`, so every merged entry deserialized
+                // to the `Trusted` default; stamp the project-origin ones back to
+                // UNTRUSTED before anything can resolve their secrets.
+                mark_project_mcp_untrusted(&mut cfg.mcp_servers, strategy, project_mcp_count);
+                cfg
             }
         };
         // Per-file backends (the endpoint control surface): drop a
@@ -4454,6 +4471,43 @@ pub(crate) fn merge_toml(base: &mut toml::Value, overlay: toml::Value, arrays: A
         }
         // Replace mode (and any scalar): the overlay replaces the base outright.
         (slot, overlay) => *slot = overlay,
+    }
+}
+
+/// Stamp the MCP servers that originated from the walked-up project-local
+/// `.newt/config.toml` as [`crate::mcp::McpTrust::Untrusted`] — the #1301 trust
+/// boundary for a cloned repo's ambient config.
+///
+/// By the time [`Config::resolve`] has a typed `Config`, the project entries are
+/// already folded into `servers` by [`merge_toml`] and — because `trust` is
+/// `#[serde(skip)]` — every entry carries the `Trusted` default, so provenance
+/// is reconstructed from the merge shape (which must match [`merge_toml`]):
+/// - `project_mcp_count == None` → the project file had no `mcp_servers` key, so
+///   `servers` came wholly from the trusted base (user config) → mark none.
+/// - [`ArrayMergeStrategy::Replace`] with a project `mcp_servers` array present →
+///   the project array REPLACED the base's, so every entry is project-origin.
+/// - [`ArrayMergeStrategy::Append`] → the project entries were concatenated
+///   AFTER the base's (base first), so only the trailing `count` are
+///   project-origin.
+///
+/// Only ever downgrades (Trusted → Untrusted); it never elevates, so a genuine
+/// user-config entry can never be mislabeled trusted by this path.
+fn mark_project_mcp_untrusted(
+    servers: &mut [crate::mcp::McpServerEntry],
+    strategy: ArrayMergeStrategy,
+    project_mcp_count: Option<usize>,
+) {
+    let Some(count) = project_mcp_count else {
+        return;
+    };
+    let start = match strategy {
+        // Replace swapped the whole array for the project's — all project-origin.
+        ArrayMergeStrategy::Replace => 0,
+        // Append put the project entries last — mark only that trailing slice.
+        ArrayMergeStrategy::Append => servers.len().saturating_sub(count),
+    };
+    for entry in &mut servers[start..] {
+        entry.trust = crate::mcp::McpTrust::Untrusted;
     }
 }
 
@@ -6099,6 +6153,63 @@ tiers = ["COMPLEX"]
         // Global entries first, then the project's appended.
         let got: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(got, vec!["a", "b", "x"]);
+    }
+
+    // --- #1301: project-origin `[[mcp_servers]]` are stamped UNTRUSTED ---
+
+    /// A minimal valid stdio entry at the `#[serde(skip)]` default trust
+    /// ([`crate::mcp::McpTrust::Trusted`]) — mirrors a freshly-deserialized entry.
+    fn mcp_entry(name: &str) -> crate::mcp::McpServerEntry {
+        crate::mcp::McpServerEntry {
+            name: name.into(),
+            enabled: true,
+            transport: crate::mcp::TransportKind::Stdio,
+            command: Some("true".into()),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
+        }
+    }
+
+    #[test]
+    fn mark_project_mcp_untrusted_replace_marks_every_entry() {
+        // Replace (the default) with a project `mcp_servers` array present: the
+        // project array REPLACED the base's, so every survivor is project-origin.
+        let mut servers = vec![mcp_entry("a"), mcp_entry("b")];
+        mark_project_mcp_untrusted(&mut servers, ArrayMergeStrategy::Replace, Some(2));
+        assert!(
+            servers
+                .iter()
+                .all(|e| e.trust == crate::mcp::McpTrust::Untrusted),
+            "replace ⇒ all project-origin ⇒ all untrusted"
+        );
+    }
+
+    #[test]
+    fn mark_project_mcp_untrusted_append_marks_only_trailing_project_entries() {
+        // Append: base entries first, project entries appended — only the
+        // trailing `count` (here 2) are project-origin.
+        let mut servers = vec![mcp_entry("base"), mcp_entry("p1"), mcp_entry("p2")];
+        mark_project_mcp_untrusted(&mut servers, ArrayMergeStrategy::Append, Some(2));
+        assert_eq!(
+            servers[0].trust,
+            crate::mcp::McpTrust::Trusted,
+            "the trusted base entry must stay trusted"
+        );
+        assert_eq!(servers[1].trust, crate::mcp::McpTrust::Untrusted);
+        assert_eq!(servers[2].trust, crate::mcp::McpTrust::Untrusted);
+    }
+
+    #[test]
+    fn mark_project_mcp_untrusted_none_marks_nothing() {
+        // No project `mcp_servers` key ⇒ the array came wholly from the trusted
+        // base (user config) ⇒ nothing is downgraded.
+        let mut servers = vec![mcp_entry("a")];
+        mark_project_mcp_untrusted(&mut servers, ArrayMergeStrategy::Replace, None);
+        assert_eq!(servers[0].trust, crate::mcp::McpTrust::Trusted);
     }
 
     #[test]
