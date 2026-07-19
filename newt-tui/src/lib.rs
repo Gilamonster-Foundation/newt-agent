@@ -36,9 +36,12 @@ mod rich_input;
 mod vi;
 // The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
 // only when an interactive surface is on — the wyvern/lean build never links it.
-#[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+// unix-only: the mouse tier's sole construction site (`with_live_spill_watch`)
+// and the raw-byte decoder are `#[cfg(unix)]`, so on Windows the guard would be
+// dead code (`-D warnings`). The whole tier rides the unix gate.
+#[cfg(all(unix, any(feature = "rich-tui", feature = "live-spill")))]
 mod mouse;
-#[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+#[cfg(all(unix, any(feature = "rich-tui", feature = "live-spill")))]
 pub use mouse::install_panic_release_hook;
 // The lean input surface (issue #527): a dead-simple word-wrapped text box, the
 // flight/wyvern morphology. Always built — it is the footer-off / lean tier.
