@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
-use newt_core::mcp::{McpServerEntry, SecretValue, TransportKind};
+use newt_core::mcp::{McpServerEntry, McpTrust, SecretValue, TransportKind};
 use newt_core::mcp_catalog::{
     builtin_catalog, merge_catalog_layers, parse_catalog, McpCatalogEntry,
 };
@@ -272,6 +272,22 @@ pub(crate) fn explicit_write_target(
     config_path: Option<&Path>,
     project: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(strong) = strong_explicit_write_target(config_path, project)? {
+        return Ok(Some(strong));
+    }
+    ambient_newt_toml()
+}
+
+/// The **strong** explicit write targets — deliberate overrides that always win:
+/// `--project` > `--config` > `$NEWT_CONFIG`. Split out from
+/// [`explicit_write_target`] so [`mcp_write_target`]'s `create=true` (import /
+/// break-out) path can honor these WITHOUT the ambient `./newt.toml`
+/// fallthrough capturing a plain `newt mcp import` (FIX 4, #1301). `Ok(None)`
+/// when none apply.
+fn strong_explicit_write_target(
+    config_path: Option<&Path>,
+    project: bool,
+) -> anyhow::Result<Option<PathBuf>> {
     if project {
         if let Some(existing) = Config::project_config_path() {
             return Ok(Some(existing));
@@ -289,6 +305,12 @@ pub(crate) fn explicit_write_target(
     if let Some(env_cfg) = std::env::var_os("NEWT_CONFIG").filter(|v| !v.is_empty()) {
         return Ok(Some(PathBuf::from(env_cfg)));
     }
+    Ok(None)
+}
+
+/// The ambient `./newt.toml` fallthrough (resolve()'s next base candidate) — the
+/// weak, cwd-dependent target. `Ok(None)` when the cwd has no `newt.toml`.
+fn ambient_newt_toml() -> anyhow::Result<Option<PathBuf>> {
     let local = std::env::current_dir()
         .context("cannot resolve the current directory")?
         .join("newt.toml");
@@ -310,13 +332,29 @@ pub(crate) fn mcp_write_target(
     project: bool,
     create: bool,
 ) -> anyhow::Result<PathBuf> {
-    if let Some(explicit) = explicit_write_target(config_path, project)? {
-        return Ok(explicit);
+    // A STRONG explicit override always wins. The ambient `./newt.toml` is NOT
+    // consulted before the user-global target on the create path — otherwise a
+    // plain `newt mcp import` run from a project dir that happens to hold a
+    // `newt.toml` would silently scope a user-global import to that project
+    // (FIX 4, #1301).
+    if let Some(strong) = strong_explicit_write_target(config_path, project)? {
+        return Ok(strong);
     }
     let dir =
         Config::user_config_dir().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))?;
     let mcp_toml = dir.join("mcp.toml");
-    if create || mcp_toml.is_file() {
+    if create {
+        // The break-out/import gesture targets `~/.newt/mcp.toml` as its help
+        // promises — created if absent, never captured by an ambient newt.toml.
+        return Ok(mcp_toml);
+    }
+    // add/install (create=false): #1291 behavior preserved — an ambient
+    // `./newt.toml` (resolve()'s base) first, then an existing mcp.toml, else the
+    // user `config.toml`.
+    if let Some(ambient) = ambient_newt_toml()? {
+        return Ok(ambient);
+    }
+    if mcp_toml.is_file() {
         return Ok(mcp_toml);
     }
     Ok(dir.join("config.toml"))
@@ -454,6 +492,8 @@ fn build_entry(
         url,
         headers: BTreeMap::new(),
         request_timeout_secs: timeout_secs,
+        // Operator-typed on the CLI — newt-owned, trusted config.
+        trust: McpTrust::Trusted,
     })
 }
 
@@ -742,10 +782,54 @@ fn cmd_import(
         .map(|e| e.name)
         .collect();
 
+    // FIX 3 (#1301): `config.toml` OUTRANKS `~/.newt/mcp.toml` in discovery, so
+    // importing into mcp.toml a name already defined in config.toml would write
+    // an entry that is silently shadowed and can never take effect (and neither
+    // `--force` nor `--merge`, which only touch the mcp.toml target, can displace
+    // it). Detect that clash and refuse it. Only relevant when the write target
+    // IS the user-global mcp.toml — an explicit `--config`/`--project` writes to
+    // the higher-precedence file directly, so there is no inversion.
+    let (config_label, config_names): (String, std::collections::BTreeSet<String>) =
+        if Config::user_config_dir()
+            .map(|d| d.join("mcp.toml"))
+            .as_deref()
+            == Some(target.as_path())
+        {
+            let cfg = match config_path {
+                Some(p) => Config::load(p)?,
+                None => Config::resolve()?,
+            };
+            let label = config_path
+                .map(Path::to_path_buf)
+                .or_else(Config::user_config_path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "config.toml".to_string());
+            (
+                label,
+                cfg.mcp_servers.iter().map(|e| e.name.clone()).collect(),
+            )
+        } else {
+            (String::new(), std::collections::BTreeSet::new())
+        };
+
     let mut added = 0usize;
     let mut overwritten = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     for entry in &imported {
+        // A clash with the OUTRANKING config.toml is always fatal — `--force` /
+        // `--merge` govern the mcp.toml target only and cannot make an import
+        // that config.toml would shadow take effect.
+        if config_names.contains(&entry.name) {
+            bail!(
+                "`{}` is already defined in {}, which outranks {} — an import here would be \
+                 ineffective (silently shadowed). Remove it from {} first, or re-run with an \
+                 explicit `--config`/`--project` target.",
+                entry.name,
+                config_label,
+                target.display(),
+                config_label
+            );
+        }
         if existing.contains(&entry.name) {
             if merge {
                 skipped.push(entry.name.clone());
@@ -874,6 +958,7 @@ mod tests {
             url: None,
             headers: BTreeMap::new(),
             request_timeout_secs: None,
+            trust: McpTrust::Trusted,
         }
     }
 
