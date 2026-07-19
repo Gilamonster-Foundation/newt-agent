@@ -4027,6 +4027,29 @@ impl Config {
         std::fs::write(path, text).map_err(NewtError::Io)
     }
 
+    /// The confined leash MCP *probe* children run under — shared by
+    /// `newt doctor` and `newt mcp probe` (#1292): the operator's configured
+    /// `[tui]` permissions preset, or a **ReadOnly, no-prompt default** when
+    /// none is configured — the session's "safe by default, never `top()`"
+    /// rule (#94). The spawn path widens exec by exactly the probed command
+    /// (`newt-mcp-client`'s `spawn_caveats`); everything else stays closed.
+    #[must_use]
+    pub fn mcp_probe_caveats(&self, workspace: &Path) -> crate::caveats::Caveats {
+        let ws = workspace.to_string_lossy();
+        self.tui
+            .as_ref()
+            .map(|t| t.permissions.to_caveats(&ws))
+            .unwrap_or_else(|| {
+                ToolPermissions {
+                    preset: PermissionPreset::ReadOnly,
+                    extra_exec: Vec::new(),
+                    net: Vec::new(),
+                    prompt: false,
+                }
+                .to_caveats(&ws)
+            })
+    }
+
     /// Set the top-level `default_backend` key while preserving the rest of the
     /// TOML document, including comments and formatting. Pure: the caller owns
     /// any filesystem write.
@@ -6221,6 +6244,38 @@ max_tool_rounds = 25
         assert!(!cav.permits_exec("cargo"));
         // The caveat stores workspace root; prefix matching is in the TUI layer.
         // Here we just verify the lattice is set up correctly (not All, not none).
+        use crate::caveats::Scope;
+        assert!(matches!(cav.fs_write, Scope::Only(_)));
+    }
+
+    // --- #1292: the shared MCP probe leash (doctor + `newt mcp probe`) ---
+
+    #[test]
+    fn mcp_probe_caveats_default_is_read_only_never_top() {
+        let cav = Config::default().mcp_probe_caveats(std::path::Path::new("/workspace"));
+        assert!(cav.permits_fs_read("/workspace/src/main.rs"));
+        assert!(
+            !cav.permits_fs_write("/workspace/src/main.rs"),
+            "unconfigured probe leash must not write"
+        );
+        assert!(
+            !cav.permits_exec("cargo"),
+            "unconfigured probe leash grants no exec (the spawn path widens \
+             exactly the probed command, nothing else)"
+        );
+    }
+
+    #[test]
+    fn mcp_probe_caveats_honors_the_configured_preset() {
+        let cfg = Config {
+            tui: Some(TuiConfig {
+                permissions: ToolPermissions::default(), // WorkspaceDev
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cav = cfg.mcp_probe_caveats(std::path::Path::new("/ws"));
+        assert!(cav.permits_exec("cargo"), "configured preset respected");
         use crate::caveats::Scope;
         assert!(matches!(cav.fs_write, Scope::Only(_)));
     }
