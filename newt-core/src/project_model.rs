@@ -350,6 +350,96 @@ fn expand_member_glob(root: &Path, entry: &str) -> Vec<String> {
     }
 }
 
+// --- Drift-cached derivation (#1282) ---------------------------------------
+
+use crate::drift_cache::{apply_drift, content_hash, DriftCache};
+
+/// Derive the model through the content-hash **drift-cache** (#1282): re-derive
+/// only the units whose marker content changed vs `prev`, reuse the cached
+/// [`ProjectUnit`] for the rest. Returns the model + the updated cache. **Pure**
+/// over the injected `(dir → marker contents)` map and `prev` cache — the fs
+/// gather + persistence live in [`scan_project_cached`].
+///
+/// The units equal those of an uncached [`derive`] (the PO-C guarantee proved in
+/// `formal/ProjectModel/Basic.lean` and realized by [`apply_drift`]); an
+/// unchanged repo re-derives nothing.
+#[must_use]
+pub fn derive_cached(
+    pack: &ProjectPack,
+    prev: &DriftCache<ProjectUnit>,
+    markers: &std::collections::BTreeMap<String, String>,
+) -> (ProjectModel, DriftCache<ProjectUnit>) {
+    let hashes: std::collections::BTreeMap<String, String> = markers
+        .iter()
+        .map(|(dir, contents)| (dir.clone(), content_hash(contents.as_bytes())))
+        .collect();
+    let next = apply_drift(prev, &hashes, |dir, _hash| {
+        let value = markers
+            .get(dir)
+            .and_then(|c| parse_marker(pack.format, c))
+            .unwrap_or(Value::Null);
+        derive_unit(pack, dir, &value)
+    });
+    let model = ProjectModel {
+        pack: pack.name.clone(),
+        units: next.entries.values().map(|e| e.value.clone()).collect(),
+    };
+    (model, next)
+}
+
+/// The drift-cache store version for the project model: bump when `derive`'s
+/// shape changes so a stale cache rebuilds cleanly.
+const PROJECT_MODEL_CACHE_VERSION: &str = "project-model.v1";
+
+/// Scan a project with the persistent drift-cache (#1282): an unchanged repo
+/// re-derives nothing; a touched unit re-derives only itself. The result equals
+/// [`scan_project`]'s units (PO-C). `config_dir` is where the cache lives
+/// (`<config_dir>/index/<repo-hash>/project-model.json`). Thin fs wrapper over
+/// [`derive_cached`].
+#[must_use]
+pub fn scan_project_cached(
+    root: &Path,
+    packs: &[ProjectPack],
+    config_dir: &Path,
+) -> Option<ProjectModel> {
+    let pack = detect_pack(packs, &|m| root.join(m).is_file())?;
+    let marker_file = pack.markers.iter().find(|m| root.join(m).is_file())?;
+    let root_text = std::fs::read_to_string(root.join(marker_file)).ok()?;
+    let root_val = parse_marker(pack.format, &root_text)?;
+
+    // Gather each unit's marker CONTENTS (the drift key), root + members.
+    let members: Vec<String> = pack
+        .workspace_members_at
+        .as_deref()
+        .and_then(|p| dotted_get(&root_val, p))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .flat_map(|g| expand_member_glob(root, g))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut markers = std::collections::BTreeMap::new();
+    if members.is_empty() {
+        markers.insert(".".to_string(), root_text);
+    } else {
+        for dir in members {
+            if let Ok(text) = std::fs::read_to_string(root.join(&dir).join(marker_file)) {
+                markers.insert(dir, text);
+            }
+        }
+    }
+
+    let cache_path =
+        crate::drift_cache::store_path(config_dir, root, &format!("project-model.{}", pack.name));
+    let prev = crate::drift_cache::load::<ProjectUnit>(&cache_path, PROJECT_MODEL_CACHE_VERSION)
+        .unwrap_or_else(|| DriftCache::new(PROJECT_MODEL_CACHE_VERSION));
+    let (model, next) = derive_cached(pack, &prev, &markers);
+    crate::drift_cache::save(&cache_path, &next);
+    Some(model)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +450,45 @@ mod tests {
             .into_iter()
             .find(|p| p.name == "rust")
             .unwrap()
+    }
+
+    #[test]
+    fn derive_cached_equals_uncached_derive_po_c() {
+        // #1282 PO-C at the project-model level: the drift-cached model equals a
+        // from-scratch derive — on a cold cache, and after a marker edits.
+        use crate::drift_cache::DriftCache;
+        let p = rust();
+        let markers: std::collections::BTreeMap<String, String> = [
+            ("a".to_string(), "[package]\nname='a'\n".to_string()),
+            ("b".to_string(), "[package]\nname='b'\n".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let uncached = |m: &std::collections::BTreeMap<String, String>| {
+            let ums: Vec<(String, Value)> = m
+                .iter()
+                .map(|(d, c)| (d.clone(), parse_marker(p.format, c).unwrap()))
+                .collect();
+            derive(&p, &ums)
+        };
+
+        // Cold cache: derive_cached == uncached derive.
+        let empty = DriftCache::<ProjectUnit>::new("v1");
+        let (m1, cache1) = derive_cached(&p, &empty, &markers);
+        assert_eq!(m1.units, uncached(&markers).units);
+        assert_eq!(cache1.entries.len(), 2);
+
+        // Edit b's marker; warm cache: still equals a fresh derive (PO-C), and
+        // a's cached ProjectUnit is byte-identical (reused, not re-derived).
+        let mut edited = markers.clone();
+        edited.insert("b".to_string(), "[package]\nname='b2'\n".to_string());
+        let (m2, cache2) = derive_cached(&p, &cache1, &edited);
+        assert_eq!(m2.units, uncached(&edited).units);
+        assert_eq!(
+            cache2.entries["a"], cache1.entries["a"],
+            "clean unit reused verbatim"
+        );
+        assert_eq!(m2.units.iter().find(|u| u.dir == "b").unwrap().name, "b2");
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod classifiers;
 pub mod config;
 pub mod conversation;
 pub mod dgx;
+pub mod drift_cache;
 pub mod error;
 pub mod ffi_manifest;
 pub mod ffi_surface;
