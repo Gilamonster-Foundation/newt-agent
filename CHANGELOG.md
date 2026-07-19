@@ -9,6 +9,42 @@ is inherited by all internal crates.
 
 ### Added
 
+- **`~/.newt/mcp.toml` + Claude-JSON import + secret references on MCP
+  `env`/`headers` + scrybe.ai smart-install (#1301).** MCP config is now
+  first-class and secret-safe:
+  - **`~/.newt/mcp.toml`** — a dedicated newt-owned source (same
+    `[[mcp_servers]]` schema as `config.toml`), discovered by
+    `newt_core::mcp::discover` as a newt-owned layer ranked with `config.toml`
+    `[[mcp_servers]]`, above the borrowed `~/.claude.json` / `<ws>/.mcp.json`
+    overlays; missing/malformed is non-fatal. `newt mcp add|install|import`
+    prefer it once it exists (else keep writing `config.toml`, #1291's
+    behavior, honoring `--config`/`$NEWT_CONFIG`/`./newt.toml`/`--project`);
+    `newt mcp list` attributes each row to its source (`newt mcp.toml`).
+  - **`newt mcp import <path>` / `--from-claude`** — reads a Claude-Code
+    `mcpServers` JSON (via `parse_claude_mcp`) and writes the equivalent
+    `[[mcp_servers]]` TOML through the comment-preserving writer, breaking
+    config out to `~/.newt/mcp.toml` (created if absent). Dedup-by-name:
+    error on a clash by default, `--force` overwrites, `--merge` skips
+    existing. Secret-bearing values (incl. Claude's `${VAR}`) import verbatim.
+  - **Secret references on every `env` and `headers` value — both syntaxes.**
+    A value is now a `SecretValue`: a plain string (`Literal`, backward-compatible
+    with every existing config and with Claude JSON) or a `{ env | file | cmd }`
+    table (`Ref`, the existing `SecretRef` scheme). A literal may embed `${...}`
+    interpolation tokens — `${VAR}`/`${env:VAR}` (env), `${file:~/p}` (first
+    non-empty line), `${cmd:vault kv get -field=token secret/x}` (command
+    stdout — the Vault path) — with literal text around tokens preserved. A
+    missing/empty reference is a hard error at spawn (never a silent empty).
+    Resolution happens **host-side, wrapped in `Secret`**, right before the
+    confined stdio child's env is built (`newt-mcp-client`) and the HTTP
+    headers are built — never inside the confined child, never into newt's own
+    process env. `newt config`'s `to_redacted_toml` redacts literal values
+    (incl. `${cmd:…}` strings) and keeps `{ env|file|cmd }` references (they
+    name a location, not a secret).
+  - **`newt mcp install scrybe`** resolves the `scrybe-mcp-server` binary
+    across `PATH` → `~/venv/bin` and registers it by **absolute** path (survives
+    PATH changes); a missing bundled-scrybe binary is a clear error naming
+    `pip install scrybe.ai` (a hint, never an auto-`pip`).
+
 - **`newt mcp probe` — derive a server's registration by asking the server
   (#1292).** Probing is verify-and-enrich, never discovery-by-scanning: the
   operator names a stdio command or an `http(s)://` URL. A stdio candidate is
