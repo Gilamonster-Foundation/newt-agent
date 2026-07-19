@@ -922,6 +922,7 @@ mod tests {
                     &stop,
                     Some(renderer.as_ref()),
                     newt_core::EditMode::Nano,
+                    false, // mode_nav: base keys only
                     10,
                     100,
                 );
