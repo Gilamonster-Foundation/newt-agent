@@ -38,6 +38,7 @@ pub mod ocap_propose;
 pub mod ocap_store;
 pub mod plan;
 pub mod pricing;
+pub mod project_map;
 pub mod project_model;
 pub mod prompt;
 pub mod prune;
@@ -131,6 +132,7 @@ pub use conversation::{
     ConversationSummary, ConversationTurn, PhantomReach, PhantomResolution, ToolEvent,
 };
 pub use ffi_surface::FfiSurfaceProvider;
+pub use project_map::ProjectMapProvider;
 // `kit::Tier` (Headless|TuiOnly) is *not* re-exported here — it would collide with
 // the router's task-complexity `Tier`; reach it as `kit::Tier`.
 pub use kit::{Axis, MountKind, RegistryEntry, COMPONENT_REGISTRY};
