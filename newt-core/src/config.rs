@@ -1250,9 +1250,24 @@ pub struct ApiSurfaceConfig {
     /// drop-in directories (the highest-precedence layer).
     #[serde(default)]
     pub language_packs: Vec<LanguagePack>,
-    /// Char ceiling on the injected surface block (it rides every turn).
-    #[serde(default = "default_api_surface_max_block_chars")]
-    pub max_block_chars: usize,
+    /// **Deprecated** operator pin. When present, the tier-2 budget is pinned to
+    /// this char count (`floor_chars == ceiling_chars == max_block_chars`) — the
+    /// legacy fixed cap. Prefer the proportional trio below (spec §3, SC-L2).
+    /// Absent by default so the surface scales with the discovered window.
+    #[serde(default)]
+    pub max_block_chars: Option<usize>,
+    /// SC-L2 floor: the minimum tier-2 char allowance, even on a tiny window —
+    /// the surface must never be starved to nothing (dominates near ~8k tokens).
+    #[serde(default = "default_api_surface_floor_chars")]
+    pub floor_chars: usize,
+    /// SC-L2 slope: percent of the resolved send budget `w` (tokens) the tier-2
+    /// surface may claim, before the chars/token conversion and clamp.
+    #[serde(default = "default_api_surface_pct_of_budget")]
+    pub pct_of_budget: usize,
+    /// SC-L2 ceiling — a §8 *pin*, not law: the max tier-2 char allowance on a
+    /// large window; the v1 value is set empirically by the #548 map-size arms.
+    #[serde(default = "default_api_surface_ceiling_chars")]
+    pub ceiling_chars: usize,
     /// Per-file symbol cap, so one huge file can't crowd out the surface.
     #[serde(default = "default_api_surface_max_symbols_per_file")]
     pub max_symbols_per_file: usize,
@@ -1262,14 +1277,28 @@ impl Default for ApiSurfaceConfig {
     fn default() -> Self {
         Self {
             language_packs: Vec::new(),
-            max_block_chars: default_api_surface_max_block_chars(),
+            max_block_chars: None,
+            floor_chars: default_api_surface_floor_chars(),
+            pct_of_budget: default_api_surface_pct_of_budget(),
+            ceiling_chars: default_api_surface_ceiling_chars(),
             max_symbols_per_file: default_api_surface_max_symbols_per_file(),
         }
     }
 }
 
-fn default_api_surface_max_block_chars() -> usize {
-    3_000
+// SC-L2 pins (spec §8). Defaults chosen so the floor dominates at the
+// DEFAULT_CONTEXT_TOKENS=8,192 fallback (8192·5% ·4 = 1,638 < 2,000) and the
+// ceiling caps a 262k-window session (its ~168k send budget · 5% · 4 ≫ 24,000).
+fn default_api_surface_floor_chars() -> usize {
+    2_000
+}
+
+fn default_api_surface_pct_of_budget() -> usize {
+    5
+}
+
+fn default_api_surface_ceiling_chars() -> usize {
+    24_000
 }
 
 fn default_api_surface_max_symbols_per_file() -> usize {

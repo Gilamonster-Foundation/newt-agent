@@ -808,7 +808,21 @@ pub(crate) fn run_chat(
                 .as_ref()
                 .map(|c| c.api_surface.clone())
                 .unwrap_or_default();
-            mgr.add_provider(newt_core::ApiSurfaceProvider::from_config(&api_cfg));
+            // #1283: the tier-2 surface budget scales with the discovered window
+            // (SC-L2), replacing the starved fixed 3000-char cap. `w` = the same
+            // resolved send budget the memory providers use (mem_budget); the
+            // ratio is the static `[context.estimation]` value, so `b` is a pure
+            // session-fixed function (never the live calibrated ratio).
+            let surface_cpt = cfg
+                .context
+                .as_ref()
+                .map(|c| c.estimation.chars_per_token)
+                .unwrap_or(4);
+            let surface_budget =
+                newt_core::resolve_surface_budget(mem_budget as usize, surface_cpt, &api_cfg);
+            mgr.add_provider(
+                newt_core::ApiSurfaceProvider::from_config(&api_cfg).with_budget(surface_budget),
+            );
             // #1284: the untruncatable project map (crate/package units + curated
             // purposes) — the navigation floor of the "IDE for LLMs" spine. A
             // no-op on a non-project dir; drift-cached so a re-launch is cheap.
