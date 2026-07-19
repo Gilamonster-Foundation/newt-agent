@@ -221,27 +221,16 @@ fn derive_name(
 /// first line of its `instructions` (truncated to ~120 chars with `…`),
 /// else empty.
 fn derive_description(server_info: Option<&ServerInfo>, instructions: Option<&str>) -> String {
+    // Both sources are server-controlled: clamp either to one bounded,
+    // control-character-free line before it reaches a terminal or catalog.
     if let Some(title) = server_info
         .and_then(|i| i.title.as_deref())
-        .map(str::trim)
+        .map(clamp_single_line)
         .filter(|t| !t.is_empty())
     {
-        return title.to_string();
+        return title;
     }
-    let Some(first_line) = instructions
-        .and_then(|i| i.lines().next())
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-    else {
-        return String::new();
-    };
-    if first_line.chars().count() <= 120 {
-        first_line.to_string()
-    } else {
-        let mut cut: String = first_line.chars().take(120).collect();
-        cut.push('…');
-        cut
-    }
+    instructions.map(clamp_single_line).unwrap_or_default()
 }
 
 /// Widen the probe leash's `net` axis by exactly `host` — the URL-probe
@@ -296,11 +285,18 @@ fn render_text_report(o: &ProbeOutcome) -> anyhow::Result<String> {
     let mut out = String::new();
     let identity = match &o.server_info {
         Some(si) => {
-            let title = si.title.as_deref().unwrap_or("");
+            // Every field is server-controlled — clamp before the terminal.
+            let name = clamp_single_line(&si.name);
+            let version = clamp_single_line(&si.version);
+            let title = si
+                .title
+                .as_deref()
+                .map(clamp_single_line)
+                .unwrap_or_default();
             if title.is_empty() {
-                format!("{} {}", si.name, si.version)
+                format!("{name} {version}")
             } else {
-                format!("{} {} ({title})", si.name, si.version)
+                format!("{name} {version} ({title})")
             }
         }
         None => "(server did not report an identity)".to_string(),
@@ -321,7 +317,12 @@ fn render_text_report(o: &ProbeOutcome) -> anyhow::Result<String> {
         "  transport         : {}\n",
         o.entry.transport.as_str()
     ));
-    let mut tools = o.tools.iter().map(String::as_str).collect::<Vec<_>>();
+    // Tool names are server-controlled too.
+    let mut tools = o
+        .tools
+        .iter()
+        .map(|t| clamp_single_line(t))
+        .collect::<Vec<_>>();
     let extra = tools.len().saturating_sub(8);
     tools.truncate(8);
     let tool_list = if o.tools.is_empty() {
@@ -393,6 +394,28 @@ fn is_yes(input: &str, default: bool) -> bool {
     }
 }
 
+/// The consent decision from one read of stdin. `bytes_read == 0` is EOF
+/// (Ctrl-D) — that is an ABORT, never the default-yes: only an actual
+/// newline keypress may take the default (fail closed, like the non-TTY
+/// path).
+fn consent_given(bytes_read: usize, input: &str) -> bool {
+    bytes_read > 0 && is_yes(input, true)
+}
+
+/// One bounded, control-character-free line out of server-controlled text —
+/// a probed server's title/instructions/version can be multi-KB, multi-line,
+/// or ANSI-laced, and reach both the terminal and the catalog.
+fn clamp_single_line(s: &str) -> String {
+    let first = s.lines().next().unwrap_or("");
+    let clean: String = first.chars().filter(|c| !c.is_control()).collect();
+    let clean = clean.trim();
+    if clean.chars().count() <= 120 {
+        clean.to_string()
+    } else {
+        clean.chars().take(120).collect::<String>() + "…"
+    }
+}
+
 /// TTY-gated `[Y/n]` confirmation (the `newt setup` pattern). `--yes` skips;
 /// a non-terminal stdin without `--yes` fails closed. Prompts on stderr so
 /// stdout stays report-only.
@@ -406,8 +429,8 @@ fn confirm_or_bail(question: &str, action: &str, yes: bool) -> anyhow::Result<()
     eprint!("{question} [Y/n] ");
     io::stderr().flush()?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
-    if is_yes(&buf, true) {
+    let bytes_read = io::stdin().read_line(&mut buf)?;
+    if consent_given(bytes_read, &buf) {
         Ok(())
     } else {
         bail!("Aborted.");
@@ -500,12 +523,13 @@ pub async fn run(args: ProbeArgs, config_path: Option<&Path>) -> anyhow::Result<
                     outcome.entry.name
                 )
             })?;
-        println!(
+        // Status goes to stderr: stdout is report-only (--json purity).
+        eprintln!(
             "Registered MCP server '{}' in {}",
             outcome.entry.name,
             written.display()
         );
-        crate::mcp_cmd::print_next_steps(&mut io::stdout())?;
+        crate::mcp_cmd::print_next_steps(&mut io::stderr())?;
     }
     if args.to_catalog {
         let path = catalog_write_target(args.project)?;
@@ -529,7 +553,7 @@ pub async fn run(args: ProbeArgs, config_path: Option<&Path>) -> anyhow::Result<
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         std::fs::write(&path, updated).with_context(|| format!("writing {}", path.display()))?;
-        println!(
+        eprintln!(
             "Cataloged '{}' in {} — install it with `newt mcp install {}`",
             outcome.entry.name,
             path.display(),
@@ -1046,5 +1070,34 @@ mod tests {
         assert!(!is_yes("", false));
         assert!(is_yes("Y", false));
         assert!(!is_yes("n", true));
+    }
+
+    #[test]
+    fn consent_requires_input_eof_fails_closed() {
+        // Ctrl-D at the prompt reads 0 bytes with an empty buffer — that is
+        // NOT a yes. Only an actual newline keypress may take the default.
+        assert!(!consent_given(0, ""), "EOF must never proceed to execution");
+        assert!(consent_given(1, "\n"), "bare Enter = default yes");
+        assert!(consent_given(2, "y\n"));
+        assert!(!consent_given(3, "no\n"));
+    }
+
+    #[test]
+    fn hostile_server_titles_are_clamped_to_one_bounded_clean_line() {
+        let hostile = format!("Evil\x1b[2J\x07 Title{}\nsecond line", "x".repeat(400));
+        let got = derive_description(Some(&info("s", Some(&hostile), "1")), None);
+        assert!(
+            !got.contains('\x1b') && !got.contains('\x07'),
+            "control chars must not reach the terminal/catalog: {got:?}"
+        );
+        assert!(!got.contains('\n'), "single line: {got:?}");
+        assert!(got.chars().count() <= 121, "bounded: {} chars", got.len());
+        assert!(got.starts_with("Evil"), "{got:?}");
+        // The identity line clamps too — a hostile title/version never
+        // reaches the terminal raw.
+        let mut o = sample_outcome();
+        o.server_info = Some(info("s", Some(&hostile), "1.0\x1b[31m"));
+        let text = render_text_report(&o).unwrap();
+        assert!(!text.contains('\x1b'), "{text:?}");
     }
 }

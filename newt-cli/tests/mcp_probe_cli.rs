@@ -79,7 +79,8 @@ fn probe_save_writes_the_config_and_duplicate_suggests_a_rename() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Registered MCP server"));
+        // Status lines live on stderr; stdout is report-only.
+        .stderr(predicate::str::contains("Registered MCP server"));
     let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml")).unwrap();
     assert_eq!(cfg.mcp_servers.len(), 1);
     assert_eq!(cfg.mcp_servers[0].name, "newt-mcp-server");
@@ -126,7 +127,8 @@ fn probe_to_catalog_then_install_round_trips() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("newt mcp install self-probe"));
+        // Status lines live on stderr; stdout is report-only.
+        .stderr(predicate::str::contains("newt mcp install self-probe"));
     let catalog_text = std::fs::read_to_string(sb.config_dir.join("mcp-catalog.toml")).unwrap();
     assert!(
         catalog_text.contains("name = \"self-probe\""),
@@ -280,6 +282,33 @@ async fn probe_url_reports_auth_required_on_401() {
         .success()
         .stdout(predicate::str::contains("authentication required"))
         .stdout(predicate::str::contains("newt auth locked"));
+}
+
+#[test]
+fn probe_json_with_save_keeps_stdout_a_single_json_value() {
+    let sb = sandbox();
+    let assert = newt(&sb)
+        .args([
+            "mcp",
+            "probe",
+            &newt_bin(),
+            "--arg",
+            "mcp",
+            "--json",
+            "--save",
+            "--to-catalog",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // Status lines ("Registered…", next steps, "Cataloged…") belong on
+    // stderr — stdout must stay exactly one machine-parseable JSON value.
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout not a single JSON value ({e}):\n{stdout}"));
+    assert_eq!(v["name"], "newt-mcp-server");
+    assert!(sb.config_dir.join("config.toml").exists());
+    assert!(sb.config_dir.join("mcp-catalog.toml").exists());
 }
 
 #[test]
