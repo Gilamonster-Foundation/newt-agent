@@ -910,6 +910,11 @@ pub(crate) fn run_chat(
     // re-walk + re-embed the repo every turn — reset on /new to re-index.
     let semantic_index = newt_core::SessionSemanticIndex::default();
     let mut semantic_indexed = false;
+    // #1285: the model-free `where_is` symbol index, built once per session on
+    // the first turn (reset on /new). Independent of the embedder — structural
+    // extraction needs no model, so the exact typed-verdict lookup rides every
+    // session as the navigation floor.
+    let mut where_is_index: Option<newt_core::WhereIsIndex> = None;
     // Step 26.6a (#585): session-scoped experiential ledger. Unlike the others it
     // SURVIVES /new (cross-task reuse within the session) — see the /new handler.
     let experience_store = newt_core::SessionExperienceStore::default();
@@ -1939,6 +1944,9 @@ pub(crate) fn run_chat(
                             semantic_index.clear();
                         }
                         semantic_indexed = false;
+                        // #1285: drop the where_is index too so /new re-derives it
+                        // (picks up file adds/removes on the next turn).
+                        where_is_index = None;
                         // Step 26.6a (#585): the experiential ledger is INTENTIONALLY
                         // NOT cleared here — it is cross-task by design (a later task
                         // reuses earlier lessons). It is dropped only at session end.
@@ -3238,6 +3246,14 @@ pub(crate) fn run_chat(
                         .map(|spill| spill as &dyn crate::SpillInput);
                     #[cfg(not(feature = "live-spill"))]
                     let spill_input: Option<&dyn crate::SpillInput> = None;
+                    // #1285: build the model-free where_is index once per session
+                    // (the gather is a capped, cheap structural walk — no model,
+                    // no network). The typed-verdict lookup then rides this turn.
+                    if where_is_index.is_none() {
+                        where_is_index = Some(tokio::task::block_in_place(|| {
+                            newt_core::build_where_is_index_from_workspace(workspace)
+                        }));
+                    }
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -3281,6 +3297,10 @@ pub(crate) fn run_chat(
                                                 top_k: semantic_cfg.top_k,
                                             }
                                         }),
+                                        // #1285: the exact typed-verdict symbol
+                                        // lookup — Some once the model-free index
+                                        // is built (first turn), degrading honestly.
+                                        where_is: where_is_index.as_ref(),
                                         // Step 26.6a (#585): the experiential store
                                         // for record/recall — Some only when on.
                                         experience_store: experiential_on.then_some(

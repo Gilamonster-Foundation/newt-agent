@@ -7826,6 +7826,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -7869,6 +7870,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -7920,6 +7922,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -7968,6 +7971,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8009,6 +8013,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8057,6 +8062,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8311,6 +8317,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8336,6 +8343,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8405,6 +8413,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8450,6 +8459,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8504,6 +8514,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -9242,6 +9253,7 @@ mod tool_round_cap_tests {
                     scratchpad: false,
                     scratchpad_store: None,
                     code_search: None,
+                    where_is: None,
                     experience_store: None,
                     step_ledger: None,
                     caveats: &caveats,

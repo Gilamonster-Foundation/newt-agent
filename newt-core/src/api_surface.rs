@@ -263,6 +263,25 @@ fn glob_match(pattern: &str, filename: &str) -> bool {
     }
 }
 
+/// Extract `(symbol, path, kind)` facts from already-gathered files using the
+/// resolved language packs — the SAME extraction the rendered surface uses, so
+/// the `where_is` index (#1285) and the tier-2 skeleton witness identical facts.
+/// Compiles the packs once. Pure (no filesystem).
+#[must_use]
+pub fn symbol_facts(
+    packs: &[LanguagePack],
+    files: &[(String, String)],
+) -> Vec<(String, String, String)> {
+    let provider = ApiSurfaceProvider::new(packs.to_vec(), &ApiSurfaceConfig::default());
+    let mut out = Vec::new();
+    for (path, content) in files {
+        for (symbol, kind) in provider.public_symbols(path, content) {
+            out.push((symbol, path.clone(), kind));
+        }
+    }
+    out
+}
+
 /// SC-L2 / SC-PO-2 — the tier-2 surface-budget resolver.
 ///
 /// A **total, monotone, clamped** pure function of the resolved session send

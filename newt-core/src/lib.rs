@@ -63,6 +63,7 @@ pub mod tokens;
 pub mod tooling;
 pub mod tuning;
 pub mod verify_gate;
+pub mod where_is;
 pub mod workflows;
 pub mod workspace_key;
 
@@ -133,6 +134,10 @@ pub use conversation::{
 };
 pub use ffi_surface::FfiSurfaceProvider;
 pub use project_map::ProjectMapProvider;
+pub use where_is::{
+    build_where_is_index, build_where_is_index_from_workspace, execute_where_is,
+    where_is_tool_definition, LookupVerdict, WhereIsIndex, Witness,
+};
 // `kit::Tier` (Headless|TuiOnly) is *not* re-exported here — it would collide with
 // the router's task-complexity `Tier`; reach it as `kit::Tier`.
 pub use kit::{Axis, MountKind, RegistryEntry, COMPONENT_REGISTRY};

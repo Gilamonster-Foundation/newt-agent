@@ -2217,6 +2217,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "request_user_input" => string("question", ""),
         "prompt_read" | "artifact_read" => string("address", "current"),
         "tool_search" | "recall" | "code_search" | "experience_recall" => string("query", ""),
+        "where_is" => string("symbol", ""),
         "memory_fetch" => string("address", ""),
         "save_note" => string("action", ""),
         "git" => string("op", ""),
@@ -2685,6 +2686,7 @@ pub async fn execute_tool(
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
+    where_is: Option<&crate::where_is::WhereIsIndex>,
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
 ) -> String {
@@ -2706,6 +2708,7 @@ pub async fn execute_tool(
         crew_runner,
         scratchpad_store,
         code_search,
+        where_is,
         experience_store,
         step_ledger,
         false,
@@ -2736,6 +2739,7 @@ pub async fn execute_tool_with_offload(
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
+    where_is: Option<&crate::where_is::WhereIsIndex>,
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
     tool_offload: bool,
@@ -2761,6 +2765,7 @@ pub async fn execute_tool_with_offload(
         crew_runner,
         scratchpad_store,
         code_search,
+        where_is,
         experience_store,
         step_ledger,
         tool_offload,
@@ -2795,6 +2800,7 @@ pub async fn execute_tool_with_offload_and_prompt(
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
+    where_is: Option<&crate::where_is::WhereIsIndex>,
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
     tool_offload: bool,
@@ -2822,6 +2828,7 @@ pub async fn execute_tool_with_offload_and_prompt(
         crew_runner,
         scratchpad_store,
         code_search,
+        where_is,
         experience_store,
         step_ledger,
         tool_offload,
@@ -2856,6 +2863,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
+    where_is: Option<&crate::where_is::WhereIsIndex>,
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
     tool_offload: bool,
@@ -2884,6 +2892,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         crew_runner,
         scratchpad_store,
         code_search,
+        where_is,
         experience_store,
         step_ledger,
         tool_offload,
@@ -2922,6 +2931,7 @@ pub(crate) async fn execute_tool_with_offload_and_prompt_and_artifacts_cancellab
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
+    where_is: Option<&crate::where_is::WhereIsIndex>,
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
     tool_offload: bool,
@@ -2959,6 +2969,7 @@ pub(crate) async fn execute_tool_with_offload_and_prompt_and_artifacts_cancellab
         crew_runner,
         scratchpad_store,
         code_search,
+        where_is,
         experience_store,
         step_ledger,
         tool_offload,
@@ -3005,6 +3016,7 @@ async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
+    where_is: Option<&crate::where_is::WhereIsIndex>,
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
     tool_offload: bool,
@@ -3040,6 +3052,7 @@ async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
             crew_runner,
             scratchpad_store,
             code_search,
+            where_is,
             experience_store,
             step_ledger,
             tool_offload,
@@ -3091,6 +3104,7 @@ async fn execute_tool_inner(
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
+    where_is: Option<&crate::where_is::WhereIsIndex>,
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
     tool_offload: bool,
@@ -3325,6 +3339,13 @@ async fn execute_tool_inner(
             None => {
                 "unknown tool: code_search (semantic retrieval is off this session)".to_string()
             }
+        },
+
+        // #1285: exact, typed-verdict symbol lookup — presence-gated on the
+        // retained where_is index (built from the honest gather + language packs).
+        "where_is" => match where_is {
+            Some(index) => crate::where_is::execute_where_is(args, index, tool_output_lines),
+            None => "unknown tool: where_is (no symbol index built for this session)".to_string(),
         },
 
         // Step 26.6a (#585): experiential record/recall — presence-gated on the
@@ -5602,6 +5623,10 @@ mod tests {
                 // injected capability, degrades to raw source when color is
                 // off), pushed after lifecycle.
                 "render_report",
+                // #1285: advertised ALWAYS (a read-only navigation utility like
+                // tool_search; degrades honestly when no symbol index is built),
+                // pushed after render_report.
+                "where_is",
             ]
         );
     }
@@ -5855,6 +5880,7 @@ mod tests {
             None,  // crew_runner
             None,  // scratchpad_store
             None,  // code_search
+            None,  // where_is
             None,  // experience_store
             None,  // step_ledger
             false, // tool_offload
@@ -6001,6 +6027,7 @@ mod tests {
             20,
             &caveats,
             &mut NoMcp,
+            None,
             None,
             None,
             None,
@@ -6933,6 +6960,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(none.starts_with("unknown tool: state_set"), "{none}");
@@ -6955,6 +6983,7 @@ mod tests {
             None,
             None,
             Some(&store as &dyn ScratchpadStore),
+            None,
             None,
             None,
             None,
@@ -6997,6 +7026,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(none.starts_with("unknown tool: code_search"), "{none}");
@@ -7027,6 +7057,7 @@ mod tests {
             Some(search),
             None,
             None,
+            None,
         )
         .await;
         assert!(out.contains("no code matched"), "{out}");
@@ -7043,7 +7074,7 @@ mod tests {
         for name in ["experience_record", "experience_recall"] {
             let out = execute_tool(
                 name, &args, ".", false, 20, &caveats, &mut NoMcp, None, None, None, None, None,
-                None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None,
             )
             .await;
             assert!(out.starts_with(&format!("unknown tool: {name}")), "{out}");
@@ -7058,6 +7089,7 @@ mod tests {
             20,
             &caveats,
             &mut NoMcp,
+            None,
             None,
             None,
             None,
@@ -7089,7 +7121,7 @@ mod tests {
         for name in ["update_plan", "plan_get"] {
             let out = execute_tool(
                 name, &args, ".", false, 20, &caveats, &mut NoMcp, None, None, None, None, None,
-                None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None,
             )
             .await;
             assert!(out.starts_with(&format!("unknown tool: {name}")), "{out}");
@@ -7115,6 +7147,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&ledger as &dyn StepLedger),
         )
         .await;
@@ -7129,6 +7162,7 @@ mod tests {
             20,
             &caveats,
             &mut NoMcp,
+            None,
             None,
             None,
             None,
@@ -7170,6 +7204,7 @@ mod tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -7307,6 +7342,7 @@ mod execute_tool_branch_tests {
             None,  // crew_runner
             None,  // scratchpad_store
             None,  // code_search
+            None,  // where_is
             None,  // experience_store
             None,  // step_ledger
             false, // tool_offload
@@ -7368,6 +7404,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None,
+            None,
             Some(ledger as &dyn crate::agentic::scheduled::StepLedger),
         )
         .await
@@ -7397,6 +7434,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -7456,6 +7494,7 @@ mod execute_tool_branch_tests {
             None,       // crew_runner
             None,       // scratchpad_store
             None,       // code_search
+            None,       // where_is
             None,       // experience_store
             None,       // step_ledger
         )
@@ -7680,6 +7719,7 @@ mod execute_tool_branch_tests {
             crew,
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8077,6 +8117,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None,
+            None,
             false,
             None,
             None,
@@ -8405,6 +8446,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -8477,6 +8519,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
             false,
@@ -9416,6 +9459,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -9482,6 +9526,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None,
+            None,
             false,
             None,
             persona_tools,
@@ -9524,6 +9569,7 @@ mod execute_tool_branch_tests {
             None,  // crew_runner
             None,  // scratchpad_store
             None,  // code_search
+            None,  // where_is
             None,  // experience_store
             None,  // step_ledger
             false, // tool_offload
@@ -10058,6 +10104,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -10454,6 +10501,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -10572,6 +10620,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -10633,6 +10682,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -10697,6 +10747,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -10815,6 +10866,7 @@ mod disable_ocap_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -11382,6 +11434,7 @@ mod disable_ocap_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -11410,6 +11463,7 @@ mod disable_ocap_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -11576,6 +11630,7 @@ mod disable_ocap_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )
@@ -11640,6 +11695,7 @@ mod disable_ocap_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // where_is
             None, // experience_store
             None, // step_ledger
         )

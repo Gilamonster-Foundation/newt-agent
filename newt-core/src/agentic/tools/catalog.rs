@@ -431,6 +431,7 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
                 | "memory_fetch"
                 | "state_get"
                 | "code_search"
+                | "where_is"
                 | "experience_recall"
                 | "plan_get"
                 // Read-only harness utilities / presentation.
@@ -727,6 +728,16 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
         name: "code_search",
         definition: super::super::semantic::code_search_tool_definition,
         gate: Gate::CodeSearch,
+    },
+    // #1285: where_is is a read-only navigation UTILITY (like tool_search /
+    // get_context_remaining) — advertised every session and degrading honestly
+    // when no symbol index was built (the index is model-free + cheap, so the
+    // harness builds it for any project). Gate::Always keeps the merged catalog
+    // free of a per-call flag; the executor's `where_is: None` arm coaches.
+    ToolSpec {
+        name: "where_is",
+        definition: crate::where_is::where_is_tool_definition,
+        gate: Gate::Always,
     },
     ToolSpec {
         name: "experience_record",
