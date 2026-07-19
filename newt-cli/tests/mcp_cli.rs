@@ -291,6 +291,54 @@ fn project_flag_edits_the_ancestor_project_config_from_a_subdir() {
 }
 
 #[test]
+fn list_fails_loudly_on_a_broken_newt_config() {
+    let sb = sandbox();
+    std::fs::write(sb.config_dir.join("config.toml"), "not toml [").unwrap();
+    // Swallowing the broken config and printing an empty view would
+    // contradict the command's own show-and-flag contract.
+    newt(&sb)
+        .args(["mcp", "list"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TOML"));
+}
+
+#[test]
+fn list_attributes_claude_code_overlays_to_their_files() {
+    let sb = sandbox();
+    std::fs::write(
+        sb.home.join(".claude.json"),
+        r#"{ "mcpServers": { "user-srv": { "command": "u" } } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        sb.cwd.join(".mcp.json"),
+        r#"{ "mcpServers": { "proj-srv": { "command": "p" } } }"#,
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "add", "mine", "--command", "m"])
+        .assert()
+        .success();
+
+    let assert = newt(&sb).args(["mcp", "list"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let row = |name: &str| {
+        stdout
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no row for {name} in:\n{stdout}"))
+            .to_string()
+    };
+    assert!(row("mine").contains("newt config"), "{stdout}");
+    assert!(row("user-srv").contains("claude-code (user)"), "{stdout}");
+    assert!(
+        row("proj-srv").contains("claude-code (project)"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn add_project_writes_the_project_config_not_the_user_config() {
     let sb = sandbox();
     newt(&sb)

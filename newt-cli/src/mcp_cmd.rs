@@ -318,7 +318,10 @@ struct McpRow {
 
 /// Fold the three sources into the deduped view, mirroring
 /// [`newt_core::mcp::discover`]'s precedence (newt > Claude user > Claude
-/// project, first occurrence of a name wins). Pure.
+/// project). Like discover, only VALID entries claim a name — a later valid
+/// duplicate is shadowed, but an invalid entry never shadows the entry the
+/// session will actually connect. Invalid entries are always shown, flagged.
+/// Pure.
 fn merged_rows(
     newt: &[McpServerEntry],
     claude_user: &[McpServerEntry],
@@ -329,19 +332,21 @@ fn merged_rows(
         (McpSource::ClaudeUser, claude_user),
         (McpSource::ClaudeProject, claude_project),
     ];
-    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut claimed: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut rows = Vec::new();
     for (source, entries) in sources {
         for entry in entries {
-            if seen.insert(entry.name.as_str()) {
-                rows.push(McpRow {
-                    name: entry.name.clone(),
-                    transport: entry.transport,
-                    enabled: entry.enabled,
-                    source,
-                    valid: entry.is_valid(),
-                });
+            let valid = entry.is_valid();
+            if valid && !claimed.insert(entry.name.as_str()) {
+                continue; // shadowed by an earlier valid claimant
             }
+            rows.push(McpRow {
+                name: entry.name.clone(),
+                transport: entry.transport,
+                enabled: entry.enabled,
+                source,
+                valid,
+            });
         }
     }
     rows
@@ -389,9 +394,13 @@ fn render_rows(rows: &[McpRow], out: &mut dyn Write) -> anyhow::Result<()> {
 /// IO shell for `newt mcp list`: load the newt config + the Claude Code
 /// overlay files, then render the pure merged view.
 fn cmd_list(config_path: Option<&Path>, out: &mut dyn Write) -> anyhow::Result<()> {
+    // A broken newt config must fail loudly — an empty view over a config
+    // that failed to parse would contradict the show-and-flag contract.
+    // (resolve() returns the default config when NO file exists; it only
+    // errors when a file is present but unreadable.)
     let cfg = match config_path {
         Some(p) => Config::load(p)?,
-        None => Config::resolve().unwrap_or_default(),
+        None => Config::resolve()?,
     };
     let claude_user = crate::home_dir()
         .map(|h| load_claude_json(&h.join(".claude.json")))
@@ -622,6 +631,34 @@ mod tests {
         assert_eq!(rows[2].source, McpSource::ClaudeUser);
         assert!(!rows[2].enabled);
         assert_eq!(rows[3].source, McpSource::ClaudeProject);
+    }
+
+    #[test]
+    fn merged_rows_never_let_an_invalid_entry_shadow_the_real_winner() {
+        // discover() only lets VALID entries claim a name: with an invalid
+        // newt "x" and a valid claude-code "x", the session connects the
+        // claude one. The view must show BOTH — the invalid row flagged, and
+        // the valid row that actually wins — never hide the winner.
+        let newt = vec![stdio_entry("x", None)]; // invalid: stdio, no command
+        let claude_user = vec![stdio_entry("x", Some("claude-wins"))];
+        let rows = merged_rows(&newt, &claude_user, &[]);
+        assert_eq!(
+            rows.len(),
+            2,
+            "both the flagged row and the winner: {rows:?}"
+        );
+        assert_eq!(rows[0].source, McpSource::NewtConfig);
+        assert!(!rows[0].valid);
+        assert_eq!(rows[1].source, McpSource::ClaudeUser);
+        assert!(rows[1].valid, "the connecting entry must be visible");
+        // A valid claimant still shadows a later VALID duplicate.
+        let rows = merged_rows(
+            &[stdio_entry("y", Some("newt-wins"))],
+            &[stdio_entry("y", Some("shadowed"))],
+            &[],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, McpSource::NewtConfig);
     }
 
     #[test]
