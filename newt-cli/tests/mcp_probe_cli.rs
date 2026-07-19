@@ -312,6 +312,72 @@ fn probe_json_with_save_keeps_stdout_a_single_json_value() {
 }
 
 #[test]
+fn unreadable_probe_rules_drop_in_fails_loudly() {
+    let sb = sandbox();
+    // Present-but-unreadable (one invalid-UTF-8 byte): silently skipping it
+    // would probe with the WRONG rules — the #1291 read-safety contract.
+    std::fs::write(sb.config_dir.join("mcp-probe-rules.toml"), b"caf\xE9").unwrap();
+    newt(&sb)
+        .args(["mcp", "probe", "/usr/bin/true", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mcp-probe-rules.toml"));
+}
+
+#[test]
+fn malformed_probe_rules_drop_in_fails_loudly() {
+    let sb = sandbox();
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    std::fs::write(
+        sb.cwd.join(".newt").join("mcp-probe-rules.toml"),
+        "not toml [",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "probe", "/usr/bin/true", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mcp-probe-rules.toml"));
+}
+
+#[test]
+fn unreadable_catalog_drop_in_fails_install_loudly() {
+    let sb = sandbox();
+    std::fs::write(sb.config_dir.join("mcp-catalog.toml"), b"caf\xE9").unwrap();
+    // Silently skipping the unreadable overlay would install from a catalog
+    // the operator believes they have overridden.
+    newt(&sb)
+        .args(["mcp", "install", "scrybe"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mcp-catalog.toml"));
+    assert!(!sb.config_dir.join("config.toml").exists());
+}
+
+#[test]
+fn probe_rules_project_drop_in_beats_the_user_one() {
+    let sb = sandbox();
+    // User rules would never speak MCP; the project rules pin `mcp`. Success
+    // proves the project file won the whole-file replacement.
+    std::fs::write(
+        sb.config_dir.join("mcp-probe-rules.toml"),
+        "arg_candidates = [[\"definitely-wrong\"]]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    std::fs::write(
+        sb.cwd.join(".newt").join("mcp-probe-rules.toml"),
+        "arg_candidates = [[\"mcp\"]]\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "probe", &newt_bin(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("newt-mcp-server"));
+}
+
+#[test]
 fn probe_refuses_non_loopback_plain_http_without_consent() {
     let sb = sandbox();
     newt(&sb)
@@ -332,28 +398,31 @@ fn probe_of_an_unreachable_loopback_url_fails_with_the_dial_error() {
         .stderr(predicate::str::contains("127.0.0.1"));
 }
 
-/// UAT tier (weekly / release): probe a real external MCP server named by
-/// `NEWT_UAT_MCP_CMD` (e.g. `scrybe-mcp-server stdio`) — the
-/// `live_confined_mcp.rs` pattern: no host path baked in, `#[ignore]` so the
-/// per-PR run never spawns it.
+/// UAT tier (weekly / release): probe a real external MCP server — the
+/// `live_confined_mcp.rs` env convention: `NEWT_UAT_MCP_CMD` is the command
+/// ONLY (a path may contain spaces), `NEWT_UAT_MCP_ARGS` is the space-split
+/// argument list. No host path baked in; `#[ignore]` keeps the per-PR run
+/// from spawning it.
 #[test]
-#[ignore = "UAT: needs a live MCP server via NEWT_UAT_MCP_CMD"]
+#[ignore = "UAT: needs a live MCP server via NEWT_UAT_MCP_CMD (+ NEWT_UAT_MCP_ARGS)"]
 fn probe_live_server_from_env() {
-    let Ok(spec) = std::env::var("NEWT_UAT_MCP_CMD") else {
+    let Ok(command) = std::env::var("NEWT_UAT_MCP_CMD") else {
         eprintln!("NEWT_UAT_MCP_CMD unset; nothing to probe");
         return;
     };
-    let mut parts = spec.split_whitespace();
-    let command = parts.next().expect("NEWT_UAT_MCP_CMD is empty");
+    assert!(
+        Path::new(&command).exists() || !command.contains('/'),
+        "NEWT_UAT_MCP_CMD names a missing path: {command}"
+    );
+    let args = std::env::var("NEWT_UAT_MCP_ARGS").unwrap_or_default();
     let sb = sandbox();
     let mut cmd = newt(&sb);
-    cmd.args(["mcp", "probe", command]);
-    for arg in parts {
+    cmd.args(["mcp", "probe", &command]);
+    for arg in args.split_whitespace() {
         cmd.args(["--arg", arg]);
     }
     cmd.arg("--yes")
         .assert()
         .success()
         .stdout(predicate::str::contains("[[mcp_servers]]"));
-    let _ = Path::new(&spec); // spec is host-provided; nothing else assumed
 }

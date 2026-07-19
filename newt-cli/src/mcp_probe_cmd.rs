@@ -447,7 +447,7 @@ fn resolve_probe_rules() -> anyhow::Result<ProbeRules> {
         .map(|d| d.join(".newt").join("mcp-probe-rules.toml"));
     let user = Config::user_config_dir().map(|d| d.join("mcp-probe-rules.toml"));
     for path in [project, user].into_iter().flatten() {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(text) = crate::mcp_cmd::read_optional(&path)? {
             return parse_probe_rules(&text).with_context(|| format!("in {}", path.display()));
         }
     }
@@ -571,7 +571,14 @@ async fn probe_stdio(
     env: BTreeMap<String, String>,
     caveats: &Caveats,
 ) -> anyhow::Result<ProbeOutcome> {
-    let candidates = candidate_arg_lists(&args.args, &resolve_probe_rules()?);
+    // Rules are only consulted when no --arg pinned the candidate — an
+    // explicit --arg probe must not fail on an unrelated rules drop-in.
+    let rules = if args.args.is_empty() {
+        resolve_probe_rules()?
+    } else {
+        ProbeRules::default()
+    };
+    let candidates = candidate_arg_lists(&args.args, &rules);
     if candidates.is_empty() {
         bail!("nothing to try: the probe rules are empty and no --arg was given");
     }

@@ -202,6 +202,20 @@ pub(crate) fn write_target(config_path: Option<&Path>, project: bool) -> anyhow:
 /// text (the first-write case); any other read failure — permissions, a
 /// non-UTF-8 byte — aborts loudly. Treating those as empty would rewrite the
 /// user's whole config as just the appended entry: silent data loss.
+/// Read an OPTIONAL drop-in file: `Ok(None)` when it does not exist, its text
+/// when it does, and a loud error naming the path for any other read failure
+/// (permissions, a non-UTF-8 byte). Silently skipping a present-but-unreadable
+/// drop-in would act on config the operator believes they have overridden —
+/// the same read-safety contract as [`read_config_text`].
+pub(crate) fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("cannot read drop-in {}", path.display())),
+    }
+}
+
 pub(crate) fn read_config_text(path: &Path) -> anyhow::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
@@ -482,7 +496,7 @@ fn resolve_catalog() -> anyhow::Result<Vec<(McpCatalogEntry, CatalogOrigin)>> {
         .ok()
         .map(|d| d.join(".newt").join("mcp-catalog.toml"));
     for path in [user, project].into_iter().flatten() {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(text) = read_optional(&path)? {
             let entries = parse_catalog(&text).with_context(|| format!("in {}", path.display()))?;
             layers.push((CatalogOrigin::DropIn(path), entries));
         }
