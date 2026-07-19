@@ -4103,6 +4103,116 @@ impl Config {
         Ok(doc.to_string())
     }
 
+    /// Append a `[[mcp_servers]]` entry to the TOML `text`, preserving comments
+    /// and formatting (`newt mcp add|install`). PURE (no I/O) like
+    /// [`with_mcp_enabled`](Self::with_mcp_enabled); the caller does the
+    /// read/write. Defaults stay implicit (no `enabled = true`, no
+    /// `type = "stdio"`) so the file stays minimal. Errors on an empty name, a
+    /// duplicate name, or an entry whose transport is missing its required
+    /// field ([`crate::mcp::McpServerEntry::is_valid`]) — an unconnectable
+    /// server never lands in the file.
+    pub fn with_mcp_server_added(text: &str, entry: &crate::mcp::McpServerEntry) -> Result<String> {
+        if entry.name.trim().is_empty() {
+            return Err(NewtError::Config(
+                "MCP server name cannot be empty".to_string(),
+            ));
+        }
+        if !entry.is_valid() {
+            let need = match entry.transport {
+                crate::mcp::TransportKind::Stdio => "a `command`",
+                crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => "a `url`",
+            };
+            return Err(NewtError::Config(format!(
+                "a {} MCP server requires {need}",
+                entry.transport.as_str()
+            )));
+        }
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let servers =
+            doc.as_table_mut()
+                .entry("mcp_servers")
+                .or_insert(toml_edit::Item::ArrayOfTables(
+                    toml_edit::ArrayOfTables::new(),
+                ));
+        let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
+            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+        })?;
+        if arr
+            .iter()
+            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(entry.name.as_str()))
+        {
+            return Err(NewtError::Config(format!(
+                "an [[mcp_servers]] entry named `{}` already exists (remove it first, \
+                 or toggle it with `/mcp enable|disable`)",
+                entry.name
+            )));
+        }
+        let mut table = toml_edit::Table::new();
+        table["name"] = toml_edit::value(&entry.name);
+        if !entry.enabled {
+            table["enabled"] = toml_edit::value(false);
+        }
+        if entry.transport != crate::mcp::TransportKind::Stdio {
+            table["type"] = toml_edit::value(entry.transport.as_str());
+        }
+        if let Some(command) = &entry.command {
+            table["command"] = toml_edit::value(command);
+        }
+        if !entry.args.is_empty() {
+            table["args"] = toml_edit::value(toml_edit::Array::from_iter(&entry.args));
+        }
+        if !entry.env.is_empty() {
+            table["env"] = toml_edit::value(toml_edit::InlineTable::from_iter(
+                entry.env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            ));
+        }
+        if let Some(url) = &entry.url {
+            table["url"] = toml_edit::value(url);
+        }
+        if !entry.headers.is_empty() {
+            table["headers"] = toml_edit::value(toml_edit::InlineTable::from_iter(
+                entry.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            ));
+        }
+        if let Some(secs) = entry.request_timeout_secs {
+            table["request_timeout_secs"] =
+                toml_edit::value(i64::try_from(secs).map_err(|_| {
+                    NewtError::Config(format!("request timeout {secs}s is out of range"))
+                })?);
+        }
+        arr.push(table);
+        Ok(doc.to_string())
+    }
+
+    /// Remove the named `[[mcp_servers]]` entry from the TOML `text`, preserving
+    /// comments and formatting (`newt mcp remove`). PURE (no I/O); the caller
+    /// does the read/write. Errors when the server name isn't present.
+    pub fn with_mcp_server_removed(text: &str, name: &str) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        // Distinguish "no section" (→ the entry is absent) from "a section this
+        // writer cannot edit" (e.g. the inline-array form, which the serde
+        // reader accepts) — misreporting the latter as absent would be a lie.
+        let item = doc
+            .as_table_mut()
+            .get_mut("mcp_servers")
+            .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
+        let arr = item.as_array_of_tables_mut().ok_or_else(|| {
+            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+        })?;
+        let before = arr.len();
+        arr.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
+        if arr.len() == before {
+            return Err(NewtError::Config(format!(
+                "no [[mcp_servers]] entry named `{name}`"
+            )));
+        }
+        Ok(doc.to_string())
+    }
+
     pub fn with_net_host(text: &str, host: &str) -> Result<String> {
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
@@ -6257,6 +6367,214 @@ max_tool_rounds = 25
         let d: crate::mcp::McpServerEntry =
             toml::from_str("name = \"x\"\ncommand = \"x\"\nenabled = false\n").unwrap();
         assert!(!d.enabled);
+    }
+
+    // ---- `newt mcp add|remove` comment-preserving config writers ----
+
+    #[test]
+    fn with_mcp_server_added_appends_and_preserves_comments() {
+        let text = "\
+# hand-authored config
+default_backend = \"local\" # keep me
+
+[[mcp_servers]]
+name = \"modulex\"
+command = \"modulex-mcp\"
+";
+        let entry = crate::mcp::McpServerEntry {
+            name: "scrybe".into(),
+            enabled: true,
+            transport: crate::mcp::TransportKind::Stdio,
+            command: Some("scrybe-mcp-server".into()),
+            args: vec!["stdio".into()],
+            env: std::collections::BTreeMap::from([("SCRYBE_LOG".to_string(), "info".to_string())]),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: Some(120),
+        };
+        let out = Config::with_mcp_server_added(text, &entry).unwrap();
+        assert!(
+            out.contains("# hand-authored config"),
+            "comment lost: {out}"
+        );
+        assert!(out.contains("# keep me"), "inline comment lost: {out}");
+        assert!(out.contains("modulex-mcp"), "existing entry lost: {out}");
+        // Round-trips through the typed config with both entries intact.
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.mcp_servers.len(), 2);
+        let added = cfg.mcp_servers.iter().find(|s| s.name == "scrybe").unwrap();
+        assert_eq!(added.command.as_deref(), Some("scrybe-mcp-server"));
+        assert_eq!(added.args, vec!["stdio"]);
+        assert_eq!(
+            added.env.get("SCRYBE_LOG").map(String::as_str),
+            Some("info")
+        );
+        assert_eq!(added.request_timeout_secs, Some(120));
+        assert!(added.enabled);
+        // Defaults stay implicit — the file stays minimal.
+        assert!(!out.contains("enabled"), "default enabled written: {out}");
+        assert!(!out.contains("type"), "default transport written: {out}");
+    }
+
+    #[test]
+    fn with_mcp_server_added_creates_section_in_empty_text() {
+        let entry = crate::mcp::McpServerEntry {
+            name: "fs".into(),
+            enabled: true,
+            transport: crate::mcp::TransportKind::Stdio,
+            command: Some("mcp-fs".into()),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+        };
+        let out = Config::with_mcp_server_added("", &entry).unwrap();
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert_eq!(cfg.mcp_servers[0].name, "fs");
+        assert_eq!(cfg.mcp_servers[0].command.as_deref(), Some("mcp-fs"));
+    }
+
+    #[test]
+    fn with_mcp_server_added_writes_sse_transport_and_url() {
+        let entry = crate::mcp::McpServerEntry {
+            name: "remote".into(),
+            enabled: true,
+            transport: crate::mcp::TransportKind::Sse,
+            command: None,
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            url: Some("https://mcp.example/sse".into()),
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+        };
+        let out = Config::with_mcp_server_added("", &entry).unwrap();
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.mcp_servers[0].transport, crate::mcp::TransportKind::Sse);
+        assert_eq!(
+            cfg.mcp_servers[0].url.as_deref(),
+            Some("https://mcp.example/sse")
+        );
+    }
+
+    #[test]
+    fn with_mcp_server_added_rejects_duplicates_and_invalid_entries() {
+        let text = "[[mcp_servers]]\nname = \"scrybe\"\ncommand = \"scrybe-mcp-server\"\n";
+        let dup = crate::mcp::McpServerEntry {
+            name: "scrybe".into(),
+            enabled: true,
+            transport: crate::mcp::TransportKind::Stdio,
+            command: Some("other".into()),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+        };
+        let err = Config::with_mcp_server_added(text, &dup).unwrap_err();
+        assert!(err.to_string().contains("scrybe"), "names the dup: {err}");
+
+        // A stdio entry with no command / an sse entry with no url never lands
+        // in the file — it could never connect (mcp::McpServerEntry::is_valid).
+        let no_cmd = crate::mcp::McpServerEntry {
+            name: "ghost".into(),
+            command: None,
+            ..dup.clone()
+        };
+        assert!(Config::with_mcp_server_added("", &no_cmd).is_err());
+        let no_url = crate::mcp::McpServerEntry {
+            name: "ghost".into(),
+            transport: crate::mcp::TransportKind::Http,
+            command: None,
+            ..dup.clone()
+        };
+        assert!(Config::with_mcp_server_added("", &no_url).is_err());
+        // An empty name can never be addressed again — reject it.
+        let unnamed = crate::mcp::McpServerEntry {
+            name: "  ".into(),
+            ..dup.clone()
+        };
+        assert!(Config::with_mcp_server_added("", &unnamed).is_err());
+    }
+
+    #[test]
+    fn with_mcp_server_removed_deletes_only_the_named_entry() {
+        let text = "\
+# my config
+
+[[mcp_servers]]
+name = \"keep\"
+command = \"keep-mcp\" # keep note
+
+[[mcp_servers]]
+name = \"drop\"
+command = \"drop-mcp\"
+";
+        let out = Config::with_mcp_server_removed(text, "drop").unwrap();
+        assert!(out.contains("# my config"), "comment lost: {out}");
+        assert!(out.contains("# keep note"), "inline comment lost: {out}");
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert_eq!(cfg.mcp_servers[0].name, "keep");
+        assert!(!out.contains("drop-mcp"));
+    }
+
+    #[test]
+    fn with_mcp_server_removed_reports_a_non_array_section_accurately() {
+        // The inline-array form is valid TOML the serde reader accepts; the
+        // writer must say it cannot edit that shape, not falsely claim the
+        // entry is absent.
+        let text = "mcp_servers = [ { name = \"x\", command = \"y\" } ]\n";
+        let err = Config::with_mcp_server_removed(text, "x").unwrap_err();
+        assert!(
+            err.to_string().contains("not an array of tables"),
+            "wrong-shape section misreported: {err}"
+        );
+        let err = Config::with_mcp_server_removed("mcp_servers = 3\n", "x").unwrap_err();
+        assert!(
+            err.to_string().contains("not an array of tables"),
+            "scalar section misreported: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_writer_error_branches_are_loud() {
+        let entry = crate::mcp::McpServerEntry {
+            name: "x".into(),
+            enabled: true,
+            transport: crate::mcp::TransportKind::Stdio,
+            command: Some("x-mcp".into()),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+        };
+        // Invalid TOML input text.
+        let err = Config::with_mcp_server_added("not toml [", &entry).unwrap_err();
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+        let err = Config::with_mcp_server_removed("not toml [", "x").unwrap_err();
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+        // A section that is not an array of tables.
+        let err = Config::with_mcp_server_added("mcp_servers = 3\n", &entry).unwrap_err();
+        assert!(err.to_string().contains("not an array of tables"), "{err}");
+        // A timeout that does not fit TOML's i64 integers.
+        let oversized = crate::mcp::McpServerEntry {
+            request_timeout_secs: Some(u64::MAX),
+            ..entry
+        };
+        let err = Config::with_mcp_server_added("", &oversized).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn with_mcp_server_removed_errors_when_absent() {
+        let text = "[[mcp_servers]]\nname = \"present\"\ncommand = \"x\"\n";
+        let err = Config::with_mcp_server_removed(text, "ghost").unwrap_err();
+        assert!(err.to_string().contains("ghost"), "names the miss: {err}");
+        // No section at all errors the same way, not a panic.
+        assert!(Config::with_mcp_server_removed("", "ghost").is_err());
     }
 
     // ---- comment-preserving default-backend writer ----
