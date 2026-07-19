@@ -67,6 +67,9 @@ fn file_scheme_and_ref_read_the_first_non_empty_line() {
 /// side-effect: a `${cmd:…}` (and a `{ cmd = … }` ref) runs on the host ONLY for
 /// a TRUSTED source, NEVER for an UNTRUSTED (discovered Claude/project) source.
 /// A marker file is the observable side effect; its (non-)creation is the proof.
+// Unix-only: real `${cmd:…}` host execution uses a unix shell (`sh -c` +
+// `touch`); the env/file resolvers above stay cross-platform.
+#[cfg(unix)]
 #[test]
 fn cmd_executes_only_for_trusted_sources_never_for_untrusted() {
     let dir = tempfile::tempdir().unwrap();

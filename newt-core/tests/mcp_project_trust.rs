@@ -20,6 +20,11 @@
 //! concurrently with one another. (The `--config`/`Config::load` case needs no
 //! env or cwd, so it is not serial.)
 
+#![cfg(unix)]
+// Unix-only: these integration tests exercise real `${cmd:…}` host execution via
+// a unix shell (`sh -c` + `touch`). The platform-independent trust-STAMPING logic
+// they guard is covered by pure unit tests in newt-core (config.rs / mcp.rs).
+
 use newt_core::mcp::{discover, resolve_secret_under_trust, McpTrust};
 use newt_core::Config;
 
