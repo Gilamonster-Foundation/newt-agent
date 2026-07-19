@@ -133,6 +133,44 @@ pub struct InitializeInfo {
     pub protocol_version: Option<String>,
 }
 
+/// A non-2xx HTTP response from an MCP endpoint, as a **typed** error so a
+/// caller can match on the status (`newt mcp probe`'s "needs `newt auth`"
+/// detection) instead of string-matching a message that could drift.
+/// Downcast it out of an `anyhow` chain via `err.chain()`.
+#[derive(Debug)]
+pub struct HttpStatusError {
+    /// The HTTP status code (e.g. `401`).
+    pub status: u16,
+    /// The canonical reason phrase (`Unauthorized`), possibly empty.
+    reason: String,
+    /// The (trimmed) response body.
+    body: String,
+}
+
+impl HttpStatusError {
+    #[must_use]
+    pub fn new(status: u16, reason: &str, body: &str) -> Self {
+        Self {
+            status,
+            reason: reason.to_string(),
+            body: body.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The exact pre-typed wording — consumers log this text.
+        write!(f, "MCP server returned HTTP {}", self.status)?;
+        if !self.reason.is_empty() {
+            write!(f, " {}", self.reason)?;
+        }
+        write!(f, ": {}", self.body)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
 /// A short, single-line sketch of a JSON value for error messages (a wrong
 /// initialize result may be arbitrarily large or hostile — never echo it all).
 fn summarize_value(v: &Value) -> String {
@@ -728,10 +766,11 @@ impl Transport for HttpTransport {
             .context("reading MCP HTTP response body")?;
 
         if !status.is_success() {
-            return Err(anyhow!(
-                "MCP server returned HTTP {status}: {}",
-                body.trim()
-            ));
+            return Err(anyhow::Error::new(HttpStatusError::new(
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                body.trim(),
+            )));
         }
         if is_sse {
             self.inbox.extend(parse_sse_messages(&body));
@@ -1381,6 +1420,21 @@ mod tests {
             parse_scheme_host(Some("http://user@[::1]:8080/x#f")),
             ("http".into(), "::1".into())
         );
+    }
+
+    #[test]
+    fn http_status_error_keeps_the_established_wording_and_downcasts() {
+        let err = HttpStatusError::new(401, "Unauthorized", "token missing");
+        assert_eq!(
+            err.to_string(),
+            "MCP server returned HTTP 401 Unauthorized: token missing"
+        );
+        let chained = anyhow::Error::new(err).context("initializing MCP server `x`");
+        let found = chained
+            .chain()
+            .find_map(|c| c.downcast_ref::<HttpStatusError>())
+            .expect("typed error survives an anyhow context chain");
+        assert_eq!(found.status, 401);
     }
 
     #[test]

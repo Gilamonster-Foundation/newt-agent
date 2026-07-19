@@ -257,20 +257,25 @@ fn widen_net_for_host(caveats: &Caveats, host: &str) -> Caveats {
     widened
 }
 
+/// The HTTP status inside an http-connect failure, if the failure was a
+/// non-2xx response — matched by TYPE ([`newt_mcp_client::HttpStatusError`]),
+/// never by message text.
+fn http_status_of(err: &anyhow::Error) -> Option<u16> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<newt_mcp_client::HttpStatusError>())
+        .map(|e| e.status)
+}
+
 /// Whether an http connect failure means "authentication required".
-/// There is no typed error today — the client surfaces
-/// `MCP server returned HTTP 401 …` as a string (facts §4).
 fn is_auth_error(err: &anyhow::Error) -> bool {
-    let chain = format!("{err:#}");
-    chain.contains("MCP server returned HTTP 401") || chain.contains("MCP server returned HTTP 403")
+    matches!(http_status_of(err), Some(401 | 403))
 }
 
 /// Whether an http connect failure looks like a legacy SSE-only endpoint
 /// (streamable-HTTP POST rejected with 405/404). The legacy SSE transport is
 /// not implemented in this build — the probe reports instead of guessing.
 fn looks_like_legacy_sse(err: &anyhow::Error) -> bool {
-    let chain = format!("{err:#}");
-    chain.contains("MCP server returned HTTP 405") || chain.contains("MCP server returned HTTP 404")
+    matches!(http_status_of(err), Some(404 | 405))
 }
 
 /// Everything a probe learned, ready to render.
@@ -957,15 +962,23 @@ mod tests {
     }
 
     #[test]
-    fn auth_and_legacy_sse_failures_are_recognized() {
-        let auth = anyhow::anyhow!("MCP server returned HTTP 401 Unauthorized: token missing")
+    fn auth_and_legacy_sse_failures_are_recognized_by_type() {
+        // Built from the client's REAL error type (not a hand-rolled string
+        // replica), so a client wording change cannot silently break the
+        // probe's detection — the coupling is the type, pinned cross-crate.
+        use newt_mcp_client::HttpStatusError;
+        let auth = anyhow::Error::new(HttpStatusError::new(401, "Unauthorized", "token missing"))
             .context("initializing MCP server `x`");
         assert!(is_auth_error(&auth));
-        let forbidden = anyhow::anyhow!("MCP server returned HTTP 403 Forbidden: nope");
+        let forbidden = anyhow::Error::new(HttpStatusError::new(403, "Forbidden", "nope"));
         assert!(is_auth_error(&forbidden));
-        let sse = anyhow::anyhow!("MCP server returned HTTP 405 Method Not Allowed: ")
+        let sse = anyhow::Error::new(HttpStatusError::new(405, "Method Not Allowed", ""))
             .context("initializing MCP server `x`");
         assert!(looks_like_legacy_sse(&sse));
+        assert!(!is_auth_error(&sse));
+        let server_err = anyhow::Error::new(HttpStatusError::new(500, "Internal Server Error", ""));
+        assert!(!is_auth_error(&server_err));
+        assert!(!looks_like_legacy_sse(&server_err));
         let plain = anyhow::anyhow!("MCP HTTP request failed");
         assert!(!is_auth_error(&plain));
         assert!(!looks_like_legacy_sse(&plain));

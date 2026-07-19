@@ -216,6 +216,72 @@ fn probe_json_emits_a_machine_readable_report() {
     assert!(v["toml"].as_str().unwrap().contains("[[mcp_servers]]"));
 }
 
+#[tokio::test]
+async fn probe_url_succeeds_against_a_streamable_http_server() {
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(r#""method":"initialize""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": { "name": "wire-srv", "version": "9.9" },
+                "instructions": "A wired test server."
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("notifications/initialized"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("tools/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "tools": [ { "name": "ping", "description": "", "inputSchema": {} } ] }
+        })))
+        .mount(&server)
+        .await;
+
+    let sb = sandbox();
+    newt(&sb)
+        .args(["mcp", "probe", &server.uri(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wire-srv"))
+        .stdout(predicate::str::contains("A wired test server."))
+        .stdout(predicate::str::contains("ping"))
+        .stdout(predicate::str::contains("type = \"http\""));
+}
+
+#[tokio::test]
+async fn probe_url_reports_auth_required_on_401() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("token required"))
+        .mount(&server)
+        .await;
+
+    let sb = sandbox();
+    // Reachable-but-locked is a FINDING, not a failure: derive the entry,
+    // point at `newt auth`, exit 0.
+    newt(&sb)
+        .args(["mcp", "probe", &server.uri(), "--name", "locked", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("authentication required"))
+        .stdout(predicate::str::contains("newt auth locked"));
+}
+
 #[test]
 fn probe_refuses_non_loopback_plain_http_without_consent() {
     let sb = sandbox();
