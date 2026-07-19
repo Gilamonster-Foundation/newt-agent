@@ -120,8 +120,9 @@ async fn spawn_and_assert_pure(bin: &PathBuf, args: &[&str]) {
 /// #1303 acceptance 1 (decision clause A/E): the mouse tier NEVER emits capture
 /// sequences on a non-interactive path — even with the opt-in FORCED ON
 /// (`NEWT_MOUSE=1`) — because stdout is piped (not a TTY), and separately when
-/// `TERM=dumb`. This is the byte-for-byte non-interactive invariant: the gate
-/// refuses without BOTH TTYs regardless of opt-in.
+/// `TERM=dumb`. This is the byte-for-byte non-interactive invariant, proven
+/// through an ACTUAL turn (a prompt is fed so the turn's `with_live_spill_watch`
+/// path runs), not just REPL init.
 #[tokio::test]
 async fn chat_emits_no_mouse_capture_sequences_when_piped() {
     let bin = locate_newt_bin();
@@ -131,11 +132,18 @@ async fn chat_emits_no_mouse_capture_sequences_when_piped() {
     assert_no_mouse_capture(&bin, "dumb").await;
 }
 
-/// Spawn the real `newt` chat REPL with piped stdio, close stdin (EOF), and
-/// assert stdout carries none of crossterm's mouse-capture private-mode
-/// sequences. `NEWT_MOUSE=1` forces the opt-in ON so the assertion proves the
-/// stdin+stdout-TTY gate — not merely a default-off opt-in. A seeded empty
-/// config skips first-run setup so the run is fast and deterministic.
+/// Spawn the real `newt` chat REPL with piped stdio, FEED A PROMPT so a real
+/// turn runs (the `ReadOutcome::Line` branch → `with_live_spill_watch`, the only
+/// caller of `MouseCaptureGuard::maybe`), THEN close stdin (EOF) so the REPL
+/// exits, and assert stdout carries none of crossterm's mouse-capture
+/// private-mode sequences. `NEWT_MOUSE=1` forces the opt-in ON, so this proves
+/// the byte-for-byte non-interactive invariant holds during an actual turn (the
+/// piped path takes the `!enabled` early-return and never enables capture) — a
+/// stronger claim than the previous stdin-EOF run, which exited before any turn.
+/// (The gate predicate itself — `mouse_capable_for` refusing without BOTH TTYs
+/// even with opt-in on — is proven by the newt-tui unit test
+/// `mouse_tier_requires_optin_and_a_supported_interactive_terminal`.) A seeded
+/// empty config skips first-run setup so the run is fast and deterministic.
 async fn assert_no_mouse_capture(bin: &PathBuf, term: &str) {
     // Isolate config from the real `~/.newt`; seed it so no first-run wizard.
     let home = tempfile::tempdir().expect("tempdir");
@@ -157,8 +165,19 @@ async fn assert_no_mouse_capture(bin: &PathBuf, term: &str) {
         .kill_on_drop(true);
 
     let mut child = cmd.spawn().expect("spawn newt");
-    // Close stdin immediately → the REPL reads EOF and exits.
-    drop(child.stdin.take());
+    {
+        // Feed a real prompt so an ACTUAL turn runs (the Line branch reaches
+        // `with_live_spill_watch` — the turn-level mouse gate), not merely REPL
+        // init. The turn then errors on the unreachable Ollama, but the mouse
+        // gate has already been consulted; the piped path must emit ZERO capture
+        // bytes. Dropping stdin closes it → the REPL reads EOF after the turn
+        // and exits cleanly.
+        let mut stdin = child.stdin.take().expect("take stdin");
+        stdin
+            .write_all(b"hello\n")
+            .await
+            .expect("write prompt to newt chat");
+    }
 
     let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
         .await
