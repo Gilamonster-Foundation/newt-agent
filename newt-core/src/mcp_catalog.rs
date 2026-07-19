@@ -131,12 +131,21 @@ pub fn with_catalog_entry(
     let arr = servers
         .as_array_of_tables_mut()
         .ok_or_else(|| NewtError::Config("[[servers]] is not an array of tables".to_string()))?;
-    let table = crate::mcp::entry_to_toml_table(server, Some(description))?;
+    // An absent description stays an absent key — never `description = ""`.
+    let table =
+        crate::mcp::entry_to_toml_table(server, Some(description).filter(|d| !d.is_empty()))?;
     let existing = arr
         .iter_mut()
         .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(server.name.as_str()));
     match existing {
-        Some(slot) => *slot = table,
+        Some(slot) => {
+            // The table's decor carries the comments ABOVE its [[servers]]
+            // header (e.g. the file banner when replacing the first entry) —
+            // keep it across the swap; only the entry's fields are replaced.
+            let decor = slot.decor().clone();
+            *slot = table;
+            *slot.decor_mut() = decor;
+        }
         None => arr.push(table),
     }
     Ok(doc.to_string())
@@ -262,6 +271,45 @@ env = { ROOT = "/tmp" }
         assert_eq!(parsed[0].description, "refreshed");
         assert_eq!(out.matches("name = \"a\"").count(), 1);
         assert!(out.contains("b-v1"), "unrelated entry untouched");
+    }
+
+    #[test]
+    fn with_catalog_entry_replace_keeps_the_banner_and_other_comments() {
+        // The file banner is prefix decor on the FIRST [[servers]] header —
+        // a naive slot assignment drops it when that entry is replaced.
+        let text = "\
+# Curated catalog — hands off
+
+[[servers]]
+name = \"a\"
+command = \"a-v1\"
+
+[[servers]]
+name = \"b\"
+command = \"b-v1\" # keep b note
+";
+        let out = with_catalog_entry(text, "refreshed", &stdio_server("a", "a-v2")).unwrap();
+        assert!(
+            out.contains("# Curated catalog — hands off"),
+            "banner lost on replace: {out}"
+        );
+        assert!(
+            out.contains("# keep b note"),
+            "unrelated inline comment lost: {out}"
+        );
+        let parsed = parse_catalog(&out).unwrap();
+        assert_eq!(parsed[0].server().command.as_deref(), Some("a-v2"));
+        assert_eq!(parsed[1].server().command.as_deref(), Some("b-v1"));
+    }
+
+    #[test]
+    fn with_catalog_entry_omits_an_empty_description() {
+        // A probe of a server with no title/instructions must not write
+        // `description = ""` — absent key, not empty string.
+        let out = with_catalog_entry("", "", &stdio_server("fs", "mcp-fs")).unwrap();
+        assert!(!out.contains("description"), "{out}");
+        let parsed = parse_catalog(&out).unwrap();
+        assert_eq!(parsed[0].description, "");
     }
 
     #[test]
