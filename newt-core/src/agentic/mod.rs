@@ -158,7 +158,7 @@ pub use display::{
     print_newt, set_spill_lines, GaugeLevel, NEWT_ORANGE_CT,
 };
 pub use driver::{
-    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
+    HeadlessCodeSearch, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
     VISIBLE_TRANSCRIPT_ROLES,
 };
 pub use experiential::{

@@ -54,9 +54,40 @@ use std::thread::JoinHandle;
 
 use tokio::sync::oneshot;
 
+use std::sync::Arc;
+
 use super::observation::ShellObservation;
-use super::{chat_complete, openai_chat_complete, ChatCtx, NoMcp, PromptDisposition};
+use super::{
+    chat_complete, openai_chat_complete, ChatCtx, CodeSearch, Embedder, NoMcp, PromptDisposition,
+    SemanticIndex,
+};
 use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, Role, TokenUsage};
+
+/// Owned, cloneable retrieval handle for the headless driver — the `'static`
+/// counterpart of the borrow-heavy [`CodeSearch`] `ChatCtx` field (#1280). A
+/// crew-leaf / cowork consumer that has an embedder + a built session index
+/// hands them in here (shared `Arc`s, so cloning the config per turn is cheap);
+/// [`run_one_turn`] borrows them into the turn's `CodeSearch`. Absent ⇒ the
+/// `code_search` tool is simply not advertised, exactly like today.
+#[derive(Clone)]
+pub struct HeadlessCodeSearch {
+    /// The query embedder (the same trait the live TUI loop uses).
+    pub embedder: Arc<dyn Embedder>,
+    /// The session semantic index the embedder searches.
+    pub index: Arc<dyn SemanticIndex>,
+    /// Default number of chunks returned per search.
+    pub top_k: usize,
+}
+
+impl std::fmt::Debug for HeadlessCodeSearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The trait objects are not `Debug`; surface only the scalar knob so the
+        // derived `Debug` on `TurnDriverConfig` still compiles.
+        f.debug_struct("HeadlessCodeSearch")
+            .field("top_k", &self.top_k)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Owned, `'static` configuration for one [`TurnDriver`] — the cloneable
 /// counterpart of the borrow-heavy [`ChatCtx`]. The driver clones it into each
@@ -114,6 +145,10 @@ pub struct TurnDriverConfig {
     pub input_ceiling_pct: u32,
     /// #727: remaining-budget percent below which the loop nudges (default 15).
     pub low_budget_pct: usize,
+    /// #1280: optional semantic retrieval for the headless turn. `Some` ⇒ the
+    /// `code_search` tool is advertised and executable against the supplied
+    /// index; `None` (the default) ⇒ absent, preserving today's behavior.
+    pub code_search: Option<HeadlessCodeSearch>,
 }
 
 impl TurnDriverConfig {
@@ -149,7 +184,27 @@ impl TurnDriverConfig {
             safe_context: None,
             input_ceiling_pct: 80,
             low_budget_pct: 15,
+            code_search: None,
         }
+    }
+
+    /// #1280: enable semantic `code_search` for driven turns. The consumer owns
+    /// the embedder + index (built once, shared via `Arc`); the driver borrows
+    /// them into each turn's `ChatCtx`. Mirrors the live TUI loop, which offers
+    /// the tool only when semantic is on.
+    #[must_use]
+    pub fn with_code_search(
+        mut self,
+        embedder: Arc<dyn Embedder>,
+        index: Arc<dyn SemanticIndex>,
+        top_k: usize,
+    ) -> Self {
+        self.code_search = Some(HeadlessCodeSearch {
+            embedder,
+            index,
+            top_k,
+        });
+        self
     }
 }
 
@@ -395,7 +450,14 @@ async fn run_one_turn(
         compaction_store: None,
         scratchpad: false,
         scratchpad_store: None,
-        code_search: None,
+        // #1280: borrow the consumer-supplied embedder + index into this turn's
+        // searcher. `Some` only when the config carries retrieval — otherwise the
+        // `code_search` tool is not advertised (unchanged headless behavior).
+        code_search: config.code_search.as_ref().map(|cs| CodeSearch {
+            embedder: cs.embedder.as_ref(),
+            index: cs.index.as_ref(),
+            top_k: cs.top_k,
+        }),
         experience_store: None,
         step_ledger: None,
         caveats: &config.caveats,
@@ -487,6 +549,7 @@ pub const VISIBLE_TRANSCRIPT_ROLES: [Role; 2] = [Role::User, Role::Assistant];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agentic::SessionSemanticIndex;
     use crate::caveats::Caveats;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -577,6 +640,91 @@ mod tests {
         // Drained — back to idle.
         assert!(matches!(driver.poll(), TurnStatus::Idle));
         assert!(!driver.is_running());
+    }
+
+    /// #1280: a stub embedder so the driver can carry a `code_search` handle.
+    /// Advertisement is gated on `code_search.is_some()`, so `embed` need not be
+    /// called for this test — a fixed vector keeps it total if it ever is.
+    struct StubEmbedder;
+    #[async_trait::async_trait]
+    impl Embedder for StubEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0_f32; 4])
+        }
+    }
+
+    /// Ollama responder that records every chat request body, so a test can
+    /// assert what tools the driver advertised.
+    struct CapturingOllama {
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        reply: String,
+    }
+    impl Respond for CapturingOllama {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+                self.bodies.lock().unwrap().push(v);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": self.reply }
+            }))
+        }
+    }
+
+    /// True if any recorded request advertised a tool named `code_search`.
+    fn advertised_code_search(bodies: &[serde_json::Value]) -> bool {
+        bodies.iter().any(|b| {
+            b["tools"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == "code_search"))
+        })
+    }
+
+    async fn drive_once_capturing(config: TurnDriverConfig) -> Vec<serde_json::Value> {
+        let server = MockServer::start().await;
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(CapturingOllama {
+                bodies: bodies.clone(),
+                reply: "done".into(),
+            })
+            .mount(&server)
+            .await;
+        // Rebind the config's URL to this server (the caller built it with a
+        // placeholder so the code_search wiring is the only variable).
+        let mut config = config;
+        config.url = server.uri();
+        let mut driver = TurnDriver::new(config);
+        driver.submit("find the retry backoff").expect("submit");
+        let _ = pump_to_done(&mut driver).await;
+        let out = bodies.lock().unwrap().clone();
+        out
+    }
+
+    /// #1280: the headless driver advertises `code_search` **iff** the config
+    /// carries a retrieval handle — the fix for the hardcoded `code_search: None`
+    /// that left crew leaves with no semantic retrieval.
+    #[tokio::test]
+    async fn code_search_advertised_only_when_the_config_carries_retrieval() {
+        // Without retrieval: the tool is absent (unchanged headless behavior).
+        let bare = drive_once_capturing(cfg("http://placeholder")).await;
+        assert!(
+            !advertised_code_search(&bare),
+            "no code_search tool without a configured index"
+        );
+
+        // With a supplied embedder + index: the tool is advertised + executable.
+        let index: Arc<dyn SemanticIndex> = Arc::new(SessionSemanticIndex::default());
+        let with = drive_once_capturing(cfg("http://placeholder").with_code_search(
+            Arc::new(StubEmbedder),
+            index,
+            3,
+        ))
+        .await;
+        assert!(
+            advertised_code_search(&with),
+            "code_search advertised once the driver carries retrieval"
+        );
     }
 
     /// A shell observation feeds the NEXT turn's context, redacted. We prove the
