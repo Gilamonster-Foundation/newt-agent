@@ -6,12 +6,12 @@
 
 use std::collections::BTreeMap;
 
-use newt_core::mcp::{McpServerEntry, TransportKind};
+use newt_core::mcp::{McpServerEntry, SecretValue, TransportKind};
 use newt_mcp_client::connect_http;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn http_entry(url: String, headers: BTreeMap<String, String>) -> McpServerEntry {
+fn http_entry(url: String, headers: BTreeMap<String, SecretValue>) -> McpServerEntry {
     McpServerEntry {
         enabled: true,
         name: "test-http".to_string(),
@@ -82,7 +82,10 @@ async fn http_json_response_lists_and_calls_tools() {
         .await;
 
     let mut headers = BTreeMap::new();
-    headers.insert("Authorization".to_string(), "Bearer secret".to_string());
+    headers.insert(
+        "Authorization".to_string(),
+        SecretValue::literal("Bearer secret"),
+    );
     let entry = http_entry(format!("{}/mcp", server.uri()), headers);
 
     let mut connected = connect_http(&entry, &newt_core::caveats::Caveats::top())

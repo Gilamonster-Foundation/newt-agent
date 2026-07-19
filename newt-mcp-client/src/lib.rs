@@ -373,10 +373,28 @@ fn assemble_env_grants(
     map.into_iter().collect()
 }
 
+/// Resolve every [`newt_core::mcp::SecretValue`] in an `env` / `headers` map to
+/// its plaintext, **host-side** (in newt's own unconfined process), just before
+/// the confined spawn / HTTP connect. A literal is `${...}`-interpolated (a
+/// token-free literal passes through verbatim); a `{ env | file | cmd }`
+/// reference is resolved through the existing `SecretRef` machinery. The
+/// resolved value is wrapped in `Secret` at every hop and exposed only into the
+/// grant map — never logged, never written back to config, never placed in
+/// newt's own env. A missing/failed reference is a hard error (fail loud).
+fn resolve_entry_secrets(
+    map: &BTreeMap<String, newt_core::mcp::SecretValue>,
+) -> Result<BTreeMap<String, String>> {
+    map.iter()
+        .map(|(k, v)| Ok((k.clone(), v.resolve()?.expose().to_string())))
+        .collect()
+}
+
 /// Resolve the three env-grant sources from the live environment (parent env +
-/// the shell-env dir + the entry) and fold them via [`assemble_env_grants`].
-/// The impure edge — kept tiny so the assembly logic itself stays pure/tested.
-fn resolve_env_grants(entry: &McpServerEntry) -> Vec<(String, String)> {
+/// the shell-env dir + the entry's own — now secret-resolved — env) and fold
+/// them via [`assemble_env_grants`]. The impure edge — kept tiny so the assembly
+/// logic itself stays pure/tested. Fails loudly if a configured secret reference
+/// cannot be resolved.
+fn resolve_env_grants(entry: &McpServerEntry) -> Result<Vec<(String, String)>> {
     let passthrough: Vec<(String, String)> = newt_core::mcp_stdio_env_passthrough()
         .iter()
         .filter_map(|k| {
@@ -386,7 +404,9 @@ fn resolve_env_grants(entry: &McpServerEntry) -> Vec<(String, String)> {
     let shell_env = newt_core::Config::user_config_path()
         .map(|p| newt_core::shell_env::from_config_dir(&p))
         .unwrap_or_default();
-    assemble_env_grants(&passthrough, &shell_env, &entry.env)
+    let entry_env = resolve_entry_secrets(&entry.env)
+        .with_context(|| format!("resolving env secrets for MCP server `{}`", entry.name))?;
+    Ok(assemble_env_grants(&passthrough, &shell_env, &entry_env))
 }
 
 /// A throwaway [`Tool`] used only to mint the spawn [`ToolContext`] through the
@@ -544,7 +564,7 @@ impl StdioTransport {
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
-        let grants = resolve_env_grants(entry);
+        let grants = resolve_env_grants(entry)?;
         // Admit exec of the configured server command; keep its runtime authority
         // (fs/net) the session leash.
         let cx = mint_spawn_context(&spawn_caveats(caveats, command)).with_context(|| {
@@ -592,7 +612,7 @@ impl StdioTransport {
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
-        let grants = resolve_env_grants(entry);
+        let grants = resolve_env_grants(entry)?;
         let mut child = Command::new(command)
             .args(&entry.args)
             .env_clear()
@@ -682,8 +702,14 @@ impl HttpTransport {
             .url
             .clone()
             .ok_or_else(|| anyhow!("http MCP server `{}` has no url", entry.name))?;
+        // Resolve every header SecretValue host-side, before the value ever
+        // touches reqwest — a literal is `${...}`-interpolated, a `{env|file|cmd}`
+        // reference is resolved through `SecretRef`. Fails loud if a reference
+        // cannot be satisfied.
+        let resolved_headers = resolve_entry_secrets(&entry.headers)
+            .with_context(|| format!("resolving header secrets for MCP server `{}`", entry.name))?;
         let mut headers = reqwest::header::HeaderMap::new();
-        for (key, value) in &entry.headers {
+        for (key, value) in &resolved_headers {
             let name =
                 reqwest::header::HeaderName::from_bytes(key.as_bytes()).with_context(|| {
                     format!("MCP server `{}`: invalid header name `{key}`", entry.name)
@@ -1099,8 +1125,10 @@ impl McpToolset {
         caveats: &Caveats,
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let mcp_toml = newt_core::Config::user_config_dir().map(|d| d.join("mcp.toml"));
         let entries = newt_core::mcp::discover(
             cfg_servers,
+            mcp_toml.as_deref(),
             home.as_deref(),
             std::path::Path::new(workspace),
         );
@@ -1676,12 +1704,15 @@ mod confined_spawn_helper_tests {
             transport: TransportKind::Stdio,
             command: Some("true".into()),
             args: vec![],
-            env: BTreeMap::from([("MCP_SERVER_ONLY".to_string(), "v".to_string())]),
+            env: BTreeMap::from([(
+                "MCP_SERVER_ONLY".to_string(),
+                newt_core::mcp::SecretValue::literal("v"),
+            )]),
             url: None,
             headers: BTreeMap::new(),
             request_timeout_secs: None,
         };
-        let grants = resolve_env_grants(&entry);
+        let grants = resolve_env_grants(&entry).unwrap();
         assert!(
             grants
                 .iter()

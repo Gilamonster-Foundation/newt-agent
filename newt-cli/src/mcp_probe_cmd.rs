@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use clap::Args;
 use newt_core::caveats::Caveats;
-use newt_core::mcp::{McpServerEntry, TransportKind};
+use newt_core::mcp::{McpServerEntry, SecretValue, TransportKind};
 use newt_core::mcp_probe::{builtin_probe_rules, parse_probe_rules, ProbeRules};
 use newt_core::Config;
 use newt_mcp_client::{ConnectedServer, NetPosture, SandboxKind, ServerInfo};
@@ -568,7 +568,7 @@ async fn probe_stdio(
     command: &str,
     target: &ProbeTarget,
     args: &ProbeArgs,
-    env: BTreeMap<String, String>,
+    env: BTreeMap<String, SecretValue>,
     caveats: &Caveats,
 ) -> anyhow::Result<ProbeOutcome> {
     // Rules are only consulted when no --arg pinned the candidate — an

@@ -3968,25 +3968,31 @@ impl Config {
     }
 
     /// Serialize the config to pretty TOML for **audit**, with inline secret
-    /// material redacted. The values of every `[[mcp_servers]]` `env` and
-    /// `headers` entry are replaced with [`Self::REDACTED`] — those maps are the
-    /// only place `Config` can carry a raw secret inline (e.g. an
-    /// `Authorization: Bearer …` header or an `API_KEY=…` child env var). Keys
-    /// are kept so an auditor sees *which* variables/headers are set without the
-    /// values. Secret *references* (`api_key_file` / `api_key_env`) are left as-is
-    /// — they name where a secret lives, not the secret itself.
+    /// material redacted. Every `[[mcp_servers]]` `env` / `headers` **literal**
+    /// value is replaced with [`Self::REDACTED`] — a literal is the only place
+    /// `Config` can carry a raw secret inline (e.g. an `Authorization: Bearer …`
+    /// header, an `API_KEY=…` child env var, or a `Bearer ${cmd:…}`
+    /// interpolation string that could embed literal secret text). Keys are kept
+    /// so an auditor sees *which* variables/headers are set without the values.
+    ///
+    /// Secret *references* — a `{ env | file | cmd }` [`SecretValue::Ref`], or an
+    /// `api_key_file` / `api_key_env` — are left as-is: they name *where* a
+    /// secret lives, never the secret itself, so `newt config` can show the
+    /// operator their wiring without ever printing a resolved value.
     ///
     /// # Errors
     /// A TOML serialization failure (should not happen for a valid `Config`).
     pub fn to_redacted_toml(&self) -> Result<String> {
+        use crate::mcp::SecretValue;
         let mut redacted = self.clone();
+        let redact = |v: &mut SecretValue| {
+            if matches!(v, SecretValue::Literal(_)) {
+                *v = SecretValue::Literal(Self::REDACTED.to_string());
+            }
+        };
         for server in &mut redacted.mcp_servers {
-            for v in server.env.values_mut() {
-                *v = Self::REDACTED.to_string();
-            }
-            for v in server.headers.values_mut() {
-                *v = Self::REDACTED.to_string();
-            }
+            server.env.values_mut().for_each(redact);
+            server.headers.values_mut().for_each(redact);
         }
         toml::to_string_pretty(&redacted).map_err(|e| NewtError::Config(e.to_string()))
     }
@@ -6135,6 +6141,48 @@ max_tool_rounds = 25
     }
 
     #[test]
+    fn to_redacted_toml_redacts_literals_but_keeps_secret_references() {
+        // A literal secret AND a `${cmd:…}` interpolation literal are both
+        // redacted (a literal can embed raw secret text); a `{ cmd = … }`
+        // SecretRef is a REFERENCE — it names where the secret lives, not the
+        // secret — so it is kept, exactly like `api_key_file`.
+        let cfg: Config = toml::from_str(
+            r#"
+            [[mcp_servers]]
+            name = "gh"
+            command = "gh-mcp"
+            [mcp_servers.env]
+            RAW = "ghp_rawinlinesecret"
+            VAULTED = { cmd = "vault kv get -field=token secret/data/gh" }
+            [mcp_servers.headers]
+            Authorization = "Bearer ${cmd:vault kv get -field=token secret/data/api}"
+            "#,
+        )
+        .unwrap();
+
+        let dump = cfg.to_redacted_toml().unwrap();
+        // Literal secret and the interpolation literal never appear…
+        assert!(
+            !dump.contains("ghp_rawinlinesecret"),
+            "raw secret leaked:\n{dump}"
+        );
+        assert!(
+            !dump.contains("secret/data/api"),
+            "interpolation literal leaked:\n{dump}"
+        );
+        assert!(dump.contains(Config::REDACTED));
+        // …but the KEYS survive, and the SecretRef reference is kept (it names
+        // a location, not a secret) — the operator can audit their wiring.
+        assert!(dump.contains("RAW"));
+        assert!(dump.contains("VAULTED"));
+        assert!(dump.contains("Authorization"));
+        assert!(
+            dump.contains("vault kv get -field=token secret/data/gh"),
+            "SecretRef reference kept:\n{dump}"
+        );
+    }
+
+    #[test]
     fn config_with_dgx_roundtrips() {
         let cfg = Config {
             dgx: Some(crate::dgx::DgxConfig::home_template()),
@@ -6424,7 +6472,10 @@ command = \"modulex-mcp\"
             transport: crate::mcp::TransportKind::Stdio,
             command: Some("scrybe-mcp-server".into()),
             args: vec!["stdio".into()],
-            env: std::collections::BTreeMap::from([("SCRYBE_LOG".to_string(), "info".to_string())]),
+            env: std::collections::BTreeMap::from([(
+                "SCRYBE_LOG".to_string(),
+                crate::mcp::SecretValue::literal("info"),
+            )]),
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: Some(120),
@@ -6443,7 +6494,10 @@ command = \"modulex-mcp\"
         assert_eq!(added.command.as_deref(), Some("scrybe-mcp-server"));
         assert_eq!(added.args, vec!["stdio"]);
         assert_eq!(
-            added.env.get("SCRYBE_LOG").map(String::as_str),
+            added
+                .env
+                .get("SCRYBE_LOG")
+                .and_then(crate::mcp::SecretValue::as_literal),
             Some("info")
         );
         assert_eq!(added.request_timeout_secs, Some(120));

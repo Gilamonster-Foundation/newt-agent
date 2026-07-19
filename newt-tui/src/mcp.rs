@@ -195,9 +195,10 @@ fn apply_transport_security(
         }
     }
     if let (Some(token), true) = (token, allowed) {
-        entry
-            .headers
-            .insert("Authorization".into(), format!("Bearer {token}"));
+        entry.headers.insert(
+            "Authorization".into(),
+            newt_core::mcp::SecretValue::literal(format!("Bearer {token}")),
+        );
     }
 }
 
@@ -234,8 +235,10 @@ impl Mcp {
         caveats: &newt_core::caveats::Caveats,
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let mcp_toml = newt_core::Config::user_config_dir().map(|d| d.join("mcp.toml"));
         let entries = newt_core::mcp::discover(
             cfg_servers,
+            mcp_toml.as_deref(),
             home.as_deref(),
             std::path::Path::new(workspace),
         );
@@ -599,7 +602,10 @@ mod tests {
         let mut https = http_entry("https://api.maas.com/mcp");
         apply_transport_security(&mut https, Some("SECRET".into()), &[]);
         assert_eq!(
-            https.headers.get("Authorization").map(String::as_str),
+            https
+                .headers
+                .get("Authorization")
+                .and_then(newt_core::mcp::SecretValue::as_literal),
             Some("Bearer SECRET")
         );
 
@@ -610,7 +616,10 @@ mod tests {
             &["api.maas.com".to_string()],
         );
         assert_eq!(
-            allowed.headers.get("Authorization").map(String::as_str),
+            allowed
+                .headers
+                .get("Authorization")
+                .and_then(newt_core::mcp::SecretValue::as_literal),
             Some("Bearer SECRET")
         );
 

@@ -103,7 +103,13 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     println!("\nMCP servers (newt config + Claude Code config):");
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let servers = newt_core::mcp::discover(&config.mcp_servers, home.as_deref(), &workspace);
+    let mcp_toml = newt_core::Config::user_config_dir().map(|d| d.join("mcp.toml"));
+    let servers = newt_core::mcp::discover(
+        &config.mcp_servers,
+        mcp_toml.as_deref(),
+        home.as_deref(),
+        &workspace,
+    );
     if servers.is_empty() {
         println!("  (none discovered)");
     }

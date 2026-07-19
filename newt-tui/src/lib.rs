@@ -123,7 +123,13 @@ pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
         .ok()
         .map(|c| c.mcp_servers)
         .unwrap_or_default();
-    let entries = newt_core::mcp::discover(&cfg_servers, home.as_deref(), &workspace);
+    let mcp_toml = newt_core::Config::user_config_dir().map(|d| d.join("mcp.toml"));
+    let entries = newt_core::mcp::discover(
+        &cfg_servers,
+        mcp_toml.as_deref(),
+        home.as_deref(),
+        &workspace,
+    );
 
     // Collect HTTP-transport servers (the only ones that use OAuth).
     let http_servers: Vec<(String, String)> = entries
