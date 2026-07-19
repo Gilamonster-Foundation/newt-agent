@@ -161,6 +161,11 @@ fn probe_without_yes_fails_closed_off_a_terminal() {
     );
 }
 
+// Unix-only: needs a real stdin-echoing binary (`/bin/cat`). The same
+// handshake-validation behavior — an echoed initialize is not a handshake — is
+// covered cross-platform (incl. Windows CI) by the mock-transport unit test
+// `initialize_rejects_an_echoed_request_as_not_an_mcp_server` in newt-mcp-client.
+#[cfg(unix)]
 #[test]
 fn probe_never_certifies_a_stdin_echoing_process() {
     let sb = sandbox();
