@@ -170,6 +170,28 @@ impl LiveSpillRenderer {
         self.scroll(SpillView::toggle_expanded)
     }
 
+    // #1303 step 5: editor-mode nav (vi `gg`/`G`/`C-d`/`C-u`, emacs paging),
+    // each riding the same single-owner `scroll` write discipline.
+    #[cfg(any(unix, test))]
+    pub(crate) fn scroll_to_top(&self) -> bool {
+        self.scroll(SpillView::scroll_to_top)
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn scroll_to_bottom(&self) -> bool {
+        self.scroll(SpillView::scroll_to_bottom)
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn half_page_up(&self) -> bool {
+        self.scroll(SpillView::half_page_up)
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn half_page_down(&self) -> bool {
+        self.scroll(SpillView::half_page_down)
+    }
+
     // Only reached through the unix-only keyboard watcher (`SpillInput::refresh_geometry`
     // in lib.rs); no test calls this directly, unlike scroll_up/scroll_down/toggle_expanded.
     #[cfg(unix)]
@@ -890,6 +912,7 @@ mod tests {
                     &hard,
                     &stop,
                     Some(renderer.as_ref()),
+                    newt_core::EditMode::Nano,
                     10,
                     100,
                 );

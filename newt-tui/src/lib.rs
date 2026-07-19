@@ -6527,6 +6527,16 @@ pub(crate) trait SpillInput: Sync {
     fn toggle_expanded(&self) -> bool;
     #[cfg(unix)]
     fn refresh_geometry(&self) -> bool;
+    // #1303 step 5: editor-mode nav targets (vi `gg`/`G`/`C-d`/`C-u`, emacs
+    // paging). Gated with their dispatch arms so the lean build links none.
+    #[cfg(all(unix, feature = "live-spill"))]
+    fn scroll_to_top(&self) -> bool;
+    #[cfg(all(unix, feature = "live-spill"))]
+    fn scroll_to_bottom(&self) -> bool;
+    #[cfg(all(unix, feature = "live-spill"))]
+    fn half_page_up(&self) -> bool;
+    #[cfg(all(unix, feature = "live-spill"))]
+    fn half_page_down(&self) -> bool;
 }
 
 #[cfg(feature = "live-spill")]
@@ -6550,6 +6560,26 @@ impl SpillInput for live_spill::LiveSpillRenderer {
     fn refresh_geometry(&self) -> bool {
         self.refresh_geometry()
     }
+
+    #[cfg(unix)]
+    fn scroll_to_top(&self) -> bool {
+        self.scroll_to_top()
+    }
+
+    #[cfg(unix)]
+    fn scroll_to_bottom(&self) -> bool {
+        self.scroll_to_bottom()
+    }
+
+    #[cfg(unix)]
+    fn half_page_up(&self) -> bool {
+        self.half_page_up()
+    }
+
+    #[cfg(unix)]
+    fn half_page_down(&self) -> bool {
+        self.half_page_down()
+    }
 }
 
 #[cfg(unix)]
@@ -6558,6 +6588,17 @@ enum TurnKey {
     Up,
     Down,
     ToggleExpanded,
+    // #1303 step 5: editor-mode nav targets (vi `gg`/`G`/`C-d`/`C-u`, emacs
+    // paging). Produced and dispatched only under `live-spill` — the wyvern
+    // build never links them.
+    #[cfg(feature = "live-spill")]
+    Top,
+    #[cfg(feature = "live-spill")]
+    Bottom,
+    #[cfg(feature = "live-spill")]
+    HalfPageUp,
+    #[cfg(feature = "live-spill")]
+    HalfPageDown,
 }
 
 #[cfg(unix)]
@@ -6579,6 +6620,26 @@ struct TurnKeyDecoder {
     // never sees mouse bytes, so this field does not exist there.
     #[cfg(feature = "live-spill")]
     params: Vec<u8>,
+    // #1303 step 5: the resolved editor keybinding for viewport nav, plus the
+    // `gg` two-key latch (vi). `default()` yields `EditMode`'s own default; the
+    // watcher builds the decoder with the live-resolved mode via `with_mode`.
+    #[cfg(feature = "live-spill")]
+    mode: newt_core::EditMode,
+    #[cfg(feature = "live-spill")]
+    pending_g: bool,
+}
+
+#[cfg(all(unix, feature = "live-spill"))]
+impl TurnKeyDecoder {
+    /// Build a decoder bound to the session's editor keybinding (resolved once
+    /// per spill turn by the watcher, never on the hot path of a non-spill
+    /// turn). Base keys (`↑`/`↓`/`Space`/`Enter`) work in every mode regardless.
+    fn with_mode(mode: newt_core::EditMode) -> Self {
+        Self {
+            mode,
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -6588,11 +6649,10 @@ impl TurnKeyDecoder {
         for &byte in bytes {
             self.state = match self.state {
                 TurnKeyState::Ground if byte == 0x1b => TurnKeyState::Escape,
-                TurnKeyState::Ground if matches!(byte, b' ' | b'\r' | b'\n') => {
-                    keys.push(TurnKey::ToggleExpanded);
+                TurnKeyState::Ground => {
+                    self.push_ground_key(byte, &mut keys);
                     TurnKeyState::Ground
                 }
-                TurnKeyState::Ground => TurnKeyState::Ground,
                 TurnKeyState::Escape if byte == b'[' => {
                     // A fresh CSI — reset the mouse-parameter accumulator.
                     #[cfg(feature = "live-spill")]
@@ -6672,6 +6732,58 @@ impl TurnKeyDecoder {
             _ => None,
         }
     }
+
+    /// A Ground-state byte (not part of an escape sequence). The base keys —
+    /// `Space`/`Enter` → expand — are ALWAYS active in every mode (the unchanged
+    /// live-spill contract); editor-mode nav is layered on top and additive.
+    fn push_ground_key(&mut self, byte: u8, keys: &mut Vec<TurnKey>) {
+        if matches!(byte, b' ' | b'\r' | b'\n') {
+            keys.push(TurnKey::ToggleExpanded);
+            #[cfg(feature = "live-spill")]
+            {
+                self.pending_g = false;
+            }
+        } else {
+            // Editor-mode nav (live-spill only); the lean build has none.
+            #[cfg(feature = "live-spill")]
+            self.push_mode_ground_key(byte, keys);
+        }
+    }
+
+    /// Editor-mode-aware viewport nav (#1303 clause 4). vi is implemented fully
+    /// (`j`/`k` line, `gg`/`G` top/bottom, `C-d`/`C-u` half-page); emacs gets
+    /// `C-n`/`C-p`/`C-v` (line + page-down). nano rides the universal arrows.
+    /// Modes' remaining bindings (emacs `M-v`/`M-<`/`M->`, nano `C-y`/`M-\`) are
+    /// a documented follow-on seam — the `↑`/`↓`/`Space` base always works.
+    #[cfg(feature = "live-spill")]
+    fn push_mode_ground_key(&mut self, byte: u8, keys: &mut Vec<TurnKey>) {
+        use newt_core::EditMode;
+        // `gg` (vi) is the only two-key sequence: a pending `g` consumes the
+        // next byte. `gg` → Top; anything else re-processes the byte normally.
+        if std::mem::take(&mut self.pending_g) && byte == b'g' {
+            keys.push(TurnKey::Top);
+            return;
+        }
+        match self.mode {
+            EditMode::Vi => match byte {
+                b'j' => keys.push(TurnKey::Down),
+                b'k' => keys.push(TurnKey::Up),
+                b'G' => keys.push(TurnKey::Bottom),
+                b'g' => self.pending_g = true,
+                0x04 => keys.push(TurnKey::HalfPageDown), // C-d
+                0x15 => keys.push(TurnKey::HalfPageUp),   // C-u
+                _ => {}
+            },
+            EditMode::Emacs => match byte {
+                0x0e => keys.push(TurnKey::Down),         // C-n
+                0x10 => keys.push(TurnKey::Up),           // C-p
+                0x16 => keys.push(TurnKey::HalfPageDown), // C-v (page down)
+                _ => {}
+            },
+            // nano is modeless/emacs-like; the universal arrows already cover it.
+            EditMode::Nano => {}
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -6690,6 +6802,22 @@ fn dispatch_turn_keys(decoder: &mut TurnKeyDecoder, bytes: &[u8], spill: Option<
             }
             TurnKey::ToggleExpanded => {
                 spill.toggle_expanded();
+            }
+            #[cfg(feature = "live-spill")]
+            TurnKey::Top => {
+                spill.scroll_to_top();
+            }
+            #[cfg(feature = "live-spill")]
+            TurnKey::Bottom => {
+                spill.scroll_to_bottom();
+            }
+            #[cfg(feature = "live-spill")]
+            TurnKey::HalfPageUp => {
+                spill.half_page_up();
+            }
+            #[cfg(feature = "live-spill")]
+            TurnKey::HalfPageDown => {
+                spill.half_page_down();
             }
         }
     }
@@ -6740,6 +6868,53 @@ mod mouse_decode_tests {
         assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up]);
         assert_eq!(d.feed(b"\x1b[B"), vec![TurnKey::Down]);
         assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded]);
+    }
+
+    #[test]
+    fn vi_mode_maps_jk_gg_g_and_halfpage() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert_eq!(d.feed(b"j"), vec![TurnKey::Down]);
+        assert_eq!(d.feed(b"k"), vec![TurnKey::Up]);
+        assert_eq!(d.feed(b"gg"), vec![TurnKey::Top]);
+        assert_eq!(d.feed(b"G"), vec![TurnKey::Bottom]);
+        assert_eq!(d.feed(b"\x04"), vec![TurnKey::HalfPageDown]); // C-d
+        assert_eq!(d.feed(b"\x15"), vec![TurnKey::HalfPageUp]); // C-u
+    }
+
+    #[test]
+    fn vi_single_g_waits_for_the_second_g() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert_eq!(d.feed(b"g"), vec![]); // pending, no key yet
+        assert_eq!(d.feed(b"g"), vec![TurnKey::Top]);
+    }
+
+    #[test]
+    fn emacs_mode_maps_ctrl_np_not_vi_letters() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Emacs);
+        assert_eq!(d.feed(b"\x0e"), vec![TurnKey::Down]); // C-n
+        assert_eq!(d.feed(b"\x10"), vec![TurnKey::Up]); // C-p
+                                                        // Bare j/k are vi motions, inert in emacs mode.
+        assert_eq!(d.feed(b"j"), vec![]);
+    }
+
+    #[test]
+    fn base_arrows_space_and_enter_work_in_every_mode() {
+        for mode in [
+            newt_core::EditMode::Vi,
+            newt_core::EditMode::Emacs,
+            newt_core::EditMode::Nano,
+        ] {
+            let label = format!("{mode:?}");
+            let mut d = TurnKeyDecoder::with_mode(mode);
+            assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up], "{label} up-arrow");
+            assert_eq!(d.feed(b"\x1b[B"), vec![TurnKey::Down], "{label} down-arrow");
+            assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded], "{label} space");
+            assert_eq!(
+                d.feed(b"\r"),
+                vec![TurnKey::ToggleExpanded],
+                "{label} enter"
+            );
+        }
     }
 }
 
@@ -6817,6 +6992,22 @@ mod interrupt_tests {
             fn refresh_geometry(&self) -> bool {
                 true
             }
+            #[cfg(feature = "live-spill")]
+            fn scroll_to_top(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn scroll_to_bottom(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn half_page_up(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn half_page_down(&self) -> bool {
+                true
+            }
         }
 
         let mut pipe = [0; 2];
@@ -6827,7 +7018,16 @@ mod interrupt_tests {
         let spill = RecordingSpill::default();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                watch_for_interrupt_fd(pipe[0], &cancel, &hard, &stop, Some(&spill), 10, 100);
+                watch_for_interrupt_fd(
+                    pipe[0],
+                    &cancel,
+                    &hard,
+                    &stop,
+                    Some(&spill),
+                    newt_core::EditMode::Nano,
+                    10,
+                    100,
+                );
             });
             let write = |bytes: &[u8]| {
                 assert_eq!(
@@ -6892,9 +7092,21 @@ pub(crate) fn with_live_spill_watch<T>(
     let _mouse_capture = crate::mouse::MouseCaptureGuard::maybe(mouse);
     #[cfg(not(any(feature = "rich-tui", feature = "live-spill")))]
     let _ = mouse;
+    // #1303 step 5: resolve the editor keybinding once per SPILL turn (never on
+    // the hot path of a non-spill turn) so viewport nav feels native. Disk read
+    // lives here, in production only — unit tests drive the watcher with an
+    // explicit mode.
+    #[cfg(feature = "live-spill")]
+    let mode = if spill.is_some() {
+        resolve_edit_mode()
+    } else {
+        newt_core::EditMode::default()
+    };
+    #[cfg(not(feature = "live-spill"))]
+    let mode = newt_core::EditMode::default();
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
-        s.spawn(|| watch_for_interrupt(cancel, hard, &stop, spill));
+        s.spawn(|| watch_for_interrupt(cancel, hard, &stop, spill, mode));
         let out = f();
         // Tell the watcher to exit; it polls with a 100 ms timeout, so it wakes
         // and returns promptly, and the scope joins it before restoring the tty.
@@ -6936,8 +7148,18 @@ fn watch_for_interrupt(
     hard: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
     spill: Option<&dyn SpillInput>,
+    mode: newt_core::EditMode,
 ) {
-    watch_for_interrupt_fd(libc::STDIN_FILENO, cancel, hard, stop, spill, 100, 200);
+    watch_for_interrupt_fd(
+        libc::STDIN_FILENO,
+        cancel,
+        hard,
+        stop,
+        spill,
+        mode,
+        100,
+        200,
+    );
 }
 
 #[cfg(unix)]
@@ -6948,6 +7170,7 @@ fn watch_for_interrupt_fd(
     hard: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
     spill: Option<&dyn SpillInput>,
+    mode: newt_core::EditMode,
     poll_timeout_ms: libc::c_int,
     escape_grace_ms: libc::c_int,
 ) {
@@ -6955,7 +7178,15 @@ fn watch_for_interrupt_fd(
     use std::time::Duration;
     let mut buf = [0u8; 64];
     let mut presses = 0u32;
-    let mut decoder = TurnKeyDecoder::default();
+    // #1303 step 5: bind the decoder to the session's editor keybinding (base
+    // keys still work in every mode). The lean build has no nav modes.
+    #[cfg(feature = "live-spill")]
+    let mut decoder = TurnKeyDecoder::with_mode(mode);
+    #[cfg(not(feature = "live-spill"))]
+    let mut decoder = {
+        let _ = mode;
+        TurnKeyDecoder::default()
+    };
     while !stop.load(Ordering::Relaxed) {
         if let Some(spill) = spill {
             spill.refresh_geometry();
