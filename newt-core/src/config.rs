@@ -3993,6 +3993,13 @@ impl Config {
         for server in &mut redacted.mcp_servers {
             server.env.values_mut().for_each(redact);
             server.headers.values_mut().for_each(redact);
+            // A `url` can embed userinfo (`user:pass@`) or a `?api_key=…` param,
+            // and `args` can carry a `--token …` — none of which are `SecretValue`s,
+            // so they'd otherwise pass through verbatim into an audit dump (#1301).
+            if let Some(url) = &server.url {
+                server.url = Some(redact_url_secrets(url));
+            }
+            server.args = redact_arg_secrets(&server.args);
         }
         toml::to_string_pretty(&redacted).map_err(|e| NewtError::Config(e.to_string()))
     }
@@ -4291,6 +4298,126 @@ impl Config {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Query-param keys (case-insensitive) whose values are treated as secrets when
+/// redacting an MCP `url` for an audit dump ([`Config::to_redacted_toml`], #1301).
+const SENSITIVE_QUERY_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "secret",
+    "password",
+    "key",
+];
+
+/// CLI flags (case-insensitive) whose value is a secret when redacting MCP
+/// `args` — both the `--flag=VALUE` and `--flag VALUE` forms (#1301).
+const SENSITIVE_ARG_FLAGS: &[&str] = &["--token", "--api-key", "--password", "--secret", "--key"];
+
+/// Redact credentials embedded in a URL for an audit dump: the userinfo
+/// (`user:pass@`) and any query-param value whose key is sensitive
+/// ([`SENSITIVE_QUERY_KEYS`]). Non-secret structure (scheme, host, path,
+/// fragment, non-sensitive params) is preserved. Pure string surgery — no `url`
+/// crate dependency.
+fn redact_url_secrets(url: &str) -> String {
+    // Peel off `#fragment` then `?query`, redact each part, reassemble.
+    let (main, fragment) = match url.split_once('#') {
+        Some((m, f)) => (m, Some(f)),
+        None => (url, None),
+    };
+    let (authority_and_path, query) = match main.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (main, None),
+    };
+    let mut out = redact_url_userinfo(authority_and_path);
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(&redact_url_query(q));
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+/// Redact `user:pass@` userinfo from the authority of a `scheme://…` string
+/// (the `?query`/`#fragment` already stripped). An `@` only counts inside the
+/// authority (before the first `/`), so a path/param `@` is never mistaken for
+/// userinfo.
+fn redact_url_userinfo(s: &str) -> String {
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return s.to_string();
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (rest, None),
+    };
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{}@{host}", Config::REDACTED),
+        None => authority.to_string(),
+    };
+    let mut out = format!("{scheme}://{authority}");
+    if let Some(p) = path {
+        out.push('/');
+        out.push_str(p);
+    }
+    out
+}
+
+/// Redact the values of sensitive query params, keeping keys + non-sensitive
+/// params intact.
+fn redact_url_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|param| match param.split_once('=') {
+            Some((k, _))
+                if SENSITIVE_QUERY_KEYS
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(k)) =>
+            {
+                format!("{k}={}", Config::REDACTED)
+            }
+            _ => param.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Whether `flag` is a sensitive CLI flag whose value must be redacted.
+fn is_sensitive_arg_flag(flag: &str) -> bool {
+    SENSITIVE_ARG_FLAGS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(flag))
+}
+
+/// Redact the values of sensitive flags in an args vector, handling both
+/// `--flag=VALUE` (redact the tail) and `--flag VALUE` (redact the next arg).
+/// Over-redaction is safe for an audit dump; under-redaction is not.
+fn redact_arg_secrets(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            out.push(Config::REDACTED.to_string());
+            redact_next = false;
+            continue;
+        }
+        match arg.split_once('=') {
+            Some((flag, _)) if is_sensitive_arg_flag(flag) => {
+                out.push(format!("{flag}={}", Config::REDACTED));
+            }
+            _ if is_sensitive_arg_flag(arg) => {
+                // `--flag VALUE`: keep the flag, redact the following value.
+                out.push(arg.clone());
+                redact_next = true;
+            }
+            _ => out.push(arg.clone()),
+        }
+    }
+    out
+}
 
 /// Best-effort home directory lookup without pulling in the `dirs` crate.
 pub(crate) fn home_dir() -> Option<PathBuf> {
@@ -6183,6 +6310,73 @@ max_tool_rounds = 25
     }
 
     #[test]
+    fn to_redacted_toml_redacts_url_userinfo_query_and_args() {
+        // FIX 5 (#1301): url and args are plain strings (no SecretValue wrapper),
+        // so URL-embedded creds and `--token` args must be redacted before the
+        // audit dump can leak them.
+        let cfg: Config = toml::from_str(
+            r#"
+            [[mcp_servers]]
+            name = "gh"
+            type = "http"
+            url = "https://alice:sk-URLPASS@api.example/mcp?api_key=SECRETQP&region=us"
+            args = ["--token=sk-EQ", "--api-key", "sk-SPACE", "--verbose"]
+            "#,
+        )
+        .unwrap();
+        let dump = cfg.to_redacted_toml().unwrap();
+        // None of the secret material survives…
+        for leaked in ["sk-URLPASS", "SECRETQP", "sk-EQ", "sk-SPACE", "alice"] {
+            assert!(!dump.contains(leaked), "`{leaked}` leaked:\n{dump}");
+        }
+        // …but the non-secret structure does.
+        assert!(dump.contains("api.example/mcp"), "host/path kept:\n{dump}");
+        assert!(dump.contains("region=us"), "non-secret param kept:\n{dump}");
+        assert!(dump.contains("--verbose"), "non-secret arg kept:\n{dump}");
+        assert!(dump.contains(Config::REDACTED));
+    }
+
+    #[test]
+    fn redact_url_and_args_helpers_are_precise() {
+        // Userinfo + sensitive query param redacted; scheme/host/path/fragment
+        // and a non-sensitive param preserved.
+        assert_eq!(
+            redact_url_secrets("https://u:p@h.example/mcp?token=abc&keep=1#frag"),
+            format!(
+                "https://{r}@h.example/mcp?token={r}&keep=1#frag",
+                r = Config::REDACTED
+            )
+        );
+        // No userinfo, no sensitive params → unchanged.
+        assert_eq!(
+            redact_url_secrets("https://h.example/mcp?region=us"),
+            "https://h.example/mcp?region=us"
+        );
+        // An `@` in the path is not userinfo.
+        assert_eq!(
+            redact_url_secrets("https://h.example/a@b"),
+            "https://h.example/a@b"
+        );
+        // Both arg forms; a non-sensitive flag with a value is untouched.
+        assert_eq!(
+            redact_arg_secrets(&[
+                "--token=sk-1".into(),
+                "--api-key".into(),
+                "sk-2".into(),
+                "--model".into(),
+                "gpt".into(),
+            ]),
+            vec![
+                format!("--token={}", Config::REDACTED),
+                "--api-key".to_string(),
+                Config::REDACTED.to_string(),
+                "--model".to_string(),
+                "gpt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn config_with_dgx_roundtrips() {
         let cfg = Config {
             dgx: Some(crate::dgx::DgxConfig::home_template()),
@@ -6479,6 +6673,7 @@ command = \"modulex-mcp\"
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: Some(120),
+            trust: crate::mcp::McpTrust::Trusted,
         };
         let out = Config::with_mcp_server_added(text, &entry).unwrap();
         assert!(
@@ -6519,6 +6714,7 @@ command = \"modulex-mcp\"
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         };
         let out = Config::with_mcp_server_added("", &entry).unwrap();
         let cfg: Config = toml::from_str(&out).unwrap();
@@ -6539,6 +6735,7 @@ command = \"modulex-mcp\"
             url: Some("https://mcp.example/sse".into()),
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         };
         let out = Config::with_mcp_server_added("", &entry).unwrap();
         let cfg: Config = toml::from_str(&out).unwrap();
@@ -6562,6 +6759,7 @@ command = \"modulex-mcp\"
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         };
         let err = Config::with_mcp_server_added(text, &dup).unwrap_err();
         assert!(err.to_string().contains("scrybe"), "names the dup: {err}");
@@ -6641,6 +6839,7 @@ command = \"drop-mcp\"
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         };
         // Invalid TOML input text.
         let err = Config::with_mcp_server_added("not toml [", &entry).unwrap_err();
