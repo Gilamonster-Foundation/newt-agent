@@ -101,6 +101,38 @@ pub trait Transport {
     async fn recv(&mut self) -> Result<Option<String>>;
 }
 
+/// The server's self-reported identity from the `initialize` result
+/// (`serverInfo`). All fields are best-effort: a server may omit any of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerInfo {
+    /// The server's programmatic name.
+    #[serde(default)]
+    pub name: String,
+    /// Human-facing display title (MCP 2025-06-18 addition).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The server's version string.
+    #[serde(default)]
+    pub version: String,
+}
+
+/// What the `initialize` handshake reported back — previously discarded
+/// (#1292 prerequisite). `newt mcp probe` derives a registration's name and
+/// description from this; other callers may ignore it.
+#[derive(Debug, Clone, Default)]
+pub struct InitializeInfo {
+    /// `serverInfo`, when the server sent one.
+    pub server_info: Option<ServerInfo>,
+    /// Server-authored usage `instructions`, when present.
+    pub instructions: Option<String>,
+    /// The raw server `capabilities` object — kept as `Value` because its
+    /// shape varies by protocol revision.
+    pub capabilities: Value,
+    /// The negotiated `protocolVersion`.
+    pub protocol_version: Option<String>,
+}
+
 /// A tool advertised by a remote MCP server.
 #[derive(Debug, Clone)]
 pub struct RemoteTool {
@@ -174,19 +206,35 @@ impl<T: Transport> McpConnection<T> {
         self.transport.send(serde_json::to_string(&note)?).await
     }
 
-    /// Perform the MCP `initialize` handshake + `notifications/initialized`.
-    pub async fn initialize(&mut self) -> Result<()> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "newt", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        )
-        .await?;
+    /// Perform the MCP `initialize` handshake + `notifications/initialized`,
+    /// returning what the server reported about itself (previously discarded —
+    /// the #1292 probe prerequisite).
+    pub async fn initialize(&mut self) -> Result<InitializeInfo> {
+        let result = self
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "newt", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            )
+            .await?;
         self.notify("notifications/initialized", json!({})).await?;
-        Ok(())
+        Ok(InitializeInfo {
+            server_info: result
+                .get("serverInfo")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            instructions: result
+                .get("instructions")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            capabilities: result.get("capabilities").cloned().unwrap_or(Value::Null),
+            protocol_version: result
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
     }
 
     /// List the server's tools.
@@ -773,6 +821,10 @@ pub struct ConnectedServer {
     /// when outbound traffic is routed through the loopback egress proxy
     /// enforcing an `n`-host allow-list, else `Advisory`.
     pub net_posture: NetPosture,
+    /// The server's self-reported identity (`serverInfo`), when it sent one.
+    pub server_info: Option<ServerInfo>,
+    /// Server-authored usage `instructions` from the handshake, when present.
+    pub instructions: Option<String>,
 }
 
 /// Initialize a transport and list its tools into a [`ConnectedServer`].
@@ -784,7 +836,7 @@ async fn finish_connect(
 ) -> Result<ConnectedServer> {
     let timeout = resolve_timeout(entry);
     let mut conn = McpConnection::new_with_timeout(transport, timeout);
-    tokio::time::timeout(timeout, conn.initialize())
+    let init = tokio::time::timeout(timeout, conn.initialize())
         .await
         .with_context(|| format!("initializing MCP server `{}`", entry.name))??;
     let tools = conn
@@ -797,6 +849,8 @@ async fn finish_connect(
         tools,
         sandbox_kind,
         net_posture,
+        server_info: init.server_info,
+        instructions: init.instructions,
     })
 }
 
@@ -1143,6 +1197,8 @@ mod toolset_tests {
                 }],
                 sandbox_kind: None,
                 net_posture: crate::NetPosture::Advisory,
+                server_info: None,
+                instructions: None,
             }],
             sanitize_server_names: true,
         };
@@ -1182,6 +1238,8 @@ mod toolset_tests {
                 tools: vec![],
                 sandbox_kind: None,
                 net_posture: crate::NetPosture::Advisory,
+                server_info: None,
+                instructions: None,
             }],
             sanitize_server_names: true,
         };
@@ -1230,6 +1288,37 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "search");
         assert_eq!(tools[0].description, "find");
+    }
+
+    #[tokio::test]
+    async fn initialize_captures_server_identity_and_instructions() {
+        let mut conn = McpConnection::new(MockTransport::new([
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"scrybe","title":"Scrybe","version":"1.2.3"},"instructions":"Edit Markdown documents."}}"#,
+        ]));
+        let info = conn.initialize().await.unwrap();
+        let si = info.server_info.expect("serverInfo captured");
+        assert_eq!(si.name, "scrybe");
+        assert_eq!(si.title.as_deref(), Some("Scrybe"));
+        assert_eq!(si.version, "1.2.3");
+        assert_eq!(
+            info.instructions.as_deref(),
+            Some("Edit Markdown documents.")
+        );
+        assert_eq!(info.protocol_version.as_deref(), Some("2024-11-05"));
+        assert!(info.capabilities.get("tools").is_some());
+    }
+
+    #[tokio::test]
+    async fn initialize_tolerates_a_minimal_result() {
+        // A server reporting nothing beyond protocol compliance still
+        // initializes; identity fields are simply absent, never an error.
+        let mut conn = McpConnection::new(MockTransport::new([
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        ]));
+        let info = conn.initialize().await.unwrap();
+        assert!(info.server_info.is_none());
+        assert!(info.instructions.is_none());
+        assert!(info.protocol_version.is_none());
     }
 
     #[tokio::test]
