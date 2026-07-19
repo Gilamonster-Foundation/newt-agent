@@ -5593,12 +5593,18 @@ fn live_spill_capable_for(
         && term != Some("dumb")
 }
 
-/// #1303: the mouse-tier opt-in — `[tui] mouse_viewport` (default false).
-/// Mirrors [`spill_lines`]; the config field is always compiled, but this
-/// accessor and the capability gate only exist under `live-spill` (the mouse
-/// tier rides the spill viewport's own feature, stripped from the wyvern build).
+/// #1303: the mouse-tier opt-in — config-first (`[tui] mouse_viewport`, default
+/// false) with a `NEWT_MOUSE` env override (the `NEWT_*` convention, and the
+/// seam the acceptance test uses to force the opt-in on while proving the TTY
+/// gate still refuses). Mirrors [`spill_lines`]; the config field is always
+/// compiled, but this accessor and the capability gate only exist under
+/// `live-spill` (the mouse tier rides the spill viewport's own feature, stripped
+/// from the wyvern build).
 #[cfg(feature = "live-spill")]
 fn mouse_viewport(cfg: &newt_core::Config) -> bool {
+    if let Ok(v) = std::env::var("NEWT_MOUSE") {
+        return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+    }
     cfg.tui.as_ref().map(|t| t.mouse_viewport).unwrap_or(false)
 }
 

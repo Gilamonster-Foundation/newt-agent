@@ -365,6 +365,15 @@ impl LiveToolOutput for LiveSpillRenderer {
         }
         let _ = sync_geometry(&mut state);
         let columns = state.columns;
+        // #1303 step 6 (DEFERRED — clean seam): the post-completion overlay
+        // attaches HERE. Instead of dropping the finished `SpillView`, a
+        // retain-overlay would move it (or its `lines` + `dropped_lines`) into a
+        // generation-keyed slot on `RenderState`, beside `view`, reusing
+        // `frame()`/`fixed_frame_lines` for a bounded reopenable viewer anchored
+        // at the cursor (decision clause 3, grounding §4). The committed block is
+        // still re-rendered from the authoritative envelope (`display.rs`), never
+        // the live buffer; an abandoned generation is NOT retainable. Kept out of
+        // v1 to preserve the single-owner hand-off below unchanged.
         state.view = None;
         state.generation = None;
         drop(state);
