@@ -86,6 +86,39 @@ pub enum McpCmd {
         #[arg(long)]
         project: bool,
     },
+    /// Run newt as an MCP server over stdio (JSON-RPC, no TUI) — always,
+    /// regardless of whether stdin is a terminal. This is the explicit,
+    /// unambiguous manual way to serve; bare `newt mcp` serves too when its
+    /// stdin is piped (an MCP client), but prints this menu at a terminal.
+    Serve,
+}
+
+/// What bare `newt mcp` (no subcommand) should do, decided purely from
+/// whether stdin is a terminal. Factored out so the choice is unit-testable
+/// without a real TTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BareMcpAction {
+    /// stdin is piped (an MCP client spawned us, or the stdout-purity
+    /// tests): serve over stdio exactly as before — the backward-compatible
+    /// path every `claude mcp add newt -- newt mcp` config relies on.
+    Serve,
+    /// stdin is an interactive terminal: a human typed `newt mcp` expecting
+    /// the management verbs. Print the subcommand menu instead of blocking
+    /// as a server that reads stdin forever.
+    Help,
+}
+
+/// Decide what bare `newt mcp` should do from the TTY-ness of stdin.
+///
+/// Piped stdin ⇒ [`BareMcpAction::Serve`]; a terminal ⇒
+/// [`BareMcpAction::Help`]. Dispatched in `lib.rs`, which passes
+/// `std::io::stdin().is_terminal()`.
+pub fn bare_mcp_action(stdin_is_tty: bool) -> BareMcpAction {
+    if stdin_is_tty {
+        BareMcpAction::Help
+    } else {
+        BareMcpAction::Serve
+    }
 }
 
 /// clap `value_parser` for `--transport` (keeps newt-core clap-free — the
@@ -150,6 +183,11 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
             )?;
             print_next_steps(&mut out)
         }
+        // `serve` runs newt-as-a-server, which needs the persona (a global
+        // flag) and the stdio_guard redirect that only `run_mcp` in lib.rs
+        // owns. lib.rs intercepts `Some(McpCmd::Serve)` before delegating
+        // here, so this arm is never reached.
+        McpCmd::Serve => unreachable!("`newt mcp serve` is dispatched to run_mcp in lib.rs"),
     }
 }
 
@@ -532,6 +570,35 @@ mod tests {
             matches!(cli.command, Some(crate::Command::Mcp { cmd: None })),
             "bare `newt mcp` must keep serving over stdio"
         );
+    }
+
+    // The explicit, unambiguous manual serve verb: `newt mcp serve`.
+    #[test]
+    fn mcp_serve_parses_to_serve_variant() {
+        let cli = crate::Cli::try_parse_from(["newt", "mcp", "serve"]).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Some(crate::Command::Mcp {
+                    cmd: Some(McpCmd::Serve)
+                })
+            ),
+            "`newt mcp serve` must parse to the Serve variant"
+        );
+    }
+
+    // TTY seam: a piped stdin (an MCP client, or the stdout-purity tests)
+    // means SERVE — the backward-compatible path.
+    #[test]
+    fn bare_mcp_action_serves_when_stdin_is_piped() {
+        assert_eq!(bare_mcp_action(false), BareMcpAction::Serve);
+    }
+
+    // TTY seam: an interactive human at a terminal gets the verb menu, not
+    // a server that blocks on stdin.
+    #[test]
+    fn bare_mcp_action_prints_help_when_stdin_is_a_terminal() {
+        assert_eq!(bare_mcp_action(true), BareMcpAction::Help);
     }
 
     #[test]
