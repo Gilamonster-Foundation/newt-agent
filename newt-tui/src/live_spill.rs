@@ -1097,6 +1097,9 @@ mod tests {
     // releases mouse capture with NO renderer I/O. Because `abandon` emits
     // nothing through the renderer, the release is asserted on the GUARD's own
     // Drop side-effect handle — a sink independent of the renderer writer.
+    // Mouse is a unix-only tier (`mod mouse` is `#[cfg(all(unix, …))]`), so this
+    // proof only compiles/runs there.
+    #[cfg(unix)]
     #[test]
     fn rule7_abandon_releases_mouse_capture_without_renderer_io() {
         use crate::mouse::{MouseCaptureGuard, MouseSink};
