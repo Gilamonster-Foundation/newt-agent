@@ -97,25 +97,17 @@ fn classify_target(target: &str) -> ProbeTarget {
     }
 }
 
-/// Best-effort `(scheme, host)` from a URL — lowercased; port, userinfo, and
-/// path stripped; `[v6]` brackets removed. Parity with the TUI's
-/// `parse_scheme_host` (`newt-tui/src/mcp.rs`).
+/// `(scheme, host)` for policy decisions — thin wrapper over the client's
+/// canonical [`newt_mcp_client::parse_scheme_host`] so the probe's gate and
+/// the connection layer can never disagree about what the host is.
 fn parse_scheme_host(url: &str) -> (String, String) {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return (String::new(), String::new());
-    };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        v6.split(']').next().unwrap_or(v6)
-    } else {
-        authority.split(':').next().unwrap_or(authority)
-    };
-    (scheme.to_ascii_lowercase(), host.to_ascii_lowercase())
+    newt_mcp_client::parse_scheme_host(Some(url))
 }
 
+/// Loopback = IP property (or `localhost`), via the client's canonical
+/// [`newt_mcp_client::host_is_loopback`] — never a string prefix.
 fn host_is_loopback(host: &str) -> bool {
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    newt_mcp_client::host_is_loopback(host)
 }
 
 /// The transport-security decision for a URL probe.
@@ -774,6 +766,57 @@ mod tests {
             ("http".into(), "::1".into())
         );
         assert_eq!(parse_scheme_host("http://"), ("http".into(), String::new()));
+    }
+
+    #[test]
+    fn scheme_host_strips_query_fragment_and_userinfo_correctly() {
+        // Query/fragment terminate the authority just like '/' — the client's
+        // canonical split set. Diverging here corrupted the net-widened host.
+        assert_eq!(
+            parse_scheme_host("https://mcp.example?key=v"),
+            ("https".into(), "mcp.example".into())
+        );
+        assert_eq!(
+            parse_scheme_host("https://mcp.example#frag"),
+            ("https".into(), "mcp.example".into())
+        );
+        // Userinfo is stripped from the AUTHORITY only — an '@' inside the
+        // query must not smuggle a fake loopback host past the gate.
+        assert_eq!(
+            parse_scheme_host("http://evil.example?@127.0.0.1/"),
+            ("http".into(), "evil.example".into())
+        );
+        assert_eq!(
+            parse_scheme_host("http://user:pw@real.example:8080/x"),
+            ("http".into(), "real.example".into())
+        );
+    }
+
+    #[test]
+    fn loopback_is_an_ip_property_not_a_string_prefix() {
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("127.9.8.7"));
+        assert!(host_is_loopback("::1"));
+        assert!(host_is_loopback("localhost"));
+        // Valid public DNS names that merely LOOK loopback-ish must not
+        // bypass the cleartext gate.
+        assert!(!host_is_loopback("127.0.0.1.evil.com"));
+        assert!(!host_is_loopback("127.evil.example"));
+        assert!(!host_is_loopback("localhost.evil.example"));
+        assert!(!host_is_loopback("mcp.example"));
+    }
+
+    #[test]
+    fn url_policy_closes_the_spoofed_loopback_bypass() {
+        // Reproduces the review's live bypasses end-to-end through the policy.
+        assert!(matches!(
+            url_probe_policy("http://127.0.0.1.evil.com/mcp", false),
+            UrlPolicy::Refuse(_)
+        ));
+        assert!(matches!(
+            url_probe_policy("http://evil.example?@127.0.0.1/", false),
+            UrlPolicy::Refuse(_)
+        ));
     }
 
     #[test]

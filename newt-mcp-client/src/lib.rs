@@ -975,7 +975,14 @@ fn server_prefix(name: &str, sanitize: bool) -> String {
 /// stripped, IPv6 brackets removed. Empty strings when absent/unparseable (which
 /// the policy treats as insecure → no token). Manual parse to avoid a url dep;
 /// good enough for the scheme+host decision below.
-fn parse_scheme_host(url: Option<&str>) -> (String, String) {
+///
+/// The **canonical** implementation for MCP transport-policy decisions —
+/// `newt mcp probe` and the TUI's Bearer/egress gates delegate here so the
+/// split rules cannot diverge. The authority ends at the first of `/ ? #`,
+/// and userinfo is stripped from the *authority only* — an `@` inside a query
+/// must never smuggle a fake host past a gate.
+#[must_use]
+pub fn parse_scheme_host(url: Option<&str>) -> (String, String) {
     let Some(url) = url else {
         return (String::new(), String::new());
     };
@@ -990,9 +997,17 @@ fn parse_scheme_host(url: Option<&str>) -> (String, String) {
     (scheme.to_ascii_lowercase(), host.to_ascii_lowercase())
 }
 
-/// A loopback host — the dev exception that needs no https and emits no warning.
-fn host_is_loopback(host: &str) -> bool {
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+/// A loopback host — the dev exception that needs no https and emits no
+/// warning. Loopback is an **IP property**, never a string prefix: a
+/// `starts_with("127.")` check certified `127.0.0.1.evil.com` (a perfectly
+/// valid public DNS name) as loopback and let cleartext through the gate.
+/// A non-IP host other than `localhost` is NOT loopback.
+#[must_use]
+pub fn host_is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Warn on every non-loopback unencrypted (non-`https`) connection — the same
@@ -1349,6 +1364,33 @@ mod tests {
         assert!(info.server_info.is_none());
         assert!(info.instructions.is_none());
         assert_eq!(info.protocol_version.as_deref(), Some("2024-11-05"));
+    }
+
+    #[test]
+    fn scheme_host_authority_ends_at_slash_query_or_fragment() {
+        assert_eq!(
+            parse_scheme_host(Some("https://mcp.example?key=v")),
+            ("https".into(), "mcp.example".into())
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://evil.example?@127.0.0.1/")),
+            ("http".into(), "evil.example".into()),
+            "an @ inside the query must not smuggle a fake host"
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://user@[::1]:8080/x#f")),
+            ("http".into(), "::1".into())
+        );
+    }
+
+    #[test]
+    fn loopback_is_an_ip_property() {
+        for yes in ["localhost", "127.0.0.1", "127.9.8.7", "::1"] {
+            assert!(host_is_loopback(yes), "{yes}");
+        }
+        for no in ["127.0.0.1.evil.com", "127.evil.example", "mcp.example", ""] {
+            assert!(!host_is_loopback(no), "{no}");
+        }
     }
 
     #[tokio::test]

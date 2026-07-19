@@ -122,23 +122,11 @@ fn server_prefix(name: &str, sanitize: bool) -> String {
     }
 }
 
-/// Best-effort `(scheme, host)` from a URL — lowercased, port/userinfo/path
-/// stripped, IPv6 brackets removed. Empty strings when absent/unparseable (which
-/// the policy treats as insecure → no token). Manual parse to avoid a url dep;
-/// good enough for the scheme+host decision below.
+/// Best-effort `(scheme, host)` from a URL — the canonical implementation
+/// lives in `newt_mcp_client` (shared with `newt mcp probe`); this delegates
+/// so the TUI's Bearer/egress gates can never diverge from it.
 fn parse_scheme_host(url: Option<&str>) -> (String, String) {
-    let Some(url) = url else {
-        return (String::new(), String::new());
-    };
-    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h); // drop userinfo
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        v6.split(']').next().unwrap_or(v6) // [::1]:port → ::1
-    } else {
-        authority.split(':').next().unwrap_or(authority) // host:port → host
-    };
-    (scheme.to_ascii_lowercase(), host.to_ascii_lowercase())
+    newt_mcp_client::parse_scheme_host(url)
 }
 
 /// A loopback host — the dev exception that needs no https and emits no warning.
@@ -152,7 +140,9 @@ fn http_egress_permitted(net: &newt_core::caveats::Scope<String>, host: &str) ->
 }
 
 fn host_is_loopback(host: &str) -> bool {
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    // Canonical (IP-property, not string-prefix) check — `127.0.0.1.evil.com`
+    // must never count as loopback for token injection or the egress gate.
+    newt_mcp_client::host_is_loopback(host)
 }
 
 /// Whether an OAuth Bearer may be sent to `url` under the secure-by-default
