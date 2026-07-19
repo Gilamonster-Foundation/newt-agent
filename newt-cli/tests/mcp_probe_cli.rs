@@ -160,6 +160,23 @@ fn probe_without_yes_fails_closed_off_a_terminal() {
 }
 
 #[test]
+fn probe_never_certifies_a_stdin_echoing_process() {
+    let sb = sandbox();
+    // `/bin/cat` echoes the initialize request back verbatim (matching id, no
+    // error) — before handshake validation this "probed OK" with zero tools
+    // and was saveable. It must be rejected as not-an-MCP-server.
+    newt(&sb)
+        .args(["mcp", "probe", "/bin/cat", "--save", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not an MCP server"));
+    assert!(
+        !sb.config_dir.join("config.toml").exists(),
+        "a non-server must never be registered"
+    );
+}
+
+#[test]
 fn probe_failure_reports_every_candidate_tried() {
     let sb = sandbox();
     newt(&sb)

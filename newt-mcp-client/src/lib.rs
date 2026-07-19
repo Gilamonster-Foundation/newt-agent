@@ -133,6 +133,16 @@ pub struct InitializeInfo {
     pub protocol_version: Option<String>,
 }
 
+/// A short, single-line sketch of a JSON value for error messages (a wrong
+/// initialize result may be arbitrarily large or hostile — never echo it all).
+fn summarize_value(v: &Value) -> String {
+    let mut s = v.to_string().replace(['\n', '\r'], " ");
+    if s.chars().count() > 120 {
+        s = s.chars().take(120).collect::<String>() + "…";
+    }
+    s
+}
+
 /// A tool advertised by a remote MCP server.
 #[derive(Debug, Clone)]
 pub struct RemoteTool {
@@ -209,6 +219,15 @@ impl<T: Transport> McpConnection<T> {
     /// Perform the MCP `initialize` handshake + `notifications/initialized`,
     /// returning what the server reported about itself (previously discarded —
     /// the #1292 probe prerequisite).
+    ///
+    /// The result is **validated as a real handshake** before anything else:
+    /// it must be a JSON object carrying `protocolVersion` (a string) and
+    /// `capabilities` — both required in the spec's InitializeResult. Without
+    /// this, any process that echoes stdin (`/bin/cat`) "initializes"
+    /// successfully: the echoed request has our id and no `error`, so
+    /// [`request`](Self::request) yields `Null` — and the probe/doctor would
+    /// certify a non-server. A non-handshake result is a loud error, and no
+    /// `notifications/initialized` is sent to it.
     pub async fn initialize(&mut self) -> Result<InitializeInfo> {
         let result = self
             .request(
@@ -220,6 +239,17 @@ impl<T: Transport> McpConnection<T> {
                 }),
             )
             .await?;
+        let is_handshake = result.as_object().is_some_and(|obj| {
+            obj.get("protocolVersion").is_some_and(Value::is_string)
+                && obj.contains_key("capabilities")
+        });
+        if !is_handshake {
+            return Err(anyhow!(
+                "not an MCP server: no valid initialize response (expected an object with \
+                 `protocolVersion` and `capabilities`, got: {})",
+                summarize_value(&result)
+            ));
+        }
         self.notify("notifications/initialized", json!({})).await?;
         Ok(InitializeInfo {
             server_info: result
@@ -1309,16 +1339,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_tolerates_a_minimal_result() {
+    async fn initialize_tolerates_a_minimal_but_compliant_result() {
         // A server reporting nothing beyond protocol compliance still
         // initializes; identity fields are simply absent, never an error.
         let mut conn = McpConnection::new(MockTransport::new([
-            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#,
         ]));
         let info = conn.initialize().await.unwrap();
         assert!(info.server_info.is_none());
         assert!(info.instructions.is_none());
-        assert!(info.protocol_version.is_none());
+        assert_eq!(info.protocol_version.as_deref(), Some("2024-11-05"));
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_an_echoed_request_as_not_an_mcp_server() {
+        // `/bin/cat` echoes our own initialize REQUEST back: id matches, no
+        // `error`, no `result`. request() then yields Null — which must NOT
+        // count as a handshake, or the probe would certify any stdin-echoing
+        // process as an MCP server (and save it).
+        let mut conn = McpConnection::new(MockTransport::new([
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
+        ]));
+        let err = conn.initialize().await.unwrap_err();
+        assert!(err.to_string().contains("not an MCP server"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_non_handshake_results() {
+        // A result that is not an InitializeResult object (array / scalar /
+        // object missing protocolVersion or capabilities) is not a handshake.
+        for result in [
+            r#"{"jsonrpc":"2.0","id":1,"result":[1,2]}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#,
+        ] {
+            let mut conn = McpConnection::new(MockTransport::new([result]));
+            let err = conn.initialize().await.unwrap_err();
+            assert!(
+                err.to_string().contains("not an MCP server"),
+                "{result} → {err}"
+            );
+        }
     }
 
     #[tokio::test]
