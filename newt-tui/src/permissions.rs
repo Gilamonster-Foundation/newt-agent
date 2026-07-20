@@ -142,6 +142,11 @@ pub(crate) fn parse_permission_choice(input: &str) -> PromptChoice {
 // One arbiter now owns both directions, so "I am about to block on a human"
 // and "I own the bottom line" are mutually exclusive by construction. These
 // re-exports keep the turn watcher's call sites unchanged.
+//
+// unix-gated to match its only consumer — the turn watcher's stdin interlock
+// at `lib.rs` is `#[cfg(unix)]`, so on Windows this re-export would be an
+// unused import and `-D warnings` fails the build.
+#[cfg(unix)]
 pub(crate) use newt_core::tty::try_watch_stdin;
 
 /// #721 / facade P1b: is this request's `reason` MODEL-authored? Only the
