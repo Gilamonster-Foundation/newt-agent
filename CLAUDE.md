@@ -31,6 +31,41 @@ once it works. Do not let the three Cs block shipping a working result; do
 circle back and de-hardcode. When you spot a hardcoded list that encodes
 language or domain knowledge, flag it as a three-Cs refactor candidate.
 
+## Reuse discipline — search, adapt, minimize
+
+The three Cs put *knowledge* in data. This puts *behavior* in one adapted
+abstraction instead of a fork. In order, every time:
+
+1. **Before writing new code, search for existing code.** Grep the
+   workspace for the concept first. Do not add a second implementation of
+   something that already exists.
+2. **Use TDD to adapt existing code to the new case.** Write the failing
+   test for the new case against the *existing* abstraction, then widen
+   that abstraction — rather than standing a parallel one up beside it.
+3. **Refactor toward the fewest lines that still pass the tests.**
+   Fewest-lines is the success metric, not merely "it works".
+
+**Why: sprawl is what breeds whack-a-mole bug classes.** This is measured,
+not theoretical — the state of this repo's terminal code before the
+`newt_core::tty` line arbiter: **5** independent spinner implementations,
+**3** copies of the same 10-glyph frame array, **4** incompatible erase
+strategies, `\r\x1b[K` open-coded at **6** sites across 2 crates, **3**
+animation clocks, and **4** different predicates for "may I draw?". That
+sprawl produced a user-visible hang — a permission prompt rendered
+invisibly underneath a spinner that overwrote it ~8×/second — and `color`
+silently overloaded from a *styling* signal into an *I/O-ownership* signal.
+No single one of those was a hard problem; the missing shared owner was.
+Tracked in #1312.
+
+**Prefer making a bug unrepresentable over fixing each site.** When the
+same defect can occur at N call sites, a per-site fix inherits the sprawl:
+`gate.ask` has six call sites, and one of them was safe only by
+call-ordering luck. Reach for types, RAII, and required parameters so the
+broken call does not compile.
+
+If a second implementation really is warranted, say so in the PR and
+explain what the existing abstraction could not be widened to cover.
+
 ## Where the rules live
 
 - **Acceptance contract for every PR:** `docs/ROADMAP.md` (top
