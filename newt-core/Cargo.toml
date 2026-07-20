@@ -74,7 +74,12 @@ agent-bridle = { version = "0.7.10", features = ["shell", "web", "host-shell", "
 # behind the default `markdown` feature. Stripped under --no-default-features
 # (the headless wyvern tier) by the passthrough shim in `agentic::markdown`.
 pulldown-cmark = { workspace = true, optional = true }
-unicode-width = { workspace = true, optional = true }
+# NON-optional: `tty::width` is the workspace's ONE display-width model and
+# `tty::fit_line` measures through it on every build, so it cannot ride on the
+# optional `markdown` feature (`docs/decisions/tty_widget_suite.md` §3.0). It is
+# a pure lookup-table crate with no transitive deps — the wyvern strip pays
+# essentially nothing for it, and gets correct CJK/emoji fitting in exchange.
+unicode-width = { workspace = true }
 # Step 25.5 (#568 follow-on): optional plain-text GFM-table-pipe alignment for
 # the headless wyvern tier. Off by default (pulls comrak + wasm-bindgen).
 markdown-table-formatter = { workspace = true, optional = true }
@@ -129,7 +134,7 @@ default = ["markdown"]
 # Markdown → ANSI rendering of assistant output (Step 25.1). On by default for
 # the human-facing binaries; compiled out (passthrough shim) for the headless
 # wyvern strip via --no-default-features.
-markdown = ["dep:pulldown-cmark", "dep:unicode-width"]
+markdown = ["dep:pulldown-cmark"]
 # Step 25.5: plain-text GFM-table-pipe alignment for the headless wyvern tier.
 # Off by default — only wyvern/headless consumers opt in (pulls comrak +
 # wasm-bindgen). `tidy_markdown_tables` is identity without this feature.

@@ -1,19 +1,11 @@
 //! Display-width primitives for the Markdown renderer.
 //!
-//! Wrapping and (in Step 25.2) table layout count *display columns*, not bytes
-//! or `char`s — a CJK ideograph or a wide emoji occupies two cells, a
-//! combining mark zero. `unicode-width` encodes the Unicode East-Asian-Width
-//! table that the terminal itself uses, so our wrap points line up with what
-//! the user actually sees.
+//! The implementation moved **up** to the public [`crate::tty::width`] in the
+//! widget-suite promotion (`docs/decisions/tty_widget_suite.md` §3.0): it was
+//! the workspace's only correct width model and it was locked at `pub(super)`
+//! in here, which is the same privacy-causes-duplication pattern
+//! `tty/frames.rs` records for the spinner frame sets. This module stays as the
+//! downward re-export, so every `use super::width::…` in the renderer is
+//! unchanged.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-/// Display width of a single `char` in terminal cells (control chars → 0).
-pub(super) fn ch_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(0)
-}
-
-/// Display width of a string in terminal cells.
-pub(super) fn str_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
-}
+pub(super) use crate::tty::width::{ch_width, str_width};

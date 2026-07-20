@@ -192,6 +192,28 @@ Four widgets and one primitive promotion. Each absorbs a measured duplication co
 
 Move `markdown::width::{str_width, ch_width}` (`newt-core/src/agentic/markdown/width.rs:12`, `:17`) up to `newt-core/src/tty/width.rs`, `pub`, and re-export into the markdown module so `markdown/table.rs` keeps compiling unchanged. Add `wrap_line(s, cols) -> Vec<String>` by moving `display::wrap_to_width` (`display.rs:29`) and pointing `transcript.rs:127` at it.
 
+> **[CORRECTION] (step 1, implemented 2026-07-19)** — two survey errors:
+>
+> 1. **`unicode-width` is an OPTIONAL dependency gated on the `markdown`
+>    feature** (`newt-core/Cargo.toml:77`, `:132`). The survey missed this. Since
+>    `tty` is unconditional and step 2 makes `fit_line` measure through
+>    `str_width`, the dependency **must become non-optional** — done in step 1,
+>    with `markdown` narrowed to `["dep:pulldown-cmark"]`. It is a pure
+>    lookup-table crate with no transitive dependencies, so the wyvern strip
+>    pays essentially nothing.
+> 2. **`transcript.rs`'s wrapper is NOT a duplicate of `display::wrap_to_width`,
+>    and must not be pointed at `wrap_line`.** The two are different algorithms:
+>    `display::wrap_to_width` splits on `split_inclusive(' ')` and therefore
+>    **keeps the break space** as a trailing space on each wrapped chunk, while
+>    `transcript.rs:178` breaks at the last space before the limit and **drops
+>    it**. Measured, `"hello there friend"` at width 10 gives
+>    `["hello ", "there ", "friend"]` vs `["hello", "there", "friend"]` — a
+>    visible text change in the downstream cowork pane, and not an enumerated
+>    diff in §5. `transcript.rs`'s own tests do **not** catch it (they pass
+>    against either implementation), so green tests were not evidence here.
+>    Unifying the two is a real behavior decision and belongs in its own step
+>    with its own goldens, not inside the "pure move" step.
+
 ```rust
 pub fn ch_width(c: char) -> usize;
 pub fn str_width(s: &str) -> usize;      // display columns, unicode-width
@@ -398,7 +420,7 @@ Each step is a separate PR, lands green on its own, and is revertible without th
 
 | # | Step | Bespoke site → what it becomes | Proof of no behavior change |
 |---|---|---|---|
-| **1** | Promote width | `markdown/width.rs:12,17` → `tty::width::{ch_width,str_width}`; `display.rs:29` `wrap_to_width` → `tty::width::wrap_line`; `transcript.rs:127` → calls it | Pure move. [UNIT] all existing markdown-width and wrap tests unchanged. New: `str_width("日本") == 4`. No output changes anywhere. |
+| **1** | Promote width | `markdown/width.rs:12,17` → `tty::width::{ch_width,str_width}`; `display.rs:29` `wrap_to_width` → `tty::width::wrap_line`; ~~`transcript.rs:127` → calls it~~ (see [CORRECTION] in §3.0 — different algorithm, left alone); `unicode-width` becomes non-optional | Pure move. [UNIT] all existing markdown-width and wrap tests unchanged. New: `str_width("日本") == 4`. No output changes anywhere. |
 | **2** | `fit_line` uses `str_width` | `tty/mod.rs:94` internals | [UNIT] existing `fit_line` table tests at `tty/mod.rs:119-158` unchanged (all ASCII). **Behaviour change, deliberate:** CJK spinner labels now fit correctly. New test asserts the old char-count result was wrong. |
 | **3** | Land `Notice` | new `tty::widgets::notice`, no call sites migrated | [UNIT] `Notice::line()` reproduces `compression_notice_text` (`display.rs:293`), `retry_progress_msg` (`lib.rs:1451`), `fallback_progress_msg`, `failure_progress_msg` byte-for-byte. Zero production diff. |
 | **4** | Kill the summarizer race | `newt-tui/src/lib.rs:1445-1470` `summarizer_progress` → `Notice{Warn}.emit(...)`; the three `if opts.color` gates at `:1610`, `:1655`, `:1667` → `LineCaps` | [UNIT] `http_loop.rs:401` (`"⚠ summarizer falling back to qwen:0.5b…"`) passes unmodified. [PTY] new: spinner live + notice emitted → no interleaved bytes; `PromptWindow` live + notice emitted → notice does not overwrite the question. **This is the one step that fixes a live bug, so it goes early.** |

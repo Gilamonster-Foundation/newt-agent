@@ -19,43 +19,11 @@ use std::io::{self, Write};
 pub use crate::tty::NEWT_ORANGE_CT;
 pub(crate) use crate::tty::{term_cols, FADE_CT};
 
-/// Word-wrap `s` into lines no wider than `width` columns (#1153): the tool-call
-/// display must show the FULL command/path so the operator can audit exactly
-/// what ran — truncating a `grep … | grep …` with `…` hid it. Wraps on
-/// whitespace when possible; a single token longer than `width` is hard-split
-/// so nothing is ever dropped. Width counted in `char`s (this path is ASCII
-/// commands/paths). Returns at least one line (possibly empty for empty input).
-pub(crate) fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for logical in s.split('\n') {
-        let mut cur = String::new();
-        let mut cur_len = 0usize;
-        for word in logical.split_inclusive(' ') {
-            let wlen = word.chars().count();
-            if cur_len + wlen > width && cur_len > 0 {
-                lines.push(std::mem::take(&mut cur));
-                cur_len = 0;
-            }
-            // A single word wider than the line: hard-split it so nothing is lost.
-            if wlen > width {
-                for ch in word.chars() {
-                    if cur_len == width {
-                        lines.push(std::mem::take(&mut cur));
-                        cur_len = 0;
-                    }
-                    cur.push(ch);
-                    cur_len += 1;
-                }
-            } else {
-                cur.push_str(word);
-                cur_len += wlen;
-            }
-        }
-        lines.push(cur);
-    }
-    lines
-}
+// The multi-line wrapper moved up to `tty::width::wrap_line` with the rest of
+// the width model (`docs/decisions/tty_widget_suite.md` §3.0). Aliased under its
+// old name so every call site and every test in this module is unchanged — the
+// promotion is a move, not a behavior change.
+pub(crate) use crate::tty::width::wrap_line as wrap_to_width;
 
 /// Print a newt narrator line.
 ///

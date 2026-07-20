@@ -40,6 +40,7 @@ pub mod arbiter;
 pub mod caps;
 pub mod frames;
 pub mod spinner;
+pub mod width;
 
 pub use arbiter::{
     prompt_stdin_active, prompt_windows_constructed, try_watch_stdin, Ephemeral, LineLease,
@@ -48,6 +49,7 @@ pub use arbiter::{
 pub use caps::{enter_protocol_mode, protocol_mode, LineCaps};
 pub use frames::{format_spinner, SPINNER_FRAMES};
 pub use spinner::{with_spinner, Spinner};
+pub use width::{ch_width, str_width, wrap_line};
 
 /// The newt logo orange as a crossterm color (matches the TUI splash).
 pub const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
