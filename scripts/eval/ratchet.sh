@@ -67,6 +67,18 @@ case "$MODE" in
     [ -x "$NEWT" ] || { echo "ratchet: newt binary not at $NEWT (build it / set NEWT_BIN)" >&2; exit 2; }
     throw="$(mktemp -d)"
     cp -r "$CASE_DIR/workspace/." "$throw/"
+    # #1320 bridge: `newt plan`'s backend selection honors ONLY the
+    # project-local `.newt/config.toml` walk-up — the base-config chain
+    # ($NEWT_CONFIG env / --config / --config-dir) never reaches it. sweep.sh
+    # exports $NEWT_CONFIG ("newt plan resolves this"), which is silently
+    # inert → crew cells would run the box's default backend under the swept
+    # model's label. Install the sweep config INTO the throwaway workspace as
+    # its project config so the pin actually lands. Remove when #1320 fixes
+    # the base chain.
+    if [ -n "${NEWT_CONFIG:-}" ] && [ -f "$NEWT_CONFIG" ]; then
+      mkdir -p "$throw/.newt"
+      cp "$NEWT_CONFIG" "$throw/.newt/config.toml"
+    fi
     ( cd "$throw" && git init -q -b main && git add -A \
         && git -c user.email=r@r -c user.name=r commit -qm baseline )
     base="$(cd "$throw" && git rev-parse HEAD)"
