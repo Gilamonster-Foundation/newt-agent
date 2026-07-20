@@ -1,0 +1,5 @@
+error: cannot construct `PromptWindow` with struct literal syntax due to private fields
+ --> tests/ui/prompt_window_cannot_be_struct_literaled.rs:4:14
+  |
+4 |     let _w = newt_core::tty::PromptWindow {};
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

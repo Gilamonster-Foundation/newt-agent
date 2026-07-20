@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `test_stub` found for struct `PromptWindow` in the current scope
+ --> tests/ui/prompt_window_test_stub_is_not_public.rs:5:44
+  |
+5 |     let _w = newt_core::tty::PromptWindow::test_stub();
+  |                                            ^^^^^^^^^ associated function or constant not found in `PromptWindow`

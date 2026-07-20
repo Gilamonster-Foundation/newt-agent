@@ -64,6 +64,16 @@ pub(crate) fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
 /// hue that's hard to parse on this operator's display (accessibility note —
 /// never lean on a deep saturated color for anything readable). No-color: `>`.
 pub fn print_newt(msg: &str, color: bool, verbose: bool) {
+    println!("{}", newt_line(msg, color, verbose));
+}
+
+/// The narrator line [`print_newt`] prints, as a string.
+///
+/// Split out so a caller holding a [`crate::tty::PromptWindow`] can route the
+/// SAME bytes through `PromptWindow::notice` instead of `println!` — a notice
+/// emitted while a question is on screen must go through the arbiter, or it
+/// races the very ticker it was meant to be protected from.
+pub fn newt_line(msg: &str, color: bool, verbose: bool) -> String {
     let prefix = if color {
         if verbose {
             "newt ▸  "
@@ -75,7 +85,7 @@ pub fn print_newt(msg: &str, color: bool, verbose: bool) {
     } else {
         ">  "
     };
-    println!("{prefix}{msg}");
+    format!("{prefix}{msg}")
 }
 
 /// Print one row of a selectable list in newt's default list style.

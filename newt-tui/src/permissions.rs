@@ -7,8 +7,17 @@
 //! [`PromptChoice`]), and threads the answer back through
 //! [`PromptPermissionGate`] (the [`newt_core::PermissionGate`] impl the run loop
 //! installs) and [`PermissionPromptState`] (session/one-shot/durable grants,
-//! including the #904 permanent-deny ledger). Raw-mode line handling
-//! ([`PromptStdinGuard`], [`enter_prompt_line_mode`]) lives here too.
+//! including the #904 permanent-deny ledger).
+//!
+//! **Terminal ownership is not decided here.** Stdin exclusion and raw-mode
+//! line handling used to live in this file (`PromptStdinGuard`,
+//! `enter_prompt_line_mode`); they moved into `newt_core::tty`, which now
+//! arbitrates BOTH halves of the terminal. Every function below that can block
+//! on a human takes a [`newt_core::tty::PromptWindow`] — an unforgeable
+//! capability whose only constructor,
+//! [`newt_core::tty::Terminal::suspend_for_prompt`], erases every live
+//! ephemeral writer before it returns. A question printed onto a live spinner
+//! is therefore not a bug that can be written: it does not typecheck.
 //!
 //! Extracted from `lib.rs` in the #1096 functional-cohesion pass. The
 //! *default-deny invariant* is the load-bearing rule: a session that cannot
@@ -17,11 +26,12 @@
 //! The `/mode` named-preset clamp (issue #307) is a *sibling* concern and
 //! deliberately stays in `lib.rs` next to the session state it floors.
 
-use std::io::{self, Write as _};
+use std::io;
 
 use crate::danger;
 use crate::mint_operating_key;
-use newt_core::agentic::print_newt;
+use newt_core::agentic::{newt_line, print_newt};
+use newt_core::tty::{PromptWindow, Terminal};
 
 // ---------------------------------------------------------------------------
 
@@ -119,140 +129,20 @@ pub(crate) fn parse_permission_choice(input: &str) -> PromptChoice {
     }
 }
 
-#[derive(Default)]
-struct StdinOwnership {
-    prompt_owner: Option<std::thread::ThreadId>,
-    prompt_depth: usize,
-    watcher_reading: bool,
-}
-
-fn stdin_ownership() -> &'static (std::sync::Mutex<StdinOwnership>, std::sync::Condvar) {
-    static OWNERSHIP: std::sync::OnceLock<(std::sync::Mutex<StdinOwnership>, std::sync::Condvar)> =
-        std::sync::OnceLock::new();
-    OWNERSHIP.get_or_init(|| {
-        (
-            std::sync::Mutex::new(StdinOwnership::default()),
-            std::sync::Condvar::new(),
-        )
-    })
-}
-
-/// Whether a prompt currently owns stdin, exposed only for ownership tests.
-#[cfg(test)]
-pub(crate) fn prompt_stdin_active() -> bool {
-    stdin_ownership()
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .prompt_owner
-        .is_some()
-}
-
-/// Exclusive read token used by the turn watcher. A prompt cannot enter while
-/// this token exists, and the watcher cannot acquire it while any prompt owns
-/// stdin, closing the check-then-read race at permission transitions.
-#[cfg(unix)]
-pub(crate) struct WatcherStdinGuard;
-
-#[cfg(unix)]
-pub(crate) fn try_watch_stdin() -> Option<WatcherStdinGuard> {
-    let (ownership, _) = stdin_ownership();
-    let mut state = ownership
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state.prompt_owner.is_some() || state.watcher_reading {
-        return None;
-    }
-    state.watcher_reading = true;
-    Some(WatcherStdinGuard)
-}
-
-#[cfg(unix)]
-impl Drop for WatcherStdinGuard {
-    fn drop(&mut self) {
-        let (ownership, wake) = stdin_ownership();
-        let mut state = ownership
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.watcher_reading = false;
-        wake.notify_all();
-    }
-}
-
-/// While a permission or free-text prompt is active, stdin belongs to the
-/// prompt reader. On Unix the surrounding turn may have put the terminal in
-/// cbreak mode for Esc/Ctrl-C watching; temporarily restore line-oriented input
-/// so `read_line` actually waits for an answer, then restore the previous mode.
-pub(crate) struct PromptStdinGuard {
-    #[cfg(unix)]
-    restore: Option<libc::termios>,
-}
-
-impl PromptStdinGuard {
-    fn enter() -> Self {
-        let thread = std::thread::current().id();
-        let (ownership, wake) = stdin_ownership();
-        let mut state = ownership
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.watcher_reading
-            || state
-                .prompt_owner
-                .as_ref()
-                .is_some_and(|owner| *owner != thread)
-        {
-            state = wake
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        state.prompt_owner = Some(thread);
-        state.prompt_depth += 1;
-        drop(state);
-        Self {
-            #[cfg(unix)]
-            restore: enter_prompt_line_mode().ok(),
-        }
-    }
-}
-
-impl Drop for PromptStdinGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(prev) = self.restore.take() {
-            unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &prev);
-            }
-        }
-        let (ownership, wake) = stdin_ownership();
-        let mut state = ownership
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.prompt_depth = state.prompt_depth.saturating_sub(1);
-        if state.prompt_depth == 0 {
-            state.prompt_owner = None;
-            wake.notify_all();
-        }
-    }
-}
-
-#[cfg(unix)]
-pub(crate) fn enter_prompt_line_mode() -> io::Result<libc::termios> {
-    unsafe {
-        let fd = libc::STDIN_FILENO;
-        let mut prev: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut prev) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut line = prev;
-        line.c_lflag |= libc::ICANON | libc::ECHO;
-        line.c_cc[libc::VMIN] = 1;
-        line.c_cc[libc::VTIME] = 0;
-        if libc::tcsetattr(fd, libc::TCSANOW, &line) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(prev)
-    }
-}
+// ---------------------------------------------------------------------------
+// Stdin ownership moved to `newt_core::tty`.
+//
+// It used to live here as a private `OnceLock<(Mutex<StdinOwnership>,
+// Condvar)>` plus `PromptStdinGuard` / `WatcherStdinGuard` /
+// `enter_prompt_line_mode`. That machinery was correct — and it was HALF the
+// terminal. It modelled who may READ stdin with real rigor while nothing at all
+// modelled who may WRITE the bottom line, which is exactly how a question came
+// to be printed onto a live spinner and then scribbled out by it.
+//
+// One arbiter now owns both directions, so "I am about to block on a human"
+// and "I own the bottom line" are mutually exclusive by construction. These
+// re-exports keep the turn watcher's call sites unchanged.
+pub(crate) use newt_core::tty::try_watch_stdin;
 
 /// #721 / facade P1b: is this request's `reason` MODEL-authored? Only the
 /// proactive `request_permissions` tool lets the model write the `reason`
@@ -384,16 +274,19 @@ pub fn ocap_high_danger_predicate() -> impl Fn(newt_core::ocap_store::Capability
     }
 }
 
-/// Production prompt: print the question, read one line from stdin under
-/// [`PromptStdinGuard`]. Any read error is a deny (never a hang, never an
-/// allow).
-pub(crate) fn prompt_permission_choice(prompt_text: &str) -> PromptChoice {
-    let _stdin = PromptStdinGuard::enter();
-    print!("{prompt_text}");
-    io::stdout().flush().ok();
-    let mut answer = String::new();
-    match io::stdin().read_line(&mut answer) {
-        Ok(_) => parse_permission_choice(&answer),
+/// Production prompt: ask the question, read one line back. Any read error is a
+/// deny (never a hang, never an allow).
+///
+/// The `&PromptWindow` is the whole fix. Obtaining one requires having called
+/// [`Terminal::suspend_for_prompt`], which erases every live ephemeral writer
+/// and holds the shared ticker still for the window's lifetime — so the
+/// question lands on a clean row and stays there while the operator reads it.
+/// The parameter is not advisory: without it this function does not compile,
+/// which is why the same mistake cannot be reintroduced at a seventh call site.
+pub(crate) fn prompt_permission_choice(w: &PromptWindow, prompt_text: &str) -> PromptChoice {
+    w.ask(prompt_text).ok();
+    match w.read_line() {
+        Ok(answer) => parse_permission_choice(&answer),
         Err(_) => PromptChoice::Deny,
     }
 }
@@ -420,20 +313,24 @@ pub(crate) fn interpret_user_line(read: io::Result<usize>, buf: &str) -> Option<
 /// one line from stdin (the same blocking shape as the permission prompt) and
 /// interpret it via [`interpret_user_line`]. Closed stdin / read error → `None`
 /// (no human to answer), never a hang.
-pub(crate) fn prompt_user_input(question: &str) -> Option<String> {
-    let _stdin = PromptStdinGuard::enter();
-    print!("? {question}\n> ");
-    io::stdout().flush().ok();
+pub(crate) fn prompt_user_input(w: &PromptWindow, question: &str) -> Option<String> {
+    w.ask(&format!("? {question}\n> ")).ok();
     let mut answer = String::new();
-    let read = io::stdin().read_line(&mut answer);
+    // `read_line_into`, not `read_line`: the BYTE COUNT is load-bearing here —
+    // `interpret_user_line` distinguishes EOF (`Ok(0)`, a deliberate empty
+    // answer from Ctrl-D) from a genuine read error (no human available).
+    let read = w.read_line_into(&mut answer);
     let line = interpret_user_line(read, &answer)?;
     if is_slash_command_at_prompt(&line) {
         // A leading-slash answer is a TUI command intent, NOT an answer for the
         // model — never hand it over. A small model will try to *run* it (e.g.
         // `/exit` -> `run_command exit`), which OCAP then denies. Refuse here;
         // Ctrl-C returns to the main prompt where slash commands work.
-        println!("(slash commands aren't answers to this question - Ctrl-C to return to the prompt, then use /exit, /model, ...)");
-        io::stdout().flush().ok();
+        w.notice(
+            "(slash commands aren't answers to this question - Ctrl-C to return \
+             to the prompt, then use /exit, /model, ...)",
+        )
+        .ok();
         return None;
     }
     Some(line)
@@ -578,8 +475,13 @@ impl PermissionPromptState {
 /// the re-executed call (and are re-minted on demand for session grants).
 ///
 /// `ask_human` is the interaction seam: production wires
-/// [`prompt_permission_choice`] (stdin); tests inject a scripted closure.
-pub(crate) struct PromptPermissionGate<'a, F: FnMut(&str) -> PromptChoice> {
+/// [`prompt_permission_choice`]; tests inject a scripted closure.
+///
+/// It takes a [`PromptWindow`] because every blocking prompt does. The token is
+/// constructed at the ONE site inside [`PromptPermissionGate::ask`] below, not
+/// threaded in from callers — so this type's shape changes while all six
+/// `gate.ask` call sites in `newt-core`'s tool dispatcher stay untouched.
+pub(crate) struct PromptPermissionGate<'a, F: FnMut(&PromptWindow, &str) -> PromptChoice> {
     pub(crate) state: &'a mut PermissionPromptState,
     /// The session's enforced caveats at turn start — the re-mint baseline.
     /// When a `/mode` preset is active this is ALREADY the clamped (base ∩
@@ -618,7 +520,7 @@ pub(crate) struct PromptPermissionGate<'a, F: FnMut(&str) -> PromptChoice> {
     pub(crate) ask_human: F,
 }
 
-impl<F: FnMut(&str) -> PromptChoice> PromptPermissionGate<'_, F> {
+impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> PromptPermissionGate<'_, F> {
     /// Record one decision: into the session list (for `/permissions`) and
     /// appended to the durable log. A log-write failure is reported but
     /// never blocks the decision — the record is a review artifact, not a
@@ -675,7 +577,9 @@ impl<F: FnMut(&str) -> PromptChoice> PromptPermissionGate<'_, F> {
     }
 }
 
-impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermissionGate<'_, F> {
+impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
+    for PromptPermissionGate<'_, F>
+{
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
         use newt_core::PermissionDecision::{Allow, Deny};
         if requests.is_empty() {
@@ -759,7 +663,20 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
                     continue;
                 }
             }
-            match (self.ask_human)(&permission_prompt_text(req, &self.danger)) {
+            // ---------------- THE seam ----------------
+            // The ONE place in the workspace that constructs a `PromptWindow`.
+            // `suspend_for_prompt()` takes stdin AND erases every registered
+            // ephemeral writer before it returns, then holds the shared ticker
+            // still until `w` drops — so the question lands on a clean row and
+            // survives for as long as the operator is reading it.
+            //
+            // Constructed HERE rather than threaded in from callers: that is
+            // what lets all six `gate.ask` sites in `newt-core`'s tool
+            // dispatcher inherit the guarantee without a single line changing
+            // at any of them, and what makes a seventh site safe by default.
+            let w = Terminal::suspend_for_prompt();
+            let choice = (self.ask_human)(&w, &permission_prompt_text(req, &self.danger));
+            match choice {
                 PromptChoice::AllowOnce => {
                     self.record(req, "allow", "once");
                     once_grants.push((req.kind, req.target.clone()));
@@ -793,7 +710,10 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
                     // makes a muscle-memory `s` safe.
                     if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
                         self.record(req, "deny", "session-allow-refused-high-danger");
-                        print_newt(
+                        // Through the window, not `println!`: the refusal is
+                        // printed while a question is still on screen, so it
+                        // must go through the arbiter or it races the ticker.
+                        w.notice(&newt_line(
                             &format!(
                                 "session allow refused for high-danger `{}` — \
                                  allow once per op or deny (step-up is the future path)",
@@ -801,7 +721,8 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
                             ),
                             self.color,
                             self.verbose,
-                        );
+                        ))
+                        .ok();
                         return Deny;
                     }
                     self.record(req, "allow", "session");
@@ -830,11 +751,12 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
                     }
                     if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
                         self.record(req, "deny", "permanent-allow-refused-high-danger");
-                        print_newt(
+                        w.notice(&newt_line(
                             &format!("permanent allow refused for high-danger `{}`", req.target),
                             self.color,
                             self.verbose,
-                        );
+                        ))
+                        .ok();
                         return Deny;
                     }
                     self.record(req, "allow", "permanent");
@@ -843,16 +765,17 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
                             if let Err(e) =
                                 newt_core::Config::append_permission_net_host(path, &req.target)
                             {
-                                print_newt(
+                                w.notice(&newt_line(
                                     &format!(
                                         "warning: could not persist net grant to config: {e} \
                                          (granted for this session only)"
                                     ),
                                     self.color,
                                     self.verbose,
-                                );
+                                ))
+                                .ok();
                             } else {
-                                print_newt(
+                                w.notice(&newt_line(
                                     &format!(
                                         "added `{}` to [tui.permissions] net — future sessions \
                                          will not prompt for it",
@@ -860,14 +783,18 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
                                     ),
                                     self.color,
                                     self.verbose,
-                                );
+                                ))
+                                .ok();
                             }
                         }
-                        None => print_newt(
-                            "no config path this session — net grant is session-only",
-                            self.color,
-                            self.verbose,
-                        ),
+                        None => {
+                            w.notice(&newt_line(
+                                "no config path this session — net grant is session-only",
+                                self.color,
+                                self.verbose,
+                            ))
+                            .ok();
+                        }
                     }
                     self.state
                         .session_grants
@@ -917,7 +844,10 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
     /// `None`, which the `request_user_input` tool renders as "no human
     /// available" — never a hang.
     fn ask_question(&mut self, question: &str) -> Option<String> {
-        prompt_user_input(question)
+        // Same seam as `ask`: suspend first, then ask. `prompt_user_input`
+        // cannot be called any other way.
+        let w = Terminal::suspend_for_prompt();
+        prompt_user_input(&w, question)
     }
 }
 
@@ -959,7 +889,7 @@ mod permission_prompt_tests {
         log_path: Option<std::path::PathBuf>,
         script: Vec<PromptChoice>,
         prompts: Rc<Cell<usize>>,
-    ) -> PromptPermissionGate<'a, impl FnMut(&str) -> PromptChoice> {
+    ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &str) -> PromptChoice> {
         let mut script = script.into_iter();
         PromptPermissionGate {
             state,
@@ -973,7 +903,7 @@ mod permission_prompt_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
-            ask_human: move |_prompt: &str| {
+            ask_human: move |_w: &PromptWindow, _prompt: &str| {
                 prompts.set(prompts.get() + 1);
                 script.next().expect("script exhausted — unexpected prompt")
             },
@@ -991,7 +921,7 @@ mod permission_prompt_tests {
         preset_clamp: Caveats,
         script: Vec<PromptChoice>,
         prompts: Rc<Cell<usize>>,
-    ) -> PromptPermissionGate<'a, impl FnMut(&str) -> PromptChoice> {
+    ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &str) -> PromptChoice> {
         let mut script = script.into_iter();
         PromptPermissionGate {
             state,
@@ -1005,7 +935,7 @@ mod permission_prompt_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
-            ask_human: move |_prompt: &str| {
+            ask_human: move |_w: &PromptWindow, _prompt: &str| {
                 prompts.set(prompts.get() + 1);
                 script.next().expect("script exhausted — unexpected prompt")
             },
@@ -1044,62 +974,11 @@ mod permission_prompt_tests {
         assert_eq!(interpret_user_line(Ok(5), "hi\n"), Some("hi".to_string()));
     }
 
-    #[serial_test::serial(prompt_stdin)]
-    #[test]
-    fn prompt_stdin_guard_marks_prompt_ownership_and_clears_on_drop() {
-        assert!(
-            !prompt_stdin_active(),
-            "test starts with no active prompt stdin owner"
-        );
-        {
-            let _guard = PromptStdinGuard::enter();
-            #[cfg(unix)]
-            assert!(
-                try_watch_stdin().is_none(),
-                "the watcher cannot read while a prompt owns stdin"
-            );
-            assert!(
-                prompt_stdin_active(),
-                "active prompts must tell the interrupt watcher not to read stdin"
-            );
-            {
-                let _nested = PromptStdinGuard::enter();
-                assert!(prompt_stdin_active(), "nested prompts keep ownership");
-            }
-            assert!(
-                prompt_stdin_active(),
-                "dropping one nested guard must not release stdin early"
-            );
-        }
-        assert!(
-            !prompt_stdin_active(),
-            "prompt stdin ownership must clear when the guard drops"
-        );
-    }
-
-    #[cfg(unix)]
-    #[serial_test::serial(prompt_stdin)]
-    #[test]
-    fn watcher_read_token_blocks_prompt_entry_until_the_read_finishes() {
-        let watcher = try_watch_stdin().expect("watcher acquires idle stdin");
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let prompt = std::thread::spawn(move || {
-            let _prompt = PromptStdinGuard::enter();
-            let _ = entered_tx.send(());
-        });
-
-        assert!(
-            entered_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "prompt entered during the watcher's protected read"
-        );
-        drop(watcher);
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("prompt enters once the watcher releases stdin");
-        prompt.join().unwrap();
-    }
+    // NOTE: `prompt_stdin_guard_marks_prompt_ownership_and_clears_on_drop` and
+    // `watcher_read_token_blocks_prompt_entry_until_the_read_finishes` moved to
+    // `newt_core::tty::arbiter` with the mechanism they test. Stdin ownership
+    // is no longer this module's concern — one arbiter owns both halves of the
+    // terminal.
 
     #[test]
     fn prompt_text_names_tool_target_axis_and_choices() {
@@ -1441,7 +1320,9 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
-                ask_human: move |_p: &str| script.next().expect("script exhausted"),
+                ask_human: move |_w: &PromptWindow, _p: &str| {
+                    script.next().expect("script exhausted")
+                },
             };
             assert!(matches!(
                 gate.ask(std::slice::from_ref(&net_req)),
@@ -1473,7 +1354,9 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
-                ask_human: |_p: &str| panic!("must NOT prompt: target was permanently denied"),
+                ask_human: |_w: &PromptWindow, _p: &str| {
+                    panic!("must NOT prompt: target was permanently denied")
+                },
             };
             assert!(matches!(
                 gate.ask(std::slice::from_ref(&net_req)),
@@ -1557,7 +1440,9 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
-                ask_human: move |_p: &str| script.next().expect("script exhausted"),
+                ask_human: move |_w: &PromptWindow, _p: &str| {
+                    script.next().expect("script exhausted")
+                },
             };
             match gate.ask(std::slice::from_ref(&net_req)) {
                 newt_core::PermissionDecision::Allow(c) => {
@@ -2264,6 +2149,52 @@ mod permission_prompt_tests {
         // Explicit OFF beats the interactive default AND an explicit ON.
         assert!(!should_prompt_permissions(false, true, true, false));
         assert!(!should_prompt_permissions(true, true, true, false));
+    }
+
+    /// §6.10 — **the default-deny invariant is not weakened by the arbiter.**
+    ///
+    /// A session that cannot answer a TTY prompt must reach a denial without
+    /// ever asking. Now that asking means constructing a `PromptWindow` — which
+    /// takes stdin and suspends every ephemeral writer — "without ever asking"
+    /// has a mechanical witness: the process-wide construction counter must not
+    /// move.
+    ///
+    /// The guard is `if headless || !interactive { return false; }`, and it must
+    /// short-circuit BEFORE anything consults the terminal. That it does is
+    /// visible in the predicate's purity (it takes four booleans and probes
+    /// nothing), and pinned here by exhausting the whole product: no combination
+    /// of the two ON signals can make a headless or non-interactive session
+    /// prompt.
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn headless_and_piped_sessions_never_construct_a_prompt_window() {
+        let before = newt_core::tty::prompt_windows_constructed();
+
+        for configured_on in [false, true] {
+            for explicit_off in [false, true] {
+                // HEADLESS: never prompts, whatever else is set.
+                for interactive in [false, true] {
+                    assert!(
+                        !should_prompt_permissions(configured_on, explicit_off, interactive, true),
+                        "headless prompted (configured_on={configured_on} \
+                         explicit_off={explicit_off} interactive={interactive})"
+                    );
+                }
+                // NON-INTERACTIVE (piped / captured): likewise never prompts.
+                assert!(
+                    !should_prompt_permissions(configured_on, explicit_off, false, false),
+                    "a non-interactive session prompted (configured_on={configured_on} \
+                     explicit_off={explicit_off})"
+                );
+            }
+        }
+
+        assert_eq!(
+            newt_core::tty::prompt_windows_constructed(),
+            before,
+            "a default-denied session must reach its denial without the terminal \
+             ever being suspended for a question"
+        );
     }
 
     #[test]

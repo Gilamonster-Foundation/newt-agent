@@ -222,6 +222,27 @@ impl Drop for LineLease {
 // The facade
 // ---------------------------------------------------------------------------
 
+/// How many times a [`PromptWindow`] has been handed out this process.
+///
+/// §6.10: the DEFAULT-DENY invariant says a session that cannot answer a TTY
+/// prompt must reach a denial *without ever asking* — `should_prompt_permissions`
+/// short-circuits on `headless || !interactive` before anything touches the
+/// terminal. This counter is how a test proves the negative: not "the prompt
+/// looked right", but "no prompt was ever constructed".
+static SUSPENSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The number of prompt windows constructed so far — see [`SUSPENSIONS`].
+///
+/// Unconditionally public, NOT behind `test-util`. It is a read-only counter
+/// that can neither forge a window nor widen anything, and gating it would have
+/// forced every crate needing the default-deny witness to enable `test-util` —
+/// which, through cargo's feature unification, would have exposed
+/// `PromptWindow::test_stub` to the whole build and hollowed out the seal that
+/// `tests/prompt_window_is_sealed.rs` exists to protect.
+pub fn prompt_windows_constructed() -> u64 {
+    SUSPENSIONS.load(Ordering::SeqCst)
+}
+
 /// The arbiter's facade — a ZST over the private singleton.
 pub struct Terminal;
 
@@ -282,6 +303,7 @@ impl Terminal {
     /// Everything after this point is guaranteed a clean bottom row, and the
     /// shared ticker paints nothing until the returned window is dropped.
     pub fn suspend_for_prompt() -> PromptWindow {
+        SUSPENSIONS.fetch_add(1, Ordering::SeqCst);
         // 1. Take stdin FIRST and block until the turn watcher's read finishes,
         //    so we never erase the screen and then wait to be allowed to ask.
         let stdin = StdinToken::acquire();
@@ -459,8 +481,17 @@ impl PromptWindow {
     /// already back in canonical line mode, so this actually waits for a human.
     pub fn read_line(&self) -> io::Result<String> {
         let mut buf = String::new();
-        io::stdin().read_line(&mut buf)?;
+        self.read_line_into(&mut buf)?;
         Ok(buf)
+    }
+
+    /// [`PromptWindow::read_line`] with `io::BufRead::read_line`'s exact shape.
+    ///
+    /// Callers that must distinguish EOF (`Ok(0)` - the operator pressed
+    /// Ctrl-D, a deliberate empty answer) from a genuine read error (no human at
+    /// all) need the byte count, not just the string.
+    pub fn read_line_into(&self, buf: &mut String) -> io::Result<usize> {
+        io::stdin().read_line(buf)
     }
 
     /// A notice printed while suspended (a deny explanation, a narrator line).
@@ -475,7 +506,7 @@ impl PromptWindow {
     /// The only other constructor: an inert window for tests, which arbitrates
     /// nothing and touches no terminal. Exists so the prompt functions stay
     /// unit-testable now that they require the capability.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn test_stub() -> Self {
         Self {
             _seal: Seal,
@@ -612,6 +643,61 @@ mod tests {
         assert!(!lease.painted.load(Ordering::SeqCst));
         lease.erase(); // no-op, no panic, no stray escape
         assert!(!lease.painted.load(Ordering::SeqCst));
+    }
+
+    /// Nested prompts keep ownership until the LAST one releases — dropping an
+    /// inner guard must not hand stdin back to the turn watcher mid-question.
+    /// (Moved here from `newt-tui/src/permissions.rs` with the mechanism.)
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn nested_prompts_hold_stdin_until_the_outermost_releases() {
+        assert!(
+            !prompt_stdin_active(),
+            "test starts with no active prompt stdin owner"
+        );
+        {
+            let _outer = StdinToken::acquire();
+            assert!(
+                try_watch_stdin().is_none(),
+                "the watcher cannot read while a prompt owns stdin"
+            );
+            assert!(prompt_stdin_active());
+            {
+                let _nested = StdinToken::acquire();
+                assert!(prompt_stdin_active(), "nested prompts keep ownership");
+            }
+            assert!(
+                prompt_stdin_active(),
+                "dropping one nested guard must not release stdin early"
+            );
+        }
+        assert!(
+            !prompt_stdin_active(),
+            "prompt stdin ownership must clear when the last guard drops"
+        );
+    }
+
+    /// The watcher's protected read BLOCKS a prompt from entering, closing the
+    /// check-then-read race at permission transitions. (Also moved here.)
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn watcher_read_token_blocks_prompt_entry_until_the_read_finishes() {
+        let watcher = try_watch_stdin().expect("watcher acquires idle stdin");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let prompt = std::thread::spawn(move || {
+            let _prompt = StdinToken::acquire();
+            let _ = entered_tx.send(());
+        });
+
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "prompt entered during the watcher's protected read"
+        );
+        drop(watcher);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("prompt enters once the watcher releases stdin");
+        prompt.join().unwrap();
     }
 
     /// The stdin half still interlocks: the watcher's read token blocks a

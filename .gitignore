@@ -76,3 +76,8 @@ docs/research/*.pdf
 # Retired: session state moved from `.newt/sessions/` to `.scratch/sessions/`
 # (#844). Kept briefly so any lingering old dir stays ignored during migration.
 /.newt/sessions/
+
+# trybuild writes proposed .stderr snapshots here when a UI test's expected
+# output drifts (newt-core/tests/ui/). Review and move them into tests/ui/;
+# never commit the scratch dir.
+wip/
