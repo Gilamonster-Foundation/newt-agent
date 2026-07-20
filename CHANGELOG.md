@@ -7,7 +7,77 @@ is inherited by all internal crates.
 
 ## [Unreleased]
 
+### Security
+
+- **Trust boundary on MCP secret resolution (#1301 review).** `${…}`
+  interpolation and `{ env | file | cmd }` references now resolve host-side
+  **only for newt-owned (TRUSTED) config** — `config.toml`'s `[[mcp_servers]]`
+  and `~/.newt/mcp.toml`. A **discovered Claude/project overlay**
+  (`~/.claude.json`, `<workspace>/.mcp.json`) is **UNTRUSTED**: its literal
+  env/header values pass to the child **verbatim** (no interpolation, no
+  `cmd:`/`file:` execution — the pre-#1301 behavior, which also restores
+  Claude-overlay compatibility), and a structured `{ env | file | cmd }`
+  reference is **rejected**. This closes a host-RCE / confinement bypass: a
+  cloned repo's `.mcp.json` with `env = { Y = "${cmd:…}" }` (or a `{ cmd = … }`
+  ref) can no longer run a command on the host, unconfined, at MCP connect.
+  Provenance is stamped at discovery (`McpServerEntry::trust`); `newt mcp
+  import` writes into `~/.newt/mcp.toml`, so an imported server is adopted as
+  trusted by explicit operator gesture.
+- **Conservative interpolation contract.** For trusted values, a `${…}`
+  interpolates only when it is a known scheme (`${env:…}`/`${file:…}`/`${cmd:…}`)
+  or a bare `${IDENT}`; any other `${…}` (`${VAR:-default}`, `${.field}`) passes
+  through **verbatim** instead of hard-failing (fixes an upgrade regression on
+  pre-existing configs). `$${` escapes a literal `${`. A recognized reference
+  that resolves to nothing stays a loud error.
+- **Redaction hardening.** `newt config`'s `to_redacted_toml` now also redacts
+  credentials embedded in an MCP `url` (userinfo `user:pass@`, sensitive query
+  params) and in `args` (`--token`/`--api-key`/… values). Interpolation errors
+  (e.g. an unterminated `${`) no longer embed the raw value in the message.
+- **`newt mcp import` correctness.** Import now checks name clashes against the
+  full merged config: a name already defined in `config.toml` (which outranks
+  `~/.newt/mcp.toml`) is a loud error instead of a silently-shadowed write. A
+  plain `newt mcp import` always targets `~/.newt/mcp.toml`, never an ambient
+  `./newt.toml` in the current directory.
+
 ### Added
+
+- **`~/.newt/mcp.toml` + Claude-JSON import + secret references on MCP
+  `env`/`headers` + scrybe.ai smart-install (#1301).** MCP config is now
+  first-class and secret-safe:
+  - **`~/.newt/mcp.toml`** — a dedicated newt-owned source (same
+    `[[mcp_servers]]` schema as `config.toml`), discovered by
+    `newt_core::mcp::discover` as a newt-owned layer ranked with `config.toml`
+    `[[mcp_servers]]`, above the borrowed `~/.claude.json` / `<ws>/.mcp.json`
+    overlays; missing/malformed is non-fatal. `newt mcp add|install|import`
+    prefer it once it exists (else keep writing `config.toml`, #1291's
+    behavior, honoring `--config`/`$NEWT_CONFIG`/`./newt.toml`/`--project`);
+    `newt mcp list` attributes each row to its source (`newt mcp.toml`).
+  - **`newt mcp import <path>` / `--from-claude`** — reads a Claude-Code
+    `mcpServers` JSON (via `parse_claude_mcp`) and writes the equivalent
+    `[[mcp_servers]]` TOML through the comment-preserving writer, breaking
+    config out to `~/.newt/mcp.toml` (created if absent). Dedup-by-name:
+    error on a clash by default, `--force` overwrites, `--merge` skips
+    existing. Secret-bearing values (incl. Claude's `${VAR}`) import verbatim.
+  - **Secret references on every `env` and `headers` value — both syntaxes.**
+    A value is now a `SecretValue`: a plain string (`Literal`, backward-compatible
+    with every existing config and with Claude JSON) or a `{ env | file | cmd }`
+    table (`Ref`, the existing `SecretRef` scheme). In **trusted** (newt-owned)
+    config a literal may embed `${...}` interpolation tokens —
+    `${VAR}`/`${env:VAR}` (env), `${file:~/p}` (first non-empty line),
+    `${cmd:vault kv get -field=token secret/x}` (command stdout — the Vault
+    path) — with literal text around tokens preserved (see **Security** above
+    for the trust boundary that gates this). A recognized but
+    missing/empty reference is a hard error at spawn (never a silent empty).
+    Resolution happens **host-side, wrapped in `Secret`**, right before the
+    confined stdio child's env is built (`newt-mcp-client`) and the HTTP
+    headers are built — never inside the confined child, never into newt's own
+    process env. `newt config`'s `to_redacted_toml` redacts literal values
+    (incl. `${cmd:…}` strings) and keeps `{ env|file|cmd }` references (they
+    name a location, not a secret).
+  - **`newt mcp install scrybe`** resolves the `scrybe-mcp-server` binary
+    across `PATH` → `~/venv/bin` and registers it by **absolute** path (survives
+    PATH changes); a missing bundled-scrybe binary is a clear error naming
+    `pip install scrybe.ai` (a hint, never an auto-`pip`).
 
 - **`newt mcp probe` — derive a server's registration by asking the server
   (#1292).** Probing is verify-and-enrich, never discovery-by-scanning: the

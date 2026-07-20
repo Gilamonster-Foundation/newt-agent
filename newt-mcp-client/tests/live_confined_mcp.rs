@@ -36,6 +36,7 @@ fn entry_from_env() -> Option<McpServerEntry> {
         url: None,
         headers: BTreeMap::new(),
         request_timeout_secs: None,
+        trust: newt_core::mcp::McpTrust::Trusted,
     })
 }
 

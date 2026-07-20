@@ -373,10 +373,39 @@ fn assemble_env_grants(
     map.into_iter().collect()
 }
 
+/// Resolve every [`newt_core::mcp::SecretValue`] in an `env` / `headers` map to
+/// its plaintext, **host-side** (in newt's own unconfined process), just before
+/// the confined spawn / HTTP connect — **under the entry's trust boundary**
+/// (#1301 security review, [`newt_core::mcp::resolve_secret_under_trust`]).
+///
+/// For a **trusted** (newt-owned config) entry a literal is `${...}`-interpolated
+/// and a `{ env | file | cmd }` reference is resolved through the `SecretRef`
+/// machinery. For an **untrusted** (discovered Claude/project overlay) entry a
+/// literal passes to the child **verbatim** (never interpolated, so a `${cmd:…}`
+/// is inert text — a hostile `.mcp.json` cannot run a host command) and a
+/// structured reference is a hard error naming the server + key. The resolved
+/// value is wrapped in `Secret` at every hop and exposed only into the grant map
+/// — never logged, never written back to config, never placed in newt's own env.
+fn resolve_entry_secrets(
+    map: &BTreeMap<String, newt_core::mcp::SecretValue>,
+    trust: newt_core::mcp::McpTrust,
+    server: &str,
+) -> Result<BTreeMap<String, String>> {
+    map.iter()
+        .map(|(k, v)| {
+            let secret = newt_core::mcp::resolve_secret_under_trust(v, trust)
+                .with_context(|| format!("MCP server `{server}`: resolving `{k}`"))?;
+            Ok((k.clone(), secret.expose().to_string()))
+        })
+        .collect()
+}
+
 /// Resolve the three env-grant sources from the live environment (parent env +
-/// the shell-env dir + the entry) and fold them via [`assemble_env_grants`].
-/// The impure edge — kept tiny so the assembly logic itself stays pure/tested.
-fn resolve_env_grants(entry: &McpServerEntry) -> Vec<(String, String)> {
+/// the shell-env dir + the entry's own — now secret-resolved — env) and fold
+/// them via [`assemble_env_grants`]. The impure edge — kept tiny so the assembly
+/// logic itself stays pure/tested. Fails loudly if a configured secret reference
+/// cannot be resolved.
+fn resolve_env_grants(entry: &McpServerEntry) -> Result<Vec<(String, String)>> {
     let passthrough: Vec<(String, String)> = newt_core::mcp_stdio_env_passthrough()
         .iter()
         .filter_map(|k| {
@@ -386,7 +415,9 @@ fn resolve_env_grants(entry: &McpServerEntry) -> Vec<(String, String)> {
     let shell_env = newt_core::Config::user_config_path()
         .map(|p| newt_core::shell_env::from_config_dir(&p))
         .unwrap_or_default();
-    assemble_env_grants(&passthrough, &shell_env, &entry.env)
+    let entry_env = resolve_entry_secrets(&entry.env, entry.trust, &entry.name)
+        .with_context(|| format!("resolving env secrets for MCP server `{}`", entry.name))?;
+    Ok(assemble_env_grants(&passthrough, &shell_env, &entry_env))
 }
 
 /// A throwaway [`Tool`] used only to mint the spawn [`ToolContext`] through the
@@ -544,7 +575,7 @@ impl StdioTransport {
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
-        let grants = resolve_env_grants(entry);
+        let grants = resolve_env_grants(entry)?;
         // Admit exec of the configured server command; keep its runtime authority
         // (fs/net) the session leash.
         let cx = mint_spawn_context(&spawn_caveats(caveats, command)).with_context(|| {
@@ -592,7 +623,7 @@ impl StdioTransport {
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
-        let grants = resolve_env_grants(entry);
+        let grants = resolve_env_grants(entry)?;
         let mut child = Command::new(command)
             .args(&entry.args)
             .env_clear()
@@ -682,8 +713,14 @@ impl HttpTransport {
             .url
             .clone()
             .ok_or_else(|| anyhow!("http MCP server `{}` has no url", entry.name))?;
+        // Resolve every header SecretValue host-side, before the value ever
+        // touches reqwest — a literal is `${...}`-interpolated, a `{env|file|cmd}`
+        // reference is resolved through `SecretRef`. Fails loud if a reference
+        // cannot be satisfied.
+        let resolved_headers = resolve_entry_secrets(&entry.headers, entry.trust, &entry.name)
+            .with_context(|| format!("resolving header secrets for MCP server `{}`", entry.name))?;
         let mut headers = reqwest::header::HeaderMap::new();
-        for (key, value) in &entry.headers {
+        for (key, value) in &resolved_headers {
             let name =
                 reqwest::header::HeaderName::from_bytes(key.as_bytes()).with_context(|| {
                     format!("MCP server `{}`: invalid header name `{key}`", entry.name)
@@ -1099,8 +1136,10 @@ impl McpToolset {
         caveats: &Caveats,
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let mcp_toml = newt_core::Config::user_config_dir().map(|d| d.join("mcp.toml"));
         let entries = newt_core::mcp::discover(
             cfg_servers,
+            mcp_toml.as_deref(),
             home.as_deref(),
             std::path::Path::new(workspace),
         );
@@ -1676,18 +1715,73 @@ mod confined_spawn_helper_tests {
             transport: TransportKind::Stdio,
             command: Some("true".into()),
             args: vec![],
-            env: BTreeMap::from([("MCP_SERVER_ONLY".to_string(), "v".to_string())]),
+            env: BTreeMap::from([(
+                "MCP_SERVER_ONLY".to_string(),
+                newt_core::mcp::SecretValue::literal("v"),
+            )]),
             url: None,
             headers: BTreeMap::new(),
             request_timeout_secs: None,
+            trust: newt_core::mcp::McpTrust::Trusted,
         };
-        let grants = resolve_env_grants(&entry);
+        let grants = resolve_env_grants(&entry).unwrap();
         assert!(
             grants
                 .iter()
                 .any(|(k, v)| k == "MCP_SERVER_ONLY" && v == "v"),
             "the entry's explicit env must reach the grants"
         );
+    }
+
+    // ---- #1301 trust boundary at the resolve edge ----
+
+    #[test]
+    fn untrusted_env_literal_reaches_the_child_verbatim_never_executed() {
+        // The CRITICAL fix: an UNTRUSTED source's `${cmd:…}` literal must arrive
+        // at the child as literal text — the resolver / a subprocess is never
+        // reached (this branch structurally cannot execute a command), so no
+        // side effect can occur. Pure: no fs / env / subprocess.
+        use newt_core::mcp::{McpTrust, SecretValue};
+        let map = BTreeMap::from([(
+            "Y".to_string(),
+            SecretValue::literal("${cmd:touch /tmp/newt-1301-unit-should-not-exist}"),
+        )]);
+        let got = resolve_entry_secrets(&map, McpTrust::Untrusted, "hostile").unwrap();
+        assert_eq!(
+            got.get("Y").map(String::as_str),
+            Some("${cmd:touch /tmp/newt-1301-unit-should-not-exist}"),
+            "an untrusted ${{cmd:…}} literal must pass to the child verbatim, not run"
+        );
+    }
+
+    #[test]
+    fn untrusted_env_structured_cmd_ref_is_rejected() {
+        // An untrusted source must never name a command to run. The rejection
+        // names the offending server.
+        use newt_core::agent_identity::SecretRef;
+        use newt_core::mcp::{McpTrust, SecretValue};
+        let map = BTreeMap::from([(
+            "Y".to_string(),
+            SecretValue::Ref(SecretRef {
+                cmd: Some("touch /tmp/newt-1301-unit-ref-should-not-exist".into()),
+                ..Default::default()
+            }),
+        )]);
+        let err = resolve_entry_secrets(&map, McpTrust::Untrusted, "hostile").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("untrusted"), "{msg}");
+        assert!(msg.contains("hostile"), "error must name the server: {msg}");
+    }
+
+    #[test]
+    fn trusted_env_literal_without_token_resolves_verbatim() {
+        // The trusted path still resolves; a token-free literal is a pure
+        // pass-through (the token-bearing Vault `${cmd:…}` trusted path is
+        // proven end-to-end in the integration tier).
+        use newt_core::mcp::{McpTrust, SecretValue};
+        let map = BTreeMap::from([("K".to_string(), SecretValue::literal("plain"))]);
+        let got = resolve_entry_secrets(&map, McpTrust::Trusted, "owned").unwrap();
+        assert_eq!(got.get("K").map(String::as_str), Some("plain"));
     }
 }
 
@@ -1810,6 +1904,7 @@ mod env_isolation_tests {
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: newt_core::mcp::McpTrust::Trusted,
         };
         // top() = advisory leash: `sh` is permitted (exec unrestricted) and the
         // env is still scrubbed to the explicit grants, so this validates the

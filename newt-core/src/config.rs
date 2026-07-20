@@ -3583,6 +3583,14 @@ impl Config {
     /// first-match behavior. Returns `Config::default()` if nothing is found.
     pub fn resolve() -> Result<Self> {
         let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
+        // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
+        // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
+        // root — `cd repo && newt` → same host-RCE class as the walk-up) rather
+        // than an operator-explicit base? Only `$NEWT_CONFIG` can pin a base here
+        // (the `--config` flag routes through `Config::load`, never `resolve`);
+        // if it points AT `./newt.toml` that is the operator's explicit choice
+        // (Trusted). Every other `./newt.toml` base is ambient → Untrusted.
+        let base_ambient = base_is_ambient_newt_toml(base_path.as_deref());
         // A project-local config that *is* the base (e.g. cwd is the project and
         // its `.newt/config.toml` already matched) must not be merged onto itself.
         let project_path =
@@ -3605,12 +3613,40 @@ impl Config {
                 // it wants to be merged (`[merge] arrays = ...`), else the global
                 // config's setting, else the built-in default (Replace).
                 let strategy = array_merge_strategy(&project_val, &merged);
+                // #1301 trust boundary: a project-local `.newt/config.toml` is
+                // found by walking UP from cwd, so a freshly cloned repo can ship
+                // one — its `[[mcp_servers]]` are attacker-reachable and must be
+                // UNTRUSTED (literals verbatim, `${cmd:…}` never runs, refs
+                // rejected), exactly like a `.mcp.json` overlay. The merge below
+                // folds those entries into `mcp_servers`, indistinguishable from
+                // the trusted base's; capture how many project entries there are
+                // BEFORE the merge so provenance can be reconstructed after.
+                let project_mcp_count = project_val
+                    .get("mcp_servers")
+                    .and_then(toml::Value::as_array)
+                    .map(Vec::len);
                 merge_toml(&mut merged, project_val, strategy);
-                merged
+                let mut cfg: Self = merged
                     .try_into()
-                    .map_err(|e| NewtError::Config(e.to_string()))?
+                    .map_err(|e| NewtError::Config(e.to_string()))?;
+                // `trust` is `#[serde(skip)]`, so every merged entry deserialized
+                // to the `Trusted` default; stamp the project-origin ones back to
+                // UNTRUSTED before anything can resolve their secrets.
+                mark_project_mcp_untrusted(&mut cfg.mcp_servers, strategy, project_mcp_count);
+                cfg
             }
         };
+        // #1301 trust boundary (ambient `./newt.toml` base): when the base is the
+        // cwd-relative `./newt.toml` fallthrough it is itself attacker-reachable,
+        // so EVERY entry it contributed — plus any ambient project overlay already
+        // merged on top — is UNTRUSTED. This only ever downgrades; a trusted base
+        // (user home config, `/etc`, or an explicit `$NEWT_CONFIG`) is untouched
+        // and its project overlay was handled by `mark_project_mcp_untrusted`.
+        if base_ambient {
+            for entry in &mut cfg.mcp_servers {
+                entry.trust = crate::mcp::McpTrust::Untrusted;
+            }
+        }
         // Per-file backends (the endpoint control surface): drop a
         // `~/.newt/backends/<name>.toml` to add/override a backend — no
         // `config.toml` edit, and no overlapping inline `[[backends]]` to
@@ -3968,25 +4004,38 @@ impl Config {
     }
 
     /// Serialize the config to pretty TOML for **audit**, with inline secret
-    /// material redacted. The values of every `[[mcp_servers]]` `env` and
-    /// `headers` entry are replaced with [`Self::REDACTED`] — those maps are the
-    /// only place `Config` can carry a raw secret inline (e.g. an
-    /// `Authorization: Bearer …` header or an `API_KEY=…` child env var). Keys
-    /// are kept so an auditor sees *which* variables/headers are set without the
-    /// values. Secret *references* (`api_key_file` / `api_key_env`) are left as-is
-    /// — they name where a secret lives, not the secret itself.
+    /// material redacted. Every `[[mcp_servers]]` `env` / `headers` **literal**
+    /// value is replaced with [`Self::REDACTED`] — a literal is the only place
+    /// `Config` can carry a raw secret inline (e.g. an `Authorization: Bearer …`
+    /// header, an `API_KEY=…` child env var, or a `Bearer ${cmd:…}`
+    /// interpolation string that could embed literal secret text). Keys are kept
+    /// so an auditor sees *which* variables/headers are set without the values.
+    ///
+    /// Secret *references* — a `{ env | file | cmd }` [`SecretValue::Ref`], or an
+    /// `api_key_file` / `api_key_env` — are left as-is: they name *where* a
+    /// secret lives, never the secret itself, so `newt config` can show the
+    /// operator their wiring without ever printing a resolved value.
     ///
     /// # Errors
     /// A TOML serialization failure (should not happen for a valid `Config`).
     pub fn to_redacted_toml(&self) -> Result<String> {
+        use crate::mcp::SecretValue;
         let mut redacted = self.clone();
+        let redact = |v: &mut SecretValue| {
+            if matches!(v, SecretValue::Literal(_)) {
+                *v = SecretValue::Literal(Self::REDACTED.to_string());
+            }
+        };
         for server in &mut redacted.mcp_servers {
-            for v in server.env.values_mut() {
-                *v = Self::REDACTED.to_string();
+            server.env.values_mut().for_each(redact);
+            server.headers.values_mut().for_each(redact);
+            // A `url` can embed userinfo (`user:pass@`) or a `?api_key=…` param,
+            // and `args` can carry a `--token …` — none of which are `SecretValue`s,
+            // so they'd otherwise pass through verbatim into an audit dump (#1301).
+            if let Some(url) = &server.url {
+                server.url = Some(redact_url_secrets(url));
             }
-            for v in server.headers.values_mut() {
-                *v = Self::REDACTED.to_string();
-            }
+            server.args = redact_arg_secrets(&server.args);
         }
         toml::to_string_pretty(&redacted).map_err(|e| NewtError::Config(e.to_string()))
     }
@@ -4286,6 +4335,126 @@ impl Config {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Query-param keys (case-insensitive) whose values are treated as secrets when
+/// redacting an MCP `url` for an audit dump ([`Config::to_redacted_toml`], #1301).
+const SENSITIVE_QUERY_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "secret",
+    "password",
+    "key",
+];
+
+/// CLI flags (case-insensitive) whose value is a secret when redacting MCP
+/// `args` — both the `--flag=VALUE` and `--flag VALUE` forms (#1301).
+const SENSITIVE_ARG_FLAGS: &[&str] = &["--token", "--api-key", "--password", "--secret", "--key"];
+
+/// Redact credentials embedded in a URL for an audit dump: the userinfo
+/// (`user:pass@`) and any query-param value whose key is sensitive
+/// ([`SENSITIVE_QUERY_KEYS`]). Non-secret structure (scheme, host, path,
+/// fragment, non-sensitive params) is preserved. Pure string surgery — no `url`
+/// crate dependency.
+fn redact_url_secrets(url: &str) -> String {
+    // Peel off `#fragment` then `?query`, redact each part, reassemble.
+    let (main, fragment) = match url.split_once('#') {
+        Some((m, f)) => (m, Some(f)),
+        None => (url, None),
+    };
+    let (authority_and_path, query) = match main.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (main, None),
+    };
+    let mut out = redact_url_userinfo(authority_and_path);
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(&redact_url_query(q));
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+/// Redact `user:pass@` userinfo from the authority of a `scheme://…` string
+/// (the `?query`/`#fragment` already stripped). An `@` only counts inside the
+/// authority (before the first `/`), so a path/param `@` is never mistaken for
+/// userinfo.
+fn redact_url_userinfo(s: &str) -> String {
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return s.to_string();
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (rest, None),
+    };
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{}@{host}", Config::REDACTED),
+        None => authority.to_string(),
+    };
+    let mut out = format!("{scheme}://{authority}");
+    if let Some(p) = path {
+        out.push('/');
+        out.push_str(p);
+    }
+    out
+}
+
+/// Redact the values of sensitive query params, keeping keys + non-sensitive
+/// params intact.
+fn redact_url_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|param| match param.split_once('=') {
+            Some((k, _))
+                if SENSITIVE_QUERY_KEYS
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(k)) =>
+            {
+                format!("{k}={}", Config::REDACTED)
+            }
+            _ => param.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Whether `flag` is a sensitive CLI flag whose value must be redacted.
+fn is_sensitive_arg_flag(flag: &str) -> bool {
+    SENSITIVE_ARG_FLAGS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(flag))
+}
+
+/// Redact the values of sensitive flags in an args vector, handling both
+/// `--flag=VALUE` (redact the tail) and `--flag VALUE` (redact the next arg).
+/// Over-redaction is safe for an audit dump; under-redaction is not.
+fn redact_arg_secrets(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            out.push(Config::REDACTED.to_string());
+            redact_next = false;
+            continue;
+        }
+        match arg.split_once('=') {
+            Some((flag, _)) if is_sensitive_arg_flag(flag) => {
+                out.push(format!("{flag}={}", Config::REDACTED));
+            }
+            _ if is_sensitive_arg_flag(arg) => {
+                // `--flag VALUE`: keep the flag, redact the following value.
+                out.push(arg.clone());
+                redact_next = true;
+            }
+            _ => out.push(arg.clone()),
+        }
+    }
+    out
+}
+
 /// Best-effort home directory lookup without pulling in the `dirs` crate.
 pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME")
@@ -4321,6 +4490,67 @@ pub(crate) fn merge_toml(base: &mut toml::Value, overlay: toml::Value, arrays: A
         }
         // Replace mode (and any scalar): the overlay replaces the base outright.
         (slot, overlay) => *slot = overlay,
+    }
+}
+
+/// Stamp the MCP servers that originated from the walked-up project-local
+/// `.newt/config.toml` as [`crate::mcp::McpTrust::Untrusted`] — the #1301 trust
+/// boundary for a cloned repo's ambient config.
+///
+/// By the time [`Config::resolve`] has a typed `Config`, the project entries are
+/// already folded into `servers` by [`merge_toml`] and — because `trust` is
+/// `#[serde(skip)]` — every entry carries the `Trusted` default, so provenance
+/// is reconstructed from the merge shape (which must match [`merge_toml`]):
+/// - `project_mcp_count == None` → the project file had no `mcp_servers` key, so
+///   `servers` came wholly from the trusted base (user config) → mark none.
+/// - [`ArrayMergeStrategy::Replace`] with a project `mcp_servers` array present →
+///   the project array REPLACED the base's, so every entry is project-origin.
+/// - [`ArrayMergeStrategy::Append`] → the project entries were concatenated
+///   AFTER the base's (base first), so only the trailing `count` are
+///   project-origin.
+///
+/// Only ever downgrades (Trusted → Untrusted); it never elevates, so a genuine
+/// user-config entry can never be mislabeled trusted by this path.
+fn mark_project_mcp_untrusted(
+    servers: &mut [crate::mcp::McpServerEntry],
+    strategy: ArrayMergeStrategy,
+    project_mcp_count: Option<usize>,
+) {
+    let Some(count) = project_mcp_count else {
+        return;
+    };
+    let start = match strategy {
+        // Replace swapped the whole array for the project's — all project-origin.
+        ArrayMergeStrategy::Replace => 0,
+        // Append put the project entries last — mark only that trailing slice.
+        ArrayMergeStrategy::Append => servers.len().saturating_sub(count),
+    };
+    for entry in &mut servers[start..] {
+        entry.trust = crate::mcp::McpTrust::Untrusted;
+    }
+}
+
+/// Whether the resolved base config is the AMBIENT cwd-relative `./newt.toml`
+/// candidate (a freshly cloned repo can ship one at its root — the #1301 sibling
+/// of the walked-up `.newt/config.toml` vector), as opposed to an
+/// operator-explicit base.
+///
+/// The only base a caller can pin explicitly *through [`Config::resolve`]* is
+/// `$NEWT_CONFIG` (the `--config` flag routes through [`Config::load`], which
+/// never reaches `resolve`, so it is Trusted without touching this path). So the
+/// `./newt.toml` base is explicit — Trusted — ONLY when `$NEWT_CONFIG` points AT
+/// it; the implicit fallthrough to the `./newt.toml` candidate (`$NEWT_CONFIG`
+/// unset, or set to some other/broken path) is ambient — Untrusted.
+fn base_is_ambient_newt_toml(base: Option<&Path>) -> bool {
+    let ambient_candidate = Path::new("./newt.toml");
+    if base != Some(ambient_candidate) {
+        return false;
+    }
+    // Mirror `candidate_paths`' `env::var("NEWT_CONFIG")` read: only a
+    // `$NEWT_CONFIG` that *is* `./newt.toml` selected this base explicitly.
+    match std::env::var("NEWT_CONFIG") {
+        Ok(explicit) => Path::new(&explicit) != ambient_candidate,
+        Err(_) => true,
     }
 }
 
@@ -5968,6 +6198,79 @@ tiers = ["COMPLEX"]
         assert_eq!(got, vec!["a", "b", "x"]);
     }
 
+    // --- #1301: project-origin `[[mcp_servers]]` are stamped UNTRUSTED ---
+
+    /// A minimal valid stdio entry at the `#[serde(skip)]` default trust
+    /// ([`crate::mcp::McpTrust::Trusted`]) — mirrors a freshly-deserialized entry.
+    fn mcp_entry(name: &str) -> crate::mcp::McpServerEntry {
+        crate::mcp::McpServerEntry {
+            name: name.into(),
+            enabled: true,
+            transport: crate::mcp::TransportKind::Stdio,
+            command: Some("true".into()),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
+        }
+    }
+
+    #[test]
+    fn mark_project_mcp_untrusted_replace_marks_every_entry() {
+        // Replace (the default) with a project `mcp_servers` array present: the
+        // project array REPLACED the base's, so every survivor is project-origin.
+        let mut servers = vec![mcp_entry("a"), mcp_entry("b")];
+        mark_project_mcp_untrusted(&mut servers, ArrayMergeStrategy::Replace, Some(2));
+        assert!(
+            servers
+                .iter()
+                .all(|e| e.trust == crate::mcp::McpTrust::Untrusted),
+            "replace ⇒ all project-origin ⇒ all untrusted"
+        );
+    }
+
+    #[test]
+    fn mark_project_mcp_untrusted_append_marks_only_trailing_project_entries() {
+        // Append: base entries first, project entries appended — only the
+        // trailing `count` (here 2) are project-origin.
+        let mut servers = vec![mcp_entry("base"), mcp_entry("p1"), mcp_entry("p2")];
+        mark_project_mcp_untrusted(&mut servers, ArrayMergeStrategy::Append, Some(2));
+        assert_eq!(
+            servers[0].trust,
+            crate::mcp::McpTrust::Trusted,
+            "the trusted base entry must stay trusted"
+        );
+        assert_eq!(servers[1].trust, crate::mcp::McpTrust::Untrusted);
+        assert_eq!(servers[2].trust, crate::mcp::McpTrust::Untrusted);
+    }
+
+    #[test]
+    fn mark_project_mcp_untrusted_none_marks_nothing() {
+        // No project `mcp_servers` key ⇒ the array came wholly from the trusted
+        // base (user config) ⇒ nothing is downgraded.
+        let mut servers = vec![mcp_entry("a")];
+        mark_project_mcp_untrusted(&mut servers, ArrayMergeStrategy::Replace, None);
+        assert_eq!(servers[0].trust, crate::mcp::McpTrust::Trusted);
+    }
+
+    #[test]
+    fn base_is_ambient_newt_toml_false_for_non_newt_toml_base() {
+        // A base that isn't the cwd `./newt.toml` candidate is never ambient,
+        // regardless of `$NEWT_CONFIG` — the user home config, `/etc`, and an
+        // explicit non-`newt.toml` base all stay trusted. (The env-dependent
+        // `./newt.toml` branches are covered end-to-end in
+        // tests/mcp_project_trust.rs, which controls `$NEWT_CONFIG`.)
+        assert!(!base_is_ambient_newt_toml(None));
+        assert!(!base_is_ambient_newt_toml(Some(Path::new(
+            "/etc/newt/config.toml"
+        ))));
+        assert!(!base_is_ambient_newt_toml(Some(Path::new(
+            "./newt-other.toml"
+        ))));
+    }
+
     #[test]
     fn array_merge_strategy_project_wins_then_base_then_default() {
         let append: toml::Value = toml::from_str("[merge]\narrays = \"append\"\n").unwrap();
@@ -6132,6 +6435,115 @@ max_tool_rounds = 25
         );
         // Non-secret structure is intact.
         assert!(dump.contains("http://remote:8000"));
+    }
+
+    #[test]
+    fn to_redacted_toml_redacts_literals_but_keeps_secret_references() {
+        // A literal secret AND a `${cmd:…}` interpolation literal are both
+        // redacted (a literal can embed raw secret text); a `{ cmd = … }`
+        // SecretRef is a REFERENCE — it names where the secret lives, not the
+        // secret — so it is kept, exactly like `api_key_file`.
+        let cfg: Config = toml::from_str(
+            r#"
+            [[mcp_servers]]
+            name = "gh"
+            command = "gh-mcp"
+            [mcp_servers.env]
+            RAW = "ghp_rawinlinesecret"
+            VAULTED = { cmd = "vault kv get -field=token secret/data/gh" }
+            [mcp_servers.headers]
+            Authorization = "Bearer ${cmd:vault kv get -field=token secret/data/api}"
+            "#,
+        )
+        .unwrap();
+
+        let dump = cfg.to_redacted_toml().unwrap();
+        // Literal secret and the interpolation literal never appear…
+        assert!(
+            !dump.contains("ghp_rawinlinesecret"),
+            "raw secret leaked:\n{dump}"
+        );
+        assert!(
+            !dump.contains("secret/data/api"),
+            "interpolation literal leaked:\n{dump}"
+        );
+        assert!(dump.contains(Config::REDACTED));
+        // …but the KEYS survive, and the SecretRef reference is kept (it names
+        // a location, not a secret) — the operator can audit their wiring.
+        assert!(dump.contains("RAW"));
+        assert!(dump.contains("VAULTED"));
+        assert!(dump.contains("Authorization"));
+        assert!(
+            dump.contains("vault kv get -field=token secret/data/gh"),
+            "SecretRef reference kept:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn to_redacted_toml_redacts_url_userinfo_query_and_args() {
+        // FIX 5 (#1301): url and args are plain strings (no SecretValue wrapper),
+        // so URL-embedded creds and `--token` args must be redacted before the
+        // audit dump can leak them.
+        let cfg: Config = toml::from_str(
+            r#"
+            [[mcp_servers]]
+            name = "gh"
+            type = "http"
+            url = "https://alice:sk-URLPASS@api.example/mcp?api_key=SECRETQP&region=us"
+            args = ["--token=sk-EQ", "--api-key", "sk-SPACE", "--verbose"]
+            "#,
+        )
+        .unwrap();
+        let dump = cfg.to_redacted_toml().unwrap();
+        // None of the secret material survives…
+        for leaked in ["sk-URLPASS", "SECRETQP", "sk-EQ", "sk-SPACE", "alice"] {
+            assert!(!dump.contains(leaked), "`{leaked}` leaked:\n{dump}");
+        }
+        // …but the non-secret structure does.
+        assert!(dump.contains("api.example/mcp"), "host/path kept:\n{dump}");
+        assert!(dump.contains("region=us"), "non-secret param kept:\n{dump}");
+        assert!(dump.contains("--verbose"), "non-secret arg kept:\n{dump}");
+        assert!(dump.contains(Config::REDACTED));
+    }
+
+    #[test]
+    fn redact_url_and_args_helpers_are_precise() {
+        // Userinfo + sensitive query param redacted; scheme/host/path/fragment
+        // and a non-sensitive param preserved.
+        assert_eq!(
+            redact_url_secrets("https://u:p@h.example/mcp?token=abc&keep=1#frag"),
+            format!(
+                "https://{r}@h.example/mcp?token={r}&keep=1#frag",
+                r = Config::REDACTED
+            )
+        );
+        // No userinfo, no sensitive params → unchanged.
+        assert_eq!(
+            redact_url_secrets("https://h.example/mcp?region=us"),
+            "https://h.example/mcp?region=us"
+        );
+        // An `@` in the path is not userinfo.
+        assert_eq!(
+            redact_url_secrets("https://h.example/a@b"),
+            "https://h.example/a@b"
+        );
+        // Both arg forms; a non-sensitive flag with a value is untouched.
+        assert_eq!(
+            redact_arg_secrets(&[
+                "--token=sk-1".into(),
+                "--api-key".into(),
+                "sk-2".into(),
+                "--model".into(),
+                "gpt".into(),
+            ]),
+            vec![
+                format!("--token={}", Config::REDACTED),
+                "--api-key".to_string(),
+                Config::REDACTED.to_string(),
+                "--model".to_string(),
+                "gpt".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -6424,10 +6836,14 @@ command = \"modulex-mcp\"
             transport: crate::mcp::TransportKind::Stdio,
             command: Some("scrybe-mcp-server".into()),
             args: vec!["stdio".into()],
-            env: std::collections::BTreeMap::from([("SCRYBE_LOG".to_string(), "info".to_string())]),
+            env: std::collections::BTreeMap::from([(
+                "SCRYBE_LOG".to_string(),
+                crate::mcp::SecretValue::literal("info"),
+            )]),
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: Some(120),
+            trust: crate::mcp::McpTrust::Trusted,
         };
         let out = Config::with_mcp_server_added(text, &entry).unwrap();
         assert!(
@@ -6443,7 +6859,10 @@ command = \"modulex-mcp\"
         assert_eq!(added.command.as_deref(), Some("scrybe-mcp-server"));
         assert_eq!(added.args, vec!["stdio"]);
         assert_eq!(
-            added.env.get("SCRYBE_LOG").map(String::as_str),
+            added
+                .env
+                .get("SCRYBE_LOG")
+                .and_then(crate::mcp::SecretValue::as_literal),
             Some("info")
         );
         assert_eq!(added.request_timeout_secs, Some(120));
@@ -6465,6 +6884,7 @@ command = \"modulex-mcp\"
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         };
         let out = Config::with_mcp_server_added("", &entry).unwrap();
         let cfg: Config = toml::from_str(&out).unwrap();
@@ -6485,6 +6905,7 @@ command = \"modulex-mcp\"
             url: Some("https://mcp.example/sse".into()),
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         };
         let out = Config::with_mcp_server_added("", &entry).unwrap();
         let cfg: Config = toml::from_str(&out).unwrap();
@@ -6508,6 +6929,7 @@ command = \"modulex-mcp\"
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         };
         let err = Config::with_mcp_server_added(text, &dup).unwrap_err();
         assert!(err.to_string().contains("scrybe"), "names the dup: {err}");
@@ -6587,6 +7009,7 @@ command = \"drop-mcp\"
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         };
         // Invalid TOML input text.
         let err = Config::with_mcp_server_added("not toml [", &entry).unwrap_err();

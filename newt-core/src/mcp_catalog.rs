@@ -198,13 +198,21 @@ env = { ROOT = "/tmp" }
         assert_eq!(remote.transport, TransportKind::Sse);
         assert_eq!(remote.url.as_deref(), Some("https://mcp.example/sse"));
         assert_eq!(
-            remote.headers.get("Authorization").map(String::as_str),
+            remote
+                .headers
+                .get("Authorization")
+                .and_then(crate::mcp::SecretValue::as_literal),
             Some("Bearer x")
         );
         assert_eq!(remote.request_timeout_secs, Some(90));
         let fs = got[1].server();
         assert_eq!(fs.command.as_deref(), Some("mcp-fs"));
-        assert_eq!(fs.env.get("ROOT").map(String::as_str), Some("/tmp"));
+        assert_eq!(
+            fs.env
+                .get("ROOT")
+                .and_then(crate::mcp::SecretValue::as_literal),
+            Some("/tmp")
+        );
         assert_eq!(got[1].description, "", "description is optional");
     }
 
@@ -233,6 +241,7 @@ env = { ROOT = "/tmp" }
             url: None,
             headers: std::collections::BTreeMap::new(),
             request_timeout_secs: None,
+            trust: crate::mcp::McpTrust::Trusted,
         }
     }
 
