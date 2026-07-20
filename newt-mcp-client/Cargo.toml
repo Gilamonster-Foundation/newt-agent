@@ -31,7 +31,7 @@ reqwest.workspace = true
 # `spawn-tokio` = the tokio-native confined spawn; `os-sandbox` = the real OS
 # sandbox backends (Landlock/Seatbelt/AppContainer) so the leash actually
 # kernel-enforces regardless of build scope, not just advisory.
-agent-bridle = { version = "0.7.8", features = ["spawn-tokio", "os-sandbox"] }
+agent-bridle = { version = "0.7.10", features = ["spawn-tokio", "os-sandbox"] }
 # The throwaway `Tool` used to mint the spawn `ToolContext` through the gate.
 async-trait.workspace = true
 
