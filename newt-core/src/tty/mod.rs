@@ -36,9 +36,18 @@
 
 use crossterm::style::Color as CtColor;
 
+pub mod arbiter;
+pub mod caps;
 pub mod frames;
+pub mod spinner;
 
+pub use arbiter::{
+    prompt_stdin_active, try_watch_stdin, Ephemeral, LineLease, LineWriter, PromptWindow, Sink,
+    Terminal, WatcherStdinGuard,
+};
+pub use caps::{enter_protocol_mode, protocol_mode, LineCaps};
 pub use frames::{format_spinner, SPINNER_FRAMES};
+pub use spinner::{with_spinner, Spinner};
 
 /// The newt logo orange as a crossterm color (matches the TUI splash).
 pub const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {

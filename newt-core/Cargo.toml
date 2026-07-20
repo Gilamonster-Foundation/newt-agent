@@ -151,10 +151,16 @@ rusqlite.workspace = true
 # HTTP mocking for the agentic-loop tests that moved here with the loop
 # (Step 9.7) — same pattern as newt-inference / the old newt-tui suites.
 wiremock.workspace = true
-# #1301 trust-boundary integration tests (tests/mcp_project_trust.rs) drive the
-# real `Config::resolve()` walk-up, which reads process-global env + cwd; they
-# must never run concurrently with one another. Same version as newt-mesh /
-# newt-tui already pin, so it adds nothing new to the workspace build graph.
+# Two independent needs, one dependency:
+# - #1301 trust-boundary integration tests (tests/mcp_project_trust.rs) drive the
+#   real `Config::resolve()` walk-up, which reads process-global env + cwd; they
+#   must never run concurrently with one another.
+# - The `tty` arbiter is a PROCESS SINGLETON (one terminal line, one stdin), so
+#   its ownership/exclusion tests must not run concurrently either;
+#   `#[serial_test::serial(tty_arbiter)]` gates them onto one lane while the rest
+#   of newt-core's suite stays fully parallel.
+# Same version newt-mesh / newt-tui already pin, so it adds nothing new to the
+# workspace build graph.
 serial_test = "3"
 
 [lints]
