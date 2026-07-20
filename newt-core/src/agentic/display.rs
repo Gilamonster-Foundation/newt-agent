@@ -17,7 +17,7 @@ use std::io::{self, Write};
 // duplicate frame sets and open-coded erase escapes elsewhere in the workspace.
 // Re-exported here so every call site in `agentic` is unchanged.
 pub use crate::tty::NEWT_ORANGE_CT;
-pub(crate) use crate::tty::{fit_line, term_cols, FADE_CT};
+pub(crate) use crate::tty::{term_cols, FADE_CT};
 
 /// Word-wrap `s` into lines no wider than `width` columns (#1153): the tool-call
 /// display must show the FULL command/path so the operator can audit exactly
@@ -600,7 +600,6 @@ pub(crate) fn print_tool_output(output: &str, _tool_output_lines: usize, color: 
 
 #[cfg(test)]
 mod tests {
-    // NOTE: `fit_line`'s unit tests moved to `newt_core::tty` with the function.
     use super::{
         fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_view_lines,
         tool_call_lines,

@@ -994,45 +994,24 @@ fn print_synthetic_tool_result(
     );
 }
 
-/// Drive `fut` while animating the thinking line in place (~8 fps), so a slow
-/// non-streaming probe still feels alive — the braille/hourglass spinner
-/// otherwise only advances when reasoning tokens arrive. Clears the line when
-/// `fut` resolves so the following output starts clean. A no-op when `animate`
-/// is false (piped / `thinking = "off"` / no TTY) — bit-for-bit today's path.
-async fn with_thinking_spinner<F: std::future::Future>(
-    animate: bool,
-    label: &str,
-    fut: F,
-) -> F::Output {
-    if !animate {
-        return fut.await;
-    }
-    tokio::pin!(fut);
-    let start = std::time::Instant::now();
-    let mut frame = 0usize;
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
-    loop {
-        tokio::select! {
-            biased;
-            out = &mut fut => {
-                let _ = write!(io::stdout(), "\r\x1b[K");
-                let _ = io::stdout().flush();
-                return out;
-            }
-            _ = ticker.tick() => {
-                let line = format_spinner(frame, start.elapsed().as_secs_f32(), label, 0);
-                let mut out = io::stdout();
-                let _ = execute!(
-                    out,
-                    Print("\r\x1b[K"),
-                    SetForegroundColor(CtColor::DarkGrey),
-                    Print(&line),
-                    ResetColor,
-                );
-                let _ = out.flush();
-                frame = frame.wrapping_add(1);
-            }
-        }
+/// The legacy `animate` / `show_thinking` gate expressed as a [`LineCaps`]
+/// override.
+///
+/// **Temporary, by design.** The real gate is `LineCaps::detect()`, which
+/// requires two real terminals; `animate` is `color && thinking_stream_enabled()`
+/// and never checked a TTY at all. Passing the legacy answer through the
+/// arbiter's override seam keeps *when* the spinner appears bit-for-bit
+/// identical while *how* it is drawn, ticked and erased moves onto the shared
+/// implementation. Protocol mode still vetoes absolutely, so the override can
+/// never re-open the JSON-RPC hazard.
+///
+/// Retiring this — so `thinking = "off"` informs the opt-out only and capability
+/// is decided in one place — is the final step of the migration.
+fn legacy_caps(animate: bool) -> crate::tty::LineCaps {
+    if animate {
+        crate::tty::LineCaps::Own
+    } else {
+        crate::tty::LineCaps::None
     }
 }
 
@@ -1526,9 +1505,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 // line with a "compressing context…" stage so it doesn't sit
                 // frozen, and race it against the interrupt flag so Esc bails
                 // out of a slow summarize instead of waiting for it to finish.
-                let outcome = match with_thinking_spinner(
-                    animate,
+                let outcome = match crate::tty::with_spinner(
+                    legacy_caps(animate),
                     "compressing context…",
+                    crate::tty::Sink::Stdout,
+                    color,
                     cancellable(
                         cancel,
                         compress(
@@ -1692,9 +1673,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // (the common "the model isn't answering" case) without waiting for it.
         // Wrapped in the thinking animation so this otherwise-silent wait shows
         // a live hourglass + clock instead of a frozen line.
-        let dispatch = match with_thinking_spinner(
-            animate,
+        let dispatch = match crate::tty::with_spinner(
+            legacy_caps(animate),
             "thinking…",
+            crate::tty::Sink::Stdout,
+            color,
             cancellable(
                 cancel,
                 with_backoff_notify(
@@ -6126,121 +6109,6 @@ fn thinking_stream_enabled() -> bool {
         .unwrap_or(true)
 }
 
-// The braille frame set and the pure line formatter now live in the public
-// `newt_core::tty` module — one copy for the whole workspace, with the unit
-// tests that pinned them. Imported here so the spinner call sites below are
-// unchanged.
-use crate::tty::format_spinner;
-
-/// Cargo-style thinking renderer: a model's reasoning (#385 — normally
-/// suppressed) streams as DIM scrolled lines that stay in scrollback, with one
-/// **ephemeral** spinner line pinned at the bottom (`\r`-redrawn, cleared with
-/// `\x1b[K` — one line, never a region; the plain-scroller carve-out), showing
-/// elapsed + size. Erased the instant the answer begins. Constructed only when
-/// the caller opts in (TTY); headless never builds it.
-struct ThinkingSpinner {
-    color: bool,
-    frame: usize,
-    start: std::time::Instant,
-    chars: usize,
-    line_buf: String,
-    spinner_drawn: bool,
-}
-
-impl ThinkingSpinner {
-    fn new(color: bool) -> Self {
-        Self {
-            color,
-            frame: 0,
-            start: std::time::Instant::now(),
-            chars: 0,
-            line_buf: String::new(),
-            spinner_drawn: false,
-        }
-    }
-
-    /// Feed a reasoning chunk: flush completed lines as dim scrollback, then
-    /// redraw the bottom spinner.
-    fn reasoning(&mut self, chunk: &str) {
-        self.chars += chunk.chars().count();
-        self.line_buf.push_str(chunk);
-        while let Some(nl) = self.line_buf.find('\n') {
-            let line: String = self.line_buf.drain(..=nl).collect();
-            self.print_dim_line(line.trim_end_matches(['\n', '\r']));
-        }
-        self.redraw_spinner();
-    }
-
-    fn print_dim_line(&mut self, line: &str) {
-        self.erase_spinner();
-        if line.trim().is_empty() {
-            return;
-        }
-        let mut out = io::stdout();
-        if self.color {
-            let _ = execute!(
-                out,
-                SetForegroundColor(CtColor::DarkGrey),
-                Print("  "),
-                Print(line),
-                ResetColor,
-                Print("\n"),
-            );
-        } else {
-            let _ = writeln!(out, "  {line}");
-        }
-    }
-
-    fn redraw_spinner(&mut self) {
-        self.frame = self.frame.wrapping_add(1);
-        let line = format_spinner(
-            self.frame,
-            self.start.elapsed().as_secs_f32(),
-            "thinking…",
-            self.chars,
-        );
-        // The spinner is redrawn in place with `\r` and never scrolls, so it
-        // must not exceed the terminal width — a wrapped spinner leaves stale
-        // rows behind. Truncate to width with a faded `…` tail.
-        let fitted = display::fit_line(&line, display::term_cols());
-        let mut out = io::stdout();
-        if self.color {
-            let _ = execute!(
-                out,
-                Print("\r\x1b[K"),
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(&fitted.head),
-                SetForegroundColor(display::FADE_CT),
-                Print(&fitted.fade),
-                Print(fitted.ellipsis),
-                ResetColor,
-            );
-        } else {
-            let _ = write!(out, "\r{}{}{}", fitted.head, fitted.fade, fitted.ellipsis);
-        }
-        let _ = out.flush();
-        self.spinner_drawn = true;
-    }
-
-    fn erase_spinner(&mut self) {
-        if self.spinner_drawn {
-            let _ = write!(io::stdout(), "\r\x1b[K");
-            let _ = io::stdout().flush();
-            self.spinner_drawn = false;
-        }
-    }
-
-    /// The answer is starting (or the stream ended): flush trailing reasoning
-    /// and erase the spinner so output flows on cleanly. Idempotent.
-    fn finish(&mut self) {
-        if !self.line_buf.is_empty() {
-            let tail = std::mem::take(&mut self.line_buf);
-            self.print_dim_line(tail.trim_end_matches(['\n', '\r']));
-        }
-        self.erase_spinner();
-    }
-}
-
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
 /// Returns `(accumulated_text, token_usage)`.
 /// Token usage is extracted from the final chunk (`done: true`).
@@ -6253,7 +6121,16 @@ async fn stream_response(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     markdown: bool,
 ) -> anyhow::Result<(String, Option<crate::TokenUsage>)> {
-    let mut spinner = show_thinking.then(|| ThinkingSpinner::new(color));
+    // The ONE spinner (`newt_core::tty`). `legacy_caps` preserves today's
+    // gating exactly; the shared 100ms OS-thread ticker replaces the old
+    // advance-only-on-a-reasoning-chunk clock, so a model STALL now shows a
+    // live glyph instead of a frozen one — the "looks hung" signature.
+    let mut spinner = crate::tty::Spinner::start_with_caps(
+        legacy_caps(show_thinking),
+        "thinking…",
+        crate::tty::Sink::Stdout,
+        color,
+    );
     let mut full = String::new();
     let mut started = false;
     let mut usage: Option<crate::TokenUsage> = None;
@@ -6294,13 +6171,13 @@ async fn stream_response(
             let (token, reasoning) = think.feed_split(raw);
             // Surface reasoning live (cargo-style) — both the inline `<think>`
             // span the filter just split out AND any separate `thinking` field.
-            if let Some(sp) = spinner.as_mut() {
+            if let Some(sp) = spinner.as_ref() {
                 if !reasoning.is_empty() {
-                    sp.reasoning(&reasoning);
+                    sp.detail(&reasoning);
                 }
                 if let Some(t) = json["message"]["thinking"].as_str() {
                     if !t.is_empty() {
-                        sp.reasoning(t);
+                        sp.detail(t);
                     }
                 }
             }
@@ -6308,9 +6185,7 @@ async fn stream_response(
             if !token.is_empty() {
                 if !started {
                     // The answer is starting — tear the spinner down first.
-                    if let Some(sp) = spinner.as_mut() {
-                        sp.finish();
-                    }
+                    drop(spinner.take());
                     if color {
                         execute!(
                             io::stdout(),
@@ -6349,9 +6224,7 @@ async fn stream_response(
     let tail = think.finish();
     if !tail.is_empty() {
         if !started {
-            if let Some(sp) = spinner.as_mut() {
-                sp.finish();
-            }
+            drop(spinner.take());
             print!("▸  ");
             started = true;
         }
@@ -6364,10 +6237,11 @@ async fn stream_response(
         full.push_str(&tail);
     }
     // All-reasoning response (no clean content): tear the spinner down anyway so
-    // the terminal isn't left mid-spinner.
-    if let Some(sp) = spinner.as_mut() {
-        sp.finish();
-    }
+    // the terminal isn't left mid-spinner. (Belt-and-braces: `Drop` covers every
+    // path out of this function, INCLUDING the `?` on a mid-stream transport
+    // error above, which used to skip every hand-placed `finish()` and leave a
+    // glyph on screen with no live owner.)
+    drop(spinner.take());
     // The markdown writer newline-terminates each line it emits, so it owns the
     // trailing newline; only the raw path needs the closing `println!`.
     if let Some(w) = md.as_mut() {
