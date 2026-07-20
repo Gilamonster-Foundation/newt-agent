@@ -1,0 +1,371 @@
+//! **The regression proof for the summarizer race** — a notice emitted from
+//! outside the lease must not damage what is already on the terminal.
+//!
+//! # What this grounds
+//!
+//! Real-resource tier, per CLAUDE.md: an add-on to the mocked tier, not a
+//! deviation from it. It grounds two mocked unit tests, and it exists because
+//! neither of them can observe the property that actually matters.
+//!
+//! 1. **`arbiter::tests::erase_is_idempotent`** proves `LineLease::erase` is
+//!    flag-guarded — that a second erase sets no bytes in motion *according to
+//!    the flag*. `Terminal::emit_line` stakes the entire suspended-case
+//!    correctness on that: under a live `PromptWindow` the registered
+//!    ephemerals were already erased, so their flags are clear and the emit
+//!    writes **no erase escape at all**, which is the only reason the notice
+//!    lands below the question instead of wiping its row. A mock cannot show
+//!    that the escape was truly absent from the wire — it can only re-read the
+//!    flag it just asserted on.
+//! 2. **`arbiter::tests::a_live_prompt_window_makes_painting_a_no_op`** proves
+//!    the *ticker* is suppressed while a question is up. It cannot prove a
+//!    **different** writer — the notice path, on another call stack — is also
+//!    harmless, and that is exactly the writer that was not: `newt-tui`'s
+//!    `summarizer_progress` wrote `\r\x1b[K` straight to stdout, held no lease,
+//!    and could not see `suspended()`.
+//!
+//! # The bug this pins
+//!
+//! `summarizer_progress` (deleted by this migration) carried a doc comment
+//! describing `LineLease::emit_line`'s contract, and then implemented it wrong
+//! in two independent ways:
+//!
+//! - it cleared the row without clearing anyone's `painted` flag, so the next
+//!   100 ms tick fired `Clear(UntilNewLine)` on the row the notice had just
+//!   moved to;
+//! - it could not see `suspended()`, so with a permission question on screen it
+//!   erased the question's row and printed over it — the same class of
+//!   invisible-prompt hang the arbiter was built to end, arriving through a
+//!   second door.
+//!
+//! The `Legacy` scenario below is that implementation, verbatim, kept as a
+//! **control**: the test asserts it damages the question and that the migrated
+//! path does not. Without the control, the passing assertion would prove only
+//! that some bytes were absent, not that their absence is the fix.
+//!
+//! # Why a PTY, and why a child process
+//!
+//! The spinner refuses to paint unless it can own a real line — correct
+//! behavior, and precisely why this bug never surfaced in a piped test. And
+//! `cargo test` installs a thread-local capture, so the scenario runs in a
+//! child (this same binary, re-invoked with `--nocapture`) whose stdin and
+//! stdout *are* the pty. No filesystem, no network, no service: a pty pair and
+//! a re-exec.
+
+use std::io::Write as _;
+use std::os::unix::io::{FromRawFd as _, RawFd};
+use std::time::Duration;
+
+use super::widgets::{Level, Notice};
+use super::{LineCaps, Sink, Spinner, Terminal};
+
+/// The notice every scenario emits — a real one, copied from the summarizer's
+/// fallback path so the test tracks the production text.
+const NOTICE_TEXT: &str = "⚠ summarizer falling back to qwen:0.5b…";
+
+/// The question the prompt scenarios put on screen before the notice fires.
+const QUESTION: &str = "⊘ web_fetch wants example.com — [a]llow once, [d]eny > ";
+
+/// Long enough for the 100 ms ticker to get several chances to redraw.
+const DWELL: Duration = Duration::from_millis(250);
+
+fn notice() -> Notice<'static> {
+    Notice::new(Level::Warn, "", NOTICE_TEXT)
+}
+
+// ---------------------------------------------------------------------------
+// The children: the scenarios themselves, run with fd 0/1 on a pty.
+// ---------------------------------------------------------------------------
+
+/// A notice fired while the spinner is live. The migrated path routes through
+/// `Terminal::emit_line`, which erases the ephemeral row through its own lease
+/// (clearing `painted`, so the next tick redraws *below* the notice).
+#[test]
+#[ignore = "child process of the notice/arbiter regression test"]
+fn notice_under_spinner_child() {
+    if std::env::var_os("NEWT_NOTICE_PTY_CHILD").as_deref() != Some("spinner".as_ref()) {
+        return;
+    }
+    let spinner =
+        Spinner::start_with_caps(LineCaps::Own, "compressing context…", Sink::Stdout, true)
+            .expect("the pty is a real terminal, so the spinner takes the line");
+    std::thread::sleep(DWELL);
+    notice().emit(LineCaps::Own, Sink::Stdout, true);
+    std::thread::sleep(DWELL);
+    drop(spinner);
+}
+
+/// A notice fired while a `PromptWindow` is live — the question is on screen
+/// and the process is about to block on a human.
+#[test]
+#[ignore = "child process of the notice/arbiter regression test"]
+fn notice_under_prompt_window_child() {
+    if std::env::var_os("NEWT_NOTICE_PTY_CHILD").as_deref() != Some("prompt".as_ref()) {
+        return;
+    }
+    let spinner =
+        Spinner::start_with_caps(LineCaps::Own, "compressing context…", Sink::Stdout, true)
+            .expect("spinner");
+    std::thread::sleep(DWELL);
+    {
+        let window = Terminal::suspend_for_prompt();
+        window.ask(QUESTION).expect("the question reaches the pty");
+        std::thread::sleep(Duration::from_millis(100));
+        notice().emit(LineCaps::Own, Sink::Stdout, true);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(spinner);
+}
+
+/// **The control.** `newt-tui`'s deleted `summarizer_progress`, verbatim, in the
+/// same scenario as [`notice_under_prompt_window_child`]. It must damage the
+/// question — that is what makes the assertion on the migrated path mean
+/// something.
+#[test]
+#[ignore = "child process of the notice/arbiter regression test"]
+fn legacy_notice_under_prompt_window_child() {
+    if std::env::var_os("NEWT_NOTICE_PTY_CHILD").as_deref() != Some("legacy".as_ref()) {
+        return;
+    }
+    let spinner =
+        Spinner::start_with_caps(LineCaps::Own, "compressing context…", Sink::Stdout, true)
+            .expect("spinner");
+    std::thread::sleep(DWELL);
+    {
+        let window = Terminal::suspend_for_prompt();
+        window.ask(QUESTION).expect("the question reaches the pty");
+        std::thread::sleep(Duration::from_millis(100));
+        // ---- the deleted implementation, exactly as it stood ----
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\r\x1b[K\x1b[33m{NOTICE_TEXT}\x1b[0m\n");
+        let _ = out.flush();
+        // ---------------------------------------------------------
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(spinner);
+}
+
+// ---------------------------------------------------------------------------
+// The parent: allocate the pty, drive a child, read the screen.
+// ---------------------------------------------------------------------------
+
+/// A pty pair. The slave becomes the child's stdin+stdout; the master is what
+/// we read the screen from.
+struct Pty {
+    master: RawFd,
+    slave: RawFd,
+}
+
+impl Pty {
+    fn open() -> Self {
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "posix_openpt failed");
+            assert_eq!(libc::grantpt(master), 0, "grantpt failed");
+            assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+            let name = libc::ptsname(master);
+            assert!(!name.is_null(), "ptsname failed");
+            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(slave >= 0, "opening the pty slave failed");
+            // A realistic geometry: a 0x0 pty drives `term_cols()` to its
+            // 8-column floor and `fit_line` would truncate the labels into
+            // something the assertions could not recognize.
+            let ws = libc::winsize {
+                ws_row: 50,
+                ws_col: 200,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            libc::ioctl(slave, libc::TIOCSWINSZ, &ws);
+            Self { master, slave }
+        }
+    }
+
+    /// Everything the terminal has been shown so far.
+    fn screen(&self) -> String {
+        unsafe {
+            let flags = libc::fcntl(self.master, libc::F_GETFL);
+            libc::fcntl(self.master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    self.master,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.slave);
+            libc::close(self.master);
+        }
+    }
+}
+
+/// Run one scenario on a fresh pty and return everything the terminal saw.
+fn run_scenario(scenario: &str, child_test: &str) -> String {
+    let pty = Pty::open();
+    let dup = |fd: RawFd| unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) };
+    let mut child = std::process::Command::new(
+        std::env::current_exe().expect("the test binary re-invokes itself"),
+    )
+    .args(["--exact", child_test, "--ignored", "--nocapture"])
+    .env("NEWT_NOTICE_PTY_CHILD", scenario)
+    .stdin(std::process::Stdio::from(dup(pty.slave)))
+    .stdout(std::process::Stdio::from(dup(pty.slave)))
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("spawn the pty child");
+    let status = child.wait().expect("wait for the pty child");
+    let screen = pty.screen();
+    assert!(
+        status.success(),
+        "the {scenario} scenario child failed.\n\nscreen:\n{screen:?}"
+    );
+    screen
+}
+
+/// Braille frames (the spinner's alphabet) present in `s`.
+fn frames(s: &str) -> Vec<char> {
+    s.chars()
+        .filter(|c| ('\u{2800}'..='\u{28FF}').contains(c))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// (a) spinner live
+// ---------------------------------------------------------------------------
+
+/// §5 row 4 (a): with a spinner live, an emitted notice produces no interleaved
+/// bytes — the notice reaches scrollback whole, and the spinner goes on
+/// spinning below it.
+#[serial_test::serial(tty_arbiter)]
+#[test]
+fn a_notice_emitted_under_a_live_spinner_is_not_interleaved() {
+    let screen = run_scenario(
+        "spinner",
+        "tty::pty_notice_test::notice_under_spinner_child",
+    );
+
+    let start = screen
+        .find(NOTICE_TEXT)
+        .unwrap_or_else(|| panic!("the notice never reached the terminal.\n\nscreen:\n{screen:?}"));
+
+    // The notice is written under ONE stdout lock — colour, text, reset and the
+    // newline in a single queued batch — so nothing may appear inside it. This
+    // is the property no mock can observe: the unit tier can only assert that
+    // `emit_line` was called.
+    let end = screen[start..]
+        .find('\n')
+        .map(|i| start + i)
+        .unwrap_or(screen.len());
+    assert!(
+        frames(&screen[start..end]).is_empty(),
+        "a spinner frame was painted INSIDE the notice line.\n\nnotice row:\n{:?}",
+        &screen[start..end]
+    );
+
+    // And the row was genuinely handed back: `emit_line` erases through the
+    // lease, which clears `painted`, so the ticker redraws *below* the notice
+    // rather than over it. If `painted` had been left set — the first half of
+    // the summarizer race — the next tick would have fired `Clear(UntilNewLine)`
+    // on the row the notice had just moved to.
+    assert!(
+        !frames(&screen[end..]).is_empty(),
+        "the spinner never resumed after the notice, so the ephemeral row was \
+         not returned.\n\nafter the notice:\n{:?}",
+        &screen[end..]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (b) PromptWindow live — and the control that proves the assertion bites
+// ---------------------------------------------------------------------------
+
+/// The bytes the terminal saw between the end of the question and the start of
+/// the notice. Everything that could damage the question lives in this window.
+fn window_between_question_and_notice(screen: &str) -> String {
+    let q_end = screen
+        .find(QUESTION)
+        .map(|i| i + QUESTION.len())
+        .unwrap_or_else(|| {
+            panic!("the question never reached the terminal.\n\nscreen:\n{screen:?}")
+        });
+    let n_start = screen[q_end..]
+        .find(NOTICE_TEXT)
+        .map(|i| q_end + i)
+        .unwrap_or_else(|| panic!("the notice never reached the terminal.\n\nscreen:\n{screen:?}"));
+    screen[q_end..n_start].to_string()
+}
+
+/// §5 row 4 (b): with a `PromptWindow` live, the notice must NOT overwrite the
+/// question.
+///
+/// The question is unterminated (`ask` writes no newline — the cursor parks
+/// after `> ` where the operator types), so it owns the current row. An erase
+/// escape between the question and the notice would wipe that row and leave the
+/// operator blocked on a question they cannot see. There must be none: every
+/// registered ephemeral was already erased when the window was handed out, so
+/// their `painted` flags are clear and `Terminal::emit_line`'s erase is a no-op
+/// that writes nothing.
+#[serial_test::serial(tty_arbiter)]
+#[test]
+fn a_notice_emitted_under_a_prompt_window_does_not_overwrite_the_question() {
+    let screen = run_scenario(
+        "prompt",
+        "tty::pty_notice_test::notice_under_prompt_window_child",
+    );
+    let window = window_between_question_and_notice(&screen);
+
+    assert!(
+        !window.contains("\x1b[K"),
+        "an erase escape was written between the question and the notice — the \
+         question's row was wiped and the operator is blocked on a question \
+         they cannot see.\n\nwindow:\n{window:?}"
+    );
+    assert!(
+        frames(&window).is_empty(),
+        "the ticker painted over the question while it was up.\n\nwindow:\n{window:?}"
+    );
+    // The question survives whole, after everything.
+    assert!(
+        screen.contains(QUESTION),
+        "the question did not survive.\n\nscreen:\n{screen:?}"
+    );
+}
+
+/// **The control**, and the evidence that the assertion above is not vacuous:
+/// the deleted `summarizer_progress` fails it. Run against the pre-migration
+/// implementation, an erase escape lands squarely between the question and the
+/// notice — which is the reported class of hang.
+///
+/// If this test ever stops failing to find `\x1b[K`, the assertion in
+/// [`a_notice_emitted_under_a_prompt_window_does_not_overwrite_the_question`]
+/// has stopped measuring anything and both need revisiting.
+#[serial_test::serial(tty_arbiter)]
+#[test]
+fn the_legacy_unleased_notice_did_overwrite_the_question() {
+    let screen = run_scenario(
+        "legacy",
+        "tty::pty_notice_test::legacy_notice_under_prompt_window_child",
+    );
+    let window = window_between_question_and_notice(&screen);
+
+    assert!(
+        window.contains("\x1b[K"),
+        "the control no longer reproduces the bug, so the migrated path's \
+         assertion proves nothing.\n\nwindow:\n{window:?}"
+    );
+}

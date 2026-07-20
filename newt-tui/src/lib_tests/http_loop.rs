@@ -402,6 +402,35 @@ fn summarizer_progress_message_text() {
     );
 }
 
+/// `docs/decisions/tty_widget_suite.md` §5 row 3: `newt_core::tty::Notice` must
+/// reproduce all three summarizer notices **byte for byte** before any of them
+/// is routed through it. These use the ONE-space convention (the
+/// `agentic::display` family uses two), which is why `Notice` carries an
+/// explicit gap rather than assuming either.
+#[test]
+fn notice_reproduces_the_summarizer_progress_bytes() {
+    use newt_core::tty::{Level, Notice};
+
+    assert_eq!(
+        Notice::new(Level::Warn, "↻", "summarizer retrying (attempt 2/3)…").line(),
+        super::retry_progress_msg(2, 3),
+    );
+    assert_eq!(
+        Notice::new(Level::Warn, "⚠", "summarizer falling back to qwen:0.5b…").line(),
+        super::fallback_progress_msg("qwen:0.5b"),
+    );
+    let err = anyhow::anyhow!("connection refused");
+    assert_eq!(
+        Notice::new(
+            Level::Warn,
+            "⚠",
+            "summarizer failed (connection refused); using static compression marker…"
+        )
+        .line(),
+        super::failure_progress_msg(&err),
+    );
+}
+
 /// F5 mirror: OpenAI-compatible endpoints configure context server-side
 /// — `num_ctx` must NOT leak into their request body.
 #[tokio::test(flavor = "multi_thread")]

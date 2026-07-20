@@ -128,6 +128,18 @@ fn lock() -> MutexGuard<'static, Inner> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Every registered ephemeral still alive, pruning the dead weak refs as it
+/// goes. The caller must release the lock before erasing any of them — erasing
+/// writes to the terminal and must not happen under the arbiter's mutex.
+fn live_ephemerals(state: &mut Inner) -> Vec<Arc<dyn Ephemeral>> {
+    state.registered.retain(|(_, w)| w.strong_count() > 0);
+    state
+        .registered
+        .iter()
+        .filter_map(|(_, w)| w.upgrade())
+        .collect()
+}
+
 /// Is a `PromptWindow` alive right now? The shared ticker checks this before
 /// every frame, so a redraw can never race a question onto the screen.
 pub(crate) fn suspended() -> bool {
@@ -291,6 +303,48 @@ impl Terminal {
         })
     }
 
+    /// [`LineLease::emit_line`] for a writer that does **not** hold the lease.
+    ///
+    /// # Why this exists
+    ///
+    /// A permanent line is often produced far from whoever owns the ephemeral
+    /// row — a retry notice raised inside an HTTP client while the spinner
+    /// covering that call is owned three crates away. Before this, such a
+    /// writer had exactly two options and both were wrong: emit nothing, or
+    /// re-implement the lease's erase-then-write from outside the arbiter.
+    /// `newt-tui`'s `summarizer_progress` chose the second, and it was a live
+    /// race in two directions:
+    ///
+    /// 1. It wrote a raw `\r ESC[K` without clearing anyone's `painted` flag,
+    ///    so the next 100 ms tick fired `Clear(UntilNewLine)` on the row the
+    ///    notice had just moved to.
+    /// 2. It could not see [`suspended`], so it happily erased and printed over
+    ///    a permission question the operator was reading.
+    ///
+    /// Both close here, and neither closes by remembering to check something:
+    /// the erase is delegated to each registered [`Ephemeral`], whose own erase
+    /// is flag-guarded and idempotent. That is what makes the suspended case
+    /// correct *by construction* — under a live [`PromptWindow`] every
+    /// ephemeral was already erased when the window was handed out, so their
+    /// flags are clear, **no erase escape is written at all**, and the line
+    /// lands below the question instead of on top of it.
+    ///
+    /// Nothing here gates on capability: this is a *permanent* line, and a
+    /// caller that must not speak into a pipe gates before it calls (see
+    /// `tty::widgets::Notice::emit`).
+    pub fn emit_line(sink: Sink, f: impl FnOnce(&mut LineWriter<'_>) -> io::Result<()>) {
+        // Collect under the lock, erase outside it: erasing writes to the
+        // terminal and must never happen while holding the arbiter's mutex.
+        let live: Vec<Arc<dyn Ephemeral>> = live_ephemerals(&mut lock());
+        for e in &live {
+            e.erase();
+        }
+        sink.with(|w| {
+            let _ = f(w);
+            let _ = w.flush();
+        });
+    }
+
     /// Register an ephemeral so [`Terminal::suspend_for_prompt`] can erase it.
     /// Held weakly — dropping the writer deregisters it.
     pub(crate) fn register(id: u64, e: &Arc<dyn Ephemeral>) {
@@ -313,12 +367,7 @@ impl Terminal {
         let live: Vec<Arc<dyn Ephemeral>> = {
             let mut state = lock();
             state.suspended = true;
-            state.registered.retain(|(_, w)| w.strong_count() > 0);
-            state
-                .registered
-                .iter()
-                .filter_map(|(_, w)| w.upgrade())
-                .collect()
+            live_ephemerals(&mut state)
         };
         for e in &live {
             e.erase();
