@@ -1,6 +1,20 @@
 //! §6.5 — **the regression proof**: when the harness blocks on a human, the
 //! question must be the most recent thing on the terminal.
 //!
+//! # What this grounds
+//!
+//! This is the ground-truth tier — an add-on to the mocked unit tier, not a
+//! deviation from it. The arbiter's lease/suspend/erase behavior is covered by
+//! fast, deterministic mocked tests in `newt_core::tty`, but those encode what
+//! we *believe* a terminal does. "The prompt is visible" is a property of an
+//! actual terminal: no mock can observe one writer scribbling over another
+//! writer's bytes. This test drives a real PTY and reads the real byte stream,
+//! so it verifies those mocks are testing something real. Mocked stays the
+//! gate; this proves the gate is measuring reality.
+//!
+//! See CLAUDE.md, "Testing strategy" — every real-resource test records which
+//! mocked behavior it grounds.
+//!
 //! # The bug this pins
 //!
 //! A turn parks a spinner on the cursor line, then — 736 lines later, deep
