@@ -379,6 +379,41 @@ impl SpillView {
         }
     }
 
+    // #1303 step 5: absolute + half-page jumps for editor-mode nav (`gg`/`G`,
+    // `C-d`/`C-u`). All ride the existing scroll model — `effective_start`
+    // clamps `view_start` into `[dropped_lines, max_start]`, so nothing here can
+    // scroll past the retained buffer.
+    #[cfg(any(unix, test))]
+    pub(crate) fn scroll_to_top(&mut self) {
+        self.follow_tail = false;
+        self.view_start = self.dropped_lines;
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        self.follow_tail = true;
+        self.view_start = self.max_start();
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn half_page_up(&mut self) {
+        for _ in 0..self.half_page_rows() {
+            self.scroll_up();
+        }
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn half_page_down(&mut self) {
+        for _ in 0..self.half_page_rows() {
+            self.scroll_down();
+        }
+    }
+
+    #[cfg(any(unix, test))]
+    fn half_page_rows(&self) -> usize {
+        (self.visible_rows / 2).max(1)
+    }
+
     pub(crate) fn finish(&mut self) {
         if self.finished {
             return;
@@ -678,6 +713,39 @@ mod tests {
                 "▓ l5",
                 "⧉ Space expands · ↑↓ scroll",
             ]
+        );
+    }
+
+    #[test]
+    fn editor_mode_nav_jumps_and_half_pages() {
+        // #1303 step 5: `gg`/`G` jumps and `C-u`/`C-d` half-pages ride the same
+        // scroll model — never past the retained buffer.
+        let mut view = SpillView::with_limits(80, 6, 100, 80);
+        let owned: Vec<String> = (1..=20).map(|n| format!("l{n}")).collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        feed_lines(&mut view, &refs);
+        assert!(view.is_following_tail());
+
+        // `gg` → jump to the very top (detaches from the tail).
+        view.scroll_to_top();
+        assert!(!view.is_following_tail());
+        let top = view.frame().lines();
+        assert!(top.iter().any(|l| l.contains("l1")), "{top:?}");
+        assert!(!top.iter().any(|l| l.contains("l20")), "{top:?}");
+
+        // `G` → jump back to the tail.
+        view.scroll_to_bottom();
+        assert!(view.is_following_tail());
+        let bottom = view.frame().lines();
+        assert!(bottom.iter().any(|l| l.contains("l20")), "{bottom:?}");
+
+        // `C-u` half-page up detaches; a matching `C-d` returns to the tail.
+        view.half_page_up();
+        assert!(!view.is_following_tail());
+        view.half_page_down();
+        assert!(
+            view.is_following_tail(),
+            "half-page down re-attached to the tail"
         );
     }
 

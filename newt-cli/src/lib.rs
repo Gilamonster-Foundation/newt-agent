@@ -588,6 +588,14 @@ fn abs_grant_paths(paths: &[PathBuf]) -> Result<std::ffi::OsString, std::env::Jo
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    // #1303 clause B: install the one-time mouse-capture panic-release hook at
+    // binary entry, before any turn can enable capture. It emits
+    // `DisableMouseCapture` ONLY when capture is currently active, so the
+    // `worker`/`mcp`/piped paths (which never enable it) stay byte-for-byte
+    // clean (clause E). Compiled out of the wyvern/lean build.
+    #[cfg(all(unix, any(feature = "rich-tui", feature = "live-spill")))]
+    newt_tui::install_panic_release_hook();
+
     if let Some(dir) = cli.config_dir.as_deref() {
         let dir = abs_grant_path(dir);
         // SAFETY: single-threaded before any async work or config resolution.

@@ -117,6 +117,89 @@ async fn spawn_and_assert_pure(bin: &PathBuf, args: &[&str]) {
     );
 }
 
+/// #1303 acceptance 1 (decision clause A/E): the mouse tier NEVER emits capture
+/// sequences on a non-interactive path — even with the opt-in FORCED ON
+/// (`NEWT_MOUSE=1`) — because stdout is piped (not a TTY), and separately when
+/// `TERM=dumb`. This is the byte-for-byte non-interactive invariant, proven
+/// through an ACTUAL turn (a prompt is fed so the turn's `with_live_spill_watch`
+/// path runs), not just REPL init.
+#[tokio::test]
+async fn chat_emits_no_mouse_capture_sequences_when_piped() {
+    let bin = locate_newt_bin();
+    // Piped stdout with a normal TERM, opt-in forced on → still no mouse.
+    assert_no_mouse_capture(&bin, "xterm-256color").await;
+    // Piped stdout AND TERM=dumb → still no mouse.
+    assert_no_mouse_capture(&bin, "dumb").await;
+}
+
+/// Spawn the real `newt` chat REPL with piped stdio and `NEWT_MOUSE=1` (the
+/// mouse opt-in forced ON), close stdin (EOF), and assert stdout carries NONE of
+/// crossterm's mouse-capture private-mode sequences. This proves the load-bearing
+/// non-interactive invariant: with piped (non-TTY) stdio, `mouse_capable` is
+/// false, so capture is never enabled and the byte stream stays byte-for-byte the
+/// 0.7.3 output — even with the opt-in forced on and even under `TERM=dumb`.
+///
+/// We deliberately do NOT feed a prompt: a real turn would only reach the
+/// unreachable model and retry with backoff (flaky/slow in CI, which has no
+/// model), and the piped path early-returns before the turn-level guard anyway,
+/// so a prompt could not reach it. The turn-level gate `mouse_capable_for`
+/// (refusing without BOTH TTYs even with the opt-in on) is proven
+/// deterministically by the newt-tui unit test
+/// `mouse_tier_requires_optin_and_a_supported_interactive_terminal`. A seeded
+/// empty config skips first-run setup so the run is fast and deterministic.
+async fn assert_no_mouse_capture(bin: &PathBuf, term: &str) {
+    // Isolate config from the real `~/.newt`; seed it so no first-run wizard.
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(home.path().join(".newt")).expect("mk .newt");
+    std::fs::write(home.path().join(".newt/config.toml"), "").expect("seed config");
+
+    let mut cmd = Command::new(bin);
+    cmd.arg("--no-splash")
+        .env("OLLAMA_HOST", "http://127.0.0.1:1")
+        // Force the mouse opt-in ON: the TTY gate must STILL refuse.
+        .env("NEWT_MOUSE", "1")
+        .env("TERM", term)
+        .env("HOME", home.path())
+        .env_remove("NEWT_CONFIG")
+        .env_remove("NEWT_CONFIG_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().expect("spawn newt");
+    // Close stdin immediately (EOF) so the REPL exits without running a turn.
+    // The non-interactive invariant does not depend on a turn: piped stdio is not
+    // a TTY, so `mouse_capable` is false and capture is never enabled regardless.
+    // Feeding a prompt would only reach the unreachable model and retry with
+    // backoff (flaky/slow in CI with no model); the piped path early-returns
+    // before the turn-level guard anyway, so it cannot exercise the gate.
+    drop(child.stdin.take());
+
+    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .expect("newt chat timed out")
+        .expect("collect newt output");
+
+    // crossterm's Enable/DisableMouseCapture emit these private-mode toggles.
+    for seq in [
+        &b"\x1b[?1000"[..],
+        b"\x1b[?1002",
+        b"\x1b[?1003",
+        b"\x1b[?1006",
+        b"\x1b[?1015",
+    ] {
+        assert!(
+            !output.stdout.windows(seq.len()).any(|w| w == seq),
+            "mouse-capture sequence {:?} leaked on the non-interactive path (TERM={term})\n\
+             Full stdout:\n{}\n\nFull stderr:\n{}",
+            String::from_utf8_lossy(seq),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 /// The cargo target directory, resolved the way cargo itself resolves it: the
 /// `CARGO_TARGET_DIR` env var, then a workspace or user `config.toml`'s `[build]
 /// target-dir`, then the default. This makes the test robust to a target-dir set

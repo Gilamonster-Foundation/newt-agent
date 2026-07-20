@@ -34,6 +34,15 @@ mod workspace_state;
 mod rich_input;
 #[cfg(feature = "rich-tui")]
 mod vi;
+// The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
+// only when an interactive surface is on — the wyvern/lean build never links it.
+// unix-only: the mouse tier's sole construction site (`with_live_spill_watch`)
+// and the raw-byte decoder are `#[cfg(unix)]`, so on Windows the guard would be
+// dead code (`-D warnings`). The whole tier rides the unix gate.
+#[cfg(all(unix, any(feature = "rich-tui", feature = "live-spill")))]
+mod mouse;
+#[cfg(all(unix, any(feature = "rich-tui", feature = "live-spill")))]
+pub use mouse::install_panic_release_hook;
 // The lean input surface (issue #527): a dead-simple word-wrapped text box, the
 // flight/wyvern morphology. Always built — it is the footer-off / lean tier.
 mod lean_input;
@@ -5593,6 +5602,60 @@ fn live_spill_capable_for(
         && term != Some("dumb")
 }
 
+/// #1303: the mouse-tier opt-in — config-first (`[tui] mouse_viewport`, default
+/// false) with a `NEWT_MOUSE` env override (the `NEWT_*` convention, and the
+/// seam the acceptance test uses to force the opt-in on while proving the TTY
+/// gate still refuses). Mirrors [`spill_lines`]; the config field is always
+/// compiled, but this accessor and the capability gate only exist under
+/// `live-spill` (the mouse tier rides the spill viewport's own feature, stripped
+/// from the wyvern build).
+#[cfg(feature = "live-spill")]
+fn mouse_viewport(cfg: &newt_core::Config) -> bool {
+    if let Ok(v) = std::env::var("NEWT_MOUSE") {
+        return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+    }
+    cfg.tui.as_ref().map(|t| t.mouse_viewport).unwrap_or(false)
+}
+
+/// #1303: the mouse-tier capability gate — layered strictly ON TOP of
+/// `live_spill_capable()` plus an explicit opt-in. Mouse events arrive on
+/// **stdin**, so both stdin and stdout must be terminals (a stdin-piped session
+/// never enables capture even when stdout is a TTY).
+#[cfg(feature = "live-spill")]
+fn mouse_capable(opt_in: bool) -> bool {
+    let term = std::env::var("TERM").ok();
+    mouse_capable_for(
+        cfg!(unix),
+        cfg!(feature = "live-spill"),
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        term.as_deref(),
+        opt_in,
+    )
+}
+
+/// Pure predicate behind [`mouse_capable`]: the opt-in AND the full
+/// `live_spill_capable_for` predicate. Injected-bool seam for the acceptance-1a
+/// table test.
+#[cfg(feature = "live-spill")]
+fn mouse_capable_for(
+    platform_supported: bool,
+    feature_enabled: bool,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    term: Option<&str>,
+    opt_in: bool,
+) -> bool {
+    opt_in
+        && live_spill_capable_for(
+            platform_supported,
+            feature_enabled,
+            stdin_terminal,
+            stdout_terminal,
+            term,
+        )
+}
+
 /// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
 /// Defaults to 25 when there's no `[tui]` table or no config file.
 fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
@@ -6457,12 +6520,17 @@ fn is_lone_esc(bytes: &[u8]) -> bool {
     bytes == [0x1b]
 }
 
-/// Ctrl-C arrives as a lone `ETX` (`0x03`) once ISIG is off (see `CbreakGuard`).
-/// A standalone press is a single byte; anything longer is typed-ahead, not an
-/// interrupt. Unix-only: the keyboard watcher (its sole caller) needs termios.
+/// Ctrl-C arrives as `ETX` (`0x03`) once ISIG is off (see `CbreakGuard`). We
+/// treat an interrupt as `0x03` appearing ANYWHERE in the read buffer, not only
+/// as a lone `[0x03]` (#1303 FIX A): a single 64-byte read can coalesce the
+/// `0x03` with other bytes — e.g. a trailing SGR-mouse event `ESC[<..M` under
+/// motion, or fast typed-ahead — and an exact-match check would silently drop
+/// the cancel. `0x03` never occurs inside a legitimate keystroke burst (escape
+/// sequences use `0x1b`/`[`/digits; text is printable), so scanning is safe.
+/// Unix-only: the keyboard watcher (its sole caller) needs termios.
 #[cfg(unix)]
 fn is_ctrl_c(bytes: &[u8]) -> bool {
-    bytes == [0x03]
+    bytes.contains(&0x03)
 }
 
 // The trait itself stays available on every platform: `chat.rs` names
@@ -6479,6 +6547,16 @@ pub(crate) trait SpillInput: Sync {
     fn toggle_expanded(&self) -> bool;
     #[cfg(unix)]
     fn refresh_geometry(&self) -> bool;
+    // #1303 step 5: editor-mode nav targets (vi `gg`/`G`/`C-d`/`C-u`, emacs
+    // paging). Gated with their dispatch arms so the lean build links none.
+    #[cfg(all(unix, feature = "live-spill"))]
+    fn scroll_to_top(&self) -> bool;
+    #[cfg(all(unix, feature = "live-spill"))]
+    fn scroll_to_bottom(&self) -> bool;
+    #[cfg(all(unix, feature = "live-spill"))]
+    fn half_page_up(&self) -> bool;
+    #[cfg(all(unix, feature = "live-spill"))]
+    fn half_page_down(&self) -> bool;
 }
 
 #[cfg(feature = "live-spill")]
@@ -6502,6 +6580,26 @@ impl SpillInput for live_spill::LiveSpillRenderer {
     fn refresh_geometry(&self) -> bool {
         self.refresh_geometry()
     }
+
+    #[cfg(unix)]
+    fn scroll_to_top(&self) -> bool {
+        self.scroll_to_top()
+    }
+
+    #[cfg(unix)]
+    fn scroll_to_bottom(&self) -> bool {
+        self.scroll_to_bottom()
+    }
+
+    #[cfg(unix)]
+    fn half_page_up(&self) -> bool {
+        self.half_page_up()
+    }
+
+    #[cfg(unix)]
+    fn half_page_down(&self) -> bool {
+        self.half_page_down()
+    }
 }
 
 #[cfg(unix)]
@@ -6510,6 +6608,17 @@ enum TurnKey {
     Up,
     Down,
     ToggleExpanded,
+    // #1303 step 5: editor-mode nav targets (vi `gg`/`G`/`C-d`/`C-u`, emacs
+    // paging). Produced and dispatched only under `live-spill` — the wyvern
+    // build never links them.
+    #[cfg(feature = "live-spill")]
+    Top,
+    #[cfg(feature = "live-spill")]
+    Bottom,
+    #[cfg(feature = "live-spill")]
+    HalfPageUp,
+    #[cfg(feature = "live-spill")]
+    HalfPageDown,
 }
 
 #[cfg(unix)]
@@ -6520,12 +6629,62 @@ enum TurnKeyState {
     Escape,
     Csi,
     Ss3,
+    // #1303 FIX C: legacy X10 mouse encoding (`ESC[M` then 3 raw bytes
+    // Cb,Cx,Cy) — a terminal that honors `?1000` but not the SGR `?1006`
+    // reports here. Consume the 3 bytes (`remaining` counts down) so they never
+    // leak as ground keys. Only reachable under `live-spill` (mouse capture).
+    #[cfg(feature = "live-spill")]
+    X10Mouse {
+        remaining: u8,
+    },
 }
+
+/// #1303 FIX E: cap on accumulated CSI parameter bytes. A well-behaved SGR-mouse
+/// param run (`<65;9999;9999`) is ~13 bytes; 32 is generous. A non-terminating
+/// or malformed CSI (continuous `;` with no `0x40..=0x7e` terminator) is dropped
+/// at the cap and the decoder resyncs to Ground rather than grow without bound.
+#[cfg(all(unix, feature = "live-spill"))]
+const MAX_CSI_PARAM_BYTES: usize = 32;
 
 #[cfg(unix)]
 #[derive(Default)]
 struct TurnKeyDecoder {
     state: TurnKeyState,
+    // #1303: accumulated CSI parameter bytes, for SGR-mouse decode. Only ever
+    // populated under `live-spill` — the wyvern build never enables capture, so
+    // never sees mouse bytes, so this field does not exist there.
+    #[cfg(feature = "live-spill")]
+    params: Vec<u8>,
+    // #1303 step 5: the resolved editor keybinding for viewport nav, plus the
+    // `gg` two-key latch (vi). `default()` yields `EditMode`'s own default; the
+    // watcher builds the decoder with the live-resolved mode via `with_mode`.
+    #[cfg(feature = "live-spill")]
+    mode: newt_core::EditMode,
+    #[cfg(feature = "live-spill")]
+    pending_g: bool,
+    // #1303 FIX F: the editor-mode nav keys (vi `j`/`k`/`gg`/`G`/`C-d`/`C-u`,
+    // emacs `C-n`/`C-p`/`C-v`) only activate with the mouse opt-in — the
+    // decision keeps the keyboard tier unchanged for operators who don't opt in.
+    // `false` (the default) = base keys only (`↑`/`↓`/`Space`/`Enter`); the
+    // watcher sets it from the resolved mouse-tier flag. Base keys are always on.
+    #[cfg(feature = "live-spill")]
+    mode_nav: bool,
+}
+
+#[cfg(all(unix, feature = "live-spill"))]
+impl TurnKeyDecoder {
+    /// Build a decoder bound to the session's editor keybinding WITH mode-aware
+    /// nav enabled — the mouse-tier (opt-in ON) constructor. Base keys
+    /// (`↑`/`↓`/`Space`/`Enter`) work in every mode regardless; the mode-aware
+    /// keys (`j`/`k`/`gg`… ) additionally activate here. Resolved once per spill
+    /// turn by the watcher, never on the hot path of a non-spill turn.
+    fn with_mode(mode: newt_core::EditMode) -> Self {
+        Self {
+            mode,
+            mode_nav: true,
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -6534,26 +6693,75 @@ impl TurnKeyDecoder {
         let mut keys = Vec::new();
         for &byte in bytes {
             self.state = match self.state {
-                TurnKeyState::Ground if byte == 0x1b => TurnKeyState::Escape,
-                TurnKeyState::Ground if matches!(byte, b' ' | b'\r' | b'\n') => {
-                    keys.push(TurnKey::ToggleExpanded);
+                TurnKeyState::Ground if byte == 0x1b => {
+                    // #1303 FIX D: an escape sequence (arrow / SS3 / SGR or X10
+                    // mouse / Alt-chord) is a non-`g` event — clear the vi `gg`
+                    // latch so a `g` before it can't mis-fire `Top` on a later
+                    // `g`. Every escape sequence starts with this `0x1b`, so one
+                    // clear here covers CSI/SS3/mouse/escape alike.
+                    #[cfg(feature = "live-spill")]
+                    {
+                        self.pending_g = false;
+                    }
+                    TurnKeyState::Escape
+                }
+                TurnKeyState::Ground => {
+                    self.push_ground_key(byte, &mut keys);
                     TurnKeyState::Ground
                 }
-                TurnKeyState::Ground => TurnKeyState::Ground,
-                TurnKeyState::Escape if byte == b'[' => TurnKeyState::Csi,
+                TurnKeyState::Escape if byte == b'[' => {
+                    // A fresh CSI — reset the mouse-parameter accumulator.
+                    #[cfg(feature = "live-spill")]
+                    self.params.clear();
+                    TurnKeyState::Csi
+                }
                 TurnKeyState::Escape if byte == b'O' => TurnKeyState::Ss3,
                 TurnKeyState::Escape if byte == 0x1b => TurnKeyState::Escape,
                 TurnKeyState::Escape => TurnKeyState::Ground,
                 TurnKeyState::Csi if (0x40..=0x7e).contains(&byte) => {
-                    match byte {
-                        b'A' => keys.push(TurnKey::Up),
-                        b'B' => keys.push(TurnKey::Down),
-                        _ => {}
-                    }
-                    TurnKeyState::Ground
+                    self.push_csi_terminal(byte, &mut keys)
                 }
                 TurnKeyState::Csi if byte == 0x1b => TurnKeyState::Escape,
-                TurnKeyState::Csi => TurnKeyState::Csi,
+                TurnKeyState::Csi => {
+                    // Accumulate parameter/intermediate bytes (`0x20..=0x3f`,
+                    // e.g. `<`, digits, `;`) for the SGR-mouse terminal decode.
+                    // #1303 FIX E: bounded — on overflow, drop the malformed /
+                    // non-terminating CSI and resync to Ground.
+                    #[cfg(feature = "live-spill")]
+                    {
+                        if (0x20..=0x3f).contains(&byte) {
+                            if self.params.len() >= MAX_CSI_PARAM_BYTES {
+                                self.params.clear();
+                                TurnKeyState::Ground
+                            } else {
+                                self.params.push(byte);
+                                TurnKeyState::Csi
+                            }
+                        } else {
+                            TurnKeyState::Csi
+                        }
+                    }
+                    #[cfg(not(feature = "live-spill"))]
+                    {
+                        TurnKeyState::Csi
+                    }
+                }
+                #[cfg(feature = "live-spill")]
+                TurnKeyState::X10Mouse { remaining } => {
+                    // #1303 FIX C: consume Cb,Cx,Cy. Decode the button from the
+                    // FIRST byte (Cb); discard the two coordinate bytes so a
+                    // coord that happens to equal `j`/`g`/space never leaks as a
+                    // ground key. Split across reads is handled by the state.
+                    if remaining == 3 {
+                        if let Some(key) = Self::x10_button_key(byte) {
+                            keys.push(key);
+                        }
+                    }
+                    match remaining - 1 {
+                        0 => TurnKeyState::Ground,
+                        left => TurnKeyState::X10Mouse { remaining: left },
+                    }
+                }
                 TurnKeyState::Ss3 => {
                     match byte {
                         b'A' => keys.push(TurnKey::Up),
@@ -6565,6 +6773,139 @@ impl TurnKeyDecoder {
             };
         }
         keys
+    }
+
+    /// A CSI terminal byte closed the sequence: an SGR-mouse event (params carry
+    /// a `<` intro), the legacy X10 mouse form (`ESC[M` with no `<`), or a plain
+    /// arrow. Returns the next decoder state — `X10Mouse` when 3 raw bytes must
+    /// still be consumed, else `Ground`.
+    fn push_csi_terminal(&self, byte: u8, keys: &mut Vec<TurnKey>) -> TurnKeyState {
+        #[cfg(feature = "live-spill")]
+        {
+            // SGR form (`ESC[<btn;col;rowM`): params begin with `<`.
+            if let Some(key) = self.mouse_key_for(byte) {
+                keys.push(key);
+                return TurnKeyState::Ground;
+            }
+            // #1303 FIX C: legacy X10 form is `ESC[M` (terminal `M`) with NO
+            // SGR `<` params — 3 raw bytes (Cb,Cx,Cy) follow. Route to the
+            // consuming state so they don't leak as ground keys. (An SGR event
+            // whose button we ignore, e.g. right-click, keeps its `<` params and
+            // is NOT mistaken for X10.)
+            if byte == b'M' && self.params.first() != Some(&b'<') {
+                return TurnKeyState::X10Mouse { remaining: 3 };
+            }
+        }
+        match byte {
+            b'A' => keys.push(TurnKey::Up),
+            b'B' => keys.push(TurnKey::Down),
+            _ => {}
+        }
+        TurnKeyState::Ground
+    }
+
+    /// #1303 FIX C: map an X10 mouse button byte (Cb = button + 32) to a nav
+    /// action, mirroring [`Self::mouse_key_for`]'s SGR button mapping. Wheel-up
+    /// = 64, wheel-down = 65, left-press = 0; other buttons / releases are
+    /// ignored. The coordinate bytes (Cx,Cy) are consumed by the caller and
+    /// never decoded.
+    #[cfg(feature = "live-spill")]
+    fn x10_button_key(cb: u8) -> Option<TurnKey> {
+        match cb.wrapping_sub(32) {
+            0 => Some(TurnKey::ToggleExpanded),
+            64 => Some(TurnKey::Up),
+            65 => Some(TurnKey::Down),
+            _ => None,
+        }
+    }
+
+    /// Decode an SGR-mouse event from the accumulated params + terminal byte:
+    /// `ESC [ < btn ; col ; row (M|m)`. Only the press form (`M`) reports —
+    /// wheels have no release and a click's release (`m`) is a deliberate no-op,
+    /// so one click = one toggle. Wheel-up = 64 → scroll toward older, wheel-down
+    /// = 65 → scroll toward newer, plain left-press = 0 → expand/collapse. A
+    /// bare left click toggles regardless of which frame row it lands on:
+    /// per-glyph hit-testing (the `⧉`/`▣`/`▲`/`▼` targets) needs the renderer's
+    /// screen geometry, a refinement seam left for a follow-up. Right/middle
+    /// buttons and drag/motion (button ≥ 32) are ignored.
+    #[cfg(feature = "live-spill")]
+    fn mouse_key_for(&self, final_byte: u8) -> Option<TurnKey> {
+        if final_byte != b'M' {
+            return None;
+        }
+        let params = std::str::from_utf8(&self.params).ok()?;
+        let btn = params
+            .strip_prefix('<')?
+            .split(';')
+            .next()?
+            .parse::<u32>()
+            .ok()?;
+        match btn {
+            0 => Some(TurnKey::ToggleExpanded),
+            64 => Some(TurnKey::Up),
+            65 => Some(TurnKey::Down),
+            _ => None,
+        }
+    }
+
+    /// A Ground-state byte (not part of an escape sequence). The base keys —
+    /// `Space`/`Enter` → expand — are ALWAYS active in every mode (the unchanged
+    /// live-spill contract); editor-mode nav is layered on top and additive.
+    fn push_ground_key(&mut self, byte: u8, keys: &mut Vec<TurnKey>) {
+        if matches!(byte, b' ' | b'\r' | b'\n') {
+            keys.push(TurnKey::ToggleExpanded);
+            #[cfg(feature = "live-spill")]
+            {
+                self.pending_g = false;
+            }
+        } else {
+            // Editor-mode nav (live-spill only); the lean build has none.
+            #[cfg(feature = "live-spill")]
+            self.push_mode_ground_key(byte, keys);
+        }
+    }
+
+    /// Editor-mode-aware viewport nav (#1303 clause 4). vi is implemented fully
+    /// (`j`/`k` line, `gg`/`G` top/bottom, `C-d`/`C-u` half-page); emacs gets
+    /// `C-n`/`C-p`/`C-v` (line + page-down). nano rides the universal arrows.
+    /// Modes' remaining bindings (emacs `M-v`/`M-<`/`M->`, nano `C-y`/`M-\`) are
+    /// a documented follow-on seam — the `↑`/`↓`/`Space` base always works.
+    #[cfg(feature = "live-spill")]
+    fn push_mode_ground_key(&mut self, byte: u8, keys: &mut Vec<TurnKey>) {
+        use newt_core::EditMode;
+        // #1303 FIX F: the mode-aware keys only fire with the mouse opt-in. When
+        // it's off (keyboard tier / opted-out), this is a no-op — `j`/`k`/`gg`…
+        // do nothing, exactly the 0.7.3 behavior — while the base keys
+        // (`↑`/`↓`/`Space`/`Enter`, handled in `push_ground_key` and the CSI/SS3
+        // arms) stay unconditional.
+        if !self.mode_nav {
+            return;
+        }
+        // `gg` (vi) is the only two-key sequence: a pending `g` consumes the
+        // next byte. `gg` → Top; anything else re-processes the byte normally.
+        if std::mem::take(&mut self.pending_g) && byte == b'g' {
+            keys.push(TurnKey::Top);
+            return;
+        }
+        match self.mode {
+            EditMode::Vi => match byte {
+                b'j' => keys.push(TurnKey::Down),
+                b'k' => keys.push(TurnKey::Up),
+                b'G' => keys.push(TurnKey::Bottom),
+                b'g' => self.pending_g = true,
+                0x04 => keys.push(TurnKey::HalfPageDown), // C-d
+                0x15 => keys.push(TurnKey::HalfPageUp),   // C-u
+                _ => {}
+            },
+            EditMode::Emacs => match byte {
+                0x0e => keys.push(TurnKey::Down),         // C-n
+                0x10 => keys.push(TurnKey::Up),           // C-p
+                0x16 => keys.push(TurnKey::HalfPageDown), // C-v (page down)
+                _ => {}
+            },
+            // nano is modeless/emacs-like; the universal arrows already cover it.
+            EditMode::Nano => {}
+        }
     }
 }
 
@@ -6585,7 +6926,228 @@ fn dispatch_turn_keys(decoder: &mut TurnKeyDecoder, bytes: &[u8], spill: Option<
             TurnKey::ToggleExpanded => {
                 spill.toggle_expanded();
             }
+            #[cfg(feature = "live-spill")]
+            TurnKey::Top => {
+                spill.scroll_to_top();
+            }
+            #[cfg(feature = "live-spill")]
+            TurnKey::Bottom => {
+                spill.scroll_to_bottom();
+            }
+            #[cfg(feature = "live-spill")]
+            TurnKey::HalfPageUp => {
+                spill.half_page_up();
+            }
+            #[cfg(feature = "live-spill")]
+            TurnKey::HalfPageDown => {
+                spill.half_page_down();
+            }
         }
+    }
+}
+
+// #1303 step 3/4/5: SGR-mouse + editor-mode keyboard decode is `live-spill`
+// mouse code — stripped from the wyvern build, so these tests are too.
+#[cfg(all(test, unix, feature = "live-spill"))]
+mod mouse_decode_tests {
+    use super::{TurnKey, TurnKeyDecoder};
+
+    #[test]
+    fn sgr_wheel_up_and_down_map_to_scroll_keys() {
+        let mut d = TurnKeyDecoder::default();
+        // SGR wheel up: ESC [ < 64 ; col ; row M
+        assert_eq!(d.feed(b"\x1b[<64;10;5M"), vec![TurnKey::Up]);
+        // SGR wheel down: button 65
+        assert_eq!(d.feed(b"\x1b[<65;10;5M"), vec![TurnKey::Down]);
+    }
+
+    #[test]
+    fn sgr_non_wheel_events_are_ignored_by_the_wheel_tier() {
+        let mut d = TurnKeyDecoder::default();
+        // A left-button RELEASE emits no key; a right/middle click is ignored.
+        assert_eq!(d.feed(b"\x1b[<0;3;3m"), vec![]);
+        assert_eq!(d.feed(b"\x1b[<2;3;3M"), vec![]);
+    }
+
+    #[test]
+    fn left_click_press_toggles_expand() {
+        let mut d = TurnKeyDecoder::default();
+        // SGR left-button PRESS toggles expand/collapse; the release is a no-op,
+        // so one click = one toggle.
+        assert_eq!(d.feed(b"\x1b[<0;3;3M"), vec![TurnKey::ToggleExpanded]);
+        assert_eq!(d.feed(b"\x1b[<0;3;3m"), vec![]);
+    }
+
+    #[test]
+    fn wheel_sequence_split_across_reads_still_decodes() {
+        let mut d = TurnKeyDecoder::default();
+        assert_eq!(d.feed(b"\x1b[<64;"), vec![]);
+        assert_eq!(d.feed(b"10;5M"), vec![TurnKey::Up]);
+    }
+
+    #[test]
+    fn arrow_and_space_still_decode_alongside_mouse_params() {
+        let mut d = TurnKeyDecoder::default();
+        assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up]);
+        assert_eq!(d.feed(b"\x1b[B"), vec![TurnKey::Down]);
+        assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded]);
+    }
+
+    #[test]
+    fn vi_mode_maps_jk_gg_g_and_halfpage() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert_eq!(d.feed(b"j"), vec![TurnKey::Down]);
+        assert_eq!(d.feed(b"k"), vec![TurnKey::Up]);
+        assert_eq!(d.feed(b"gg"), vec![TurnKey::Top]);
+        assert_eq!(d.feed(b"G"), vec![TurnKey::Bottom]);
+        assert_eq!(d.feed(b"\x04"), vec![TurnKey::HalfPageDown]); // C-d
+        assert_eq!(d.feed(b"\x15"), vec![TurnKey::HalfPageUp]); // C-u
+    }
+
+    #[test]
+    fn vi_single_g_waits_for_the_second_g() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert_eq!(d.feed(b"g"), vec![]); // pending, no key yet
+        assert_eq!(d.feed(b"g"), vec![TurnKey::Top]);
+    }
+
+    #[test]
+    fn emacs_mode_maps_ctrl_np_not_vi_letters() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Emacs);
+        assert_eq!(d.feed(b"\x0e"), vec![TurnKey::Down]); // C-n
+        assert_eq!(d.feed(b"\x10"), vec![TurnKey::Up]); // C-p
+                                                        // Bare j/k are vi motions, inert in emacs mode.
+        assert_eq!(d.feed(b"j"), vec![]);
+    }
+
+    #[test]
+    fn base_arrows_space_and_enter_work_in_every_mode() {
+        for mode in [
+            newt_core::EditMode::Vi,
+            newt_core::EditMode::Emacs,
+            newt_core::EditMode::Nano,
+        ] {
+            let label = format!("{mode:?}");
+            let mut d = TurnKeyDecoder::with_mode(mode);
+            assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up], "{label} up-arrow");
+            assert_eq!(d.feed(b"\x1b[B"), vec![TurnKey::Down], "{label} down-arrow");
+            assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded], "{label} space");
+            assert_eq!(
+                d.feed(b"\r"),
+                vec![TurnKey::ToggleExpanded],
+                "{label} enter"
+            );
+        }
+    }
+
+    // #1303 FIX F: the mode-aware nav keys activate ONLY with the mouse opt-in
+    // (`mode_nav`). A decoder built WITHOUT the opt-in must ignore vi `j`/`k`/`gg`
+    // exactly like 0.7.3, while the base keys stay unconditional.
+    #[test]
+    fn mode_nav_off_ignores_editor_keys_even_in_vi_mode() {
+        let mut d = TurnKeyDecoder {
+            mode: newt_core::EditMode::Vi,
+            mode_nav: false,
+            ..Default::default()
+        };
+        assert_eq!(d.feed(b"j"), vec![], "opt-in off: vi `j` does nothing");
+        assert_eq!(d.feed(b"k"), vec![], "opt-in off: vi `k` does nothing");
+        assert_eq!(d.feed(b"gg"), vec![], "opt-in off: `gg` does nothing");
+        assert_eq!(d.feed(b"\x04"), vec![], "opt-in off: C-d does nothing");
+        // Base keys remain unconditional.
+        assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded], "space");
+        assert_eq!(d.feed(b"\r"), vec![TurnKey::ToggleExpanded], "enter");
+        assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up], "up-arrow");
+        assert_eq!(d.feed(b"\x1b[B"), vec![TurnKey::Down], "down-arrow");
+    }
+
+    #[test]
+    fn mode_nav_on_activates_vi_scroll() {
+        // Opt-in ON (mouse tier): the same vi `j` now scrolls.
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert_eq!(d.feed(b"j"), vec![TurnKey::Down]);
+    }
+
+    // #1303 FIX D: the vi `gg` latch must not survive an intervening escape /
+    // CSI / SS3 / mouse event. A stray `g` then an arrow (or wheel) then a `g`
+    // must NOT mis-fire `Top`.
+    #[test]
+    fn pending_g_cleared_by_intervening_arrow() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert_eq!(d.feed(b"g"), vec![], "arms pending_g");
+        assert_eq!(
+            d.feed(b"\x1b[A"),
+            vec![TurnKey::Up],
+            "arrow clears the latch"
+        );
+        assert_eq!(d.feed(b"g"), vec![], "lone `g` again — pending, NOT Top");
+        assert_eq!(
+            d.feed(b"g"),
+            vec![TurnKey::Top],
+            "a real `gg` still fires Top"
+        );
+    }
+
+    #[test]
+    fn pending_g_cleared_by_intervening_mouse_wheel() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert_eq!(d.feed(b"g"), vec![]);
+        // The feature's headline interaction: a wheel scroll (SGR mouse).
+        assert_eq!(d.feed(b"\x1b[<64;10;5M"), vec![TurnKey::Up]);
+        assert_eq!(d.feed(b"g"), vec![], "wheel cleared the latch — no misfire");
+    }
+
+    // #1303 FIX C: the legacy X10 mouse form (`ESC[M` + 3 raw bytes) must be
+    // recognized and its 3 bytes CONSUMED, never leaked as ground keys.
+    #[test]
+    fn x10_mouse_left_press_consumes_three_bytes() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        // Cb=0x20 (button 0 = left press) => ToggleExpanded; Cx=Cy=0x21 consumed.
+        assert_eq!(d.feed(b"\x1b[M\x20\x21\x21"), vec![TurnKey::ToggleExpanded]);
+        // Decoder is back in Ground: a plain space toggles as normal.
+        assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded]);
+    }
+
+    #[test]
+    fn x10_mouse_coordinate_bytes_never_leak_as_nav() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        // X10 wheel-up: Cb = 64 + 32 = 0x60. The coord bytes are `j` and `g` —
+        // which WOULD scroll / arm-`gg` if leaked. They must be swallowed.
+        assert_eq!(d.feed(b"\x1b[M\x60jg"), vec![TurnKey::Up]);
+        // No stray Down (from `j`) and no armed `gg`: a lone `g` now is pending,
+        // and only a second `g` fires Top.
+        assert_eq!(d.feed(b"g"), vec![]);
+        assert_eq!(d.feed(b"g"), vec![TurnKey::Top]);
+    }
+
+    #[test]
+    fn x10_mouse_bytes_split_across_reads_are_consumed() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert_eq!(d.feed(b"\x1b[M"), vec![], "header only");
+        assert_eq!(d.feed(b"\x20"), vec![TurnKey::ToggleExpanded], "Cb (btn 0)");
+        assert_eq!(d.feed(b"j"), vec![], "Cx consumed, not a Down");
+        assert_eq!(d.feed(b"j"), vec![], "Cy consumed — sequence complete");
+        // Back in Ground: base space still toggles.
+        assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded]);
+    }
+
+    // #1303 FIX E: the CSI params accumulator is length-capped so a
+    // non-terminating CSI stream can't grow it without bound; the decoder
+    // resyncs to Ground and a following well-formed sequence still decodes.
+    #[test]
+    fn csi_params_are_length_capped_and_resync() {
+        let mut d = TurnKeyDecoder::default();
+        d.feed(b"\x1b[");
+        for _ in 0..1000 {
+            d.feed(b";");
+        }
+        assert!(
+            d.params.len() <= super::MAX_CSI_PARAM_BYTES,
+            "params bounded at the cap, was {}",
+            d.params.len()
+        );
+        // After the overflow resync, a fresh arrow decodes normally.
+        assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up]);
     }
 }
 
@@ -6608,11 +7170,21 @@ mod interrupt_tests {
     }
 
     #[test]
-    fn ctrl_c_is_a_lone_etx_byte() {
+    fn ctrl_c_detected_anywhere_in_the_read() {
         assert!(is_ctrl_c(&[0x03]), "a bare Ctrl-C press interrupts");
+        // #1303 FIX A: a `0x03` coalesced with other bytes in ONE read must
+        // still interrupt — the old exact-match dropped these.
         assert!(
-            !is_ctrl_c(&[0x03, b'x']),
-            "Ctrl-C + typed-ahead is not lone"
+            is_ctrl_c(&[0x03, b'x']),
+            "Ctrl-C coalesced with typed-ahead still interrupts"
+        );
+        assert!(
+            is_ctrl_c(b"\x1b[<35;120;40M\x03"),
+            "Ctrl-C coalesced after a mouse-motion event still interrupts"
+        );
+        assert!(
+            is_ctrl_c(&[b'a', b'b', 0x03]),
+            "a trailing Ctrl-C interrupts"
         );
         assert!(!is_ctrl_c(&[0x1b]), "Esc is not Ctrl-C");
         assert!(!is_ctrl_c(b"c"), "the letter c is not Ctrl-C");
@@ -6663,6 +7235,22 @@ mod interrupt_tests {
             fn refresh_geometry(&self) -> bool {
                 true
             }
+            #[cfg(feature = "live-spill")]
+            fn scroll_to_top(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn scroll_to_bottom(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn half_page_up(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn half_page_down(&self) -> bool {
+                true
+            }
         }
 
         let mut pipe = [0; 2];
@@ -6673,7 +7261,17 @@ mod interrupt_tests {
         let spill = RecordingSpill::default();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                watch_for_interrupt_fd(pipe[0], &cancel, &hard, &stop, Some(&spill), 10, 100);
+                watch_for_interrupt_fd(
+                    pipe[0],
+                    &cancel,
+                    &hard,
+                    &stop,
+                    Some(&spill),
+                    newt_core::EditMode::Nano,
+                    false, // mode_nav: base keys (arrow + space) only
+                    10,
+                    100,
+                );
             });
             let write = |bytes: &[u8]| {
                 assert_eq!(
@@ -6718,6 +7316,7 @@ pub(crate) fn with_live_spill_watch<T>(
     enabled: bool,
     cancel: &std::sync::atomic::AtomicBool,
     hard: &std::sync::atomic::AtomicBool,
+    mouse: bool,
     spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
 ) -> T {
@@ -6728,9 +7327,32 @@ pub(crate) fn with_live_spill_watch<T>(
     let Ok(_cbreak) = CbreakGuard::enter() else {
         return f();
     };
+    // #1303: mouse capture is turn-scoped and released on EVERY exit path. The
+    // guard drops when this scope unwinds — normal return, `?`, or panic — and
+    // its `Drop` is a direct stdout write (NOT a renderer write), so the rule-7
+    // abandon path (contractually I/O-free through the renderer) still releases.
+    // `None` on the keyboard tier / opt-out; nothing is emitted then.
+    #[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+    let _mouse_capture = crate::mouse::MouseCaptureGuard::maybe(mouse);
+    #[cfg(not(any(feature = "rich-tui", feature = "live-spill")))]
+    let _ = mouse;
+    // #1303 step 5 + FIX F: the editor-mode nav keys only activate WITH the
+    // mouse opt-in — the decision leaves the keyboard tier unchanged for
+    // operators who don't opt in. So resolve the keybinding (a disk read, in
+    // production only) ONLY when `mouse` is on, and pass `mouse` as the decoder's
+    // `mode_nav` gate. When off, `mode` is unused (nav disabled) and the base
+    // keys still work. Unit tests drive the watcher with an explicit mode.
+    #[cfg(feature = "live-spill")]
+    let mode = if mouse && spill.is_some() {
+        resolve_edit_mode()
+    } else {
+        newt_core::EditMode::default()
+    };
+    #[cfg(not(feature = "live-spill"))]
+    let mode = newt_core::EditMode::default();
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
-        s.spawn(|| watch_for_interrupt(cancel, hard, &stop, spill));
+        s.spawn(|| watch_for_interrupt(cancel, hard, &stop, spill, mode, mouse));
         let out = f();
         // Tell the watcher to exit; it polls with a 100 ms timeout, so it wakes
         // and returns promptly, and the scope joins it before restoring the tty.
@@ -6744,6 +7366,7 @@ pub(crate) fn with_live_spill_watch<T>(
     _enabled: bool,
     _cancel: &std::sync::atomic::AtomicBool,
     _hard: &std::sync::atomic::AtomicBool,
+    _mouse: bool,
     _spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
 ) -> T {
@@ -6757,7 +7380,8 @@ pub(crate) fn with_interrupt_watch<T>(
     hard: &std::sync::atomic::AtomicBool,
     f: impl FnOnce() -> T,
 ) -> T {
-    with_live_spill_watch(enabled, cancel, hard, None, f)
+    // No live spill viewport ⇒ no mouse tier.
+    with_live_spill_watch(enabled, cancel, hard, false, None, f)
 }
 
 /// Poll stdin while the turn runs; trip `cancel` on the first interrupt (a lone
@@ -6770,8 +7394,20 @@ fn watch_for_interrupt(
     hard: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
     spill: Option<&dyn SpillInput>,
+    mode: newt_core::EditMode,
+    mode_nav: bool,
 ) {
-    watch_for_interrupt_fd(libc::STDIN_FILENO, cancel, hard, stop, spill, 100, 200);
+    watch_for_interrupt_fd(
+        libc::STDIN_FILENO,
+        cancel,
+        hard,
+        stop,
+        spill,
+        mode,
+        mode_nav,
+        100,
+        200,
+    );
 }
 
 #[cfg(unix)]
@@ -6782,6 +7418,8 @@ fn watch_for_interrupt_fd(
     hard: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
     spill: Option<&dyn SpillInput>,
+    mode: newt_core::EditMode,
+    mode_nav: bool,
     poll_timeout_ms: libc::c_int,
     escape_grace_ms: libc::c_int,
 ) {
@@ -6789,7 +7427,22 @@ fn watch_for_interrupt_fd(
     use std::time::Duration;
     let mut buf = [0u8; 64];
     let mut presses = 0u32;
-    let mut decoder = TurnKeyDecoder::default();
+    // #1303 step 5 + FIX F: bind the decoder to the session's editor keybinding,
+    // but activate the mode-aware nav keys ONLY when `mode_nav` (the mouse
+    // opt-in) is on — the base keys (`↑`/`↓`/`Space`/`Enter`) work either way.
+    // The lean build has no nav modes.
+    #[cfg(feature = "live-spill")]
+    let mut decoder = if mode_nav {
+        TurnKeyDecoder::with_mode(mode)
+    } else {
+        TurnKeyDecoder::default()
+    };
+    #[cfg(not(feature = "live-spill"))]
+    let mut decoder = {
+        let _ = mode;
+        let _ = mode_nav;
+        TurnKeyDecoder::default()
+    };
     while !stop.load(Ordering::Relaxed) {
         if let Some(spill) = spill {
             spill.refresh_geometry();

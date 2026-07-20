@@ -1486,6 +1486,14 @@ pub struct TuiConfig {
     #[serde(default)]
     pub no_splash: bool,
 
+    /// Opt into the mouse-driven spill-viewport tier (#1303): wheel/click scroll
+    /// and editor-mode-aware keys on the live-spill viewport. Default **off**; it
+    /// only ever activates on top of `live_spill_capable()` on an interactive
+    /// stdin+stdout TTY (a strict superset gate), and the mouse code is
+    /// compile-time-stripped from the lean/wyvern build.
+    #[serde(default)]
+    pub mouse_viewport: bool,
+
     /// Key binding mode for the chat input line.
     /// `"emacs"` (default), `"vi"`, or `"nano"`. Also overridable via
     /// `NEWT_EDIT_MODE`. (`nano` is emacs-style/modeless — it differs from
@@ -3013,6 +3021,7 @@ impl Default for TuiConfig {
             chat_style: ChatStyle::Compact,
             prompt: None,
             no_splash: false,
+            mouse_viewport: false,
             edit_mode: EditMode::Nano,
             gutter: None,
             footer: FooterMode::Auto,

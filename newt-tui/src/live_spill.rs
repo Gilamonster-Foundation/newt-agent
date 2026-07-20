@@ -170,6 +170,32 @@ impl LiveSpillRenderer {
         self.scroll(SpillView::toggle_expanded)
     }
 
+    // #1303 step 5: editor-mode nav (vi `gg`/`G`/`C-d`/`C-u`, emacs paging),
+    // each riding the same single-owner `scroll` write discipline. Reached ONLY
+    // through the `#[cfg(unix)]` keyboard-watcher `SpillInput` impl (no test
+    // calls them directly, unlike scroll_up/scroll_down/toggle_expanded) — so
+    // gate them `unix`, not `any(unix, test)`, or the Windows `test` build
+    // compiles them with their sole (unix-only) caller absent → dead_code.
+    #[cfg(unix)]
+    pub(crate) fn scroll_to_top(&self) -> bool {
+        self.scroll(SpillView::scroll_to_top)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn scroll_to_bottom(&self) -> bool {
+        self.scroll(SpillView::scroll_to_bottom)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn half_page_up(&self) -> bool {
+        self.scroll(SpillView::half_page_up)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn half_page_down(&self) -> bool {
+        self.scroll(SpillView::half_page_down)
+    }
+
     // Only reached through the unix-only keyboard watcher (`SpillInput::refresh_geometry`
     // in lib.rs); no test calls this directly, unlike scroll_up/scroll_down/toggle_expanded.
     #[cfg(unix)]
@@ -343,6 +369,15 @@ impl LiveToolOutput for LiveSpillRenderer {
         }
         let _ = sync_geometry(&mut state);
         let columns = state.columns;
+        // #1303 step 6 (DEFERRED — clean seam): the post-completion overlay
+        // attaches HERE. Instead of dropping the finished `SpillView`, a
+        // retain-overlay would move it (or its `lines` + `dropped_lines`) into a
+        // generation-keyed slot on `RenderState`, beside `view`, reusing
+        // `frame()`/`fixed_frame_lines` for a bounded reopenable viewer anchored
+        // at the cursor (decision clause 3, grounding §4). The committed block is
+        // still re-rendered from the authoritative envelope (`display.rs`), never
+        // the live buffer; an abandoned generation is NOT retainable. Kept out of
+        // v1 to preserve the single-owner hand-off below unchanged.
         state.view = None;
         state.generation = None;
         drop(state);
@@ -740,6 +775,10 @@ mod tests {
             match (body, final_byte) {
                 ("?7", 'l') => self.wrap = false,
                 ("?7", 'h') => self.wrap = true,
+                // #1303 (§8.4): mouse-mode private sequences (set/reset) alter
+                // input reporting, not the visible grid — no-op them so a frame
+                // captured while mouse capture toggles doesn't panic.
+                ("?1000" | "?1002" | "?1003" | "?1006" | "?1015", 'h' | 'l') => {}
                 (_, 'A') => self.cursor_row = self.cursor_row.saturating_sub(amount),
                 (_, 'G') => self.cursor_col = amount.saturating_sub(1),
                 ("2", 'K') => {
@@ -886,6 +925,8 @@ mod tests {
                     &hard,
                     &stop,
                     Some(renderer.as_ref()),
+                    newt_core::EditMode::Nano,
+                    false, // mode_nav: base keys only
                     10,
                     100,
                 );
@@ -1054,6 +1095,77 @@ mod tests {
             !next_frame.contains("\u{1b}[5A") && !next_frame.contains("\u{1b}[J"),
             "a new generation must not erase an abandoned frame from the new cursor: {next_frame:?}"
         );
+    }
+
+    // #1303 acceptance 2 (clause B / rule 7): the abandon/teardown-miss path
+    // releases mouse capture with NO renderer I/O. Because `abandon` emits
+    // nothing through the renderer, the release is asserted on the GUARD's own
+    // Drop side-effect handle — a sink independent of the renderer writer.
+    // Mouse is a unix-only tier (`mod mouse` is `#[cfg(all(unix, …))]`), so this
+    // proof only compiles/runs there.
+    #[cfg(unix)]
+    #[test]
+    fn rule7_abandon_releases_mouse_capture_without_renderer_io() {
+        use crate::mouse::{MouseCaptureGuard, MouseSink};
+        use std::sync::{Arc, Mutex};
+
+        let renderer_writer = SharedWriter::default();
+        let renderer = LiveSpillRenderer::with_writer(renderer_writer.clone(), 80, 3, false);
+        let mouse_sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let released =
+            || String::from_utf8_lossy(&mouse_sink.lock().unwrap()).contains("\u{1b}[?1006l");
+
+        renderer.start(1);
+        renderer.write(1, ToolOutputStream::Stdout, b"stalled frame\n");
+        let before_abandon = renderer_writer.0.lock().unwrap().len();
+
+        {
+            // Capture is live for the turn.
+            let _capture = MouseCaptureGuard::enable(MouseSink::Shared(mouse_sink.clone()));
+            assert!(
+                String::from_utf8_lossy(&mouse_sink.lock().unwrap()).contains("\u{1b}[?1006h"),
+                "capture enabled on the mouse tier"
+            );
+
+            // The rule-7 teardown-miss: atomic, I/O-free abandon then a delayed
+            // finish. Neither may touch the renderer writer...
+            renderer.abandon(1);
+            renderer.finish(1);
+            assert_eq!(
+                renderer_writer.0.lock().unwrap().len(),
+                before_abandon,
+                "abandon + delayed finish performed renderer I/O"
+            );
+            // ...and capture stays held until the turn scope unwinds.
+            assert!(!released(), "capture must stay held inside the turn scope");
+        }
+
+        // Scope exit dropped the guard → capture released via the guard's OWN
+        // handle, with the renderer writer still untouched.
+        assert!(
+            released(),
+            "mouse capture released on the abandon/teardown path"
+        );
+        assert_eq!(
+            renderer_writer.0.lock().unwrap().len(),
+            before_abandon,
+            "release must not have ridden the renderer writer"
+        );
+    }
+
+    // #1303 (§8.4): the hand-rolled CSI interpreter must tolerate mouse-capture
+    // enable/disable sequences so a golden/frame test never panics on them.
+    #[test]
+    fn screen_model_tolerates_mouse_capture_sequences() {
+        let mut screen = ScreenModel::new(20);
+        screen.apply(b"hi");
+        let mut enable = Vec::new();
+        let _ = crossterm::queue!(enable, crossterm::event::EnableMouseCapture);
+        let mut disable = Vec::new();
+        let _ = crossterm::queue!(disable, crossterm::event::DisableMouseCapture);
+        screen.apply(&enable);
+        screen.apply(&disable);
+        assert_eq!(screen.nonempty_rows(), vec!["hi".to_string()]);
     }
 
     #[test]
