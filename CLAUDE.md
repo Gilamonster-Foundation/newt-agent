@@ -190,6 +190,22 @@ behavior; reserve expensive tiers for what only they can catch.
   with `Permission denied (os error 13)` on tempdir creation, aborting the
   whole test binary. Never run them multi-threaded.
 
+**Why the expensive tier exists at all: it grounds the mocks.** A fully
+mocked suite can be green against a fiction — a mock encodes what we
+*believe* the real filesystem, terminal, or subprocess does, and nothing in
+the unit tier can tell you that belief is wrong. Real-resource tests are the
+**ground truth that verifies the mocks test something real**. The two tiers
+are therefore not in tension, and a real-resource test is **not** a deviation
+from "fully mocked": *mocked stays the gate — fast, deterministic, every PR —
+and a real-resource test is an add-on that proves the gate is measuring
+reality.* When you add one, record in its doc comment which mocked behavior
+it grounds. A real test that grounds nothing is just a slow test.
+
+Worked example: `prompt_visibility_test` drives a real PTY, because "the
+prompt is visible" is a property of an actual terminal — no mock can observe
+one writer scribbling over another's bytes. It grounds the line arbiter's
+mocked lease/suspend unit tests.
+
 Migration of the existing real-fs (`tempfile`) tests out of the unit tier
 is tracked in issue #514.
 

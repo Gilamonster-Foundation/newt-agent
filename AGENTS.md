@@ -88,6 +88,15 @@ assumptions. Beliefs are not ground truth; tool results are.
 
 **Never commit if any of the above are uncertain.**
 
+**The same doctrine applies to tests.** A mocked test is a *belief* — it
+encodes what we think the real filesystem, terminal, or subprocess does, and
+nothing in the mocked tier can tell you that belief is wrong. A real-resource
+test (PTY, real subprocess, real fs) is the **ground truth that verifies it**.
+Mocked stays the gate — fast, deterministic, every PR — and a real-resource
+test is an **add-on that proves the gate measures reality**, not a deviation
+from "fully mocked". When you add one, record in its doc comment which mocked
+behavior it grounds; a real test that grounds nothing is just a slow test.
+
 ## File editing rules
 
 - **Prefer `edit_file` over `write_file`** for any existing file.
