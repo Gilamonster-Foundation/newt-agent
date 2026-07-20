@@ -6,7 +6,12 @@
 //! integration tier: env vars are uniquely named per test and cleaned up.
 
 use newt_core::agent_identity::SecretRef;
-use newt_core::mcp::{interpolate, resolve_secret_under_trust, McpTrust, SecretValue};
+use newt_core::mcp::{interpolate, SecretValue};
+// `resolve_secret_under_trust` + `McpTrust` are exercised only by the
+// `#[cfg(unix)]` cmd-trust test below; gate the import so Windows (where that
+// test is absent) doesn't see them as unused under `-D warnings`.
+#[cfg(unix)]
+use newt_core::mcp::{resolve_secret_under_trust, McpTrust};
 
 #[test]
 fn literal_without_tokens_resolves_verbatim() {
