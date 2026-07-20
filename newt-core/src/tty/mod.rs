@@ -83,8 +83,8 @@ pub fn term_cols() -> usize {
 /// and the last couple of visible cells are split off into `fade` so the caller
 /// can render them dimmer (the soft fade-out). When it already fits, `fade` and
 /// `ellipsis` are empty and `head` is the whole string. Width is counted in
-/// `char`s — good enough for the braille spinner + ASCII status text these
-/// lines carry; no CJK in this path.
+/// **display columns** via [`width::str_width`], so a CJK or emoji label is cut
+/// where the terminal actually runs out of cells.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FittedLine {
     pub head: String,
@@ -94,8 +94,7 @@ pub struct FittedLine {
 
 /// Fit `s` into `max_cols` columns (see [`FittedLine`]).
 pub fn fit_line(s: &str, max_cols: usize) -> FittedLine {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_cols {
+    if str_width(s) <= max_cols {
         return FittedLine {
             head: s.to_string(),
             fade: String::new(),
@@ -104,7 +103,21 @@ pub fn fit_line(s: &str, max_cols: usize) -> FittedLine {
     }
     // Reserve one column for the ellipsis; keep at least one visible char.
     let budget = max_cols.saturating_sub(1).max(1);
-    let kept = &chars[..budget];
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let cw = ch_width(c);
+        if used + cw > budget {
+            break;
+        }
+        used += cw;
+        kept.push(c);
+    }
+    // A single glyph wider than the whole budget still shows: an empty row is
+    // worse than one over-wide cell, and this row is erased in place anyway.
+    if kept.is_empty() {
+        kept.extend(s.chars().next());
+    }
     let fade_n = 2.min(kept.len());
     let split = kept.len() - fade_n;
     FittedLine {
@@ -157,5 +170,51 @@ mod tests {
     #[test]
     fn term_cols_never_returns_a_degenerate_width() {
         assert!(term_cols() >= 8);
+    }
+
+    /// **A deliberate behavior change** (`docs/decisions/tty_widget_suite.md`
+    /// §5 row 2): `fit_line` used to count `char`s, and a `char` count is not a
+    /// column count. Every ASCII case above is unaffected — this is the case
+    /// that was silently wrong.
+    ///
+    /// `"日本語です"` is 5 `char`s but **10 columns**. Against a 6-column
+    /// budget the old implementation compared `5 <= 6`, declared it a fit, and
+    /// returned the whole string with no ellipsis — so the spinner painted a
+    /// 10-column line onto a 6-column row, which wraps and strands a row that
+    /// the single-line erase can never reach. That is the residue class the
+    /// arbiter exists to eliminate, reintroduced by the measurement.
+    ///
+    /// The row must now fit: visible width (head + fade + the one ellipsis
+    /// cell) never exceeds the budget.
+    #[test]
+    fn fit_line_measures_columns_so_a_cjk_label_is_actually_cut() {
+        use super::width::str_width;
+        let label = "日本語です";
+        assert_eq!(label.chars().count(), 5, "5 chars…");
+        assert_eq!(str_width(label), 10, "…but 10 columns");
+
+        let f = fit_line(label, 6);
+        assert_eq!(
+            f.ellipsis, "…",
+            "the old char-count result — the whole 10-column string, untruncated \
+             — was wrong: it overflows a 6-column row"
+        );
+        assert_eq!(f.head, "");
+        assert_eq!(f.fade, "日本");
+        assert!(
+            str_width(&f.head) + str_width(&f.fade) + str_width(f.ellipsis) <= 6,
+            "the fitted row must not exceed its budget"
+        );
+    }
+
+    /// The degenerate case the column measurement introduces and the `char`
+    /// count could not: one glyph that is wider than the entire budget. It is
+    /// still shown rather than yielding a blank row.
+    #[test]
+    fn fit_line_keeps_a_glyph_wider_than_the_whole_budget() {
+        let f = fit_line("日本", 1);
+        assert_eq!(f.head, "");
+        assert_eq!(f.fade, "日");
+        assert_eq!(f.ellipsis, "…");
     }
 }
