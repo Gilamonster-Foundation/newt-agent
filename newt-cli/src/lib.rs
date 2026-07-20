@@ -1137,6 +1137,13 @@ async fn run_worker(
     operator_key_path: Option<PathBuf>,
     allow_no_key: bool,
 ) -> anyhow::Result<()> {
+    // fd 1 is the ACP JSON-RPC wire from here on. Declare it BEFORE any other
+    // work so no ephemeral writer can ever paint a frame into a protocol
+    // stream. Deliberately unconditional on platform: the `dup2` guard below is
+    // `#[cfg(unix)]` and its non-unix arm returns `ErrorKind::Unsupported`, so
+    // on Windows this flag is the ONLY thing protecting the wire.
+    newt_core::tty::enter_protocol_mode();
+
     if coder {
         // SAFETY: single-threaded section before tokio takes over —
         // set_var is safe here because no other thread reads/writes
@@ -1269,6 +1276,10 @@ fn print_mcp_help() -> anyhow::Result<()> {
 }
 
 async fn run_mcp(persona: Option<&str>) -> anyhow::Result<()> {
+    // fd 1 is the MCP JSON-RPC wire from here on — see the note in
+    // `run_worker`. Unconditional on platform, and irreversible.
+    newt_core::tty::enter_protocol_mode();
+
     #[cfg(unix)]
     {
         match stdio_guard::redirect_stdout_to_stderr() {

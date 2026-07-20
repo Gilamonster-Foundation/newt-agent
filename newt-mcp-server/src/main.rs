@@ -9,6 +9,12 @@ async fn main() -> Result<()> {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    // Declare fd 1 a protocol channel before anything else can paint on it.
+    // Routing tracing to stderr (below) covers logging; this covers the OTHER
+    // family of stdout writers — spinners and progress readouts — which no
+    // subscriber configuration can reach. Unconditional on platform.
+    newt_core::tty::enter_protocol_mode();
+
     // Route ALL tracing output to stderr. This binary uses stdout as
     // the JSON-RPC wire — any tracing or logging on stdout would
     // corrupt the protocol. Defaulting the subscriber to stderr is
