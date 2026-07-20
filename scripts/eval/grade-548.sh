@@ -6,10 +6,10 @@
 # progressive-disclosure detail page. In the baseline, `/dgx help` ALREADY
 # expands the subcommands — the missing piece is the top-level rollup.
 #
-# This is a BEHAVIORAL check (not `just check`): it drives a built `newt` in
-# lean/pipe mode and inspects the actual help output. A plausible-but-unwired
-# implementation (e.g. an orphan module never hooked into help_lines) FAILS here
-# even though it compiles + passes the unit tests.
+# This is a BEHAVIORAL check (not `just check`): it inspects the ACTUAL help
+# output of a built `newt`. A plausible-but-unwired implementation (e.g. an
+# orphan module never hooked into help_lines) FAILS here even though it compiles
+# + passes the unit tests.
 #
 #   PASS  ⇔  top-level /help shows a /dgx SUMMARY line   (rolled up)
 #            AND lists no /dgx subcommand detail lines   (rolled up)
@@ -17,9 +17,13 @@
 #
 # Usage:  grade-548.sh <path-to-newt-binary>
 #
-# Note: `newt` connects to the session backend on startup (the help text itself
-# is backend-independent), so a reachable session backend is required for it to
-# print help. Output: one JSON result line on stdout; human-readable on stderr.
+# Note: the help text is backend-independent, and as of the help-render-decouple
+# change it is rendered by the STARTUP-FREE `newt help [command]` subcommand —
+# no session, no backend connect, no splash/wizard. That is what lets this
+# grader run on a hosted CI runner rather than a self-hosted box with a live
+# Ollama. `newt help` is the exact byte-source of the interactive `/help`, and
+# `newt help dgx` of `/dgx help` (both route through `newt_tui::render_help`).
+# Output: one JSON result line on stdout; human-readable on stderr.
 #
 # ---------------------------------------------------------------------------
 # MECHANISM vs POLICY
@@ -34,7 +38,6 @@
 # instrument that reports success is worthless until you have watched it report
 # failure. The self-test is therefore part of the grader, not an optional extra.
 # ---------------------------------------------------------------------------
-
 set -uo pipefail
 
 SUBS='status|models|ps|warm|pull|rm|route|doctor'
@@ -107,7 +110,8 @@ fi
 
 NEWT="${1:?usage: grade-548.sh <newt-binary>}"
 
-# Drive newt non-interactively: feed a slash command, then /exit.
-drive() { printf '%s\n/exit\n' "$1" | "$NEWT" --plain --ephemeral 2>/dev/null; }
+# Render help startup-free: `newt help` == interactive `/help`,
+# `newt help <cmd>` == interactive `/<cmd> --help`. No backend required.
+drive() { "$NEWT" help ${1:+"$1"} 2>/dev/null; }
 
-score_548 "$(drive '/help')" "$(drive '/dgx help')"
+score_548 "$(drive)" "$(drive dgx)"
