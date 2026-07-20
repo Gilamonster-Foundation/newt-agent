@@ -1,0 +1,13 @@
+{
+  "name": "2026-07-20-ornith-crew-hard",
+  "created": "2026-07-20T20:43:34Z",
+  "git_sha": "35a2536",
+  "tasks": "008-extract-helper,010-decompose-god-function,011-state-machine-drain,013-generic-bounds,014-multi-file-extract",
+  "modes": "crew",
+  "models": "sakamakismile/Ornith-1.0-35B-NVFP4",
+  "trials": 5,
+  "max_leaves": 6,
+  "timeout": 1200,
+  "keep": "fail",
+  "config_template": "~/.newt/eval-sweeps/template.toml"
+}
