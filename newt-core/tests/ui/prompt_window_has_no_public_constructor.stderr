@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `new` found for struct `PromptWindow` in the current scope
+ --> tests/ui/prompt_window_has_no_public_constructor.rs:5:44
+  |
+5 |     let _w = newt_core::tty::PromptWindow::new();
+  |                                            ^^^ associated function or constant not found in `PromptWindow`

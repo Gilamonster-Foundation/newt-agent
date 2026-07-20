@@ -58,6 +58,15 @@ async fn spawn_and_assert_pure(bin: &PathBuf, args: &[&str]) {
         // Crank up tracing on purpose — we want to PROVE that tracing
         // output stays on stderr even when the dep tree is chatty.
         .env("RUST_LOG", "debug")
+        // §6.2: turn the terminal-rendering knobs to their most hostile
+        // settings. `NEWT_COLOR=always` FORCES `color = true` even into a pipe
+        // — and `color` used to be the whole gate for two of the workspace's
+        // spinners, so this is exactly the configuration under which an
+        // ephemeral writer would have sprayed frames onto the JSON-RPC wire.
+        // With the arbiter, `color` decides styling only and
+        // `tty::enter_protocol_mode()` vetoes the line outright.
+        .env("NEWT_COLOR", "always")
+        .env("TERM", "dumb")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -82,6 +91,32 @@ async fn spawn_and_assert_pure(bin: &PathBuf, args: &[&str]) {
         .expect("collect worker output");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // §6.2 BYTE PURITY. Stronger than "every line parses as JSON": assert the
+    // two byte classes an ephemeral writer emits are absent outright.
+    //
+    // A JSON-RPC frame could in principle carry an escape or a braille glyph
+    // inside a string value, so a parse check alone would not catch a spinner
+    // that happened to land mid-frame. These do.
+    let esc = stdout.matches('\u{1b}').count();
+    assert_eq!(
+        esc,
+        0,
+        "stdout carries {esc} ANSI escape(s) — a protocol wire must be plain \
+         bytes ({} args={args:?})\n\nFull stdout:\n{stdout}",
+        bin.display(),
+    );
+    // The braille run the shared spinner frame set draws from (U+280B..U+280F).
+    let braille: Vec<char> = stdout
+        .chars()
+        .filter(|c| ('\u{280B}'..='\u{280F}').contains(c))
+        .collect();
+    assert!(
+        braille.is_empty(),
+        "stdout carries spinner glyph(s) {braille:?} — an ephemeral writer \
+         painted onto the JSON-RPC wire ({} args={args:?})\n\nFull stdout:\n{stdout}",
+        bin.display(),
+    );
 
     // Every non-empty line of stdout must be valid JSON.
     let mut saw_response = false;

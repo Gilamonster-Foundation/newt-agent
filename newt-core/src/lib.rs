@@ -61,6 +61,10 @@ pub mod symbols;
 pub mod templates;
 pub mod tokens;
 pub mod tooling;
+/// Terminal-line ownership: the process-wide arbiter every ephemeral writer
+/// (spinner, viewport, progress readout) leases the bottom line from, plus the
+/// shared frame set / width-fitting primitives they all draw through.
+pub mod tty;
 pub mod tuning;
 pub mod verify_gate;
 pub mod where_is;

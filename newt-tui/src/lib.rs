@@ -20,6 +20,12 @@ pub mod dgx_probe;
 mod live_spill;
 mod permissions;
 mod prompt;
+/// §6.5 — the PTY regression proof that a permission prompt stays VISIBLE when
+/// the harness blocks on a human. Its own file because it needs crate-private
+/// access to the production gate + prompt reader, and its own tier because it
+/// needs a real terminal to observe a terminal property. See the module docs.
+#[cfg(all(test, unix))]
+mod prompt_visibility_test;
 #[cfg(feature = "live-spill")]
 mod spill_view;
 // OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).
@@ -9051,7 +9057,7 @@ mod disable_ocap_session_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
-            ask_human: |_prompt: &str| PromptChoice::AllowOnce,
+            ask_human: |_w: &newt_core::tty::PromptWindow, _prompt: &str| PromptChoice::AllowOnce,
         };
 
         let out = execute_tool(
@@ -9098,7 +9104,7 @@ mod disable_ocap_session_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
-            ask_human: |_prompt: &str| PromptChoice::AllowOnce,
+            ask_human: |_w: &newt_core::tty::PromptWindow, _prompt: &str| PromptChoice::AllowOnce,
         };
         let out = execute_tool(
             "read_file",

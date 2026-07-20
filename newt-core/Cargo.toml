@@ -139,6 +139,11 @@ markdown-table-formatter = ["dep:markdown-table-formatter"]
 # Off by default to keep the binary lean.
 markdown-syntect = ["markdown", "dep:syntect"]
 pyo3 = ["dep:pyo3"]
+# Exposes `tty::PromptWindow::test_stub()` to DOWNSTREAM crates' tests. The
+# window is a sealed capability with no public constructor — that is the point —
+# so a crate whose prompt functions now require one needs a sanctioned inert
+# stand-in. Enable it in `[dev-dependencies]`, never in `[dependencies]`.
+test-util = []
 
 [dev-dependencies]
 tempfile = "3"
@@ -151,11 +156,22 @@ rusqlite.workspace = true
 # HTTP mocking for the agentic-loop tests that moved here with the loop
 # (Step 9.7) — same pattern as newt-inference / the old newt-tui suites.
 wiremock.workspace = true
-# #1301 trust-boundary integration tests (tests/mcp_project_trust.rs) drive the
-# real `Config::resolve()` walk-up, which reads process-global env + cwd; they
-# must never run concurrently with one another. Same version as newt-mesh /
-# newt-tui already pin, so it adds nothing new to the workspace build graph.
+# Two independent needs, one dependency:
+# - #1301 trust-boundary integration tests (tests/mcp_project_trust.rs) drive the
+#   real `Config::resolve()` walk-up, which reads process-global env + cwd; they
+#   must never run concurrently with one another.
+# - The `tty` arbiter is a PROCESS SINGLETON (one terminal line, one stdin), so
+#   its ownership/exclusion tests must not run concurrently either;
+#   `#[serial_test::serial(tty_arbiter)]` gates them onto one lane while the rest
+#   of newt-core's suite stays fully parallel.
+# Same version newt-mesh / newt-tui already pin, so it adds nothing new to the
+# workspace build graph.
 serial_test = "3"
+# §6.6(a): the compile-fail proof that `tty::PromptWindow` is unforgeable. The
+# design's primary guarantee is a TYPE-level one — "a hidden prompt does not
+# compile" — so it needs a test that asserts non-compilation, which only a UI
+# test harness can do.
+trybuild = "1"
 
 [lints]
 workspace = true

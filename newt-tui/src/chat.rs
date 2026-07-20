@@ -3164,7 +3164,8 @@ pub(crate) fn run_chat(
                             danger: production_danger_table(),
                             color,
                             verbose,
-                            ask_human: prompt_permission_choice as fn(&str) -> PromptChoice,
+                            ask_human: prompt_permission_choice
+                                as fn(&newt_core::tty::PromptWindow, &str) -> PromptChoice,
                         });
                     // Per-round observation hook (Phase 20,
                     // docs/design/model-self-tuning.md §2.2): evidence is

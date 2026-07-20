@@ -82,6 +82,12 @@ wiremock.workspace = true
 # test binary. `#[serial_test::serial(real_fs)]` gates them onto one lane while
 # the ~370 fs-free tests stay fully parallel. Mirrors newt-mesh's serial_test use.
 serial_test = "3"
+# NOTE: deliberately NOT `newt-core = { features = ["test-util"] }`. §6.10's
+# default-deny proof needs `tty::prompt_windows_constructed()`, which is
+# unconditionally public precisely so this dev-dependency is unnecessary:
+# cargo unifies features across a workspace build, so enabling `test-util` here
+# would expose `PromptWindow::test_stub` to every crate and break the
+# compile-fail seal test in newt-core.
 
 [lints]
 workspace = true
