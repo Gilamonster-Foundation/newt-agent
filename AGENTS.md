@@ -88,6 +88,15 @@ assumptions. Beliefs are not ground truth; tool results are.
 
 **Never commit if any of the above are uncertain.**
 
+**The same doctrine applies to tests.** A mocked test is a *belief* — it
+encodes what we think the real filesystem, terminal, or subprocess does, and
+nothing in the mocked tier can tell you that belief is wrong. A real-resource
+test (PTY, real subprocess, real fs) is the **ground truth that verifies it**.
+Mocked stays the gate — fast, deterministic, every PR — and a real-resource
+test is an **add-on that proves the gate measures reality**, not a deviation
+from "fully mocked". When you add one, record in its doc comment which mocked
+behavior it grounds; a real test that grounds nothing is just a slow test.
+
 ## File editing rules
 
 - **Prefer `edit_file` over `write_file`** for any existing file.
@@ -97,6 +106,32 @@ assumptions. Beliefs are not ground truth; tool results are.
   more than 30% of lines. This exists because of an observed failure
   where a model replaced a 4,247-line file with 107 lines.
 - After `write_file` or `edit_file`, read the returned line count.
+
+## Reuse discipline — search, adapt, minimize
+
+Before writing new code, in order:
+
+1. **Search for existing code.** Grep the workspace for the concept. Do
+   not add a second implementation of something that already exists.
+2. **TDD-adapt what exists.** Write the failing test for the new case
+   against the *existing* abstraction, then widen it — do not stand a
+   parallel one up beside it. (The cycle itself is below.)
+3. **Refactor to the fewest lines that still pass the tests.**
+   Fewest-lines is the success metric, not merely "it works".
+
+**Why:** sprawl breeds whack-a-mole bug classes. Measured here before the
+`newt_core::tty` line arbiter: 5 spinner implementations, 3 copies of one
+frame array, 4 erase strategies, `\r\x1b[K` at 6 sites across 2 crates, 3
+animation clocks, 4 different "may I draw?" predicates — which produced a
+real user-visible hang (a permission prompt drawn invisibly under a spinner
+that overwrote it ~8×/second). Tracked in #1312.
+
+**Prefer making a bug unrepresentable over fixing each site.** `gate.ask`
+has six call sites; one was safe only by call-ordering luck. Use types,
+RAII, and required parameters so the broken call does not compile.
+
+If a second implementation is truly warranted, say so in the PR and explain
+what the existing abstraction could not be widened to cover.
 
 ## TDD discipline
 
