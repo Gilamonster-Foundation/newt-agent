@@ -386,9 +386,11 @@ mod mocked {
         // when the folder is named differently.
         let root = PathBuf::from("/s");
         let fs = MemFs::new().skill(&root, "folder-name", skill_md("real-name", "R"));
-        assert!(load_body_from_in(&fs, std::slice::from_ref(&root), "real-name")
-            .unwrap()
-            .contains("Body of real-name."));
+        assert!(
+            load_body_from_in(&fs, std::slice::from_ref(&root), "real-name")
+                .unwrap()
+                .contains("Body of real-name.")
+        );
         // Asking for the folder name (a valid component, but not a declared
         // skill name) is a clean miss, not a match.
         assert!(matches!(
