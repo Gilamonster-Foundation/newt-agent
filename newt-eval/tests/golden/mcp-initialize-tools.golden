@@ -1,0 +1,216 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "capabilities": {
+      "tools": {}
+    },
+    "protocolVersion": "2024-11-05",
+    "serverInfo": {
+      "name": "newt-mcp-server",
+      "version": "<VER>"
+    }
+  }
+}
+{
+  "id": 2,
+  "jsonrpc": "2.0",
+  "result": {
+    "tools": [
+      {
+        "description": "Read a file's contents",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "File path to read",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "code_read"
+      },
+      {
+        "description": "Apply a unified diff patch to a file",
+        "inputSchema": {
+          "properties": {
+            "patch": {
+              "description": "Unified diff to apply",
+              "type": "string"
+            },
+            "path": {
+              "description": "File path to edit",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "patch"
+          ],
+          "type": "object"
+        },
+        "name": "code_edit"
+      },
+      {
+        "description": "Search files for a regex pattern",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "Root directory to search",
+              "type": "string"
+            },
+            "query": {
+              "description": "Regex pattern",
+              "type": "string"
+            }
+          },
+          "required": [
+            "query",
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "code_search"
+      },
+      {
+        "description": "Run a git operation via the embedded engine (grit-lib), gated by GitCaveats derived from the granted Caveats leash. ops: status | log | diff | add | commit | branch. Local-only; network ops (clone/fetch/push) are fail-closed. A write op (add/commit/branch) under a read-only grant is DENIED (isError). Returns structured JSON.",
+        "inputSchema": {
+          "properties": {
+            "limit": {
+              "description": "log: max commits (default 20)",
+              "type": "integer"
+            },
+            "message": {
+              "description": "commit: commit message",
+              "type": "string"
+            },
+            "name": {
+              "description": "branch: new branch name",
+              "type": "string"
+            },
+            "op": {
+              "enum": [
+                "status",
+                "log",
+                "diff",
+                "add",
+                "commit",
+                "branch"
+              ],
+              "type": "string"
+            },
+            "paths": {
+              "description": "add: repo-relative paths to stage",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "repo": {
+              "description": "Repository path (default: current directory)",
+              "type": "string"
+            },
+            "staged": {
+              "description": "diff: staged (index vs HEAD) instead of worktree (default false)",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "name": "git"
+      },
+      {
+        "description": "Run a tier-routed inference turn",
+        "inputSchema": {
+          "properties": {
+            "prompt": {
+              "description": "The prompt",
+              "type": "string"
+            },
+            "tier": {
+              "description": "Optional tier override",
+              "enum": [
+                "FAST",
+                "STANDARD",
+                "COMPLEX",
+                "REVIEW"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompt"
+          ],
+          "type": "object"
+        },
+        "name": "goal_run"
+      },
+      {
+        "description": "List directory contents (dirs first, then files, alphabetical). Returns name, kind, and size_bytes for each entry.",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "Directory path to list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "fs_list"
+      },
+      {
+        "description": "Run a shell command and capture stdout/stderr. Returns exit_code, stdout, stderr, timed_out. Max timeout 300s. CAVEATS-CONFINED: the command runs inside agent-bridle's brush shell under the granted Caveats leash (from ~/.newt/config.toml [caveats]); a command outside the granted exec/fs scope is DENIED (isError) rather than executed.",
+        "inputSchema": {
+          "properties": {
+            "cmd": {
+              "description": "Shell command to execute, confined in-process by the agent-bridle capability interceptor (exec + fs scopes)",
+              "type": "string"
+            },
+            "cwd": {
+              "description": "Working directory (default: current directory)",
+              "type": "string"
+            },
+            "timeout_secs": {
+              "description": "Timeout in seconds (default 30, max 300)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cmd"
+          ],
+          "type": "object"
+        },
+        "name": "shell_run"
+      },
+      {
+        "description": "Fetch an http(s) URL and return its main content as clean markdown. CAVEATS-CONFINED: reachable hosts are gated by the granted `net` scope (host allowlist + SSRF screen); an out-of-scope host is DENIED (isError) rather than fetched. Returns { url, final_url, status, title, markdown } — the markdown is untrusted page content.",
+        "inputSchema": {
+          "properties": {
+            "max_bytes": {
+              "description": "Optional cap on bytes downloaded (default 5 MiB, max 25 MiB)",
+              "type": "integer"
+            },
+            "url": {
+              "description": "The http(s) URL to fetch",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "type": "object"
+        },
+        "name": "web_fetch"
+      }
+    ]
+  }
+}
