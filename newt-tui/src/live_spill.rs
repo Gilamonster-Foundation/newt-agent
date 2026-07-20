@@ -171,23 +171,27 @@ impl LiveSpillRenderer {
     }
 
     // #1303 step 5: editor-mode nav (vi `gg`/`G`/`C-d`/`C-u`, emacs paging),
-    // each riding the same single-owner `scroll` write discipline.
-    #[cfg(any(unix, test))]
+    // each riding the same single-owner `scroll` write discipline. Reached ONLY
+    // through the `#[cfg(unix)]` keyboard-watcher `SpillInput` impl (no test
+    // calls them directly, unlike scroll_up/scroll_down/toggle_expanded) — so
+    // gate them `unix`, not `any(unix, test)`, or the Windows `test` build
+    // compiles them with their sole (unix-only) caller absent → dead_code.
+    #[cfg(unix)]
     pub(crate) fn scroll_to_top(&self) -> bool {
         self.scroll(SpillView::scroll_to_top)
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn scroll_to_bottom(&self) -> bool {
         self.scroll(SpillView::scroll_to_bottom)
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn half_page_up(&self) -> bool {
         self.scroll(SpillView::half_page_up)
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn half_page_down(&self) -> bool {
         self.scroll(SpillView::half_page_down)
     }
