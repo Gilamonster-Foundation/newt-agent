@@ -747,6 +747,39 @@ mod tests {
         assert!(msg.contains(", still over budget"), "{msg}");
     }
 
+    /// `docs/decisions/tty_widget_suite.md` §5 row 3: `Notice` must reproduce
+    /// this builder's bytes **exactly** before any call site is migrated onto
+    /// it. Every one of the three registers is a glyph + the two-space gutter +
+    /// text, so the widget's composition is the right shape and the migration
+    /// in step 5 is a deletion rather than a rewrite.
+    ///
+    /// Byte-for-byte, not "starts with" — the assertions above are the loose
+    /// ones this deliberately is not.
+    #[test]
+    fn notice_reproduces_the_compression_notice_bytes() {
+        use super::compression_notice_text;
+        use crate::agentic::compress::CompressAction;
+        use crate::tty::{Level, Notice};
+
+        let cases = [
+            (CompressAction::StaticFallback, Level::Loud, "⛔"),
+            (CompressAction::Summarized, Level::Ok, "✓"),
+            (CompressAction::Pruned, Level::Info, "⧉"),
+        ];
+        for (action, level, glyph) in cases {
+            let (msg, _) = compression_notice_text(action, 10_000, 6_000, "");
+            let body = msg
+                .strip_prefix(glyph)
+                .and_then(|r| r.strip_prefix("  "))
+                .unwrap_or_else(|| panic!("{action:?} is not `{glyph}` + two spaces: {msg:?}"));
+            assert_eq!(
+                Notice::new(level, glyph, body).gap(2).line(),
+                msg,
+                "Notice must reproduce {action:?}'s bytes exactly"
+            );
+        }
+    }
+
     /// Visual preview for UX review (run with `--ignored --nocapture`): the three
     /// compression-notice registers with their colors.
     #[test]
