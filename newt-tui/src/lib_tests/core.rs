@@ -692,6 +692,63 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
     assert!(!print_command_help("bogus", false, false));
 }
 
+/// ANTI-DRIFT: the startup-free `render_help` path (behind `newt help`) must
+/// emit bytes IDENTICAL to what the interactive REPL prints for `/help` and
+/// `/<cmd> --help`. Both surfaces route through `render_help`, so this pins the
+/// output against the single-source-of-truth corpora (`help_lines` /
+/// `command_help_page`) reconstructed the way the REPL printed them before the
+/// decouple: `print_newt` == `println!(newt_line(...))` (a `newt_line` + `\n`),
+/// then one corpus line per `\n`-terminated row. If `render_help` ever reshapes,
+/// drops, or reorders a line relative to the corpus, this fails — the exact
+/// plausible-but-unwired divergence a forked second help path would introduce.
+#[test]
+fn render_help_is_byte_identical_to_the_repl_help_corpus() {
+    for &(color, verbose) in &[(false, false), (true, false), (false, true), (true, true)] {
+        // Bare `/help` — the full command list.
+        let mut expected = newt_line("Available commands:", color, verbose);
+        expected.push('\n');
+        for line in help_lines() {
+            expected.push_str(line);
+            expected.push('\n');
+        }
+        assert_eq!(
+            render_help(None, color, verbose),
+            expected,
+            "render_help(None) drifted from the help_lines corpus (color={color}, verbose={verbose})"
+        );
+
+        // Per-command detail pages: a representative command, an alias that
+        // folds to a shared page, and the #548 `/dgx` target.
+        for cmd in ["dgx", "help", "exit", "quit", "emacs"] {
+            let page = command_help_page(cmd).expect("help page exists");
+            let mut want = newt_line(
+                &format!("/{} help", canonical_help_topic(cmd)),
+                color,
+                verbose,
+            );
+            want.push('\n');
+            for line in page.lines() {
+                want.push_str(line);
+                want.push('\n');
+            }
+            assert_eq!(
+                render_help(Some(cmd), color, verbose),
+                want,
+                "render_help(Some({cmd:?})) drifted from command_help_page"
+            );
+        }
+
+        // Unknown topic renders the one-line miss (never empty, never a panic).
+        let mut miss = newt_line(
+            "no help for '/bogus' — /help lists every command",
+            color,
+            verbose,
+        );
+        miss.push('\n');
+        assert_eq!(render_help(Some("bogus"), color, verbose), miss);
+    }
+}
+
 #[test]
 fn slash_version_returns_true() {
     assert!(dispatch_slash("/version", "/ws", false, false).unwrap());

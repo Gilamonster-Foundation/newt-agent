@@ -4,7 +4,7 @@
 
 use newt_core::agentic::print_newt;
 
-use crate::{help_lines, VERSION};
+use crate::{render_help, VERSION};
 
 /// Handle the lifecycle/info command family. `/exit`/`/quit` return `Ok(false)`
 /// to end the session; everything else returns `Ok(true)`.
@@ -18,12 +18,10 @@ pub(crate) fn dispatch(
     match cmd {
         "exit" | "quit" => return Ok(false),
 
-        "help" => {
-            print_newt("Available commands:", color, verbose);
-            for line in help_lines() {
-                println!("{line}");
-            }
-        }
+        // Bare `/help` — the full command list. Shares its byte-source
+        // (`render_help`) with the startup-free `newt help` CLI path, so the
+        // interactive and non-interactive surfaces cannot diverge.
+        "help" => print!("{}", render_help(None, color, verbose)),
 
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),
 
