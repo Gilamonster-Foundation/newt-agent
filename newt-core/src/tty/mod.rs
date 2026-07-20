@@ -39,6 +39,10 @@ use crossterm::style::Color as CtColor;
 pub mod arbiter;
 pub mod caps;
 pub mod frames;
+/// Real-resource (PTY) proof that a notice emitted from outside the lease
+/// damages nothing. Unix-only: it needs a real pty pair.
+#[cfg(all(test, unix))]
+mod pty_notice_test;
 pub mod spinner;
 pub mod widgets;
 pub mod width;

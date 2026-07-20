@@ -1426,9 +1426,15 @@ struct SummarizerOpts {
     /// When the primary model's attempts all fail, the summary is retried once
     /// on this model — a rung above the static marker. `None` = no fallback.
     fallback_model: Option<String>,
-    /// Whether to surface live retry/fallback notices (Step 24.7). On only in
-    /// interactive color sessions — off (default) for headless/captured streams.
+    /// Styling ONLY: may the live retry/fallback notices carry ANSI color?
+    /// Never a capability signal — `color` used to gate whether these notices
+    /// were emitted *at all*, which is exactly the styling-into-I/O-ownership
+    /// overload `LineCaps` exists to end (see `newt_core::tty::caps`).
     color: bool,
+    /// Whether this process may narrate onto the terminal at all (Step 24.7's
+    /// real question). `None` — the default — emits zero bytes, so a headless
+    /// or captured stream stays clean even under `NEWT_COLOR=always`.
+    caps: newt_core::tty::LineCaps,
 }
 
 impl Default for SummarizerOpts {
@@ -1440,14 +1446,20 @@ impl Default for SummarizerOpts {
             retries: 2,
             fallback_model: None,
             color: false,
+            caps: newt_core::tty::LineCaps::None,
         }
     }
 }
 
-/// Live summarizer-progress notices (Step 24.7, #559). The summarizer runs under
-/// the `compressing context…` spinner; clearing the spinner line (`\r\x1b[K`)
-/// before each notice lets it scroll into history while the spinner redraws
-/// cleanly below — so the operator *watches* a retry/fallback happen.
+/// Live summarizer-progress notices (Step 24.7, #559). The summarizer runs
+/// under the `compressing context…` spinner, so each notice has to scroll into
+/// history *without* destroying the row the spinner is redrawing.
+///
+/// These are the pure text builders; [`summarizer_notice`] wraps one in a
+/// `Notice` and the arbiter does the cooperating. Until this migration the
+/// wrapping was a local `summarizer_progress` that wrote `\r\x1b[K` straight to
+/// stdout with no lease — the race documented on
+/// `newt_core::tty::Terminal::emit_line`.
 fn retry_progress_msg(attempt: u32, total: u32) -> String {
     format!("↻ summarizer retrying (attempt {attempt}/{total})…")
 }
@@ -1457,16 +1469,12 @@ fn fallback_progress_msg(model: &str) -> String {
 fn failure_progress_msg(err: &anyhow::Error) -> String {
     format!("⚠ summarizer failed ({err}); using static compression marker…")
 }
-fn summarizer_progress(msg: &str, color: bool) {
-    use std::io::Write as _;
-    let mut out = std::io::stdout();
-    if color {
-        // Clear the spinner line, then an amber notice that scrolls into history.
-        let _ = write!(out, "\r\x1b[K\x1b[33m{msg}\x1b[0m\n");
-    } else {
-        let _ = write!(out, "\r\x1b[K{msg}\n");
-    }
-    let _ = out.flush();
+
+/// One summarizer notice, as a `Notice` value. The text already leads with its
+/// own sigil, so the glyph is empty and `line()` is the message verbatim —
+/// which is what keeps the builders above (and their tests) untouched.
+fn summarizer_notice(msg: String) -> newt_core::tty::Notice<'static> {
+    newt_core::tty::Notice::new(newt_core::tty::Level::Warn, "", msg)
 }
 
 /// One summary attempt: send, check status, parse the content.
@@ -1606,9 +1614,11 @@ async fn summarize_one_model(
         if attempt > 0 {
             // Step 24.7 (#559): surface the retry live (scrolls above the
             // `compressing context…` spinner) so the recovery is honest.
-            if opts.color {
-                summarizer_progress(&retry_progress_msg(attempt + 1, opts.retries + 1), true);
-            }
+            summarizer_notice(retry_progress_msg(attempt + 1, opts.retries + 1)).emit(
+                opts.caps,
+                newt_core::tty::Sink::Stdout,
+                opts.color,
+            );
             // Exponential backoff capped at ~4s: 250ms, 500ms, 1s, …
             let backoff = std::time::Duration::from_millis(250u64 << (attempt - 1).min(4));
             tokio::time::sleep(backoff).await;
@@ -1651,9 +1661,11 @@ fn make_loop_summarizer(
                     match opts.fallback_model.clone() {
                         Some(fb) if fb != model => {
                             // Step 24.7 (#559): announce the fallback live.
-                            if opts.color {
-                                summarizer_progress(&fallback_progress_msg(&fb), true);
-                            }
+                            summarizer_notice(fallback_progress_msg(&fb)).emit(
+                                opts.caps,
+                                newt_core::tty::Sink::Stdout,
+                                opts.color,
+                            );
                             summarize_one_model(&url, &fb, openai, &prompt, &opts, &api_key)
                                 .await
                                 .map_err(|fallback_err| {
@@ -1663,9 +1675,11 @@ fn make_loop_summarizer(
                                 })
                         }
                         _ => {
-                            if opts.color {
-                                summarizer_progress(&failure_progress_msg(&primary_err), true);
-                            }
+                            summarizer_notice(failure_progress_msg(&primary_err)).emit(
+                                opts.caps,
+                                newt_core::tty::Sink::Stdout,
+                                opts.color,
+                            );
                             Err(primary_err)
                         }
                     }
@@ -5847,6 +5861,9 @@ fn summarizer_opts(
         retries: sum_cfg.retries,
         fallback_model: sum_cfg.fallback_model.clone(),
         color,
+        // The live-notice decision is ownership, not styling: detect it once
+        // here rather than re-deriving it from `color` at three call sites.
+        caps: newt_core::tty::LineCaps::detect(),
     }
 }
 
