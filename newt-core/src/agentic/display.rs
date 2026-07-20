@@ -11,68 +11,13 @@ use crossterm::{
 };
 use std::io::{self, Write};
 
-/// The newt logo orange as a crossterm color (matches the TUI splash).
-pub const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
-    r: 220,
-    g: 60,
-    b: 20,
-};
-
-/// Dimmer-than-DarkGrey hue for the soft "fade" tail on a truncated status
-/// line — the last couple of cells before the `…` dissolve toward the
-/// background so the cut reads as "there's more here", not a hard chop.
-pub(crate) const FADE_CT: CtColor = CtColor::Rgb {
-    r: 90,
-    g: 90,
-    b: 90,
-};
-
-/// Current terminal width in columns. Falls back to 80 when stdout isn't a tty
-/// (headless/piped) — callers only truncate single ephemeral status lines, so a
-/// conservative default is harmless.
-pub(crate) fn term_cols() -> usize {
-    crossterm::terminal::size()
-        .map(|(c, _)| c as usize)
-        .unwrap_or(80)
-        .max(8)
-}
-
-/// A single status/spinner line fitted to the terminal width.
-///
-/// When the source overflows `max_cols` it is cut to fit with a trailing `…`,
-/// and the last couple of visible cells are split off into `fade` so the caller
-/// can render them dimmer (the soft fade-out). When it already fits, `fade` and
-/// `ellipsis` are empty and `head` is the whole string. Width is counted in
-/// `char`s — good enough for the braille spinner + ASCII status text these
-/// lines carry; no CJK in this path.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct FittedLine {
-    pub head: String,
-    pub fade: String,
-    pub ellipsis: &'static str,
-}
-
-/// Fit `s` into `max_cols` columns (see [`FittedLine`]).
-pub(crate) fn fit_line(s: &str, max_cols: usize) -> FittedLine {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_cols {
-        return FittedLine {
-            head: s.to_string(),
-            fade: String::new(),
-            ellipsis: "",
-        };
-    }
-    // Reserve one column for the ellipsis; keep at least one visible char.
-    let budget = max_cols.saturating_sub(1).max(1);
-    let kept = &chars[..budget];
-    let fade_n = 2.min(kept.len());
-    let split = kept.len() - fade_n;
-    FittedLine {
-        head: kept[..split].iter().collect(),
-        fade: kept[split..].iter().collect(),
-        ellipsis: "…",
-    }
-}
+// The terminal-line primitives (palette, width, single-line fitting) moved to
+// the public `newt_core::tty` module — `agentic::display` is private with a
+// curated re-export list, and *that privacy was the mechanical cause* of the
+// duplicate frame sets and open-coded erase escapes elsewhere in the workspace.
+// Re-exported here so every call site in `agentic` is unchanged.
+pub use crate::tty::NEWT_ORANGE_CT;
+pub(crate) use crate::tty::{fit_line, term_cols, FADE_CT};
 
 /// Word-wrap `s` into lines no wider than `width` columns (#1153): the tool-call
 /// display must show the FULL command/path so the operator can audit exactly
@@ -655,8 +600,9 @@ pub(crate) fn print_tool_output(output: &str, _tool_output_lines: usize, color: 
 
 #[cfg(test)]
 mod tests {
+    // NOTE: `fit_line`'s unit tests moved to `newt_core::tty` with the function.
     use super::{
-        fit_line, fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_view_lines,
+        fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_view_lines,
         tool_call_lines,
     };
 
@@ -760,40 +706,6 @@ mod tests {
         assert_eq!(super::wrap_to_width("cargo build", 40), vec!["cargo build"]);
         // Embedded newlines split into separate logical lines.
         assert_eq!(super::wrap_to_width("a\nb", 40), vec!["a", "b"]);
-    }
-
-    #[test]
-    fn fit_line_passes_through_when_it_fits() {
-        let f = fit_line("hello", 10);
-        assert_eq!(f.head, "hello");
-        assert_eq!(f.fade, "");
-        assert_eq!(f.ellipsis, "");
-        // Exact fit is not an overflow.
-        let exact = fit_line("hello", 5);
-        assert_eq!(exact.ellipsis, "");
-        assert_eq!(exact.head, "hello");
-    }
-
-    #[test]
-    fn fit_line_truncates_with_faded_tail_and_ellipsis() {
-        // 11 chars into 6 cols: 5 visible + "…"; last 2 visible cells fade.
-        let f = fit_line("abcdefghijk", 6);
-        assert_eq!(f.ellipsis, "…");
-        assert_eq!(f.head, "abc");
-        assert_eq!(f.fade, "de");
-        // Reassembled visible width (head + fade + the single ellipsis cell)
-        // never exceeds the budget.
-        assert!(f.head.chars().count() + f.fade.chars().count() < 6);
-    }
-
-    #[test]
-    fn fit_line_handles_tiny_budgets() {
-        // One column of room still yields a single visible char + ellipsis,
-        // never a panic or an empty line.
-        let f = fit_line("abcdef", 1);
-        assert_eq!(f.ellipsis, "…");
-        assert_eq!(f.head, "");
-        assert_eq!(f.fade, "a");
     }
 
     #[test]

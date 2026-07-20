@@ -6126,23 +6126,11 @@ fn thinking_stream_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Spinner glyph frames (braille) for the thinking renderer.
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// The ephemeral spinner line text. Pure for testing. A braille spinner that
-/// advances every frame (so the line is visibly alive even while only the clock
-/// moves), a stage `label` telling the user what's happening right now
-/// (`thinking…`, `compressing context…`, …), and the elapsed seconds. The
-/// `· N chars` tail is shown only once generation has produced output
-/// (`chars > 0`).
-fn format_spinner(frame: usize, secs: f32, label: &str, chars: usize) -> String {
-    let braille = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
-    if chars == 0 {
-        format!("{braille} {label} {secs:.1}s")
-    } else {
-        format!("{braille} {label} {secs:.1}s · {chars} chars")
-    }
-}
+// The braille frame set and the pure line formatter now live in the public
+// `newt_core::tty` module — one copy for the whole workspace, with the unit
+// tests that pinned them. Imported here so the spinner call sites below are
+// unchanged.
+use crate::tty::format_spinner;
 
 /// Cargo-style thinking renderer: a model's reasoning (#385 — normally
 /// suppressed) streams as DIM scrolled lines that stay in scrollback, with one
@@ -6933,25 +6921,6 @@ mod cap_exit_unit_tests {
         .expect("non-empty progress");
         assert!(p.contains("build it"), "{p}");
         assert!(p.contains("cwd"), "{p}");
-    }
-
-    #[test]
-    fn spinner_line_formats_and_frame_wraps() {
-        // Braille spinner + stage label + clock; the chars tail shows once
-        // generation has produced output.
-        assert_eq!(
-            format_spinner(0, 1.23, "thinking…", 340),
-            "⠋ thinking… 1.2s · 340 chars"
-        );
-        // A different stage label, and chars == 0 drops the `· N chars` tail.
-        assert_eq!(
-            format_spinner(1, 0.5, "compressing context…", 0),
-            "⠙ compressing context… 0.5s"
-        );
-        // Frame index wraps over the braille glyph set.
-        assert!(
-            format_spinner(SPINNER_FRAMES.len(), 0.0, "thinking…", 0).contains(SPINNER_FRAMES[0])
-        );
     }
 
     #[test]
