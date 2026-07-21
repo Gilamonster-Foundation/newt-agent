@@ -835,7 +835,7 @@ struct ModeApplication {
 fn build_mode(
     name: &str,
     cfg: &newt_core::Config,
-    mut load_skill: impl FnMut(&str) -> anyhow::Result<String>,
+    mut load_skill: impl FnMut(&str) -> newt_skills::Result<String>,
 ) -> anyhow::Result<ModeApplication> {
     let mode_cfg = cfg
         .modes
