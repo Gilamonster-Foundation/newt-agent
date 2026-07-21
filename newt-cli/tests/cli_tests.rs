@@ -31,6 +31,66 @@ fn binary_help_surfaces_start_on_the_guarded_cli_stack() {
         .stdout(predicate::str::contains("--config-dir"));
 }
 
+/// `newt help` renders the interactive command catalog WITHOUT starting a
+/// session or connecting to a backend. This is the property that lets
+/// `scripts/eval/grade-548.sh` run on a hosted CI runner (no live Ollama): the
+/// binary is spawned with an unreachable backend and no config, yet must still
+/// print help and exit 0. Fully mocked / hostile-env — PR tier.
+#[test]
+fn help_subcommand_renders_without_a_backend() {
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env("OLLAMA_HOST", "http://127.0.0.1:1") // unreachable on purpose
+        .env("NO_COLOR", "1")
+        .args(["help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Available commands:"))
+        .stdout(predicate::str::contains("/dgx status"));
+
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env("OLLAMA_HOST", "http://127.0.0.1:1")
+        .env("NO_COLOR", "1")
+        .args(["help", "dgx"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/dgx help"));
+}
+
+/// ANTI-DRIFT (process tier): the `newt help` BINARY must emit bytes IDENTICAL
+/// to the library renderer `newt_tui::render_help` — the same function the
+/// interactive REPL prints for `/help` and `/<cmd> --help`. Pairs with the
+/// newt-tui unit test `render_help_is_byte_identical_to_the_repl_help_corpus`
+/// (which pins `render_help` to the help_lines / command_help_page corpora): the
+/// two together prove `newt help` == the REPL `/help`, byte for byte, so the
+/// startup-free path can never silently fork from the interactive one. `NO_COLOR`
+/// pins `color_supported()` to `false` in both the binary and this expectation.
+#[test]
+fn help_subcommand_is_byte_identical_to_the_repl_renderer() {
+    let cases: [(&[&str], Option<&str>); 3] = [
+        (&["help"], None),
+        (&["help", "dgx"], Some("dgx")),
+        (&["help", "/exit"], Some("exit")), // leading slash tolerated
+    ];
+    for (args, topic) in cases {
+        let out = Command::cargo_bin("newt")
+            .unwrap()
+            .env("OLLAMA_HOST", "http://127.0.0.1:1")
+            .env("NO_COLOR", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "`newt {args:?}` exited non-zero");
+        let expected = newt_tui::render_help(topic, false, false);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "`newt {args:?}` stdout drifted from newt_tui::render_help"
+        );
+    }
+}
+
 #[test]
 fn doctor_runs_without_crash() {
     Command::cargo_bin("newt")

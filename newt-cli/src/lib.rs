@@ -47,6 +47,11 @@ fn parse_shell_engine(
 
 #[derive(Parser, Debug)]
 #[command(name = "newt", version, about = "Free, friendly, local agentic coder")]
+// `newt help [command]` renders newt's INTERACTIVE `/help` command catalog
+// startup-free (no session, no backend) via the `Help` subcommand below —
+// deliberately taking over the name from clap's auto-generated `help`
+// subcommand, whose CLI-tree text remains available as `newt --help`.
+#[command(disable_help_subcommand = true)]
 pub struct Cli {
     /// Path to config file (overrides default search order).
     #[arg(short, long, global = true)]
@@ -286,6 +291,18 @@ pub enum Command {
     Code {
         /// Optional working path.
         path: Option<PathBuf>,
+    },
+    /// Print newt's interactive command catalog without starting a session.
+    ///
+    /// `newt help` lists every `/command`; `newt help <command>` shows one
+    /// command's detail page (the same text as the in-session `/help` and
+    /// `/<command> --help`). Renders with no backend connect, so it works
+    /// offline and in CI. For the CLI subcommand tree instead, use `newt
+    /// --help`.
+    Help {
+        /// Optional `/command` name to show the detail page for (omit for the
+        /// full list). A leading slash is accepted and ignored.
+        command: Option<String>,
     },
     /// Drake-swarm pilot dashboard.
     Pilot {
@@ -1108,6 +1125,19 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),
         Command::Models { cmd } => models_cmd::run(cmd).await,
         Command::Summarizer { cmd } => summarizer_cmd::run(cmd).await,
+        // Startup-free help: no session, no backend connect. Renders the SAME
+        // bytes the interactive `/help` prints (both route through
+        // `newt_tui::render_help`), so `newt help` is a hosted-CI-safe way to
+        // inspect the command catalog. A leading `/` on the topic is tolerated
+        // so `newt help /dgx` and `newt help dgx` behave alike.
+        Command::Help { command } => {
+            let topic = command.as_deref().map(|c| c.trim_start_matches('/'));
+            print!(
+                "{}",
+                newt_tui::render_help(topic, newt_tui::color_supported(), false)
+            );
+            Ok(())
+        }
     }
 }
 
