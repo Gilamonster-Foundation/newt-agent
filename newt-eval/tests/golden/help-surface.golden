@@ -1,0 +1,84 @@
+=== newt help (top) ===
+>  Available commands:
+  /models                  - list models on the active endpoint
+  /models capabilities     - tool-conformance matrix (cached)
+  /model <name>            - switch model on the active backend (sticks across runs)
+  /backend <openai|ollama> [model] - switch backend (e.g. /backend ollama deepseek-r1)
+  /backends [name]         - list configured backends; /backends <name> switches (e.g. dgx1, gnuc)
+  /thinking <on|off>       - toggle the reasoning spinner for this session
+  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)
+  /probe window [model]    - empirical input-boundary search (records max input at High confidence)
+  /probe reset             - wipe all learned probe values (conformance, windows, calibration)
+  /memory                  - show context window / notes usage
+  /compress [focus]        - compress context now, optionally focused on a topic (alias: /compact)
+  /summarizer              - show or change the summarizer backend and knobs
+  /rounds [n|double|reset|unlimited] - set this session's tool-call round limit
+  /context                 - show the active context manager + features
+  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)
+  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)
+  /context compaction [headroom_aware|message_count|reset] - set this session's automatic-compaction trigger policy
+  /context stats           - experimentation dashboard: budget, compression, feature states
+  /remember <fact>         - add a fact to persistent NOTES.md
+  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)
+  /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)
+  /start [title]           - begin a new conversation, leaving the current one open to /resume
+  /rename <title>          - retitle the current conversation so it is easy to find in /resume
+  /conversation list       - list saved conversations
+  /conversation show <id>  - show a saved conversation
+  /conversation restore <id> - restore a saved conversation
+  /conversation rename <id> <title> - rename a saved conversation
+  /conversation delete <id> - delete a saved conversation
+  /conversation rm <id>    - alias for /conversation delete
+  /recall [query]          - recent conversations, or full-text search
+  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)
+  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]
+  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)
+  /persona list            - list configured personas
+  /persona show            - show the active persona
+  /persona <name>          - start fresh with a persona
+  /persona switch <name>   - same as /persona <name> (an explicit verb)
+  /persona clear           - start fresh with no persona
+  /crew edit [name]        - edit a crew's settings (roles, control loop, test, budgets)
+  /dgx status              - DGX endpoint health + running models
+  /dgx models              - list models installed on the DGX
+  /dgx ps                  - models currently loaded in VRAM
+  /dgx warm [model]        - pre-load a model into VRAM
+  /dgx pull <model>        - pull an Ollama/HuggingFace GGUF model onto the node
+  /dgx rm <model>          - delete a model from the DGX
+  /dgx route <task>        - recommend a formation for a task
+  /dgx doctor              - probe every configured endpoint
+  /permissions             - prompted permission decisions + active mode clamp
+  /mode <name>             - enter a named mode: load skill + clamp authority (floor)
+  /mode                    - show the active mode; /mode off clears it
+  /loadout                 - show the active loadout: declared axes vs what resolved
+  /workspace               - show current workspace path
+  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode
+  /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)
+  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)
+  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt
+  /prompt set "<template>"  - set the prompt for this session; /prompt reset to revert
+  /vi  /emacs  /nano       - switch line-editor key bindings for this session
+  /version                 - print newt version
+  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent
+  /cd [dir]                - change the session working dir (shown in prompt), confined below the start dir; bare /cd returns to the root — use ! for pwd/ls/rm/…
+  Esc                      - while the agent is working: interrupt the turn, back to your prompt
+  Up/Down                  - while a tool is active: scroll its retained output
+  Space/Enter              - while a tool is active: toggle ⧉ expand / ▣ collapse
+  /exit  /quit  exit  quit - leave the session
+
+  Add --help (or -h) to any command — or /help <command> — for its detail page.
+=== newt help dgx ===
+>  /dgx help
+/dgx <sub> — NVIDIA DGX endpoint operations
+
+  /dgx status       endpoint health + currently-loaded models
+  /dgx models       models installed on the DGX
+  /dgx ps           models currently loaded in VRAM
+  /dgx warm [model] pre-load a model into VRAM (cuts first-token latency)
+  /dgx pull <model> pull an Ollama or HuggingFace GGUF model onto the node
+  /dgx rm <model>   delete a model from the DGX
+  /dgx route <task> recommend a formation for a task
+  /dgx doctor       probe every configured endpoint
+
+  Note: flags like --dry-run/--force/--name are CLI-only; use
+  `newt dgx pull ...` from a shell for the full pull workflow.
