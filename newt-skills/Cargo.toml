@@ -16,8 +16,10 @@ serde.workspace = true
 # YAML frontmatter parsing for SKILL.md files. Kept deliberately light —
 # serde_yaml is pure-Rust, no C deps, and resolves under MSRV 1.75, so it
 # preserves the PyO3 wheel story for the rest of the workspace.
-serde_yaml = "0.9"
-anyhow.workspace = true
+serde_yaml.workspace = true
+# Typed, concern-separated error enum (`SkillError`) — the adoptable choice for
+# a library boundary. thiserror is a proc-macro-only dep with no runtime weight.
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

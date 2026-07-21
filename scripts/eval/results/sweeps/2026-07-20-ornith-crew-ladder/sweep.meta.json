@@ -1,0 +1,13 @@
+{
+  "name": "2026-07-20-ornith-crew-ladder",
+  "created": "2026-07-20T20:38:50Z",
+  "git_sha": "8844352",
+  "tasks": "T0-fix-add,T1-parse-port,T2-humanize-duration,T3-format-temperature",
+  "modes": "crew",
+  "models": "sakamakismile/Ornith-1.0-35B-NVFP4",
+  "trials": 5,
+  "max_leaves": 6,
+  "timeout": 1200,
+  "keep": "fail",
+  "config_template": "~/.newt/eval-sweeps/template.toml"
+}

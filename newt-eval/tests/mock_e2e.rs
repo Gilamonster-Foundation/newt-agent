@@ -117,6 +117,271 @@ async fn all_bundled_cases_pass_in_mock_mode() {
     );
 }
 
+// ── golden masters over the product boundaries (the refactor net) ──────────
+//
+// Characterization tests for the kernel-first decomposition: byte-level golden
+// masters over the THREE product boundaries that must survive the refactor —
+//
+//   1. the ACP TaskReply (`newt worker`, driven via `run_case` exactly like the
+//      bundled-cases test above — widened, not forked);
+//   2. the MCP stdio handshake + tool catalog (`newt mcp`);
+//   3. the plain chat surface — BLOCKED by a real coupling (see the recorded
+//      finding below); lands as a `newt help` master once #1318 merges.
+//
+// NOT internal seams — a refactor may rearrange everything behind these bytes.
+//
+// Discipline (this repo's pathology is gates that pass while nothing changed):
+//   * a MISSING golden file FAILS the test (it never silently passes);
+//   * every master has a NEGATIVE CONTROL — `golden_negative_controls` proves
+//     the comparator rejects a perturbed expectation for every stored golden;
+//   * masters are captured TWICE per run and must agree post-normalization, so
+//     a nondeterministic master cannot be baselined in the first place.
+//
+// Baseline capture / intentional update:  NEWT_GOLDEN_UPDATE=1 cargo test
+//   -p newt-eval --test mock_e2e   (then commit newt-eval/tests/golden/*.golden)
+//
+// Unix-gated like `stdout_purity.rs`: byte-exact CLI output on Windows adds
+// CRLF/path hazards the refactor net doesn't need — gnuc/beaver (the boxes that
+// run it) are both unix.
+#[cfg(unix)]
+mod golden {
+    use super::{ensure_worker_built, locate_worker_bin};
+    use newt_eval::{cases, run_case, RunnerConfig};
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn golden_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+    }
+
+    /// Compare `actual` against the stored golden `name`. `NEWT_GOLDEN_UPDATE=1`
+    /// rewrites the file and passes (the baseline-capture mode). A missing
+    /// golden is a FAILURE with capture instructions — never a silent pass.
+    fn golden_compare(name: &str, actual: &str) -> Result<(), String> {
+        let path = golden_dir().join(format!("{name}.golden"));
+        if std::env::var("NEWT_GOLDEN_UPDATE").as_deref() == Ok("1") {
+            std::fs::create_dir_all(golden_dir()).map_err(|e| e.to_string())?;
+            std::fs::write(&path, actual).map_err(|e| e.to_string())?;
+            eprintln!("[golden] UPDATED {}", path.display());
+            return Ok(());
+        }
+        let expected = std::fs::read_to_string(&path).map_err(|_| {
+            format!(
+                "golden `{name}` missing at {} — capture the baseline with \
+                 NEWT_GOLDEN_UPDATE=1 and commit it (a missing master must \
+                 never pass)",
+                path.display()
+            )
+        })?;
+        if expected != actual {
+            return Err(format!(
+                "golden `{name}` MISMATCH — the product boundary changed.\n\
+                 If intentional, re-baseline with NEWT_GOLDEN_UPDATE=1 and \
+                 review the diff in the PR.\n--- expected ---\n{expected}\n\
+                 --- actual ---\n{actual}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replace volatile tokens so the masters are machine- and run-independent:
+    /// the workspace version string and any explicitly-passed volatile substrings
+    /// (temp paths, model ids). Purely mechanical — no regex, no cleverness.
+    fn normalize(text: &str, volatile: &[(&str, &str)]) -> String {
+        let mut out = text.replace(env!("CARGO_PKG_VERSION"), "<VER>");
+        for (needle, marker) in volatile {
+            if !needle.is_empty() {
+                out = out.replace(needle, marker);
+            }
+        }
+        out
+    }
+
+    /// Boundary 1 — ACP: the T0 TaskReply, normalized. Reuses the SAME
+    /// wiremock + `run_case` path as `all_bundled_cases_pass_in_mock_mode`.
+    async fn capture_acp_reply() -> String {
+        ensure_worker_built();
+        let worker = locate_worker_bin();
+        let cases_dir = cases::default_cases_dir();
+        let all = cases::load_all(&cases_dir).expect("bundled cases load");
+        let t0 = all
+            .iter()
+            .find(|c| c.name == "T0-fix-add")
+            .expect("T0-fix-add is bundled");
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "mock-llama",
+                "message": { "role": "assistant", "content": t0.mock_response.content },
+                "done": true,
+            })))
+            .mount(&mock)
+            .await;
+
+        let config = RunnerConfig::new(&worker).with_mock_endpoint(mock.uri());
+        let outcome = run_case(t0, &config).await.expect("T0 runs");
+        let ws = outcome.workspace.display().to_string();
+        let bl = outcome.baseline.display().to_string();
+        // The boundary artifact: the fields a downstream consumer contracts on.
+        let r = &outcome.reply;
+        let raw = format!(
+            "model_id: {}\nempty_diff: {}\ndiff_applied: {}\n--- diff ---\n{}",
+            r.model_id, r.empty_diff, r.diff_applied, r.diff
+        );
+        normalize(&raw, &[(&ws, "<WS>"), (&bl, "<BASELINE>")])
+    }
+
+    /// Boundary 2 — MCP stdio: initialize + tools/list frames, normalized.
+    /// HOME-isolated so a developer's `~/.newt` MCP config can't leak into the
+    /// golden (the master must be machine-independent).
+    async fn capture_mcp_handshake() -> String {
+        ensure_worker_built();
+        let worker = locate_worker_bin();
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".newt")).expect("mk .newt");
+        std::fs::write(home.path().join(".newt/config.toml"), "").expect("seed config");
+
+        let mut cmd = Command::new(&worker);
+        cmd.arg("mcp")
+            .env("OLLAMA_HOST", "http://127.0.0.1:1")
+            .env("HOME", home.path())
+            .env("TERM", "dumb")
+            .env_remove("NEWT_CONFIG")
+            .env_remove("NEWT_CONFIG_DIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn newt mcp");
+        {
+            let mut stdin = child.stdin.take().expect("stdin");
+            let frames = [
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            ];
+            for f in &frames {
+                let line = format!("{}\n", serde_json::to_string(f).unwrap());
+                stdin.write_all(line.as_bytes()).await.expect("write frame");
+            }
+            // drop closes stdin → server loop exits.
+        }
+        let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+            .await
+            .expect("newt mcp timed out")
+            .expect("collect output");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Re-serialize each frame with sorted keys (serde_json maps preserve
+        // order; Value round-trip is stable) so the golden is layout-stable.
+        let mut lines = Vec::new();
+        for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).expect("stdout frame is JSON");
+            lines.push(serde_json::to_string_pretty(&v).unwrap());
+        }
+        normalize(&lines.join("\n"), &[])
+    }
+
+    // Boundary 3 — the piped plain chat surface: BLOCKED BY COUPLING (recorded
+    // finding for the refactor review, 2026-07-20 baseline attempt on gnuc).
+    //
+    // A hermetic capture needs the chat backend pinned to a mock. It cannot be:
+    //   * `OLLAMA_HOST` — honored by the worker (verbatim contract), NOT by the
+    //     interactive chat path;
+    //   * `$NEWT_CONFIG` — in `candidate_paths()` but observed INERT end-to-end
+    //     (`newt config` under it shows pure defaults) — bug, filed on the board;
+    //   * `--config` — routes through `Config::load` for subcommands (`newt
+    //     config` shows the pinned backends) but is not plumbed into the chat
+    //     REPL's backend choice;
+    //   * cwd `./newt.toml` / project `.newt/config.toml` — loaded, but AMBIENT
+    //     (#1301 trust boundary): an untrusted repo config must not redirect
+    //     inference to an attacker endpoint, so its backends don't drive the
+    //     chat. Correct security posture; fatal for a mock pin.
+    //   Net effect on a box with a live ollama on :11434 the chat silently runs
+    //   a REAL model (observed: llama3.1:8b answering with live tool calls) —
+    //   nondeterministic and non-hermetic by construction.
+    //
+    // This is exactly the coupling the kernel-first refactor should dissolve
+    // (backend choice as an injectable seam). Until then the plain surface gets
+    // its master from the startup-free `newt help` (#1318) once merged — byte
+    // source of the interactive `/help`, no backend, fully deterministic.
+
+    // ── the masters ─────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn golden_acp_reply_boundary() {
+        // Double-capture: a master that can't agree with itself is not a
+        // baseline, it's a flake generator — refuse to compare it at all.
+        let a = capture_acp_reply().await;
+        let b = capture_acp_reply().await;
+        assert_eq!(a, b, "ACP capture is nondeterministic post-normalization");
+        golden_compare("acp-t0-reply", &a).unwrap();
+    }
+
+    #[tokio::test]
+    async fn golden_mcp_handshake_boundary() {
+        let a = capture_mcp_handshake().await;
+        let b = capture_mcp_handshake().await;
+        assert_eq!(a, b, "MCP capture is nondeterministic post-normalization");
+        golden_compare("mcp-initialize-tools", &a).unwrap();
+    }
+
+    // `golden_plain_turn_boundary` intentionally absent — see the coupling
+    // finding above. Lands as a `newt help` master once #1318 merges.
+
+    /// The negative control the card demands: EVERY stored golden must be shown
+    /// to fail against a perturbed expectation. A comparator that can't reject
+    /// a mutation is the "gate that passes while nothing changed" pathology.
+    #[test]
+    fn golden_negative_controls() {
+        // In baseline-capture mode the comparator WRITES what it's given — a
+        // perturbed probe would corrupt the goldens. The control only means
+        // anything in compare mode anyway.
+        if std::env::var("NEWT_GOLDEN_UPDATE").as_deref() == Ok("1") {
+            eprintln!("[golden] negative controls skipped in update mode");
+            return;
+        }
+        let dir = golden_dir();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "golden"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !entries.is_empty(),
+            "no goldens found in {} — capture the baseline first \
+             (NEWT_GOLDEN_UPDATE=1); an empty net must not pass",
+            dir.display()
+        );
+        for e in entries {
+            let name = e.path().file_stem().unwrap().to_string_lossy().into_owned();
+            let stored = std::fs::read_to_string(e.path()).expect("read golden");
+            let perturbed = format!("{stored}\nPERTURBED-LINE-MUST-FAIL");
+            assert!(
+                golden_compare(&name, &perturbed).is_err(),
+                "golden `{name}` ACCEPTED a perturbed expectation — the master \
+                 detects nothing"
+            );
+            // And the unperturbed content still round-trips (the comparator is
+            // strict equality, not vibes).
+            assert!(
+                golden_compare(&name, &stored).is_ok(),
+                "golden `{name}` rejected its own stored bytes"
+            );
+        }
+    }
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
 
 /// Best-effort build of `newt` so the test doesn't have to assume the
