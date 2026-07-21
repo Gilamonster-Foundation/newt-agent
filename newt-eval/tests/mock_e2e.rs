@@ -125,8 +125,9 @@ async fn all_bundled_cases_pass_in_mock_mode() {
 //   1. the ACP TaskReply (`newt worker`, driven via `run_case` exactly like the
 //      bundled-cases test above — widened, not forked);
 //   2. the MCP stdio handshake + tool catalog (`newt mcp`);
-//   3. the plain chat surface — BLOCKED by a real coupling (see the recorded
-//      finding below); lands as a `newt help` master once #1318 merges.
+//   3. the plain help surface via startup-free `newt help` (#1318) — the byte
+//      source of the interactive `/help`. (The full chat-turn surface remains
+//      blocked by a real coupling — see the recorded finding below.)
 //
 // NOT internal seams — a refactor may rearrange everything behind these bytes.
 //
@@ -311,8 +312,55 @@ mod golden {
     //
     // This is exactly the coupling the kernel-first refactor should dissolve
     // (backend choice as an injectable seam). Until then the plain surface gets
-    // its master from the startup-free `newt help` (#1318) once merged — byte
-    // source of the interactive `/help`, no backend, fully deterministic.
+    // its master from the startup-free `newt help` (#1318, now merged) — the
+    // byte source of the interactive `/help`, no backend, fully deterministic:
+    // see `golden_help_surface_boundary` below.
+
+    /// Boundary 3 — the plain help surface via startup-free `newt help` /
+    /// `newt help dgx` (#1318): the exact bytes the interactive `/help` and
+    /// `/dgx help` print (both route through `newt_tui::render_help`; piped
+    /// stdout ⇒ `color_supported()` is false ⇒ plain bytes). HOME- and
+    /// cwd-isolated so no operator config/skills or `.newt` walk-up can leak
+    /// into the master.
+    async fn capture_help_surface() -> String {
+        ensure_worker_built();
+        let worker = locate_worker_bin();
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".newt")).expect("mk .newt");
+        std::fs::write(home.path().join(".newt/config.toml"), "").expect("seed config");
+        let workdir = tempfile::tempdir().expect("workdir");
+
+        let mut out = String::new();
+        for topic in [None, Some("dgx")] {
+            let mut cmd = Command::new(&worker);
+            cmd.arg("help");
+            if let Some(t) = topic {
+                cmd.arg(t);
+            }
+            cmd.current_dir(workdir.path())
+                .env("HOME", home.path())
+                .env("TERM", "dumb")
+                .env("NO_COLOR", "1")
+                .env_remove("NEWT_CONFIG")
+                .env_remove("NEWT_CONFIG_DIR")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(20), async {
+                cmd.spawn()
+                    .expect("spawn newt help")
+                    .wait_with_output()
+                    .await
+            })
+            .await
+            .expect("newt help timed out")
+            .expect("collect output");
+            out.push_str(&format!("=== newt help {} ===\n", topic.unwrap_or("(top)")));
+            out.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        normalize(&out, &[])
+    }
 
     // ── the masters ─────────────────────────────────────────────────────
 
@@ -334,8 +382,13 @@ mod golden {
         golden_compare("mcp-initialize-tools", &a).unwrap();
     }
 
-    // `golden_plain_turn_boundary` intentionally absent — see the coupling
-    // finding above. Lands as a `newt help` master once #1318 merges.
+    #[tokio::test]
+    async fn golden_help_surface_boundary() {
+        let a = capture_help_surface().await;
+        let b = capture_help_surface().await;
+        assert_eq!(a, b, "help capture is nondeterministic post-normalization");
+        golden_compare("help-surface", &a).unwrap();
+    }
 
     /// The negative control the card demands: EVERY stored golden must be shown
     /// to fail against a perturbed expectation. A comparator that can't reject
