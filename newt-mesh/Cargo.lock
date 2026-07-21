@@ -45,8 +45,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle"
-version = "0.7.5"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=47430ca665d35ec382ec4d95f0de060270946324#47430ca665d35ec382ec4d95f0de060270946324"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8d3614821acc984019eba4bc283ba18e6f0e13b288456a4f92bba5afbe238e1"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -55,23 +56,26 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-core"
-version = "0.7.5"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=47430ca665d35ec382ec4d95f0de060270946324#47430ca665d35ec382ec4d95f0de060270946324"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f28f10ae1acc4e0148f86483f0c08a2b2e7a6895fa6ce76dd3831bbe3d0b63bf"
 dependencies = [
- "agent-mesh-protocol 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "agent-mesh-protocol 0.6.2",
  "anyhow",
  "async-trait",
  "ed25519-dalek 2.2.0",
  "landlock",
  "serde",
  "serde_json",
+ "tokio",
  "toml 0.8.23",
 ]
 
 [[package]]
 name = "agent-bridle-tool-shell"
-version = "0.7.5"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=47430ca665d35ec382ec4d95f0de060270946324#47430ca665d35ec382ec4d95f0de060270946324"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e342d25472912a87f44211721e462e43e33d588f1e3d472d54299a047736e52"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -86,8 +90,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-tool-web"
-version = "0.7.5"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=47430ca665d35ec382ec4d95f0de060270946324#47430ca665d35ec382ec4d95f0de060270946324"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a85ccf5601b5acc25a04a8d1e75d043e2f04b4b3f3d6db30aac5068f402e955c"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -104,10 +109,10 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-bus"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "agent-mesh-discovery",
- "agent-mesh-protocol 0.6.2",
+ "agent-mesh-protocol 0.6.3",
  "agent-mesh-transport",
  "anyhow",
  "async-trait",
@@ -124,9 +129,9 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-discovery"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
- "agent-mesh-protocol 0.6.2",
+ "agent-mesh-protocol 0.6.3",
  "anyhow",
  "base64",
  "hex",
@@ -136,23 +141,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "agent-mesh-protocol"
-version = "0.6.2"
-dependencies = [
- "blake3",
- "ed25519-dalek 2.2.0",
- "hex",
- "rand 0.8.6",
- "serde",
- "serde_bytes",
- "serde_json",
- "ssh-key",
- "thiserror 2.0.18",
- "tracing",
- "zeroize",
 ]
 
 [[package]]
@@ -175,11 +163,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-mesh-protocol"
+version = "0.6.3"
+dependencies = [
+ "blake3",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "rand 0.8.6",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "ssh-key",
+ "thiserror 2.0.18",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "agent-mesh-transport"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "agent-mesh-discovery",
- "agent-mesh-protocol 0.6.2",
+ "agent-mesh-protocol 0.6.3",
  "anyhow",
  "async-trait",
  "bytes",
@@ -540,9 +545,9 @@ dependencies = [
 
 [[package]]
 name = "brush-ocap-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9590361ea19dd8581fa80d40b41ee19707bf9ba82c1f9c7433325974a0248e74"
+checksum = "edb53713161f76bc0f93e80431652fdfcce08e2eecef021e0b77410aa283b72b"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -3429,10 +3434,10 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "newt-core"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "agent-bridle",
- "agent-mesh-protocol 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "agent-mesh-protocol 0.6.2",
  "anyhow",
  "async-trait",
  "base64",
@@ -3462,9 +3467,9 @@ dependencies = [
 
 [[package]]
 name = "newt-identity"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
- "agent-mesh-protocol 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "agent-mesh-protocol 0.6.2",
  "base64",
  "chrono",
  "newt-core",
@@ -3474,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3497,7 +3502,7 @@ version = "0.6.8"
 dependencies = [
  "agent-mesh-bus",
  "agent-mesh-discovery",
- "agent-mesh-protocol 0.6.2",
+ "agent-mesh-protocol 0.6.3",
  "anyhow",
  "async-trait",
  "base64",
@@ -3520,16 +3525,16 @@ dependencies = [
 
 [[package]]
 name = "newt-skills"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
- "anyhow",
  "serde",
  "serde_yaml",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "newt-tuner"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -4191,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "plugins-protocol"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "async-trait",
  "serde",
@@ -5545,7 +5550,7 @@ dependencies = [
 
 [[package]]
 name = "tests-common"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
