@@ -30,10 +30,28 @@ remains the sole writer, exactly as if the operator had typed. No second claim,
 no co-driving, no claim theft. Detach closes the inbox; the session never
 noticed anything but input.
 
-**D3 — Auth posture: LAN-bind now, WebAuthn later.** v1 binds to the home LAN
-behind the firewall/UFW (phone + MacBook testing per the operator's ask);
-`agent-bridle-gateway`'s WebAuthn-presence pattern is the W8 hardening path.
-Never a public bind.
+**D3 — Auth posture (amended 2026-07-22, twice).** First: the browser path is
+HTTPS + SSO at the ingress — the cluster's Authentik-backed oauth2-proxy
+forward-auth chain gates every request; newt-web is ClusterIP-only (the
+unauthenticated NodePort was closed the day it existed). Never a public bind.
+
+Second (operator ruling): **auth self-sufficiency, fail-closed.** newt-web
+must not hard-depend on a resident IdP. The tiers:
+
+1. **Ingress SSO present** (Authentik/oauth2-proxy, the deployed state) —
+   newt-web trusts the forward-auth boundary; the ingress is the gate.
+2. **No IdP available** — newt-web stands up its OWN gate: WebAuthn passkey
+   enrollment on first run (the `agent-bridle-gateway` presence pattern —
+   enroll once, assert per session), with a printed one-time enrollment token
+   as the bootstrap (the Jupyter pattern).
+3. **No gate at all** — web chat is DISABLED. An absent IdP is a named CHORE
+   ("enable auth to open the cockpit"), never an open door. The cockpit
+   renders the chore, not the tabs.
+
+Tier detection is explicit config, not sniffing (`NEWT_WEB_AUTH =
+ingress | webauthn | disabled-until-configured`); the default is tier 3 —
+fail closed. Implementation is the W8 rung, promoted from "hardening" to a
+release blocker for any deployment outside the SSO'd cluster.
 
 **D4 — Release: out of the 0.8.0 gate.** newt-web versions independently until
 it earns a release story (revisit at W8).
@@ -73,7 +91,8 @@ Two agent sources, one tab model:
 - [ ] **W6** — the attach seam: `/attach` opens a provenance-tagged local inbox
   the REPL muxes with stdin; `/detach` closes it
 - [ ] **W7** — v1: web tab ↔ running session (mirror + inject end-to-end)
-- [ ] **W8** — ops: WebAuthn hardening path, reconnect, README, release call
+- [ ] **W8** — auth self-sufficiency (tiered gate per amended D3: ingress SSO /
+  own WebAuthn / fail-closed chore) + ops: reconnect, README, release call
 
 ## Craft
 
