@@ -567,6 +567,15 @@ pub(crate) fn run_chat(
     let permission_config_path = newt_core::Config::user_config_path();
     let mut permission_state =
         PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
+    // A4/W6 (opt-in via NEWT_WEB_DECISIONS): route permission decisions to the
+    // attach surface (the web) through the store instead of the TTY — the gate
+    // publishes the decision and polls for the operator's verdict. Off by
+    // default, so the canonical TTY prompt is byte-for-byte unchanged. A durable
+    // conversation store is required (an ephemeral session has nothing to attach
+    // to); `clone` is cheap (shares the connection).
+    if std::env::var("NEWT_WEB_DECISIONS").is_ok() {
+        permission_state.web_store = conversation_store.clone();
+    }
     // Track O (#1131): load the durable OCAP policy from `~/.newt/ocap/*.toml`
     // (beside the config file). The gate consults it before prompting — a
     // durable deny refuses, a durable approve pre-answers (danger-gated). A
