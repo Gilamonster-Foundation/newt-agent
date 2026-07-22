@@ -1,0 +1,27 @@
+# HTTPS + SSO for the cockpit: Traefik terminates TLS (the cluster wildcard)
+# and the auth-ns oauth2-proxy forward-auth middleware (Authentik OIDC) gates
+# every request BEFORE it reaches newt-web. Copied from the cluster's
+# established protected-service pattern.
+#
+# WEB_HOST is substituted by build-and-roll.sh (internal DNS names are never
+# committed — the same invariant as REGISTRY).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: newt-web
+  namespace: drake
+  labels: { app: drake-interactive }
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-oauth2-errors@kubernetescrd,auth-oauth2-proxy@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: WEB_HOST
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: newt-web, port: { number: 8880 } }
+  tls:
+    - hosts: [WEB_HOST]
