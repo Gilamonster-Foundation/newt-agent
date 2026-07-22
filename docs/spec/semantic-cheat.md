@@ -255,6 +255,11 @@ rule, **nothing joins this section without a proof obligation demanding it**.
 Values (order pins, hash algorithms, class names, defaults) live in the
 profile (§8), never in law text.
 
+> Law style per the line's Craft Register (`steward-charter/docs/CRAFT.md`):
+> laws name **properties** and carry **proof obligations**; profiles pin
+> algorithms; identifiers self-describe. A law here without a discharged or
+> tracked obligation is a bug in the spec.
+
 ### SC-L1 — Resolution is a layered fold
 
 Every navigation-knowledge artifact — language packs, workspace maps, budget

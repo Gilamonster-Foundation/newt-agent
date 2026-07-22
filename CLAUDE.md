@@ -13,6 +13,12 @@ gate. The gates must be honest. Do not game them.
 
 ## Architectural style — the three Cs
 
+> Canonical home: the line's craft doctrine is the **Craft Register** —
+> `steward-charter/docs/CRAFT.md`. The laws below (three Cs, reuse
+> discipline, testing tiers, keep-files-small, one-issue-one-PR, zero
+> warnings, hooks-mirror-pipelines) are this repo's operational statement of
+> that register; when they drift, the register wins.
+
 Knowledge belongs in **data**, not logic. Prefer **Composition,
 Configuration, and Convention** over hardcoded lists and constants:
 language- or domain-specific knowledge — keyword lists, magic constants,
