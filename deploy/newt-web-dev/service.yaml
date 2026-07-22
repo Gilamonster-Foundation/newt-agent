@@ -10,5 +10,5 @@ spec:
   ports:
     # The REGISTERED reach point — never renumber.
     - { name: ssh, port: 22, targetPort: 22, nodePort: 30122 }
-    # newt-web (D3: home-LAN reach for MacBook Air + phone).
-    - { name: newt-web, port: 8880, targetPort: 8880, nodePort: 30880 }
+    # newt-web has NO NodePort: the browser path is the SSO ingress
+    # (ingress.yaml → web-service.yaml). The old :30880 bypass is closed.

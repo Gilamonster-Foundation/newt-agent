@@ -1,0 +1,14 @@
+# newt-web's in-cluster service — ClusterIP ONLY: the browser path goes
+# through the SSO ingress (ingress.yaml); there is deliberately NO direct
+# NodePort for the web surface (it was the unauthenticated bypass).
+apiVersion: v1
+kind: Service
+metadata:
+  name: newt-web
+  namespace: drake
+  labels: { app: drake-interactive }
+spec:
+  type: ClusterIP
+  selector: { app: drake-interactive, app.kubernetes.io/part-of: drake }
+  ports:
+    - { name: newt-web, port: 8880, targetPort: 8880 }
