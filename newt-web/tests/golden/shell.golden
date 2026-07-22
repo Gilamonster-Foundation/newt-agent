@@ -39,6 +39,7 @@
 <label>workspace<input name="workspace" value="." required></label>
 <button>spawn</button>
 </form>
+
 <nav id="tabs"></nav>
 <div id="panel"><p class="empty">No agents yet. Spawn one above.</p></div>
 </main>
