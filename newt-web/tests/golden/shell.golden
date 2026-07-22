@@ -11,6 +11,9 @@
   header { padding: 0.5rem 1rem; border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
   header h1 { font-size: 1rem; margin: 0; }
   #content { padding: 1rem; display: grid; gap: 1rem; }
+  #tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  #tabs button { padding: 0.25rem 0.75rem; border-radius: 4px 4px 0 0; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; cursor: pointer; }
+  #tabs button.active { border-bottom-color: transparent; font-weight: bold; }
   .empty { opacity: 0.7; }
   form.spawn { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; }
   form.spawn label { display: grid; font-size: 0.75rem; gap: 0.15rem; }
@@ -36,7 +39,8 @@
 <label>workspace<input name="workspace" value="." required></label>
 <button>spawn</button>
 </form>
-<div id="agents"><p class="empty">No agents yet. Spawn one above.</p></div>
+<nav id="tabs"></nav>
+<div id="panel"><p class="empty">No agents yet. Spawn one above.</p></div>
 </main>
 </body>
 </html>
