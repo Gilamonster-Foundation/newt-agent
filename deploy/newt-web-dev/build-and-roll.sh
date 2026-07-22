@@ -9,5 +9,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # The binary builds INSIDE the image (glibc-matched); context = repo root.
 docker build -t "$REGISTRY/newt-web-dev:latest" -f "$HERE/Containerfile" "$ROOT"
 docker push "$REGISTRY/newt-web-dev:latest"
-sed "s|REGISTRY|$REGISTRY|" "$HERE/deployment.yaml" | kubectl apply -f "$HERE/service.yaml" -f -
+# Pin the roll to the exact pushed bytes: what was attested is what runs.
+DIGEST_REF="$(docker inspect --format '{{index .RepoDigests 0}}' "$REGISTRY/newt-web-dev:latest")"
+echo "rolling image $DIGEST_REF"
+sed -e "s|image: REGISTRY/newt-web-dev:latest|image: $DIGEST_REF|" \
+    "$HERE/deployment.yaml" | kubectl apply -f "$HERE/service.yaml" -f -
 kubectl -n drake rollout status deploy/drake-interactive --timeout=300s
