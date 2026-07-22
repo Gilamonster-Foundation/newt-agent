@@ -21,11 +21,27 @@ spec:
     spec:
       containers:
         - name: newt-web-dev
-          image: REGISTRY/newt-web-dev:latest # sed REGISTRY -> your local registry (never commit a real host)
-          imagePullPolicy: Always
+          # build-and-roll.sh substitutes REGISTRY *and* pins the image by
+          # DIGEST at apply time (review: a mutable :latest tag deploys
+          # unbounded future bytes under the same attested manifest). The
+          # committed value is a template, never what runs.
+          image: REGISTRY/newt-web-dev:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - { containerPort: 22, name: ssh }
             - { containerPort: 8880, name: newt-web }
+          securityContext:
+            # sshd must start as root (bind :22, setuid to session users) but
+            # nothing here may escalate beyond the named capabilities.
+            allowPrivilegeEscalation: false
+            seccompProfile: { type: RuntimeDefault }
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "KILL", "AUDIT_WRITE", "SYS_CHROOT"]
+          readinessProbe:
+            tcpSocket: { port: ssh }
+            initialDelaySeconds: 2
+            periodSeconds: 5
           env:
             - { name: TMPDIR, value: /scratch }
             - { name: CARGO_TARGET_DIR, value: /scratch/cargo-target }
@@ -45,7 +61,13 @@ spec:
             # sshd refuses that — the image CMD installs them 0600 into
             # /etc/ssh at start.
             - { mountPath: /run/hostkeys, name: hostkeys, readOnly: true }
-      securityContext: { fsGroup: 100 }
+      # fsGroup 100 exists for the SHARED STORAGE (the /workspaces NFS export
+      # and /home/drake PVC carry group-100 ownership from the drake lineage) —
+      # NOT for the SSH Secret; the entrypoint re-stages keys 0600 precisely
+      # because fsGroup makes Secret projections group-readable.
+      securityContext:
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
       serviceAccountName: drake-interactive
       volumes:
         - name: home

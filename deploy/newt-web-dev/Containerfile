@@ -1,22 +1,22 @@
 # newt-web-dev — the repurposed drake-interactive image (decision D5,
 # docs/decisions/newt_web_htmx.md). Dev/test box for newt-agent + newt-web:
-# sshd + tmux + rust toolchain + the newt build deps.
+# sshd + tmux + rust toolchain + the newt build deps + the cockpit binary.
 #
-# IDENTITY IS NEVER BAKED IN. The registered SSH host keys mount from the
-# `drake-interactive-hostkeys` Secret at runtime (the old image baked decoy
-# keys at build time — root@buildkitsandbox — while sshd served a second set
-# from the home PVC; this image ends that split). authorized_keys mounts from
-# `drake-interactive-keys`. Tear down and rebuild freely: the identity is
-# cluster-side.
-# Stage 1: build newt-web INSIDE the image lineage so glibc always matches
-# (a host-built binary from a newer distro dies with `GLIBC_x.y not found`).
-# Context = the repo root (see build-and-roll.sh); .dockerignore keeps it lean.
-FROM rust:1-bookworm AS builder
+# IDENTITY IS NEVER BAKED IN: host keys mount from the
+# drake-interactive-hostkeys Secret; entrypoint.sh stages them 0600 (fsGroup
+# makes Secret files group-readable, which sshd refuses).
+#
+# SUPPLY-CHAIN POSTURE (review, 2026-07-22): the base is digest-pinned, the
+# one downloaded artifact (just) is sha256-verified per-arch, and the deploy
+# script rolls by image DIGEST — what was attested is what runs.
+
+# Stage 1: build newt-web INSIDE the image lineage so glibc always matches.
+FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 WORKDIR /src
 COPY . .
 RUN CARGO_TARGET_DIR=/build cargo build --release --manifest-path newt-web/Cargo.toml
 
-FROM rust:1-bookworm
+FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tmux git ripgrep curl jq \
@@ -25,12 +25,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /run/sshd \
     && useradd -m -s /bin/bash -u 1000 drake
 
-# `just` is not in bookworm's apt — install the prebuilt binary (pinned).
-RUN curl -fsSL https://github.com/casey/just/releases/download/1.40.0/just-1.40.0-x86_64-unknown-linux-musl.tar.gz \
-        | tar -xz -C /usr/local/bin just \
-    && just --version
+# `just` is not in bookworm's apt — fetch the pinned release and VERIFY it
+# before executing anything (per-arch checksum; unsupported arches fail loudly
+# rather than shipping a lying multi-platform file).
+ARG TARGETARCH=amd64
+ARG JUST_VERSION=1.40.0
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) just_arch="x86_64-unknown-linux-musl"; \
+             just_sha="181b91d0ceebe8a57723fb648ed2ce1a44d849438ce2e658339df4f8db5f1263" ;; \
+      arm64) just_arch="aarch64-unknown-linux-musl"; \
+             just_sha="d065d0df1a1f99529869fba8a5b3e0a25c1795b9007099b00dfabe29c7c1f7b6" ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/just.tar.gz \
+      "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-${just_arch}.tar.gz"; \
+    echo "${just_sha}  /tmp/just.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/just.tar.gz -C /usr/local/bin just; \
+    rm -f /tmp/just.tar.gz; \
+    /usr/local/bin/just --version
 
-# No HostKey generation: /etc/ssh/ssh_host_* arrive as Secret mounts.
+# No HostKey generation: keys arrive via the Secret + entrypoint staging.
 RUN rm -f /etc/ssh/ssh_host_*_key* \
     && printf '%s\n' \
         'PasswordAuthentication no' \
@@ -40,13 +55,7 @@ RUN rm -f /etc/ssh/ssh_host_*_key* \
 
 # The cockpit binary from the builder stage (glibc-matched).
 COPY --from=builder /build/release/newt-web /usr/local/bin/newt-web
+COPY deploy/newt-web-dev/entrypoint.sh /entrypoint.sh
 
 EXPOSE 22 8880
-# Host keys arrive as a Secret mounted at /run/hostkeys. fsGroup makes Secret
-# files group-readable (0640) and sshd refuses that, so the CMD installs them
-# 0600 into /etc/ssh before exec'ing sshd (-D foreground, -e stderr).
-# newt-web runs alongside sshd (dev-box supervision: if the cockpit dies the
-# box lives; restart it over SSH or re-roll). Bind comes from NEWT_WEB_BIND
-# (the Deployment opts into the LAN bind, D3).
-CMD ["/bin/sh", "-c", \
-     "install -m 600 -o root -g root /run/hostkeys/ssh_host_* /etc/ssh/ && (su drake -c 'RUST_LOG=info NEWT_WEB_BIND=\"${NEWT_WEB_BIND:-127.0.0.1:8880}\" /usr/local/bin/newt-web' &) && exec /usr/sbin/sshd -D -e -h /etc/ssh/ssh_host_ed25519_key -h /etc/ssh/ssh_host_rsa_key"]
+CMD ["/entrypoint.sh"]
