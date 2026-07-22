@@ -1,1 +1,3 @@
 target/
+# newt-web vendored front-end asset (0BSD) — the one intentional .js in-tree
+!assets/htmx.min.js
