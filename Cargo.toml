@@ -33,7 +33,7 @@ members = [
 #   cargo test --manifest-path newt-mesh/Cargo.toml
 #
 # See docs/decisions/mesh_integration.md for the full rationale.
-exclude = ["newt-mesh"]
+exclude = ["newt-mesh", "newt-web"]
 
 [workspace.package]
 # Semver — 0.7.1 (see the version block above); 0.6.8 was: the honest, measurable, family-aware harness — verify oracle

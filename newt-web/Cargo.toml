@@ -1,0 +1,19 @@
+[package]
+name = "newt-web"
+version = "0.1.0"
+edition = "2021"
+description = "HTMX web cockpit for newt-agent instances on a shared box — tabs over TurnDriver / ConversationStore / mesh presence"
+license = "Apache-2.0"
+publish = false
+
+# NOT a workspace member (the newt-mesh pattern, decision D1 in
+# docs/decisions/newt_web_htmx.md): own lock, path deps, so the web dependency
+# tree never enters the agent workspace graph.
+[dependencies]
+newt-core = { path = "../newt-core" }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -1,0 +1,33 @@
+# newt-web CI — the excluded-crate lane (decision D1, docs/decisions/newt_web_htmx.md).
+# Runs only when newt-web/ or its path-dep surface changes.
+name: newt-web
+on:
+  pull_request:
+    paths:
+      - "newt-web/**"
+      - "newt-core/**"
+      - ".github/workflows/newt-web.yml"
+  push:
+    branches: [main]
+    paths:
+      - "newt-web/**"
+      - "newt-core/**"
+      - ".github/workflows/newt-web.yml"
+jobs:
+  newt-web:
+    name: newt-web (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: newt-web
+      - name: fmt check
+        run: cargo fmt --manifest-path newt-web/Cargo.toml -- --check
+      - name: clippy (-D warnings)
+        run: cargo clippy --manifest-path newt-web/Cargo.toml --all-targets -- -D warnings
+      - name: test
+        run: cargo test --manifest-path newt-web/Cargo.toml
