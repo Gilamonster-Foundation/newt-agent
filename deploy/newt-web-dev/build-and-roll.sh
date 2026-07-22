@@ -6,6 +6,9 @@ set -euo pipefail
 : "${REGISTRY:?set REGISTRY=<your-registry-host:port>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
+# Pin the target dir: an ambient CARGO_TARGET_DIR would silently relocate the
+# binary this script stages next.
+export CARGO_TARGET_DIR="$ROOT/newt-web/target"
 cargo build --release --manifest-path "$ROOT/newt-web/Cargo.toml"
 cp "$ROOT/newt-web/target/release/newt-web" "$HERE/newt-web"
 trap 'command rm -f "$HERE/newt-web"' EXIT
