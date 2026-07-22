@@ -169,8 +169,9 @@ pub use role_profile::{
 pub use router::{Router, Tier};
 pub use session::SessionId;
 pub use store::{
-    sanitize_fts5_query, ClaimOutcome, ConversationStore, InjectOutcome, InjectedPrompt,
-    LivenessFn, Roadmap, RoadmapSummary, SearchHit, StoredOwner,
+    sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, InjectOutcome,
+    InjectedPrompt, LivenessFn, PendingPermission, Roadmap, RoadmapSummary, SearchHit, StoredOwner,
+    Verdict,
 };
 pub use tokens::TokenEstimation;
 pub use workflows::{
