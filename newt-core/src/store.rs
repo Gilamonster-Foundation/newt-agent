@@ -1346,6 +1346,124 @@ impl ConversationStore {
         Ok(out)
     }
 
+    /// Enqueue a prompt injected from an ATTACH surface (newt-web, A3/W6) for
+    /// the running session to consume as its next turn. This is the ONLY store
+    /// write an attach surface makes — it never calls `create`/`claim`/
+    /// `append_turn` — so the claim-holding REPL stays the SOLE writer of the
+    /// transcript (D2). Workspace-fenced exactly like [`begin_prompt`]: a handle
+    /// in workspace B cannot inject into workspace A's conversation. Idempotent
+    /// on `idem_key` — a double-submit / SSE reconnect that reuses the key is a
+    /// no-op ([`InjectOutcome::Duplicate`]), not a second enqueue.
+    pub fn inject_prompt(
+        &self,
+        conversation_id: &str,
+        body: &str,
+        idem_key: Option<&str>,
+    ) -> anyhow::Result<InjectOutcome> {
+        validate_record_id(conversation_id)?;
+        let now = (self.claim_clock)();
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        // Same authority boundary as begin_prompt (store.rs): the global id is
+        // an authority boundary — never inject across workspaces.
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT workspace_key FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match owner.as_deref() {
+            None => anyhow::bail!("cannot inject into unknown conversation `{conversation_id}`"),
+            Some(key) if key != self.workspace_id => {
+                anyhow::bail!("conversation `{conversation_id}` belongs to another workspace")
+            }
+            _ => {}
+        }
+        // Idempotency: a prior row for this (conversation, idem_key) → no-op.
+        if let Some(key) = idem_key {
+            let seen = tx
+                .query_row(
+                    "SELECT 1 FROM conversation_inbox
+                      WHERE conversation_id = ?1 AND idem_key = ?2",
+                    rusqlite::params![conversation_id, key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if seen {
+                tx.commit()?;
+                return Ok(InjectOutcome::Duplicate);
+            }
+        }
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM conversation_inbox WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO conversation_inbox
+               (id, conversation_id, workspace_key, seq, body, idem_key, delivered, injected_at_claim)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            rusqlite::params![
+                new_conversation_id(),
+                conversation_id,
+                self.workspace_id,
+                seq,
+                body,
+                idem_key,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(InjectOutcome::Enqueued)
+    }
+
+    /// Dequeue the next undelivered injected prompt for `conversation_id`,
+    /// marking it delivered in the SAME transaction — exactly-once even against
+    /// a racing writer (the `BEGIN IMMEDIATE` RESERVED lock serializes it).
+    /// Returns `Ok(None)` INSTANTLY on an empty inbox: a bounded, NON-BLOCKING
+    /// poll the REPL calls at each turn boundary (it never blocks on input).
+    /// Workspace-fenced.
+    pub fn take_injected_prompt(
+        &self,
+        conversation_id: &str,
+    ) -> anyhow::Result<Option<InjectedPrompt>> {
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let row: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT id, body, seq FROM conversation_inbox
+                  WHERE conversation_id = ?1 AND workspace_key = ?2 AND delivered = 0
+                  ORDER BY seq ASC LIMIT 1",
+                rusqlite::params![conversation_id, self.workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((id, body, seq)) = row else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE conversation_inbox SET delivered = 1 WHERE id = ?1",
+            [&id],
+        )?;
+        tx.commit()?;
+        Ok(Some(InjectedPrompt { id, body, seq }))
+    }
+
+    /// Record the durable turn a delivered injection became — the additive,
+    /// auditable "entered via web" proof. Lets the receipt itself stay
+    /// `origin='operator'`, so no `prompt_receipts` CHECK migration is needed.
+    pub fn link_inbox_delivery(&self, inbox_id: &str, receipt_id: &str) -> anyhow::Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE conversation_inbox SET delivered_receipt_id = ?2 WHERE id = ?1",
+            [inbox_id, receipt_id],
+        )?;
+        Ok(())
+    }
+
     /// The most-recently-active **open** conversation in this workspace —
     /// highest `activity_tick` whose `end_reason` is still NULL — or `None`
     /// when every conversation has been ended (or none exist). This is the
@@ -2749,7 +2867,29 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              pid                INTEGER NOT NULL,
              writer_fingerprint TEXT NOT NULL,
              heartbeat_tick     INTEGER NOT NULL
-         );",
+         );
+         -- A3 (W6) attach-inject inbox: prompts an ATTACH surface (newt-web)
+         -- enqueues for the RUNNING session to consume as its next turn. The
+         -- attach surface writes ONLY here — never a turn/claim — so the
+         -- claim-holding REPL stays the sole writer of the transcript (D2). A
+         -- brand-new table: `IF NOT EXISTS` creates it on every existing db, no
+         -- rebuild. `delivered_receipt_id` back-links the durable turn the
+         -- injection became (the additive, auditable 'entered via web' proof
+         -- that avoids a prompt_receipts CHECK migration).
+         CREATE TABLE IF NOT EXISTS conversation_inbox (
+             id                   TEXT PRIMARY KEY,
+             conversation_id      TEXT NOT NULL,
+             workspace_key        TEXT NOT NULL,          -- same fence every table carries
+             seq                  INTEGER NOT NULL,       -- per-conversation FIFO order (ASC)
+             body                 TEXT NOT NULL,          -- the injected prompt text
+             idem_key             TEXT,                   -- idempotency (double-submit / SSE reconnect)
+             delivered            INTEGER NOT NULL DEFAULT 0,
+             delivered_receipt_id TEXT,                   -- back-link → prompt_receipts.id
+             injected_at_claim    INTEGER NOT NULL,       -- DISPLAY ONLY (wall-clock, unix nanos)
+             UNIQUE(conversation_id, idem_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_conversation_inbox_poll
+             ON conversation_inbox (conversation_id, workspace_key, delivered, seq);",
     )?;
     Ok(())
 }
@@ -3311,6 +3451,29 @@ pub enum ClaimOutcome {
     /// A DIFFERENT, LIVE process owns it. The fields drive an honest message
     /// ("open in another newt, pid N on host H"); the caller must NOT attach.
     HeldBy { host: String, pid: i64 },
+}
+
+/// The outcome of [`ConversationStore::inject_prompt`] (A3/W6 attach-inject).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InjectOutcome {
+    /// A new inbox row was enqueued for the running session to consume.
+    Enqueued,
+    /// An `idem_key` match already existed — no new row (a safe retry / a
+    /// double-submit / an SSE reconnect that re-POSTed the same prompt).
+    Duplicate,
+}
+
+/// One dequeued injected prompt, from [`ConversationStore::take_injected_prompt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectedPrompt {
+    /// The inbox row id — pass to [`ConversationStore::link_inbox_delivery`]
+    /// once the turn's receipt is minted, to record what it became.
+    pub id: String,
+    /// The injected prompt text (becomes the turn's input, tagged as
+    /// web-injected so it is inert model text — never a host-shell escape).
+    pub body: String,
+    /// Per-conversation FIFO sequence (delivery order).
+    pub seq: i64,
 }
 
 /// Liveness oracle: is `owner` still a running process, as of `now`? Injectable
@@ -4680,6 +4843,87 @@ mod tests {
         // from ANOTHER workspace: re-open at B's path, load B's conversation.
         let follower = ConversationStore::new(root.path(), path_of(&b), 100).unwrap();
         assert_eq!(follower.load(&b).unwrap().title, "in B");
+    }
+
+    /// The A3/W6 attach-inject inbox: enqueue is FIFO and idempotent, dequeue is
+    /// exactly-once and non-blocking on empty, and both are workspace-fenced —
+    /// the properties the interactive-attach seam rests on (D2: the web writes
+    /// only the inbox; the REPL alone writes turns).
+    #[test]
+    fn inbox_inject_take_is_exactly_once_fifo_idempotent_and_fenced() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("session", None).unwrap();
+
+        // Empty inbox → non-blocking None (the REPL poll never stalls).
+        assert_eq!(store.take_injected_prompt(&conv).unwrap(), None);
+
+        // Enqueue two; dequeue FIFO, exactly-once.
+        assert_eq!(
+            store.inject_prompt(&conv, "first", None).unwrap(),
+            InjectOutcome::Enqueued
+        );
+        assert_eq!(
+            store.inject_prompt(&conv, "second", None).unwrap(),
+            InjectOutcome::Enqueued
+        );
+        assert_eq!(
+            store.take_injected_prompt(&conv).unwrap().unwrap().body,
+            "first"
+        );
+        assert_eq!(
+            store.take_injected_prompt(&conv).unwrap().unwrap().body,
+            "second"
+        );
+        assert_eq!(
+            store.take_injected_prompt(&conv).unwrap(),
+            None,
+            "drained exactly once"
+        );
+
+        // Idempotency: the same idem_key is a no-op, not a second enqueue.
+        assert_eq!(
+            store.inject_prompt(&conv, "again", Some("k1")).unwrap(),
+            InjectOutcome::Enqueued
+        );
+        assert_eq!(
+            store.inject_prompt(&conv, "again", Some("k1")).unwrap(),
+            InjectOutcome::Duplicate
+        );
+        assert_eq!(
+            store.take_injected_prompt(&conv).unwrap().unwrap().body,
+            "again"
+        );
+        assert_eq!(
+            store.take_injected_prompt(&conv).unwrap(),
+            None,
+            "the idem duplicate did not enqueue twice"
+        );
+
+        // link_inbox_delivery records the receipt back-link without error.
+        store.inject_prompt(&conv, "linked", None).unwrap();
+        let taken = store.take_injected_prompt(&conv).unwrap().unwrap();
+        store.link_inbox_delivery(&taken.id, "receipt-123").unwrap();
+
+        // Workspace fence: a store on ANOTHER workspace can neither inject into
+        // nor take from this conversation.
+        let ws_b = tempfile::tempdir().unwrap();
+        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+        assert!(
+            store_b.inject_prompt(&conv, "cross-ws", None).is_err(),
+            "cross-workspace inject is rejected"
+        );
+        store.inject_prompt(&conv, "mine", None).unwrap();
+        assert_eq!(
+            store_b.take_injected_prompt(&conv).unwrap(),
+            None,
+            "cross-workspace take sees nothing"
+        );
+        assert!(
+            store.take_injected_prompt(&conv).unwrap().is_some(),
+            "the owning workspace still dequeues it"
+        );
     }
 
     /// Ending is metadata, not activity: it must not tick the §6 clock (so it

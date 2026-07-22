@@ -77,6 +77,16 @@ enum ModelInputOrigin {
     HarnessRetry {
         parent: Box<newt_core::TurnPromptContext>,
     },
+    /// A prompt injected from an ATTACH surface (newt-web, A3/W6): the operator
+    /// typed it into a web/phone tab attached to this running session. Like
+    /// `HarnessRetry`, it is deliberately NOT operator input to the TUI — see
+    /// `is_operator` — so an injected `/exit` or `! rm ...` is inert model text,
+    /// never a host-shell escape, slash command, or readline-history entry. The
+    /// running REPL still mints the turn (D2 sole-writer); the web only enqueued
+    /// it in the store inbox. `inbox_id` back-links the delivered turn.
+    WebInjected {
+        inbox_id: String,
+    },
 }
 
 impl ModelInputOrigin {
@@ -262,6 +272,21 @@ fn begin_model_prompt(
                 model.to_vec(),
                 parent.submitted_prompt().id(),
             ),
+        ),
+        // A3/W6: a web-injected turn is minted by the RUNNING session (D2). The
+        // durable receipt is written as `operator` on purpose — a first-class
+        // `origin='web_injected'` would trip the prompt_receipts CHECK on every
+        // existing db; the auditable "entered via web" proof is recorded
+        // additively via `link_inbox_delivery` at the call site instead.
+        (Some(store), ModelInputOrigin::WebInjected { .. }) => store.begin_prompt(
+            conversation_id,
+            title,
+            persona,
+            newt_core::NewPrompt::operator(raw.to_vec(), model.to_vec()),
+        ),
+        (None, ModelInputOrigin::WebInjected { .. }) => ingress.ephemeral.begin_prompt(
+            conversation_id,
+            newt_core::NewPrompt::operator(raw.to_vec(), model.to_vec()),
         ),
     }
 }
@@ -1134,6 +1159,33 @@ pub(crate) fn run_chat(
                 ReadOutcome::Line(retry.text),
                 ModelInputOrigin::HarnessRetry {
                     parent: retry.parent,
+                },
+            )
+        } else if let Some(injected) = pending_clarification
+            .is_none()
+            .then(|| {
+                // A3/W6: a prompt injected from an ATTACH surface (newt-web) runs
+                // as this turn's input. take_injected_prompt is a bounded,
+                // NON-BLOCKING store poll — it returns None instantly on an empty
+                // inbox, so this never stalls the REPL. A BUSY/store error is
+                // swallowed (`.ok()`) so a transient db lock can NEVER kill the
+                // session; we simply fall through to the blocking read. Skipped
+                // while a clarification is pending so an injection can't orphan
+                // the bounded handoff (the row stays queued until it is answered).
+                conversation_store.as_ref().and_then(|s| {
+                    s.take_injected_prompt(&active_conversation_id)
+                        .ok()
+                        .flatten()
+                })
+            })
+            .flatten()
+        {
+            // A fresh turn: reset the re-prompt budget (as the read path does).
+            retry_budget = retry_max;
+            (
+                ReadOutcome::Line(injected.body),
+                ModelInputOrigin::WebInjected {
+                    inbox_id: injected.id,
                 },
             )
         } else {
@@ -2555,7 +2607,22 @@ pub(crate) fn run_chat(
                         task.as_bytes(),
                         &model_input_origin,
                     ) {
-                        Ok(context) => active_prompt_context = Some(context),
+                        Ok(context) => {
+                            // A3/W6: record the durable turn a web-injected prompt
+                            // became — the additive, auditable "entered via web"
+                            // proof (the receipt itself stays origin=operator, so
+                            // no CHECK migration). Best-effort: a link failure must
+                            // never abort a turn that was already durably minted.
+                            if let (ModelInputOrigin::WebInjected { inbox_id }, Some(store)) =
+                                (&model_input_origin, conversation_store.as_ref())
+                            {
+                                let _ = store.link_inbox_delivery(
+                                    inbox_id,
+                                    &context.submitted_prompt().id().to_string(),
+                                );
+                            }
+                            active_prompt_context = Some(context);
+                        }
                         Err(e) => {
                             active_prompt_context = None;
                             print_newt(
@@ -3975,6 +4042,73 @@ mod prompt_ingress_tests {
         assert!(record.turns.is_empty(), "ingress precedes turn completion");
         assert_eq!(record.title, "inspect src");
         assert_eq!(record.persona.as_deref(), Some("coder"));
+    }
+
+    /// A3/W6 end-to-end at the seam level: a prompt enqueued via the attach
+    /// API is dequeued and minted by the running session (D2), its durable
+    /// receipt stays `origin=operator` (so no prompt_receipts CHECK migration),
+    /// the inbox row is linked to that receipt, and — crucially — a web-injected
+    /// line is NOT operator input to the TUI (its `/exit`/`!rm` can never reach
+    /// the host-shell/slash/history gates).
+    #[test]
+    fn web_injected_prompt_mints_operator_receipt_and_is_inert_tui_input() {
+        // Containment: the load-bearing safety property.
+        let origin = ModelInputOrigin::WebInjected {
+            inbox_id: "ib-1".into(),
+        };
+        assert!(
+            !origin.is_operator(),
+            "a web-injected line must be inert model text, never TUI operator input"
+        );
+
+        let (_tmp, store, conversation_id) = prompt_store();
+        store
+            .create_with_id(&conversation_id, "attached session", None)
+            .unwrap();
+        // The attach surface enqueues; it never mints the turn.
+        store
+            .inject_prompt(&conversation_id, "fix the flaky test", Some("req-1"))
+            .unwrap();
+        let injected = store
+            .take_injected_prompt(&conversation_id)
+            .unwrap()
+            .expect("one queued prompt");
+        assert_eq!(injected.body, "fix the flaky test");
+
+        // The RUNNING session mints the turn (D2), durable origin = operator.
+        let ephemeral_prompts = newt_core::agentic::SessionPromptStore::default();
+        let context = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "attached session",
+            None,
+            injected.body.as_bytes(),
+            injected.body.as_bytes(),
+            &ModelInputOrigin::WebInjected {
+                inbox_id: injected.id.clone(),
+            },
+        )
+        .unwrap();
+        let submitted = context.submitted_prompt().receipt();
+        assert_eq!(
+            submitted.origin(),
+            newt_core::PromptOrigin::Operator,
+            "durable origin stays operator — no prompt_receipts CHECK migration"
+        );
+        submitted.verify_integrity().unwrap();
+
+        // Additive provenance + exactly-once drain.
+        store
+            .link_inbox_delivery(&injected.id, &submitted.id().to_string())
+            .unwrap();
+        assert_eq!(
+            store.take_injected_prompt(&conversation_id).unwrap(),
+            None,
+            "the inbox drained exactly once"
+        );
     }
 
     #[test]
