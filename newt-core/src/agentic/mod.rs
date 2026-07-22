@@ -2611,50 +2611,49 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 // host-exec timeout ceiling. `is_cancelled` between rounds still
                 // catches the abandoned turn; this closes the *during-a-tool*
                 // window that a foreground child on the tty used to wedge.
-                let Some(result) =
-                    tools::execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
-                        name,
-                        &args,
-                        workspace,
-                        color,
-                        tool_output_lines,
-                        caveats,
-                        mcp,
-                        build_check_cmd.as_deref(),
-                        // Reborrow + re-coerce: shortens the trait-object lifetime to
-                        // this call (Option<&mut dyn _> is invariant, so the longer
-                        // ChatCtx lifetime can't unify directly).
-                        note_sink
+                let Some(result) = tools::execute_tool_with_collaborators(
+                    name,
+                    &args,
+                    workspace,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    mcp,
+                    tools::ToolCollaborators {
+                        build_check_cmd: build_check_cmd.as_deref(),
+                        // Reborrow + re-coerce: shortens the trait-object
+                        // lifetime to this call (Option<&mut dyn _> is
+                        // invariant, so the longer ChatCtx lifetime can't
+                        // unify directly).
+                        note_sink: note_sink
                             .as_deref_mut()
                             .map(|s| &mut *s as &mut dyn NoteSink),
                         recall_source,
                         memory_source,
-                        Some(prompt_context),
+                        prompt_context: Some(prompt_context),
                         artifact_context,
                         artifact_sink,
-                        // #263 prompted grants — same reborrow pattern as note_sink.
-                        permission_gate
+                        // #263 prompted grants — same reborrow pattern.
+                        permission_gate: permission_gate
                             .as_deref_mut()
                             .map(|g| &mut *g as &mut dyn PermissionGate),
-                        // #307: the active preset's exec floor (the bypass ceiling).
                         exec_floor,
-                        // PR4: the injected embedded-git capability (None for headless).
                         git_tool,
-                        // #479: the injected crew/team orchestration (None for headless).
                         crew_runner,
                         scratchpad_store,
                         code_search,
                         where_is,
                         experience_store,
                         step_ledger,
-                        tool_offload,
                         spill_store,
                         persona_tools,
-                        prompt_disposition,
-                        live_tool_output.clone(),
-                        cancel,
-                    )
-                    .await
+                        live_tool_output: live_tool_output.clone(),
+                    },
+                    tool_offload,
+                    prompt_disposition,
+                    cancel,
+                )
+                .await
                 else {
                     return Ok((String::new(), false, accumulated_usage, hallucination_count));
                 };
@@ -5361,50 +5360,49 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
                 report
             } else {
-                let Some(result) =
-                    tools::execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
-                        name,
-                        &args,
-                        workspace,
-                        color,
-                        tool_output_lines,
-                        caveats,
-                        mcp,
-                        build_check_cmd.as_deref(),
-                        // Reborrow + re-coerce: shortens the trait-object lifetime to
-                        // this call (Option<&mut dyn _> is invariant, so the longer
-                        // ChatCtx lifetime can't unify directly).
-                        note_sink
+                let Some(result) = tools::execute_tool_with_collaborators(
+                    name,
+                    &args,
+                    workspace,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    mcp,
+                    tools::ToolCollaborators {
+                        build_check_cmd: build_check_cmd.as_deref(),
+                        // Reborrow + re-coerce: shortens the trait-object
+                        // lifetime to this call (Option<&mut dyn _> is
+                        // invariant, so the longer ChatCtx lifetime can't
+                        // unify directly).
+                        note_sink: note_sink
                             .as_deref_mut()
                             .map(|s| &mut *s as &mut dyn NoteSink),
                         recall_source,
                         memory_source,
-                        Some(prompt_context),
+                        prompt_context: Some(prompt_context),
                         artifact_context,
                         artifact_sink,
-                        // #263 prompted grants — same reborrow pattern as note_sink.
-                        permission_gate
+                        // #263 prompted grants — same reborrow pattern.
+                        permission_gate: permission_gate
                             .as_deref_mut()
                             .map(|g| &mut *g as &mut dyn PermissionGate),
-                        // #307: the active preset's exec floor (the bypass ceiling).
                         exec_floor,
-                        // PR4: the injected embedded-git capability (None for headless).
                         git_tool,
-                        // #479: the injected crew/team orchestration (None for headless).
                         crew_runner,
                         scratchpad_store,
                         code_search,
                         where_is,
                         experience_store,
                         step_ledger,
-                        tool_offload,
                         spill_store,
                         persona_tools,
-                        prompt_disposition,
-                        live_tool_output.clone(),
-                        cancel,
-                    )
-                    .await
+                        live_tool_output: live_tool_output.clone(),
+                    },
+                    tool_offload,
+                    prompt_disposition,
+                    cancel,
+                )
+                .await
                 else {
                     return Ok((String::new(), false, accumulated_usage, hallucination_count));
                 };
@@ -5982,25 +5980,30 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
                 report
             } else {
-                let Some(result) =
-                    tools::execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
-                        name,
-                        &args,
-                        workspace,
-                        color,
-                        tool_output_lines,
-                        caveats,
-                        mcp,
-                        build_check_cmd.as_deref(),
-                        note_sink
+                let Some(result) = tools::execute_tool_with_collaborators(
+                    name,
+                    &args,
+                    workspace,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    mcp,
+                    tools::ToolCollaborators {
+                        build_check_cmd: build_check_cmd.as_deref(),
+                        // Reborrow + re-coerce: shortens the trait-object
+                        // lifetime to this call (Option<&mut dyn _> is
+                        // invariant, so the longer ChatCtx lifetime can't
+                        // unify directly).
+                        note_sink: note_sink
                             .as_deref_mut()
                             .map(|s| &mut *s as &mut dyn NoteSink),
                         recall_source,
                         memory_source,
-                        Some(prompt_context),
+                        prompt_context: Some(prompt_context),
                         artifact_context,
                         artifact_sink,
-                        permission_gate
+                        // #263 prompted grants — same reborrow pattern.
+                        permission_gate: permission_gate
                             .as_deref_mut()
                             .map(|g| &mut *g as &mut dyn PermissionGate),
                         exec_floor,
@@ -6011,14 +6014,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         where_is,
                         experience_store,
                         step_ledger,
-                        tool_offload,
                         spill_store,
                         persona_tools,
-                        prompt_disposition,
-                        live_tool_output.clone(),
-                        cancel,
-                    )
-                    .await
+                        live_tool_output: live_tool_output.clone(),
+                    },
+                    tool_offload,
+                    prompt_disposition,
+                    cancel,
+                )
+                .await
                 else {
                     return Ok((String::new(), false, accumulated_usage, hallucination_count));
                 };
