@@ -8,9 +8,10 @@
 #                     one large GGUF resident on :8080. Registered modes below.
 #
 # Big-model modes (vLLM-off; each maps to a GGUF stem in ~/models/gguf/):
-#   super     -> nemotron-3-super_120b   (~86 GB)
-#   kimi-dev  -> kimi-dev_72b            (~54 GB, coding)
-#   big <stem>-> any stem you name
+#   super       -> nemotron-3-super_120b   (~86 GB)
+#   kimi-dev    -> kimi-dev_72b            (~54 GB, coding)
+#   kimi-linear -> kimi-linear_48b         (~30 GB; above the co-host budget)
+#   big <stem>  -> any stem you name
 #
 # Usage: llm-mode.sh {status|list|ornith|super|kimi-dev|big <stem>}
 #
@@ -30,6 +31,7 @@ VLLM_OUT="/home/hartsock/ornith.out"
 declare -A BIG=(
   [super]="nemotron-3-super_120b"
   [kimi-dev]="kimi-dev_72b"
+  [kimi-linear]="kimi-linear_48b"
 )
 
 say(){ echo "$(date +%H:%M:%S) [llm-mode] $*"; }
