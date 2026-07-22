@@ -34,6 +34,7 @@ fn app() -> Router {
             }),
         )
         .route("/agents", post(spawn_agent))
+        .route("/follow", post(follow_session))
         .route("/agents/:id/panel", get(agent_panel_route))
         .route("/agents/:id/prompt", post(prompt_agent))
         .route("/agents/:id/events", get(agent_events))
@@ -67,7 +68,13 @@ async fn spawn_agent(
         kind,
         workspace: form.workspace,
     });
-    let panel = shell::agent_panel(id, &form.name, &form.model, &agents::Snapshot::default());
+    let panel = shell::agent_panel(
+        id,
+        &form.name,
+        &form.model,
+        false,
+        &agents::Snapshot::default(),
+    );
     let strip = shell::tab_strip(&reg.list(), Some(id));
     Html(format!("{panel}\n{strip}"))
 }
@@ -79,11 +86,11 @@ async fn agent_panel_route(
     Path(id): Path<u64>,
 ) -> Result<Html<String>, StatusCode> {
     let agents = reg.list();
-    let (aid, name, model, snap) = agents
+    let (aid, name, model, readonly, snap) = agents
         .iter()
         .find(|(aid, ..)| *aid == id)
         .ok_or(StatusCode::NOT_FOUND)?;
-    let panel = shell::agent_panel(*aid, name, model, snap);
+    let panel = shell::agent_panel(*aid, name, model, *readonly, snap);
     let strip = shell::tab_strip(&agents, Some(id));
     Ok(Html(format!("{panel}\n{strip}")))
 }
@@ -146,6 +153,77 @@ async fn agent_events(
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Where the shared conversation store lives (W4). Env-driven so the
+/// deployment points at the box's real state dir; tests point at a tempdir.
+fn store_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let state = std::env::var("NEWT_WEB_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".newt")
+        });
+    let ws = std::env::var("NEWT_WEB_WORKSPACE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    (state, ws)
+}
+
+/// The "sessions on this box" section: conversations in the shared store,
+/// each followable read-only (W4). Store errors render as an empty section —
+/// the cockpit must not die because the store isn't there yet.
+pub(crate) async fn sessions_section() -> String {
+    let (state, ws) = store_paths();
+    let list = tokio::task::spawn_blocking(move || {
+        newt_core::ConversationStore::new(&state, &ws, 1000)
+            .and_then(|s| s.list())
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    if list.is_empty() {
+        return String::new();
+    }
+    let mut out =
+        String::from(r#"<details class="sessions"><summary>sessions on this box</summary><ul>"#);
+    for c in list.iter().take(20) {
+        out.push_str(&format!(
+            r##"<li>{title} <small>({n} turns)</small>
+<form style="display:inline" hx-post="/follow" hx-target="#panel" hx-swap="innerHTML">
+<input type="hidden" name="conv_id" value="{id}"><input type="hidden" name="title" value="{title}">
+<button>follow</button></form></li>"##,
+            title = shell::escape(&c.title),
+            n = c.turn_count,
+            id = shell::escape(&c.id),
+        ));
+    }
+    out.push_str("</ul></details>");
+    out
+}
+
+#[derive(serde::Deserialize)]
+struct FollowForm {
+    conv_id: String,
+    title: String,
+}
+
+/// POST /follow — open a read-only store-follow tab (W4).
+async fn follow_session(
+    State(reg): State<Arc<Registry>>,
+    Form(form): Form<FollowForm>,
+) -> Html<String> {
+    let (state, ws) = store_paths();
+    let id = reg.spawn_follow(state, ws, form.conv_id, form.title.clone());
+    let panel = shell::agent_panel(
+        id,
+        &form.title,
+        "follow",
+        true,
+        &agents::Snapshot::default(),
+    );
+    let strip = shell::tab_strip(&reg.list(), Some(id));
+    Html(format!("{panel}\n{strip}"))
 }
 
 #[tokio::main]
@@ -334,12 +412,14 @@ mod tests {
 
     /// The shell golden — #1319 discipline (missing-fails, double-render
     /// determinism, negative control). The W2 shell adds the spawn form.
+    #[serial_test::serial(newt_web_env)]
     #[tokio::test]
     async fn shell_matches_its_golden() {
         // Pin the env-derived form defaults so the golden is machine-independent.
         std::env::remove_var("NEWT_WEB_BACKEND_URL");
         std::env::remove_var("NEWT_WEB_MODEL");
         std::env::remove_var("NEWT_WEB_WORKSPACE");
+        std::env::remove_var("NEWT_WEB_STATE_DIR");
         let (status, a) = req(&app(), "GET", "/", None).await;
         assert_eq!(status, StatusCode::OK);
         let (_, b) = req(&app(), "GET", "/", None).await;
@@ -444,6 +524,56 @@ mod tests {
             p2.contains("agent-2") && p2.contains("hx-swap-oob"),
             "panel + OOB strip"
         );
+    }
+
+    /// W4 acceptance (BAT tier — a real store in a tempdir stands in for the
+    /// box's shared db): a conversation written by ANOTHER writer becomes a
+    /// followable read-only tab whose panel mirrors new turns; prompts are
+    /// refused (D2: the running session stays the sole writer).
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_follow_mirrors_a_conversation_read_only() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::env::set_var("NEWT_WEB_STATE_DIR", state.path());
+        std::env::set_var("NEWT_WEB_WORKSPACE", ws.path());
+
+        // Another process's session writes a turn.
+        let store = newt_core::ConversationStore::new(state.path(), ws.path(), 100).unwrap();
+        let conv = store.create("terminal session", None).unwrap();
+        store
+            .append_turn(&conv, "hello from the terminal", "hi from the model")
+            .unwrap();
+
+        let app = app();
+        // The sessions section lists it.
+        let (_, body) = req(&app, "GET", "/", None).await;
+        assert!(body.contains("terminal session"), "session listed: {body}");
+        // Follow it.
+        let form = format!("conv_id={conv}&title=terminal+session");
+        let (status, panel) = req(&app, "POST", "/follow", Some(&form)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            panel.contains("read-only follow"),
+            "readonly badge: {panel}"
+        );
+        // The mirror catches up with the existing turn...
+        let p = wait_for_path(&app, "/agents/1/panel", "hi from the model").await;
+        assert!(p.contains("hello from the terminal"));
+        // ...and with turns appended AFTER the follow began.
+        store
+            .append_turn(&conv, "second question", "second answer")
+            .unwrap();
+        wait_for_path(&app, "/agents/1/panel", "second answer").await;
+        // Prompts are refused on a follow (the session owns the claim).
+        let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=hijack")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "readonly tab refuses prompts"
+        );
+        std::env::remove_var("NEWT_WEB_STATE_DIR");
+        std::env::remove_var("NEWT_WEB_WORKSPACE");
     }
 
     /// Poll an arbitrary GET path until `needle` appears.

@@ -63,16 +63,19 @@ pub(crate) fn transcript_fragment(snap: &Snapshot) -> String {
 
 /// One agent's panel: header, live transcript, prompt form, and the
 /// EventSource hook feeding the transcript from `/agents/{id}/events`.
-pub(crate) fn agent_panel(id: u64, name: &str, model: &str, snap: &Snapshot) -> String {
+pub(crate) fn agent_panel(
+    id: u64,
+    name: &str,
+    model: &str,
+    readonly: bool,
+    snap: &Snapshot,
+) -> String {
     format!(
         r##"<section class="agent" id="agent-{id}">
 <h2><span>{name} <small>({model})</small></span>
 <button hx-delete="/agents/{id}" hx-target="#panel" hx-swap="innerHTML">✕</button></h2>
 <div class="transcript" id="transcript-{id}">{fragment}</div>
-<form class="prompt" hx-post="/agents/{id}/prompt" hx-swap="none" hx-on::after-request="this.reset()">
-<input name="text" placeholder="prompt…" autocomplete="off" required>
-<button>send</button>
-</form>
+{prompt_form}
 <script>
 (function () {{
   var es = new EventSource("/agents/{id}/events");
@@ -88,6 +91,16 @@ pub(crate) fn agent_panel(id: u64, name: &str, model: &str, snap: &Snapshot) -> 
         name = escape(name),
         model = escape(model),
         fragment = transcript_fragment(snap),
+        prompt_form = if readonly {
+            r#"<p class="empty" style="padding:0.5rem 0.75rem">read-only follow — the running session owns this conversation (D2)</p>"#.to_string()
+        } else {
+            format!(
+                r##"<form class="prompt" hx-post="/agents/{id}/prompt" hx-swap="none" hx-on::after-request="this.reset()">
+<input name="text" placeholder="prompt…" autocomplete="off" required>
+<button>send</button>
+</form>"##
+            )
+        },
     )
 }
 
@@ -97,15 +110,24 @@ pub(crate) fn agent_panel(id: u64, name: &str, model: &str, snap: &Snapshot) -> 
 /// registry. Switching tabs replaces the panel, which closes the old panel's
 /// EventSource (its transcript node vanishes) and opens the new one — the
 /// per-view attach/detach the ladder asks for.
-pub(crate) fn tab_strip(agents: &[(u64, String, String, Snapshot)], active: Option<u64>) -> String {
+pub(crate) fn tab_strip(
+    agents: &[(u64, String, String, bool, Snapshot)],
+    active: Option<u64>,
+) -> String {
     let mut out = String::from(r#"<nav id="tabs" hx-swap-oob="true">"#);
-    for (id, name, _model, snap) in agents {
+    for (id, name, _model, readonly, snap) in agents {
         let class = if Some(*id) == active {
             " class=\"active\""
         } else {
             ""
         };
-        let dot = if snap.busy { "● " } else { "" };
+        let dot = if snap.busy {
+            "● "
+        } else if *readonly {
+            "◫ "
+        } else {
+            ""
+        };
         out.push_str(&format!(
             r##"<button{class} hx-get="/agents/{id}/panel" hx-target="#panel" hx-swap="innerHTML">{dot}{name}</button>"##,
             class = class,
@@ -129,9 +151,10 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
     let active = agents.first().map(|(id, ..)| *id);
     let strip = tab_strip(&agents, active).replace(r#" hx-swap-oob="true""#, ""); // in-page render, not OOB
     let panel = match agents.first() {
-        Some((id, name, model, snap)) => agent_panel(*id, name, model, snap),
+        Some((id, name, model, readonly, snap)) => agent_panel(*id, name, model, *readonly, snap),
         None => r#"<p class="empty">No agents yet. Spawn one above.</p>"#.to_string(),
     };
+    let sessions = crate::sessions_section().await;
 
     Html(format!(
         r##"<!doctype html>
@@ -154,6 +177,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <label>workspace<input name="workspace" value="{ws}" required></label>
 <button>spawn</button>
 </form>
+{sessions}
 {strip}
 <div id="panel">{panel}</div>
 </main>
@@ -164,6 +188,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
         url = escape(&default_url),
         model = escape(&default_model),
         ws = escape(&default_ws),
+        sessions = sessions,
         strip = strip,
         panel = panel,
     ))
