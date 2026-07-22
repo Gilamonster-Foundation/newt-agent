@@ -1,21 +1,130 @@
 //! newt-web — the HTMX web cockpit (#1331, decision record
 //! `docs/decisions/newt_web_htmx.md`).
 //!
-//! W1 scaffold: the server shell. Tabs/agents arrive in W2+; this rung is the
-//! bindable surface + its characterization golden, so every later rung lands
-//! against a pinned baseline. Composition only: newt-web owns no agent logic —
-//! agents are driven through `newt_core::TurnDriver` (W2) and followed through
-//! the shared `ConversationStore` (W4).
+//! W2: spawn-and-drive. Agents are `TurnDriver`s owned by pump tasks
+//! (`agents.rs`); the front end is server-rendered HTML (`shell.rs`); this
+//! file is the composition root — routes, state, and the SSE bridge only.
 
-use axum::routing::get;
-use axum::Router;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{Html, IntoResponse};
+use axum::routing::{get, post};
+use axum::{Form, Router};
+use std::convert::Infallible;
+use std::sync::Arc;
 
+mod agents;
 mod shell;
 
+use agents::{Registry, Spec};
+
 fn app() -> Router {
+    let reg = Arc::new(Registry::default());
     Router::new()
         .route("/", get(shell::index))
         .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/assets/htmx.min.js",
+            get(|| async {
+                (
+                    [("content-type", "text/javascript")],
+                    include_str!("../assets/htmx.min.js"),
+                )
+            }),
+        )
+        .route("/agents", post(spawn_agent))
+        .route("/agents/:id/prompt", post(prompt_agent))
+        .route("/agents/:id/events", get(agent_events))
+        .route("/agents/:id", axum::routing::delete(delete_agent))
+        .with_state(reg)
+}
+
+#[derive(serde::Deserialize)]
+struct SpawnForm {
+    name: String,
+    url: String,
+    model: String,
+    kind: String,
+    workspace: String,
+}
+
+/// POST /agents — spawn, and return the new panel fragment (HTMX appends it).
+async fn spawn_agent(
+    State(reg): State<Arc<Registry>>,
+    Form(form): Form<SpawnForm>,
+) -> Html<String> {
+    let kind = match form.kind.as_str() {
+        "openai" => newt_core::BackendKind::Openai,
+        _ => newt_core::BackendKind::Ollama,
+    };
+    let id = reg.spawn(Spec {
+        name: form.name.clone(),
+        url: form.url,
+        model: form.model.clone(),
+        kind,
+        workspace: form.workspace,
+    });
+    Html(shell::agent_panel(
+        id,
+        &form.name,
+        &form.model,
+        &agents::Snapshot::default(),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct PromptForm {
+    text: String,
+}
+
+/// POST /agents/:id/prompt — submit a prompt; 204 (the SSE stream carries the
+/// visible effect), 404 for an unknown agent.
+async fn prompt_agent(
+    State(reg): State<Arc<Registry>>,
+    Path(id): Path<u64>,
+    Form(form): Form<PromptForm>,
+) -> StatusCode {
+    if reg.prompt(id, form.text) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// DELETE /agents/:id — shut the agent down; HTMX swaps the panel away with
+/// the empty body.
+async fn delete_agent(State(reg): State<Arc<Registry>>, Path(id): Path<u64>) -> impl IntoResponse {
+    if reg.remove(id) {
+        (StatusCode::OK, Html(String::new()))
+    } else {
+        (StatusCode::NOT_FOUND, Html(String::new()))
+    }
+}
+
+/// GET /agents/:id/events — the SSE bridge: one event per snapshot change,
+/// carrying the rendered transcript fragment. Ends when the agent closes.
+async fn agent_events(
+    State(reg): State<Arc<Registry>>,
+    Path(id): Path<u64>,
+) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let mut rx = reg.subscribe(id).ok_or(StatusCode::NOT_FOUND)?;
+    let stream = async_stream::stream! {
+        // Initial frame so a late subscriber renders current state at once.
+        let mut last = rx.borrow().clone();
+        yield Ok(Event::default().data(shell::transcript_fragment(&last)));
+        loop {
+            if last.closed {
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+            last = rx.borrow().clone();
+            yield Ok(Event::default().data(shell::transcript_fragment(&last)));
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 #[tokio::main]
@@ -37,38 +146,182 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
 
-    async fn get_body(path: &str) -> (axum::http::StatusCode, String) {
-        let resp = app()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(path)
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    async fn req(
+        app: &Router,
+        method: &str,
+        path: &str,
+        form: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut b = axum::http::Request::builder().method(method).uri(path);
+        let body = match form {
+            Some(f) => {
+                b = b.header("content-type", "application/x-www-form-urlencoded");
+                axum::body::Body::from(f.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let resp = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// Poll the index until `needle` appears (the pump publishes async).
+    async fn wait_for(app: &Router, needle: &str) -> String {
+        for _ in 0..100 {
+            let (_, body) = req(app, "GET", "/", None).await;
+            if body.contains(needle) {
+                return body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (_, body) = req(app, "GET", "/", None).await;
+        panic!("never saw {needle:?}; last body:\n{body}");
+    }
+
     #[tokio::test]
     async fn healthz_is_ok() {
-        let (status, body) = get_body("/healthz").await;
-        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, body) = req(&app(), "GET", "/healthz", None).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok");
     }
 
-    /// The shell golden — the #1319 characterization discipline applied to the
-    /// web surface from birth: a MISSING golden fails (never silently passes),
-    /// the render must agree with itself (double-render determinism), and the
-    /// negative control proves the comparator rejects a perturbed expectation.
-    /// Update intentionally: NEWT_GOLDEN_UPDATE=1 cargo test, commit the file.
+    #[tokio::test]
+    async fn htmx_asset_is_served() {
+        let (status, body) = req(&app(), "GET", "/assets/htmx.min.js", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("htmx"), "vendored htmx served");
+    }
+
+    /// The W2 acceptance: spawn → prompt → a full mocked turn lands in the
+    /// transcript (wiremock ollama, the TurnDriver test shape) — through the
+    /// web seam end to end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_prompt_and_the_turn_lands_in_the_transcript() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock-llama",
+                "message": { "role": "assistant", "content": "REPLY-FROM-MOCK" },
+                "done": true,
+            })))
+            .mount(&mock)
+            .await;
+
+        let app = app();
+        let form = format!(
+            "name=t1&url={}&model=mock-llama&kind=ollama&workspace=.",
+            urlencode(&mock.uri())
+        );
+        let (status, panel) = req(&app, "POST", "/agents", Some(&form)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            panel.contains("agent-1"),
+            "panel fragment returned: {panel}"
+        );
+
+        let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=say+hi")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let body = wait_for(&app, "REPLY-FROM-MOCK").await;
+        assert!(body.contains("say hi"), "user prompt rendered");
+    }
+
+    /// The SSE bridge serves an event stream whose first frame is the current
+    /// transcript fragment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn events_stream_opens_with_the_current_fragment() {
+        let app = app();
+        let form = "name=t2&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.";
+        let (status, _) = req(&app, "POST", "/agents", Some(form)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/agents/1/events")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+            .await
+            .expect("first SSE frame within 5s")
+            .expect("stream not ended")
+            .expect("frame ok");
+        let text = String::from_utf8_lossy(frame.data_ref().expect("data frame"));
+        assert!(text.starts_with("data:"), "SSE frame: {text}");
+        assert!(text.contains("No turns yet"), "initial fragment: {text}");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_agent_and_unknown_ids_404() {
+        let app = app();
+        let form = "name=t3&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.";
+        req(&app, "POST", "/agents", Some(form)).await;
+        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=x")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Web hygiene regression: model/user text renders ESCAPED — a transcript
+    /// can never inject markup into the cockpit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transcript_content_is_html_escaped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "m",
+                "message": { "role": "assistant", "content": "<script>alert(1)</script>" },
+                "done": true,
+            })))
+            .mount(&mock)
+            .await;
+        let app = app();
+        let form = format!(
+            "name=x&url={}&model=m&kind=ollama&workspace=.",
+            urlencode(&mock.uri())
+        );
+        req(&app, "POST", "/agents", Some(&form)).await;
+        req(&app, "POST", "/agents/1/prompt", Some("text=go")).await;
+        let body = wait_for(&app, "alert(1)").await;
+        assert!(
+            body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "reply is escaped"
+        );
+        assert!(
+            !body.contains("<script>alert(1)</script>"),
+            "raw script tag must never render"
+        );
+    }
+
+    /// The shell golden — #1319 discipline (missing-fails, double-render
+    /// determinism, negative control). The W2 shell adds the spawn form.
     #[tokio::test]
     async fn shell_matches_its_golden() {
-        let (status, a) = get_body("/").await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        let (_, b) = get_body("/").await;
+        // Pin the env-derived form defaults so the golden is machine-independent.
+        std::env::remove_var("NEWT_WEB_BACKEND_URL");
+        std::env::remove_var("NEWT_WEB_MODEL");
+        std::env::remove_var("NEWT_WEB_WORKSPACE");
+        let (status, a) = req(&app(), "GET", "/", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, b) = req(&app(), "GET", "/", None).await;
         assert_eq!(a, b, "shell render is nondeterministic");
 
         let path =
@@ -89,8 +342,11 @@ mod tests {
             expected, a,
             "shell golden MISMATCH — re-baseline intentionally"
         );
-        // Negative control: the comparator must reject a perturbation.
         let perturbed = format!("{a}\nPERTURBED-MUST-FAIL");
         assert_ne!(expected, perturbed, "negative control failed to fail");
+    }
+
+    fn urlencode(s: &str) -> String {
+        s.replace(':', "%3A").replace('/', "%2F")
     }
 }
