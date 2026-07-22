@@ -13,6 +13,12 @@ publish = false
 newt-core = { path = "../newt-core" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# Markdown for the transcript: the same engine Scrybe's scrybe-render uses
+# (pulldown-cmark, all extensions) so output matches. ammonia is the piece
+# Scrybe omits and a web surface MUST have — the transcript carries UNTRUSTED
+# model output, so the generated HTML is allowlist-sanitized before it ships.
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+ammonia = "4"
 serde = { version = "1", features = ["derive"] }
 async-stream = "0.3"
 futures-core = "0.3"
