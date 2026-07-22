@@ -169,7 +169,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <body>
 <header><h1>newt-web</h1></header>
 <main id="content">
-<form class="spawn" hx-post="/agents" hx-target="#agents" hx-swap="beforeend">
+<form class="spawn" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
 <label>name<input name="name" value="agent" required></label>
 <label>backend url<input name="url" value="{url}" required></label>
 <label>model<input name="model" value="{model}" required></label>
