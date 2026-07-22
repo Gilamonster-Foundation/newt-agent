@@ -88,7 +88,16 @@ spec:
         - name: api-keys
           secret: { secretName: drake-api-keys, defaultMode: 288, optional: true }
         - name: authorized-keys
-          secret: { secretName: drake-interactive-keys, defaultMode: 256 }
+          # 0444 (world-readable): sshd opens AuthorizedKeysFile AS the drake
+          # user (it drops privileges first), but drake is only in group `drake`
+          # while fsGroup:100 lands this Secret as root:users — so 0400/0440
+          # left drake unable to read its own authorized_keys and EVERY key was
+          # refused ("Could not open ... authorized keys: Permission denied").
+          # authorized_keys holds only PUBLIC keys, so world-read is safe and
+          # StrictModes (which forbids group/other WRITE, not read) still passes.
+          # Do NOT widen drake's groups instead: the host PRIVATE key mounts
+          # root:users too, and that must stay unreadable to the agent user.
+          secret: { secretName: drake-interactive-keys, defaultMode: 292 }
         - name: hostkeys
           secret: { secretName: drake-interactive-hostkeys, defaultMode: 384 }
         - name: scratch
