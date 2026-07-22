@@ -37,6 +37,8 @@ fn app() -> Router {
         .route("/follow", post(follow_session))
         .route("/agents/:id/panel", get(agent_panel_route))
         .route("/agents/:id/prompt", post(prompt_agent))
+        .route("/agents/:id/pending", get(pending_decision_route))
+        .route("/agents/:id/decision", post(decide_route))
         .route("/agents/:id/events", get(agent_events))
         .route("/agents/:id", axum::routing::delete(delete_agent))
         .with_state(reg)
@@ -131,6 +133,74 @@ async fn prompt_agent(
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
+    }
+}
+
+/// GET /agents/:id/pending — the pending permission decision for an attach tab
+/// (A4/W6), or empty when there is none. The attach panel polls this; when the
+/// running session's gate publishes a decision, the card appears with buttons.
+async fn pending_decision_route(
+    State(reg): State<Arc<Registry>>,
+    Path(id): Path<u64>,
+) -> Html<String> {
+    let Some(attach) = reg.attach_of(id) else {
+        return Html(String::new());
+    };
+    let (state, _) = store_paths();
+    let conv = attach.conv_id.clone();
+    let pending = tokio::task::spawn_blocking(move || {
+        newt_core::ConversationStore::new(&state, &attach.workspace, 1000)
+            .and_then(|s| s.pending_permission_request(&conv))
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten();
+    Html(match pending {
+        Some(p) => shell::pending_permission_card(id, &p),
+        None => String::new(),
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct DecisionForm {
+    request_id: String,
+    verdict: String,
+}
+
+/// POST /agents/:id/decision — answer a pending permission decision (A4/W6).
+/// The web NAMES a verdict; the running gate mints the caveats (the web never
+/// carries authority). A web grant is ephemeral — there is no durable
+/// "always-allow" (that is terminal-audit-only). 204 on accept, 404 for a tab
+/// that isn't an attach tab.
+async fn decide_route(
+    State(reg): State<Arc<Registry>>,
+    Path(id): Path<u64>,
+    Form(form): Form<DecisionForm>,
+) -> StatusCode {
+    let Some(attach) = reg.attach_of(id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    let verdict = match form.verdict.as_str() {
+        "allow_once" => newt_core::Verdict::AllowOnce,
+        "allow_session" => newt_core::Verdict::AllowSession,
+        _ => newt_core::Verdict::Deny,
+    };
+    let (state, _) = store_paths();
+    let conv = attach.conv_id.clone();
+    let request_id = form.request_id;
+    let ok = tokio::task::spawn_blocking(move || {
+        newt_core::ConversationStore::new(&state, &attach.workspace, 1000)
+            .and_then(|s| s.answer_permission_request(&conv, &request_id, verdict))
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if ok {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
@@ -654,6 +724,75 @@ mod tests {
             store.load(&conv).unwrap().turns.len(),
             2,
             "D2: injecting never writes a turn (still the two the session wrote)"
+        );
+        std::env::remove_var("NEWT_WEB_STATE_DIR");
+        std::env::remove_var("NEWT_WEB_WORKSPACE");
+    }
+
+    /// A4/W6 web half: an attach tab renders a pending permission decision the
+    /// running gate published, danger-gated (a HIGH-danger target offers only
+    /// allow-once/deny — never a standing session grant), and answering it
+    /// records the verdict the gate then consumes. The web NAMES a verdict; it
+    /// never writes caveats.
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_tab_renders_and_answers_a_danger_gated_permission_decision() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::env::set_var("NEWT_WEB_STATE_DIR", state.path());
+        std::env::set_var("NEWT_WEB_WORKSPACE", ws.path());
+        let store = newt_core::ConversationStore::new(state.path(), ws.path(), 100).unwrap();
+        let conv = store.create("ssh session", None).unwrap();
+        store.append_turn(&conv, "hi", "hello").unwrap();
+
+        let app = app();
+        let form = format!(
+            "conv_id={conv}&title=s&workspace={}",
+            urlencode(&ws.path().to_string_lossy())
+        );
+        req(&app, "POST", "/follow", Some(&form)).await;
+
+        // Nothing pending yet → empty.
+        let (_, empty) = req(&app, "GET", "/agents/1/pending", None).await;
+        assert!(
+            empty.trim().is_empty(),
+            "no card before a request: {empty:?}"
+        );
+
+        // The running gate publishes a HIGH-danger request.
+        let req_json = serde_json::to_string(&newt_core::PermissionRequest {
+            tool: "run_command".into(),
+            kind: newt_core::DenialKind::Exec,
+            target: "bash".into(),
+            reason: "needs a shell".into(),
+        })
+        .unwrap();
+        let rid = store
+            .publish_permission_request(&conv, &req_json, "\"high\"")
+            .unwrap();
+
+        // The card renders — allow-once + deny, but NOT allow-session (high).
+        let (_, card) = req(&app, "GET", "/agents/1/pending", None).await;
+        assert!(card.contains("Permission needed"), "card: {card}");
+        assert!(card.contains("<code>bash</code>"), "target shown: {card}");
+        assert!(
+            card.contains(r#"verdict":"allow_once"#),
+            "allow-once offered"
+        );
+        assert!(card.contains(r#"verdict":"deny"#), "deny offered");
+        assert!(
+            !card.contains("allow_session"),
+            "high-danger must NOT offer a standing session grant: {card}"
+        );
+
+        // Answer allow-once → 204, and the gate's poll takes exactly that.
+        let dform = format!("request_id={rid}&verdict=allow_once");
+        let (status, _) = req(&app, "POST", "/agents/1/decision", Some(&dform)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            store.take_permission_decision(&conv, &rid).unwrap(),
+            Some(newt_core::Verdict::AllowOnce),
+            "the gate consumes the web verdict"
         );
         std::env::remove_var("NEWT_WEB_STATE_DIR");
         std::env::remove_var("NEWT_WEB_WORKSPACE");

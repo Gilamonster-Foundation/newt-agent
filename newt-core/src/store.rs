@@ -1464,6 +1464,175 @@ impl ConversationStore {
         Ok(())
     }
 
+    // ---- A4 (W6) permission-decision channel -------------------------------
+    // The RUNNING gate (the sole authority minter) PUBLISHES a pending decision;
+    // an ATTACH surface RENDERS it and ANSWERS a VERDICT (never caveats); the
+    // gate RACES that answer against the TTY and RESOLVES it exactly-once. Same
+    // one-BEGIN-IMMEDIATE, workspace-fenced discipline as the A3 inbox.
+
+    /// Publish a pending permission decision for the attach surface to render.
+    /// `requests_json` is a serialized `&[PermissionRequest]`; `danger_json` is
+    /// the GATE-STAMPED per-target tier (the web never classifies danger).
+    /// Returns an unguessable `request_id` the gate polls and the web echoes.
+    /// Workspace-fenced like [`begin_prompt`]; the caller must own the claim.
+    pub fn publish_permission_request(
+        &self,
+        conversation_id: &str,
+        requests_json: &str,
+        danger_json: &str,
+    ) -> anyhow::Result<String> {
+        validate_record_id(conversation_id)?;
+        let now = (self.claim_clock)();
+        let request_id = new_conversation_id();
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT workspace_key FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match owner.as_deref() {
+            None => anyhow::bail!(
+                "cannot publish a permission request for unknown conversation `{conversation_id}`"
+            ),
+            Some(key) if key != self.workspace_id => {
+                anyhow::bail!("conversation `{conversation_id}` belongs to another workspace")
+            }
+            _ => {}
+        }
+        tx.execute(
+            "INSERT INTO permission_requests
+               (request_id, conversation_id, workspace_key, requests_json, danger_json, resolved, created_tick)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            rusqlite::params![
+                request_id,
+                conversation_id,
+                self.workspace_id,
+                requests_json,
+                danger_json,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(request_id)
+    }
+
+    /// The unresolved pending decision for `conversation_id`, if any — what the
+    /// attach surface renders (request_id + the serialized requests + the
+    /// gate-stamped danger). Workspace-fenced, non-blocking read.
+    pub fn pending_permission_request(
+        &self,
+        conversation_id: &str,
+    ) -> anyhow::Result<Option<PendingPermission>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT request_id, requests_json, danger_json FROM permission_requests
+              WHERE conversation_id = ?1 AND workspace_key = ?2 AND resolved = 0 AND verdict IS NULL
+              ORDER BY created_tick ASC LIMIT 1",
+            rusqlite::params![conversation_id, self.workspace_id],
+            |row| {
+                Ok(PendingPermission {
+                    request_id: row.get(0)?,
+                    requests_json: row.get(1)?,
+                    danger_json: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Record a surface's VERDICT for a pending request (the web calls this).
+    /// Idempotent on `request_id`: a double-submit / SSE reconnect that names
+    /// the same still-unresolved request is a safe no-op. Workspace-fenced.
+    /// This does NOT resolve the request — the gate's poll consumes it (so a
+    /// TTY answer can still win the race first).
+    pub fn answer_permission_request(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+        verdict: Verdict,
+    ) -> anyhow::Result<AnswerOutcome> {
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let state: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT resolved, verdict FROM permission_requests
+                  WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3",
+                rusqlite::params![request_id, conversation_id, self.workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let outcome = match state {
+            None => AnswerOutcome::Unknown,
+            Some((1, _)) | Some((_, Some(_))) => AnswerOutcome::AlreadyResolved,
+            Some((_, None)) => {
+                tx.execute(
+                    "UPDATE permission_requests SET verdict = ?2, answered_by = 'web'
+                      WHERE request_id = ?1 AND resolved = 0 AND verdict IS NULL",
+                    rusqlite::params![request_id, verdict.as_db_str()],
+                )?;
+                AnswerOutcome::Answered
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// The gate's poll: if a surface has answered `request_id` and it is still
+    /// unresolved, RESOLVE it (exactly-once) and return the verdict. Returns
+    /// `Ok(None)` instantly when no answer is waiting — a bounded, non-blocking
+    /// poll the gate calls each tick while also watching the TTY.
+    pub fn take_permission_decision(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+    ) -> anyhow::Result<Option<Verdict>> {
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let verdict: Option<String> = tx
+            .query_row(
+                "SELECT verdict FROM permission_requests
+                  WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3
+                    AND resolved = 0 AND verdict IS NOT NULL",
+                rusqlite::params![request_id, conversation_id, self.workspace_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(v) = verdict else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE permission_requests SET resolved = 1 WHERE request_id = ?1",
+            [request_id],
+        )?;
+        tx.commit()?;
+        Ok(Verdict::from_db_str(&v))
+    }
+
+    /// The gate RESOLVES a request itself (the TTY answered, or the deadline
+    /// fired) — a CAS that flips `resolved` 0→1 only if still unresolved.
+    /// Returns `true` if THIS call won (the TTY/timeout beat any web answer);
+    /// `false` means a web answer already resolved it (its verdict stands, and
+    /// the caller must discard the TTY/timeout choice). `by` is 'tty'|'expired'.
+    pub fn resolve_permission_request(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+        by: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.lock_conn();
+        let changed = conn.execute(
+            "UPDATE permission_requests SET resolved = 1, answered_by = ?3
+              WHERE request_id = ?1 AND conversation_id = ?2 AND resolved = 0",
+            rusqlite::params![request_id, conversation_id, by],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// The most-recently-active **open** conversation in this workspace —
     /// highest `activity_tick` whose `end_reason` is still NULL — or `None`
     /// when every conversation has been ended (or none exist). This is the
@@ -2889,7 +3058,27 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              UNIQUE(conversation_id, idem_key)
          );
          CREATE INDEX IF NOT EXISTS idx_conversation_inbox_poll
-             ON conversation_inbox (conversation_id, workspace_key, delivered, seq);",
+             ON conversation_inbox (conversation_id, workspace_key, delivered, seq);
+         -- A4 (W6) permission-decision channel: the RUNNING gate (sole authority
+         -- minter) publishes a pending permission decision here; an ATTACH
+         -- surface (newt-web) renders it and writes back a VERDICT (never
+         -- caveats). The gate races this against the TTY and resolves it
+         -- exactly-once. A brand-new table: `IF NOT EXISTS` on every existing db,
+         -- no rebuild. `danger_json` is GATE-STAMPED (the web never classifies
+         -- danger) so a high-danger row cannot be forged to a lower tier.
+         CREATE TABLE IF NOT EXISTS permission_requests (
+             request_id      TEXT PRIMARY KEY,        -- unguessable nonce (new_conversation_id)
+             conversation_id TEXT NOT NULL,
+             workspace_key   TEXT NOT NULL,           -- same fence every table carries
+             requests_json   TEXT NOT NULL,           -- serialized &[PermissionRequest]
+             danger_json     TEXT NOT NULL,           -- gate-stamped per-target tier
+             verdict         TEXT,                    -- NULL until a surface answers
+             answered_by     TEXT,                    -- audit: 'web' | 'tty' | 'expired'
+             resolved        INTEGER NOT NULL DEFAULT 0,
+             created_tick    INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_permission_requests_pending
+             ON permission_requests (conversation_id, workspace_key, resolved);",
     )?;
     Ok(())
 }
@@ -3474,6 +3663,63 @@ pub struct InjectedPrompt {
     pub body: String,
     /// Per-conversation FIFO sequence (delivery order).
     pub seq: i64,
+}
+
+/// A verdict an attach surface can NAME for a pending permission decision
+/// (A4/W6). It names a CHOICE the running gate then interprets and mints — the
+/// web never carries caveats/authority itself. `AllowSession` is session-scoped
+/// (ephemeral); there is deliberately NO durable "always-allow" verdict — the
+/// web cannot write durable OCAP policy (that is terminal-audit-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Allow this one denied action, this time only.
+    AllowOnce,
+    /// Allow it for the rest of the session (in-memory; NOT persisted).
+    AllowSession,
+    /// Refuse — the model sees the standard structured denial.
+    Deny,
+}
+
+impl Verdict {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow_once",
+            Self::AllowSession => "allow_session",
+            Self::Deny => "deny",
+        }
+    }
+    fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "allow_once" => Some(Self::AllowOnce),
+            "allow_session" => Some(Self::AllowSession),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// A pending permission decision as the attach surface renders it
+/// ([`ConversationStore::pending_permission_request`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPermission {
+    /// The unguessable nonce that binds a verdict to THIS request (not a later
+    /// one — a turn issues several `gate.ask` calls).
+    pub request_id: String,
+    /// Serialized `&[PermissionRequest]` (the web deserializes to render).
+    pub requests_json: String,
+    /// Gate-stamped per-target danger tier (the web renders, never classifies).
+    pub danger_json: String,
+}
+
+/// The outcome of [`ConversationStore::answer_permission_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerOutcome {
+    /// The verdict was recorded (awaiting the gate's poll to resolve it).
+    Answered,
+    /// The request was already answered or resolved — a safe no-op.
+    AlreadyResolved,
+    /// No such open request for this conversation (stale/unknown request_id).
+    Unknown,
 }
 
 /// Liveness oracle: is `owner` still a running process, as of `now`? Injectable
@@ -4923,6 +5169,129 @@ mod tests {
         assert!(
             store.take_injected_prompt(&conv).unwrap().is_some(),
             "the owning workspace still dequeues it"
+        );
+    }
+
+    /// The A4/W6 permission channel: publish -> pending; a web verdict is taken
+    /// exactly-once by the gate; a TTY resolve wins the race so a late web
+    /// answer is discarded; verdicts bind to their own request_id; and the
+    /// whole channel is workspace-fenced.
+    #[test]
+    fn permission_channel_publish_answer_take_race_and_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("session", None).unwrap();
+
+        // Nothing pending initially.
+        assert_eq!(store.pending_permission_request(&conv).unwrap(), None);
+
+        // Publish -> the web sees exactly this pending row.
+        let r1 = store
+            .publish_permission_request(&conv, r#"[{"tool":"run_command"}]"#, r#"["low"]"#)
+            .unwrap();
+        let pending = store.pending_permission_request(&conv).unwrap().unwrap();
+        assert_eq!(pending.request_id, r1);
+        assert_eq!(pending.danger_json, r#"["low"]"#);
+
+        // The gate polls before any answer -> None (non-blocking).
+        assert_eq!(store.take_permission_decision(&conv, &r1).unwrap(), None);
+
+        // The web answers; the gate takes it exactly once and it resolves.
+        assert_eq!(
+            store
+                .answer_permission_request(&conv, &r1, Verdict::AllowSession)
+                .unwrap(),
+            AnswerOutcome::Answered
+        );
+        assert_eq!(
+            store.take_permission_decision(&conv, &r1).unwrap(),
+            Some(Verdict::AllowSession)
+        );
+        assert_eq!(
+            store.take_permission_decision(&conv, &r1).unwrap(),
+            None,
+            "a resolved request yields the verdict exactly once"
+        );
+        assert_eq!(
+            store.pending_permission_request(&conv).unwrap(),
+            None,
+            "an answered request is no longer pending"
+        );
+        // A double-answer after resolution is a safe no-op.
+        assert_eq!(
+            store
+                .answer_permission_request(&conv, &r1, Verdict::Deny)
+                .unwrap(),
+            AnswerOutcome::AlreadyResolved
+        );
+
+        // TTY wins the race: publish, the gate resolves-as-tty BEFORE a web
+        // answer -> the win is recorded and a late web verdict never applies.
+        let r2 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
+        assert!(
+            store.resolve_permission_request(&conv, &r2, "tty").unwrap(),
+            "the TTY resolve wins when unresolved"
+        );
+        assert!(
+            !store.resolve_permission_request(&conv, &r2, "tty").unwrap(),
+            "resolving an already-resolved request loses"
+        );
+        assert_eq!(
+            store
+                .answer_permission_request(&conv, &r2, Verdict::AllowOnce)
+                .unwrap(),
+            AnswerOutcome::AlreadyResolved,
+            "a web answer after the TTY won is a no-op"
+        );
+        assert_eq!(
+            store.take_permission_decision(&conv, &r2).unwrap(),
+            None,
+            "no web verdict applies once the TTY resolved it"
+        );
+
+        // request_id binding: a verdict for r3 never resolves r4.
+        let r3 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
+        let r4 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
+        store
+            .answer_permission_request(&conv, &r3, Verdict::AllowOnce)
+            .unwrap();
+        assert_eq!(store.take_permission_decision(&conv, &r4).unwrap(), None);
+        assert_eq!(
+            store.take_permission_decision(&conv, &r3).unwrap(),
+            Some(Verdict::AllowOnce)
+        );
+
+        // Answering an unknown request is Unknown, not a crash.
+        assert_eq!(
+            store
+                .answer_permission_request(&conv, "no-such-id", Verdict::Deny)
+                .unwrap(),
+            AnswerOutcome::Unknown
+        );
+
+        // Workspace fence: another workspace can neither publish into nor read
+        // this conversation's channel.
+        let ws_b = tempfile::tempdir().unwrap();
+        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+        assert!(
+            store_b
+                .publish_permission_request(&conv, "[]", "[]")
+                .is_err(),
+            "cross-workspace publish is rejected"
+        );
+        let r5 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
+        assert_eq!(
+            store_b.pending_permission_request(&conv).unwrap(),
+            None,
+            "cross-workspace pending read sees nothing"
+        );
+        assert_eq!(
+            store_b
+                .answer_permission_request(&conv, &r5, Verdict::AllowOnce)
+                .unwrap(),
+            AnswerOutcome::Unknown,
+            "cross-workspace answer cannot resolve it"
         );
     }
 

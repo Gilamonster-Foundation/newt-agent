@@ -29,7 +29,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 /// The capability axis a denial occurred on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DenialKind {
     /// `exec` — a command outside the granted exec allowlist.
     Exec,
@@ -157,7 +157,7 @@ pub fn append_denial(path: &Path, kind: DenialKind, target: &str) -> std::io::Re
 }
 
 /// One denied capability surfaced for a human decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     /// The tool the model called (`run_command`, `read_file`, …).
     pub tool: String,

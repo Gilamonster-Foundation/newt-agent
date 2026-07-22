@@ -371,6 +371,14 @@ mod slash_prompt_tests {
 /// with the process: a restart starts from the configured policy again.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
+    /// A4/W6 (opt-in, `NEWT_WEB_DECISIONS`): when set, a permission decision is
+    /// PUBLISHED to this store and answered from an attach surface (the web)
+    /// rather than the TTY — the gate polls [`ConversationStore::take_permission_decision`]
+    /// for the operator's verdict. `None` (the default) keeps the canonical TTY
+    /// prompt bit-for-bit, so a normal session is unaffected. The simultaneous
+    /// TTY-vs-web race is a follow-up (it needs a pollable single-key read on
+    /// the #1312-sensitive terminal arbiter; validated on a real PTY).
+    pub(crate) web_store: Option<newt_core::ConversationStore>,
     /// `(kind, target)` pairs the human allowed for the rest of the session.
     session_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     /// `(kind, target)` pairs the human denied for the rest of the session
@@ -580,6 +588,56 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> PromptPermissionGate<'_, F> 
             None => policy,
         }
     }
+
+    /// A4/W6: publish the pending decision to the store and poll for the
+    /// operator's WEB verdict (opt-in). The web NAMES a verdict; this maps it to
+    /// the same `PromptChoice` a TTY key would, so every downstream arm — the
+    /// high-danger `[s]ession` refusal, the mint, the re-exec — is reused
+    /// unchanged. Fails closed (`Deny`) if the store can't publish/read. The
+    /// danger tier is GATE-STAMPED here (the web renders it, never classifies).
+    /// Blocks polling like the TTY read would (no auto-deny); it runs on the
+    /// turn's own thread, so the UI never hangs.
+    fn await_web_decision(
+        &self,
+        store: &newt_core::ConversationStore,
+        w: &newt_core::tty::PromptWindow,
+        req: &newt_core::PermissionRequest,
+    ) -> PromptChoice {
+        let requests_json = serde_json::to_string(req).unwrap_or_default();
+        let tier = if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+            "\"high\""
+        } else {
+            "\"low\""
+        };
+        let request_id =
+            match store.publish_permission_request(&self.conversation_id, &requests_json, tier) {
+                Ok(id) => id,
+                Err(_) => return PromptChoice::Deny,
+            };
+        w.notice(&newt_line(
+            &format!("awaiting a decision from the web for `{}`…", req.target),
+            self.color,
+            self.verbose,
+        ))
+        .ok();
+        loop {
+            match store.take_permission_decision(&self.conversation_id, &request_id) {
+                Ok(Some(verdict)) => return verdict_to_choice(verdict),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Err(_) => return PromptChoice::Deny,
+            }
+        }
+    }
+}
+
+/// Map a web-named [`newt_core::Verdict`] to the [`PromptChoice`] a TTY key
+/// would produce, so a web answer flows through the exact same gate arms.
+fn verdict_to_choice(v: newt_core::Verdict) -> PromptChoice {
+    match v {
+        newt_core::Verdict::AllowOnce => PromptChoice::AllowOnce,
+        newt_core::Verdict::AllowSession => PromptChoice::AllowSession,
+        newt_core::Verdict::Deny => PromptChoice::Deny,
+    }
 }
 
 impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
@@ -612,6 +670,10 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
             return Deny;
         }
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
+        // A4/W6: a cheap clone of the opt-in web-decision store (None normally),
+        // taken once so the per-request `self.record`/grant mutations in the
+        // loop don't collide with the shared-borrow at the prompt seam below.
+        let web = self.state.web_store.clone();
         for req in requests {
             // #1056 FLOOR: a readonly `/mode` denies LOCAL git writes just as it
             // denies fs writes. The git-write capability is non-axis, so `mint`'s
@@ -680,7 +742,15 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
             // dispatcher inherit the guarantee without a single line changing
             // at any of them, and what makes a seventh site safe by default.
             let w = Terminal::suspend_for_prompt();
-            let choice = (self.ask_human)(&w, &permission_prompt_text(req, &self.danger));
+            // A4/W6: when a web-decision store is configured (opt-in), publish
+            // the decision and poll for the operator's web verdict instead of
+            // reading the TTY. Off by default → the canonical prompt is
+            // unchanged. `web` is a cheap clone taken before the loop so the
+            // per-request `self.record`/grant mutations below don't conflict.
+            let choice = match &web {
+                Some(store) => self.await_web_decision(store, &w, req),
+                None => (self.ask_human)(&w, &permission_prompt_text(req, &self.danger)),
+            };
             match choice {
                 PromptChoice::AllowOnce => {
                     self.record(req, "allow", "once");
@@ -884,6 +954,67 @@ mod permission_prompt_tests {
             target: target.to_string(),
             reason: format!("exec of \"{target}\" is not within the granted authority"),
         }
+    }
+
+    /// A4/W6 (part 2): with `web_store` set, the gate PUBLISHES the decision and
+    /// consumes the operator's WEB verdict — it never reads the TTY. A concurrent
+    /// answerer stands in for the web POST; allow-once → the gate returns `Allow`.
+    /// This grounds the store's publish/answer/take methods against the gate's
+    /// own poll loop (the map from `Verdict` to the reused `PromptChoice` arms).
+    #[test]
+    fn web_decisions_publish_and_consume_a_web_verdict_without_the_tty() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("s", None).unwrap();
+
+        // Stand in for the web POST: wait for the gate to publish, then answer.
+        let answerer_store = store.clone();
+        let answer_conv = conv.clone();
+        let answerer = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if let Ok(Some(p)) = answerer_store.pending_permission_request(&answer_conv) {
+                    answerer_store
+                        .answer_permission_request(
+                            &answer_conv,
+                            &p.request_id,
+                            newt_core::Verdict::AllowOnce,
+                        )
+                        .unwrap();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("the gate never published a permission request");
+        });
+
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let mut gate = PromptPermissionGate {
+            state: &mut state,
+            base: Caveats::default(),
+            key_path: None,
+            conversation_id: conv.clone(),
+            log_path: None,
+            denials_path: None,
+            config_path: None,
+            preset_clamp: None,
+            danger: danger::DangerTable::builtin(),
+            color: false,
+            verbose: false,
+            // Proof the TTY is bypassed when web decisions are on.
+            ask_human: |_w: &PromptWindow, _p: &str| {
+                panic!("the TTY must not be read when web decisions are enabled")
+            },
+        };
+        let decision = gate.ask(&[exec_request("bash")]);
+        answerer.join().unwrap();
+        assert!(
+            matches!(decision, newt_core::PermissionDecision::Allow(_)),
+            "a web allow-once verdict must produce Allow"
+        );
     }
 
     /// A gate whose "human" is a script of choices; counts every prompt.
