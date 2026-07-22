@@ -1,0 +1,39 @@
+# NetworkPolicy: fence the newt-web cockpit port (:8880) so it is reachable
+# ONLY through Traefik → oauth2-proxy (Authentik), closing the in-cluster
+# bypass (#1355). Without this, any pod in the cluster could POST
+# /agents/:id/decision or /agents/:id/prompt straight to :8880, skipping SSO —
+# and the app-layer identity header would be forgeable by that direct caller.
+# The netpol is what makes the header unspoofable.
+#
+#   - :8880 (newt-web): only the Traefik ingress namespace may connect.
+#   - :22   (sshd): reached via the ServiceLB NodePort, whose path SNATs the
+#     source, so it cannot be restricted by pod/namespace selector without
+#     breaking LAN SSH — left open (authorized_keys holds public keys only;
+#     sshd StrictModes enforced).
+#   - readiness: the Deployment uses an EXEC probe (curl localhost INSIDE the
+#     pod), so /healthz needs no ingress rule and this policy cannot strand the
+#     pod NotReady regardless of CNI (k3s kube-router).
+#
+# PARITY: mirrors the SSO ingress posture (ingress.yaml) and the app-layer
+# fail-closed gate (newt-web NEWT_WEB_AUTH_HEADER, #1355). BOTH layers are
+# required — neither alone closes the bypass.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: newt-web-fence
+  namespace: drake
+  labels: { app: drake-interactive }
+spec:
+  podSelector:
+    matchLabels: { app: drake-interactive }
+  policyTypes: [Ingress]
+  ingress:
+    # SSH: the NodePort path SNATs the client, so :22 is allowed from any source.
+    - ports:
+        - { port: 22, protocol: TCP }
+    # newt-web: ONLY the Traefik ingress namespace may reach :8880.
+    - ports:
+        - { port: 8880, protocol: TCP }
+      from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: traefik }
