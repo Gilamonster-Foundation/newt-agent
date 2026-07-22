@@ -8,6 +8,14 @@
 # from the home PVC; this image ends that split). authorized_keys mounts from
 # `drake-interactive-keys`. Tear down and rebuild freely: the identity is
 # cluster-side.
+# Stage 1: build newt-web INSIDE the image lineage so glibc always matches
+# (a host-built binary from a newer distro dies with `GLIBC_x.y not found`).
+# Context = the repo root (see build-and-roll.sh); .dockerignore keeps it lean.
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN CARGO_TARGET_DIR=/build cargo build --release --manifest-path newt-web/Cargo.toml
+
 FROM rust:1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,9 +38,8 @@ RUN rm -f /etc/ssh/ssh_host_*_key* \
         'AuthorizedKeysFile /etc/drake-interactive/authorized_keys' \
         > /etc/ssh/sshd_config.d/newt-web-dev.conf
 
-# The cockpit binary, built OUTSIDE the image (gnuc is the build farm; see
-# build-and-roll.sh) and staged next to this Containerfile as `newt-web`.
-COPY newt-web /usr/local/bin/newt-web
+# The cockpit binary from the builder stage (glibc-matched).
+COPY --from=builder /build/release/newt-web /usr/local/bin/newt-web
 
 EXPOSE 22 8880
 # Host keys arrive as a Secret mounted at /run/hostkeys. fsGroup makes Secret
