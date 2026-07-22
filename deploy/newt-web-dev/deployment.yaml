@@ -41,10 +41,10 @@ spec:
             - { mountPath: /nats-nkeys, name: nats-nkeys, readOnly: true }
             - { mountPath: /run/drake/api-keys, name: api-keys, readOnly: true }
             - { mountPath: /etc/drake-interactive/authorized_keys, name: authorized-keys, readOnly: true, subPath: authorized_keys }
-            - { mountPath: /etc/ssh/ssh_host_ed25519_key, name: hostkeys, readOnly: true, subPath: ssh_host_ed25519_key }
-            - { mountPath: /etc/ssh/ssh_host_ed25519_key.pub, name: hostkeys, readOnly: true, subPath: ssh_host_ed25519_key.pub }
-            - { mountPath: /etc/ssh/ssh_host_rsa_key, name: hostkeys, readOnly: true, subPath: ssh_host_rsa_key }
-            - { mountPath: /etc/ssh/ssh_host_rsa_key.pub, name: hostkeys, readOnly: true, subPath: ssh_host_rsa_key.pub }
+            # Mounted as a DIRECTORY: fsGroup forces Secret files to 0640,
+            # sshd refuses that — the image CMD installs them 0600 into
+            # /etc/ssh at start.
+            - { mountPath: /run/hostkeys, name: hostkeys, readOnly: true }
       securityContext: { fsGroup: 100 }
       serviceAccountName: drake-interactive
       volumes:
