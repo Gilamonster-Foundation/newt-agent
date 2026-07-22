@@ -38,10 +38,19 @@ spec:
             capabilities:
               drop: ["ALL"]
               add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "KILL", "AUDIT_WRITE", "SYS_CHROOT"]
+          # Gate readiness on the WEB endpoint, not sshd. Traefik routes web
+          # traffic to the newt-web Service (:8880); newt-web is a backgrounded
+          # child that binds a beat after sshd. A tcp :22 probe marks the pod
+          # Ready — and adds it to the newt-web endpoints — before newt-web is
+          # listening, so a request landing in that window gets connection-
+          # refused upstream and surfaces as a transient 5xx right after a roll.
+          # /healthz answering means newt-web is truly up.
           readinessProbe:
-            tcpSocket: { port: ssh }
+            httpGet: { path: /healthz, port: newt-web }
             initialDelaySeconds: 2
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           env:
             - { name: TMPDIR, value: /scratch }
             - { name: CARGO_TARGET_DIR, value: /scratch/cargo-target }
