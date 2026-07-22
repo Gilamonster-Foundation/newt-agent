@@ -2364,6 +2364,40 @@ fn artifact_postcondition_warning(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The optional collaborator seams a tool dispatch may carry, bundled into ONE
+/// value (reuse discipline: "prefer making a bug unrepresentable"). The
+/// positional form threaded ~19 `Option` params through every facade layer —
+/// and a bare-`None` run misaligned by one slot compiles fine while silently
+/// disabling the wrong seam (the exact hazard hit while threading `where_is`,
+/// #1285). Named fields + `..Default::default()` make that miswiring
+/// impossible, and a NEW seam is one field plus its construction sites, not a
+/// signature change through six layers.
+///
+/// `Default` is all-`None`: the bare dispatch a test or embedder starts from.
+#[derive(Default)]
+pub(crate) struct ToolCollaborators<'a> {
+    pub(crate) build_check_cmd: Option<&'a str>,
+    pub(crate) note_sink: Option<&'a mut dyn NoteSink>,
+    pub(crate) recall_source: Option<&'a dyn RecallSource>,
+    pub(crate) memory_source: Option<&'a dyn MemorySource>,
+    pub(crate) prompt_context: Option<PromptReadContext<'a>>,
+    pub(crate) artifact_context: Option<ArtifactReadContext<'a>>,
+    pub(crate) artifact_sink: Option<&'a dyn super::artifact_read::PromptArtifactSink>,
+    pub(crate) permission_gate: Option<&'a mut dyn PermissionGate>,
+    pub(crate) exec_floor: Option<&'a crate::caveats::Scope<String>>,
+    pub(crate) git_tool: Option<&'a dyn GitTool>,
+    pub(crate) crew_runner: Option<&'a dyn CrewRunner>,
+    pub(crate) scratchpad_store: Option<&'a dyn super::scratchpad::ScratchpadStore>,
+    pub(crate) code_search: Option<super::semantic::CodeSearch<'a>>,
+    pub(crate) where_is: Option<&'a crate::where_is::WhereIsIndex>,
+    pub(crate) experience_store: Option<&'a dyn super::experiential::ExperienceStore>,
+    pub(crate) step_ledger: Option<&'a dyn super::scheduled::StepLedger>,
+    pub(crate) spill_store: Option<&'a dyn SpillStore>,
+    pub(crate) persona_tools: Option<&'a [String]>,
+    pub(crate) live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     name: &str,
     args: &serde_json::Value,
@@ -2386,19 +2420,16 @@ pub async fn execute_tool(
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
 ) -> String {
-    execute_tool_with_offload(
-        name,
-        args,
-        workspace,
-        color,
-        tool_output_lines,
-        caveats,
-        mcp,
+    // The convenience wrapper carries no offload/persona/prompt surface —
+    // callers that need those seams use the wider entry points.
+    let collab = ToolCollaborators {
         build_check_cmd,
-        note_sink,
+        // Reborrow the invariant `&mut dyn` seams to the local region (the
+        // same coercion the loop's call sites perform on ChatCtx fields).
+        note_sink: note_sink.map(|s| &mut *s as &mut dyn NoteSink),
         recall_source,
         memory_source,
-        permission_gate,
+        permission_gate: permission_gate.map(|g| &mut *g as &mut dyn PermissionGate),
         exec_floor,
         git_tool,
         crew_runner,
@@ -2407,13 +2438,23 @@ pub async fn execute_tool(
         where_is,
         experience_store,
         step_ledger,
+        ..Default::default()
+    };
+    execute_tool_with_collaborators(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        collab,
         false,
-        None,
-        // The convenience wrapper carries no persona surface — callers that
-        // enforce a persona allow-list use `execute_tool_with_offload` directly.
+        PromptDisposition::Act,
         None,
     )
     .await
+    .expect("tool execution without a cancellation flag cannot be interrupted")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2442,20 +2483,14 @@ pub async fn execute_tool_with_offload(
     spill_store: Option<&dyn SpillStore>,
     persona_tools: Option<&[String]>,
 ) -> String {
-    execute_tool_with_offload_and_prompt(
-        name,
-        args,
-        workspace,
-        color,
-        tool_output_lines,
-        caveats,
-        mcp,
+    let collab = ToolCollaborators {
         build_check_cmd,
-        note_sink,
+        // Reborrow the invariant `&mut dyn` seams to the local region (the
+        // same coercion the loop's call sites perform on ChatCtx fields).
+        note_sink: note_sink.map(|s| &mut *s as &mut dyn NoteSink),
         recall_source,
         memory_source,
-        None,
-        permission_gate,
+        permission_gate: permission_gate.map(|g| &mut *g as &mut dyn PermissionGate),
         exec_floor,
         git_tool,
         crew_runner,
@@ -2464,11 +2499,25 @@ pub async fn execute_tool_with_offload(
         where_is,
         experience_store,
         step_ledger,
-        tool_offload,
         spill_store,
         persona_tools,
+        ..Default::default()
+    };
+    execute_tool_with_collaborators(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        collab,
+        tool_offload,
+        PromptDisposition::Act,
+        None,
     )
     .await
+    .expect("tool execution without a cancellation flag cannot be interrupted")
 }
 
 /// Prompt-aware tool dispatcher used by inference loops.
@@ -2503,22 +2552,15 @@ pub async fn execute_tool_with_offload_and_prompt(
     spill_store: Option<&dyn SpillStore>,
     persona_tools: Option<&[String]>,
 ) -> String {
-    execute_tool_with_offload_and_prompt_and_artifacts(
-        name,
-        args,
-        workspace,
-        color,
-        tool_output_lines,
-        caveats,
-        mcp,
+    let collab = ToolCollaborators {
         build_check_cmd,
-        note_sink,
+        // Reborrow the invariant `&mut dyn` seams to the local region (the
+        // same coercion the loop's call sites perform on ChatCtx fields).
+        note_sink: note_sink.map(|s| &mut *s as &mut dyn NoteSink),
         recall_source,
         memory_source,
         prompt_context,
-        None,
-        None,
-        permission_gate,
+        permission_gate: permission_gate.map(|g| &mut *g as &mut dyn PermissionGate),
         exec_floor,
         git_tool,
         crew_runner,
@@ -2527,12 +2569,25 @@ pub async fn execute_tool_with_offload_and_prompt(
         where_is,
         experience_store,
         step_ledger,
-        tool_offload,
         spill_store,
         persona_tools,
+        ..Default::default()
+    };
+    execute_tool_with_collaborators(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        collab,
+        tool_offload,
         PromptDisposition::Act,
+        None,
     )
     .await
+    .expect("tool execution without a cancellation flag cannot be interrupted")
 }
 
 /// Prompt- and artifact-aware tool dispatcher used by inference loops.
@@ -2567,22 +2622,17 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     persona_tools: Option<&[String]>,
     disposition: PromptDisposition,
 ) -> String {
-    execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
-        name,
-        args,
-        workspace,
-        color,
-        tool_output_lines,
-        caveats,
-        mcp,
+    let collab = ToolCollaborators {
         build_check_cmd,
-        note_sink,
+        // Reborrow the invariant `&mut dyn` seams to the local region (the
+        // same coercion the loop's call sites perform on ChatCtx fields).
+        note_sink: note_sink.map(|s| &mut *s as &mut dyn NoteSink),
         recall_source,
         memory_source,
         prompt_context,
         artifact_context,
         artifact_sink,
-        permission_gate,
+        permission_gate: permission_gate.map(|g| &mut *g as &mut dyn PermissionGate),
         exec_floor,
         git_tool,
         crew_runner,
@@ -2591,22 +2641,33 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         where_is,
         experience_store,
         step_ledger,
-        tool_offload,
         spill_store,
         persona_tools,
+        ..Default::default()
+    };
+    execute_tool_with_collaborators(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        collab,
+        tool_offload,
         disposition,
-        None,
         None,
     )
     .await
     .expect("tool execution without a cancellation flag cannot be interrupted")
 }
 
-/// Cancellation-aware loop entry point. The header is written synchronously
+/// Cancellation-aware loop entry point — the collaborator-struct core every
+/// public wrapper above flattens into. The header is written synchronously
 /// before the cancel-first race begins; an already-set interrupt therefore
 /// closes a complete audit block without ever polling the tool body.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_tool_with_offload_and_prompt_and_artifacts_cancellable(
+pub(crate) async fn execute_tool_with_collaborators(
     name: &str,
     args: &serde_json::Value,
     workspace: &str,
@@ -2614,27 +2675,9 @@ pub(crate) async fn execute_tool_with_offload_and_prompt_and_artifacts_cancellab
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
     mcp: &mut dyn McpTools,
-    build_check_cmd: Option<&str>,
-    note_sink: Option<&mut dyn NoteSink>,
-    recall_source: Option<&dyn RecallSource>,
-    memory_source: Option<&dyn MemorySource>,
-    prompt_context: Option<PromptReadContext<'_>>,
-    artifact_context: Option<ArtifactReadContext<'_>>,
-    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
-    permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
-    git_tool: Option<&dyn GitTool>,
-    crew_runner: Option<&dyn CrewRunner>,
-    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
-    code_search: Option<super::semantic::CodeSearch<'_>>,
-    where_is: Option<&crate::where_is::WhereIsIndex>,
-    experience_store: Option<&dyn super::experiential::ExperienceStore>,
-    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    collab: ToolCollaborators<'_>,
     tool_offload: bool,
-    spill_store: Option<&dyn SpillStore>,
-    persona_tools: Option<&[String]>,
     disposition: PromptDisposition,
-    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<String> {
     let mut display = ToolDisplay::new(
@@ -2652,27 +2695,9 @@ pub(crate) async fn execute_tool_with_offload_and_prompt_and_artifacts_cancellab
         tool_output_lines,
         caveats,
         mcp,
-        build_check_cmd,
-        note_sink,
-        recall_source,
-        memory_source,
-        prompt_context,
-        artifact_context,
-        artifact_sink,
-        permission_gate,
-        exec_floor,
-        git_tool,
-        crew_runner,
-        scratchpad_store,
-        code_search,
-        where_is,
-        experience_store,
-        step_ledger,
+        collab,
         tool_offload,
-        spill_store,
-        persona_tools,
         disposition,
-        live_tool_output,
         cancel,
     )
     .await
@@ -2699,27 +2724,9 @@ async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
     mcp: &mut dyn McpTools,
-    build_check_cmd: Option<&str>,
-    note_sink: Option<&mut dyn NoteSink>,
-    recall_source: Option<&dyn RecallSource>,
-    memory_source: Option<&dyn MemorySource>,
-    prompt_context: Option<PromptReadContext<'_>>,
-    artifact_context: Option<ArtifactReadContext<'_>>,
-    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
-    permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
-    git_tool: Option<&dyn GitTool>,
-    crew_runner: Option<&dyn CrewRunner>,
-    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
-    code_search: Option<super::semantic::CodeSearch<'_>>,
-    where_is: Option<&crate::where_is::WhereIsIndex>,
-    experience_store: Option<&dyn super::experiential::ExperienceStore>,
-    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    collab: ToolCollaborators<'_>,
     tool_offload: bool,
-    spill_store: Option<&dyn SpillStore>,
-    persona_tools: Option<&[String]>,
     disposition: PromptDisposition,
-    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<String> {
     let (presentation_name, presentation_detail) =
@@ -2735,27 +2742,9 @@ async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
             tool_output_lines,
             caveats,
             mcp,
-            build_check_cmd,
-            note_sink,
-            recall_source,
-            memory_source,
-            prompt_context,
-            artifact_context,
-            artifact_sink,
-            permission_gate,
-            exec_floor,
-            git_tool,
-            crew_runner,
-            scratchpad_store,
-            code_search,
-            where_is,
-            experience_store,
-            step_ledger,
+            collab,
             tool_offload,
-            spill_store,
-            persona_tools,
             disposition,
-            live_tool_output,
         );
         tokio::pin!(execution);
         tokio::select! {
@@ -2787,37 +2776,37 @@ async fn execute_tool_inner(
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
     mcp: &mut dyn McpTools,
-    build_check_cmd: Option<&str>,
-    note_sink: Option<&mut dyn NoteSink>,
-    recall_source: Option<&dyn RecallSource>,
-    memory_source: Option<&dyn MemorySource>,
-    prompt_context: Option<PromptReadContext<'_>>,
-    artifact_context: Option<ArtifactReadContext<'_>>,
-    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
-    mut permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
-    git_tool: Option<&dyn GitTool>,
-    crew_runner: Option<&dyn CrewRunner>,
-    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
-    code_search: Option<super::semantic::CodeSearch<'_>>,
-    where_is: Option<&crate::where_is::WhereIsIndex>,
-    experience_store: Option<&dyn super::experiential::ExperienceStore>,
-    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    collab: ToolCollaborators<'_>,
     tool_offload: bool,
-    spill_store: Option<&dyn SpillStore>,
-    // FR-1 part 2 (#997): the active persona's tool allow-list (its `tools:`
-    // front-matter), or `None` when no persona is active. The name-scoped
-    // enforcement half — advertisement is only cosmetic, so the boundary is
-    // real ONLY because this executor refuses a disallowed name even if the
-    // model calls it unprompted.
-    persona_tools: Option<&[String]>,
     // The prompt's validated disposition. This is deliberately a required
     // dispatcher input: catalog filtering is cosmetic, whereas this check is
     // the boundary that refuses fabricated tool names before MCP routing,
     // aliases, or permission widening can run.
     disposition: PromptDisposition,
-    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> String {
+    // One unpack; the dispatch body below binds the same names it always has.
+    let ToolCollaborators {
+        build_check_cmd,
+        note_sink,
+        recall_source,
+        memory_source,
+        prompt_context,
+        artifact_context,
+        artifact_sink,
+        mut permission_gate,
+        exec_floor,
+        git_tool,
+        crew_runner,
+        scratchpad_store,
+        code_search,
+        where_is,
+        experience_store,
+        step_ledger,
+        spill_store,
+        persona_tools,
+        live_tool_output,
+    } = collab;
+
     // Prompt-comprehension boundary: enforce the validated disposition BEFORE
     // every other routing or grant path. In particular, unknown names (including
     // generic `server__tool` MCP calls) fail closed under a non-Act disposition;
@@ -7391,27 +7380,9 @@ mod execute_tool_branch_tests {
             20,
             &caveats,
             &mut NoMcp,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ToolCollaborators::default(),
             false,
-            None,
-            None,
             PromptDisposition::Act,
-            None,
             Some(&cancel),
         )
         .await;
@@ -7795,27 +7766,14 @@ mod execute_tool_branch_tests {
             20,
             caveats,
             mcp,
-            None, // build_check_cmd
-            None, // note_sink
-            None, // recall_source
-            None, // memory_source
-            prompt_context,
-            artifact_context,
-            None, // artifact_sink
-            None, // permission_gate
-            None, // exec_floor
-            None, // git_tool
-            None, // crew_runner
-            None, // scratchpad_store
-            None, // code_search
-            None, // where_is
-            None, // experience_store
-            None, // step_ledger
+            ToolCollaborators {
+                prompt_context,
+                artifact_context,
+                live_tool_output,
+                ..Default::default()
+            },
             false,
-            None,
-            None,
             PromptDisposition::Act,
-            live_tool_output,
             None,
         )
         .await
