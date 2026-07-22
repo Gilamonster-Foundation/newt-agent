@@ -29,11 +29,14 @@ done
 # and the /healthz readiness probe pulls the pod out of the web endpoints while
 # newt-web is down and re-adds it once it answers. `set +e` scopes to the
 # subshell — an expected non-zero exit must not abort the loop under errexit.
-# Bind per NEWT_WEB_BIND (D3).
+# Bind per NEWT_WEB_BIND (D3). NEWT_WEB_AUTH_HEADER (#1355) must be threaded
+# through `su drake -c` explicitly — su resets the environment, so a value set
+# only in the Deployment env would not reach newt-web (same reason NEWT_WEB_BIND
+# is passed here). Unset ⇒ blank ⇒ the gate stays off (loopback dev).
 (
     set +e
     while true; do
-        su drake -c "RUST_LOG=info NEWT_WEB_BIND='${NEWT_WEB_BIND:-127.0.0.1:8880}' /usr/local/bin/newt-web"
+        su drake -c "RUST_LOG=info NEWT_WEB_BIND='${NEWT_WEB_BIND:-127.0.0.1:8880}' NEWT_WEB_AUTH_HEADER='${NEWT_WEB_AUTH_HEADER:-}' /usr/local/bin/newt-web"
         echo "entrypoint: newt-web exited ($?); respawning in 1s" >&2
         sleep 1
     done

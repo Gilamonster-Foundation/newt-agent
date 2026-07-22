@@ -5,8 +5,9 @@
 //! (`agents.rs`); the front end is server-rendered HTML (`shell.rs`); this
 //! file is the composition root — routes, state, and the SSE bridge only.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
@@ -19,11 +20,51 @@ mod shell;
 
 use agents::{Registry, Spec};
 
+/// The trusted forward-auth identity header, from `NEWT_WEB_AUTH_HEADER`
+/// (config, three-Cs). Unset/blank (loopback dev + the mocked test tier) ⇒ no
+/// gate; set (the deployment pins `X-Auth-Request-Email`, injected by the
+/// cluster's oauth2-proxy/Authentik forward-auth) ⇒ every route but `/healthz`
+/// demands it (#1355). Header-trust is sound ONLY because the NetworkPolicy
+/// (`deploy/newt-web-dev/networkpolicy.yaml`) forces every request through
+/// Traefik → oauth2-proxy first, so a direct in-cluster caller cannot forge it.
+fn required_auth_header() -> Option<String> {
+    std::env::var("NEWT_WEB_AUTH_HEADER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Fail-closed identity gate: reject any request whose trusted identity header
+/// is absent or blank. Never wraps `/healthz` — the readiness probe carries no
+/// oauth2-proxy identity.
+async fn require_identity(
+    State(header): State<String>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let present = req
+        .headers()
+        .get(header.as_str())
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.trim().is_empty());
+    if present {
+        next.run(req).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    }
+}
+
 fn app() -> Router {
+    app_with_auth(required_auth_header())
+}
+
+/// Compose the cockpit. `auth_header = Some(name)` fences every route except
+/// `/healthz` behind that trusted identity header (fail-closed, #1355); `None`
+/// leaves the surface open — the loopback-dev + fully-mocked-test posture.
+fn app_with_auth(auth_header: Option<String>) -> Router {
     let reg = Arc::new(Registry::default());
-    Router::new()
+    let mut gated = Router::new()
         .route("/", get(shell::index))
-        .route("/healthz", get(|| async { "ok" }))
         .route(
             "/assets/htmx.min.js",
             get(|| async {
@@ -38,7 +79,14 @@ fn app() -> Router {
         .route("/agents/:id/panel", get(agent_panel_route))
         .route("/agents/:id/prompt", post(prompt_agent))
         .route("/agents/:id/events", get(agent_events))
-        .route("/agents/:id", axum::routing::delete(delete_agent))
+        .route("/agents/:id", axum::routing::delete(delete_agent));
+    if let Some(header) = auth_header {
+        gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
+    }
+    // `/healthz` stays outside the gate: the kubelet probe has no identity.
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(gated)
         .with_state(reg)
 }
 
@@ -311,6 +359,26 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// Like `req` but carries extra request headers — used to simulate the
+    /// oauth2-proxy identity header the forward-auth gate trusts.
+    async fn req_with_headers(
+        app: &Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        let mut b = axum::http::Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let resp = app
+            .clone()
+            .oneshot(b.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        resp.status()
+    }
+
     /// Poll the index until `needle` appears (the pump publishes async).
     async fn wait_for(app: &Router, needle: &str) -> String {
         for _ in 0..100 {
@@ -329,6 +397,84 @@ mod tests {
         let (status, body) = req(&app(), "GET", "/healthz", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok");
+    }
+
+    /// #1355: with a trusted identity header configured, every sensitive route
+    /// fail-closes on a request that lacks it — this is the app-layer half that
+    /// (with the NetworkPolicy) closes the in-cluster bypass of oauth2-proxy.
+    /// Uses storeless routes so the gate is proven without any fs/store touch.
+    #[tokio::test]
+    async fn require_identity_gate_rejects_the_unauthenticated_and_admits_the_header() {
+        let app = app_with_auth(Some("X-Auth-Request-Email".into()));
+        // No identity → 403, on both a write path and a GET.
+        let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=hi")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "write path fail-closes");
+        let (status, _) = req(&app, "GET", "/assets/htmx.min.js", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "reads are gated too");
+        // A blank header value is not an identity.
+        let status = req_with_headers(
+            &app,
+            "GET",
+            "/assets/htmx.min.js",
+            &[("X-Auth-Request-Email", "  ")],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "blank identity is no identity"
+        );
+        // The trusted header admits the request — it reaches the handler (a
+        // static asset → 200; NOT a 403), proving the gate opened.
+        let status = req_with_headers(
+            &app,
+            "GET",
+            "/assets/htmx.min.js",
+            &[("X-Auth-Request-Email", "op@example.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "trusted identity is admitted");
+    }
+
+    /// #1355: `/healthz` must NEVER require identity — the kubelet readiness
+    /// probe carries no oauth2-proxy header. (The deployment also moves to an
+    /// exec probe, but the route staying public is the invariant.)
+    #[tokio::test]
+    async fn healthz_stays_public_even_when_identity_is_required() {
+        let app = app_with_auth(Some("X-Auth-Request-Email".into()));
+        let (status, body) = req(&app, "GET", "/healthz", None).await;
+        assert_eq!(status, StatusCode::OK, "the probe must not require auth");
+        assert_eq!(body, "ok");
+    }
+
+    /// #1355: unconfigured (the loopback-dev + mocked-test default) leaves the
+    /// surface open — no identity header is demanded. This pins that the gate
+    /// is strictly opt-in, so the existing test suite (which never sets one)
+    /// exercises the real, ungated handlers.
+    #[tokio::test]
+    async fn no_auth_header_configured_leaves_the_surface_open() {
+        let app = app_with_auth(None);
+        let (status, _) = req(&app, "GET", "/assets/htmx.min.js", None).await;
+        assert_eq!(status, StatusCode::OK, "open when unconfigured");
+        let (status, _) = req(&app, "GET", "/healthz", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// #1355 config seam: `NEWT_WEB_AUTH_HEADER` set (non-blank) turns the gate
+    /// ON through the default `app()` path; blank or unset leaves it off. Covers
+    /// the env read that `app_with_auth` is otherwise tested independently of.
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test]
+    async fn auth_header_env_toggles_the_gate() {
+        std::env::set_var("NEWT_WEB_AUTH_HEADER", "X-Auth-Request-Email");
+        let (status, _) = req(&app(), "GET", "/assets/htmx.min.js", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "env set ⇒ gate on");
+        std::env::set_var("NEWT_WEB_AUTH_HEADER", "   ");
+        let (status, _) = req(&app(), "GET", "/assets/htmx.min.js", None).await;
+        assert_eq!(status, StatusCode::OK, "blank env ⇒ gate off");
+        std::env::remove_var("NEWT_WEB_AUTH_HEADER");
+        let (status, _) = req(&app(), "GET", "/assets/htmx.min.js", None).await;
+        assert_eq!(status, StatusCode::OK, "unset ⇒ gate off");
     }
 
     #[tokio::test]

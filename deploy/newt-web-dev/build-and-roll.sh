@@ -13,7 +13,9 @@ docker push "$REGISTRY/newt-web-dev:latest"
 DIGEST_REF="$(docker inspect --format '{{index .RepoDigests 0}}' "$REGISTRY/newt-web-dev:latest")"
 echo "rolling image $DIGEST_REF"
 sed -e "s|image: REGISTRY/newt-web-dev:latest|image: $DIGEST_REF|" \
-    "$HERE/deployment.yaml" | kubectl apply -f "$HERE/service.yaml" -f "$HERE/web-service.yaml" -f -
+    "$HERE/deployment.yaml" | kubectl apply \
+      -f "$HERE/service.yaml" -f "$HERE/web-service.yaml" \
+      -f "$HERE/networkpolicy.yaml" -f -
 # SSO ingress: WEB_HOST is operator-local (internal DNS never committed).
 if [ -n "${WEB_HOST:-}" ]; then
   sed "s|WEB_HOST|$WEB_HOST|g" "$HERE/ingress.yaml" | kubectl apply -f -

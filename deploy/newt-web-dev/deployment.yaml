@@ -1,7 +1,10 @@
 # newt-web-dev — repurposes the drake-interactive Deployment (D5). Identity
 # (SSH host keys, authorized_keys, NATS nkey) mounts from Secrets; everything
 # else is disposable. Apply over the drake namespace; the Service keeps SSH on
-# the registered NodePort 30122 and adds newt-web on 30880.
+# the registered NodePort 30122. newt-web (:8880) is ClusterIP-only, reached
+# through the Traefik SSO ingress (ingress.yaml) — there is NO web NodePort (the
+# old :30880 bypass was removed, #1341), and networkpolicy.yaml fences :8880 to
+# Traefik so oauth2-proxy cannot be skipped (#1355).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -38,15 +41,17 @@ spec:
             capabilities:
               drop: ["ALL"]
               add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "KILL", "AUDIT_WRITE", "SYS_CHROOT"]
-          # Gate readiness on the WEB endpoint, not sshd. Traefik routes web
-          # traffic to the newt-web Service (:8880); newt-web is a backgrounded
-          # child that binds a beat after sshd. A tcp :22 probe marks the pod
-          # Ready — and adds it to the newt-web endpoints — before newt-web is
-          # listening, so a request landing in that window gets connection-
-          # refused upstream and surfaces as a transient 5xx right after a roll.
-          # /healthz answering means newt-web is truly up.
+          # Gate readiness on the WEB endpoint, not sshd. newt-web is a
+          # backgrounded child that binds a beat after sshd; /healthz answering
+          # means it is truly up (a tcp :22 probe would mark the pod Ready — and
+          # add it to the newt-web endpoints — while newt-web is still down,
+          # surfacing as a transient 5xx right after a roll). This is an EXEC
+          # probe (curl localhost INSIDE the pod), not httpGet: networkpolicy.yaml
+          # fences :8880 to Traefik, and an in-pod curl never traverses the pod
+          # network, so the probe is unaffected by the fence on any CNI (#1355).
           readinessProbe:
-            httpGet: { path: /healthz, port: newt-web }
+            exec:
+              command: ["curl", "-sf", "http://127.0.0.1:8880/healthz"]
             initialDelaySeconds: 2
             periodSeconds: 5
             timeoutSeconds: 2
@@ -56,6 +61,11 @@ spec:
             - { name: CARGO_TARGET_DIR, value: /scratch/cargo-target }
             # D3: the deployment opts into the LAN bind; the binary defaults loopback.
             - { name: NEWT_WEB_BIND, value: "0.0.0.0:8880" }
+            # #1355: the app-layer fail-closed identity gate. oauth2-proxy injects
+            # X-Auth-Request-Email; newt-web rejects any request to a non-/healthz
+            # route that lacks it. Sound only WITH networkpolicy.yaml, which makes
+            # the header unspoofable by a direct in-cluster caller.
+            - { name: NEWT_WEB_AUTH_HEADER, value: "X-Auth-Request-Email" }
           resources:
             requests: { cpu: 500m, memory: 1Gi }
             limits: { cpu: "4", memory: 12Gi }
