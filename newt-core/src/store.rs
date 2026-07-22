@@ -1311,6 +1311,41 @@ impl ConversationStore {
         Ok(summaries)
     }
 
+    /// Every conversation in the store, ACROSS all workspaces, most-recently-
+    /// active first — each paired with the absolute `workspace_path` it belongs
+    /// to. Unlike [`list`](Self::list) (workspace-fenced), this is the "all my
+    /// sessions" view an attach surface needs when the operator runs newt in
+    /// many directories. `load`/`resolve_id` fence by workspace, so a follower
+    /// re-opens the store *with the returned path* to read that conversation.
+    /// The store instance's own workspace is irrelevant here — the query spans
+    /// every `workspace_key`.
+    pub fn list_all(&self) -> anyhow::Result<Vec<(ConversationSummary, String)>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.title, c.persona, c.updated_at_claim, c.workspace_path,
+                    (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id)
+               FROM conversations c
+              ORDER BY c.activity_tick DESC, c.id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                ConversationSummary {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    persona: row.get(2)?,
+                    updated_at_unix_nanos: claim_to_u128(row.get(3)?),
+                    turn_count: row.get::<_, i64>(5)?.max(0) as usize,
+                },
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// The most-recently-active **open** conversation in this workspace —
     /// highest `activity_tick` whose `end_reason` is still NULL — or `None`
     /// when every conversation has been ended (or none exist). This is the
@@ -4600,6 +4635,51 @@ mod tests {
         store.end_conversation(&c1, "end").unwrap();
         assert!(store.latest_open().unwrap().is_none());
         assert_eq!(store.list().unwrap().len(), 2, "still listed after ending");
+    }
+
+    /// `list_all` spans every workspace (the fenced `list` does not) and pairs
+    /// each conversation with the `workspace_path` a follower re-opens the store
+    /// at — the exact mechanism a cross-workspace attach surface needs.
+    #[test]
+    fn list_all_spans_workspaces_and_carries_their_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let canon = |d: &std::path::Path| {
+            std::fs::canonicalize(d)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // One store root (one db); two different workspaces.
+        let store_a = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+        let a = store_a.create("in A", None).unwrap();
+        store_a.append_turn(&a, "q", "a").unwrap();
+        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+        let b = store_b.create("in B", None).unwrap();
+        store_b.append_turn(&b, "q", "a").unwrap();
+
+        // The fenced list only sees its own workspace.
+        assert_eq!(store_a.list().unwrap().len(), 1);
+        assert_eq!(store_b.list().unwrap().len(), 1);
+
+        // list_all (from EITHER handle) sees both, each with its real path.
+        let all = store_a.list_all().unwrap();
+        assert_eq!(all.len(), 2, "both workspaces' conversations");
+        let path_of = |id: &str| {
+            all.iter()
+                .find(|(s, _)| s.id == id)
+                .map(|(_, p)| p.clone())
+                .unwrap()
+        };
+        assert_eq!(path_of(&a), canon(ws_a.path()));
+        assert_eq!(path_of(&b), canon(ws_b.path()));
+
+        // The returned path is exactly what lets a follower load a conversation
+        // from ANOTHER workspace: re-open at B's path, load B's conversation.
+        let follower = ConversationStore::new(root.path(), path_of(&b), 100).unwrap();
+        assert_eq!(follower.load(&b).unwrap().title, "in B");
     }
 
     /// Ending is metadata, not activity: it must not tick the §6 clock (so it

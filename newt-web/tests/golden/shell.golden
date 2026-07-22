@@ -15,7 +15,14 @@
   #tabs button { padding: 0.25rem 0.75rem; border-radius: 4px 4px 0 0; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; cursor: pointer; }
   #tabs button.active { border-bottom-color: transparent; font-weight: bold; }
   .empty { opacity: 0.7; }
-  form.spawn { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; }
+  .sessions h2 { font-size: 0.9rem; margin: 0 0 0.25rem; }
+  .sessions .hint { opacity: 0.7; font-size: 0.75rem; margin: 0 0 0.5rem; }
+  .sessions ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
+  .sessions li { display: flex; align-items: baseline; gap: 0.5rem; }
+  .sessions .s-title { font-weight: bold; }
+  .spawn-wrap { border: 1px dashed color-mix(in srgb, currentColor 25%, transparent); border-radius: 4px; padding: 0.4rem 0.6rem; }
+  .spawn-wrap summary { cursor: pointer; font-size: 0.85rem; }
+  form.spawn { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; margin-top: 0.5rem; }
   form.spawn label { display: grid; font-size: 0.75rem; gap: 0.15rem; }
   input, select, button { font: inherit; }
   .agent { border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 4px; }
@@ -44,6 +51,9 @@
 <body>
 <header><h1>newt-web</h1></header>
 <main id="content">
+<section class="sessions"><h2>your sessions</h2><p class="hint">Durable conversations in the store — attach from anywhere; the running session stays the writer (D2).</p><p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section>
+<details class="spawn-wrap">
+<summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
 <form class="spawn" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
 <label>name<input name="name" value="agent" required></label>
 <label>backend url<input name="url" value="http://127.0.0.1:11434" required></label>
@@ -52,7 +62,7 @@
 <label>workspace<input name="workspace" value="." required></label>
 <button>spawn</button>
 </form>
-
+</details>
 <nav id="tabs"></nav>
 <div id="panel"><p class="empty">No agents yet. Spawn one above.</p></div>
 </main>

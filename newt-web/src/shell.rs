@@ -46,7 +46,14 @@ const STYLE: &str = r#"
   #tabs button { padding: 0.25rem 0.75rem; border-radius: 4px 4px 0 0; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; cursor: pointer; }
   #tabs button.active { border-bottom-color: transparent; font-weight: bold; }
   .empty { opacity: 0.7; }
-  form.spawn { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; }
+  .sessions h2 { font-size: 0.9rem; margin: 0 0 0.25rem; }
+  .sessions .hint { opacity: 0.7; font-size: 0.75rem; margin: 0 0 0.5rem; }
+  .sessions ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
+  .sessions li { display: flex; align-items: baseline; gap: 0.5rem; }
+  .sessions .s-title { font-weight: bold; }
+  .spawn-wrap { border: 1px dashed color-mix(in srgb, currentColor 25%, transparent); border-radius: 4px; padding: 0.4rem 0.6rem; }
+  .spawn-wrap summary { cursor: pointer; font-size: 0.85rem; }
+  form.spawn { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; margin-top: 0.5rem; }
   form.spawn label { display: grid; font-size: 0.75rem; gap: 0.15rem; }
   input, select, button { font: inherit; }
   .agent { border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 4px; }
@@ -216,6 +223,9 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <body>
 <header><h1>newt-web</h1></header>
 <main id="content">
+{sessions}
+<details class="spawn-wrap">
+<summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
 <form class="spawn" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
 <label>name<input name="name" value="agent" required></label>
 <label>backend url<input name="url" value="{url}" required></label>
@@ -224,7 +234,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <label>workspace<input name="workspace" value="{ws}" required></label>
 <button>spawn</button>
 </form>
-{sessions}
+</details>
 {strip}
 <div id="panel">{panel}</div>
 </main>
