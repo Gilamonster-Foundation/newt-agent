@@ -420,6 +420,7 @@ mod tests {
         std::env::remove_var("NEWT_WEB_MODEL");
         std::env::remove_var("NEWT_WEB_WORKSPACE");
         std::env::remove_var("NEWT_WEB_STATE_DIR");
+        std::env::remove_var("NEWT_WEB_KIND");
         let (status, a) = req(&app(), "GET", "/", None).await;
         assert_eq!(status, StatusCode::OK);
         let (_, b) = req(&app(), "GET", "/", None).await;
@@ -604,6 +605,36 @@ mod tests {
         assert!(
             missing.is_empty(),
             "hx-target(s) with no matching id in the page: {missing:?}"
+        );
+    }
+
+    /// The spawn form must pre-select the configured wire protocol. Without
+    /// NEWT_WEB_KIND the dropdown always defaulted to `ollama`, so an operator
+    /// whose backend URL points at a vLLM (openai) endpoint would spawn an
+    /// agent that speaks the wrong protocol and fails on the first turn. This
+    /// pins that NEWT_WEB_KIND=openai renders the openai option `selected`,
+    /// while the ollama option is not — and that an unset kind is ollama-first.
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_form_preselects_configured_kind() {
+        std::env::remove_var("NEWT_WEB_STATE_DIR");
+        std::env::set_var("NEWT_WEB_KIND", "openai");
+        let (_, page) = req(&app(), "GET", "/", None).await;
+        std::env::remove_var("NEWT_WEB_KIND");
+        assert!(
+            page.contains(r#"<option value="openai" selected>openai</option>"#),
+            "openai must be pre-selected when NEWT_WEB_KIND=openai"
+        );
+        assert!(
+            page.contains(r#"<option value="ollama">ollama</option>"#),
+            "the non-configured option must not carry `selected`"
+        );
+
+        // Unset ⇒ ollama-first (the historical default) stays selected.
+        let (_, page) = req(&app(), "GET", "/", None).await;
+        assert!(
+            page.contains(r#"<option value="ollama" selected>ollama</option>"#),
+            "ollama must be the default pre-selection with NEWT_WEB_KIND unset"
         );
     }
 

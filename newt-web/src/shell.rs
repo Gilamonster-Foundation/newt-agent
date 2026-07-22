@@ -146,6 +146,19 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
         std::env::var("NEWT_WEB_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
     let default_model = std::env::var("NEWT_WEB_MODEL").unwrap_or_else(|_| "llama3.1:8b".into());
     let default_ws = std::env::var("NEWT_WEB_WORKSPACE").unwrap_or_else(|_| ".".into());
+    // The wire protocol the spawn form pre-selects. Without this the dropdown
+    // always defaults to `ollama`, so pointing NEWT_WEB_BACKEND_URL at a vLLM
+    // (openai) endpoint spawns an agent that speaks the wrong protocol and
+    // fails on first turn. Pre-select the configured kind; unknown values fall
+    // through to the plain (ollama-first) option order.
+    let default_kind = std::env::var("NEWT_WEB_KIND").unwrap_or_else(|_| "ollama".into());
+    let kind_options = ["ollama", "openai"]
+        .into_iter()
+        .map(|k| {
+            let sel = if k == default_kind { " selected" } else { "" };
+            format!(r#"<option value="{k}"{sel}>{k}</option>"#)
+        })
+        .collect::<String>();
 
     let agents = reg.list();
     let active = agents.first().map(|(id, ..)| *id);
@@ -173,7 +186,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <label>name<input name="name" value="agent" required></label>
 <label>backend url<input name="url" value="{url}" required></label>
 <label>model<input name="model" value="{model}" required></label>
-<label>kind<select name="kind"><option value="ollama">ollama</option><option value="openai">openai</option></select></label>
+<label>kind<select name="kind">{kind_options}</select></label>
 <label>workspace<input name="workspace" value="{ws}" required></label>
 <button>spawn</button>
 </form>
