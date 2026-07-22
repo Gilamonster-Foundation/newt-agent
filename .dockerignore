@@ -1,0 +1,6 @@
+.git
+target
+*/target
+newt-web/target
+newt-mesh/target
+deploy/newt-web-dev/newt-web

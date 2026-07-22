@@ -8,6 +8,14 @@
 # from the home PVC; this image ends that split). authorized_keys mounts from
 # `drake-interactive-keys`. Tear down and rebuild freely: the identity is
 # cluster-side.
+# Stage 1: build newt-web INSIDE the image lineage so glibc always matches
+# (a host-built binary from a newer distro dies with `GLIBC_x.y not found`).
+# Context = the repo root (see build-and-roll.sh); .dockerignore keeps it lean.
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN CARGO_TARGET_DIR=/build cargo build --release --manifest-path newt-web/Cargo.toml
+
 FROM rust:1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,9 +38,15 @@ RUN rm -f /etc/ssh/ssh_host_*_key* \
         'AuthorizedKeysFile /etc/drake-interactive/authorized_keys' \
         > /etc/ssh/sshd_config.d/newt-web-dev.conf
 
+# The cockpit binary from the builder stage (glibc-matched).
+COPY --from=builder /build/release/newt-web /usr/local/bin/newt-web
+
 EXPOSE 22 8880
 # Host keys arrive as a Secret mounted at /run/hostkeys. fsGroup makes Secret
 # files group-readable (0640) and sshd refuses that, so the CMD installs them
 # 0600 into /etc/ssh before exec'ing sshd (-D foreground, -e stderr).
+# newt-web runs alongside sshd (dev-box supervision: if the cockpit dies the
+# box lives; restart it over SSH or re-roll). Bind comes from NEWT_WEB_BIND
+# (the Deployment opts into the LAN bind, D3).
 CMD ["/bin/sh", "-c", \
-     "install -m 600 -o root -g root /run/hostkeys/ssh_host_* /etc/ssh/ && exec /usr/sbin/sshd -D -e -h /etc/ssh/ssh_host_ed25519_key -h /etc/ssh/ssh_host_rsa_key"]
+     "install -m 600 -o root -g root /run/hostkeys/ssh_host_* /etc/ssh/ && (su drake -c 'RUST_LOG=info NEWT_WEB_BIND=\"${NEWT_WEB_BIND:-127.0.0.1:8880}\" /usr/local/bin/newt-web' &) && exec /usr/sbin/sshd -D -e -h /etc/ssh/ssh_host_ed25519_key -h /etc/ssh/ssh_host_rsa_key"]
