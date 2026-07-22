@@ -28,10 +28,15 @@ use agents::{Registry, Spec};
 /// (`deploy/newt-web-dev/networkpolicy.yaml`) forces every request through
 /// Traefik → oauth2-proxy first, so a direct in-cluster caller cannot forge it.
 fn required_auth_header() -> Option<String> {
-    std::env::var("NEWT_WEB_AUTH_HEADER")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    normalized_auth_header(std::env::var("NEWT_WEB_AUTH_HEADER").ok())
+}
+
+/// Config-parse rule for the trusted identity header: trim, and treat a blank
+/// value as unset. Pure, so it is tested WITHOUT mutating process env — a
+/// global-env test races the parallel suite (the gate flips other tests' status
+/// codes), which is exactly why `app_with_auth` takes the parsed value directly.
+fn normalized_auth_header(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Fail-closed identity gate: reject any request whose trusted identity header
@@ -460,21 +465,21 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// #1355 config seam: `NEWT_WEB_AUTH_HEADER` set (non-blank) turns the gate
-    /// ON through the default `app()` path; blank or unset leaves it off. Covers
-    /// the env read that `app_with_auth` is otherwise tested independently of.
-    #[serial_test::serial(newt_web_env)]
-    #[tokio::test]
-    async fn auth_header_env_toggles_the_gate() {
-        std::env::set_var("NEWT_WEB_AUTH_HEADER", "X-Auth-Request-Email");
-        let (status, _) = req(&app(), "GET", "/assets/htmx.min.js", None).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "env set ⇒ gate on");
-        std::env::set_var("NEWT_WEB_AUTH_HEADER", "   ");
-        let (status, _) = req(&app(), "GET", "/assets/htmx.min.js", None).await;
-        assert_eq!(status, StatusCode::OK, "blank env ⇒ gate off");
-        std::env::remove_var("NEWT_WEB_AUTH_HEADER");
-        let (status, _) = req(&app(), "GET", "/assets/htmx.min.js", None).await;
-        assert_eq!(status, StatusCode::OK, "unset ⇒ gate off");
+    /// #1355 config parse: the trusted-header rule trims and treats blank as
+    /// unset. Pure — no process-env mutation, so it cannot race the parallel
+    /// suite (an earlier env-mutating version flipped other tests' status codes).
+    #[test]
+    fn normalized_auth_header_trims_and_treats_blank_as_unset() {
+        assert_eq!(
+            normalized_auth_header(Some("X-Auth-Request-Email".into())).as_deref(),
+            Some("X-Auth-Request-Email")
+        );
+        assert_eq!(
+            normalized_auth_header(Some("  X-H  ".into())).as_deref(),
+            Some("X-H")
+        );
+        assert_eq!(normalized_auth_header(Some("   ".into())), None);
+        assert_eq!(normalized_auth_header(None), None);
     }
 
     #[tokio::test]
