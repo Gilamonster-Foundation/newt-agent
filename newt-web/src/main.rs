@@ -34,6 +34,7 @@ fn app() -> Router {
             }),
         )
         .route("/agents", post(spawn_agent))
+        .route("/agents/:id/panel", get(agent_panel_route))
         .route("/agents/:id/prompt", post(prompt_agent))
         .route("/agents/:id/events", get(agent_events))
         .route("/agents/:id", axum::routing::delete(delete_agent))
@@ -49,7 +50,8 @@ struct SpawnForm {
     workspace: String,
 }
 
-/// POST /agents — spawn, and return the new panel fragment (HTMX appends it).
+/// POST /agents — spawn; respond with the new agent's panel (targeted at
+/// `#panel`, activating the tab) plus an out-of-band refresh of the strip.
 async fn spawn_agent(
     State(reg): State<Arc<Registry>>,
     Form(form): Form<SpawnForm>,
@@ -65,12 +67,25 @@ async fn spawn_agent(
         kind,
         workspace: form.workspace,
     });
-    Html(shell::agent_panel(
-        id,
-        &form.name,
-        &form.model,
-        &agents::Snapshot::default(),
-    ))
+    let panel = shell::agent_panel(id, &form.name, &form.model, &agents::Snapshot::default());
+    let strip = shell::tab_strip(&reg.list(), Some(id));
+    Html(format!("{panel}\n{strip}"))
+}
+
+/// GET /agents/:id/panel — the tab body (view attach: opening a tab opens its
+/// SSE; the replaced panel's EventSource closes itself when its node vanishes).
+async fn agent_panel_route(
+    State(reg): State<Arc<Registry>>,
+    Path(id): Path<u64>,
+) -> Result<Html<String>, StatusCode> {
+    let agents = reg.list();
+    let (aid, name, model, snap) = agents
+        .iter()
+        .find(|(aid, ..)| *aid == id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let panel = shell::agent_panel(*aid, name, model, snap);
+    let strip = shell::tab_strip(&agents, Some(id));
+    Ok(Html(format!("{panel}\n{strip}")))
 }
 
 #[derive(serde::Deserialize)]
@@ -92,11 +107,17 @@ async fn prompt_agent(
     }
 }
 
-/// DELETE /agents/:id — shut the agent down; HTMX swaps the panel away with
-/// the empty body.
+/// DELETE /agents/:id — shut the agent down; the response clears the panel
+/// region and refreshes the strip out-of-band.
 async fn delete_agent(State(reg): State<Arc<Registry>>, Path(id): Path<u64>) -> impl IntoResponse {
     if reg.remove(id) {
-        (StatusCode::OK, Html(String::new()))
+        let agents = reg.list();
+        let body = format!(
+            r#"<p class="empty">Agent closed. Pick a tab or spawn a new one.</p>
+{}"#,
+            shell::tab_strip(&agents, None)
+        );
+        (StatusCode::OK, Html(body))
     } else {
         (StatusCode::NOT_FOUND, Html(String::new()))
     }
@@ -344,6 +365,98 @@ mod tests {
         );
         let perturbed = format!("{a}\nPERTURBED-MUST-FAIL");
         assert_ne!(expected, perturbed, "negative control failed to fail");
+    }
+
+    /// W3 acceptance: two agents, two backends, concurrent turns — each
+    /// transcript gets ITS OWN reply; deleting one leaves the other driving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_agents_drive_concurrently_and_die_independently() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let mut mocks = Vec::new();
+        for reply in ["REPLY-ALPHA", "REPLY-BETA"] {
+            let m = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/chat"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "m",
+                    "message": { "role": "assistant", "content": reply },
+                    "done": true,
+                })))
+                .mount(&m)
+                .await;
+            mocks.push(m);
+        }
+        let app = app();
+        for (i, m) in mocks.iter().enumerate() {
+            let form = format!(
+                "name=a{i}&url={}&model=m&kind=ollama&workspace=.",
+                urlencode(&m.uri())
+            );
+            let (status, _) = req(&app, "POST", "/agents", Some(&form)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        // Prompt both back-to-back — turns run concurrently in their pumps.
+        req(&app, "POST", "/agents/1/prompt", Some("text=go")).await;
+        req(&app, "POST", "/agents/2/prompt", Some("text=go")).await;
+        // Each panel shows ITS reply (and not the sibling's).
+        let p1 = wait_for_path(&app, "/agents/1/panel", "REPLY-ALPHA").await;
+        assert!(!p1.contains("REPLY-BETA"), "no cross-talk into panel 1");
+        let p2 = wait_for_path(&app, "/agents/2/panel", "REPLY-BETA").await;
+        assert!(!p2.contains("REPLY-ALPHA"), "no cross-talk into panel 2");
+        // Independent lifecycles: kill 1; 2 still drives.
+        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = req(&app, "GET", "/agents/1/panel", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "dead tab 404s");
+        let (status, _) = req(&app, "POST", "/agents/2/prompt", Some("text=again")).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "survivor still accepts prompts"
+        );
+    }
+
+    /// The strip lists every agent; the index shows one active panel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tab_strip_lists_agents_and_index_shows_one_panel() {
+        let app = app();
+        for name in ["one", "two"] {
+            let form = format!(
+                "name={name}&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=."
+            );
+            req(&app, "POST", "/agents", Some(&form)).await;
+        }
+        let (_, body) = req(&app, "GET", "/", None).await;
+        assert!(
+            body.contains(">one</button>") && body.contains(">two</button>"),
+            "strip lists both"
+        );
+        assert!(body.contains("agent-1"), "first agent's panel active");
+        assert!(
+            !body.contains("agent-2\""),
+            "second panel not rendered inline"
+        );
+        // Switching tabs serves the other panel (+ an OOB strip refresh).
+        let (status, p2) = req(&app, "GET", "/agents/2/panel", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            p2.contains("agent-2") && p2.contains("hx-swap-oob"),
+            "panel + OOB strip"
+        );
+    }
+
+    /// Poll an arbitrary GET path until `needle` appears.
+    async fn wait_for_path(app: &Router, path: &str, needle: &str) -> String {
+        for _ in 0..100 {
+            let (_, body) = req(app, "GET", path, None).await;
+            if body.contains(needle) {
+                return body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (_, body) = req(app, "GET", path, None).await;
+        panic!("never saw {needle:?} at {path}; last body:\n{body}");
     }
 
     fn urlencode(s: &str) -> String {
