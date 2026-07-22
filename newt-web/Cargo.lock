@@ -119,6 +119,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ammonia"
+version = "4.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6d763210e2eb7670d1a5183a08bebefa3f97db2a738a684f2ce00bd49f681d"
+dependencies = [
+ "cssparser 0.37.0",
+ "html5ever 0.39.0",
+ "maplit",
+ "url",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -914,6 +926,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cssparser"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c9cdaae01d5ed7882b04d795e7f752f46ff52d2fa3b50a20d28c464510bba98"
+dependencies = [
+ "dtoa-short",
+ "itoa",
+ "smallvec",
+]
+
+[[package]]
 name = "cssparser-macros"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1157,9 +1180,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521e380c0c8afb8d9a1e83a1822ee03556fc3e3e7dbc1fd30be14e37f9cb3f89"
 dependencies = [
  "bit-set",
- "cssparser",
+ "cssparser 0.36.0",
  "foldhash",
- "html5ever",
+ "html5ever 0.38.0",
  "nom 8.0.0",
  "precomputed-hash",
  "selectors",
@@ -1771,7 +1794,7 @@ version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7eee9b00ee2e599b4f86507157e3db786e7a3319fc225f0e9584151dbea2291d"
 dependencies = [
- "html5ever",
+ "html5ever 0.38.0",
  "markup5ever_rcdom",
  "phf 0.13.1",
 ]
@@ -1789,7 +1812,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1054432bae2f14e0061e33d23402fbaa67a921d319d56adc6bcf887ddad1cbc2"
 dependencies = [
  "log",
- "markup5ever",
+ "markup5ever 0.38.0",
+]
+
+[[package]]
+name = "html5ever"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46a1761807faccc9a19e86944bbf40610014066306f96edcdedc2fb714bcb7b8"
+dependencies = [
+ "log",
+ "markup5ever 0.39.0",
 ]
 
 [[package]]
@@ -2363,10 +2396,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "maplit"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
+
+[[package]]
 name = "markup5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8983d30f2915feeaaab2d6babdd6bc7e9ed1a00b66b5e6d74df19aa9c0e91862"
+dependencies = [
+ "log",
+ "tendril",
+ "web_atoms",
+]
+
+[[package]]
+name = "markup5ever"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7122d987ec5f704ee56f6e5b41a7d93722e9aae27ae07cafa4036c4d3f9757de"
 dependencies = [
  "log",
  "tendril",
@@ -2379,8 +2429,8 @@ version = "0.38.0+unofficial"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "333171ccdf66e915257740d44e38ea5b1b19ce7b45d33cc35cb6f118fbd981ff"
 dependencies = [
- "html5ever",
- "markup5ever",
+ "html5ever 0.38.0",
+ "markup5ever 0.38.0",
  "tendril",
  "xml5ever",
 ]
@@ -2496,11 +2546,13 @@ dependencies = [
 name = "newt-web"
 version = "0.1.0"
 dependencies = [
+ "ammonia",
  "async-stream",
  "axum",
  "futures-core",
  "http-body-util",
  "newt-core",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "serial_test",
@@ -3042,8 +3094,15 @@ checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
 dependencies = [
  "bitflags 2.13.1",
  "memchr",
+ "pulldown-cmark-escape",
  "unicase",
 ]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "quinn"
@@ -3517,7 +3576,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5d9c0c92a92d33f08817311cf3f2c29a3538a8240e94a6a3c622ce652d7e00c"
 dependencies = [
  "bitflags 2.13.1",
- "cssparser",
+ "cssparser 0.36.0",
  "derive_more",
  "log",
  "new_debug_unreachable",
@@ -5078,7 +5137,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3dc9559429edf0cd3f327cc0afd9d6b36fa8cec6d93107b7fbe64f806b5f2d9"
 dependencies = [
  "log",
- "markup5ever",
+ "markup5ever 0.38.0",
 ]
 
 [[package]]

@@ -15,6 +15,27 @@ pub(crate) fn escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Render message text as Markdown → sanitized HTML.
+///
+/// Matches Scrybe's `scrybe-render` (pulldown-cmark, all extensions) so the
+/// transcript reads the way the rest of the toolchain renders Markdown — but
+/// adds the step Scrybe deliberately skips: the transcript carries UNTRUSTED
+/// model/user text, so the generated HTML is run through an `ammonia` allowlist
+/// before it reaches the page. `ammonia` drops `<script>`/`<style>`, event-
+/// handler attributes, and `javascript:`/`data:` URLs, so a model reply cannot
+/// smuggle script into the cockpit. Soft line breaks become hard breaks so
+/// chat text keeps its newlines instead of Markdown-collapsing them.
+pub(crate) fn render_markdown(src: &str) -> String {
+    use pulldown_cmark::{html, Event, Options, Parser};
+    let parser = Parser::new_ext(src, Options::all()).map(|ev| match ev {
+        Event::SoftBreak => Event::HardBreak,
+        other => other,
+    });
+    let mut raw = String::new();
+    html::push_html(&mut raw, parser);
+    ammonia::clean(&raw)
+}
+
 const STYLE: &str = r#"
   :root { color-scheme: light dark; }
   body { font-family: ui-monospace, monospace; margin: 0; }
@@ -32,8 +53,21 @@ const STYLE: &str = r#"
   .agent h2 { font-size: 0.9rem; margin: 0; padding: 0.4rem 0.75rem; display: flex; justify-content: space-between; gap: 0.5rem; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
   .agent h2 .busy { opacity: 0.7; font-weight: normal; }
   .transcript { padding: 0.5rem 0.75rem; max-height: 50vh; overflow-y: auto; display: grid; gap: 0.4rem; }
-  .msg { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg { overflow-wrap: anywhere; }
   .msg .role { opacity: 0.6; font-size: 0.75rem; display: block; }
+  /* Rendered Markdown body (render_markdown -> ammonia). Tight vertical
+     rhythm so a reply reads as one chat bubble, code/tables scroll rather
+     than widen the page. Mirrors scrybe-render/src/themes/default.css. */
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p { margin: 0.3rem 0; }
+  .md code { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
+  .md pre { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.6rem; border-radius: 6px; overflow-x: auto; }
+  .md pre code { background: none; padding: 0; }
+  .md blockquote { margin: 0.3rem 0; padding-left: 0.75rem; border-left: 3px solid color-mix(in srgb, currentColor 25%, transparent); opacity: 0.85; }
+  .md table { border-collapse: collapse; display: block; overflow-x: auto; }
+  .md th, .md td { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); padding: 0.2rem 0.5rem; }
+  .md a { color: inherit; }
   form.prompt { display: flex; gap: 0.5rem; padding: 0.5rem 0.75rem; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
   form.prompt input[name=text] { flex: 1; }
 "#;
@@ -44,9 +78,9 @@ pub(crate) fn transcript_fragment(snap: &Snapshot) -> String {
     let mut msgs = String::new();
     for (role, content) in &snap.messages {
         msgs.push_str(&format!(
-            r#"<div class="msg"><span class="role">{}</span>{}</div>"#,
+            r#"<div class="msg"><span class="role">{}</span><div class="md">{}</div></div>"#,
             escape(role),
-            escape(content)
+            render_markdown(content)
         ));
     }
     if snap.messages.is_empty() {
@@ -205,4 +239,38 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
         strip = strip,
         panel = panel,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_renders_common_formatting() {
+        let out = render_markdown("**bold** and `code`\n\n```\nfn x() {}\n```");
+        assert!(out.contains("<strong>bold</strong>"), "bold: {out}");
+        assert!(out.contains("<code>code</code>"), "inline code: {out}");
+        assert!(out.contains("<pre>"), "fenced block: {out}");
+    }
+
+    #[test]
+    fn markdown_keeps_soft_breaks_as_line_breaks() {
+        // Chat text uses single newlines meaningfully; they must not collapse.
+        let out = render_markdown("line one\nline two");
+        assert!(
+            out.contains("<br"),
+            "soft break becomes a hard break: {out}"
+        );
+    }
+
+    #[test]
+    fn markdown_sanitizes_every_xss_vector() {
+        let out = render_markdown(
+            "[x](javascript:alert(1)) <img src=x onerror=alert(2)> <script>alert(3)</script>",
+        );
+        assert!(!out.contains("<script"), "script stripped: {out}");
+        assert!(!out.contains("alert(3)"), "script body dropped: {out}");
+        assert!(!out.contains("onerror"), "event handler stripped: {out}");
+        assert!(!out.contains("javascript:"), "js url stripped: {out}");
+    }
 }

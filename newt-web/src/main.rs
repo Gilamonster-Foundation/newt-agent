@@ -376,18 +376,24 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    /// Web hygiene regression: model/user text renders ESCAPED — a transcript
-    /// can never inject markup into the cockpit.
+    /// Web hygiene regression: model/user text renders as Markdown but every
+    /// XSS vector is sanitized away (render_markdown -> ammonia). The transcript
+    /// carries untrusted model output, so a reply must be able to format itself
+    /// (bold, code) yet must never smuggle script, an event handler, or a
+    /// `javascript:` URL into the cockpit.
     #[tokio::test(flavor = "multi_thread")]
-    async fn transcript_content_is_html_escaped() {
+    async fn transcript_renders_markdown_and_sanitizes_xss() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        // One reply mixing a benign sentinel, real Markdown, and three attacks.
+        let reply = "SENTINEL **bold** [x](javascript:alert(1)) \
+             <img src=x onerror=alert(2)> <script>alert(3)</script>";
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "m",
-                "message": { "role": "assistant", "content": "<script>alert(1)</script>" },
+                "message": { "role": "assistant", "content": reply },
                 "done": true,
             })))
             .mount(&mock)
@@ -399,14 +405,27 @@ mod tests {
         );
         req(&app, "POST", "/agents", Some(&form)).await;
         req(&app, "POST", "/agents/1/prompt", Some("text=go")).await;
-        let body = wait_for(&app, "alert(1)").await;
+        let body = wait_for(&app, "SENTINEL").await;
+
+        // Markdown renders.
         assert!(
-            body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
-            "reply is escaped"
+            body.contains("<strong>bold</strong>"),
+            "Markdown must render (bold): {body}"
+        );
+        // Every XSS vector is neutralized. (The page carries its own legitimate
+        // EventSource <script> hook, so we assert on the ATTACK payload, not the
+        // substring "<script": the model's script tag and body are gone.)
+        assert!(
+            !body.contains("alert(3)"),
+            "injected script tag + body must be dropped"
         );
         assert!(
-            !body.contains("<script>alert(1)</script>"),
-            "raw script tag must never render"
+            !body.contains("onerror"),
+            "event-handler attr must be stripped"
+        );
+        assert!(
+            !body.contains("javascript:"),
+            "javascript: URL must be stripped"
         );
     }
 
