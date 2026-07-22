@@ -55,6 +55,9 @@ built-ins (SC-L1, later-wins). The hand-written `.newt/workspace-map.toml` is th
 
 ## 3. The Laws (normative — LAW MINIMALISM; each carries a proof obligation)
 
+> Law style per the line's Craft Register (`steward-charter/docs/CRAFT.md`):
+> properties over algorithms, every law with a proof obligation.
+
 ### PM-L1 — Derivation is a pure per-unit fold
 `derive(pack, tree) = fun u => deriveUnit(pack, tree[u])`. The model is a
 function of `(pack, tree)` alone — no hidden state, compositional over units.
