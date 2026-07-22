@@ -175,30 +175,46 @@ fn store_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 /// the cockpit must not die because the store isn't there yet.
 pub(crate) async fn sessions_section() -> String {
     let (state, ws) = store_paths();
+    // list_all spans EVERY workspace (A2) — the operator runs newt in many
+    // dirs, so "my sessions" is not one workspace's. Each row carries the
+    // workspace path a follow re-opens the store at (load is workspace-fenced).
     let list = tokio::task::spawn_blocking(move || {
         newt_core::ConversationStore::new(&state, &ws, 1000)
-            .and_then(|s| s.list())
+            .and_then(|s| s.list_all())
             .unwrap_or_default()
     })
     .await
     .unwrap_or_default();
+    let mut out = String::from(
+        r#"<section class="sessions"><h2>your sessions</h2><p class="hint">Durable conversations in the store — attach from anywhere; the running session stays the writer (D2).</p>"#,
+    );
     if list.is_empty() {
-        return String::new();
+        out.push_str(
+            r#"<p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section>"#,
+        );
+        return out;
     }
-    let mut out =
-        String::from(r#"<details class="sessions"><summary>sessions on this box</summary><ul>"#);
-    for c in list.iter().take(20) {
+    out.push_str("<ul>");
+    for (c, workspace) in list.iter().take(30) {
+        // The workspace basename orients the operator ("kyln" vs "newt-agent").
+        let wsname = std::path::Path::new(workspace)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| workspace.clone());
         out.push_str(&format!(
-            r##"<li>{title} <small>({n} turns)</small>
+            r##"<li><span class="s-title">{title}</span> <small>({n} turns · {wsname})</small>
 <form style="display:inline" hx-post="/follow" hx-target="#panel" hx-swap="innerHTML">
 <input type="hidden" name="conv_id" value="{id}"><input type="hidden" name="title" value="{title}">
-<button>follow</button></form></li>"##,
+<input type="hidden" name="workspace" value="{workspace}">
+<button>attach</button></form></li>"##,
             title = shell::escape(&c.title),
             n = c.turn_count,
+            wsname = shell::escape(&wsname),
             id = shell::escape(&c.id),
+            workspace = shell::escape(workspace),
         ));
     }
-    out.push_str("</ul></details>");
+    out.push_str("</ul></section>");
     out
 }
 
@@ -206,15 +222,25 @@ pub(crate) async fn sessions_section() -> String {
 struct FollowForm {
     conv_id: String,
     title: String,
+    /// The conversation's own workspace path (from list_all): store `load` is
+    /// workspace-fenced, so the follow re-opens the store here, not at the
+    /// web's default workspace.
+    workspace: String,
 }
 
-/// POST /follow — open a read-only store-follow tab (W4).
+/// POST /follow — open a read-only store-follow tab (W4). The workspace comes
+/// from the session row (A2 cross-workspace attach), not the web's default.
 async fn follow_session(
     State(reg): State<Arc<Registry>>,
     Form(form): Form<FollowForm>,
 ) -> Html<String> {
-    let (state, ws) = store_paths();
-    let id = reg.spawn_follow(state, ws, form.conv_id, form.title.clone());
+    let (state, _) = store_paths();
+    let id = reg.spawn_follow(
+        state,
+        std::path::PathBuf::from(&form.workspace),
+        form.conv_id,
+        form.title.clone(),
+    );
     let panel = shell::agent_panel(
         id,
         &form.title,
@@ -438,8 +464,12 @@ mod tests {
         std::env::remove_var("NEWT_WEB_BACKEND_URL");
         std::env::remove_var("NEWT_WEB_MODEL");
         std::env::remove_var("NEWT_WEB_WORKSPACE");
-        std::env::remove_var("NEWT_WEB_STATE_DIR");
         std::env::remove_var("NEWT_WEB_KIND");
+        // Pin an EMPTY store dir so the sessions section is deterministically
+        // the empty-state hint — otherwise list_all would surface whatever
+        // conversations happen to live in the dev box's real ~/.newt.
+        let empty_state = tempfile::tempdir().unwrap();
+        std::env::set_var("NEWT_WEB_STATE_DIR", empty_state.path());
         let (status, a) = req(&app(), "GET", "/", None).await;
         assert_eq!(status, StatusCode::OK);
         let (_, b) = req(&app(), "GET", "/", None).await;
@@ -569,8 +599,11 @@ mod tests {
         // The sessions section lists it.
         let (_, body) = req(&app, "GET", "/", None).await;
         assert!(body.contains("terminal session"), "session listed: {body}");
-        // Follow it.
-        let form = format!("conv_id={conv}&title=terminal+session");
+        // Follow it — the workspace comes from the session row (A2).
+        let form = format!(
+            "conv_id={conv}&title=terminal+session&workspace={}",
+            urlencode(&ws.path().to_string_lossy())
+        );
         let (status, panel) = req(&app, "POST", "/follow", Some(&form)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
