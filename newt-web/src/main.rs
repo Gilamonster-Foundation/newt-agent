@@ -576,6 +576,37 @@ mod tests {
         std::env::remove_var("NEWT_WEB_WORKSPACE");
     }
 
+    /// Regression (#1331 live testing, 2026-07-22): the spawn button "did
+    /// nothing" — the form's hx-target pointed at #agents, an element W3 had
+    /// replaced with #panel. HTMX silently no-ops on a missing target, and the
+    /// route tests never exercise the DOM wiring. This pins the invariant:
+    /// every hx-target="#x" in the rendered surface must resolve to an id="x"
+    /// present in the same document (the index composed with a live panel).
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_hx_target_resolves_within_the_rendered_page() {
+        std::env::remove_var("NEWT_WEB_STATE_DIR");
+        let app = app();
+        // Compose the fullest surface: one agent spawned so panel + strip +
+        // delete button + prompt form are all present.
+        let form = "name=t&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.";
+        req(&app, "POST", "/agents", Some(form)).await;
+        let (_, page) = req(&app, "GET", "/", None).await;
+
+        let mut missing = Vec::new();
+        for part in page.split("hx-target=\"#").skip(1) {
+            let target = part.split('"').next().unwrap_or_default();
+            let id_attr = format!("id=\"{target}\"");
+            if !page.contains(&id_attr) {
+                missing.push(target.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "hx-target(s) with no matching id in the page: {missing:?}"
+        );
+    }
+
     /// Poll an arbitrary GET path until `needle` appears.
     async fn wait_for_path(app: &Router, path: &str, needle: &str) -> String {
         for _ in 0..100 {
