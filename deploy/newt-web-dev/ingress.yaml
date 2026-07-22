@@ -13,6 +13,16 @@ metadata:
   labels: { app: drake-interactive }
   annotations:
     traefik.ingress.kubernetes.io/router.middlewares: auth-oauth2-errors@kubernetescrd,auth-oauth2-proxy@kubernetescrd
+    # Homepage dashboard auto-discovery (the cluster's www dashboard scans
+    # gethomepage.dev/* ingress annotations). WEB_HOST substituted with the
+    # rest of the file.
+    gethomepage.dev/enabled: "true"
+    gethomepage.dev/name: "newt-web"
+    gethomepage.dev/group: "AI"
+    gethomepage.dev/description: "Agent cockpit — spawn & follow newt sessions (SSO)"
+    gethomepage.dev/href: "https://WEB_HOST"
+    gethomepage.dev/icon: "mdi-robot"
+    gethomepage.dev/pod-selector: "app=drake-interactive"
 spec:
   ingressClassName: traefik
   rules:
