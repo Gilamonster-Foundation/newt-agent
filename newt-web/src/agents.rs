@@ -39,11 +39,23 @@ pub(crate) enum Cmd {
 pub(crate) struct AgentHandle {
     pub name: String,
     pub model: String,
-    /// W4: a store-follow tab — read-only mirror of a conversation on the box;
-    /// prompts are refused, "delete" merely unfollows.
+    /// W4: a store-follow tab — a mirror of a conversation on the box. It never
+    /// drives a local pump; a prompt on this tab INJECTS into the running
+    /// session's store inbox (`attach`, A3/W6) rather than writing a turn (D2).
     pub readonly: bool,
+    /// A3/W6: the store target a followed tab injects into. `None` for a
+    /// pump-backed spawned agent (its prompts go to the in-process driver).
+    pub attach: Option<Attach>,
     pub cmd: mpsc::UnboundedSender<Cmd>,
     pub snapshots: watch::Receiver<Snapshot>,
+}
+
+/// Where a followed tab injects (A3/W6): the conversation and the workspace to
+/// re-open its (workspace-fenced) store at.
+#[derive(Clone)]
+pub(crate) struct Attach {
+    pub conv_id: String,
+    pub workspace: std::path::PathBuf,
 }
 
 #[derive(Default)]
@@ -76,6 +88,7 @@ impl Registry {
                 name: spec.name,
                 model: spec.model,
                 readonly: false,
+                attach: None,
                 cmd: cmd_tx,
                 snapshots: snap_rx,
             },
@@ -83,13 +96,24 @@ impl Registry {
         id
     }
 
-    /// Send a prompt to an agent. `false` if the id is unknown or the tab is
-    /// a read-only follow (D2: the running session stays the sole writer).
+    /// Send a prompt to a PUMP-backed agent. `false` if the id is unknown or the
+    /// tab is a follow (those inject via [`attach_of`]/`inject_prompt`, not the
+    /// pump — D2: the running session stays the sole writer).
     pub(crate) fn prompt(&self, id: u64, text: String) -> bool {
         match self.agents.lock().unwrap().get(&id) {
             Some(a) if !a.readonly => a.cmd.send(Cmd::Prompt(text)).is_ok(),
             _ => false,
         }
+    }
+
+    /// The store-inject target for a followed tab, if `id` is one (A3/W6). The
+    /// route uses it to enqueue a prompt into the running session's inbox.
+    pub(crate) fn attach_of(&self, id: u64) -> Option<Attach> {
+        self.agents
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|a| a.attach.clone())
     }
 
     /// W4: follow a conversation in the shared ConversationStore, read-only.
@@ -106,6 +130,11 @@ impl Registry {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
+        // A3/W6: remember where to inject before the poll thread consumes these.
+        let attach = Attach {
+            conv_id: conv_id.clone(),
+            workspace: workspace.clone(),
+        };
         std::thread::spawn(move || {
             let store = match newt_core::ConversationStore::new(&state_dir, &workspace, 1000) {
                 Ok(s) => s,
@@ -172,6 +201,7 @@ impl Registry {
                 name: title,
                 model: "follow".to_string(),
                 readonly: true,
+                attach: Some(attach),
                 cmd: cmd_tx,
                 snapshots: snap_rx,
             },

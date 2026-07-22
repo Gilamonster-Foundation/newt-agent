@@ -100,13 +100,33 @@ struct PromptForm {
     text: String,
 }
 
-/// POST /agents/:id/prompt — submit a prompt; 204 (the SSE stream carries the
-/// visible effect), 404 for an unknown agent.
+/// POST /agents/:id/prompt — submit a prompt. For a followed (attach) tab this
+/// INJECTS into the running session's store inbox (A3/W6) — the web never
+/// writes a turn, so the running session stays the sole writer (D2); the mirror
+/// shows the result once that session consumes it. For a pump-backed spawned
+/// agent it drives the in-process driver. 204 either way (the SSE stream
+/// carries the visible effect), 404 for an unknown agent.
 async fn prompt_agent(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
     Form(form): Form<PromptForm>,
 ) -> StatusCode {
+    if let Some(attach) = reg.attach_of(id) {
+        let (state, _) = store_paths();
+        let text = form.text;
+        let injected = tokio::task::spawn_blocking(move || {
+            newt_core::ConversationStore::new(&state, &attach.workspace, 1000)
+                .and_then(|s| s.inject_prompt(&attach.conv_id, &text, None))
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        return if injected {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+    }
     if reg.prompt(id, form.text) {
         StatusCode::NO_CONTENT
     } else {
@@ -607,8 +627,8 @@ mod tests {
         let (status, panel) = req(&app, "POST", "/follow", Some(&form)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            panel.contains("read-only follow"),
-            "readonly badge: {panel}"
+            panel.contains("injects into the running session"),
+            "attach tab shows the inject affordance (A3): {panel}"
         );
         // The mirror catches up with the existing turn...
         let p = wait_for_path(&app, "/agents/1/panel", "hi from the model").await;
@@ -618,12 +638,22 @@ mod tests {
             .append_turn(&conv, "second question", "second answer")
             .unwrap();
         wait_for_path(&app, "/agents/1/panel", "second answer").await;
-        // Prompts are refused on a follow (the session owns the claim).
-        let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=hijack")).await;
+        // A3/W6: a prompt on the attach tab INJECTS into the running session's
+        // store inbox — it does NOT drive a local pump and, crucially, does NOT
+        // write a turn (D2: the running session stays the sole writer).
+        let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=please+fix+it")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "attach prompt is accepted");
+        // The running session would dequeue exactly this from its inbox…
+        let taken = store
+            .take_injected_prompt(&conv)
+            .unwrap()
+            .expect("the attach prompt was enqueued");
+        assert_eq!(taken.body, "please fix it");
+        // …and the web wrote NO turn — the transcript is unchanged (D2).
         assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "readonly tab refuses prompts"
+            store.load(&conv).unwrap().turns.len(),
+            2,
+            "D2: injecting never writes a turn (still the two the session wrote)"
         );
         std::env::remove_var("NEWT_WEB_STATE_DIR");
         std::env::remove_var("NEWT_WEB_WORKSPACE");

@@ -133,7 +133,16 @@ pub(crate) fn agent_panel(
         model = escape(model),
         fragment = transcript_fragment(snap),
         prompt_form = if readonly {
-            r#"<p class="empty" style="padding:0.5rem 0.75rem">read-only follow — the running session owns this conversation (D2)</p>"#.to_string()
+            // A3/W6: a followed tab injects into the running session's inbox
+            // (D2 — it stays the writer; the mirror shows the reply once the
+            // session consumes it). Same POST target; the route routes it.
+            format!(
+                r##"<p class="empty" style="padding:0.4rem 0.75rem 0">→ injects into the running session (it stays the writer — D2)</p>
+<form class="prompt" hx-post="/agents/{id}/prompt" hx-swap="none" hx-on::after-request="this.reset()">
+<input name="text" placeholder="inject a prompt…" autocomplete="off" required>
+<button>inject</button>
+</form>"##
+            )
         } else {
             format!(
                 r##"<form class="prompt" hx-post="/agents/{id}/prompt" hx-swap="none" hx-on::after-request="this.reset()">
