@@ -1,0 +1,64 @@
+# newt-web-dev — repurposes the drake-interactive Deployment (D5). Identity
+# (SSH host keys, authorized_keys, NATS nkey) mounts from Secrets; everything
+# else is disposable. Apply over the drake namespace; the Service keeps SSH on
+# the registered NodePort 30122 and adds newt-web on 30880.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drake-interactive
+  namespace: drake
+  labels:
+    app: drake-interactive
+    app.kubernetes.io/part-of: newt-web
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: drake-interactive, app.kubernetes.io/part-of: drake }
+  template:
+    metadata:
+      labels: { app: drake-interactive, app.kubernetes.io/part-of: drake }
+    spec:
+      containers:
+        - name: newt-web-dev
+          image: REGISTRY/newt-web-dev:latest # sed REGISTRY -> your local registry (never commit a real host)
+          imagePullPolicy: Always
+          ports:
+            - { containerPort: 22, name: ssh }
+            - { containerPort: 8880, name: newt-web }
+          env:
+            - { name: TMPDIR, value: /scratch }
+            - { name: CARGO_TARGET_DIR, value: /scratch/cargo-target }
+            # D3: the deployment opts into the LAN bind; the binary defaults loopback.
+            - { name: NEWT_WEB_BIND, value: "0.0.0.0:8880" }
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "4", memory: 12Gi }
+          volumeMounts:
+            - { mountPath: /home/drake, name: home }
+            - { mountPath: /workspaces, name: agent-workspace }
+            - { mountPath: /scratch, name: scratch }
+            - { mountPath: /nats-nkeys, name: nats-nkeys, readOnly: true }
+            - { mountPath: /run/drake/api-keys, name: api-keys, readOnly: true }
+            - { mountPath: /etc/drake-interactive/authorized_keys, name: authorized-keys, readOnly: true, subPath: authorized_keys }
+            - { mountPath: /etc/ssh/ssh_host_ed25519_key, name: hostkeys, readOnly: true, subPath: ssh_host_ed25519_key }
+            - { mountPath: /etc/ssh/ssh_host_ed25519_key.pub, name: hostkeys, readOnly: true, subPath: ssh_host_ed25519_key.pub }
+            - { mountPath: /etc/ssh/ssh_host_rsa_key, name: hostkeys, readOnly: true, subPath: ssh_host_rsa_key }
+            - { mountPath: /etc/ssh/ssh_host_rsa_key.pub, name: hostkeys, readOnly: true, subPath: ssh_host_rsa_key.pub }
+      securityContext: { fsGroup: 100 }
+      serviceAccountName: drake-interactive
+      volumes:
+        - name: home
+          persistentVolumeClaim: { claimName: drake-interactive-home }
+        - name: agent-workspace
+          persistentVolumeClaim: { claimName: agent-workspace }
+        - name: nats-nkeys
+          secret: { secretName: drake-nats-nkey, defaultMode: 256 }
+        - name: api-keys
+          secret: { secretName: drake-api-keys, defaultMode: 288, optional: true }
+        - name: authorized-keys
+          secret: { secretName: drake-interactive-keys, defaultMode: 256 }
+        - name: hostkeys
+          secret: { secretName: drake-interactive-hostkeys, defaultMode: 384 }
+        - name: scratch
+          emptyDir: { sizeLimit: 50Gi }

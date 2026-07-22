@@ -1,0 +1,32 @@
+# newt-web-dev — the repurposed drake-interactive image (decision D5,
+# docs/decisions/newt_web_htmx.md). Dev/test box for newt-agent + newt-web:
+# sshd + tmux + rust toolchain + the newt build deps.
+#
+# IDENTITY IS NEVER BAKED IN. The registered SSH host keys mount from the
+# `drake-interactive-hostkeys` Secret at runtime (the old image baked decoy
+# keys at build time — root@buildkitsandbox — while sshd served a second set
+# from the home PVC; this image ends that split). authorized_keys mounts from
+# `drake-interactive-keys`. Tear down and rebuild freely: the identity is
+# cluster-side.
+FROM rust:1-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server tmux git just ripgrep curl jq \
+        pkg-config libssl-dev sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd \
+    && useradd -m -s /bin/bash -u 1000 drake
+
+# No HostKey generation: /etc/ssh/ssh_host_* arrive as Secret mounts.
+RUN rm -f /etc/ssh/ssh_host_*_key* \
+    && printf '%s\n' \
+        'PasswordAuthentication no' \
+        'PermitRootLogin no' \
+        'AuthorizedKeysFile /etc/drake-interactive/authorized_keys' \
+        > /etc/ssh/sshd_config.d/newt-web-dev.conf
+
+EXPOSE 22 8880
+# -D foreground; -e log to stderr; host keys from the Secret mount paths.
+CMD ["/usr/sbin/sshd", "-D", "-e", \
+     "-h", "/etc/ssh/ssh_host_ed25519_key", \
+     "-h", "/etc/ssh/ssh_host_rsa_key"]
