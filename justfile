@@ -56,16 +56,16 @@ install-lean dest=`echo $HOME/bin`:
 # disk. Removing first gives a new inode; re-signing ad-hoc clears the cache.
 # `codesign` exists only on macOS, so the re-sign is a no-op elsewhere.
 #
-# Copy from ${CARGO_TARGET_DIR:-target}: `cargo build` above honors
-# CARGO_TARGET_DIR when it is set (e.g. a shared /tmp/.cargo-target in some CI /
-# agent sandboxes), so a hardcoded `target/release` would copy a STALE binary
-# from the local ./target while the fresh build actually landed elsewhere —
-# `just install` would then silently install the wrong (old) version.
+# Resolve the copy source through `cargo metadata`: unlike
+# ${CARGO_TARGET_DIR:-target}, this also honors `[build] target-dir` in workspace
+# or user Cargo config. That prevents installing a stale local binary when the
+# fresh build landed in a configured shared target directory.
 _place-binaries dest:
     mkdir -p {{dest}}
     rm -f {{dest}}/newt {{dest}}/newt-mcp-server
-    cp "${CARGO_TARGET_DIR:-target}/release/newt" {{dest}}/newt
-    cp "${CARGO_TARGET_DIR:-target}/release/newt-mcp-server" {{dest}}/newt-mcp-server
+    target_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"; \
+        cp "$target_dir/release/newt" {{dest}}/newt; \
+        cp "$target_dir/release/newt-mcp-server" {{dest}}/newt-mcp-server
     @if command -v codesign >/dev/null 2>&1; then codesign --force --sign - {{dest}}/newt {{dest}}/newt-mcp-server && echo "re-signed ad-hoc (macOS AMFI)"; fi
 
 # Remove the binaries `just install` placed in DEST (default: ~/bin) — the
