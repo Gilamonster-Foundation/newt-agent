@@ -1558,12 +1558,27 @@ impl ConversationStore {
     /// Idempotent on `request_id`: a double-submit / SSE reconnect that names
     /// the same still-unresolved request is a safe no-op. Workspace-fenced.
     /// This does NOT resolve the request — the gate's poll consumes it (so a
-    /// TTY answer can still win the race first).
+    /// TTY answer can still win the race first). Convenience wrapper that stamps
+    /// the coarse channel tag `"web"`; [`answer_permission_request_as`] records
+    /// the authenticated operator identity that answered (#1354).
     pub fn answer_permission_request(
         &self,
         conversation_id: &str,
         request_id: &str,
         verdict: Verdict,
+    ) -> anyhow::Result<AnswerOutcome> {
+        self.answer_permission_request_as(conversation_id, request_id, verdict, "web")
+    }
+
+    /// As [`answer_permission_request`], but stamps `answered_by` with WHO
+    /// answered — the authenticated operator identity (the web principal, #1354)
+    /// rather than a coarse channel tag. The audit ledger's "who" axis.
+    pub fn answer_permission_request_as(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+        verdict: Verdict,
+        answered_by: &str,
     ) -> anyhow::Result<AnswerOutcome> {
         let cutoff = (self.claim_clock)().saturating_sub(Self::PERMISSION_REQUEST_TTL_NANOS);
         let conn = self.lock_conn();
@@ -1584,15 +1599,36 @@ impl ConversationStore {
             Some((1, _, _)) | Some((_, Some(_), _)) => AnswerOutcome::AlreadyResolved,
             Some((_, None, _)) => {
                 tx.execute(
-                    "UPDATE permission_requests SET verdict = ?2, answered_by = 'web'
+                    "UPDATE permission_requests SET verdict = ?2, answered_by = ?3
                       WHERE request_id = ?1 AND resolved = 0 AND verdict IS NULL",
-                    rusqlite::params![request_id, verdict.as_db_str()],
+                    rusqlite::params![request_id, verdict.as_db_str(), answered_by],
                 )?;
                 AnswerOutcome::Answered
             }
         };
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// The recorded `answered_by` for a request — the authenticated operator
+    /// identity that answered (web), or the channel tag (`tty`/`expired`) that
+    /// resolved it. The audit "who" read; `None` if the request is unknown or
+    /// not yet answered. Workspace-fenced.
+    pub fn answered_by(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT answered_by FROM permission_requests
+              WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3",
+            rusqlite::params![request_id, conversation_id, self.workspace_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
     }
 
     /// The gate's poll: if a surface has answered `request_id` and it is still
@@ -5237,6 +5273,44 @@ mod tests {
                 .unwrap(),
             AnswerOutcome::Answered,
             "a within-TTL request still answers"
+        );
+    }
+
+    #[test]
+    fn answer_stamps_the_operator_identity_who_answered() {
+        // #1354: a web answer records WHO answered (the authenticated operator
+        // identity), not just the coarse channel — the audit "who" axis.
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("session", None).unwrap();
+        let rid = store
+            .publish_permission_request(&conv, "[]", r#"["low"]"#)
+            .unwrap();
+        // Unanswered → no who yet.
+        assert_eq!(store.answered_by(&conv, &rid).unwrap(), None);
+        // The operator answers via the web — their identity is stamped.
+        assert_eq!(
+            store
+                .answer_permission_request_as(&conv, &rid, Verdict::AllowOnce, "op@example.com")
+                .unwrap(),
+            AnswerOutcome::Answered
+        );
+        assert_eq!(
+            store.answered_by(&conv, &rid).unwrap().as_deref(),
+            Some("op@example.com"),
+            "the operator identity is stamped as who answered"
+        );
+        // The convenience wrapper stamps the coarse channel tag.
+        let rid2 = store
+            .publish_permission_request(&conv, "[]", r#"["low"]"#)
+            .unwrap();
+        store
+            .answer_permission_request(&conv, &rid2, Verdict::Deny)
+            .unwrap();
+        assert_eq!(
+            store.answered_by(&conv, &rid2).unwrap().as_deref(),
+            Some("web")
         );
     }
 

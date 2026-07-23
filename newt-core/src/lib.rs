@@ -78,6 +78,11 @@ pub mod pyo3_module;
 /// the top of `main` to become dispatch-capable, so the brush engine's carried
 /// `ls`/`cat` shims re-exec against the newt binary itself.
 pub use agent_bridle::maybe_dispatch;
+// The web-authz operator contract (#1354): newt adopts bridle's shared
+// operator-authz types. `HumanPrincipal` is the authenticated web operator the
+// cockpit stamps on a permission decision; the rest of the triangle
+// (PermissionChallenge / OperatorDecision) is re-exported as it is wired in.
+pub use agent_bridle::operator::HumanPrincipal;
 pub use agent_identity::{
     AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef, DEFAULT_AGENT_EMAIL,
     DEFAULT_AGENT_NAME,

@@ -66,6 +66,12 @@ spec:
             # route that lacks it. Sound only WITH networkpolicy.yaml, which makes
             # the header unspoofable by a direct in-cluster caller.
             - { name: NEWT_WEB_AUTH_HEADER, value: "X-Auth-Request-Email" }
+            # #1354: the OIDC issuer the operator identity is keyed by
+            # (issuer, subject) — the audit "who". Operator-local (an internal
+            # IdP URL, never committed): build-and-roll.sh substitutes it from
+            # $NEWT_WEB_OIDC_ISSUER. Unset/blank ⇒ the gate fails CLOSED (403),
+            # never a null-issuer identity.
+            - { name: NEWT_WEB_OIDC_ISSUER, value: "__OIDC_ISSUER__" }
           resources:
             requests: { cpu: 500m, memory: 1Gi }
             limits: { cpu: "4", memory: 12Gi }

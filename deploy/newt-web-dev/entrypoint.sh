@@ -36,7 +36,7 @@ done
 (
     set +e
     while true; do
-        su drake -c "RUST_LOG=info NEWT_WEB_BIND='${NEWT_WEB_BIND:-127.0.0.1:8880}' NEWT_WEB_AUTH_HEADER='${NEWT_WEB_AUTH_HEADER:-}' /usr/local/bin/newt-web"
+        su drake -c "RUST_LOG=info NEWT_WEB_BIND='${NEWT_WEB_BIND:-127.0.0.1:8880}' NEWT_WEB_AUTH_HEADER='${NEWT_WEB_AUTH_HEADER:-}' NEWT_WEB_OIDC_ISSUER='${NEWT_WEB_OIDC_ISSUER:-}' /usr/local/bin/newt-web"
         echo "entrypoint: newt-web exited ($?); respawning in 1s" >&2
         sleep 1
     done

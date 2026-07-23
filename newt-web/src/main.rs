@@ -5,8 +5,8 @@
 //! (`agents.rs`); the front end is server-rendered HTML (`shell.rs`); this
 //! file is the composition root — routes, state, and the SSE bridge only.
 
-use axum::extract::{Path, Request, State};
-use axum::http::StatusCode;
+use axum::extract::{Extension, Path, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
@@ -19,54 +19,115 @@ mod agents;
 mod shell;
 
 use agents::{Registry, Spec};
+use newt_core::HumanPrincipal;
 
-/// The trusted forward-auth identity header, from `NEWT_WEB_AUTH_HEADER`
-/// (config, three-Cs). Unset/blank (loopback dev + the mocked test tier) ⇒ no
-/// gate; set (the deployment pins `X-Auth-Request-Email`, injected by the
-/// cluster's oauth2-proxy/Authentik forward-auth) ⇒ every route but `/healthz`
-/// demands it (#1355). Header-trust is sound ONLY because the NetworkPolicy
-/// (`deploy/newt-web-dev/networkpolicy.yaml`) forces every request through
-/// Traefik → oauth2-proxy first, so a direct in-cluster caller cannot forge it.
-fn required_auth_header() -> Option<String> {
-    normalized_auth_header(std::env::var("NEWT_WEB_AUTH_HEADER").ok())
+/// Standard oauth2-proxy identity headers the gate reads (convention — these are
+/// what the cluster's forward-auth injects). The EMAIL header is configurable
+/// (`NEWT_WEB_AUTH_HEADER`); subject/groups follow the oauth2-proxy convention.
+const SUBJECT_HEADER: &str = "x-auth-request-user";
+const GROUPS_HEADER: &str = "x-auth-request-groups";
+
+/// The gate's config: which header carries the operator's email, plus the OIDC
+/// issuer (`NEWT_WEB_OIDC_ISSUER`). BOTH are required to mint a principal — an
+/// unset issuer fails CLOSED (never a null-issuer identity, #1354 / FMEA), so
+/// the audit key stays the stable `(issuer, subject)`, never mutable email.
+#[derive(Clone)]
+struct AuthConfig {
+    identity_header: String,
+    issuer: String,
 }
 
-/// Config-parse rule for the trusted identity header: trim, and treat a blank
-/// value as unset. Pure, so it is tested WITHOUT mutating process env — a
-/// global-env test races the parallel suite (the gate flips other tests' status
-/// codes), which is exactly why `app_with_auth` takes the parsed value directly.
-fn normalized_auth_header(raw: Option<String>) -> Option<String> {
+/// Read the gate config from env. `None` (`NEWT_WEB_AUTH_HEADER` unset/blank) ⇒
+/// gate off — the loopback-dev + fully-mocked-test posture. `Some` ⇒ the gate is
+/// on; a blank `NEWT_WEB_OIDC_ISSUER` yields an empty issuer that fails closed
+/// per request (see `operator_from_headers`) rather than minting a partial one.
+fn auth_config() -> Option<AuthConfig> {
+    let identity_header = normalized(std::env::var("NEWT_WEB_AUTH_HEADER").ok())?;
+    let issuer = normalized(std::env::var("NEWT_WEB_OIDC_ISSUER").ok()).unwrap_or_default();
+    Some(AuthConfig {
+        identity_header,
+        issuer,
+    })
+}
+
+/// Trim + treat blank as absent. Pure, so it is tested WITHOUT mutating process
+/// env — a global-env test races the parallel suite (the gate flips other tests'
+/// status codes), which is why `app_with_auth` takes the parsed config directly.
+fn normalized(raw: Option<String>) -> Option<String> {
     raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Fail-closed identity gate: reject any request whose trusted identity header
-/// is absent or blank. Never wraps `/healthz` — the readiness probe carries no
-/// oauth2-proxy identity.
+/// The trimmed value of header `name`, or `None` if absent/blank/non-UTF8.
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Build the authenticated operator from the oauth2-proxy identity headers, or
+/// `None` if a COMPLETE principal cannot be formed — all-or-nothing, so a
+/// missing issuer / email / subject fails CLOSED rather than stamping a partial
+/// (null-issuer or mutable-email) identity (#1354 / FMEA). Pure.
+fn operator_from_headers(headers: &HeaderMap, cfg: &AuthConfig) -> Option<HumanPrincipal> {
+    if cfg.issuer.is_empty() {
+        return None; // never mint a null-issuer identity
+    }
+    let email = header_value(headers, &cfg.identity_header)?;
+    let subject = header_value(headers, SUBJECT_HEADER)?;
+    let groups = header_value(headers, GROUPS_HEADER)
+        .map(|g| {
+            g.split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(HumanPrincipal {
+        issuer: cfg.issuer.clone(),
+        subject,
+        email: Some(email),
+        groups,
+    })
+}
+
+/// The stable audit key for an operator — `(issuer, subject)`, NEVER email
+/// (email is mutable/display-only per the contract). What the store stamps as
+/// "who answered". Attribution, not authorization.
+fn principal_key(p: &HumanPrincipal) -> String {
+    format!("{}|{}", p.issuer, p.subject)
+}
+
+/// Fail-closed identity gate: mint the operator from the oauth2-proxy headers,
+/// stash it in the request for `decide_route`, and proceed — or 403 if a
+/// complete principal cannot be formed (missing identity/subject, or an unset
+/// issuer). Never wraps `/healthz` — the readiness probe carries no identity.
+/// Trust is sound ONLY because the NetworkPolicy forces every request through
+/// Traefik → oauth2-proxy first, so a direct in-cluster caller cannot forge it.
 async fn require_identity(
-    State(header): State<String>,
-    req: Request,
+    State(cfg): State<AuthConfig>,
+    mut req: Request,
     next: Next,
 ) -> axum::response::Response {
-    let present = req
-        .headers()
-        .get(header.as_str())
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| !v.trim().is_empty());
-    if present {
-        next.run(req).await
-    } else {
-        StatusCode::FORBIDDEN.into_response()
+    match operator_from_headers(req.headers(), &cfg) {
+        Some(principal) => {
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
+        None => StatusCode::FORBIDDEN.into_response(),
     }
 }
 
 fn app() -> Router {
-    app_with_auth(required_auth_header())
+    app_with_auth(auth_config())
 }
 
-/// Compose the cockpit. `auth_header = Some(name)` fences every route except
-/// `/healthz` behind that trusted identity header (fail-closed, #1355); `None`
-/// leaves the surface open — the loopback-dev + fully-mocked-test posture.
-fn app_with_auth(auth_header: Option<String>) -> Router {
+/// Compose the cockpit. `auth = Some(cfg)` fences every route except `/healthz`
+/// behind the fail-closed operator gate (#1355/#1354); `None` leaves the surface
+/// open — the loopback-dev + fully-mocked-test posture.
+fn app_with_auth(auth: Option<AuthConfig>) -> Router {
     let reg = Arc::new(Registry::default());
     let mut gated = Router::new()
         .route("/", get(shell::index))
@@ -87,8 +148,8 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/agents/:id/decision", post(decide_route))
         .route("/agents/:id/events", get(agent_events))
         .route("/agents/:id", axum::routing::delete(delete_agent));
-    if let Some(header) = auth_header {
-        gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
+    if let Some(cfg) = auth {
+        gated = gated.layer(middleware::from_fn_with_state(cfg, require_identity));
     }
     // `/healthz` stays outside the gate: the kubelet probe has no identity.
     Router::new()
@@ -230,6 +291,7 @@ struct DecisionForm {
 async fn decide_route(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    principal: Option<Extension<HumanPrincipal>>,
     Form(form): Form<DecisionForm>,
 ) -> StatusCode {
     let Some(attach) = reg.attach_of(id) else {
@@ -240,12 +302,20 @@ async fn decide_route(
         "allow_session" => newt_core::Verdict::AllowSession,
         _ => newt_core::Verdict::Deny,
     };
+    // AUDIT-ONLY (#1354): stamp WHO answered — the stable `(issuer, subject)` key
+    // of the authenticated operator (the gate inserted it), or the `"web"`
+    // channel tag when the gate is off (dev). This is ATTRIBUTION, not
+    // authorization: any authenticated operator can still answer any session —
+    // per-session authZ is a tracked follow-on, not part of this stamp.
+    let answered_by = principal
+        .map(|Extension(p)| principal_key(&p))
+        .unwrap_or_else(|| "web".to_string());
     let (state, _) = store_paths();
     let conv = attach.conv_id.clone();
     let request_id = form.request_id;
     let ok = tokio::task::spawn_blocking(move || {
         newt_core::ConversationStore::new(&state, &attach.workspace, 1000)
-            .and_then(|s| s.answer_permission_request(&conv, &request_id, verdict))
+            .and_then(|s| s.answer_permission_request_as(&conv, &request_id, verdict, &answered_by))
             .is_ok()
     })
     .await
@@ -454,6 +524,49 @@ mod tests {
         resp.status()
     }
 
+    /// Like `req` but carries extra headers AND a form body (a gated request
+    /// that also posts a form). Returns status + body.
+    async fn req_full(
+        app: &Router,
+        method: &str,
+        path: &str,
+        form: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded");
+        for &(k, v) in headers {
+            b = b.header(k, v);
+        }
+        let resp = app
+            .clone()
+            .oneshot(b.body(axum::body::Body::from(form.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The gate config a gated-app test uses — a fixed header + issuer so the
+    /// operator key is deterministic.
+    fn test_auth() -> AuthConfig {
+        AuthConfig {
+            identity_header: "X-Auth-Request-Email".into(),
+            issuer: "https://idp.example".into(),
+        }
+    }
+
+    /// A complete oauth2-proxy identity header set (email + subject).
+    fn op_headers() -> [(&'static str, &'static str); 2] {
+        [
+            ("X-Auth-Request-Email", "op@example.com"),
+            ("X-Auth-Request-User", "sub-1"),
+        ]
+    }
+
     /// Poll the index until `needle` appears (the pump publishes async).
     async fn wait_for(app: &Router, needle: &str) -> String {
         for _ in 0..100 {
@@ -480,7 +593,7 @@ mod tests {
     /// Uses storeless routes so the gate is proven without any fs/store touch.
     #[tokio::test]
     async fn require_identity_gate_rejects_the_unauthenticated_and_admits_the_header() {
-        let app = app_with_auth(Some("X-Auth-Request-Email".into()));
+        let app = app_with_auth(Some(test_auth()));
         // No identity → 403, on both a write path and a GET.
         let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=hi")).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "write path fail-closes");
@@ -499,8 +612,12 @@ mod tests {
             StatusCode::FORBIDDEN,
             "blank identity is no identity"
         );
-        // The trusted header admits the request — it reaches the handler (a
-        // static asset → 200; NOT a 403), proving the gate opened.
+        // A COMPLETE principal (email + subject, configured issuer) admits — it
+        // reaches the handler (static asset → 200; NOT 403), proving the gate opened.
+        let status = req_with_headers(&app, "GET", "/assets/htmx.min.js", &op_headers()).await;
+        assert_eq!(status, StatusCode::OK, "complete identity is admitted");
+        // #1354 blocker: email present but SUBJECT missing ⇒ incomplete principal
+        // ⇒ fail-closed. Never admit/stamp a partial (email-only) identity.
         let status = req_with_headers(
             &app,
             "GET",
@@ -508,7 +625,11 @@ mod tests {
             &[("X-Auth-Request-Email", "op@example.com")],
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "trusted identity is admitted");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "email-only (no subject) is an incomplete principal → 403"
+        );
     }
 
     /// #1355: `/healthz` must NEVER require identity — the kubelet readiness
@@ -516,7 +637,7 @@ mod tests {
     /// exec probe, but the route staying public is the invariant.)
     #[tokio::test]
     async fn healthz_stays_public_even_when_identity_is_required() {
-        let app = app_with_auth(Some("X-Auth-Request-Email".into()));
+        let app = app_with_auth(Some(test_auth()));
         let (status, body) = req(&app, "GET", "/healthz", None).await;
         assert_eq!(status, StatusCode::OK, "the probe must not require auth");
         assert_eq!(body, "ok");
@@ -535,21 +656,127 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// #1355 config parse: the trusted-header rule trims and treats blank as
-    /// unset. Pure — no process-env mutation, so it cannot race the parallel
-    /// suite (an earlier env-mutating version flipped other tests' status codes).
+    /// #1355 config parse: trim + treat blank as unset. Pure — no process-env
+    /// mutation, so it cannot race the parallel suite (an earlier env-mutating
+    /// version flipped other tests' status codes).
     #[test]
-    fn normalized_auth_header_trims_and_treats_blank_as_unset() {
+    fn normalized_trims_and_treats_blank_as_unset() {
         assert_eq!(
-            normalized_auth_header(Some("X-Auth-Request-Email".into())).as_deref(),
+            normalized(Some("X-Auth-Request-Email".into())).as_deref(),
             Some("X-Auth-Request-Email")
         );
+        assert_eq!(normalized(Some("  X-H  ".into())).as_deref(), Some("X-H"));
+        assert_eq!(normalized(Some("   ".into())), None);
+        assert_eq!(normalized(None), None);
+    }
+
+    /// #1354: the operator is built from the oauth2-proxy headers ALL-OR-NOTHING —
+    /// a missing issuer / email / subject yields `None` (fail-closed), never a
+    /// partial identity; and the audit key is the stable `(issuer, subject)`,
+    /// never mutable email.
+    #[test]
+    fn operator_from_headers_is_all_or_nothing_and_keyed_by_issuer_subject() {
+        let cfg = test_auth();
+        let hdr = |pairs: &[(&str, &str)]| {
+            let mut h = HeaderMap::new();
+            for &(k, v) in pairs {
+                h.insert(
+                    k.parse::<axum::http::HeaderName>().unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            h
+        };
+        // Complete → keyed by (issuer, subject); email is display-only; groups split.
+        let p = operator_from_headers(
+            &hdr(&[
+                ("x-auth-request-email", "op@example.com"),
+                ("x-auth-request-user", "sub-1"),
+                ("x-auth-request-groups", "newt-operators, admins"),
+            ]),
+            &cfg,
+        )
+        .expect("complete principal");
+        assert_eq!(p.key(), ("https://idp.example", "sub-1"));
+        assert_eq!(p.email.as_deref(), Some("op@example.com"));
+        assert_eq!(p.groups, vec!["newt-operators", "admins"]);
         assert_eq!(
-            normalized_auth_header(Some("  X-H  ".into())).as_deref(),
-            Some("X-H")
+            principal_key(&p),
+            "https://idp.example|sub-1",
+            "the stamp key is (issuer, subject), never email"
         );
-        assert_eq!(normalized_auth_header(Some("   ".into())), None);
-        assert_eq!(normalized_auth_header(None), None);
+        // Missing subject → None (incomplete ⇒ fail-closed).
+        assert!(
+            operator_from_headers(&hdr(&[("x-auth-request-email", "op@example.com")]), &cfg)
+                .is_none()
+        );
+        // Missing email → None.
+        assert!(operator_from_headers(&hdr(&[("x-auth-request-user", "sub-1")]), &cfg).is_none());
+        // Unset issuer → None (never a null-issuer identity).
+        let no_issuer = AuthConfig {
+            identity_header: "X-Auth-Request-Email".into(),
+            issuer: String::new(),
+        };
+        assert!(operator_from_headers(
+            &hdr(&[
+                ("x-auth-request-email", "op@example.com"),
+                ("x-auth-request-user", "sub-1"),
+            ]),
+            &no_issuer,
+        )
+        .is_none());
+    }
+
+    /// #1354 end-to-end: a web decision through the GATED app stamps the
+    /// authenticated operator's stable `(issuer, subject)` key as who answered —
+    /// the middleware extracts the principal, `decide_route` reads it, the store
+    /// records it. Proves the wiring (audit-only, but honestly attributed).
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gated_web_decision_stamps_the_operator_key_not_web() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::env::set_var("NEWT_WEB_STATE_DIR", state.path());
+        std::env::set_var("NEWT_WEB_WORKSPACE", ws.path());
+        let store = newt_core::ConversationStore::new(state.path(), ws.path(), 100).unwrap();
+        let conv = store.create("ssh session", None).unwrap();
+        store.append_turn(&conv, "hi", "hello").unwrap();
+        let req_json = serde_json::to_string(&newt_core::PermissionRequest {
+            tool: "run_command".into(),
+            kind: newt_core::DenialKind::Exec,
+            target: "bash".into(),
+            reason: "needs a shell".into(),
+        })
+        .unwrap();
+        let rid = store
+            .publish_permission_request(&conv, &req_json, "\"high\"")
+            .unwrap();
+
+        let app = app_with_auth(Some(test_auth()));
+        // Follow the session (gated — carries the operator headers).
+        let follow = format!(
+            "conv_id={conv}&title=s&workspace={}",
+            urlencode(&ws.path().to_string_lossy())
+        );
+        let (status, _) = req_full(&app, "POST", "/follow", &follow, &op_headers()).await;
+        assert_eq!(status, StatusCode::OK);
+        // Answer the decision — gated + attributed.
+        let dform = format!("request_id={rid}&verdict=allow_once");
+        let (status, _) = req_full(&app, "POST", "/agents/1/decision", &dform, &op_headers()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // The gate consumes the verdict…
+        assert_eq!(
+            store.take_permission_decision(&conv, &rid).unwrap(),
+            Some(newt_core::Verdict::AllowOnce)
+        );
+        // …and the store recorded the STABLE (issuer,subject) key — NOT "web", NOT email.
+        assert_eq!(
+            store.answered_by(&conv, &rid).unwrap().as_deref(),
+            Some("https://idp.example|sub-1"),
+            "who answered = the operator's stable key"
+        );
+        std::env::remove_var("NEWT_WEB_STATE_DIR");
+        std::env::remove_var("NEWT_WEB_WORKSPACE");
     }
 
     #[tokio::test]
