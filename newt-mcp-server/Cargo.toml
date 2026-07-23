@@ -54,7 +54,7 @@ agent-mesh-protocol.workspace = true
 # published agent-bridle 0.7.7 (supersedes the earlier #1235 git pin; 0.7.7 was
 # cut after PR #246's output-observer API merged), preserving a single bridle
 # type universe.
-agent-bridle = { version = "0.7.10", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils"] }
+agent-bridle = { version = "0.7.13", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils"] }
 
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.

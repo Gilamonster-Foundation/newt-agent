@@ -68,7 +68,7 @@ tokio.workspace = true
 # output-observer API (#1235's need) AND `spawn_tokio` (#254) for the confined
 # stdio-MCP boundary (#1243 Leg 3). `spawn-tokio` = the tokio-native confined
 # spawn newt-mcp-client uses; the rest are the confined shell/web engines.
-agent-bridle = { version = "0.7.10", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "spawn-tokio"] }
+agent-bridle = { version = "0.7.13", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "spawn-tokio"] }
 
 # Step 25.1 (#568 follow-on): Markdown → ANSI rendering for assistant output,
 # behind the default `markdown` feature. Stripped under --no-default-features
