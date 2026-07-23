@@ -688,6 +688,25 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         unsafe { std::env::set_var("NEWT_COLOR", kw) };
     }
 
+    // Denial repair journal: arm every agent surface, including headless
+    // workers/crews, before command dispatch. The journal is evidence only and
+    // is never read back into authority. An explicit `off`/`0` opts out.
+    if std::env::var_os(newt_core::denial_journal::DENIAL_JOURNAL_PATH_ENV).is_none() {
+        if let Some(cfg_path) = newt_core::Config::user_config_path() {
+            let journal = cfg_path.with_file_name("denial-journal.jsonl");
+            unsafe {
+                std::env::set_var(newt_core::denial_journal::DENIAL_JOURNAL_PATH_ENV, journal);
+            }
+        }
+    }
+    if let Ok(v) = std::env::var(newt_core::denial_journal::DENIAL_JOURNAL_PATH_ENV) {
+        if v.eq_ignore_ascii_case("off") || v == "0" {
+            unsafe {
+                std::env::remove_var(newt_core::denial_journal::DENIAL_JOURNAL_PATH_ENV);
+            }
+        }
+    }
+
     match cli.command.unwrap_or(Command::Code { path: None }) {
         Command::Code { path } => {
             // --debug / --trace / --num-ctx set env vars so the TUI picks them up
