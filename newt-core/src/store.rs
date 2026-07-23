@@ -1470,6 +1470,14 @@ impl ConversationStore {
     // gate RACES that answer against the TTY and RESOLVES it exactly-once. Same
     // one-BEGIN-IMMEDIATE, workspace-fenced discipline as the A3 inbox.
 
+    /// How long an unanswered permission-decision nonce stays consumable before
+    /// the store treats it as gone (#1356). The gate's own deadline is the
+    /// primary resolver; this is the store-layer backstop that bounds the window
+    /// in which a published-but-never-answered `request_id` can still be
+    /// surfaced or answered. 5 minutes — comfortably longer than an interactive
+    /// decision, short enough that an abandoned request does not linger.
+    pub(crate) const PERMISSION_REQUEST_TTL_NANOS: i64 = 5 * 60 * 1_000_000_000;
+
     /// Publish a pending permission decision for the attach surface to render.
     /// `requests_json` is a serialized `&[PermissionRequest]`; `danger_json` is
     /// the GATE-STAMPED per-target tier (the web never classifies danger).
@@ -1527,11 +1535,13 @@ impl ConversationStore {
         conversation_id: &str,
     ) -> anyhow::Result<Option<PendingPermission>> {
         let conn = self.lock_conn();
+        let cutoff = (self.claim_clock)().saturating_sub(Self::PERMISSION_REQUEST_TTL_NANOS);
         conn.query_row(
             "SELECT request_id, requests_json, danger_json FROM permission_requests
               WHERE conversation_id = ?1 AND workspace_key = ?2 AND resolved = 0 AND verdict IS NULL
+                AND created_tick > ?3
               ORDER BY created_tick ASC LIMIT 1",
-            rusqlite::params![conversation_id, self.workspace_id],
+            rusqlite::params![conversation_id, self.workspace_id, cutoff],
             |row| {
                 Ok(PendingPermission {
                     request_id: row.get(0)?,
@@ -1555,20 +1565,24 @@ impl ConversationStore {
         request_id: &str,
         verdict: Verdict,
     ) -> anyhow::Result<AnswerOutcome> {
+        let cutoff = (self.claim_clock)().saturating_sub(Self::PERMISSION_REQUEST_TTL_NANOS);
         let conn = self.lock_conn();
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let state: Option<(i64, Option<String>)> = tx
+        let state: Option<(i64, Option<String>, i64)> = tx
             .query_row(
-                "SELECT resolved, verdict FROM permission_requests
+                "SELECT resolved, verdict, created_tick FROM permission_requests
                   WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3",
                 rusqlite::params![request_id, conversation_id, self.workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         let outcome = match state {
             None => AnswerOutcome::Unknown,
-            Some((1, _)) | Some((_, Some(_))) => AnswerOutcome::AlreadyResolved,
-            Some((_, None)) => {
+            // Expired nonce (#1356): an aged-out request is gone — never newly
+            // answerable, even while still unresolved.
+            Some((_, _, created_tick)) if created_tick <= cutoff => AnswerOutcome::Unknown,
+            Some((1, _, _)) | Some((_, Some(_), _)) => AnswerOutcome::AlreadyResolved,
+            Some((_, None, _)) => {
                 tx.execute(
                     "UPDATE permission_requests SET verdict = ?2, answered_by = 'web'
                       WHERE request_id = ?1 AND resolved = 0 AND verdict IS NULL",
@@ -5176,6 +5190,56 @@ mod tests {
     /// exactly-once by the gate; a TTY resolve wins the race so a late web
     /// answer is discarded; verdicts bind to their own request_id; and the
     /// whole channel is workspace-fenced.
+    #[test]
+    fn permission_request_expires_on_created_tick_ttl() {
+        // #1356: an unanswered permission-decision nonce must expire on its
+        // `created_tick` — once older than the TTL the store treats it as gone
+        // (not surfaced by `pending`, rejected by `answer`), so a stale
+        // request_id cannot linger indefinitely consumable. Injected clock.
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let mut store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("session", None).unwrap();
+
+        // Publish at t=0 — within TTL, so it is pending.
+        store.set_claim_clock_for_test(|| 0);
+        let r1 = store
+            .publish_permission_request(&conv, "[]", r#"["low"]"#)
+            .unwrap();
+        assert!(
+            store.pending_permission_request(&conv).unwrap().is_some(),
+            "a fresh request is pending"
+        );
+
+        // Advance the clock past the TTL: the nonce is gone.
+        store.set_claim_clock_for_test(|| ConversationStore::PERMISSION_REQUEST_TTL_NANOS + 1);
+        assert_eq!(
+            store.pending_permission_request(&conv).unwrap(),
+            None,
+            "an aged-out request is not surfaced"
+        );
+        assert_eq!(
+            store
+                .answer_permission_request(&conv, &r1, Verdict::AllowOnce)
+                .unwrap(),
+            AnswerOutcome::Unknown,
+            "answering an expired request is rejected as gone"
+        );
+
+        // A request published at the new 'now' is within TTL and still answers.
+        let r2 = store
+            .publish_permission_request(&conv, "[]", r#"["low"]"#)
+            .unwrap();
+        assert!(store.pending_permission_request(&conv).unwrap().is_some());
+        assert_eq!(
+            store
+                .answer_permission_request(&conv, &r2, Verdict::AllowOnce)
+                .unwrap(),
+            AnswerOutcome::Answered,
+            "a within-TTL request still answers"
+        );
+    }
+
     #[test]
     fn permission_channel_publish_answer_take_race_and_fence() {
         let root = tempfile::tempdir().unwrap();
