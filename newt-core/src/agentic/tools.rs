@@ -640,6 +640,17 @@ async fn exec_confined_command(
         // capability-denied UX by reading the structured `denied` field — NEVER
         // a stderr grep.
         Ok(envelope) if envelope_denied(&envelope) => {
+            // Repair evidence is distinct from the prompted-decision log: keep
+            // the redacted raw command + structured refusal even when prompting
+            // is off or the operator allows it. This is what lets `newt ocap
+            // denials` distinguish a policy gap from a parser/implementation
+            // defect instead of repeatedly granting a bogus target.
+            crate::denial_journal::record_envelope(
+                cmd,
+                cwd,
+                crate::denial_journal::DenialStage::Initial,
+                &envelope,
+            );
             // #263: an interactive gate may turn this denial into a human grant.
             // ONE consult + ONE re-execution per call: a second denial (a
             // different target reached on the re-run) surfaces as the standard
@@ -660,6 +671,12 @@ async fn exec_confined_command(
                         .await
                         {
                             Ok(env2) if envelope_denied(&env2) => {
+                                crate::denial_journal::record_envelope(
+                                    cmd,
+                                    cwd,
+                                    crate::denial_journal::DenialStage::AfterGrant,
+                                    &env2,
+                                );
                                 denied_run_command_result(&env2, color)
                             }
                             Ok(env2) => shell_envelope_output(

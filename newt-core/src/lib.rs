@@ -14,6 +14,7 @@ pub mod caveats;
 pub mod classifiers;
 pub mod config;
 pub mod conversation;
+pub mod denial_journal;
 pub mod dgx;
 pub mod drift_cache;
 pub mod error;

@@ -41,6 +41,13 @@ is inherited by all internal crates.
 
 ### Added
 
+- **Denial repair journal.** Confined `run_command` refusals are now appended
+  to `~/.newt/denial-journal.jsonl` with a secret-redacted replay command,
+  working directory, structured reason, and whether the refusal recurred after
+  an operator grant. `newt ocap denials` folds repeated targets and presents
+  them as policy review, shell/parser implementation work, or a broken
+  grant-retry path. The journal is evidence only and is never read back into
+  authority; set `NEWT_DENIAL_JOURNAL=off` to opt out.
 - **`~/.newt/mcp.toml` + Claude-JSON import + secret references on MCP
   `env`/`headers` + scrybe.ai smart-install (#1301).** MCP config is now
   first-class and secret-safe:

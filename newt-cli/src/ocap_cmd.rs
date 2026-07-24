@@ -21,6 +21,14 @@ use newt_core::ocap_store::{build_store, CapabilityClass, PolicyFile, Verdict, V
 
 #[derive(Subcommand, Debug)]
 pub enum OcapCmd {
+    /// Review confined denials as repair evidence. Repeated targets are folded
+    /// and classified as policy gaps, shell/parser implementation work, or a
+    /// grant-retry failure. This never grants authority.
+    Denials {
+        /// Read this journal instead of `~/.newt/denial-journal.jsonl`.
+        #[arg(long, value_name = "FILE")]
+        journal: Option<PathBuf>,
+    },
     /// Propose durable `approve.toml` candidates from the flight-recorder
     /// capture of a prior `--full-access` (or `--yolo`) session — the observed
     /// authority a leash would have gated on. Dry-run by default (prints the
@@ -44,8 +52,30 @@ pub enum OcapCmd {
 /// Dispatch `newt ocap <cmd>`.
 pub fn run(cmd: OcapCmd, config: Option<&Path>) -> anyhow::Result<i32> {
     match cmd {
+        OcapCmd::Denials { journal } => run_denials(journal, config),
         OcapCmd::Propose { save, capture } => run_propose(save, capture, config),
     }
+}
+
+fn run_denials(journal: Option<PathBuf>, config: Option<&Path>) -> anyhow::Result<i32> {
+    let config_path = config
+        .map(Path::to_path_buf)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve the newt config path"))?;
+    let path = journal.unwrap_or_else(|| config_path.with_file_name("denial-journal.jsonl"));
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "No denial journal at {}.\nConfined run_command refusals will be recorded there.",
+                path.display()
+            );
+            return Ok(0);
+        }
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+    };
+    print!("{}", render_denials(&body, &path));
+    Ok(0)
 }
 
 /// Resolve the capture-file path the same way the CLI arms it (newt-cli
@@ -245,6 +275,50 @@ fn note_of(note: &Option<String>) -> &str {
     note.as_deref().unwrap_or("observed")
 }
 
+/// Pure repair-oriented presentation of the denial journal.
+pub(crate) fn render_denials(body: &str, path: &Path) -> String {
+    let records = newt_core::denial_journal::read_jsonl(body);
+    let summaries = newt_core::denial_journal::summarize(&records);
+    if summaries.is_empty() {
+        return format!("No structured denials recorded in {}.\n", path.display());
+    }
+
+    let mut out = format!(
+        "Denial repair journal: {} attempt(s), {} target(s)\nsource: {}\n\n",
+        records.len(),
+        summaries.len(),
+        path.display()
+    );
+    for summary in summaries {
+        out.push_str(&format!(
+            "[{}] {}:{} ({}x)\n  reason: {}\n  replay: {}\n",
+            summary.classification.as_str(),
+            summary.kind,
+            summary.target,
+            summary.count,
+            summary.reason,
+            summary.example_command
+        ));
+        match summary.classification {
+            newt_core::denial_journal::RepairClass::PolicyGap => out.push_str(
+                "  next: review whether this target is necessary; if so, use the normal \
+                 permission/policy approval path.\n",
+            ),
+            newt_core::denial_journal::RepairClass::Structural => out.push_str(
+                "  next: implement or route around this shell construct; a grant cannot \
+                 make the confined engine interpret it.\n",
+            ),
+            newt_core::denial_journal::RepairClass::GrantRetryFailure => out.push_str(
+                "  next:\n  1. Reproduce from the replay command.\n  2. Do not add it to policy; \
+                 the grant already failed.\n  3. Repair denial attribution, grant matching, \
+                 or the upstream command implementation.\n",
+            ),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +424,28 @@ mod tests {
         // No override, no env → default beside the config.
         let def = capture_path_from(None, None, &cfg);
         assert!(def.ends_with("flight-recorder/unconfined.jsonl"), "{def:?}");
+    }
+
+    #[test]
+    fn denial_report_presents_repair_class_and_replay_fixture() {
+        let record = newt_core::denial_journal::DenialRecord {
+            ts_claim: "2026-07-23T22:00:00Z".into(),
+            command: "wc -l src/lib.rs".into(),
+            cwd: "/workspace".into(),
+            stage: newt_core::denial_journal::DenialStage::AfterGrant,
+            denials: vec![newt_core::denial_journal::JournalDenial {
+                kind: "exec".into(),
+                target: "confinement".into(),
+                reason: "exec of \"confinement\" is not within the granted authority".into(),
+            }],
+        };
+        let body = serde_json::to_string(&record).unwrap();
+        let report = render_denials(&body, Path::new("/home/x/.newt/denial-journal.jsonl"));
+
+        assert!(report.contains("grant-retry"));
+        assert!(report.contains("exec:confinement"));
+        assert!(report.contains("2. Do not add it to policy"));
+        assert!(report.contains("wc -l src/lib.rs"));
+        assert!(report.contains("/home/x/.newt/denial-journal.jsonl"));
     }
 }
