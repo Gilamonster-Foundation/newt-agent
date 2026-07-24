@@ -31,7 +31,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_mesh_protocol::Caveats;
+use agent_mesh_protocol::{Caveats, CountBound, Scope};
 
 /// Where the granted leash came from — surfaced in the startup log so an
 /// operator can tell, at a glance, whether `shell_run` is confined.
@@ -41,6 +41,8 @@ pub enum CaveatsSource {
     ConfigFile(PathBuf),
     /// No `[caveats]` configured — defaulted to [`Caveats::top()`] (UNCONFINED).
     UnconfinedDefault,
+    /// `[caveats]` existed but was malformed — fail-closed to empty authority.
+    MalformedConfig(PathBuf),
 }
 
 /// The resolved leash plus where it came from.
@@ -58,8 +60,8 @@ impl GrantedCaveats {
     /// than erroring.
     ///
     /// On any failure to *parse* a present config, this logs a warning and
-    /// falls back to the unconfined default — `shell_run` must remain usable
-    /// even if the host config is malformed, but the operator is told.
+    /// falls back to a **deny-all** envelope (`resource access is DENIED`) so
+    /// that malformed config cannot be turned into implicit privilege.
     #[must_use]
     pub fn load() -> Self {
         let path = newt_core::Config::user_config_path();
@@ -67,13 +69,10 @@ impl GrantedCaveats {
             Ok(g) => g,
             Err(e) => {
                 eprintln!(
-                    "WARNING: newt-mcp-server could not parse the user config [caveats]: {e}; \
-                     shell_run is running UNCONFINED (full ambient authority)."
+                    "WARNING: newt-mcp-server found malformed user config [caveats]: {e}; \
+                     resource access is DENIED (fail-closed default)."
                 );
-                Self {
-                    caveats: Caveats::top(),
-                    source: CaveatsSource::UnconfinedDefault,
-                }
+                Self::deny_all(path.as_deref())
             }
         }
     }
@@ -107,6 +106,23 @@ impl GrantedCaveats {
         })
     }
 
+    fn deny_all(path: Option<&Path>) -> Self {
+        Self {
+            caveats: Caveats {
+                fs_read: Scope::none(),
+                fs_write: Scope::none(),
+                exec: Scope::none(),
+                net: Scope::none(),
+                max_calls: CountBound::AtMost(0),
+                valid_for_generation: Scope::none(),
+            },
+            source: CaveatsSource::MalformedConfig(
+                path.unwrap_or_else(|| Path::new("/dev/failure"))
+                    .to_path_buf(),
+            ),
+        }
+    }
+
     /// A human-readable, one-line provenance banner for stderr. When the leash
     /// is the unconfined default, the line is a prominent WARNING.
     #[must_use]
@@ -115,6 +131,12 @@ impl GrantedCaveats {
             CaveatsSource::ConfigFile(p) => {
                 format!(
                     "newt-mcp-server: shell_run confined by {} [caveats]",
+                    p.display()
+                )
+            }
+            CaveatsSource::MalformedConfig(p) => {
+                format!(
+                    "newt-mcp-server: shell_run is fail-closed by malformed config at {}",
                     p.display()
                 )
             }
