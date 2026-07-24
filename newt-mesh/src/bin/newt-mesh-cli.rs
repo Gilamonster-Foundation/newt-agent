@@ -27,6 +27,9 @@ use newt_inference::backend::InferenceBackend;
 use newt_inference::local::LocalOllamaBackend;
 use newt_mesh::{InferenceRequest, MeshAsker, NewtMeshService, CAPABILITY_TAG};
 
+#[path = "newt-mesh/help_suite.rs"]
+mod help_suite;
+
 /// Default model when the user doesn't override it via env or flag.
 const DEFAULT_MODEL: &str = "llama3.1:8b";
 
@@ -101,7 +104,7 @@ async fn main() -> Result<()> {
         .try_init()
         .ok();
 
-    let cli = Cli::parse();
+    let cli = help_suite::parse_with_help::<Cli>()?;
     match cli.command {
         Command::Announce {
             capabilities,

@@ -20,6 +20,9 @@ use newt_eval::{
     EvalContext, RunnerConfig, Scorecard, TestCase,
 };
 
+#[path = "newt-eval/help_suite.rs"]
+mod help_suite;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "newt-eval",
@@ -224,7 +227,7 @@ enum RunOutcomeStatus {
 }
 
 async fn real_main() -> Result<RunOutcomeStatus> {
-    let cli = Cli::parse();
+    let cli = help_suite::parse_with_help::<Cli>()?;
     match cli.command {
         Command::ListCases { cases_dir } => {
             let dir = cases_dir.unwrap_or_else(cases::default_cases_dir);

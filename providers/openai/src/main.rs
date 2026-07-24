@@ -1,10 +1,13 @@
 use async_trait::async_trait;
-use clap::Parser;
 use newt_provider_openai::OpenAiClient;
 use plugins_protocol::{
     CompleteRequest, CompleteResponse, InitializeRequest, InitializeResponse, ListModelsResponse,
     PluginHandler, PluginServer, PROTOCOL_VERSION,
 };
+
+use clap::Parser;
+
+mod help_suite;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -52,7 +55,7 @@ impl PluginHandler for OpenAiProvider {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _cli = Cli::parse();
+    let _cli = help_suite::parse_with_help::<Cli>()?;
     PluginServer::new(OpenAiProvider).run_stdio().await?;
     Ok(())
 }

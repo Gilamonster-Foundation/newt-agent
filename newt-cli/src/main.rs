@@ -1,5 +1,4 @@
 use anyhow::Result;
-use clap::Parser;
 
 fn main() -> Result<()> {
     // Carried-coreutils dispatch (agent-bridle #206): if this process was invoked
@@ -33,6 +32,6 @@ async fn run() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
-    let cli = newt_cli::Cli::parse();
+    let cli = newt_cli::parse_with_help()?;
     newt_cli::dispatch(cli).await
 }
