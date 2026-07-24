@@ -20,6 +20,7 @@ pub mod dgx_registry;
 pub mod dgx_status;
 pub mod dgx_vllm;
 mod doctor;
+pub mod help_suite;
 mod identity_cmd;
 mod mcp_cmd;
 mod mcp_probe_cmd;
@@ -43,6 +44,17 @@ fn parse_shell_engine(
     s: &str,
 ) -> Result<newt_core::ShellEngine, Box<dyn std::error::Error + Send + Sync + 'static>> {
     Ok(s.parse::<newt_core::ShellEngine>()?)
+}
+
+/// Build a parser command graph with the shared `help` formatting applied to
+/// this command and all subcommands.
+pub fn help_command() -> clap::Command {
+    help_suite::help_command()
+}
+
+/// Parse CLI args with the shared help format wiring.
+pub fn parse_with_help() -> anyhow::Result<Cli> {
+    help_suite::parse_with_help()
 }
 
 #[derive(Parser, Debug)]
@@ -1311,8 +1323,7 @@ fn maybe_start_metrics_server() -> Option<std::sync::Arc<newt_acp_worker::NewtMe
 /// subcommand so it can never drift from the parser, followed by a one-line
 /// pointer to the two ways to actually serve. Returns `Ok` (exit 0).
 fn print_mcp_help() -> anyhow::Result<()> {
-    use clap::CommandFactory;
-    let mut cmd = Cli::command();
+    let mut cmd = help_command();
     if let Some(mcp) = cmd.find_subcommand_mut("mcp") {
         // `render_long_help` lists each verb with its description — the menu.
         print!("{}", mcp.render_long_help());
@@ -1426,6 +1437,22 @@ mod tests {
             cli.color.map(|c| c.keyword())
         };
         assert_eq!(color_kw, Some("mono"));
+    }
+
+    #[test]
+    fn help_suite_applies_next_line_help_to_root_and_subcommands() {
+        let mut command = help_command();
+        let mut root_help = Vec::new();
+        command.write_long_help(&mut root_help).unwrap();
+        let root_help = String::from_utf8(root_help).unwrap();
+
+        let mut sub_help = Vec::new();
+        let dgx = command.find_subcommand_mut("dgx").unwrap();
+        dgx.write_long_help(&mut sub_help).unwrap();
+        let dgx_help = String::from_utf8(sub_help).unwrap();
+
+        assert!(root_help.contains("  -h, --help\n          Print help"));
+        assert!(dgx_help.contains("  -h, --help\n          Print help"));
     }
 
     #[test]

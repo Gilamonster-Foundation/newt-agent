@@ -7,6 +7,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod help_suite;
+
 #[derive(Parser)]
 #[command(
     name = "newt-tuner",
@@ -34,7 +36,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = help_suite::parse_with_help::<Cli>()?;
 
     match cli.command {
         Commands::Init => {
