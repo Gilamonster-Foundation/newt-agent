@@ -28,6 +28,20 @@ build:
 release:
     cargo build --workspace --release
 
+# Build against arbitrary agent-bridle + agent-mesh branches from sibling checkouts.
+# This is a local, ephemeral test workflow:
+#   1) temporarily check out the requested branches in ../agent-bridle and ../agent-mesh
+#   2) relax version caps in this tree to "*" so local sibling crates can satisfy workspace deps
+#   3) add temporary `[patch.crates-io]` for agent-bridle + agent-mesh-protocol
+#   4) run `cargo build --workspace`
+#   5) restore all modified manifests and original branches.
+#
+# Example:
+#   just build-agent-stack main fix/mesh-proxy
+[unix]
+build-agent-stack AGENT_BRIDLE_BRANCH="main" AGENT_MESH_BRANCH="main":
+    python3 scripts/build_agent_stack.py --agent-bridle-branch="{{AGENT_BRIDLE_BRANCH}}" --agent-mesh-branch="{{AGENT_MESH_BRANCH}}" "{{justfile_directory()}}"
+
 # Install newt + newt-mcp-server release binaries to DEST (default: ~/bin).
 # The rich TTY inline surface (issue #416) is a DEFAULT feature, so plain
 # `just install` already gives you the rich editor — no flag needed.
