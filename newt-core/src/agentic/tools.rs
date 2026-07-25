@@ -4997,6 +4997,18 @@ mod tests {
                 // tool_search; degrades honestly when no symbol index is built),
                 // pushed after render_report.
                 "where_is",
+                // #1387 Code Navigator — Always-gated structural/lexical tools
+                // (degrade when session indexes are absent).
+                "goto_definition",
+                "text_search",
+                "find_references",
+                "find_tests",
+                "find_callers",
+                "find_callees",
+                "find_implementations",
+                "find_hierarchy",
+                "inspect_type",
+                "impact",
             ]
         );
     }
