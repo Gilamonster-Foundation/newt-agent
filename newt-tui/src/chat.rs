@@ -949,6 +949,12 @@ pub(crate) fn run_chat(
     // re-walk + re-embed the repo every turn — reset on /new to re-index.
     let semantic_index = newt_core::SessionSemanticIndex::default();
     let mut semantic_indexed = false;
+    // #1387 Phase 1: session pin/exclude + lightweight index status + last
+    // `/search` result (for preview/model/pin). Cleared on `/new`.
+    let mut retrieval_steer = newt_core::RetrievalSteer::default();
+    let mut index_status = newt_core::IndexStatus::default();
+    let mut last_search: Option<newt_core::RetrievalResult> = None;
+    let mut nav_session = newt_core::NavigatorSession::default();
     // #1285: the model-free `where_is` symbol index, built once per session on
     // the first turn (reset on /new). Independent of the embedder — structural
     // extraction needs no model, so the exact typed-verdict lookup rides every
@@ -1801,6 +1807,296 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
+
+                    // #1387 Phases 2–4: structural nav + retrieval debug + impact.
+                    if let Some(parsed) = crate::navigator_cmds::parse_nav_command(&task) {
+                        match parsed {
+                            Ok(cmd) => {
+                                ensure_nav_indexes(
+                                    workspace,
+                                    &mut where_is_index,
+                                    &mut nav_session,
+                                    &index_status,
+                                );
+                                let msg = handle_nav_command(
+                                    cmd,
+                                    workspace,
+                                    &mut nav_session,
+                                    where_is_index.as_ref(),
+                                    &index_status,
+                                );
+                                print_newt(&msg, color, verbose);
+                            }
+                            Err(e) => print_newt(&e, color, verbose),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+
+                    // #1387 Phase 1: Code Navigator `/search` cockpit — same
+                    // structured retrieve path as auto-inject + code_search.
+                    if slash_md == "search" || slash_md.starts_with("search ") {
+                        match parse_search_command(&task) {
+                            Ok(SearchCommand::Help) => {
+                                for line in search_help_text().lines() {
+                                    print_newt(line, color, verbose);
+                                }
+                            }
+                            Ok(SearchCommand::Status) => {
+                                print_newt(
+                                    &newt_core::format_index_status(
+                                        &index_status,
+                                        &retrieval_steer,
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(SearchCommand::Clear) => {
+                                retrieval_steer.clear();
+                                print_newt(
+                                    "cleared session pins/exclusions (applies on next inject)",
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(SearchCommand::Preview(n)) => match last_search.as_ref() {
+                                Some(r) => print_newt(
+                                    &newt_core::format_search_preview(r, n),
+                                    color,
+                                    verbose,
+                                ),
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Model) => match last_search.as_ref() {
+                                Some(r) => match newt_core::render_code_evidence(r) {
+                                    Some(block) => {
+                                        print_newt(
+                                            "model view (exact evidence packet):",
+                                            color,
+                                            verbose,
+                                        );
+                                        println!("{block}");
+                                    }
+                                    None => print_newt(
+                                        "last search selected no hits for the model packet",
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Rejects) => match last_search.as_ref() {
+                                Some(r) => {
+                                    print_newt(
+                                        &newt_core::format_search_rejects(r),
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Pin(n)) => match last_search.as_ref() {
+                                Some(r) => match r.hits.get(n.saturating_sub(1)) {
+                                    Some(hit) => {
+                                        retrieval_steer.pin(hit.clone());
+                                        print_newt(
+                                            &format!(
+                                                "pinned {} for next inject/tool retrieve",
+                                                hit.loc_key()
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                    None => print_newt(
+                                        &format!("no hit #{n} in last search"),
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Exclude(n)) => match last_search.as_ref() {
+                                Some(r) => match r.hits.get(n.saturating_sub(1)) {
+                                    Some(hit) => {
+                                        let path = hit.chunk.file.clone();
+                                        retrieval_steer.exclude_path(path.clone());
+                                        print_newt(
+                                            &format!(
+                                                "excluded path `{path}` from automatic retrieval"
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                    None => print_newt(
+                                        &format!("no hit #{n} in last search"),
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Query(query)) => {
+                                let manager = context_manager(&cfg, context_manager_override);
+                                let features = context_features(
+                                    &cfg,
+                                    manager,
+                                    &context_features_override,
+                                    inf_kind,
+                                );
+                                if !features.semantic {
+                                    print_newt(
+                                        "semantic feature is off — enable with /context feature semantic on",
+                                        color,
+                                        verbose,
+                                    );
+                                } else {
+                                    let mut semantic_cfg = cfg
+                                        .context
+                                        .as_ref()
+                                        .map(|c| c.semantic.clone())
+                                        .unwrap_or_default();
+                                    semantic_cfg.embedding_model_path =
+                                        effective_embedding_model_path(
+                                            semantic_cfg.embedding_model_path.take(),
+                                            newt_inference::palette::embed_model_dir_if_present(),
+                                        );
+                                    if let Some(reason) =
+                                        semantic_embedder_unavailable_reason(&semantic_cfg)
+                                    {
+                                        print_newt(&reason, color, verbose);
+                                    } else {
+                                        let embedder = build_semantic_embedder(
+                                            &semantic_cfg,
+                                            &inf_url,
+                                            inf_kind,
+                                            inf_key.as_deref(),
+                                        );
+                                        if !semantic_indexed {
+                                            semantic_indexed = true;
+                                            let (files, manifest) = newt_core::gather_with_manifest(
+                                                workspace,
+                                                &["rs".to_string(), "py".to_string()],
+                                                newt_core::GatherCaps::default(),
+                                            );
+                                            let (git_head, dirty) = lightweight_git_meta(workspace);
+                                            index_status.generation =
+                                                index_status.generation.saturating_add(1);
+                                            index_status.manifest = Some(manifest);
+                                            index_status.git_head = git_head;
+                                            index_status.dirty = dirty;
+                                            if !files.is_empty() {
+                                                print_newt(
+                                                    &format!(
+                                                        "indexing {} files for semantic retrieval…",
+                                                        files.len()
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                );
+                                                let n = tokio::task::block_in_place(|| {
+                                                    rt.block_on(newt_core::index_files(
+                                                        &files,
+                                                        embedder.as_ref(),
+                                                        &semantic_index,
+                                                        semantic_cfg.on_embed_failure,
+                                                    ))
+                                                });
+                                                print_newt(
+                                                    &format!("semantic: indexed {n} code chunks"),
+                                                    color,
+                                                    verbose,
+                                                );
+                                            }
+                                        }
+                                        match tokio::task::block_in_place(|| {
+                                            rt.block_on(newt_core::retrieve_ranked(
+                                                &query,
+                                                embedder.as_ref(),
+                                                &semantic_index,
+                                                semantic_cfg.top_k,
+                                                Some(&retrieval_steer),
+                                                Some(&index_status),
+                                            ))
+                                        }) {
+                                            Some(result) => {
+                                                print_newt(
+                                                    &newt_core::format_search_hits(&result),
+                                                    color,
+                                                    verbose,
+                                                );
+                                                nav_session.turn_counter =
+                                                    nav_session.turn_counter.saturating_add(1);
+                                                let pins: Vec<_> = retrieval_steer
+                                                    .pinned
+                                                    .iter()
+                                                    .map(|h| h.loc_key())
+                                                    .collect();
+                                                let ctx_hash =
+                                                    newt_core::render_code_evidence(&result)
+                                                        .map(|b| {
+                                                            newt_core::hash_context(b.as_bytes())
+                                                        })
+                                                        .unwrap_or_else(|| {
+                                                            newt_core::hash_context(
+                                                                result
+                                                                    .hits
+                                                                    .iter()
+                                                                    .map(|h| h.loc_key())
+                                                                    .collect::<Vec<_>>()
+                                                                    .join("\n")
+                                                                    .as_bytes(),
+                                                            )
+                                                        });
+                                                nav_session.ledger.record_semantic(
+                                                    nav_session.turn_counter,
+                                                    &query,
+                                                    &result,
+                                                    &pins,
+                                                    &retrieval_steer.excluded_paths,
+                                                    &ctx_hash,
+                                                );
+                                                nav_session.last_semantic = Some(result.clone());
+                                                last_search = Some(result);
+                                            }
+                                            None => print_newt(
+                                                "no code matched — index empty or embed failed",
+                                                color,
+                                                verbose,
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
                     if tool_round_limit_command_arg(&task).is_some() {
                         let configured = cfg
                             .find_model_tuning(&inf_model)
@@ -2136,6 +2432,12 @@ pub(crate) fn run_chat(
                             semantic_index.clear();
                         }
                         semantic_indexed = false;
+                        // #1387: pins/exclusions and search cockpit state are
+                        // session-task scoped — clear with the index on /new.
+                        retrieval_steer.clear();
+                        index_status = newt_core::IndexStatus::default();
+                        last_search = None;
+                        nav_session.clear();
                         // #1285: drop the where_is index too so /new re-derives it
                         // (picks up file adds/removes on the next turn).
                         where_is_index = None;
@@ -3152,10 +3454,18 @@ pub(crate) fn run_chat(
                             // Semantic embedding index keeps the narrow rs/py set
                             // on purpose (#956 blast-radius note): broadening it
                             // would embed every language's files each session.
-                            let files = newt_core::gather_code_files(
+                            // #1387: keep the GatherManifest (was discarded) so
+                            // completeness / index_id are honest.
+                            let (files, manifest) = newt_core::gather_with_manifest(
                                 workspace,
                                 &["rs".to_string(), "py".to_string()],
+                                newt_core::GatherCaps::default(),
                             );
+                            let (git_head, dirty) = lightweight_git_meta(workspace);
+                            index_status.generation = index_status.generation.saturating_add(1);
+                            index_status.manifest = Some(manifest);
+                            index_status.git_head = git_head;
+                            index_status.dirty = dirty;
                             if !files.is_empty() {
                                 print_newt(
                                     &format!(
@@ -3187,15 +3497,33 @@ pub(crate) fn run_chat(
                                 }
                             }
                         }
-                        if let Some(block) = tokio::task::block_in_place(|| {
-                            rt.block_on(newt_core::retrieve_evidence(
+                        if let Some(result) = tokio::task::block_in_place(|| {
+                            rt.block_on(newt_core::retrieve_ranked(
                                 &task,
                                 embedder,
                                 &semantic_index,
                                 semantic_cfg.top_k,
+                                Some(&retrieval_steer),
+                                Some(&index_status),
                             ))
                         }) {
-                            turn_system = format!("{block}\n\n{turn_system}");
+                            if let Some(block) = newt_core::render_code_evidence(&result) {
+                                nav_session.turn_counter =
+                                    nav_session.turn_counter.saturating_add(1);
+                                let pins: Vec<_> =
+                                    retrieval_steer.pinned.iter().map(|h| h.loc_key()).collect();
+                                let ctx_hash = newt_core::hash_context(block.as_bytes());
+                                nav_session.ledger.record_semantic(
+                                    nav_session.turn_counter,
+                                    &task,
+                                    &result,
+                                    &pins,
+                                    &retrieval_steer.excluded_paths,
+                                    &ctx_hash,
+                                );
+                                nav_session.last_semantic = Some(result);
+                                turn_system = format!("{block}\n\n{turn_system}");
+                            }
                         }
                     }
                     // Step 26.6a (#585): inject the <experience> block (relevant
@@ -3505,10 +3833,13 @@ pub(crate) fn run_chat(
                     // #1285: build the model-free where_is index once per session
                     // (the gather is a capped, cheap structural walk — no model,
                     // no network). The typed-verdict lookup then rides this turn.
-                    if where_is_index.is_none() {
-                        where_is_index = Some(tokio::task::block_in_place(|| {
-                            newt_core::build_where_is_index_from_workspace(workspace)
-                        }));
+                    if where_is_index.is_none() || nav_session.usage.is_none() {
+                        ensure_nav_indexes(
+                            workspace,
+                            &mut where_is_index,
+                            &mut nav_session,
+                            &index_status,
+                        );
                     }
                     // The core sees this collaborator only in human-selected
                     // Auto. It is bound to this conversation and any model
@@ -3562,12 +3893,23 @@ pub(crate) fn run_chat(
                                                 embedder: e,
                                                 index: &semantic_index,
                                                 top_k: semantic_cfg.top_k,
+                                                steer: Some(&retrieval_steer),
+                                                status: Some(&index_status),
                                             }
                                         }),
                                         // #1285: the exact typed-verdict symbol
                                         // lookup — Some once the model-free index
                                         // is built (first turn), degrading honestly.
                                         where_is: where_is_index.as_ref(),
+                                        nav: Some(newt_core::NavToolCtx {
+                                            workspace,
+                                            where_is: where_is_index.as_ref(),
+                                            usage: nav_session.usage.as_ref(),
+                                            graph: nav_session.graph.as_ref(),
+                                            project: nav_session.project.as_ref(),
+                                            files: Some(nav_session.files.as_slice()),
+                                            status: Some(&index_status),
+                                        }),
                                         // Step 26.6a (#585): the experiential store
                                         // for record/recall — Some only when on.
                                         experience_store: experiential_on.then_some(
@@ -4143,6 +4485,226 @@ pub(crate) fn run_chat(
 
     surface.save_history();
     Ok(())
+}
+
+/// #1387: build where_is + usage + graph + project model once per session.
+fn ensure_nav_indexes(
+    workspace: &str,
+    where_is_index: &mut Option<newt_core::WhereIsIndex>,
+    nav_session: &mut newt_core::NavigatorSession,
+    index_status: &newt_core::IndexStatus,
+) {
+    use newt_core::{gather_with_manifest, GatherCaps};
+    let packs = newt_core::api_surface::builtin_packs();
+    let exts: Vec<String> = packs
+        .iter()
+        .flat_map(|p| p.extensions.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let (files, manifest) = gather_with_manifest(workspace, &exts, GatherCaps::default());
+    let cuts_open = !manifest.cuts.is_empty();
+    let id = index_status.index_id();
+    if where_is_index.is_none() {
+        *where_is_index = Some(newt_core::build_where_is_index(&files, &packs, &manifest));
+    }
+    if nav_session.usage.is_none() {
+        nav_session.usage = Some(newt_core::UsageIndex::build(&files, cuts_open, &id));
+    }
+    if nav_session.graph.is_none() {
+        nav_session.graph = Some(newt_core::GraphIndex::build(&files, cuts_open, &id));
+    }
+    if nav_session.project.is_none() {
+        let root = std::path::Path::new(workspace);
+        nav_session.project = newt_core::project_model::scan_project(
+            root,
+            &newt_core::project_model::builtin_project_packs(),
+        );
+    }
+    nav_session.files = files;
+    nav_session.ledger.set_index(id);
+}
+
+fn handle_nav_command(
+    cmd: crate::navigator_cmds::NavCommand,
+    workspace: &str,
+    nav_session: &mut newt_core::NavigatorSession,
+    where_is: Option<&newt_core::WhereIsIndex>,
+    index_status: &newt_core::IndexStatus,
+) -> String {
+    use crate::navigator_cmds::{NavCommand, RetrievalView};
+    use newt_core::{
+        compare_ledgers, compare_semantic_lexical, export_ledger_json, export_ledger_markdown,
+        find_callees, find_callers, find_hierarchy, find_implementations, find_references,
+        find_tests, format_ledger_diff, format_ledger_human, format_ledger_model, goto_definition,
+        hash_context, impact_analysis, inspect_type, project_map_nav, text_search,
+        GotoDefinitionArgs,
+    };
+    let id = index_status.index_id();
+    let record =
+        |nav_session: &mut newt_core::NavigatorSession, query: &str, nav: newt_core::NavResult| {
+            nav_session.turn_counter = nav_session.turn_counter.saturating_add(1);
+            let ctx = hash_context(nav.render().as_bytes());
+            nav_session
+                .ledger
+                .record_nav(nav_session.turn_counter, query, &nav, &ctx);
+            let rendered = nav.render();
+            nav_session.last_nav = Some(nav);
+            rendered
+        };
+    match cmd {
+        NavCommand::Help(msg) => msg.to_string(),
+        NavCommand::Def(sym) => {
+            let Some(idx) = where_is else {
+                return "where_is index not ready".into();
+            };
+            let nav = goto_definition(
+                idx,
+                GotoDefinitionArgs {
+                    symbol: &sym,
+                    kind: None,
+                    index_id: &id,
+                    files: Some(nav_session.files.as_slice()),
+                },
+            );
+            record(nav_session, &sym, nav)
+        }
+        NavCommand::Text(q) => {
+            let nav = text_search(&q, std::path::Path::new(workspace), &id);
+            nav_session.last_lexical = Some(nav.clone());
+            record(nav_session, &q, nav)
+        }
+        NavCommand::Uses(sym) => {
+            let Some(idx) = nav_session.usage.as_ref() else {
+                return "usage index not ready".into();
+            };
+            let nav = find_references(idx, &sym);
+            record(nav_session, &sym, nav)
+        }
+        NavCommand::Tests(sym) => {
+            let Some(idx) = nav_session.usage.as_ref() else {
+                return "usage index not ready".into();
+            };
+            let nav = find_tests(idx, &sym);
+            record(nav_session, &sym, nav)
+        }
+        NavCommand::Map { expand } => {
+            if nav_session.project.is_none() {
+                return "no project model detected for this workspace".into();
+            }
+            let seed = newt_core::project_map::load_seed(std::path::Path::new(workspace));
+            let (out, nav) = {
+                let model = nav_session.project.as_ref().expect("checked above");
+                let mut out = newt_core::project_map::render_project_map(model, &seed)
+                    .unwrap_or_else(|| "(empty project map)\n".into());
+                if let Some(unit) = expand.as_ref() {
+                    if let Some(u) = model
+                        .units
+                        .iter()
+                        .find(|u| u.name == *unit || u.dir == *unit)
+                    {
+                        out.push_str(&format!(
+                            "\nexpanded `{unit}`:\n  dir: {}\n  roots: {:?}\n  deps: {:?}\n  langs: {:?}\n",
+                            u.dir, u.source_roots, u.deps, u.languages
+                        ));
+                    } else {
+                        out.push_str(&format!("\n(no unit named `{unit}`)\n"));
+                    }
+                }
+                let nav = project_map_nav(model, expand.as_deref(), &id);
+                (out, nav)
+            };
+            if let Some(unit) = expand.clone() {
+                nav_session.map_expand = Some(unit);
+            }
+            let _ = record(nav_session, expand.as_deref().unwrap_or("map"), nav);
+            out
+        }
+        NavCommand::Callers(sym) => {
+            let Some(idx) = nav_session.graph.as_ref() else {
+                return "graph index not ready".into();
+            };
+            record(nav_session, &sym, find_callers(idx, &sym))
+        }
+        NavCommand::Callees(sym) => {
+            let Some(idx) = nav_session.graph.as_ref() else {
+                return "graph index not ready".into();
+            };
+            record(nav_session, &sym, find_callees(idx, &sym))
+        }
+        NavCommand::Implementations(sym) => {
+            let Some(idx) = nav_session.graph.as_ref() else {
+                return "graph index not ready".into();
+            };
+            record(nav_session, &sym, find_implementations(idx, &sym))
+        }
+        NavCommand::Hierarchy(sym) => {
+            let Some(idx) = nav_session.graph.as_ref() else {
+                return "graph index not ready".into();
+            };
+            record(nav_session, &sym, find_hierarchy(idx, &sym))
+        }
+        NavCommand::Type(sym) => {
+            let nav = inspect_type(&sym, &nav_session.files, where_is, &id);
+            record(nav_session, &sym, nav)
+        }
+        NavCommand::Impact(unit) => {
+            let Some(model) = nav_session.project.as_ref() else {
+                return "no project model — cannot compute impact".into();
+            };
+            let report = impact_analysis(
+                &unit,
+                model,
+                &nav_session.files,
+                std::path::Path::new(workspace),
+            );
+            let nav = report.to_nav(&id);
+            let text = report.render();
+            let _ = record(nav_session, &unit, nav);
+            text
+        }
+        NavCommand::Retrieval { turn, view } => {
+            let t = match turn {
+                Some(n) => nav_session.ledger.get_turn(n),
+                None => nav_session.ledger.turns.last(),
+            };
+            match t {
+                None => "no retrieval ledger entries yet".into(),
+                Some(tr) => match view {
+                    RetrievalView::Human => format_ledger_human(tr),
+                    RetrievalView::Model => format_ledger_model(tr),
+                    RetrievalView::Diff => {
+                        let prior = match turn {
+                            Some(n) => nav_session.ledger.prior_turn(n),
+                            None => {
+                                let len = nav_session.ledger.turns.len();
+                                if len >= 2 {
+                                    Some(&nav_session.ledger.turns[len - 2])
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        match prior {
+                            Some(a) => format_ledger_diff(a, tr),
+                            None => format_ledger_human(tr),
+                        }
+                    }
+                },
+            }
+        }
+        NavCommand::CompareSemanticLexical => compare_semantic_lexical(
+            nav_session.last_semantic.as_ref(),
+            nav_session.last_lexical.as_ref(),
+        ),
+        NavCommand::CompareTurns(a, b) => compare_ledgers(&nav_session.ledger, a, b),
+        NavCommand::CompareIndex => format!(
+            "session-index previous={:?} current={:?}\n",
+            nav_session.ledger.previous_index_id, nav_session.ledger.current_index_id
+        ),
+        NavCommand::ExportJson => export_ledger_json(&nav_session.ledger),
+        NavCommand::ExportMarkdown => export_ledger_markdown(&nav_session.ledger),
+    }
 }
 
 #[cfg(test)]

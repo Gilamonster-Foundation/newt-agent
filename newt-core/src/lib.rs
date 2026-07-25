@@ -32,6 +32,7 @@ pub mod memory;
 pub mod metrics;
 pub mod model_card;
 pub mod model_id;
+pub mod navigator;
 pub mod notes;
 pub mod notes_scan;
 pub mod nudger;
@@ -97,16 +98,19 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 pub use agentic::wrap_untrusted;
 pub use agentic::{
     append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
-    compress_user_initiated_for_task, execute_tool, experience_block, gather_code_files,
-    index_files, load_denials, memory_fetch_tool_definition, openai_chat_complete,
-    openai_chat_complete_with_prompt, openai_responses_complete,
-    openai_responses_complete_with_prompt, plan_block, retrieve_evidence, set_spill_lines,
-    transcript_lines, transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx,
-    CodeSearch, CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient,
-    ExperienceStore, HeadlessCodeSearch, LiveToolOutput, ManualCompressOutcome, McpTools, MemAddr,
-    MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision, PermissionGate,
-    PermissionRecord, PermissionRequest, PlanModeControl, PlanSnapshot, RecallSource,
-    RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
+    compress_user_initiated_for_task, execute_tool, experience_block, format_index_status,
+    format_search_hits, format_search_model, format_search_preview, format_search_rejects,
+    gather_code_files, gather_with_manifest, index_files, load_denials,
+    memory_fetch_tool_definition, openai_chat_complete, openai_chat_complete_with_prompt,
+    openai_responses_complete, openai_responses_complete_with_prompt, plan_block,
+    render_code_evidence, retrieve_evidence, retrieve_evidence_steered, retrieve_ranked,
+    set_spill_lines, transcript_lines, transcript_lines_styled, trim_for_summary, widen_caveats,
+    ChatCtx, CodeSearch, CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient,
+    EvidenceKind, ExperienceStore, GatherCaps, GatherManifest, HeadlessCodeSearch, IndexStatus,
+    LiveToolOutput, ManualCompressOutcome, McpTools, MemAddr, MemPayload, MemorySource, NoMcp,
+    NoteNudge, NoteSink, PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest,
+    PlanModeControl, PlanSnapshot, RankedHit, RecallSource, RejectReason, RetrievalResult,
+    RetrievalSteer, RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
     SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, SessionStepLedger,
     ShellObservation, SpillStore, Step, StepLedger, StepStatus, StoreMemorySource,
     StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, ToolOutputStream, TranscriptLine,
@@ -140,6 +144,14 @@ pub use conversation::{
     ConversationSummary, ConversationTurn, PhantomReach, PhantomResolution, ToolEvent,
 };
 pub use ffi_surface::FfiSurfaceProvider;
+pub use navigator::{
+    compare_ledgers, compare_semantic_lexical, execute_nav_tool, export_ledger_json,
+    export_ledger_markdown, find_callees, find_callers, find_hierarchy, find_implementations,
+    find_references, find_tests, format_ledger_diff, format_ledger_human, format_ledger_model,
+    goto_definition, hash_context, impact_analysis, inspect_type, project_map_nav, text_search,
+    GotoDefinitionArgs, GraphIndex, ImpactReport, NavHit, NavResult, NavToolCtx, NavigatorSession,
+    RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
+};
 pub use project_map::ProjectMapProvider;
 pub use where_is::{
     build_where_is_index, build_where_is_index_from_workspace, execute_where_is,

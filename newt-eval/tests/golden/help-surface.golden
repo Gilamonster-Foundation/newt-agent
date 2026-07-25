@@ -18,6 +18,7 @@
   /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)
   /context compaction [headroom_aware|message_count|reset] - set this session's automatic-compaction trigger policy
   /context stats           - experimentation dashboard: budget, compression, feature states
+  /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status
   /remember <fact>         - add a fact to persistent NOTES.md
   /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)
   /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)
@@ -69,6 +70,18 @@
   Esc                      - while the agent is working: interrupt the turn, back to your prompt
   Up/Down                  - while a tool is active: scroll its retained output
   Space/Enter              - while a tool is active: toggle ⧉ expand / ▣ collapse
+  /search [query|preview|model|rejects|pin|exclude|status|clear] - #1387 semantic search cockpit
+  /def <symbol>            - goto definition ([SYMBOL])
+  /text <regex>            - lexical search ([LEXICAL])
+  /uses <symbol>           - find references (usage index)
+  /tests <symbol>          - related tests (heuristic)
+  /map [unit]              - project map; optional expand unit
+  /callers|/callees|/implementations|/hierarchy <sym> - GRAPH regex-floor
+  /type <symbol>           - inspect_type (not typechecker-proved)
+  /impact <unit>           - outbound/reverse deps (+ optional lcov)
+  /retrieval [turn N] [human|model|diff] - retrieval ledger
+  /compare semantic lexical | turn A B | index - compare retrieval
+  /export json|markdown    - export retrieval ledger
   /exit  /quit  exit  quit - leave the session
 
   Add --help (or -h) to any command — or /help <command> — for its detail page.

@@ -457,10 +457,13 @@ async fn run_one_turn(
             embedder: cs.embedder.as_ref(),
             index: cs.index.as_ref(),
             top_k: cs.top_k,
+            steer: None,
+            status: None,
         }),
         // #1285: headless driver builds no symbol index yet (a follow-up wires
         // it from the leaf's gather) — the where_is tool degrades honestly.
         where_is: None,
+        nav: None,
         experience_store: None,
         step_ledger: None,
         caveats: &config.caveats,

@@ -183,10 +183,13 @@ pub use scheduled::{
 };
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
-    chunk_source, code_evidence_block, code_search_tool_definition, cosine, gather_code_files,
-    gather_with_manifest, index_files, plan_gather, retrieve_evidence, CodeChunk, CodeSearch, Cut,
-    CutClass, Embedder, EmbeddingsClient, GatherCaps, GatherManifest, SemanticIndex,
-    SessionSemanticIndex,
+    chunk_source, code_evidence_block, code_search_tool_definition, cosine, format_index_status,
+    format_search_hits, format_search_model, format_search_preview, format_search_rejects,
+    gather_code_files, gather_with_manifest, index_files, plan_gather, render_code_evidence,
+    retrieve_evidence, retrieve_evidence_steered, retrieve_ranked, retrieve_ranked_with_cap,
+    CodeChunk, CodeSearch, Cut, CutClass, Embedder, EmbeddingsClient, EvidenceKind, GatherCaps,
+    GatherManifest, IndexStatus, RankedHit, RejectReason, RetrievalResult, RetrievalSteer,
+    SemanticIndex, SessionSemanticIndex,
 };
 pub use spill::{SessionSpillStore, SpillStore};
 
@@ -546,6 +549,8 @@ pub struct ChatCtx<'a> {
     /// from the honest gather + language packs — model-free, so it can ride
     /// every session.
     pub where_is: Option<&'a crate::where_is::WhereIsIndex>,
+    /// #1387 Code Navigator tool context (usage/graph/project).
+    pub nav: Option<crate::navigator::NavToolCtx<'a>>,
     /// Experiential store for the record/recall tools (Step 26.6a). `None` = the
     /// tools are not advertised (experiential off). Shared `&dyn` (interior mut).
     pub experience_store: Option<&'a dyn crate::agentic::experiential::ExperienceStore>,
@@ -1119,6 +1124,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         scratchpad_store,
         code_search,
         where_is,
+        nav,
         experience_store,
         step_ledger,
         caveats,
@@ -2667,6 +2673,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         scratchpad_store,
                         code_search,
                         where_is,
+                        nav,
                         experience_store,
                         step_ledger,
                         operating_mode_control,
@@ -4429,6 +4436,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         scratchpad_store,
         code_search,
         where_is,
+        nav,
         experience_store,
         step_ledger,
         caveats,
@@ -5427,6 +5435,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         scratchpad_store,
                         code_search,
                         where_is,
+                        nav,
                         experience_store,
                         step_ledger,
                         operating_mode_control,
@@ -5716,6 +5725,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         scratchpad_store,
         code_search,
         where_is,
+        nav,
         experience_store,
         step_ledger,
         caveats,
@@ -6058,6 +6068,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         scratchpad_store,
                         code_search,
                         where_is,
+                        nav,
                         experience_store,
                         step_ledger,
                         operating_mode_control,
@@ -7356,6 +7367,7 @@ mod tool_round_cap_tests {
             scratchpad_store: None,
             code_search: None,
             where_is: None,
+            nav: None,
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -7528,6 +7540,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -7830,6 +7843,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -7923,6 +7937,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8525,6 +8540,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8630,6 +8646,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8744,6 +8761,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8870,6 +8888,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8988,6 +9007,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9148,6 +9168,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9317,6 +9338,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9452,6 +9474,7 @@ mod save_note_loop_tests {
             scratchpad_store: None,
             code_search: None,
             where_is: None,
+            nav: None,
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -9950,6 +9973,7 @@ mod compression_loop_tests {
             scratchpad_store: None,
             code_search: None,
             where_is: None,
+            nav: None,
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -10863,11 +10887,10 @@ mod compression_loop_tests {
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
         c.max_tool_rounds = 12;
-        // The full request includes ~3.4k tokens of always-on schemas. Keep
-        // enough room for one complete fresh result group and make the
-        // request (rather than message-only accounting) drive compression.
-        // The tools-disabled cap-exit then truthfully fits the same budget.
-        c.mid_loop_trim_tokens = Some(8_000); // hard trigger, fires most rounds
+        // Derive the trigger from the live Always-on catalog (#1387 grew it)
+        // plus a catalog-independent headroom for one complete fresh result
+        // group — same shape as the other compression-loop fixtures.
+        c.mid_loop_trim_tokens = Some(builtin_catalog_tokens(PromptDisposition::Act) + 4_600);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -10983,12 +11006,17 @@ mod compression_loop_tests {
             .respond_with(OversizedRoundResponder { log: log.clone() })
             .mount(&server)
             .await;
-        // Three ~7 KB results plus ~3.4k tokens of schemas exceed an 8,192
-        // num_ctx (6,553-token input ceiling) — the trailing group makes the
-        // COMPLETE request exceed the window; no boundary can split it
-        // (B6's shape).
+        // Three ~7 KB results plus Always-on schemas must exceed the input
+        // ceiling before reclaim (B6's shape). Derive num_ctx from the live
+        // catalog (#1387 grew Always-on tools) plus fixed headroom so the
+        // relative property stays stable as the catalog changes.
         // Distinct contents per file: identical results would engage the
         // dedupe pass, which is not what this test pins.
+        let catalog = builtin_catalog_tokens(PromptDisposition::Act);
+        // ~3.2k tokens of message/result headroom after reclaim (matches the
+        // pre-#1387 6,553 − ~3.4k catalog gap).
+        let input_ceiling = catalog + 3_200;
+        let num_ctx = ((input_ceiling as f64) / 0.8).ceil() as u32;
         let ws = tempfile::TempDir::new().unwrap();
         std::fs::write(
             ws.path().join("a.txt"),
@@ -11021,7 +11049,7 @@ mod compression_loop_tests {
         c.max_ok_input = None;
         c.safe_context = None;
         c.mid_loop_trim_tokens = None;
-        c.num_ctx = Some(8_192);
+        c.num_ctx = Some(num_ctx);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -11035,15 +11063,12 @@ mod compression_loop_tests {
         // Never a silent wrong answer: the model answered from real data.
         assert_eq!(reply, "the three files are summarized");
 
-        // THE #285 property: no dispatch ships over the window. The newest
-        // result plus schemas fits the ceiling here, so there is no truthful
-        // still-over residual to excuse an oversized request — pre-fix the
-        // round-1 dispatch went out at ~5.5k est tokens against 3,276.
+        // THE #285 property: no dispatch ships over the window.
         for (i, &(tokens, ..)) in log.iter().enumerate() {
             assert!(
-                tokens <= 6_553,
+                tokens <= input_ceiling,
                 "request {i} dispatched over the window: ~{tokens} est. \
-                 full-request tokens > 6,553 (the pre-#285 B6 residual)"
+                 full-request tokens > {input_ceiling}"
             );
         }
 
@@ -11060,16 +11085,15 @@ mod compression_loop_tests {
             "#285: the NEWEST result must reach the model whole"
         );
         assert!(task_present, "the task survives the within-group reclaim");
-        // The dispatch fits the same input ceiling the #284 test pins:
-        // 80% of 8,192 = 6,553 estimated full-request tokens.
         assert!(
-            tokens <= 6_553,
+            tokens <= input_ceiling,
             "#285: the reclaimed dispatch must fit the window \
-             (got ~{tokens} est. full-request tokens > 6,553)"
+             (got ~{tokens} est. full-request tokens > {input_ceiling})"
         );
         println!(
             "#285 e2e trace: reclaimed dispatch ~{tokens} est. tokens \
-             (full-request ceiling 6,553), a/b one-lined, c intact"
+             (full-request ceiling {input_ceiling}, num_ctx {num_ctx}), \
+             a/b one-lined, c intact"
         );
     }
 
@@ -11219,6 +11243,7 @@ mod observation_hook_tests {
             scratchpad_store: None,
             code_search: None,
             where_is: None,
+            nav: None,
             experience_store: None,
             step_ledger: None,
             caveats,

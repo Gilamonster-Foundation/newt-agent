@@ -2416,6 +2416,8 @@ pub(crate) struct ToolCollaborators<'a> {
     pub(crate) scratchpad_store: Option<&'a dyn super::scratchpad::ScratchpadStore>,
     pub(crate) code_search: Option<super::semantic::CodeSearch<'a>>,
     pub(crate) where_is: Option<&'a crate::where_is::WhereIsIndex>,
+    /// #1387 navigator tool context (usage/graph/project). `None` ⇒ tools degrade.
+    pub(crate) nav: Option<crate::navigator::NavToolCtx<'a>>,
     pub(crate) experience_store: Option<&'a dyn super::experiential::ExperienceStore>,
     pub(crate) step_ledger: Option<&'a dyn super::scheduled::StepLedger>,
     pub(crate) operating_mode_control: Option<&'a dyn super::OperatingModeControl>,
@@ -2464,6 +2466,7 @@ pub async fn execute_tool(
         scratchpad_store,
         code_search,
         where_is,
+        nav: None,
         experience_store,
         step_ledger,
         ..Default::default()
@@ -2525,6 +2528,7 @@ pub async fn execute_tool_with_offload(
         scratchpad_store,
         code_search,
         where_is,
+        nav: None,
         experience_store,
         step_ledger,
         spill_store,
@@ -2595,6 +2599,7 @@ pub async fn execute_tool_with_offload_and_prompt(
         scratchpad_store,
         code_search,
         where_is,
+        nav: None,
         experience_store,
         step_ledger,
         spill_store,
@@ -2667,6 +2672,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         scratchpad_store,
         code_search,
         where_is,
+        nav: None,
         experience_store,
         step_ledger,
         spill_store,
@@ -2828,6 +2834,7 @@ async fn execute_tool_inner(
         scratchpad_store,
         code_search,
         where_is,
+        nav,
         experience_store,
         step_ledger,
         operating_mode_control,
@@ -3075,6 +3082,22 @@ async fn execute_tool_inner(
             Some(index) => crate::where_is::execute_where_is(args, index, tool_output_lines),
             None => "unknown tool: where_is (no symbol index built for this session)".to_string(),
         },
+
+        // #1387 Code Navigator narrow tools — degrade via execute_nav_tool when
+        // session indexes are absent.
+        name if crate::navigator::NAV_TOOL_NAMES.contains(&name) => {
+            let ctx = nav.unwrap_or(crate::navigator::NavToolCtx {
+                workspace,
+                where_is,
+                usage: None,
+                graph: None,
+                project: None,
+                files: None,
+                status: None,
+            });
+            crate::navigator::execute_nav_tool(name, args, &ctx)
+                .unwrap_or_else(|| format!("unknown tool: {name}"))
+        }
 
         // Step 26.6a (#585): experiential record/recall — presence-gated on the
         // store (advertised only when the `experiential` feature is on).
@@ -4974,6 +4997,18 @@ mod tests {
                 // tool_search; degrades honestly when no symbol index is built),
                 // pushed after render_report.
                 "where_is",
+                // #1387 Code Navigator — Always-gated structural/lexical tools
+                // (degrade when session indexes are absent).
+                "goto_definition",
+                "text_search",
+                "find_references",
+                "find_tests",
+                "find_callers",
+                "find_callees",
+                "find_implementations",
+                "find_hierarchy",
+                "inspect_type",
+                "impact",
             ]
         );
     }
@@ -6510,6 +6545,8 @@ mod tests {
             embedder: &E,
             index: &idx,
             top_k: 1,
+            steer: None,
+            status: None,
         };
         let out = execute_tool(
             "code_search",

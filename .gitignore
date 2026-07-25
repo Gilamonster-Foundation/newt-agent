@@ -81,3 +81,6 @@ docs/research/*.pdf
 # output drifts (newt-core/tests/ui/). Review and move them into tests/ui/;
 # never commit the scratch dir.
 wip/
+
+# Cursor agent test target (local)
+target-cursor-tests/
