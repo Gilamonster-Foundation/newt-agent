@@ -32,6 +32,7 @@
   /recall [query]          - recent conversations, or full-text search
   /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)
   /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]
+  /plan                    - alias for /roadmap
   /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)
   /persona list            - list configured personas
   /persona show            - show the active persona
@@ -51,7 +52,11 @@
   /posture [name]          - show/set configured posture; permission floor is optional
   /permissions             - prompted decisions + active permission posture
   /loadout                 - show the active loadout: declared axes vs what resolved
+  /status                  - show session and environment summary
+  /info                    - show detailed session info (backend, permissions, version)
   /workspace               - show current workspace path
+  /docs                    - quick pointers to newt docs and issue tracker
+  /allow                   - alias for /permissions
   /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode
   /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)
   /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)

@@ -1560,6 +1560,46 @@ pub(crate) fn permissions_command_lines(
     lines
 }
 
+/// Parse the permission log into human-readable audit rows (newest-first).
+///
+/// Malformed lines are skipped so a corrupt log never blocks the `/permissions
+/// audit` path. An empty or unreadable log returns a one-line user-facing
+/// message instead.
+pub(crate) fn permission_audit_lines(log_path: &std::path::Path, limit: usize) -> Vec<String> {
+    let body = match std::fs::read_to_string(log_path) {
+        Ok(body) => body,
+        Err(e) => {
+            return vec![format!(
+                "unable to read permission log {}: {e}",
+                log_path.display()
+            )];
+        }
+    };
+
+    let records: Vec<newt_core::PermissionRecord> = body
+        .lines()
+        .filter_map(|line| serde_json::from_str::<newt_core::PermissionRecord>(line).ok())
+        .collect();
+
+    if records.is_empty() {
+        return vec!["no permission log entries yet".to_string()];
+    }
+
+    let show = if limit == 0 { records.len() } else { limit };
+    let shown = records.len().min(show);
+    let mut lines = vec![format!(
+        "permission audit: {shown} of {} (newest first)",
+        records.len()
+    )];
+    for rec in records.iter().rev().take(show) {
+        lines.push(format!(
+            "  {:<7} {:<9} {:<8} {} via {}",
+            rec.decision, rec.scope, rec.kind, rec.target, rec.tool
+        ));
+    }
+    lines
+}
+
 // ---------------------------------------------------------------------------
 // INTERIM (#297): --disable-ocap / --yolo session surfacing. Removed with the
 // bypass when brush upstreams CommandInterceptor (agent-bridle#20).
@@ -8167,6 +8207,8 @@ fn canonical_help_topic(cmd: &str) -> &str {
     match cmd {
         "quit" => "exit",
         "end" | "restart" | "clear" => "new",
+        "allow" => "permissions",
+        "plan" => "roadmap",
         "compact" => "compress",
         "vi" | "vim" | "emacs" | "nano" | "edit-mode" => "editor",
         "tool-rounds" | "max-rounds" => "rounds",
@@ -8355,6 +8397,20 @@ Markers: ▶ current · ● open in another newt · ○ resumable. Reopening a
 conversation another live newt holds is refused (it would mix turns) —
 this is how #1030 keeps multiple newts from colliding."
         }
+        "roadmap" => {
+            "\
+/roadmap [sub] — manage the per-session planning roadmap
+
+  /roadmap list             list open roadmaps
+  /roadmap show             render the active roadmap tree
+  /roadmap new              create a new roadmap
+  /roadmap use <n>          bind a roadmap by number
+  /roadmap add <title>      add a roadmap item
+  /roadmap task <n>         show one task
+  /tree                     render the active roadmap tree (alias of /roadmap show)
+
+Alias: /plan"
+        }
         "persona" => {
             "\
 /persona <sub> — configured personas
@@ -8390,7 +8446,44 @@ changes). Define personas in config."
 
 Read-only: what you've allowed/denied this session and the posture's optional
 authority floor, when configured. Durable grants are made by editing
-[tui.permissions] in config, not here."
+[tui.permissions] in config, not here.
+
+Usage:
+  /permissions                overview of this session's prompt flow
+  /permissions audit [N]      newest N audit rows from the persisted permission log
+  /allow                      alias for /permissions
+
+Examples:
+  /permissions                # show current session decisions
+  /permissions audit 25       # show newest 25 rows from permission-log.jsonl
+  /allow                      # alias for /permissions"
+        }
+        "status" => {
+            "\
+/status — show session status and environment summary
+
+  workspace, backend, mode, posture, permissions state, and active identifiers.
+
+Tip: use /info for a slightly richer version, and /permissions for full
+prompted-decisions history."
+        }
+        "info" => {
+            "\
+/info — show machine-readable context for the current session
+
+Shows the same status surface as /status, plus the version, active model
+identity, and resolved backend details that drive this prompt.
+        "
+        }
+        "docs" => {
+            "\
+/docs — open the right docs quickly
+
+  GitHub README: https://github.com/Gilamonster-Foundation/newt-agent
+  issue tracker: https://github.com/Gilamonster-Foundation/newt-agent/issues
+  architecture docs: https://github.com/Gilamonster-Foundation/newt-agent/tree/main/docs
+
+Use /help for the in-session command list."
         }
         "mode" => {
             "\
@@ -8651,6 +8744,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /recall [query]          - recent conversations, or full-text search",
         "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
         "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]",
+        "  /plan                    - alias for /roadmap",
         "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
@@ -8670,7 +8764,11 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /posture [name]          - show/set configured posture; permission floor is optional",
         "  /permissions             - prompted decisions + active permission posture",
         "  /loadout                 - show the active loadout: declared axes vs what resolved",
+        "  /status                  - show session and environment summary",
+        "  /info                    - show detailed session info (backend, permissions, version)",
         "  /workspace               - show current workspace path",
+        "  /docs                    - quick pointers to newt docs and issue tracker",
+        "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",

@@ -666,10 +666,15 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
         "mode",
         "posture",
         "loadout",
+        "plan",
+        "status",
+        "info",
+        "docs",
         "workspace",
         "spill",
         "config",
         "prompt",
+        "allow",
         "vi",
         "emacs",
         "nano",
@@ -685,6 +690,14 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
     assert_eq!(command_help_page("restart"), command_help_page("new"));
     assert_eq!(command_help_page("emacs"), command_help_page("vi"));
     assert_eq!(command_help_page("quit"), command_help_page("exit"));
+    assert_eq!(command_help_page("plan"), command_help_page("roadmap"));
+    assert_eq!(command_help_page("allow"), command_help_page("permissions"));
+    assert!(help_lines().iter().any(|l| l.contains("/loadout")));
+    assert!(help_lines().iter().any(|l| l.contains("/status")));
+    assert!(help_lines().iter().any(|l| l.contains("/info")));
+    assert!(help_lines().iter().any(|l| l.contains("/docs")));
+    assert!(help_lines().iter().any(|l| l.contains("/allow")));
+    assert!(help_lines().iter().any(|l| l.contains("/plan")));
     let spill_help = command_help_page("spill").expect("spill help page");
     assert!(spill_help.contains("Space or Enter"));
     assert!(spill_help.contains("⧉"));
@@ -758,6 +771,41 @@ fn slash_version_returns_true() {
 #[test]
 fn slash_workspace_returns_true() {
     assert!(dispatch_slash("/workspace", "/ws", false, false).unwrap());
+}
+
+#[test]
+fn permission_audit_lines_lists_newest_entries_and_ignores_bad_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permission-log.jsonl");
+    std::fs::write(
+        &path,
+        "\
+{\"ts_claim\":\"t0\",\"conversation_id\":\"c\",\"tool\":\"run_command\",\"kind\":\"exec\",\"target\":\"/bin/echo\",\"decision\":\"allow\",\"scope\":\"session\"}\n\
+this is not json\n\
+{\"ts_claim\":\"t1\",\"conversation_id\":\"c\",\"tool\":\"run_command\",\"kind\":\"net\",\"target\":\"https://example.com\",\"decision\":\"deny\",\"scope\":\"once\"}\n\
+",
+    )
+    .unwrap();
+
+    let lines = permission_audit_lines(&path, 5);
+    assert_eq!(
+        lines.first(),
+        Some(&"permission audit: 2 of 2 (newest first)".to_string())
+    );
+    assert!(lines[1].contains("deny"));
+    assert!(lines[1].contains("once"));
+    assert!(lines[1].contains("net"));
+    assert!(lines[1].contains("https://example.com"));
+    assert!(lines[2].contains("allow"));
+
+    let limited = permission_audit_lines(&path, 1);
+    assert_eq!(
+        limited,
+        vec![
+            "permission audit: 1 of 2 (newest first)".to_string(),
+            "  deny    once      net      https://example.com via run_command".to_string()
+        ]
+    );
 }
 
 #[test]
