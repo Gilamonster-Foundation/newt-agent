@@ -3590,6 +3590,39 @@ impl Config {
         dirs
     }
 
+    /// Fill in a default `[skills].bundled_dir` when the user left it unset, so
+    /// an agent running **inside a newt checkout gets the repo's bundled skills
+    /// surfaced out-of-the-box** (progressive-disclosure index → `use_skill`)
+    /// without any config. Detection walks up from `cwd` for a
+    /// `.newt/bundled-skills` directory; if none is found (or the field is
+    /// already set), the config is returned unchanged. Kept off the pure
+    /// [`Self::skill_search_dirs`] path — the filesystem probe lives only here.
+    ///
+    /// This is the smallest first step (dev/agent-in-checkout); packaging a
+    /// default bundled dir for an *installed* newt is a follow-up (see the
+    /// bundled-skills epic).
+    #[must_use]
+    pub fn with_bundled_default(mut self) -> Self {
+        let already_set = self
+            .skills
+            .as_ref()
+            .is_some_and(|s| !s.bundled_dir.is_empty());
+        if already_set {
+            return self;
+        }
+        let Ok(cwd) = std::env::current_dir() else {
+            return self;
+        };
+        if let Some(dir) =
+            find_ancestor_dir(&cwd, Path::new(".newt/bundled-skills"), |p| p.is_dir())
+        {
+            self.skills
+                .get_or_insert_with(SkillsConfig::default)
+                .bundled_dir = dir.to_string_lossy().into_owned();
+        }
+        self
+    }
+
     /// The personas directory: sibling of `~/.newt/config.toml`, i.e.
     /// `~/.newt/personas`. Falls back to a relative `./personas` only when
     /// `$HOME` can't be resolved. The same default `newt-tui`'s
@@ -4114,6 +4147,23 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// Walk `start` and its ancestors, returning the first `ancestor.join(rel)` for
+/// which `exists` is true. Pure: the filesystem probe is the injected `exists`
+/// closure, so the walk logic is unit-testable without touching disk.
+pub(crate) fn find_ancestor_dir(
+    start: &Path,
+    rel: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join(rel);
+        if exists(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5444,6 +5494,50 @@ mod tests {
             no_bundled.skill_search_dirs().len(),
             1,
             "empty bundled_dir contributes no directory"
+        );
+    }
+
+    #[test]
+    fn find_ancestor_dir_returns_first_matching_ancestor() {
+        // Only the workspace root has `.newt/bundled-skills`; the walk from a
+        // nested cwd must find it there, not stop short or overshoot.
+        let root = Path::new("/home/u/repo");
+        let target = root.join(".newt/bundled-skills");
+        let exists = |p: &Path| p == target;
+        let got = find_ancestor_dir(
+            Path::new("/home/u/repo/newt-core/src"),
+            Path::new(".newt/bundled-skills"),
+            exists,
+        );
+        assert_eq!(got, Some(target));
+    }
+
+    #[test]
+    fn find_ancestor_dir_none_when_no_ancestor_has_it() {
+        let got = find_ancestor_dir(
+            Path::new("/home/u/repo/newt-core/src"),
+            Path::new(".newt/bundled-skills"),
+            |_| false,
+        );
+        assert_eq!(got, None, "no ancestor matches → None, never a bogus path");
+    }
+
+    #[test]
+    fn with_bundled_default_leaves_a_configured_value_untouched() {
+        // A user who set `bundled_dir` must win — the checkout default only
+        // fills the gap, it never overrides an explicit choice.
+        let cfg = Config {
+            skills: Some(SkillsConfig {
+                search: vec![],
+                bundled_dir: "/explicit/bundled".into(),
+            }),
+            ..Config::default()
+        }
+        .with_bundled_default();
+        assert_eq!(
+            cfg.skills.unwrap().bundled_dir,
+            "/explicit/bundled",
+            "an explicitly configured bundled_dir is never overridden"
         );
     }
 

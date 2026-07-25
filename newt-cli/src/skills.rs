@@ -78,7 +78,7 @@ pub fn run(cmd: SkillsCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
         Some(p) => newt_core::Config::load(p)?,
         None => newt_core::Config::resolve().unwrap_or_default(),
     };
-    let search = cfg.skill_search_dirs();
+    let search = cfg.with_bundled_default().skill_search_dirs();
     let mut out = std::io::stdout();
     run_with(cmd, &search, &mut out)
 }

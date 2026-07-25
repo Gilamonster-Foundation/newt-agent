@@ -3730,12 +3730,15 @@ fn build_system_prompt_with_persona(
     ));
 
     // Progressive disclosure: inject ONLY the skills index (one
-    // `name: description` line per installed skill) — never the bodies.
-    // Bodies load on demand when the model calls the `use_skill` tool. Skills
-    // come from the configured search path (`[skills].search`, default
-    // `~/.newt/skills`); a missing dir contributes nothing.
+    // `name: description (when to use: …)` line per installed skill) — never
+    // the bodies. Bodies load on demand when the model calls the `use_skill`
+    // tool. Skills come from the configured search path (`[skills].search`,
+    // default `~/.newt/skills`); a missing dir contributes nothing.
+    // `with_bundled_default` fills an unset `[skills].bundled_dir` from the
+    // repo's `.newt/bundled-skills` when running inside a checkout, so bundled
+    // skills are surfaced to the model out-of-the-box.
     let skills_dirs = newt_core::Config::resolve()
-        .map(|c| c.skill_search_dirs())
+        .map(|c| c.with_bundled_default().skill_search_dirs())
         .unwrap_or_default();
     if let Some(index) = skills_index_for_prompt(&skills_dirs) {
         ctx.push('\n');
