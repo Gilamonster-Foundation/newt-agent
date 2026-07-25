@@ -1419,10 +1419,122 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
+                    let slash_body = task.trim_start_matches('/');
+                    // #1030: `/status` / `/info` quick state surfaces.
+                    if slash_body == "status" || slash_body == "info" {
+                        let mut lines = vec![
+                            format!("workspace: {workspace}"),
+                            format!("conversation: {active_conversation_id}"),
+                            format!("backend: {inf_model} @ {inf_url} ({})", inf_kind.label()),
+                            format!(
+                                "prompt permissions: {}",
+                                if prompt_permissions_enabled {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
+                            ),
+                        ];
+                        if slash_body == "info" {
+                            lines.push(format!("newt version: {VERSION}"));
+                            lines.push(format!(
+                                "active mode: {}",
+                                active_operating_mode.as_str()
+                            ));
+                            lines.push(format!(
+                                "active posture: {}",
+                                active_posture.as_ref().map_or("off", |p| p.name.as_str())
+                            ));
+                            if let Some(path) = permission_log_path.as_deref() {
+                                lines.push(format!("permission log: {}", path.display()));
+                            }
+                        }
+                        let mut it = lines.into_iter();
+                        if let Some(first) = it.next() {
+                            print_newt(&first, color, verbose);
+                        }
+                        for line in it {
+                            println!("{line}");
+                        }
+                        println!();
+                        continue;
+                    }
+                    if slash_body == "docs" {
+                        print_newt("docs and help:", color, verbose);
+                        println!("  https://github.com/Gilamonster-Foundation/newt-agent");
+                        println!("  https://github.com/Gilamonster-Foundation/newt-agent/blob/main/README.md");
+                        println!("  https://github.com/Gilamonster-Foundation/newt-agent/issues");
+                        println!(
+                            "  https://github.com/Gilamonster-Foundation/newt-agent/tree/main/docs"
+                        );
+                        println!("  /help (command list) · /help <cmd> (command detail)");
+                        println!();
+                        continue;
+                    }
                     // #263: review surface for prompted permission decisions.
                     // Read-only by design — promoting an allow to a durable
                     // grant is a human editing [tui.permissions] in config.
-                    if task.trim_start_matches('/') == "permissions" {
+                    if slash_body == "permissions"
+                        || slash_body == "allow"
+                        || slash_body.starts_with("permissions ")
+                        || slash_body.starts_with("allow ")
+                    {
+                        let perm_tail = if let Some(tail) = slash_body.strip_prefix("permissions") {
+                            tail.trim()
+                        } else if let Some(tail) = slash_body.strip_prefix("allow") {
+                            tail.trim()
+                        } else {
+                            ""
+                        };
+                        if let Some(tail) = perm_tail.strip_prefix("audit") {
+                            let tail = tail.trim();
+                            let limit = if tail.is_empty() {
+                                50
+                            } else {
+                                match tail.parse::<usize>() {
+                                    Ok(n) => n,
+                                    Err(_) => {
+                                        print_newt(
+                                            "usage: /permissions audit [N] (N must be an integer)",
+                                            color,
+                                            verbose,
+                                        );
+                                        println!();
+                                        continue;
+                                    }
+                                }
+                            };
+                            match permission_log_path.as_deref() {
+                                Some(path) => {
+                                    let mut lines = permission_audit_lines(path, limit).into_iter();
+                                    if let Some(first) = lines.next() {
+                                        print_newt(&first, color, verbose);
+                                    }
+                                    for line in lines {
+                                        println!("{line}");
+                                    }
+                                    if perm_tail.trim() == "audit" {
+                                        print_newt(
+                                            "showing newest 50 (default). use /permissions audit N",
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                None => print_newt(
+                                    "permission log not configured for this session yet",
+                                    color,
+                                    verbose,
+                                ),
+                            }
+                            println!();
+                            continue;
+                        }
+                        if !perm_tail.is_empty() {
+                            print_newt("usage: /permissions [audit N]", color, verbose);
+                            println!();
+                            continue;
+                        }
                         let mut lines = permissions_command_lines(
                             &permission_state,
                             prompt_permissions_enabled,
@@ -2353,10 +2465,16 @@ pub(crate) fn run_chat(
                     // tree; /tree renders the active roadmap (alias of /roadmap show).
                     if slash_body == "roadmap"
                         || slash_body.starts_with("roadmap ")
+                        || slash_body == "plan"
+                        || slash_body.starts_with("plan ")
                         || slash_body == "tree"
                     {
                         let cmd = if slash_body == "tree" {
                             "/roadmap show".to_string()
+                        } else if slash_body == "plan" {
+                            "/roadmap".to_string()
+                        } else if slash_body.starts_with("plan ") {
+                            format!("/roadmap {}", &slash_body["plan ".len()..])
                         } else {
                             task.clone()
                         };
