@@ -47,9 +47,9 @@
   /dgx rm <model>          - delete a model from the DGX
   /dgx route <task>        - recommend a formation for a task
   /dgx doctor              - probe every configured endpoint
-  /permissions             - prompted permission decisions + active mode clamp
-  /mode <name>             - enter a named mode: load skill + clamp authority (floor)
-  /mode                    - show the active mode; /mode off clears it
+  /mode [name]             - show/set operating style: chat, dev, admin, plan, diagnose, auto, full-auto
+  /posture [name]          - show/set configured posture; permission floor is optional
+  /permissions             - prompted decisions + active permission posture
   /loadout                 - show the active loadout: declared axes vs what resolved
   /workspace               - show current workspace path
   /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode

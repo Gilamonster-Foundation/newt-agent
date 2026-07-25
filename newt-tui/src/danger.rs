@@ -1,7 +1,7 @@
 //! Danger-tiering for permission grants — facade **P1b** (§7-F3/F4 of
 //! `docs/ocap/permissions-facade-design.md`).
 //!
-//! Absent an active `/mode`, the only authority boundary is the human operator,
+//! Absent an active `/posture`, the only authority boundary is the human operator,
 //! and the **model controls the prompt text**: `request_permissions{capability,
 //! target, reason}` carries a model-authored `reason`. A benign reason can dress
 //! a catastrophic grant (`exec bash`, `fs_write /`) — a
@@ -118,7 +118,7 @@ impl DangerTable {
             // #1056: a LOCAL git write is Low — a commit is not an interpreter or
             // a broad-tree grant, and it must be `[s]ession allow`-able so a coder
             // can commit its work without a prompt per op. The floor that still
-            // denies it under a readonly `/mode` is the gate's preset check, not a
+            // denies it under a readonly `/posture` is the gate's preset check, not a
             // High tier (which would only block the session grant, not once).
             DenialKind::GitWrite => false,
         };

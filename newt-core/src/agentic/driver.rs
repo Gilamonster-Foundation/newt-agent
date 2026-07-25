@@ -516,6 +516,8 @@ async fn run_one_turn(
         live_tool_output: None,
         git_tool: None,
         crew_runner: None,
+        operating_mode_control: None,
+        plan_mode_control: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.

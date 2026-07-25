@@ -102,7 +102,9 @@ mod mcp;
 mod memory_fetch;
 mod note_sink;
 mod observation;
+mod operating_mode;
 mod permissions;
+mod plan_mode;
 // PR5: deterministic prompt-comprehension intake owns the turn disposition,
 // bounded clarification manifest, and content-free model projection.
 mod prompt_intake;
@@ -243,17 +245,19 @@ pub use memory_fetch::{
 };
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use observation::{ShellObservation, SHELL_OBSERVATION_PREFIX};
+pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeControl};
 pub use permissions::{
     append_denial, load_denials, widen_caveats, DenialKind, PermissionDecision, PermissionGate,
     PermissionRecord, PermissionRequest, PersistentDenial,
 };
+pub use plan_mode::PlanModeControl;
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
-    filter_tools_for_disposition, full_access_requested, in_plan_phase, ocap_disabled,
-    persona_tool_allowed, plan_phase_clamp, set_max_output_tokens, set_output_head_tokens,
+    filter_tools_for_disposition, full_access_requested, ocap_disabled, persona_tool_allowed,
+    plan_phase_clamp, set_max_output_tokens, set_output_head_tokens, tool_allowed,
     tool_definitions, venv_cmd_prefix,
 };
 pub use transcript::{
@@ -738,11 +742,11 @@ pub struct ChatCtx<'a> {
     /// loop treats the turn as "low budget" and nudges toward wrapping up.
     /// Historically hardcoded at 15.
     pub low_budget_pct: usize,
-    /// #307 named-permission-preset exec FLOOR. When a `/mode` preset is active
+    /// #307 named-permission-preset exec FLOOR. When a `/posture` preset is active
     /// its exec clamp is threaded here so the `--disable-ocap` / `--yolo`
     /// bypass in `execute_tool` cannot raise exec authority above the preset:
     /// an out-of-floor command falls through to the confined shell and is
-    /// denied. `None` (no active preset, and every headless caller) leaves the
+    /// denied. `None` (no active posture, and every headless caller) leaves the
     /// bypass bit-for-bit. The floor is also already `meet`-ed into `caveats`,
     /// so the confined-shell and gate paths enforce it too; this field is the
     /// one extra place the otherwise caveats-blind bypass must consult.
@@ -780,6 +784,17 @@ pub struct ChatCtx<'a> {
     /// ⇒ never advertised. Trait-injection seam like `git_tool` (newt-scheduler
     /// depends on newt-core, so the dep can't be direct).
     pub crew_runner: Option<&'a dyn CrewRunner>,
+    /// Session-local working-style selector behind `/mode auto`. `Some` only
+    /// when the human configured Auto mode, so every other session omits the
+    /// model-facing selector entirely. A selection affects a future turn and
+    /// cannot change this turn's disposition or caveats.
+    pub operating_mode_control: Option<&'a dyn OperatingModeControl>,
+    /// Session-local state behind `enter_plan_mode` / `exit_plan_mode`.
+    ///
+    /// The dispatcher checks this collaborator before every tool call, so
+    /// entering Plan immediately clamps subsequent calls in the same model
+    /// round. `None` means the model-entered Plan phase is unavailable.
+    pub plan_mode_control: Option<&'a dyn PlanModeControl>,
 }
 
 /// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
@@ -1149,6 +1164,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         live_tool_output,
         git_tool,
         crew_runner,
+        operating_mode_control,
+        plan_mode_control,
     } = ctx;
     // Explain / Research / Ask turns may still use bounded read-only tools, but
     // must never inherit the harness's execution-pressure repairs.
@@ -1197,6 +1214,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
+    let advertise_operating_mode = operating_mode_control.is_some();
+    let advertise_plan_mode = plan_mode_control.is_some();
+    let advertise_plan_mode_active =
+        plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
     // Convert MemMessage list to Ollama JSON format.
     // The memory manager already included the current task as the last user message.
@@ -1277,6 +1298,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         advertise_code_search,
         advertise_experiential,
         advertise_scheduled,
+        advertise_operating_mode,
+        advertise_plan_mode,
+        advertise_plan_mode_active,
     );
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona's
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
@@ -2645,6 +2669,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         where_is,
                         experience_store,
                         step_ledger,
+                        operating_mode_control,
+                        plan_mode_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -4448,6 +4474,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         live_tool_output,
         git_tool,
         crew_runner,
+        operating_mode_control,
+        plan_mode_control,
     } = ctx;
     // See the Ollama path: a non-Act turn is allowed bounded reads but never
     // execution-pressure nudges.
@@ -4481,6 +4509,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
+    let advertise_operating_mode = operating_mode_control.is_some();
+    let advertise_plan_mode = plan_mode_control.is_some();
+    let advertise_plan_mode_active =
+        plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
@@ -4546,6 +4578,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         advertise_code_search,
         advertise_experiential,
         advertise_scheduled,
+        advertise_operating_mode,
+        advertise_plan_mode,
+        advertise_plan_mode_active,
     );
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona's
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
@@ -5394,6 +5429,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         where_is,
                         experience_store,
                         step_ledger,
+                        operating_mode_control,
+                        plan_mode_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -5728,6 +5765,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         live_tool_output,
         git_tool,
         crew_runner,
+        operating_mode_control,
+        plan_mode_control,
     } = ctx;
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // The OpenAI-Responses loop offloads tool output (spill_store) but does not
@@ -5753,6 +5792,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
+    let advertise_operating_mode = operating_mode_control.is_some();
+    let advertise_plan_mode = plan_mode_control.is_some();
+    let advertise_plan_mode_active =
+        plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
     let mut msgs_json: Vec<serde_json::Value> = mem_messages
         .iter()
@@ -5787,6 +5830,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         advertise_code_search,
         advertise_experiential,
         advertise_scheduled,
+        advertise_operating_mode,
+        advertise_plan_mode,
+        advertise_plan_mode_active,
     );
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona
     // (Responses wire). No-op when `persona_tools` is `None`.
@@ -6014,6 +6060,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         where_is,
                         experience_store,
                         step_ledger,
+                        operating_mode_control,
+                        plan_mode_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -7115,7 +7163,8 @@ mod cap_exit_unit_tests {
 pub(crate) fn builtin_catalog_tokens(disposition: PromptDisposition) -> usize {
     let tools = filter_tools_for_disposition(
         merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         ),
         disposition,
     );
@@ -7352,6 +7401,8 @@ mod tool_round_cap_tests {
             live_tool_output: None,
             git_tool: None,
             crew_runner: None,
+            operating_mode_control: None,
+            plan_mode_control: None,
         }
     }
 
@@ -7522,6 +7573,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -7822,6 +7875,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -7913,6 +7968,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -8039,7 +8096,8 @@ mod tool_round_cap_tests {
         );
         let head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
         let chat_tools = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let tools = if responses_wire {
             serde_json::Value::Array(tools_to_responses(&chat_tools))
@@ -8512,6 +8570,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             Some(&turn_prompt),
             Some(&prompt_source),
@@ -8615,6 +8675,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -8727,6 +8789,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -8851,6 +8915,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -8967,6 +9033,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -9125,6 +9193,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -9292,6 +9362,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -9425,6 +9497,8 @@ mod save_note_loop_tests {
             live_tool_output: None,
             git_tool: None,
             crew_runner: None,
+            operating_mode_control: None,
+            plan_mode_control: None,
         }
     }
 
@@ -9923,6 +9997,8 @@ mod compression_loop_tests {
             live_tool_output: None,
             git_tool: None,
             crew_runner: None,
+            operating_mode_control: None,
+            plan_mode_control: None,
         }
     }
 
@@ -10505,7 +10581,8 @@ mod compression_loop_tests {
     /// catalog rather than a stale numeric snapshot of its schema overhead.
     fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         let tools = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let mut wire_messages: Vec<serde_json::Value> = messages
             .iter()
@@ -11188,6 +11265,8 @@ mod observation_hook_tests {
             live_tool_output: None,
             git_tool: None,
             crew_runner: None,
+            operating_mode_control: None,
+            plan_mode_control: None,
         }
     }
 
@@ -11196,7 +11275,8 @@ mod observation_hook_tests {
     /// than making this regression depend on a frozen catalog size.
     fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         let tools = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let mut wire_messages: Vec<serde_json::Value> = messages
             .iter()

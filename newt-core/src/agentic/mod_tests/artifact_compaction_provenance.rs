@@ -78,6 +78,8 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         live_tool_output: None,
         git_tool: None,
         crew_runner: None,
+        operating_mode_control: None,
+        plan_mode_control: None,
     }
 }
 

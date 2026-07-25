@@ -74,6 +74,25 @@ disabled. The default `newt` binary enables `live-spill`; a
 [TUI README](./newt-tui/README.md) and
 [decision record](./docs/decisions/live_spill_viewport.md).
 
+### Operating modes and permission postures
+
+Inside the TUI, `/mode` lists and selects a working style: `chat`, `dev`,
+`admin`, `plan`, `diagnose`, `auto`, or `full-auto`. Bare `/mode` includes a
+description of each. `plan` is workspace-read-only with access to Newt's plan
+ledger, and `diagnose` is bounded read-only research. In `auto`, the model can
+select a bounded style for a later action-shaped turn, but protected intake
+still wins and only the human can select `full-auto`. Every mode still honors
+all permission and safety boundaries. `dev` and `full-auto` both carry TDD,
+worktree-safe Git, targeted-test, and full-preflight guidance; `full-auto`
+changes persistence and interruption policy, not authority.
+
+`/posture` is the separate authority control. It lists or applies a configured
+skill/framing binding and its optional permission floor; `/posture off` clears
+it. A configured floor can only narrow authority, while a posture without one
+leaves authority unchanged. Existing posture bindings remain under
+`[modes.<name>]` in TOML for compatibility. See the
+[mode/posture decision](./docs/decisions/operating_modes_and_permission_postures.md).
+
 Run `newt --help` for every mode (worker, MCP server, doctor, config, …) —
 the binary is the authority on its own surface, this file is not. Python
 bindings live in [`newt-agent-py/`](./newt-agent-py/) (`pip install

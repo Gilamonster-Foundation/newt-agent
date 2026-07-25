@@ -222,7 +222,9 @@ mod tests {
     /// The full advertised catalog with every presence gate ON, so crew /
     /// plan / scratchpad / etc. all appear — the richest catalog to search.
     fn full_catalog() -> serde_json::Value {
-        merged_tool_definitions(&NoMcp, true, true, true, true, true, true, true, true, true)
+        merged_tool_definitions(
+            &NoMcp, true, true, true, true, true, true, true, true, true, true, true, true,
+        )
     }
 
     #[test]

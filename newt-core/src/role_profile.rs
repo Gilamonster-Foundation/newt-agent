@@ -403,7 +403,7 @@ impl NamedPermissionPreset {
         self.to_caveat_profile().to_caveats()
     }
 
-    /// One-line human summary for `/permissions` and `/mode` reporting, e.g.
+    /// One-line human summary for `/permissions` and `/posture` reporting, e.g.
     /// `readonly exec=[git, gh] deny=* max_calls=40`.
     #[must_use]
     pub fn summary(&self) -> String {

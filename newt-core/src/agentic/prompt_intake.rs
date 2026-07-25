@@ -2,8 +2,9 @@
 //!
 //! The intake runs after a durable prompt receipt exists and before the model,
 //! tool catalog, or action nudges run. It makes a small, inspectable decision:
-//! whether the turn is an `ask`, `act`, `explain`, or `research` turn; which
-//! atomic asks it contains; and whether an operator decision remains unlocked.
+//! whether the turn is an `ask`, `act`, `explain`, `research`, or harness-
+//! selected `plan` turn; which atomic asks it contains; and whether an operator
+//! decision remains unlocked.
 //!
 //! This is deliberately a bounded heuristic, not an LLM judge. The security
 //! contract is fail-closed at the dispatcher: classification changes what is
@@ -27,6 +28,9 @@ const MAX_CONCRETE_DECISIONS: usize = MAX_DECISIONS - 1;
 const MAX_ASK_BYTES: usize = 4_096;
 const MAX_CLARIFICATION_BYTES: usize = 384;
 const RESEARCH_TOOL_ROUND_LIMIT: usize = 3;
+pub(super) const PROMPT_COMPREHENSION_SCHEMA_V1: &str = "prompt_comprehension_manifest_v1";
+pub(super) const PROMPT_COMPREHENSION_SCHEMA_V2: &str = "prompt_comprehension_manifest_v2";
+pub(super) const PROMPT_COMPREHENSION_SCHEMA_CURRENT: &str = PROMPT_COMPREHENSION_SCHEMA_V2;
 
 /// The harness-selected mode for one accepted prompt receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +46,10 @@ pub enum PromptDisposition {
     /// Gather bounded read-only evidence; mutations and capability grants are
     /// unavailable.
     Research,
+    /// Read/recover and update only the harness-owned plan ledger; workspace,
+    /// execution, network, capability-grant, and generic MCP mutation paths
+    /// remain unavailable.
+    Plan,
 }
 
 impl PromptDisposition {
@@ -51,6 +59,7 @@ impl PromptDisposition {
             Self::Act => "act",
             Self::Explain => "explain",
             Self::Research => "research",
+            Self::Plan => "plan",
         }
     }
 
@@ -63,6 +72,7 @@ impl PromptDisposition {
             Self::Act => max,
             Self::Explain => max,
             Self::Research => max.min(RESEARCH_TOOL_ROUND_LIMIT),
+            Self::Plan => max,
         }
     }
 }
@@ -258,6 +268,28 @@ impl PromptIntake {
         self.disposition
     }
 
+    /// Select an explicit non-action disposition for this accepted intake.
+    ///
+    /// Operating modes are applied after deterministic prompt intake. They may
+    /// choose `Explain`, `Research`, or `Plan`, but must never turn a pending
+    /// `Ask` into executable work or select `Act`. Updating both live and
+    /// post-lock state keeps the model card, durable artifact, advertised
+    /// catalog, and dispatcher on one effective disposition.
+    pub fn enforce_read_only(&mut self, disposition: PromptDisposition) {
+        if !matches!(
+            disposition,
+            PromptDisposition::Explain | PromptDisposition::Research | PromptDisposition::Plan
+        ) {
+            debug_assert!(false, "read-only disposition required");
+            return;
+        }
+        if self.disposition != PromptDisposition::Ask {
+            self.disposition = disposition;
+            self.post_lock_disposition = disposition;
+        }
+        debug_assert!(self.validate().is_ok());
+    }
+
     pub fn atomic_asks(&self) -> &[AtomicAsk] {
         self.manifest.atomic_asks()
     }
@@ -366,6 +398,9 @@ impl PromptIntake {
             PromptDisposition::Research => {
                 "harness_action: gather bounded read-only evidence; do not mutate or request capability grants"
             }
+            PromptDisposition::Plan => {
+                "harness_action: read evidence and maintain the harness plan ledger only; do not mutate the workspace, execute commands, or request capability grants"
+            }
         };
         format!(
             "{PROMPT_COMPREHENSION_MODEL_CARD_PREFIX}\n\
@@ -411,7 +446,7 @@ impl PromptIntake {
         }
 
         json!({
-            "schema": "prompt_comprehension_manifest_v1",
+            "schema": PROMPT_COMPREHENSION_SCHEMA_CURRENT,
             "disposition": self.disposition.as_str(),
             "atomic_ask_count": self.manifest.atomic_asks.len() as u64,
             "clarification_count": self.manifest.pending_decision_count() as u64,
@@ -789,7 +824,12 @@ mod tests {
         assert_eq!(intake.disposition(), PromptDisposition::Act);
         assert_eq!(intake.atomic_asks().len(), 1);
         intake.validate().unwrap();
-        let metadata = intake.artifact_metadata().to_string();
+        let artifact_metadata = intake.artifact_metadata();
+        assert_eq!(
+            artifact_metadata["schema"],
+            "prompt_comprehension_manifest_v2"
+        );
+        let metadata = artifact_metadata.to_string();
         assert!(!metadata.contains("private parser"));
         assert!(metadata.contains("atomic_ask_digests"));
         let card = intake.model_card();
@@ -917,6 +957,35 @@ mod tests {
         assert_eq!(PromptDisposition::Ask.tool_round_limit(40), 0);
         assert_eq!(PromptDisposition::Explain.tool_round_limit(40), 40);
         assert_eq!(PromptDisposition::Research.tool_round_limit(40), 3);
+        assert_eq!(PromptDisposition::Plan.tool_round_limit(40), 40);
+    }
+
+    #[test]
+    fn read_only_attenuation_keeps_model_card_and_artifact_in_sync() {
+        let mut action = PromptIntake::analyze("Implement the requested parser change.");
+        assert_eq!(action.disposition(), PromptDisposition::Act);
+
+        action.enforce_read_only(PromptDisposition::Plan);
+
+        assert_eq!(action.disposition(), PromptDisposition::Plan);
+        assert!(
+            action.model_card().contains("disposition: plan"),
+            "{}",
+            action.model_card()
+        );
+        assert_eq!(
+            action.artifact_metadata()["schema"],
+            "prompt_comprehension_manifest_v2"
+        );
+        assert_eq!(action.artifact_metadata()["disposition"], "plan");
+
+        let mut research = PromptIntake::analyze("Investigate the parser behavior.");
+        research.enforce_read_only(PromptDisposition::Research);
+        assert_eq!(
+            research.disposition(),
+            PromptDisposition::Research,
+            "the mode-selected read-only disposition must remain consistent"
+        );
     }
 
     #[test]

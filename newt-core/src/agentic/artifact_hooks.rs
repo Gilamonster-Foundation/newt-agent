@@ -11,7 +11,11 @@ use std::path::{Component, Path, PathBuf};
 
 use super::artifact_read::{ArtifactReadContext, ArtifactReadRecord, PromptArtifactSink};
 use super::compress::{CompressAction, CompressTrigger};
-use super::prompt_intake::PromptIntake;
+#[cfg(test)]
+use super::prompt_intake::PROMPT_COMPREHENSION_SCHEMA_CURRENT;
+use super::prompt_intake::{
+    PromptIntake, PROMPT_COMPREHENSION_SCHEMA_V1, PROMPT_COMPREHENSION_SCHEMA_V2,
+};
 use super::scheduled::{PlanSnapshot, Step, StepStatus, MAX_STEPS, STEP_DESC_CAP};
 use crate::artifact::{ArtifactKind, ArtifactRelation, NewPromptArtifact};
 use crate::{TokenUsage, TurnEndReason};
@@ -19,7 +23,6 @@ use crate::{TokenUsage, TurnEndReason};
 const COMPACTION_REASON_CHARS: usize = 512;
 const GIT_OID_CHARS: usize = 128;
 const GIT_BRANCH_CHARS: usize = 512;
-const PROMPT_COMPREHENSION_SCHEMA: &str = "prompt_comprehension_manifest_v1";
 const PROMPT_COMPREHENSION_LOCATOR: &str = "prompt-comprehension";
 const MAX_ATOMIC_ASK_DIGESTS: usize = 64;
 const MAX_CLARIFICATION_DIGESTS: usize = 16;
@@ -64,9 +67,10 @@ fn append(
 ///
 /// [`PromptIntake::artifact_metadata`] is deliberately treated as untrusted at
 /// this persistence boundary. The hook accepts one exact scalar/aggregate
-/// schema, validates every digest, and reconstructs a fresh JSON object from a
-/// whitelist. Unknown or missing fields fail closed instead of creating a
-/// second prompt transcript through artifact metadata.
+/// field shape with version-specific disposition enums, validates every
+/// digest, and reconstructs a fresh JSON object from a whitelist. Unknown or
+/// missing fields fail closed instead of creating a second prompt transcript
+/// through artifact metadata.
 pub fn record_prompt_comprehension_manifest(
     sink: &dyn PromptArtifactSink,
     context: ArtifactReadContext<'_>,
@@ -99,12 +103,19 @@ fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Val
     )?;
 
     let schema = required_string(object, "schema", "prompt-comprehension schema")?;
-    if schema != PROMPT_COMPREHENSION_SCHEMA {
-        anyhow::bail!("prompt-comprehension metadata has an unsupported schema");
-    }
     let disposition = required_string(object, "disposition", "prompt-comprehension disposition")?;
-    if !matches!(disposition, "ask" | "act" | "explain" | "research") {
-        anyhow::bail!("prompt-comprehension metadata has an invalid disposition");
+    match schema {
+        PROMPT_COMPREHENSION_SCHEMA_V1 => {
+            if !matches!(disposition, "ask" | "act" | "explain" | "research") {
+                anyhow::bail!("prompt-comprehension metadata has an invalid v1 disposition");
+            }
+        }
+        PROMPT_COMPREHENSION_SCHEMA_V2 => {
+            if !matches!(disposition, "ask" | "act" | "explain" | "research" | "plan") {
+                anyhow::bail!("prompt-comprehension metadata has an invalid v2 disposition");
+            }
+        }
+        _ => anyhow::bail!("prompt-comprehension metadata has an unsupported schema"),
     }
 
     let atomic_ask_count = required_count(object, "atomic_ask_count")?;
@@ -163,7 +174,7 @@ fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Val
     }
 
     Ok(json!({
-        "schema": PROMPT_COMPREHENSION_SCHEMA,
+        "schema": schema,
         "disposition": disposition,
         "atomic_ask_count": atomic_ask_count,
         "clarification_count": clarification_count,
@@ -788,9 +799,9 @@ mod tests {
         })
     }
 
-    fn valid_prompt_comprehension_metadata() -> Value {
+    fn valid_prompt_comprehension_metadata_for_schema(schema: &str) -> Value {
         json!({
-            "schema": PROMPT_COMPREHENSION_SCHEMA,
+            "schema": schema,
             "disposition": "ask",
             "atomic_ask_count": 2,
             "clarification_count": 1,
@@ -812,6 +823,10 @@ mod tests {
                 digest_metadata("private clarification question"),
             ],
         })
+    }
+
+    fn valid_prompt_comprehension_metadata() -> Value {
+        valid_prompt_comprehension_metadata_for_schema(PROMPT_COMPREHENSION_SCHEMA_CURRENT)
     }
 
     fn assert_prompt_comprehension_metadata_rejected(metadata: &Value) {
@@ -851,7 +866,10 @@ mod tests {
         assert_eq!(artifact.relation(), ArtifactRelation::DerivedFrom);
         assert_eq!(artifact.locator(), Some(PROMPT_COMPREHENSION_LOCATOR));
         assert!(artifact.body().is_none());
-        assert_eq!(artifact.metadata()["schema"], PROMPT_COMPREHENSION_SCHEMA);
+        assert_eq!(
+            artifact.metadata()["schema"],
+            PROMPT_COMPREHENSION_SCHEMA_CURRENT
+        );
         assert_eq!(artifact.metadata()["disposition"], "ask");
         assert_eq!(artifact.metadata()["atomic_ask_count"], 2);
         assert_eq!(artifact.metadata()["clarification_count"], 1);
@@ -876,10 +894,57 @@ mod tests {
     }
 
     #[test]
+    fn prompt_comprehension_manifest_accepts_harness_selected_plan_disposition() {
+        let mut intake = crate::agentic::PromptIntake::analyze("Implement the parser repair.");
+        intake.enforce_read_only(crate::agentic::PromptDisposition::Plan);
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+
+        record_prompt_comprehension_metadata(&sink, context, &intake.artifact_metadata()).unwrap();
+
+        let writes = sink.writes.lock().unwrap();
+        assert_eq!(
+            writes[0].2.metadata()["schema"],
+            "prompt_comprehension_manifest_v2"
+        );
+        assert_eq!(writes[0].2.metadata()["disposition"], "plan");
+    }
+
+    #[test]
+    fn prompt_comprehension_manifest_accepts_legacy_v1_without_rewriting_its_schema() {
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+        let metadata =
+            valid_prompt_comprehension_metadata_for_schema("prompt_comprehension_manifest_v1");
+
+        record_prompt_comprehension_metadata(&sink, context, &metadata).unwrap();
+
+        let writes = sink.writes.lock().unwrap();
+        assert_eq!(
+            writes[0].2.metadata()["schema"],
+            "prompt_comprehension_manifest_v1"
+        );
+        assert_eq!(writes[0].2.metadata()["disposition"], "ask");
+    }
+
+    #[test]
+    fn prompt_comprehension_manifest_rejects_plan_under_legacy_v1_schema() {
+        let mut metadata =
+            valid_prompt_comprehension_metadata_for_schema("prompt_comprehension_manifest_v1");
+        metadata["disposition"] = Value::from("plan");
+
+        assert_prompt_comprehension_metadata_rejected(&metadata);
+    }
+
+    #[test]
     fn prompt_comprehension_manifest_rejects_text_bearing_or_unknown_fields() {
         let mut missing_field = valid_prompt_comprehension_metadata();
         missing_field.as_object_mut().unwrap().remove("schema");
         assert_prompt_comprehension_metadata_rejected(&missing_field);
+
+        let mut unsupported_schema = valid_prompt_comprehension_metadata();
+        unsupported_schema["schema"] = Value::from("prompt_comprehension_manifest_v3");
+        assert_prompt_comprehension_metadata_rejected(&unsupported_schema);
 
         let mut root_text = valid_prompt_comprehension_metadata();
         root_text["prompt_text"] = Value::from("private operator prompt");

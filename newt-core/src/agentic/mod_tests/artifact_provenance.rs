@@ -83,6 +83,8 @@ fn ctx<'a>(
         live_tool_output: None,
         git_tool: None,
         crew_runner: None,
+        operating_mode_control: None,
+        plan_mode_control: None,
     }
 }
 
