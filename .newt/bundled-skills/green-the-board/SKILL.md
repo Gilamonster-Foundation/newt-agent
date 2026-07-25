@@ -123,13 +123,62 @@ gh pr update-branch <pr-number>
 # Code PRs: merge locally, RE-VERIFY the merged tree against the real CI command
 # (the early error may have masked a second issue), then push.
 git checkout -B <pr-branch> origin/<pr-branch>
-git merge --no-edit origin/main         # expect 0 conflicts if step 2 said so
+git merge --no-edit origin/main         # 0 conflicts if step 2 said so; else → step 4a
 cargo clippy --workspace --all-targets --features <same-as-CI> -- -D warnings
 git push origin <pr-branch>
 ```
 
 Re-verifying each merged code tree locally (with a warm build cache it's cheap)
 catches a *masked second failure* before you spend a full CI round-trip on it.
+
+### 4a. When the forward-merge conflicts — resolve on purpose, never blindly
+
+Step 2 already predicts this: a PR that **touches the broken region itself**
+will conflict when `main`'s fix lands on the same lines. A conflict is
+information, not a nuisance — it is git telling you the fix and the PR both
+edited the same place, and only a human-meaningful merge is correct. Do **not**
+reach for `-X ours` / `-X theirs` or accept one side wholesale: each silently
+discards real work (the fix, or the PR's change) and reintroduces the very red
+you are clearing.
+
+```bash
+git merge --no-edit origin/main
+# → CONFLICT (content): Merge conflict in path/to/file
+git diff --name-only --diff-filter=U        # exactly which files conflict?
+```
+
+Decide by *what* conflicts:
+
+- **Only the broken region conflicts** (the fix and the PR edited the same
+  lines): this is the case step 2 flagged. Usually cleaner to **abort and apply
+  the fix directly in the PR's own diff** instead of merging — a small,
+  reviewable commit beats a tangled merge:
+  ```bash
+  git merge --abort
+  # re-apply the same minimal fix by hand on <pr-branch>, commit it there
+  ```
+  If you do resolve in-place instead, hand-merge so **both** intents survive:
+  keep the PR's behavior *and* the fix's behavior, not one clobbering the other.
+
+- **The conflict is elsewhere** (unrelated files drifted): resolve those
+  normally, preserving both sides' intent, then continue.
+
+After **any** resolution, treat the merged tree as unverified — the merge
+itself can introduce a fresh break the pre-merge checks never saw:
+
+```bash
+git add <resolved-files> && git commit --no-edit        # complete the merge
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --features <same-as-CI> -- -D warnings
+cargo test  --workspace --features <same-as-CI>          # the merge can break tests
+git push origin <pr-branch>
+```
+
+If a resolution is non-obvious or the diff is large, **stop and reassess** —
+`git merge --abort` returns you to a clean branch with nothing lost. A guessed
+conflict resolution that "compiles" is exactly the kind of plausible-but-wrong
+change the honest-gate rule forbids. When unsure whose intent wins, ask the PR
+author rather than choose for them.
 
 ### 5. Confirm the whole board, then hand back
 
@@ -189,6 +238,10 @@ not to widen the definition.
 - **Forward-merge, not rebase.** Merging `main` into a PR "adds a commit" and
   preserves the author's history; force-pushing a rebase rewrites work that may
   not be yours.
+- **Conflicts are resolved on purpose, never guessed (step 4a).** No blind
+  `-X ours`/`-X theirs`; keep *both* the fix's intent and the PR's; re-run the
+  exact CI command on the merged tree; `git merge --abort` and reassess (or
+  apply the fix directly in the PR's diff) when the resolution isn't obvious.
 - **One logical change per PR**, with the What / Test plan / Out of scope body.
 - **Minimal, intent-preserving fixes.** Prefer the smallest edit that satisfies
   the gate over a broad refactor; note anything larger as a follow-up.
