@@ -1437,10 +1437,7 @@ pub(crate) fn run_chat(
                         ];
                         if slash_body == "info" {
                             lines.push(format!("newt version: {VERSION}"));
-                            lines.push(format!(
-                                "active mode: {}",
-                                active_operating_mode.as_str()
-                            ));
+                            lines.push(format!("active mode: {}", active_operating_mode.as_str()));
                             lines.push(format!(
                                 "active posture: {}",
                                 active_posture.as_ref().map_or("off", |p| p.name.as_str())
