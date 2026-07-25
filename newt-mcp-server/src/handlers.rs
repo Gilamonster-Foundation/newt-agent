@@ -58,7 +58,7 @@ pub fn register_handlers(
         server,
         registry,
         router,
-        Arc::new(agent_bridle::registry()),
+        bridle_registry(),
         Arc::new(granted.caveats),
         toolset,
         persona_tools,
@@ -662,6 +662,21 @@ fn mcp_error_content(reason: &str) -> Value {
 }
 
 #[cfg(test)]
+fn bridle_registry() -> Arc<Registry> {
+    Arc::new(
+        Registry::builder()
+            .tool(Arc::new(agent_bridle::ShellTool::new()))
+            .tool(Arc::new(agent_bridle::WebFetchTool::new()))
+            .build(),
+    )
+}
+
+#[cfg(not(test))]
+fn bridle_registry() -> Arc<Registry> {
+    Arc::new(agent_bridle::registry())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -730,7 +745,7 @@ mod tests {
             &mut server,
             Arc::new(BackendRegistry::new()),
             Arc::new(Router::new()),
-            Arc::new(agent_bridle::registry()),
+            bridle_registry(),
             Arc::new(granted),
             toolset,
             persona_tools,

@@ -9120,6 +9120,29 @@ mod run_command_confinement_tests {
     use newt_core::agentic::execute_tool;
     use newt_core::caveats::{Caveats, CountBound, Scope};
 
+    // Only the `#[cfg(unix)]` confinement tests below construct this guard; on
+    // Windows those tests are gated out, so gate the guard too or it trips the
+    // `-D dead-code` clippy wall on the Windows CI job.
+    #[cfg(unix)]
+    struct ShellEngineGuard(Option<String>);
+    #[cfg(unix)]
+    impl ShellEngineGuard {
+        fn safe_subset() -> Self {
+            let previous = std::env::var("NEWT_SHELL_ENGINE").ok();
+            std::env::set_var("NEWT_SHELL_ENGINE", "safe-subset");
+            Self(previous)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for ShellEngineGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("NEWT_SHELL_ENGINE", value),
+                None => std::env::remove_var("NEWT_SHELL_ENGINE"),
+            }
+        }
+    }
+
     /// A `Caveats` granting exec for the given commands and full fs/read+write
     /// (so the test's own file-survival assertions are not themselves confined),
     /// otherwise read-only-ish. `exec` is `Scope::Only` of the named commands.
@@ -9143,7 +9166,8 @@ mod run_command_confinement_tests {
     #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn run_command_allowed_external_succeeds() {
-        let _env = crate::test_env_guard::env_read_guard_async().await;
+        let _env = crate::test_env_guard::env_write_guard_async().await;
+        let _engine = ShellEngineGuard::safe_subset();
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_exec_only(&["env"]);
         let args = serde_json::json!({ "command": "env" });
@@ -9187,7 +9211,8 @@ mod run_command_confinement_tests {
     #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn run_command_out_of_scope_is_denied() {
-        let _env = crate::test_env_guard::env_read_guard_async().await;
+        let _env = crate::test_env_guard::env_write_guard_async().await;
+        let _engine = ShellEngineGuard::safe_subset();
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_exec_only(&["echo"]);
         let args = serde_json::json!({ "command": "env" });
