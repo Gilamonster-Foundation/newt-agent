@@ -118,6 +118,7 @@ async fn run_scenario(
         code_search: None,
         where_is: None,
         nav: None,
+        exposure: Default::default(),
         experience_store: None,
         step_ledger: None,
         caveats: &caveats,

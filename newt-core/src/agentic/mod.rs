@@ -261,7 +261,7 @@ pub use tools::{
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
     filter_tools_for_disposition, full_access_requested, ocap_disabled, persona_tool_allowed,
     plan_phase_clamp, set_max_output_tokens, set_output_head_tokens, tool_allowed,
-    tool_definitions, venv_cmd_prefix,
+    tool_definitions, venv_cmd_prefix, ExposureSettings,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -304,6 +304,17 @@ fn tui_retry_policy() -> RetryPolicy {
 /// Tightest whole-request ceiling that carries authoritative semantics for
 /// this turn. A proven-good high-water mark by itself is deliberately not a
 /// ceiling; configured token thresholds and believed/declared windows are.
+/// The LIVE usable input budget (in estimated tokens) the tool-exposure
+/// controller sizes the schema set against — the initial send budget when known
+/// (derived from probed `max_ok_input` / `safe_context` / `num_ctx`), else the
+/// declared `safe_context`. `None` means no live signal: the controller then
+/// does NOT clip (no starvation without a measurement). Deliberately not a
+/// function of the model name (#TEC): a bigger probed window widens exposure
+/// automatically.
+fn exposure_budget_tokens(send_budget: Option<usize>, safe_context: Option<u32>) -> Option<usize> {
+    send_budget.or_else(|| safe_context.map(|s| s as usize))
+}
+
 fn authoritative_request_budget(
     send_budget: Option<usize>,
     send_budget_authoritative: bool,
@@ -551,6 +562,13 @@ pub struct ChatCtx<'a> {
     pub where_is: Option<&'a crate::where_is::WhereIsIndex>,
     /// #1387 Code Navigator tool context (usage/graph/project).
     pub nav: Option<crate::navigator::NavToolCtx<'a>>,
+    /// Tool-exposure controller policy (Pass 1). `Default` is
+    /// [`crate::agentic::tools::ExposureSettings::default`] =
+    /// `ExposureProfile::Full`, i.e. the identity controller (advertise the full
+    /// authorized catalog). Resolved by the TUI from `[tool_exposure]`; headless
+    /// / eval callers take the default. Budget-driven selection uses the LIVE
+    /// send budget (probed `safe_context`), never the model name.
+    pub exposure: crate::agentic::tools::ExposureSettings,
     /// Experiential store for the record/recall tools (Step 26.6a). `None` = the
     /// tools are not advertised (experiential off). Shared `&dyn` (interior mut).
     pub experience_store: Option<&'a dyn crate::agentic::experiential::ExperienceStore>,
@@ -1125,6 +1143,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         code_search,
         where_is,
         nav,
+        exposure,
         experience_store,
         step_ledger,
         caveats,
@@ -1313,6 +1332,19 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
     let tools = filter_tools_for_disposition(tools, prompt_disposition);
+    // #TEC Pass 1: the exposure stage. Clip the AUTHORIZED catalog to what the
+    // model's LIVE usable budget can afford (probed `safe_context` → send
+    // budget), never by model name. `ExposureProfile::Full` (the default) is
+    // identity, so this is bit-for-bit unchanged unless `[tool_exposure]` opts
+    // in. Applied before the token estimate so what we count equals what we
+    // send. Dispatch still authorizes on the full set — exposure ≠ authority.
+    let tools = crate::agentic::tools::select_exposed(
+        tools,
+        &exposure,
+        exposure_budget_tokens(send_budget, safe_context),
+        &std::collections::BTreeSet::new(),
+        estimation,
+    );
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
     // tool-schema overhead converts to real-token space once — the schema
@@ -4437,6 +4469,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         code_search,
         where_is,
         nav,
+        exposure,
         experience_store,
         step_ledger,
         caveats,
@@ -4595,6 +4628,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
     let tools = filter_tools_for_disposition(tools, prompt_disposition);
+    // #TEC Pass 1: exposure stage — clip the authorized catalog to the live
+    // usable budget (identity under `ExposureProfile::Full`). See the Ollama
+    // path for the full rationale.
+    let tools = crate::agentic::tools::select_exposed(
+        tools,
+        &exposure,
+        exposure_budget_tokens(send_budget, safe_context),
+        &std::collections::BTreeSet::new(),
+        estimation,
+    );
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
@@ -5726,6 +5769,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         code_search,
         where_is,
         nav,
+        exposure,
         experience_store,
         step_ledger,
         caveats,
@@ -5848,6 +5892,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // (Responses wire). No-op when `persona_tools` is `None`.
     let tools_chat = filter_advertised_tools(tools_chat, persona_tools);
     let tools_chat = filter_tools_for_disposition(tools_chat, prompt_disposition);
+    // #TEC Pass 1: exposure stage on the chat-shaped catalog before it is
+    // projected to Responses tools, so the estimate and the wire agree.
+    // Identity under `ExposureProfile::Full`. The send budget is computed just
+    // below on this wire, so derive the live budget inline here.
+    let tools_chat = crate::agentic::tools::select_exposed(
+        tools_chat,
+        &exposure,
+        exposure_budget_tokens(
+            initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct),
+            safe_context,
+        ),
+        &std::collections::BTreeSet::new(),
+        estimation,
+    );
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
     let cal = sanitize_estimate_ratio(estimate_ratio);
@@ -7368,6 +7426,7 @@ mod tool_round_cap_tests {
             code_search: None,
             where_is: None,
             nav: None,
+            exposure: Default::default(),
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -7541,6 +7600,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -7844,6 +7904,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -7938,6 +7999,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8541,6 +8603,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8647,6 +8710,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8762,6 +8826,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8889,6 +8954,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9008,6 +9074,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9169,6 +9236,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9339,6 +9407,7 @@ mod tool_round_cap_tests {
                 code_search: None,
                 where_is: None,
                 nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9475,6 +9544,7 @@ mod save_note_loop_tests {
             code_search: None,
             where_is: None,
             nav: None,
+            exposure: Default::default(),
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -9974,6 +10044,7 @@ mod compression_loop_tests {
             code_search: None,
             where_is: None,
             nav: None,
+            exposure: Default::default(),
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -11244,6 +11315,7 @@ mod observation_hook_tests {
             code_search: None,
             where_is: None,
             nav: None,
+            exposure: Default::default(),
             experience_store: None,
             step_ledger: None,
             caveats,

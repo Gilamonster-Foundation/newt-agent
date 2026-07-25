@@ -3910,6 +3910,14 @@ pub(crate) fn run_chat(
                                             files: Some(nav_session.files.as_slice()),
                                             status: Some(&index_status),
                                         }),
+                                        // #TEC Pass 1: resolve the tool-exposure
+                                        // controller policy from `[tool_exposure]`.
+                                        // Default `full` = identity (unchanged
+                                        // advertised catalog); `auto`/`minimal`
+                                        // size the schema set to the live budget.
+                                        exposure: newt_core::ExposureSettings::from(
+                                            cfg.tool_exposure(),
+                                        ),
                                         // Step 26.6a (#585): the experiential store
                                         // for record/recall — Some only when on.
                                         experience_store: experiential_on.then_some(

@@ -25,6 +25,7 @@ use output_budget::{
 pub use output_budget::{set_max_output_tokens, set_output_head_tokens};
 
 mod catalog;
+pub(crate) mod exposure;
 mod live_output;
 mod output_budget;
 use live_output::{LiveOutputRelay, LiveOutputSession};
@@ -47,6 +48,8 @@ pub use catalog::{
 use catalog::{
     levenshtein, nearest_tool_name, ALL_TOOL_NAMES, BASE_TOOL_NAMES, EXTENDED_TOOL_REGISTRY,
 };
+pub(crate) use exposure::select_exposed;
+pub use exposure::ExposureSettings;
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///

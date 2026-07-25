@@ -464,6 +464,10 @@ async fn run_one_turn(
         // it from the leaf's gather) — the where_is tool degrades honestly.
         where_is: None,
         nav: None,
+        // Headless driver: identity exposure (advertise the full authorized
+        // catalog, unchanged). The `[tool_exposure]` controller is a TUI-session
+        // concern; the driver keeps bit-for-bit behaviour.
+        exposure: crate::agentic::tools::ExposureSettings::default(),
         experience_store: None,
         step_ledger: None,
         caveats: &config.caveats,
