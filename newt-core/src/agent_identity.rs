@@ -219,6 +219,12 @@ pub struct AgentIdentity {
     /// address for `newt-agent[bot]`.
     pub email: String,
 
+    /// Optional model identifier used in the Co-authored-by header.
+    /// When set, the trailer reads `Co-Authored-By: name (model) <email>`.
+    /// When unset, the header omits the model parenthetical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
     /// Filesystem **path** to the agent's signing key PEM (tilde-expanded),
     /// the [`agent_mesh_protocol::UserKey`] that roots the §6 writer
     /// fingerprint and the mesh `AgentKey`. A **path**, never inline key
@@ -252,6 +258,7 @@ impl Default for AgentIdentity {
         Self {
             name: DEFAULT_AGENT_NAME.to_string(),
             email: DEFAULT_AGENT_EMAIL.to_string(),
+            model: None,
             signing_key: None,
             public_key: None,
             github_app: None,
@@ -410,9 +417,16 @@ impl AgentIdentity {
     }
 
     /// A `Co-Authored-By:` trailer line for commit messages.
+    ///
+    /// When `model` is `Some`, the header reads `Co-Authored-By: name (model)
+    /// <email>`; otherwise the header is `Co-Authored-By: name <email>`
+    /// (no model parenthetical).
     #[must_use]
     pub fn co_author_trailer(&self) -> String {
-        format!("Co-Authored-By: {} <{}>", self.name, self.email)
+        match &self.model {
+            Some(model) => format!("Co-Authored-By: {} ({}) <{}>", self.name, model, self.email),
+            None => format!("Co-Authored-By: {} <{}>", self.name, self.email),
+        }
     }
 
     /// The configured signing-key path, tilde-expanded. `None` when unset
@@ -496,6 +510,7 @@ mod tests {
         assert!(id.public_key.is_none());
         assert!(id.github_app.is_none());
         assert!(id.tokens.is_empty());
+        assert!(id.model.is_none());
     }
 
     #[test]
@@ -567,6 +582,18 @@ name = "custom[bot]"
         assert_eq!(
             id.co_author_trailer(),
             "Co-Authored-By: newt-agent[bot] <293447090+newt-agent[bot]@users.noreply.github.com>"
+        );
+    }
+
+    #[test]
+    fn co_author_trailer_with_model() {
+        let id = AgentIdentity {
+            model: Some("sakamakismile/Ornith-1.0-35B-NVFP4".to_string()),
+            ..AgentIdentity::default()
+        };
+        assert_eq!(
+            id.co_author_trailer(),
+            "Co-Authored-By: newt-agent[bot] (sakamakismile/Ornith-1.0-35B-NVFP4) <293447090+newt-agent[bot]@users.noreply.github.com>"
         );
     }
 
