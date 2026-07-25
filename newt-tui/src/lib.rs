@@ -8512,7 +8512,12 @@ mod run_command_confinement_tests {
     use newt_core::agentic::execute_tool;
     use newt_core::caveats::{Caveats, CountBound, Scope};
 
+    // Only the `#[cfg(unix)]` confinement tests below construct this guard; on
+    // Windows those tests are gated out, so gate the guard too or it trips the
+    // `-D dead-code` clippy wall on the Windows CI job.
+    #[cfg(unix)]
     struct ShellEngineGuard(Option<String>);
+    #[cfg(unix)]
     impl ShellEngineGuard {
         fn safe_subset() -> Self {
             let previous = std::env::var("NEWT_SHELL_ENGINE").ok();
@@ -8520,6 +8525,7 @@ mod run_command_confinement_tests {
             Self(previous)
         }
     }
+    #[cfg(unix)]
     impl Drop for ShellEngineGuard {
         fn drop(&mut self) {
             match self.0.take() {
