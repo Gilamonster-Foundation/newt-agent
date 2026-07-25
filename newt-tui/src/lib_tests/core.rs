@@ -459,6 +459,56 @@ fn spill_commands_parse_expected_forms() {
 }
 
 #[test]
+fn search_commands_parse_expected_forms() {
+    assert_eq!(
+        parse_search_command("/search").unwrap(),
+        SearchCommand::Help
+    );
+    assert_eq!(
+        parse_search_command("/search help").unwrap(),
+        SearchCommand::Help
+    );
+    assert_eq!(
+        parse_search_command("/search auth handshake").unwrap(),
+        SearchCommand::Query("auth handshake".into())
+    );
+    assert_eq!(
+        parse_search_command("/search preview").unwrap(),
+        SearchCommand::Preview(1)
+    );
+    assert_eq!(
+        parse_search_command("/search preview 3").unwrap(),
+        SearchCommand::Preview(3)
+    );
+    assert_eq!(
+        parse_search_command("/search model").unwrap(),
+        SearchCommand::Model
+    );
+    assert_eq!(
+        parse_search_command("/search rejects").unwrap(),
+        SearchCommand::Rejects
+    );
+    assert_eq!(
+        parse_search_command("/search pin 2").unwrap(),
+        SearchCommand::Pin(2)
+    );
+    assert_eq!(
+        parse_search_command("/search exclude 1").unwrap(),
+        SearchCommand::Exclude(1)
+    );
+    assert_eq!(
+        parse_search_command("/search status").unwrap(),
+        SearchCommand::Status
+    );
+    assert_eq!(
+        parse_search_command("/search clear").unwrap(),
+        SearchCommand::Clear
+    );
+    assert!(parse_search_command("/searching foo").is_err());
+    assert!(parse_search_command("/search pin").is_err());
+}
+
+#[test]
 fn spill_override_resolves_and_reports_live_capability() {
     assert_eq!(effective_spill_lines(3, None), 3);
     assert_eq!(effective_spill_lines(3, Some(7)), 7);

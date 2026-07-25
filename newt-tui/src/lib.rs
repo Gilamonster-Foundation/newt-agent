@@ -9,6 +9,7 @@ mod brand;
 mod chat;
 mod color;
 mod crew_form;
+mod navigator_cmds;
 // Danger-tiering for permission grants (facade P1b, §7-F3/F4): pure-data
 // classification of a `(capability, target)` grant into a `DangerTier`, read by
 // the permission prompt to show a system-computed blast-radius line and refuse a
@@ -801,6 +802,7 @@ pub(crate) enum OperatingMode {
     FullAuto,
 }
 
+#[allow(dead_code)]
 impl OperatingMode {
     fn from_keyword(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -6200,6 +6202,101 @@ fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
     }
 }
 
+/// #1387 Phase 1 — `/search` cockpit verbs (pure parse; chat owns execution).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchCommand {
+    /// Run a semantic query (the remainder of the line).
+    Query(String),
+    Preview(usize),
+    Model,
+    Rejects,
+    Pin(usize),
+    Exclude(usize),
+    Status,
+    Clear,
+    Help,
+}
+
+fn parse_search_command(input: &str) -> anyhow::Result<SearchCommand> {
+    let body = input.trim().trim_start_matches('/').trim();
+    let Some(rest) = body.strip_prefix("search") else {
+        anyhow::bail!("not a search command");
+    };
+    if !rest.is_empty()
+        && !rest
+            .chars()
+            .next()
+            .map(char::is_whitespace)
+            .unwrap_or(false)
+    {
+        anyhow::bail!("not a search command");
+    }
+    let arg = rest.trim();
+    if arg.is_empty() || matches!(arg, "help" | "--help" | "-h") {
+        return Ok(SearchCommand::Help);
+    }
+    let (verb, tail) = match arg.split_once(char::is_whitespace) {
+        Some((v, t)) => (v, t.trim()),
+        None => (arg, ""),
+    };
+    match verb {
+        "preview" => Ok(SearchCommand::Preview(if tail.is_empty() {
+            1
+        } else {
+            tail.parse()
+                .map_err(|_| anyhow::anyhow!("usage: /search preview [N]"))?
+        })),
+        "model" | "packet" => Ok(SearchCommand::Model),
+        "rejects" | "reject" | "ledger" => Ok(SearchCommand::Rejects),
+        "pin" => {
+            let n: usize = tail
+                .parse()
+                .map_err(|_| anyhow::anyhow!("usage: /search pin <N>"))?;
+            Ok(SearchCommand::Pin(n))
+        }
+        "exclude" | "x" => {
+            let n: usize = tail
+                .parse()
+                .map_err(|_| anyhow::anyhow!("usage: /search exclude <N>"))?;
+            Ok(SearchCommand::Exclude(n))
+        }
+        "status" => Ok(SearchCommand::Status),
+        "clear" => Ok(SearchCommand::Clear),
+        _ => Ok(SearchCommand::Query(arg.to_string())),
+    }
+}
+
+fn search_help_text() -> &'static str {
+    "/search <query>     — semantic search (shared with model code_search)\n\
+     /search preview [N] — preview hit N (default 1)\n\
+     /search model       — exact <code_evidence> packet the model would see\n\
+     /search rejects     — reject ledger (below top_k / budget / excluded)\n\
+     /search pin N       — pin hit N into the next inject + tool retrieve\n\
+     /search exclude N   — exclude hit N's path from automatic retrieval\n\
+     /search status      — index generation, completeness, git HEAD/dirty\n\
+     /search clear       — clear session pins/exclusions"
+}
+
+/// Best-effort HEAD + dirty bit for lightweight index status (#1387). Runtime
+/// glue (not unit-tier) — absence is reported honestly as unavailable.
+fn lightweight_git_meta(workspace: &str) -> (Option<String>, Option<bool>) {
+    let head = std::process::Command::new("git")
+        .args(["-C", workspace, "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let dirty = std::process::Command::new("git")
+        .args(["-C", workspace, "status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| !o.stdout.is_empty());
+    (head, dirty)
+}
+
 fn effective_spill_lines(configured: usize, session_override: Option<usize>) -> usize {
     session_override.unwrap_or(configured)
 }
@@ -8730,6 +8827,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
         "  /context compaction [headroom_aware|message_count|reset] - set this session's automatic-compaction trigger policy",
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
+        "  /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)",
         "  /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)",
@@ -8781,6 +8879,18 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  Esc                      - while the agent is working: interrupt the turn, back to your prompt",
         "  Up/Down                  - while a tool is active: scroll its retained output",
         "  Space/Enter              - while a tool is active: toggle ⧉ expand / ▣ collapse",
+        "  /search [query|preview|model|rejects|pin|exclude|status|clear] - #1387 semantic search cockpit",
+        "  /def <symbol>            - goto definition ([SYMBOL])",
+        "  /text <regex>            - lexical search ([LEXICAL])",
+        "  /uses <symbol>           - find references (usage index)",
+        "  /tests <symbol>          - related tests (heuristic)",
+        "  /map [unit]              - project map; optional expand unit",
+        "  /callers|/callees|/implementations|/hierarchy <sym> - GRAPH regex-floor",
+        "  /type <symbol>           - inspect_type (not typechecker-proved)",
+        "  /impact <unit>           - outbound/reverse deps (+ optional lcov)",
+        "  /retrieval [turn N] [human|model|diff] - retrieval ledger",
+        "  /compare semantic lexical | turn A B | index - compare retrieval",
+        "  /export json|markdown    - export retrieval ledger",
         "  /exit  /quit  exit  quit - leave the session",
         "",
         "  Add --help (or -h) to any command — or /help <command> — for its detail page.",
@@ -11238,6 +11348,7 @@ mod tool_round_cap_tests {
                     scratchpad_store: None,
                     code_search: None,
                     where_is: None,
+                    nav: None,
                     experience_store: None,
                     step_ledger: None,
                     caveats: &caveats,

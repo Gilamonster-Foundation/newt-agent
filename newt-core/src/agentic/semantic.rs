@@ -432,52 +432,398 @@ const DEF_BOOST: f32 = 0.05;
 /// A chunk whose file path contains a query term is nudged up.
 const PATH_BOOST: f32 = 0.05;
 
-/// Re-score cosine `hits` with cheap, deterministic boosts (Step 26.5.6): a
-/// definition beats a raw window, and a file path matching a query term gets a
-/// nudge — then a STABLE re-sort by `(cosine + boost)` descending. The boosts
-/// are small, so they only reorder near-ties; with no boost applicable the
-/// cosine order is preserved bit-for-bit (a stable sort on already-cosine-sorted
-/// input). Pure + deterministic — no clock, no allocation beyond the term split.
-fn rerank(query: &str, hits: &mut [(f32, CodeChunk)]) {
-    let terms: Vec<String> = query
+/// Evidence provenance label (#1387). Semantic similarity is never structural
+/// proof — callers must surface the kind to both human and model consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Lexical,
+    Symbol,
+    Graph,
+    Semantic,
+    Curated,
+}
+
+impl EvidenceKind {
+    /// Bracket label for human/model surfaces (`[SEMANTIC]`, …).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lexical => "[LEXICAL]",
+            Self::Symbol => "[SYMBOL]",
+            Self::Graph => "[GRAPH]",
+            Self::Semantic => "[SEMANTIC]",
+            Self::Curated => "[CURATED]",
+        }
+    }
+}
+
+/// One ranked retrieval candidate with decomposed scores (#1387 Phase 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankedHit {
+    pub chunk: CodeChunk,
+    pub kind: EvidenceKind,
+    pub cosine: f32,
+    pub def_boost: f32,
+    pub path_boost: f32,
+    pub final_score: f32,
+}
+
+impl RankedHit {
+    /// Stable location key (`file:start-end`) for pin/exclude identity.
+    #[must_use]
+    pub fn loc_key(&self) -> String {
+        format!(
+            "{}:{}-{}",
+            self.chunk.file, self.chunk.start_line, self.chunk.end_line
+        )
+    }
+}
+
+/// Why a candidate did not enter the model-facing evidence packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectReason {
+    /// Ranked below the selected top_k.
+    BelowTopK,
+    /// Did not fit the `<code_evidence>` char budget.
+    BudgetExhausted,
+    /// Operator (or path) exclusion.
+    Excluded,
+}
+
+/// Structured retrieval outcome — string render is a view over this (#1387).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalResult {
+    pub hits: Vec<RankedHit>,
+    pub rejected: Vec<(RankedHit, RejectReason)>,
+    /// Cosine candidates considered before top_k / budget cuts.
+    pub candidates: usize,
+    /// `true` iff the gather recorded no cuts (`GatherManifest.cuts` empty).
+    pub complete: bool,
+    /// Lightweight index identity (`genN:<hash-prefix>`).
+    pub index_id: String,
+    pub warnings: Vec<String>,
+}
+
+/// Session-scoped operator steering for retrieval (#1387). Cleared on `/new`.
+#[derive(Debug, Clone, Default)]
+pub struct RetrievalSteer {
+    /// Hits forced into the next evidence packet (by loc key).
+    pub pinned: Vec<RankedHit>,
+    /// Path prefixes excluded from automatic retrieval.
+    pub excluded_paths: Vec<String>,
+}
+
+impl RetrievalSteer {
+    pub fn clear(&mut self) {
+        self.pinned.clear();
+        self.excluded_paths.clear();
+    }
+
+    /// True when `path` matches an exclusion (exact or prefix `excl/` / `excl`).
+    #[must_use]
+    pub fn is_excluded(&self, path: &str) -> bool {
+        self.excluded_paths
+            .iter()
+            .any(|ex| path_is_excluded(path, ex))
+    }
+
+    pub fn pin(&mut self, hit: RankedHit) {
+        let key = hit.loc_key();
+        self.pinned.retain(|h| h.loc_key() != key);
+        self.pinned.push(hit);
+    }
+
+    pub fn exclude_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if !self.excluded_paths.iter().any(|p| p == &path) {
+            self.excluded_paths.push(path);
+        }
+        let excluded = self.excluded_paths.clone();
+        self.pinned.retain(|h| {
+            !excluded
+                .iter()
+                .any(|ex| path_is_excluded(&h.chunk.file, ex))
+        });
+    }
+}
+
+fn path_is_excluded(path: &str, ex: &str) -> bool {
+    path == ex || path.starts_with(&format!("{ex}/")) || path.starts_with(&format!("{ex}\\"))
+}
+
+/// Lightweight session index status (#1387) — not the durable `#1282` index.
+#[derive(Debug, Clone, Default)]
+pub struct IndexStatus {
+    /// Bumped each time this session re-indexes.
+    pub generation: u64,
+    pub manifest: Option<GatherManifest>,
+    pub git_head: Option<String>,
+    pub dirty: Option<bool>,
+}
+
+impl IndexStatus {
+    #[must_use]
+    pub fn index_id(&self) -> String {
+        match &self.manifest {
+            Some(m) if m.candidate_hash.len() >= 8 => {
+                format!("gen{}:{}", self.generation, &m.candidate_hash[..8])
+            }
+            Some(m) => format!("gen{}:{}", self.generation, m.candidate_hash),
+            None => format!("gen{}", self.generation),
+        }
+    }
+
+    /// Completeness from the gather: no cuts ⇒ complete.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.manifest
+            .as_ref()
+            .map(|m| m.cuts.is_empty())
+            .unwrap_or(true)
+    }
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    query
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.len() >= 3)
         .map(str::to_lowercase)
-        .collect();
-    let boost = |chunk: &CodeChunk| -> f32 {
-        let mut b = 0.0;
-        if chunk.kind != "window" {
-            b += DEF_BOOST;
-        }
-        let file_lc = chunk.file.to_lowercase();
-        if terms.iter().any(|t| file_lc.contains(t.as_str())) {
-            b += PATH_BOOST;
-        }
-        b
+        .collect()
+}
+
+fn boosts_for(terms: &[String], chunk: &CodeChunk) -> (f32, f32) {
+    let def_boost = if chunk.kind != "window" {
+        DEF_BOOST
+    } else {
+        0.0
     };
-    hits.sort_by(|a, b| {
-        let sb = b.0 + boost(&b.1);
-        let sa = a.0 + boost(&a.1);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    let file_lc = chunk.file.to_lowercase();
+    let path_boost = if terms.iter().any(|t| file_lc.contains(t.as_str())) {
+        PATH_BOOST
+    } else {
+        0.0
+    };
+    (def_boost, path_boost)
+}
+
+/// Turn cosine hits into [`RankedHit`]s with decomposed boosts, sorted by
+/// `final_score` descending (stable on ties).
+fn rank_hits(query: &str, hits: Vec<(f32, CodeChunk)>) -> Vec<RankedHit> {
+    let terms = query_terms(query);
+    let mut ranked: Vec<RankedHit> = hits
+        .into_iter()
+        .map(|(cosine, chunk)| {
+            let (def_boost, path_boost) = boosts_for(&terms, &chunk);
+            RankedHit {
+                chunk,
+                kind: EvidenceKind::Semantic,
+                cosine,
+                def_boost,
+                path_boost,
+                final_score: cosine + def_boost + path_boost,
+            }
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
+    ranked
+}
+
+/// Re-score cosine `hits` with cheap, deterministic boosts (Step 26.5.6).
+/// Test/legacy adapter over [`rank_hits`].
+#[cfg(test)]
+fn rerank(query: &str, hits: &mut [(f32, CodeChunk)]) {
+    let ranked = rank_hits(query, hits.to_vec());
+    for (slot, hit) in hits.iter_mut().zip(ranked) {
+        *slot = (hit.cosine, hit.chunk);
+    }
+}
+
+fn format_hit_piece(hit: &RankedHit) -> String {
+    format!(
+        "// {} {}:{}-{} ({}, score {:.2})\n{}\n\n",
+        hit.kind.label(),
+        hit.chunk.file,
+        hit.chunk.start_line,
+        hit.chunk.end_line,
+        hit.chunk.kind,
+        hit.final_score,
+        hit.chunk.text
+    )
+}
+
+const SEMANTIC_EVIDENCE_NOTE: &str =
+    "// NOTE: SEMANTIC evidence is embedding similarity — not proof of a \
+         call, reference, implementation, or reachability relationship.\n";
+
+/// Apply the char budget to `selected`, moving overflow into `rejected` as
+/// [`RejectReason::BudgetExhausted`]. Returns the hits that fit.
+fn apply_budget(
+    selected: Vec<RankedHit>,
+    rejected: &mut Vec<(RankedHit, RejectReason)>,
+    total_cap: usize,
+) -> Vec<RankedHit> {
+    let mut kept = Vec::new();
+    let mut body_chars = "<code_evidence>\n".chars().count()
+        + SEMANTIC_EVIDENCE_NOTE.chars().count()
+        + "</code_evidence>".chars().count();
+    let mut budget_hit = false;
+    for hit in selected {
+        let piece_chars = format_hit_piece(&hit).chars().count();
+        if budget_hit || body_chars + piece_chars > total_cap {
+            rejected.push((hit, RejectReason::BudgetExhausted));
+            budget_hit = true;
+            continue;
+        }
+        body_chars += piece_chars;
+        kept.push(hit);
+    }
+    kept
+}
+
+/// Render a `<code_evidence>` block from a structured [`RetrievalResult`].
+/// `None` when there are no selected hits (OFF/empty bit-for-bit guarantee).
+pub fn render_code_evidence(result: &RetrievalResult) -> Option<String> {
+    if result.hits.is_empty() {
+        return None;
+    }
+    let mut body = String::from("<code_evidence>\n");
+    body.push_str(SEMANTIC_EVIDENCE_NOTE);
+    for hit in &result.hits {
+        body.push_str(&format_hit_piece(hit));
+    }
+    body.push_str("</code_evidence>");
+    Some(body)
+}
+
+/// Structured retrieval (#1387 Phase 1): embed → over-fetch → rank with
+/// boosts → apply pin/exclude → top_k + budget. `None` when the query can't
+/// embed or the index has nothing to score.
+pub async fn retrieve_ranked(
+    query: &str,
+    embedder: &dyn Embedder,
+    index: &dyn SemanticIndex,
+    top_k: usize,
+    steer: Option<&RetrievalSteer>,
+    status: Option<&IndexStatus>,
+) -> Option<RetrievalResult> {
+    retrieve_ranked_with_cap(
+        query,
+        embedder,
+        index,
+        top_k,
+        CODE_EVIDENCE_CAP,
+        steer,
+        status,
+    )
+    .await
+}
+
+/// Like [`retrieve_ranked`] with an explicit char budget (tests + tooling).
+pub async fn retrieve_ranked_with_cap(
+    query: &str,
+    embedder: &dyn Embedder,
+    index: &dyn SemanticIndex,
+    top_k: usize,
+    total_cap: usize,
+    steer: Option<&RetrievalSteer>,
+    status: Option<&IndexStatus>,
+) -> Option<RetrievalResult> {
+    let qv = embedder.embed(query).await.ok()?;
+    let raw = index.search(&qv, top_k.saturating_mul(RERANK_OVERFETCH).max(top_k));
+    if raw.is_empty() && steer.map(|s| s.pinned.is_empty()).unwrap_or(true) {
+        return None;
+    }
+    let candidates = raw.len();
+    let ranked = rank_hits(query, raw);
+    let mut rejected = Vec::new();
+    let mut eligible = Vec::new();
+    for hit in ranked {
+        if steer.is_some_and(|s| s.is_excluded(&hit.chunk.file)) {
+            rejected.push((hit, RejectReason::Excluded));
+        } else {
+            eligible.push(hit);
+        }
+    }
+
+    // Automatic top_k by score, then force-union operator pins.
+    let mut selected: Vec<RankedHit> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for hit in eligible {
+        let key = hit.loc_key();
+        if selected.len() < top_k {
+            seen.insert(key);
+            selected.push(hit);
+        } else {
+            rejected.push((hit, RejectReason::BelowTopK));
+        }
+    }
+    if let Some(steer) = steer {
+        for pin in steer.pinned.iter().rev() {
+            if steer.is_excluded(&pin.chunk.file) {
+                continue;
+            }
+            let key = pin.loc_key();
+            if seen.insert(key.clone()) {
+                // Pinned hits are forced in even when they missed top_k.
+                rejected.retain(|(h, _)| h.loc_key() != key);
+                selected.insert(0, pin.clone());
+            }
+        }
+    }
+
+    let hits = apply_budget(selected, &mut rejected, total_cap);
+    let complete = status.map(IndexStatus::complete).unwrap_or(true);
+    let index_id = status
+        .map(IndexStatus::index_id)
+        .unwrap_or_else(|| "gen0".to_string());
+    let mut warnings = Vec::new();
+    if !complete {
+        warnings.push("index incomplete: gather caps cut one or more candidate files".to_string());
+    }
+    warnings.push(
+        "results are SEMANTIC evidence (embedding similarity), not structural proof".to_string(),
+    );
+    Some(RetrievalResult {
+        hits,
+        rejected,
+        candidates,
+        complete,
+        index_id,
+        warnings,
+    })
 }
 
 /// Retrieve a reranked `<code_evidence>` block for `query` (Step 26.5.4 +
-/// 26.5.6): embed the query, over-fetch cosine candidates, rerank with the cheap
-/// structural boosts, take the top_k, render. `None` when the query can't embed,
-/// the index is empty, or nothing matches — so an absent embedding model is a
-/// silent no-op, not a turn failure.
+/// 26.5.6 + #1387): thin wrapper over [`retrieve_ranked`] →
+/// [`render_code_evidence`]. `None` when the query can't embed, the index is
+/// empty, or nothing matches — so an absent embedding model is a silent no-op,
+/// not a turn failure.
 pub async fn retrieve_evidence(
     query: &str,
     embedder: &dyn Embedder,
     index: &dyn SemanticIndex,
     top_k: usize,
 ) -> Option<String> {
-    let qv = embedder.embed(query).await.ok()?;
-    let mut hits = index.search(&qv, top_k.saturating_mul(RERANK_OVERFETCH));
-    rerank(query, &mut hits);
-    hits.truncate(top_k);
-    render_hits(&hits, CODE_EVIDENCE_CAP)
+    retrieve_evidence_steered(query, embedder, index, top_k, None, None).await
+}
+
+/// Like [`retrieve_evidence`] with session pin/exclude + index status (#1387).
+pub async fn retrieve_evidence_steered(
+    query: &str,
+    embedder: &dyn Embedder,
+    index: &dyn SemanticIndex,
+    top_k: usize,
+    steer: Option<&RetrievalSteer>,
+    status: Option<&IndexStatus>,
+) -> Option<String> {
+    let result = retrieve_ranked(query, embedder, index, top_k, steer, status).await?;
+    render_code_evidence(&result)
 }
 
 /// Walk `workspace` for indexable code files (Step 26.5.4) — gitignore-aware,
@@ -666,12 +1012,15 @@ pub fn gather_code_files(workspace: &str, extensions: &[String]) -> Vec<(String,
 
 /// The semantic searcher handed to the `code_search` tool (Step 26.5.5): an
 /// embedder + the session index + the default top_k, bundled into ONE `ChatCtx`
-/// field (both members are shared refs, so this is `Copy`).
+/// field (both members are shared refs, so this is `Copy`). Optional steer /
+/// index status (#1387) apply the same pin/exclude + completeness as auto-inject.
 #[derive(Clone, Copy)]
 pub struct CodeSearch<'a> {
     pub embedder: &'a dyn Embedder,
     pub index: &'a dyn SemanticIndex,
     pub top_k: usize,
+    pub steer: Option<&'a RetrievalSteer>,
+    pub status: Option<&'a IndexStatus>,
 }
 
 /// The `code_search` tool definition (Step 26.5.5) — advertised only when the
@@ -685,7 +1034,9 @@ pub fn code_search_tool_definition() -> serde_json::Value {
                             (semantic/embedding search, not keyword) — use it to find where \
                             something is implemented when you don't have a file path, e.g. \
                             'where is the retry backoff computed'. Returns the top matching \
-                            code chunks with their file:line; then read_file the ones you need.",
+                            code chunks with their file:line; then read_file the ones you need. \
+                            Results are SEMANTIC evidence (similarity), not proof of calls, \
+                            references, or implementations.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -697,8 +1048,8 @@ pub fn code_search_tool_definition() -> serde_json::Value {
     })
 }
 
-/// Execute a `code_search` call (Step 26.5.5): embed the query, search the
-/// index, return the matching `<code_evidence>` (or a labelled no-match).
+/// Execute a `code_search` call (Step 26.5.5 / #1387): structured retrieve →
+/// render the matching `<code_evidence>` (or a labelled no-match).
 pub(crate) async fn execute_code_search(
     args: &serde_json::Value,
     search: CodeSearch<'_>,
@@ -709,12 +1060,153 @@ pub(crate) async fn execute_code_search(
     if query.is_empty() {
         return "error: code_search requires a non-empty `query`".to_string();
     }
-    let out = match retrieve_evidence(query, search.embedder, search.index, search.top_k).await {
+    match retrieve_evidence_steered(
+        query,
+        search.embedder,
+        search.index,
+        search.top_k,
+        search.steer,
+        search.status,
+    )
+    .await
+    {
         Some(block) => block,
         None => "no code matched — the semantic index may be empty or the embedding model \
                  unavailable; use read_file/find if you already know the path"
             .to_string(),
-    };
+    }
+}
+
+/// Human-facing ranked list for `/search` (#1387).
+#[must_use]
+pub fn format_search_hits(result: &RetrievalResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "semantic search — {} candidate(s) → {} shown, {} rejected  [{}] complete={}  {}\n",
+        result.candidates,
+        result.hits.len(),
+        result.rejected.len(),
+        result.index_id,
+        result.complete,
+        EvidenceKind::Semantic.label(),
+    ));
+    for (i, hit) in result.hits.iter().enumerate() {
+        out.push_str(&format!(
+            "  {:>2}. {:.3}  {}:{}-{}  {}  cosine={:.3} def={:+.2} path={:+.2}\n",
+            i + 1,
+            hit.final_score,
+            hit.chunk.file,
+            hit.chunk.start_line,
+            hit.chunk.end_line,
+            hit.kind.label(),
+            hit.cosine,
+            hit.def_boost,
+            hit.path_boost,
+        ));
+    }
+    if result.hits.is_empty() {
+        out.push_str("  (no hits)\n");
+    }
+    for w in &result.warnings {
+        out.push_str(&format!("  warning: {w}\n"));
+    }
+    out.push_str(
+        "  /search preview N · /search model · /search rejects · /search pin N · /search exclude N · /search status\n",
+    );
+    out
+}
+
+/// Source preview for hit `n` (1-based).
+#[must_use]
+pub fn format_search_preview(result: &RetrievalResult, n: usize) -> String {
+    match result.hits.get(n.saturating_sub(1)) {
+        Some(hit) => format!(
+            "preview [{n}] {} {}:{}-{}\n{}\n",
+            hit.kind.label(),
+            hit.chunk.file,
+            hit.chunk.start_line,
+            hit.chunk.end_line,
+            hit.chunk.text
+        ),
+        None => format!(
+            "no hit #{n} — run /search <query> first, or pick 1..{}\n",
+            result.hits.len()
+        ),
+    }
+}
+
+/// Reject ledger for `/search rejects`.
+#[must_use]
+pub fn format_search_rejects(result: &RetrievalResult) -> String {
+    let mut out = String::from("reject ledger:\n");
+    if result.rejected.is_empty() {
+        out.push_str("  (none)\n");
+        return out;
+    }
+    for (hit, reason) in &result.rejected {
+        out.push_str(&format!(
+            "  {:.3}  {}:{}-{}  {:?}  {}\n",
+            hit.final_score,
+            hit.chunk.file,
+            hit.chunk.start_line,
+            hit.chunk.end_line,
+            reason,
+            hit.kind.label(),
+        ));
+    }
+    out
+}
+
+/// Model view — the exact `<code_evidence>` packet that would be injected.
+#[must_use]
+pub fn format_search_model(result: &RetrievalResult) -> String {
+    render_code_evidence(result)
+        .unwrap_or_else(|| "(no selected hits — empty model packet)\n".into())
+}
+
+/// Index status lines for `/search status`.
+#[must_use]
+pub fn format_index_status(status: &IndexStatus, steer: &RetrievalSteer) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("index_id: {}\n", status.index_id()));
+    out.push_str(&format!("generation: {}\n", status.generation));
+    out.push_str(&format!("complete: {}\n", status.complete()));
+    match &status.manifest {
+        Some(m) => {
+            out.push_str(&format!(
+                "gather: {} candidate(s), {} cut(s), hash {}\n",
+                m.candidate_count,
+                m.cuts.len(),
+                m.candidate_hash
+            ));
+            if !m.cuts.is_empty() {
+                for (dir, n) in m.cut_rollup() {
+                    out.push_str(&format!("  cut rollup: {dir} × {n}\n"));
+                }
+            }
+        }
+        None => out.push_str("gather: (not yet indexed this session)\n"),
+    }
+    match (&status.git_head, status.dirty) {
+        (Some(h), Some(d)) => out.push_str(&format!(
+            "git HEAD: {}  dirty: {}\n",
+            &h[..h.len().min(12)],
+            if d { "yes" } else { "no" }
+        )),
+        (Some(h), None) => out.push_str(&format!("git HEAD: {}\n", &h[..h.len().min(12)])),
+        _ => out.push_str("git: (unavailable)\n"),
+    }
+    out.push_str(&format!(
+        "steering: {} pinned, {} excluded path(s)\n",
+        steer.pinned.len(),
+        steer.excluded_paths.len()
+    ));
+    for p in &steer.pinned {
+        out.push_str(&format!("  pin {}\n", p.loc_key()));
+    }
+    for p in &steer.excluded_paths {
+        out.push_str(&format!("  exclude {p}\n"));
+    }
     out
 }
 
@@ -1321,6 +1813,8 @@ class Dog:
             embedder: &MockEmbedder,
             index: &idx,
             top_k: 1,
+            steer: None,
+            status: None,
         };
         // a query → the matching <code_evidence>
         let out =
@@ -1341,6 +1835,8 @@ class Dog:
             embedder: &MockEmbedder,
             index: &empty,
             top_k: 1,
+            steer: None,
+            status: None,
         };
         assert!(
             execute_code_search(&serde_json::json!({"query": "x"}), s2, false, 20)
@@ -1399,5 +1895,365 @@ class Dog:
         ];
         rerank("zz", &mut hits);
         assert_eq!(hits[0].1.file, "first.rs", "stable: ties keep input order");
+    }
+
+    // --- #1387 Phase 1: structured RetrievalResult --------------------------
+
+    fn hit(file: &str, kind: &str, cosine: f32) -> RankedHit {
+        let chunk = CodeChunk {
+            file: file.to_string(),
+            start_line: 1,
+            end_line: 2,
+            kind: kind.to_string(),
+            text: format!("body of {file}"),
+        };
+        let (def_boost, path_boost) = boosts_for(&[], &chunk);
+        RankedHit {
+            chunk,
+            kind: EvidenceKind::Semantic,
+            cosine,
+            def_boost,
+            path_boost,
+            final_score: cosine + def_boost + path_boost,
+        }
+    }
+
+    #[test]
+    fn ranked_hits_decompose_cosine_and_boosts() {
+        let ranked = rank_hits(
+            "retry backoff",
+            vec![
+                (
+                    0.50,
+                    CodeChunk {
+                        file: "other.rs".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        kind: "window".into(),
+                        text: "x".into(),
+                    },
+                ),
+                (
+                    0.48,
+                    CodeChunk {
+                        file: "retry.rs".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        kind: "function".into(),
+                        text: "fn retry() {}".into(),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(ranked[0].chunk.file, "retry.rs");
+        assert!(ranked[0].def_boost > 0.0, "def boost applied");
+        assert!(ranked[0].path_boost > 0.0, "path boost applied");
+        assert!(
+            (ranked[0].final_score
+                - (ranked[0].cosine + ranked[0].def_boost + ranked[0].path_boost))
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(ranked[0].kind, EvidenceKind::Semantic);
+    }
+
+    #[test]
+    fn apply_budget_rejects_overflow_as_budget_exhausted() {
+        let selected = vec![hit("a.rs", "function", 0.9), hit("b.rs", "function", 0.8)];
+        let mut rejected = Vec::new();
+        // Tiny cap: only the wrapper fits → both hits budget-rejected.
+        let kept = apply_budget(selected, &mut rejected, 40);
+        assert!(kept.is_empty());
+        assert_eq!(rejected.len(), 2);
+        assert!(rejected
+            .iter()
+            .all(|(_, r)| *r == RejectReason::BudgetExhausted));
+    }
+
+    #[test]
+    fn index_status_complete_follows_gather_cuts() {
+        let mut status = IndexStatus {
+            generation: 2,
+            manifest: Some(GatherManifest {
+                candidate_count: 3,
+                candidate_hash: "abcd1234ffff".into(),
+                max_files: 2,
+                max_bytes: 100,
+                cuts: vec![Cut {
+                    path: "z.rs".into(),
+                    class: CutClass::OverFileCap,
+                }],
+            }),
+            git_head: Some("deadbeefcafe".into()),
+            dirty: Some(true),
+        };
+        assert!(!status.complete());
+        assert_eq!(status.index_id(), "gen2:abcd1234");
+        status.manifest.as_mut().unwrap().cuts.clear();
+        assert!(status.complete());
+    }
+
+    #[test]
+    fn pin_exclude_filters_shape_retrieval_result() {
+        let mut steer = RetrievalSteer::default();
+        let pinned = hit("keep.rs", "function", 0.1);
+        steer.pin(pinned.clone());
+        steer.exclude_path("skip.rs");
+        assert!(steer.is_excluded("skip.rs"));
+        assert!(steer.is_excluded("skip.rs/nested.rs"));
+        assert!(!steer.is_excluded("keep.rs"));
+
+        let mut rejected = Vec::new();
+        let eligible = vec![
+            hit("skip.rs", "function", 0.99),
+            hit("keep.rs", "function", 0.50),
+            hit("other.rs", "window", 0.40),
+        ];
+        // Simulate the filter + top_k=1 + pin union used by retrieve_ranked.
+        let mut selected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for h in eligible {
+            if steer.is_excluded(&h.chunk.file) {
+                rejected.push((h, RejectReason::Excluded));
+            } else if selected.is_empty() {
+                seen.insert(h.loc_key());
+                selected.push(h);
+            } else {
+                rejected.push((h, RejectReason::BelowTopK));
+            }
+        }
+        for pin in steer.pinned.iter().rev() {
+            let key = pin.loc_key();
+            if seen.insert(key.clone()) {
+                rejected.retain(|(h, _)| h.loc_key() != key);
+                selected.insert(0, pin.clone());
+            }
+        }
+        assert!(rejected
+            .iter()
+            .any(|(h, r)| h.chunk.file == "skip.rs" && *r == RejectReason::Excluded));
+        assert!(selected.iter().any(|h| h.chunk.file == "keep.rs"));
+    }
+
+    #[test]
+    fn render_code_evidence_compatible_with_legacy_packet_shape() {
+        let result = RetrievalResult {
+            hits: vec![hit("src/lib.rs", "function", 0.9)],
+            rejected: vec![],
+            candidates: 1,
+            complete: true,
+            index_id: "gen1:abcd1234".into(),
+            warnings: vec![],
+        };
+        let block = render_code_evidence(&result).unwrap();
+        assert!(block.starts_with("<code_evidence>\n"));
+        assert!(block.ends_with("</code_evidence>"));
+        assert!(block.contains("src/lib.rs:1-2"), "{block}");
+        assert!(block.contains("[SEMANTIC]"), "{block}");
+        assert!(
+            block.contains("not proof"),
+            "semantic honesty note: {block}"
+        );
+        assert!(render_code_evidence(&RetrievalResult {
+            hits: vec![],
+            rejected: vec![],
+            candidates: 0,
+            complete: true,
+            index_id: "gen0".into(),
+            warnings: vec![],
+        })
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn retrieve_ranked_reports_completeness_and_exclusions() {
+        let files = vec![
+            ("keep.rs".to_string(), "fn keep_me() {}".to_string()),
+            ("skip.rs".to_string(), "fn skip_me() {}".to_string()),
+        ];
+        let idx = SessionSemanticIndex::default();
+        index_files(&files, &MockEmbedder, &idx, crate::OnEmbedFailure::Disable).await;
+        let status = IndexStatus {
+            generation: 1,
+            manifest: Some(GatherManifest {
+                candidate_count: 2,
+                candidate_hash: "ffffffff".into(),
+                max_files: 400,
+                max_bytes: 200_000,
+                cuts: vec![],
+            }),
+            git_head: None,
+            dirty: None,
+        };
+        let mut steer = RetrievalSteer::default();
+        steer.exclude_path("skip.rs");
+        let result = retrieve_ranked("keep", &MockEmbedder, &idx, 5, Some(&steer), Some(&status))
+            .await
+            .unwrap();
+        assert!(result.complete);
+        assert_eq!(result.index_id, "gen1:ffffffff");
+        assert!(result
+            .rejected
+            .iter()
+            .any(|(h, r)| h.chunk.file.contains("skip") && *r == RejectReason::Excluded));
+        assert!(result.hits.iter().all(|h| !h.chunk.file.contains("skip")));
+        let rendered = render_code_evidence(&result).unwrap();
+        assert!(rendered.contains("<code_evidence>"));
+    }
+
+    fn sample_chunk(file: &str, kind: &str, text: &str) -> CodeChunk {
+        CodeChunk {
+            file: file.to_string(),
+            start_line: 1,
+            end_line: 2,
+            kind: kind.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieve_ranked_decomposes_scores_and_rejects() {
+        let files = vec![
+            (
+                "retry.rs".to_string(),
+                "fn retry_backoff() { /* aaaaa */ }\n".to_string(),
+            ),
+            ("other.rs".to_string(), "fn unrelated() {}\n".to_string()),
+        ];
+        let idx = SessionSemanticIndex::default();
+        index_files(&files, &MockEmbedder, &idx, crate::OnEmbedFailure::Disable).await;
+        let status = IndexStatus {
+            generation: 2,
+            manifest: Some(GatherManifest {
+                candidate_count: 2,
+                candidate_hash: "abcdef0123456789".into(),
+                max_files: 400,
+                max_bytes: 200_000,
+                cuts: vec![],
+            }),
+            git_head: None,
+            dirty: None,
+        };
+        let result = retrieve_ranked("aaaaa retry", &MockEmbedder, &idx, 1, None, Some(&status))
+            .await
+            .expect("hits");
+        assert!(result.complete);
+        assert!(result.index_id.starts_with("gen2:"));
+        assert!(!result.hits.is_empty());
+        assert_eq!(result.hits[0].kind, EvidenceKind::Semantic);
+        assert!(result.hits[0].final_score >= result.hits[0].cosine);
+        // BelowTopK rejects when over-fetched
+        assert!(
+            result
+                .rejected
+                .iter()
+                .any(|(_, r)| *r == RejectReason::BelowTopK)
+                || result.candidates <= 1,
+            "expected BelowTopK or single candidate: {:?}",
+            result.rejected
+        );
+        let rendered = render_code_evidence(&result).unwrap();
+        assert!(rendered.contains("[SEMANTIC]"));
+        assert!(rendered.contains("<code_evidence>"));
+    }
+
+    #[tokio::test]
+    async fn retrieve_ranked_pin_exclude_and_budget() {
+        let files = vec![
+            ("keep/a.rs".to_string(), "fn aaa() {}\n".to_string()),
+            ("skip/b.rs".to_string(), "fn aaa_bbb() {}\n".to_string()),
+        ];
+        let idx = SessionSemanticIndex::default();
+        index_files(&files, &MockEmbedder, &idx, crate::OnEmbedFailure::Disable).await;
+        let mut steer = RetrievalSteer::default();
+        steer.exclude_path("skip");
+        let status = IndexStatus {
+            generation: 1,
+            manifest: Some(GatherManifest {
+                candidate_count: 99,
+                candidate_hash: "deadbeef".into(),
+                max_files: 400,
+                max_bytes: 200_000,
+                cuts: vec![Cut {
+                    path: "big.rs".into(),
+                    class: CutClass::TooLarge,
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(!status.complete());
+        let result = retrieve_ranked_with_cap(
+            "aaa",
+            &MockEmbedder,
+            &idx,
+            5,
+            80, // tiny budget → BudgetExhausted
+            Some(&steer),
+            Some(&status),
+        )
+        .await
+        .expect("some result");
+        assert!(!result.complete);
+        assert!(
+            result
+                .rejected
+                .iter()
+                .any(|(_, r)| *r == RejectReason::Excluded)
+                || result
+                    .hits
+                    .iter()
+                    .all(|h| !h.chunk.file.starts_with("skip")),
+            "exclude should filter skip/: {result:?}"
+        );
+        // Pin a hit and ensure it appears
+        if let Some(hit) = result.hits.first().cloned() {
+            steer.pin(hit.clone());
+            let pinned =
+                retrieve_ranked("aaa", &MockEmbedder, &idx, 1, Some(&steer), Some(&status))
+                    .await
+                    .unwrap();
+            assert!(pinned.hits.iter().any(|h| h.loc_key() == hit.loc_key()));
+        }
+    }
+
+    #[test]
+    fn format_search_surfaces_include_kind_labels() {
+        let result = RetrievalResult {
+            hits: vec![RankedHit {
+                chunk: sample_chunk("a.rs", "function", "fn a() {}"),
+                kind: EvidenceKind::Semantic,
+                cosine: 0.5,
+                def_boost: 0.05,
+                path_boost: 0.0,
+                final_score: 0.55,
+            }],
+            rejected: vec![(
+                RankedHit {
+                    chunk: sample_chunk("b.rs", "window", "x"),
+                    kind: EvidenceKind::Semantic,
+                    cosine: 0.1,
+                    def_boost: 0.0,
+                    path_boost: 0.0,
+                    final_score: 0.1,
+                },
+                RejectReason::BelowTopK,
+            )],
+            candidates: 2,
+            complete: false,
+            index_id: "gen1:abcd".into(),
+            warnings: vec!["incomplete".into()],
+        };
+        let hits = format_search_hits(&result);
+        assert!(hits.contains("[SEMANTIC]"));
+        assert!(hits.contains("complete=false"));
+        assert!(format_search_rejects(&result).contains("BelowTopK"));
+        assert!(format_search_preview(&result, 1).contains("fn a()"));
+        assert!(format_search_model(&result).contains("<code_evidence>"));
+        let status = IndexStatus {
+            generation: 1,
+            manifest: None,
+            ..Default::default()
+        };
+        assert!(format_index_status(&status, &RetrievalSteer::default()).contains("index_id:"));
     }
 }

@@ -777,6 +777,59 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
         definition: crate::where_is::where_is_tool_definition,
         gate: Gate::Always,
     },
+    // #1387 Code Navigator — narrow structural/lexical tools (Always; degrade
+    // honestly when session indexes are absent). code_search / where_is keep
+    // their existing names for compatibility.
+    ToolSpec {
+        name: "goto_definition",
+        definition: crate::navigator::goto_definition_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "text_search",
+        definition: crate::navigator::text_search_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_references",
+        definition: crate::navigator::find_references_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_tests",
+        definition: crate::navigator::find_tests_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_callers",
+        definition: crate::navigator::find_callers_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_callees",
+        definition: crate::navigator::find_callees_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_implementations",
+        definition: crate::navigator::find_implementations_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_hierarchy",
+        definition: crate::navigator::find_hierarchy_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "inspect_type",
+        definition: crate::navigator::inspect_type_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "impact",
+        definition: crate::navigator::impact_tool_definition,
+        gate: Gate::Always,
+    },
     ToolSpec {
         name: "experience_record",
         definition: super::super::experiential::experience_record_tool_definition,
