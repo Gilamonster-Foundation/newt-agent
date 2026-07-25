@@ -27,6 +27,7 @@
 //! deliberately stays in `lib.rs` next to the session state it floors.
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use crate::danger;
 use crate::mint_operating_key;
@@ -530,6 +531,10 @@ pub(crate) struct PromptPermissionGate<'a, F: FnMut(&PromptWindow, &str) -> Prom
     pub(crate) danger: danger::DangerTable,
     pub(crate) color: bool,
     pub(crate) verbose: bool,
+    /// Bound the web-decision wait below the store's five-minute TTL. Tests
+    /// inject a short duration so the timeout path is exercised without a
+    /// multi-minute test.
+    pub(crate) web_decision_timeout: Duration,
     pub(crate) ask_human: F,
 }
 
@@ -620,10 +625,33 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> PromptPermissionGate<'_, F> 
             self.verbose,
         ))
         .ok();
+        let deadline = Instant::now() + self.web_decision_timeout;
         loop {
             match store.take_permission_decision(&self.conversation_id, &request_id) {
                 Ok(Some(verdict)) => return verdict_to_choice(verdict),
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Ok(None) if Instant::now() >= deadline => {
+                    // Resolve through the same CAS as a TTY answer. If a web
+                    // answer won the race, consume that verdict; otherwise
+                    // the timeout is a fail-closed denial.
+                    match store.resolve_permission_request(
+                        &self.conversation_id,
+                        &request_id,
+                        "expired",
+                    ) {
+                        Ok(true) => return PromptChoice::Deny,
+                        Ok(false) => match store
+                            .take_permission_decision(&self.conversation_id, &request_id)
+                        {
+                            Ok(Some(verdict)) => return verdict_to_choice(verdict),
+                            Ok(None) | Err(_) => return PromptChoice::Deny,
+                        },
+                        Err(_) => return PromptChoice::Deny,
+                    }
+                }
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(remaining.min(Duration::from_millis(200)));
+                }
                 Err(_) => return PromptChoice::Deny,
             }
         }
@@ -1004,6 +1032,7 @@ mod permission_prompt_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            web_decision_timeout: Duration::from_secs(2),
             // Proof the TTY is bypassed when web decisions are on.
             ask_human: |_w: &PromptWindow, _p: &str| {
                 panic!("the TTY must not be read when web decisions are enabled")
@@ -1015,6 +1044,40 @@ mod permission_prompt_tests {
             matches!(decision, newt_core::PermissionDecision::Allow(_)),
             "a web allow-once verdict must produce Allow"
         );
+    }
+
+    #[test]
+    fn web_decision_timeout_resolves_and_denies_without_hanging() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("s", None).unwrap();
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let mut gate = PromptPermissionGate {
+            state: &mut state,
+            base: Caveats::default(),
+            key_path: None,
+            conversation_id: conv.clone(),
+            log_path: None,
+            denials_path: None,
+            config_path: None,
+            preset_clamp: None,
+            danger: danger::DangerTable::builtin(),
+            color: false,
+            verbose: false,
+            web_decision_timeout: Duration::from_millis(50),
+            ask_human: |_w: &PromptWindow, _p: &str| {
+                panic!("the TTY must not be read when web decisions are enabled")
+            },
+        };
+        let started = Instant::now();
+        let decision = gate.ask(&[exec_request("bash")]);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+        assert_eq!(store.pending_permission_request(&conv).unwrap(), None);
     }
 
     /// A gate whose "human" is a script of choices; counts every prompt.
@@ -1039,6 +1102,7 @@ mod permission_prompt_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            web_decision_timeout: Duration::from_secs(2),
             ask_human: move |_w: &PromptWindow, _prompt: &str| {
                 prompts.set(prompts.get() + 1);
                 script.next().expect("script exhausted — unexpected prompt")
@@ -1071,6 +1135,7 @@ mod permission_prompt_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            web_decision_timeout: Duration::from_secs(2),
             ask_human: move |_w: &PromptWindow, _prompt: &str| {
                 prompts.set(prompts.get() + 1);
                 script.next().expect("script exhausted — unexpected prompt")
@@ -1456,6 +1521,7 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
+                web_decision_timeout: Duration::from_secs(2),
                 ask_human: move |_w: &PromptWindow, _p: &str| {
                     script.next().expect("script exhausted")
                 },
@@ -1490,6 +1556,7 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
+                web_decision_timeout: Duration::from_secs(2),
                 ask_human: |_w: &PromptWindow, _p: &str| {
                     panic!("must NOT prompt: target was permanently denied")
                 },
@@ -1576,6 +1643,7 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
+                web_decision_timeout: Duration::from_secs(2),
                 ask_human: move |_w: &PromptWindow, _p: &str| {
                     script.next().expect("script exhausted")
                 },

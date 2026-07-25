@@ -1640,9 +1640,10 @@ impl ConversationStore {
     ) -> anyhow::Result<bool> {
         let conn = self.lock_conn();
         let changed = conn.execute(
-            "UPDATE permission_requests SET resolved = 1, answered_by = ?3
-              WHERE request_id = ?1 AND conversation_id = ?2 AND resolved = 0",
-            rusqlite::params![request_id, conversation_id, by],
+            "UPDATE permission_requests SET resolved = 1, answered_by = ?4
+              WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3
+                AND resolved = 0 AND verdict IS NULL",
+            rusqlite::params![request_id, conversation_id, self.workspace_id, by],
         )?;
         Ok(changed == 1)
     }
@@ -5314,15 +5315,53 @@ mod tests {
             "no web verdict applies once the TTY resolved it"
         );
 
-        // request_id binding: a verdict for r3 never resolves r4.
+        // A resolver from another workspace cannot consume this request, and
+        // a resolver cannot overwrite the web attribution after the web has
+        // recorded its verdict but before the gate takes it.
+        let ws_b = tempfile::tempdir().unwrap();
+        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
         let r3 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
-        let r4 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
-        store
-            .answer_permission_request(&conv, &r3, Verdict::AllowOnce)
+        assert!(
+            !store_b
+                .resolve_permission_request(&conv, &r3, "expired")
+                .unwrap(),
+            "a cross-workspace resolver must not win"
+        );
+        assert_eq!(
+            store
+                .answer_permission_request(&conv, &r3, Verdict::AllowOnce)
+                .unwrap(),
+            AnswerOutcome::Answered
+        );
+        let answered_by: String = store
+            .lock_conn()
+            .query_row(
+                "SELECT answered_by FROM permission_requests WHERE request_id = ?1",
+                [&r3],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(store.take_permission_decision(&conv, &r4).unwrap(), None);
+        assert_eq!(answered_by, "web");
+        assert!(
+            !store
+                .resolve_permission_request(&conv, &r3, "expired")
+                .unwrap(),
+            "timeout must not clobber a recorded web answer"
+        );
         assert_eq!(
             store.take_permission_decision(&conv, &r3).unwrap(),
+            Some(Verdict::AllowOnce)
+        );
+
+        // request_id binding: a verdict for r4 never resolves r5.
+        let r4 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
+        let r5 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
+        store
+            .answer_permission_request(&conv, &r4, Verdict::AllowOnce)
+            .unwrap();
+        assert_eq!(store.take_permission_decision(&conv, &r5).unwrap(), None);
+        assert_eq!(
+            store.take_permission_decision(&conv, &r4).unwrap(),
             Some(Verdict::AllowOnce)
         );
 
