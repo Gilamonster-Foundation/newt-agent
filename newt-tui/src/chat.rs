@@ -2473,8 +2473,8 @@ pub(crate) fn run_chat(
                             "/roadmap show".to_string()
                         } else if slash_body == "plan" {
                             "/roadmap".to_string()
-                        } else if slash_body.starts_with("plan ") {
-                            format!("/roadmap {}", &slash_body["plan ".len()..])
+                        } else if let Some(rest) = slash_body.strip_prefix("plan ") {
+                            format!("/roadmap {rest}")
                         } else {
                             task.clone()
                         };
