@@ -329,28 +329,45 @@ fn bridle_registry(
             Arc::new(tool)
         }
         crate::ShellEngine::Brush => {
-            // The carried brush engine (agent-bridle 0.7): in-process bash + the
-            // L2 CommandInterceptor. The cross-platform engine — and on Windows
-            // the ONLY full-grammar option, since `host` needs `/bin/sh`.
-            #[cfg(windows)]
-            {
-                use std::sync::Once;
-                static WARN: Once = Once::new();
-                WARN.call_once(|| {
-                    tracing::warn!(
-                        "using the 'brush' shell engine on Windows: run_command runs a \
+            // Cargo's library-test harness is not the `newt` executable and
+            // therefore cannot service bridle's worker re-exec handshake
+            // (`--agent-bridle-worker brush`). Keep unit tests on the same
+            // confined Tool contract without attempting to re-exec the test
+            // harness; the real binary path remains Brush unchanged.
+            #[cfg(test)]
+            let shell = {
+                let mut tool = agent_bridle::ShellTool::new();
+                if let Some(observer) = live {
+                    tool = tool.with_output_observer(observer);
+                }
+                Arc::new(tool) as Arc<dyn agent_bridle::Tool>
+            };
+            #[cfg(not(test))]
+            let shell = {
+                // The carried brush engine (agent-bridle 0.7): in-process bash + the
+                // L2 CommandInterceptor. The cross-platform engine — and on Windows
+                // the ONLY full-grammar option, since `host` needs `/bin/sh`.
+                #[cfg(windows)]
+                {
+                    use std::sync::Once;
+                    static WARN: Once = Once::new();
+                    WARN.call_once(|| {
+                        tracing::warn!(
+                            "using the 'brush' shell engine on Windows: run_command runs a \
                          bash-in-Rust shell for internal-tooling compatibility. Native \
                          PowerShell/cmd code paths are a FUTURE release — not written yet \
                          (we are opinionated Linux developers who occasionally use a \
                          MacBook). Bash-isms work; Windows-native shell semantics do not."
-                    );
-                });
-            }
-            let mut tool = agent_bridle::BrushShellTool::new();
-            if let Some(observer) = live {
-                tool = tool.with_output_observer(observer);
-            }
-            Arc::new(tool)
+                        );
+                    });
+                }
+                let mut tool = agent_bridle::BrushShellTool::new();
+                if let Some(observer) = live {
+                    tool = tool.with_output_observer(observer);
+                }
+                Arc::new(tool) as Arc<dyn agent_bridle::Tool>
+            };
+            shell
         }
     };
     agent_bridle::Registry::builder()
@@ -9527,6 +9544,10 @@ mod execute_tool_branch_tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
+        let _l = super::disable_ocap_tests::env_lock().await;
+        // Pin the engine for deterministic permission-retry behavior when the
+        // workspace suite runs tests concurrently with ambient shell settings.
+        let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         #[derive(Default)]
         struct LifecycleOutput(std::sync::Mutex<Vec<String>>);
         impl crate::agentic::LiveToolOutput for LifecycleOutput {
@@ -10042,22 +10063,22 @@ mod disable_ocap_tests {
     /// across the parallel test runner. Async-aware (tokio) so the guard may
     /// be held across the `execute_tool` awaits; no poisoning — the `EnvVar`
     /// guards below restore the environment even on panic.
-    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-    async fn env_lock() -> MutexGuard<'static, ()> {
+    pub(crate) async fn env_lock() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().await
     }
 
     /// RAII env override: set/unset `key` for the test body, restore the
     /// previous value on drop — including on a failed assertion, so yolo can
     /// never leak into a neighboring test.
-    struct EnvVar {
+    pub(crate) struct EnvVar {
         key: &'static str,
         saved: Option<String>,
     }
 
     impl EnvVar {
-        fn set(key: &'static str, value: &str) -> Self {
+        pub(crate) fn set(key: &'static str, value: &str) -> Self {
             let saved = std::env::var(key).ok();
             std::env::set_var(key, value);
             Self { key, saved }
