@@ -3240,6 +3240,7 @@ pub(crate) fn run_chat(
                             danger: production_danger_table(),
                             color,
                             verbose,
+                            web_decision_timeout: std::time::Duration::from_secs(4 * 60),
                             ask_human: prompt_permission_choice
                                 as fn(&newt_core::tty::PromptWindow, &str) -> PromptChoice,
                         });

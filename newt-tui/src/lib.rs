@@ -9123,6 +9123,7 @@ mod disable_ocap_session_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            web_decision_timeout: std::time::Duration::from_secs(2),
             ask_human: |_w: &newt_core::tty::PromptWindow, _prompt: &str| PromptChoice::AllowOnce,
         };
 
@@ -9170,6 +9171,7 @@ mod disable_ocap_session_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            web_decision_timeout: std::time::Duration::from_secs(2),
             ask_human: |_w: &newt_core::tty::PromptWindow, _prompt: &str| PromptChoice::AllowOnce,
         };
         let out = execute_tool(

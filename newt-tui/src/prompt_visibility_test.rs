@@ -144,6 +144,7 @@ fn prompt_scenario_child() {
             danger: danger::DangerTable::builtin(),
             color: true,
             verbose: false,
+            web_decision_timeout: std::time::Duration::from_secs(2),
             ask_human: prompt_permission_choice,
         };
         let _decision = gate.ask(std::slice::from_ref(&request));
