@@ -162,6 +162,8 @@ async fn run_scenario(
         live_tool_output: None,
         git_tool: None,
         crew_runner: None,
+        operating_mode_control: None,
+        plan_mode_control: None,
     };
     c.end_reason = Some(&mut end_reason);
     let (reply, _streamed, _usage, hallucinations) = chat_complete(c, &mut NoMcp)

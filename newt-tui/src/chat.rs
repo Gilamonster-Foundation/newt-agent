@@ -499,10 +499,15 @@ pub(crate) fn run_chat(
     apply_openai_api_env(choice.api);
     let key_path = newt_identity::default_key_path().ok();
     let mut cap = SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace);
-    // #307: the active `/mode` preset clamp (an authority FLOOR), if any. `None`
-    // ⇒ no mode active ⇒ effective authority is the session base, exactly as
-    // before. Set by `/mode <name>`; lives for the rest of the session.
-    let mut active_mode: Option<ActiveMode> = None;
+    // Session working style. This never grants authority; plan/diagnose only
+    // narrow the existing prompt-disposition and caveat boundaries.
+    let mut active_operating_mode = OperatingMode::Chat;
+    // Model-selected working style while the human leaves `/mode auto`
+    // active. Bound to the requesting conversation and never authority.
+    let conversation_mode_states = ConversationModeStates::default();
+    // #307: the active `/posture` preset clamp (an authority FLOOR), if any.
+    // It persists across conversations for the life of this process.
+    let mut active_posture: Option<ActivePosture> = None;
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
     let mut markdown_override: Option<bool> = None;
@@ -1024,6 +1029,7 @@ pub(crate) fn run_chat(
             scratchpad: &scratchpad_store as &dyn newt_core::ScratchpadStore,
             step_ledger: &step_ledger as &dyn newt_core::StepLedger,
             active_prompt_context: &mut active_prompt_context,
+            mode_states: &conversation_mode_states,
         };
         match &session_start {
             // NEWT_CONVERSATION_ID: an explicit override — errors are hard
@@ -1077,12 +1083,16 @@ pub(crate) fn run_chat(
                     color,
                     verbose,
                 );
+                let mut reset_ctx = ConversationResetContext {
+                    memory: &mut memory,
+                    system: &mut system,
+                    conversation_id: &mut active_conversation_id,
+                    mode_states: &conversation_mode_states,
+                };
                 handle_new_conversation(
                     workspace,
-                    &mut memory,
-                    &mut system,
                     active_persona.as_ref(),
-                    &mut active_conversation_id,
+                    &mut reset_ctx,
                     &mut compress_state,
                     &mut session_opted_fresh,
                 );
@@ -1417,8 +1427,8 @@ pub(crate) fn run_chat(
                             &permission_state,
                             prompt_permissions_enabled,
                             permission_log_path.as_deref(),
-                            // #307: surface the active mode's preset clamp.
-                            active_mode.as_ref(),
+                            // #307: surface the active posture's preset clamp.
+                            active_posture.as_ref(),
                         )
                         .into_iter();
                         if let Some(first) = lines.next() {
@@ -1430,17 +1440,25 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
-                    // #307: `/mode <name>` — atomically preload a skill body,
+                    // #307: `/posture <name>` — atomically preload a skill body,
                     // apply a named permission preset (an authority floor), and
-                    // inject a one-line system-prompt framing. All three or none.
-                    let slash_mode = task.trim_start_matches('/');
-                    if slash_mode == "mode" || slash_mode.starts_with("mode ") {
-                        let arg = slash_mode.strip_prefix("mode").unwrap_or("").trim();
-                        handle_mode_command(
+                    // carry its guidance into each live turn. All three or none.
+                    let slash_command = task.trim_start_matches('/');
+                    if slash_command == "posture" || slash_command.starts_with("posture ") {
+                        let arg = slash_command.strip_prefix("posture").unwrap_or("").trim();
+                        handle_posture_command(arg, &cfg, &mut active_posture, color, verbose);
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // Operating modes guide how the harness works; they do not
+                    // alter the authority posture above.
+                    if slash_command == "mode" || slash_command.starts_with("mode ") {
+                        let arg = slash_command.strip_prefix("mode").unwrap_or("").trim();
+                        handle_operating_mode_command(
                             arg,
-                            &cfg,
-                            &mut active_mode,
-                            &mut system,
+                            &mut active_operating_mode,
+                            &conversation_mode_states,
                             color,
                             verbose,
                         );
@@ -1963,12 +1981,16 @@ pub(crate) fn run_chat(
                             let _ = store.release(&outgoing_id);
                         }
                         turns_this_conversation = 0;
+                        let mut reset_ctx = ConversationResetContext {
+                            memory: &mut memory,
+                            system: &mut system,
+                            conversation_id: &mut active_conversation_id,
+                            mode_states: &conversation_mode_states,
+                        };
                         let started = handle_new_conversation(
                             workspace,
-                            &mut memory,
-                            &mut system,
                             active_persona.as_ref(),
-                            &mut active_conversation_id,
+                            &mut reset_ctx,
                             &mut compress_state,
                             &mut session_opted_fresh,
                         );
@@ -2109,6 +2131,7 @@ pub(crate) fn run_chat(
                                         as &dyn newt_core::ScratchpadStore,
                                     step_ledger: &step_ledger as &dyn newt_core::StepLedger,
                                     active_prompt_context: &mut active_prompt_context,
+                                    mode_states: &conversation_mode_states,
                                 };
                                 match handle_conversation_command(&task, &mut conversation_ctx) {
                                     Ok(msg) => print_newt(&msg, color, verbose),
@@ -2260,6 +2283,7 @@ pub(crate) fn run_chat(
                                                         as &dyn newt_core::StepLedger,
                                                     active_prompt_context:
                                                         &mut active_prompt_context,
+                                                    mode_states: &conversation_mode_states,
                                                 };
                                                 match resume_session_conversation(
                                                     &mut resume_ctx,
@@ -2385,6 +2409,7 @@ pub(crate) fn run_chat(
                                                                 as &dyn newt_core::StepLedger,
                                                             active_prompt_context:
                                                                 &mut active_prompt_context,
+                                                            mode_states: &conversation_mode_states,
                                                         };
                                                         match resume_session_conversation(
                                                             &mut ctx, &target,
@@ -2457,14 +2482,18 @@ pub(crate) fn run_chat(
                         // plan path follows (issue #220).
                         let persona_name_before = active_persona.as_ref().map(|p| p.name.clone());
                         let conversation_id_before = active_conversation_id.clone();
+                        let mut reset_ctx = ConversationResetContext {
+                            memory: &mut memory,
+                            system: &mut system,
+                            conversation_id: &mut active_conversation_id,
+                            mode_states: &conversation_mode_states,
+                        };
                         match handle_persona_command(
                             &task,
                             workspace,
                             &persona_store,
-                            &mut memory,
-                            &mut system,
                             &mut active_persona,
-                            &mut active_conversation_id,
+                            &mut reset_ctx,
                         ) {
                             Ok(msg) => print_newt(&msg, color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
@@ -2662,7 +2691,7 @@ pub(crate) fn run_chat(
                         .as_ref()
                         .map(newt_core::IntakeConfig::to_lexicon)
                         .unwrap_or_default();
-                    let prompt_intake = if is_clarification_answer {
+                    let mut prompt_intake = if is_clarification_answer {
                         pending_clarification
                             .as_ref()
                             .map(|pending| pending.intake.resolve_with_operator_answer(&task))
@@ -2675,6 +2704,28 @@ pub(crate) fn run_chat(
                     } else {
                         newt_core::agentic::PromptIntake::analyze_with(&task, &intake_lexicon)
                     };
+                    // A model-selected Auto style is a one-shot instruction
+                    // for the next action-shaped turn. Protected intake does
+                    // not consume it; it remains pending until an Act turn or
+                    // an explicit conversation/mode boundary clears it.
+                    let plan_mode_active = conversation_mode_states.plan.is_active();
+                    let auto_selected = (active_operating_mode == OperatingMode::Auto
+                        && !plan_mode_active
+                        && prompt_intake.disposition()
+                            == newt_core::agentic::PromptDisposition::Act)
+                        .then(|| {
+                            conversation_mode_states
+                                .auto
+                                .take_for(&active_conversation_id)
+                        })
+                        .flatten();
+                    let turn_operating_mode = effective_operating_mode(
+                        active_operating_mode,
+                        &prompt_intake,
+                        plan_mode_active,
+                        auto_selected,
+                    );
+                    apply_operating_mode_to_intake(turn_operating_mode, &mut prompt_intake);
 
                     // The manifest artifact deliberately contains only bounded
                     // counts and digests. It is written before an Ask handoff
@@ -2876,6 +2927,7 @@ pub(crate) fn run_chat(
                     // is safe.
                     // Step 26.3/26.4: resolve the per-turn feature set once (used
                     // for the <state> injection here and the ChatCtx fields below).
+                    let turn_disposition = prompt_intake.disposition();
                     let turn_features = context_features(
                         &cfg,
                         context_manager(&cfg, context_manager_override),
@@ -2885,8 +2937,13 @@ pub(crate) fn run_chat(
                     let tool_offload_on = turn_features.tool_offload;
                     let scratchpad_on = turn_features.scratchpad;
                     let semantic_on = turn_features.semantic;
+                    let session_controls = session_control_prompt(
+                        active_operating_mode,
+                        turn_operating_mode,
+                        active_posture.as_ref(),
+                    );
                     let mut turn_system = format!(
-                        "{}\n\n{}\n{system}",
+                        "{}\n\n{}\n\n{system}\n\n{session_controls}",
                         workspace_state_block(workspace),
                         runtime_context_block(&inf_model, &inf_url, inf_kind)
                     );
@@ -3177,25 +3234,20 @@ pub(crate) fn run_chat(
                     let mut turn_phantom_reaches: Vec<newt_core::PhantomReach> = Vec::new();
                     let mut turn_end_reason: Option<newt_core::TurnEndReason> = None;
                     // #307: the EFFECTIVE caveats for this turn — the session
-                    // base intersected with the active mode's preset clamp (a
-                    // FLOOR). This single `meet` is what the gate base, the
+                    // base intersected with the active posture's preset clamp
+                    // (a FLOOR). This single `meet` is what the gate base, the
                     // ChatCtx dispatch, and (via the preset clamp + exec_floor)
                     // the --disable-ocap bypass all enforce, so authority can
-                    // never exceed the preset. With no mode it is the base
+                    // never exceed the preset. With no posture it is the base
                     // unchanged. Computed once so all three consult one value.
                     let mut turn_caveats = meet_persona_caveats(
-                        effective_caveats(cap.caveats(), active_mode.as_ref()),
+                        effective_caveats(cap.caveats(), active_posture.as_ref()),
                         active_persona.as_ref(),
                     );
-                    // #1193: in the read-only PLAN phase, MEET the read-only
-                    // clamp so writes/exec are DENIED while the model plans —
-                    // the design's safety guarantee, not the model's good
-                    // intentions. `meet` only narrows, so this can never widen
-                    // the session grant; exit_plan_mode drops the flag and the
-                    // next turn returns to the base authority.
-                    if newt_core::agentic::in_plan_phase() {
-                        turn_caveats = turn_caveats.meet(&newt_core::agentic::plan_phase_clamp());
-                    }
+                    // The effective turn mode includes both `/mode` and any
+                    // model-entered legacy plan phase, so one clamp keeps the
+                    // prompt card, catalog, and authority boundary aligned.
+                    turn_caveats = operating_mode_caveats(turn_operating_mode, turn_caveats);
                     // FR-1 part 2 (#997): the active persona's tool allow-list
                     // (its `tools:` front-matter). Threaded into `ChatCtx` so the
                     // loop advertises ONLY these tools and the executor refuses
@@ -3206,18 +3258,20 @@ pub(crate) fn run_chat(
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());
-                    // The active preset clamp threaded to the gate (re-clamps
-                    // any session grant); `None` when no mode is active.
-                    let preset_clamp = active_mode.as_ref().map(|m| m.clamp.clone());
+                    // The active posture's optional clamp is threaded to the
+                    // gate (re-clamps any session grant). A skill/framing-only
+                    // compatibility binding is genuinely `None` here.
+                    let preset_clamp = active_posture
+                        .as_ref()
+                        .and_then(ActivePosture::permission_clamp)
+                        .cloned();
                     // #774 (P0): the exec FLOOR threaded to the bypass is the
                     // operator's `[tui.permissions]` exec clamp — a NON-OPTIONAL
-                    // floor enforced even with no active `/mode`. `turn_caveats.exec`
-                    // is the base clamp already met with the mode (meet-only), so
-                    // `/mode` only tightens it. `None` only when exec is
-                    // unrestricted AND no mode is active. Before #774 this was
-                    // sourced from the mode alone, so a configured clamp imposed
-                    // no floor without a `/mode` (design-review F1).
-                    let exec_floor = exec_floor_from(&turn_caveats.exec, active_mode.is_some());
+                    // floor enforced even with no active `/posture`.
+                    // `turn_caveats.exec` is the base clamp already met with the
+                    // posture preset (meet-only), so `/posture` only tightens
+                    // it when a permission floor is actually configured.
+                    let exec_floor = exec_floor_from(&turn_caveats.exec, preset_clamp.is_some());
                     // Prompted ocap grants (issue #263): only an interactive
                     // session constructs a gate — headless paths (ACP worker,
                     // newt-eval) never reach this code, so a denial there can
@@ -3341,6 +3395,16 @@ pub(crate) fn run_chat(
                             newt_core::build_where_is_index_from_workspace(workspace)
                         }));
                     }
+                    // The core sees this collaborator only in human-selected
+                    // Auto. It is bound to this conversation and any model
+                    // selection takes effect on a later outer turn.
+                    let turn_auto_mode_control =
+                        conversation_mode_states.auto.bind(&active_conversation_id);
+                    let operating_mode_control = (active_operating_mode == OperatingMode::Auto)
+                        .then_some(
+                            &turn_auto_mode_control
+                                as &dyn newt_core::agentic::OperatingModeControl,
+                        );
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -3400,7 +3464,7 @@ pub(crate) fn run_chat(
                                             .then_some(&step_ledger as &dyn newt_core::StepLedger),
                                         // #307: the clamped effective caveats (base ∩
                                         // preset). Identical to `cap.caveats()` when no
-                                        // mode is active.
+                                        // posture is active.
                                         caveats: &turn_caveats,
                                         persona_tools,
                                         max_tool_rounds: eff_max_tool_rounds,
@@ -3408,7 +3472,7 @@ pub(crate) fn run_chat(
                                         // #1162: the /nudge dial — env set by the
                                         // /nudge command; off = no action-pressure.
                                         action_nudges: !nudges_off,
-                                        prompt_disposition: prompt_intake.disposition(),
+                                        prompt_disposition: turn_disposition,
                                         prompt_intake: Some(&prompt_intake),
                                         workflow_grace_rounds: eff_workflow_grace_rounds,
                                         tool_output_lines: tool_output_lines(&cfg),
@@ -3480,7 +3544,7 @@ pub(crate) fn run_chat(
                                             .clamp(1, 50),
                                         // #307: the active preset's exec floor — the
                                         // ceiling the --disable-ocap bypass cannot
-                                        // cross. None when no mode is active.
+                                        // cross. None when no posture is active.
                                         exec_floor: exec_floor.as_ref(),
                                         // retry technique: the per-turn write ledger (Some
                                         // only under a `retry` profile). The write tools
@@ -3505,6 +3569,11 @@ pub(crate) fn run_chat(
                                         // the binary (newt-cli) — advertises + dispatches
                                         // the `/team` tools when present.
                                         crew_runner,
+                                        operating_mode_control,
+                                        plan_mode_control: Some(
+                                            &conversation_mode_states.plan
+                                                as &dyn newt_core::agentic::PlanModeControl,
+                                        ),
                                     },
                                     active_prompt_context.as_ref(),
                                     prompt_source,

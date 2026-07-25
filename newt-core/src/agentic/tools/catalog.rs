@@ -303,6 +303,9 @@ pub(crate) fn merged_tool_definitions(
     with_code_search: bool,
     with_experiential: bool,
     with_scheduled: bool,
+    with_operating_mode_control: bool,
+    with_plan_mode_control: bool,
+    with_plan_mode_active: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -330,6 +333,9 @@ pub(crate) fn merged_tool_definitions(
             with_code_search,
             with_experiential,
             with_scheduled,
+            with_operating_mode_control,
+            with_plan_mode_control,
+            with_plan_mode_active,
         ) {
             defs.push((spec.definition)());
         }
@@ -338,15 +344,17 @@ pub(crate) fn merged_tool_definitions(
     serde_json::Value::Array(defs)
 }
 
-/// The always-on infra tools ([`Gate::Always`] in [`EXTENDED_TOOL_REGISTRY`]:
-/// resume_context / prompt_read / artifact_read / tool_search /
-/// get_context_remaining / request_user_input / lifecycle). The loop depends
-/// on these every round, so a persona allow-list can NEVER fence them off —
-/// they ride every session regardless of `tools:`.
-fn is_always_on_tool(name: &str) -> bool {
-    EXTENDED_TOOL_REGISTRY
-        .iter()
-        .any(|spec| spec.gate == Gate::Always && spec.name == name)
+/// Tools a persona allow-list cannot fence off: always-on loop infrastructure
+/// plus the presence-gated operating/Plan mode controls. These are session
+/// controls, not task authority; hiding an exit could strand the session in a
+/// read-only style, while exposing them still cannot widen human authority.
+fn is_persona_unfenceable_tool(name: &str) -> bool {
+    EXTENDED_TOOL_REGISTRY.iter().any(|spec| {
+        matches!(
+            spec.gate,
+            Gate::Always | Gate::OperatingMode | Gate::PlanMode | Gate::ScheduledPlanMode
+        ) && spec.name == name
+    })
 }
 
 /// FR-1 part 2 (#997): is `name` callable under a persona whose `tools:`
@@ -360,7 +368,7 @@ fn is_always_on_tool(name: &str) -> bool {
 /// (`newt-mcp-server`) filters its own, separately-built catalog by the same
 /// rule rather than reimplementing it.
 pub fn persona_tool_allowed(name: &str, allow: &[String]) -> bool {
-    allow.iter().any(|t| t == name) || is_always_on_tool(name)
+    allow.iter().any(|t| t == name) || is_persona_unfenceable_tool(name)
 }
 
 /// The advertised name of one tool definition (`{"function":{"name":…}}`), or
@@ -401,11 +409,13 @@ pub fn filter_advertised_tools(
 
 /// Whether `name` is available under the prompt's validated disposition.
 ///
-/// `Act` retains the complete catalog. `Explain` and `Research` are deliberately
-/// a small, explicit read/recovery set: an unknown name is denied rather than
-/// assumed safe, which also fences every generic MCP name (`server__tool`) until
-/// MCP supplies machine-readable authority metadata. `Ask` is terminal at the
-/// harness layer, so no model tool invocation is admitted as defense in depth.
+/// `Act` retains the complete catalog. `Explain`, `Research`, and `Plan` are
+/// deliberately a small, explicit read/recovery set (`Plan` additionally gets
+/// the harness-owned ledger writer): an unknown name is denied rather than
+/// assumed safe, which also fences every generic MCP name (`server__tool`)
+/// until MCP supplies machine-readable authority metadata. `Ask` is terminal
+/// at the harness layer, so no model tool invocation is admitted as defense in
+/// depth.
 ///
 /// This predicate is shared by advertisement and dispatch. The latter remains
 /// the security boundary: a model can always fabricate an omitted tool name.
@@ -413,10 +423,28 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
     match disposition {
         PromptDisposition::Act => true,
         PromptDisposition::Ask => false,
-        PromptDisposition::Explain | PromptDisposition::Research => matches!(
-            name,
-            // Workspace / prompt / artifact recovery.
-            "read_file"
+        PromptDisposition::Explain | PromptDisposition::Research => {
+            common_read_only_tool_allowed(name)
+        }
+        PromptDisposition::Plan => {
+            // Human/model Plan mode is deliberately offline. Do not advertise
+            // `web_fetch` when the matching plan caveat always denies network.
+            (name != "web_fetch" && common_read_only_tool_allowed(name))
+                // `update_plan` changes only the harness-owned session ledger
+                // (and its derived audit artifact), never workspace or external
+                // state. `exit_plan_mode` removes only the model-entered
+                // self-clamp; it cannot override a human `/mode plan` or the
+                // session's underlying caveats.
+                || matches!(name, "update_plan" | "exit_plan_mode")
+        }
+    }
+}
+
+fn common_read_only_tool_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        // Workspace / prompt / artifact recovery.
+        "read_file"
                 | "list_dir"
                 | "find"
                 | "prompt_read"
@@ -438,6 +466,11 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
                 | "tool_search"
                 | "get_context_remaining"
                 | "render_report"
+                // Auto-mode selection changes only a future turn's working
+                // style. It cannot change the current disposition, caveats, or
+                // permissions, so a read-only turn may safely schedule its
+                // successor without widening itself.
+                | "select_operating_mode"
                 // #1259: the formal ask-the-human escalation. An evidence turn
                 // that is genuinely boxed in (no capable tool) ends as a
                 // legitimate QUESTION instead of penalized narration — the
@@ -447,8 +480,7 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
                 // nulled non-Act permission gate (headless → a recoverable
                 // no-human message, never a grant, never a hang).
                 | "request_user_input"
-        ),
-    }
+    )
 }
 
 /// Restrict an advertised tool catalog to the current prompt disposition.
@@ -493,6 +525,9 @@ pub(super) fn disposition_tool_denied_message(
         }
         PromptDisposition::Research => {
             "This is a Research turn: only the bounded read-only evidence and recovery tools are available; capability grants, execution, mutations, and generic MCP calls require an Act disposition."
+        }
+        PromptDisposition::Plan => {
+            "This is a Plan turn: reads, the harness-owned update_plan ledger, and exit from a model-entered plan phase are available; workspace mutations, execution, capability grants, and generic MCP calls require an Act disposition."
         }
         PromptDisposition::Act => unreachable!("Act permits every tool"),
     };
@@ -616,6 +651,9 @@ pub(super) enum Gate {
     CodeSearch,
     Experiential,
     Scheduled,
+    PlanMode,
+    ScheduledPlanMode,
+    OperatingMode,
 }
 
 /// One built-in (non-base) tool, declared in exactly one place.
@@ -762,12 +800,17 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
     ToolSpec {
         name: "enter_plan_mode",
         definition: super::super::scheduled::enter_plan_mode_tool_definition,
-        gate: Gate::Scheduled,
+        gate: Gate::ScheduledPlanMode,
     },
     ToolSpec {
         name: "exit_plan_mode",
         definition: super::super::scheduled::exit_plan_mode_tool_definition,
-        gate: Gate::Scheduled,
+        gate: Gate::PlanMode,
+    },
+    ToolSpec {
+        name: "select_operating_mode",
+        definition: super::super::operating_mode::select_operating_mode_tool_definition,
+        gate: Gate::OperatingMode,
     },
 ];
 
@@ -824,6 +867,9 @@ fn gate_satisfied(
     with_code_search: bool,
     with_experiential: bool,
     with_scheduled: bool,
+    with_operating_mode_control: bool,
+    with_plan_mode_control: bool,
+    with_plan_mode_active: bool,
 ) -> bool {
     match gate {
         Gate::Always => true,
@@ -836,6 +882,14 @@ fn gate_satisfied(
         Gate::CodeSearch => with_code_search,
         Gate::Experiential => with_experiential,
         Gate::Scheduled => with_scheduled,
+        // Provider loops freeze their schema for the whole multi-round turn.
+        // If enter is visible at turn start, exit must be visible too so the
+        // model can enter, write its plan, and leave in that same turn. An
+        // already-active phase also keeps exit visible when scheduled planning
+        // is toggled off between turns.
+        Gate::PlanMode => (with_scheduled && with_plan_mode_control) || with_plan_mode_active,
+        Gate::ScheduledPlanMode => with_scheduled && with_plan_mode_control,
+        Gate::OperatingMode => with_operating_mode_control,
     }
 }
 

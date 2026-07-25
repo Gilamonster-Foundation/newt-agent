@@ -782,80 +782,573 @@ impl SessionCapability {
 // Prompted ocap grants — issue #263 (`--prompt-for-permissions`)
 // Interactive permission prompting (`--prompt-for-permissions`, #263) — the
 // OCAP grant UI + `PromptPermissionGate`/`PermissionPromptState` state machine
-// — lives in `permissions.rs`. The `/mode` named-preset clamp (#307) stays below.
+// — lives in `permissions.rs`. The `/posture` named-preset clamp (#307) stays
+// below.
 
 // ---------------------------------------------------------------------------
-// Named permission presets + the `/mode` command (issue #307).
+// Operating modes (`/mode`) — working style, never authority.
 // ---------------------------------------------------------------------------
 
-/// The session's active `/mode` (issue #307): the named-permission-preset clamp
-/// applied as an authority FLOOR plus the binding that produced it. Held by the
-/// session next to `SessionCapability`; the clamp is `meet`-ed into the
-/// effective caveats for every turn (and into the #263 gate's re-mint), so it
-/// wins over both `--disable-ocap` and any interactive session-grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OperatingMode {
+    #[default]
+    Chat,
+    Dev,
+    Admin,
+    Plan,
+    Diagnose,
+    Auto,
+    FullAuto,
+}
+
+impl OperatingMode {
+    fn from_keyword(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chat" => Some(Self::Chat),
+            "dev" | "developer" => Some(Self::Dev),
+            "admin" | "sysadmin" => Some(Self::Admin),
+            "plan" => Some(Self::Plan),
+            "diagnose" | "diagnostic" => Some(Self::Diagnose),
+            "auto" => Some(Self::Auto),
+            "full-auto" | "full_auto" | "fullauto" => Some(Self::FullAuto),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Dev => "dev",
+            Self::Admin => "admin",
+            Self::Plan => "plan",
+            Self::Diagnose => "diagnose",
+            Self::Auto => "auto",
+            Self::FullAuto => "full-auto",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Chat => {
+                "Collaborate conversationally; answer directly and confirm consequential choices."
+            }
+            Self::Dev => {
+                "Develop with TDD, worktree-safe Git habits, targeted tests, and full preflight before a PR."
+            }
+            Self::Admin => {
+                "Do no harm, make minimal changes, respect privacy, and use elevated power responsibly."
+            }
+            Self::Plan => {
+                "Write an actionable plan without changing files, running mutations, or altering external state."
+            }
+            Self::Diagnose => {
+                "Gather evidence and identify root cause only; stop before planning or implementing a repair."
+            }
+            Self::Auto => {
+                "Let the model choose a bounded working style per task and ask when a consequential decision is unresolved."
+            }
+            Self::FullAuto => {
+                "Work safely to completion with minimal interruption, including tests and preflight."
+            }
+        }
+    }
+
+    fn instructions(self) -> &'static str {
+        match self {
+            Self::Chat => {
+                "Collaborate with the human at a conversational pace. Answer questions directly. \
+                 When action is requested, stay within the request and ask before making an \
+                 unresolved consequential choice."
+            }
+            Self::Dev => {
+                "Act as a disciplined developer. Inspect branch, worktree, and existing changes \
+                 before editing; preserve unrelated work. Use TDD when feasible: establish the \
+                 failing behavior, make the smallest coherent change, run targeted tests, then \
+                 run the workspace's full preflight before proposing or pushing a PR. Ask the \
+                 human when a product or architecture decision remains unresolved."
+            }
+            Self::Admin => {
+                "Do no harm. Make minimal changes. Respect privacy. With great power comes great \
+                 responsibility. Inspect first, protect secrets and user data, prefer reversible \
+                 operations, and require a clear human decision before destructive or \
+                 irreversible work."
+            }
+            Self::Plan => {
+                "Analyze the request and write a concrete, sequenced plan. Do not modify files, \
+                 run mutating commands, or alter external state. Surface unresolved decisions \
+                 for the human. When the plan is ready, recommend /mode dev to implement it, or \
+                 /mode admin for system administration."
+            }
+            Self::Diagnose => {
+                "Seek only to understand. Inspect available read-only evidence and identify the \
+                 root cause; do not plan, mutate the workspace, or implement the repair. Once the \
+                 root cause is known, say: \"I have found the root cause. Would you like to \
+                 switch to /mode plan to plan a fix?\""
+            }
+            Self::Auto => {
+                "Use the effective style for this turn and adapt within its boundaries. For later \
+                 action-shaped turns, select_operating_mode may choose chat, dev, admin, plan, or \
+                 diagnose; it never selects full-auto. Protected ask, research, explanation, and \
+                 plan intake still win. Ask the human whenever a consequential decision, \
+                 tradeoff, or missing requirement is unresolved."
+            }
+            Self::FullAuto => {
+                "Carry safe in-scope work through implementation, verification, and full \
+                 preflight with minimal interruption. Inspect branch, worktree, and existing \
+                 changes before editing; preserve unrelated work. Use TDD when feasible: \
+                 establish the failing behavior, make the smallest coherent change, run targeted \
+                 tests, then run the workspace's full preflight before proposing or pushing a \
+                 PR. Make conservative reversible assumptions and iterate to completion. Ask \
+                 only when blocked by required authority, a secret, destructive or irreversible \
+                 action, or a consequential human choice."
+            }
+        }
+    }
+
+    fn all() -> &'static [Self] {
+        &[
+            Self::Chat,
+            Self::Dev,
+            Self::Admin,
+            Self::Plan,
+            Self::Diagnose,
+            Self::Auto,
+            Self::FullAuto,
+        ]
+    }
+}
+
+/// Session-local model selection behind `/mode auto`.
 ///
-/// `None` (no mode active) ⇒ behavior is exactly today's: the effective caveats
-/// are the session base, the gate has no clamp, and the exec floor is absent.
+/// The selected style is bound to the conversation that requested it and is
+/// consumed by its next action-shaped turn. Conversation-boundary handlers
+/// clear it eagerly, so `/new`, restore, and persona-driven rotation cannot
+/// resurrect a stale model choice.
+#[derive(Debug, Default)]
+struct AutoModeState {
+    selected: std::sync::Mutex<Option<(String, OperatingMode)>>,
+}
+
+impl AutoModeState {
+    fn take_for(&self, conversation_id: &str) -> Option<OperatingMode> {
+        let Ok(mut selected) = self.selected.lock() else {
+            return None;
+        };
+        match selected.take() {
+            Some((bound_id, mode)) if bound_id == conversation_id => Some(mode),
+            Some(_) | None => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_for(&self, conversation_id: &str) -> Option<OperatingMode> {
+        self.selected
+            .lock()
+            .ok()
+            .and_then(|selected| match selected.as_ref() {
+                Some((bound_id, mode)) if bound_id == conversation_id => Some(*mode),
+                _ => None,
+            })
+    }
+
+    fn clear(&self) {
+        if let Ok(mut selected) = self.selected.lock() {
+            *selected = None;
+        }
+    }
+
+    fn bind<'a>(&'a self, conversation_id: &'a str) -> TurnAutoModeControl<'a> {
+        TurnAutoModeControl {
+            state: self,
+            conversation_id,
+        }
+    }
+}
+
+/// Per-TUI-session state for the model-entered Plan phase. This is deliberately
+/// not process-global: multiple embedded or test sessions must never clamp one
+/// another's tool calls.
+#[derive(Debug, Default)]
+struct PlanModeState {
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl PlanModeState {
+    fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn clear(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl newt_core::agentic::PlanModeControl for PlanModeState {
+    fn is_plan_mode(&self) -> bool {
+        self.is_active()
+    }
+
+    fn set_plan_mode(&self, active: bool) -> Result<(), String> {
+        self.active
+            .store(active, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Conversation-scoped operating state with one boundary-clear operation.
+///
+/// Keeping these together makes it impossible for `/new`, persona rotation,
+/// or restore to clear one model-selected mode while accidentally retaining
+/// the other.
+#[derive(Debug, Default)]
+struct ConversationModeStates {
+    auto: AutoModeState,
+    plan: PlanModeState,
+}
+
+impl ConversationModeStates {
+    fn clear(&self) {
+        self.auto.clear();
+        self.plan.clear();
+    }
+}
+
+/// Turn-bound adapter lent to the core loop only while the human-selected
+/// session mode is Auto.
+struct TurnAutoModeControl<'a> {
+    state: &'a AutoModeState,
+    conversation_id: &'a str,
+}
+
+impl newt_core::agentic::OperatingModeControl for TurnAutoModeControl<'_> {
+    fn select_operating_mode(&self, requested: &str) -> Result<String, String> {
+        let Some(mode) = OperatingMode::from_keyword(requested) else {
+            return Err(
+                "choose one of: chat, dev, admin, plan, diagnose (full-auto is human-only)"
+                    .to_string(),
+            );
+        };
+        if matches!(mode, OperatingMode::Auto | OperatingMode::FullAuto) {
+            return Err(format!(
+                "{} cannot be model-selected; choose chat, dev, admin, plan, or diagnose",
+                mode.as_str()
+            ));
+        }
+        let mut selected = self
+            .state
+            .selected
+            .lock()
+            .map_err(|_| "session mode state is unavailable".to_string())?;
+        *selected = Some((self.conversation_id.to_string(), mode));
+        Ok(format!(
+            "selected {} for the next action-shaped turn in this conversation. \
+             The current turn's operating mode, disposition, caveats, and permissions are unchanged.",
+            mode.as_str()
+        ))
+    }
+}
+
+/// Apply a human `/mode` command to session state and return printable lines.
+/// Invalid input is fail-closed: the active mode is left untouched.
+fn operating_mode_command_lines(
+    arg: &str,
+    active: &mut OperatingMode,
+) -> Result<Vec<String>, String> {
+    let arg = arg.trim().to_ascii_lowercase();
+    if arg.is_empty() || arg == "list" {
+        let mut lines = vec![format!(
+            "active operating mode: {} — {}",
+            active.as_str(),
+            active.description()
+        )];
+        lines.push("available operating modes:".to_string());
+        lines.extend(
+            OperatingMode::all()
+                .iter()
+                .map(|mode| format!("  {:<9} {}", mode.as_str(), mode.description())),
+        );
+        return Ok(lines);
+    }
+    if matches!(arg.as_str(), "show" | "status") {
+        return Ok(vec![format!(
+            "active operating mode: {} — {}",
+            active.as_str(),
+            active.description()
+        )]);
+    }
+    if matches!(arg.as_str(), "off" | "clear" | "reset" | "default") {
+        *active = OperatingMode::Chat;
+        return Ok(vec![
+            "operating mode reset to chat (the default)".to_string()
+        ]);
+    }
+    let Some(mode) = OperatingMode::from_keyword(&arg) else {
+        let names = OperatingMode::all()
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(format!("unknown /mode '{arg}' — usage: /mode <{names}>"));
+    };
+    *active = mode;
+    Ok(vec![format!(
+        "operating mode set to {} — {}",
+        mode.as_str(),
+        mode.description()
+    )])
+}
+
+/// Resolve the working style for this turn. An explicit human mode is stable;
+/// `auto` first honors a conversation-local model selection on action-shaped
+/// work, then falls back to a deterministic, inspectable choice from accepted
+/// prompt intake. Protected non-action intake always wins. A legacy
+/// model-entered plan phase is represented as `plan` so the prompt card and
+/// executor cannot disagree.
+fn effective_operating_mode(
+    configured: OperatingMode,
+    intake: &newt_core::agentic::PromptIntake,
+    model_plan_phase: bool,
+    auto_selected: Option<OperatingMode>,
+) -> OperatingMode {
+    use newt_core::agentic::PromptDisposition;
+    if model_plan_phase {
+        return OperatingMode::Plan;
+    }
+    if configured != OperatingMode::Auto {
+        return match (configured, intake.disposition()) {
+            // These two modes carry implementation imperatives. On protected
+            // non-action intake, render disposition-compatible instructions
+            // instead so small models are not told both to edit and not edit.
+            (
+                OperatingMode::Dev | OperatingMode::Admin | OperatingMode::FullAuto,
+                PromptDisposition::Research,
+            ) => OperatingMode::Diagnose,
+            (
+                OperatingMode::Dev | OperatingMode::Admin | OperatingMode::FullAuto,
+                PromptDisposition::Plan,
+            ) => OperatingMode::Plan,
+            (
+                OperatingMode::Dev | OperatingMode::Admin | OperatingMode::FullAuto,
+                PromptDisposition::Ask | PromptDisposition::Explain,
+            ) => OperatingMode::Chat,
+            _ => configured,
+        };
+    }
+
+    let prompt = intake
+        .atomic_asks()
+        .iter()
+        .map(newt_core::agentic::AtomicAsk::text)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    match intake.disposition() {
+        PromptDisposition::Act => {
+            if let Some(selected) = auto_selected
+                .filter(|mode| !matches!(mode, OperatingMode::Auto | OperatingMode::FullAuto))
+            {
+                return selected;
+            }
+            // Action keywords win prompt intake. Only an explicit leading
+            // orchestration intent overrides the normal developer style, so
+            // "fix the diagnose mode" and "implement plan mode" remain dev.
+            let mut objective = prompt.trim_start();
+            for prefix in ["please ", "can you ", "could you ", "would you "] {
+                if let Some(rest) = objective.strip_prefix(prefix) {
+                    objective = rest.trim_start();
+                    break;
+                }
+            }
+            let starts_any =
+                |needles: &[&str]| needles.iter().any(|needle| objective.starts_with(needle));
+            if starts_any(&[
+                "diagnose ",
+                "investigate ",
+                "troubleshoot ",
+                "find the root cause",
+            ]) {
+                OperatingMode::Diagnose
+            } else if starts_any(&["plan ", "write a plan", "make a plan", "formulate a plan"]) {
+                OperatingMode::Plan
+            } else if starts_any(&[
+                "use admin mode",
+                "work in admin mode",
+                "act as a sysadmin",
+                "perform system administration",
+            ]) {
+                OperatingMode::Admin
+            } else {
+                OperatingMode::Dev
+            }
+        }
+        PromptDisposition::Research => OperatingMode::Diagnose,
+        PromptDisposition::Ask | PromptDisposition::Explain => OperatingMode::Chat,
+        PromptDisposition::Plan => OperatingMode::Plan,
+    }
+}
+
+/// A mode can preserve or narrow prompt intake, never widen it. Plan and
+/// diagnose force action-shaped prompts through the same `PromptIntake` object
+/// later used by the model card, artifact recorder, catalog, and dispatcher.
+fn apply_operating_mode_to_intake(
+    mode: OperatingMode,
+    intake: &mut newt_core::agentic::PromptIntake,
+) {
+    match mode {
+        OperatingMode::Plan => {
+            intake.enforce_read_only(newt_core::agentic::PromptDisposition::Plan);
+        }
+        OperatingMode::Diagnose => {
+            intake.enforce_read_only(newt_core::agentic::PromptDisposition::Research);
+        }
+        _ => {}
+    }
+}
+
+/// Defense in depth for modes that promise no mutation. This is a meet with
+/// the existing plan-phase clamp, so it can only attenuate ambient authority.
+fn operating_mode_caveats(mode: OperatingMode, caveats: newt_core::Caveats) -> newt_core::Caveats {
+    match mode {
+        OperatingMode::Plan => caveats.meet(&newt_core::agentic::plan_phase_clamp()),
+        OperatingMode::Diagnose => caveats.meet(&diagnose_mode_clamp()),
+        _ => caveats,
+    }
+}
+
+/// Diagnose may gather remote read-only evidence, while still denying every
+/// workspace mutation and executable spawn. Plan is stricter and remains
+/// fully offline through [`newt_core::agentic::plan_phase_clamp`].
+fn diagnose_mode_clamp() -> newt_core::Caveats {
+    use newt_core::{CountBound, Scope};
+    newt_core::Caveats {
+        fs_read: Scope::All,
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::All,
+        max_calls: CountBound::Unlimited,
+        valid_for_generation: Scope::All,
+    }
+}
+
+fn operating_mode_prompt(configured: OperatingMode, effective: OperatingMode) -> String {
+    let identity = if configured == effective {
+        format!(
+            "Operating mode: {} — {}",
+            effective.as_str(),
+            effective.description()
+        )
+    } else {
+        format!(
+            "Configured session mode: {}. Effective working style for this turn: {} — {}.",
+            configured.as_str(),
+            effective.as_str(),
+            effective.description(),
+        )
+    };
+    let auto_control = if configured == OperatingMode::Auto {
+        "\nAuto-mode control: use select_operating_mode when the next action-shaped turn \
+         should use chat, dev, admin, plan, or diagnose. A selection takes effect only \
+         on a later turn and grants no authority. Never attempt to select full-auto."
+    } else {
+        ""
+    };
+    let configured_invariants = if configured == OperatingMode::Admin {
+        "\nConfigured admin invariants remain in force: Do no harm. Make minimal changes. \
+         Respect privacy. With great power comes great responsibility."
+    } else {
+        ""
+    };
+    format!(
+        "<operating_mode configured=\"{}\" effective=\"{}\">\n{}\n\
+         Effective instructions:\n{}{}{}\n\
+         This mode controls working style only. It grants no authority, bypasses no \
+         permission or safety boundary, and cannot turn a read-only prompt into an \
+         action prompt.\n</operating_mode>",
+        configured.as_str(),
+        effective.as_str(),
+        identity,
+        effective.instructions(),
+        auto_control,
+        configured_invariants,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Named permission presets + the `/posture` command (issue #307).
+// ---------------------------------------------------------------------------
+
+/// The session's active `/posture` (issue #307): a configured skill/framing
+/// binding plus its optional named-permission-preset clamp. Held by the session
+/// next to `SessionCapability`; when configured, the clamp is `meet`-ed into
+/// the effective caveats for every turn (and into the #263 gate's re-mint), so
+/// it wins over both `--disable-ocap` and any interactive session-grant.
+///
+/// `None` (no posture active) means only that no posture-supplied clamp is
+/// present. Session, operating-mode, persona, or other effective floors may
+/// still narrow authority or force confined exec.
 #[derive(Debug, Clone)]
-pub(crate) struct ActiveMode {
-    /// The mode name (the `<name>` in `/mode <name>`), for `/permissions`.
+pub(crate) struct ActivePosture {
+    /// The posture name (the `<name>` in `/posture <name>`), for `/permissions`.
     name: String,
-    /// The preset name that supplied the clamp (for reporting).
+    /// The preset name that supplied the clamp (for reporting), or empty when
+    /// this compatibility binding intentionally carries only skill/framing.
     preset_name: String,
     /// The authority ceiling (`NamedPermissionPreset::clamp`). The session's
     /// effective authority is `base.meet(&clamp)`.
     clamp: newt_core::Caveats,
     /// One-line human summary of the clamp (for `/permissions`).
     clamp_summary: String,
-}
-
-/// Outcome of applying `/mode <name>`: the skill body to print, the new active
-/// mode, and the framing to inject into the system prompt. Built by
-/// [`build_mode`] (pure, unit-testable) and applied by the command handler.
-#[derive(Debug)]
-struct ModeApplication {
-    /// The new active mode (the clamp + names).
-    mode: ActiveMode,
-    /// The preloaded skill body, if the mode named a skill. Printed to the
-    /// transcript so the model sees it (same payload as `use_skill`).
+    /// The validated skill guidance composed into each live turn.
     skill_body: Option<String>,
-    /// The one-line framing to inject into the system prompt, if any.
+    /// Operator-defined framing composed into each live turn.
     framing: Option<String>,
 }
 
-/// Resolve and validate a `/mode <name>` invocation against config + skills,
+impl ActivePosture {
+    /// A compatibility binding without `preset` carries guidance only. Treat
+    /// that as genuinely absent at every enforcement seam rather than passing
+    /// an identity clamp that could still change the exec mechanism.
+    fn permission_clamp(&self) -> Option<&newt_core::Caveats> {
+        (!self.preset_name.is_empty()).then_some(&self.clamp)
+    }
+}
+
+/// Resolve and validate a `/posture <name>` invocation against config + skills,
 /// WITHOUT mutating anything — the atomic-or-nothing core of the command. A
-/// missing mode, a missing preset, or an unloadable skill is an `Err`: a mode
-/// that silently skipped its clamp or its skill would be a false claim. On
-/// success the caller applies all three effects together.
+/// missing posture or any resource it explicitly names is an `Err`: a posture
+/// that silently skipped a configured clamp or guidance would be a false
+/// claim. A binding may intentionally omit its preset, skill, or framing. On
+/// success the caller applies every configured effect together.
 ///
 /// `load_skill` is the skill-body loader seam (production wires the same
 /// `use_skill` / `newt_skills::load_body_from` path; tests inject a closure
 /// over a mock skills dir) — so skill loading is NOT reimplemented here.
-fn build_mode(
+fn build_posture(
     name: &str,
     cfg: &newt_core::Config,
     mut load_skill: impl FnMut(&str) -> newt_skills::Result<String>,
-) -> anyhow::Result<ModeApplication> {
-    let mode_cfg = cfg
-        .modes
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown mode: '{name}' (no [modes.{name}] in config)"))?;
+) -> anyhow::Result<ActivePosture> {
+    let mode_cfg = cfg.modes.get(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown posture: '{name}' (no [modes.{name}] compatibility entry in config)"
+        )
+    })?;
 
-    // Resolve the preset clamp (if the mode names one). A named-but-missing
+    // Resolve the preset clamp (if the posture names one). A named-but-missing
     // preset is a hard error — never a silent no-clamp.
     let (preset_name, clamp, clamp_summary) = match &mode_cfg.preset {
         Some(preset_name) => {
             let preset = cfg.permission_presets.get(preset_name).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "mode '{name}' names preset '{preset_name}' but no \
+                    "posture '{name}' names preset '{preset_name}' but no \
                      [permission_presets.{preset_name}] is defined"
                 )
             })?;
             (preset_name.clone(), preset.clamp(), preset.summary())
         }
-        // A mode with no preset imposes no clamp (identity) — still a valid
-        // mode (e.g. skill + framing only).
+        // A posture with no preset imposes no clamp (identity) — still valid
+        // for skill + framing composition.
         None => (
             String::new(),
             newt_core::Caveats::top(),
@@ -868,38 +1361,93 @@ fn build_mode(
     let skill_body = match &mode_cfg.skill {
         Some(skill_name) => Some(
             load_skill(skill_name)
-                .map_err(|e| anyhow::anyhow!("mode '{name}' skill '{skill_name}': {e}"))?,
+                .map_err(|e| anyhow::anyhow!("posture '{name}' skill '{skill_name}': {e}"))?,
         ),
         None => None,
     };
 
-    Ok(ModeApplication {
-        mode: ActiveMode {
-            name: name.to_string(),
-            preset_name,
-            clamp,
-            clamp_summary,
-        },
+    Ok(ActivePosture {
+        name: name.to_string(),
+        preset_name,
+        clamp,
+        clamp_summary,
         skill_body,
         framing: mode_cfg.framing.clone(),
     })
 }
 
-/// The system-prompt framing line injected when a mode is active (issue #307).
-/// Kept distinct from the persona overlay so a mode and a persona compose.
-fn mode_framing_line(mode: &ActiveMode) -> String {
-    format!("Active mode: {} — {}", mode.name, mode.clamp_summary)
+/// Compose posture guidance from current session state on every turn. It is
+/// deliberately not appended to the frozen base prompt: switching or clearing
+/// a posture therefore cannot leave stale instructions behind, and `/new`
+/// cannot accidentally drop an active posture.
+fn posture_prompt(posture: &ActivePosture) -> String {
+    let authority_line = if posture.permission_clamp().is_none() {
+        format!(
+            "Active permission posture: {} (no permission clamp)",
+            posture.name
+        )
+    } else {
+        format!(
+            "Active permission posture: {} — {}",
+            posture.name, posture.clamp_summary
+        )
+    };
+    let mut lines = vec![
+        format!(
+            "<permission_posture name=\"{}\">",
+            posture.name.replace('"', "&quot;")
+        ),
+        authority_line,
+    ];
+    if posture.permission_clamp().is_none() {
+        lines.push(
+            "This posture has no configured permission floor. Its skill and framing \
+             do not grant authority; the session's existing boundaries remain in force."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "This posture's permission preset is an authority floor. It can only \
+             narrow permissions and cannot be overridden by the operating mode or \
+             a session grant."
+                .to_string(),
+        );
+    }
+    if let Some(framing) = &posture.framing {
+        lines.push(format!("Posture framing: {framing}"));
+    }
+    if let Some(skill) = &posture.skill_body {
+        lines.push(format!("Preloaded posture skill guidance:\n{skill}"));
+    }
+    lines.push("</permission_posture>".to_string());
+    lines.join("\n")
+}
+
+fn session_control_prompt(
+    configured_mode: OperatingMode,
+    effective_mode: OperatingMode,
+    posture: Option<&ActivePosture>,
+) -> String {
+    let mut prompt = operating_mode_prompt(configured_mode, effective_mode);
+    if let Some(posture) = posture {
+        prompt.push_str("\n\n");
+        prompt.push_str(&posture_prompt(posture));
+    }
+    prompt
 }
 
 /// The session's EFFECTIVE authority for this turn: the session base
-/// (`SessionCapability::caveats`) intersected with the active mode's preset
-/// clamp, if any. This is the single intersection point the enforcement path
-/// consults — `meet` is the greatest lower bound, so the result can never
-/// exceed EITHER the base or the preset. With no active mode it is the base
-/// unchanged (a clone), so the no-preset path is bit-for-bit.
-fn effective_caveats(base: &newt_core::Caveats, mode: Option<&ActiveMode>) -> newt_core::Caveats {
-    match mode {
-        Some(m) => base.meet(&m.clamp),
+/// (`SessionCapability::caveats`) intersected with the active posture's
+/// optional preset clamp. This is the single intersection point the
+/// enforcement path consults — `meet` is the greatest lower bound, so the
+/// result can never exceed EITHER the base or a configured preset. With no
+/// active posture, or a posture with no preset, it is the base unchanged.
+fn effective_caveats(
+    base: &newt_core::Caveats,
+    posture: Option<&ActivePosture>,
+) -> newt_core::Caveats {
+    match posture.and_then(ActivePosture::permission_clamp) {
+        Some(clamp) => base.meet(clamp),
         None => base.clone(),
     }
 }
@@ -918,36 +1466,36 @@ fn meet_persona_caveats(base: newt_core::Caveats, persona: Option<&Persona>) -> 
 
 /// #774 (P0): the always-on exec FLOOR threaded to `execute_tool` as
 /// `exec_floor`. The operator's `[tui.permissions]` exec clamp is a
-/// NON-OPTIONAL floor — enforced even with NO active `/mode`.
+/// NON-OPTIONAL floor — enforced even with NO active `/posture`.
 ///
 /// `effective_exec` is the base `[tui.permissions]` exec scope already met with
-/// any active `/mode` clamp (i.e. `effective_caveats(base, mode).exec`), so the
-/// floor is meet-only: `/mode` can only TIGHTEN it, never widen it past either
-/// the base or the preset.
+/// any configured `/posture` clamp (i.e.
+/// `effective_caveats(base, posture).exec`), so the floor is meet-only: a
+/// posture preset can only TIGHTEN it, never widen it past either the base or
+/// the preset.
 ///
 /// Returns `Some(effective_exec)` whenever the operator configured a restrictive
-/// exec clamp (`Scope::Only`) OR a `/mode` is active, so an out-of-floor command
-/// can never take the `--disable-ocap` / `--yolo` unconfined bypass — it falls
-/// through to the confined shell, which enforces the (already-clamped) caveats
-/// and denies it. Returns `None` ONLY when exec is unrestricted (`Scope::All`)
-/// AND no `/mode` is active, leaving the unrestricted `--disable-ocap` bypass
-/// exactly as it was pre-#307 (whether `--yolo` should unconfine at all by
-/// default is a separate question — design-review §7-F5 / P4, out of scope here).
+/// exec clamp (`Scope::Only`) OR a `/posture` permission floor is active, so an
+/// out-of-floor command can never take the `--disable-ocap` / `--yolo`
+/// unconfined bypass — it falls through to the confined shell, which enforces
+/// the (already-clamped) caveats and denies it. Returns `None` ONLY when exec is
+/// unrestricted (`Scope::All`) AND no posture permission floor is active,
+/// leaving the unrestricted `--disable-ocap` bypass exactly as it was pre-#307.
 ///
-/// Before #774 the floor was sourced from the active `/mode` ALONE
-/// (`active_mode.map(|m| m.clamp.exec.clone())`), so a configured
-/// `[tui.permissions]` clamp imposed NO floor without a `/mode` — the
+/// Before #774 the floor was sourced from the active `/posture` ALONE
+/// (`active_posture.map(|p| p.clamp.exec.clone())`), so a configured
+/// `[tui.permissions]` clamp imposed NO floor without a posture — the
 /// design-review F1 finding: the operator's exec clamp was not enforced by
 /// default on the bypass path.
 fn exec_floor_from(
     effective_exec: &newt_core::caveats::Scope<String>,
-    mode_active: bool,
+    posture_floor_active: bool,
 ) -> Option<newt_core::caveats::Scope<String>> {
     use newt_core::caveats::Scope;
     match effective_exec {
-        // Unrestricted base, no mode ⇒ no floor (pre-#307 bypass, bit-for-bit).
-        Scope::All if !mode_active => None,
-        // A configured restriction, or any active mode, is an always-on floor.
+        // Unrestricted base, no posture preset ⇒ no floor (pre-#307 bypass).
+        Scope::All if !posture_floor_active => None,
+        // A configured restriction or posture preset is an always-on floor.
         scope => Some(scope.clone()),
     }
 }
@@ -957,23 +1505,25 @@ fn exec_floor_from(
 /// grant is deliberately NOT offered here — that is a human editing
 /// `[tui.permissions]` in the config (see issues #263/#181).
 ///
-/// `active_mode` (issue #307) reflects an applied `/mode` preset as an authority
-/// floor at the top of the listing — so the user can always see the clamp in
-/// force, even when permission prompting is off.
+/// `active_posture` (issue #307) reflects an applied `/posture` preset as an
+/// authority floor at the top of the listing, even when prompting is off.
 pub(crate) fn permissions_command_lines(
     state: &PermissionPromptState,
     enabled: bool,
     log_path: Option<&std::path::Path>,
-    active_mode: Option<&ActiveMode>,
+    active_posture: Option<&ActivePosture>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(mode) = active_mode {
-        if mode.preset_name.is_empty() {
-            lines.push(format!("active mode: {} (no permission clamp)", mode.name));
+    if let Some(posture) = active_posture {
+        if posture.permission_clamp().is_none() {
+            lines.push(format!(
+                "active permission posture: {} (no permission clamp)",
+                posture.name
+            ));
         } else {
             lines.push(format!(
-                "active mode: {} — preset '{}' clamps authority (floor): {}",
-                mode.name, mode.preset_name, mode.clamp_summary
+                "active permission posture: {} — preset '{}' clamps authority (floor): {}",
+                posture.name, posture.preset_name, posture.clamp_summary
             ));
             lines.push(
                 "this clamp WINS over --disable-ocap/--yolo and over session grants (#307)"
@@ -1020,17 +1570,18 @@ pub(crate) fn permissions_command_lines(
 /// `NEWT_DISABLE_OCAP=1`). The bypass itself lives at the `run_command`
 /// dispatch in newt-core; this is the loud surfacing half of the contract.
 fn ocap_disabled_banner() -> String {
-    "⚠ ocap DISABLED (--disable-ocap): commands run unconfined on the host shell — \
-     fs tools keep the workspace fence; drop the flag to restore confinement (#297)"
+    "⚠ ocap DISABLED (--disable-ocap): permitted commands may run unconfined on the \
+     host shell; active exec floors can force confinement or denial — fs tools keep \
+     the workspace fence; drop the flag to restore default confinement (#297)"
         .to_string()
 }
 
 /// INTERIM (#297): the ONE `ocap-disabled` line written to the #263
 /// permission log at session start, so the audit trail shows this session
-/// ran with unconfined exec. `decision: "ocap-disabled"`, `scope:
-/// "session"` per the issue; the `*` target means every exec — the bypass
-/// is per-session, never per-command. A record, not authority: nothing
-/// reads it back.
+/// requested the unconfined exec bypass. `decision: "ocap-disabled"`, `scope:
+/// "session"` per the issue; the `*` target means the bypass is enabled for the
+/// session, while effective exec floors still decide each command. A record,
+/// not authority: nothing reads it back.
 fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
     newt_core::PermissionRecord::new(
         conversation_id,
@@ -3260,61 +3811,104 @@ fn rebuild_system_prompt(
     build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy())
 }
 
-/// #307: handle `/mode <name>` (and bare `/mode` = show). Atomically preloads
-/// the named skill body, applies the named permission preset as an authority
-/// FLOOR, and injects a one-line framing into the system prompt — all three or
-/// none. Mutates `active_mode` and `system` only on success; on any error
-/// (unknown mode/preset/skill) nothing changes and the error is printed, so a
-/// mode can never half-apply (a clamp without its skill, or vice versa).
-fn handle_mode_command(
+fn handle_operating_mode_command(
     arg: &str,
-    cfg: &newt_core::Config,
-    active_mode: &mut Option<ActiveMode>,
-    system: &mut String,
+    active_mode: &mut OperatingMode,
+    mode_states: &ConversationModeStates,
     color: bool,
     verbose: bool,
 ) {
-    // Bare `/mode` (or `/mode show`): report the current mode.
-    if arg.is_empty() || arg == "show" {
-        match active_mode.as_ref() {
-            Some(m) if m.preset_name.is_empty() => {
-                print_newt(
-                    &format!("active mode: {} (no clamp)", m.name),
-                    color,
-                    verbose,
-                );
+    match operating_mode_command_lines(arg, active_mode) {
+        Ok(mut lines) => {
+            let normalized = arg.trim().to_ascii_lowercase();
+            if !matches!(normalized.as_str(), "" | "list" | "show" | "status") {
+                // An explicit human selection supersedes any stale
+                // model-entered plan phase. `/mode plan` has its own
+                // read-only enforcement and does not need the legacy flag.
+                mode_states.plan.clear();
+                // A successful explicit human selection also supersedes any
+                // model-selected Auto style. Listing, status, and invalid
+                // commands leave both pieces of state untouched.
+                mode_states.auto.clear();
             }
-            Some(m) => print_newt(
-                &format!(
-                    "active mode: {} — preset '{}' floor: {}",
-                    m.name, m.preset_name, m.clamp_summary
-                ),
-                color,
-                verbose,
-            ),
-            None => {
-                let names: Vec<&str> = cfg.modes.keys().map(String::as_str).collect();
-                let avail = if names.is_empty() {
-                    "(none configured — define [modes.<name>] in your newt config)".to_string()
-                } else {
-                    format!("available: {}", names.join(", "))
-                };
-                print_newt(&format!("no active mode. {avail}"), color, verbose);
+            if let Some(first) = lines.first() {
+                print_newt(first, color, verbose);
             }
+            for line in lines.drain(1..) {
+                println!("{line}");
+            }
+        }
+        Err(error) => print_newt(&error, color, verbose),
+    }
+}
+
+fn posture_status_lines(
+    cfg: &newt_core::Config,
+    active_posture: Option<&ActivePosture>,
+    include_available: bool,
+) -> Vec<String> {
+    let active = match active_posture {
+        Some(posture) if posture.permission_clamp().is_none() => {
+            format!(
+                "active permission posture: {} (no permission clamp)",
+                posture.name
+            )
+        }
+        Some(posture) => format!(
+            "active permission posture: {} — preset '{}' floor: {}",
+            posture.name, posture.preset_name, posture.clamp_summary
+        ),
+        None => "no active permission posture".to_string(),
+    };
+    let mut lines = vec![active];
+    if include_available {
+        let names: Vec<&str> = cfg.modes.keys().map(String::as_str).collect();
+        lines.push(if names.is_empty() {
+            "available permission postures: (none configured — define [modes.<name>] in your newt config)"
+                .to_string()
+        } else {
+            format!("available permission postures: {}", names.join(", "))
+        });
+    }
+    lines
+}
+
+/// #307: handle `/posture <name>`. Atomically preloads any named skill body,
+/// applies an optional named permission preset as an authority floor, and
+/// carries framing into the live per-turn prompt. Mutates `active_posture` only
+/// after every configured component resolves successfully.
+fn handle_posture_command(
+    arg: &str,
+    cfg: &newt_core::Config,
+    active_posture: &mut Option<ActivePosture>,
+    color: bool,
+    verbose: bool,
+) {
+    // Bare `/posture` and `/posture list` are discovery surfaces. `show` and
+    // `status` keep the concise active-only form.
+    if matches!(arg, "" | "list" | "show" | "status") {
+        let include_available = matches!(arg, "" | "list");
+        let mut lines =
+            posture_status_lines(cfg, active_posture.as_ref(), include_available).into_iter();
+        if let Some(first) = lines.next() {
+            print_newt(&first, color, verbose);
+        }
+        for line in lines {
+            println!("{line}");
         }
         return;
     }
 
-    // `/mode off` / `/mode clear`: drop the clamp for the rest of the session.
-    if arg == "off" || arg == "clear" {
-        if active_mode.take().is_some() {
+    // Drop the clamp and its prompt guidance for the rest of the session.
+    if matches!(arg, "off" | "clear" | "reset") {
+        if active_posture.take().is_some() {
             print_newt(
-                "mode cleared — authority returns to the session base",
+                "permission posture cleared — authority returns to the session base",
                 color,
                 verbose,
             );
         } else {
-            print_newt("no active mode to clear", color, verbose);
+            print_newt("no active permission posture to clear", color, verbose);
         }
         return;
     }
@@ -3323,47 +3917,36 @@ fn handle_mode_command(
     // `use_skill` path (`load_body_from` over the configured search dirs) —
     // skill dirs are config-rooted, exactly as the `use_skill` tool resolves.
     let skills_dirs = cfg.skill_search_dirs();
-    let application = build_mode(arg, cfg, |skill_name| {
+    let posture = build_posture(arg, cfg, |skill_name| {
         newt_skills::load_body_from(&skills_dirs, skill_name)
     });
-    let application = match application {
-        Ok(a) => a,
+    let posture = match posture {
+        Ok(posture) => posture,
         Err(e) => {
             print_newt(&format!("error: {e}"), color, verbose);
             return;
         }
     };
 
-    // Commit all three effects together.
-    if let Some(body) = &application.skill_body {
-        // Same payload the model gets from `use_skill`, printed to the
-        // transcript so the guidance is in context for the next turn.
+    if let Some(body) = &posture.skill_body {
         print_newt(
-            &format!("loaded skill for mode '{arg}':\n{body}"),
+            &format!("loaded skill for permission posture '{arg}':\n{body}"),
             color,
             verbose,
         );
     }
-    if let Some(framing) = &application.framing {
-        // Inject the one-line framing into the live system prompt.
-        system.push_str("\n\n");
-        system.push_str(framing);
-        system.push('\n');
-    }
-    let mode = application.mode;
-    let report = if mode.preset_name.is_empty() {
-        format!("mode '{}' active (no permission clamp)", mode.name)
+    let report = if posture.permission_clamp().is_none() {
+        format!(
+            "permission posture '{}' active (no permission clamp)",
+            posture.name
+        )
     } else {
         format!(
-            "mode '{}' active — preset '{}' clamps authority (floor): {}",
-            mode.name, mode.preset_name, mode.clamp_summary
+            "permission posture '{}' active — preset '{}' clamps authority (floor): {}",
+            posture.name, posture.preset_name, posture.clamp_summary
         )
     };
-    // Also append the clamp framing so the model knows its reduced authority.
-    system.push_str("\n\n");
-    system.push_str(&mode_framing_line(&mode));
-    system.push('\n');
-    *active_mode = Some(mode);
+    *active_posture = Some(posture);
     print_newt(&report, color, verbose);
 }
 
@@ -3415,15 +3998,25 @@ fn persona_list(store: &PersonaStore) -> anyhow::Result<String> {
     store.list_message()
 }
 
+struct ConversationResetContext<'a> {
+    memory: &'a mut newt_core::MemoryManager,
+    system: &'a mut String,
+    conversation_id: &'a mut String,
+    mode_states: &'a ConversationModeStates,
+}
+
 fn reset_conversation(
     workspace: &str,
-    memory: &mut newt_core::MemoryManager,
-    system: &mut String,
     active_persona: Option<&Persona>,
-    conversation_id: &str,
+    ctx: &mut ConversationResetContext<'_>,
 ) {
-    memory.reset_all();
-    *system = rebuild_system_prompt(workspace, memory, active_persona, conversation_id);
+    // Every caller of this helper crosses a conversation boundary (`/new`,
+    // persona clear, or a persona swap without `--keep-context`). Legacy
+    // model-entered plan state belongs to the old conversation and must not
+    // survive any of those paths.
+    ctx.mode_states.clear();
+    ctx.memory.reset_all();
+    *ctx.system = rebuild_system_prompt(workspace, ctx.memory, active_persona, ctx.conversation_id);
 }
 
 fn new_conversation_message(active_persona: Option<&Persona>) -> String {
@@ -3478,23 +4071,21 @@ pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_durable: b
 
 fn handle_new_conversation(
     workspace: &str,
-    memory: &mut newt_core::MemoryManager,
-    system: &mut String,
     active_persona: Option<&Persona>,
-    conversation_id: &mut String,
+    ctx: &mut ConversationResetContext<'_>,
     compress_state: &mut newt_core::CompressState,
     session_opted_fresh: &mut bool,
 ) -> String {
     // A new conversation gets a fresh id, which rotates the per-session plan
     // path to a new `.scratch/sessions/<id>/` dir (issue #220).
-    *conversation_id = newt_core::new_conversation_id();
+    *ctx.conversation_id = newt_core::new_conversation_id();
     // Re-arm compression anti-thrash (F4): the disable notice promises
     // "start a new conversation to reset" — this is what makes that true.
     compress_state.reset();
     // 17.7: an explicit /new opts this session out of auto-resume for good
     // (`should_auto_resume` consults the flag) — resume never undoes /new.
     *session_opted_fresh = true;
-    reset_conversation(workspace, memory, system, active_persona, conversation_id);
+    reset_conversation(workspace, active_persona, ctx);
     new_conversation_message(active_persona)
 }
 
@@ -3824,6 +4415,10 @@ struct ConversationCommandContext<'a> {
     /// rehydrates it for addressability, but never turns it into queued input:
     /// resuming a prompt-only conversation still waits for the operator.
     active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
+    /// A model-selected Auto style is one-shot conversation state. Every
+    /// successful restore is a hard boundary and clears it before adopting
+    /// the restored conversation, including A→B→A switches.
+    mode_states: &'a ConversationModeStates,
 }
 
 fn handle_conversation_command(
@@ -3885,6 +4480,10 @@ fn restore_conversation_into_session(
         Some(receipt) => ctx.store.turn_prompt_context(&record.id, receipt.id())?,
         None => None,
     };
+    // Restore is a conversation boundary. Clear the legacy model-entered plan
+    // clamp only after the record and prompt receipt validate, so a failed
+    // restore cannot partially mutate the live session.
+    ctx.mode_states.clear();
     ctx.memory.restore_turns(&record.turns);
     // #713: re-hydrate the live scratchpad <state> store from the restored
     // record, right next to `restore_turns`, so an interrupt + auto-resume gives
@@ -5436,10 +6035,8 @@ fn handle_persona_command(
     input: &str,
     workspace: &str,
     store: &PersonaStore,
-    memory: &mut newt_core::MemoryManager,
-    system: &mut String,
     active_persona: &mut Option<Persona>,
-    conversation_id: &mut String,
+    ctx: &mut ConversationResetContext<'_>,
 ) -> anyhow::Result<String> {
     match parse_persona_command(input)? {
         PersonaCommand::List => persona_list(store),
@@ -5447,14 +6044,8 @@ fn handle_persona_command(
         PersonaCommand::Clear => {
             *active_persona = None;
             // Clearing the persona starts a new conversation → fresh id + plan.
-            *conversation_id = newt_core::new_conversation_id();
-            reset_conversation(
-                workspace,
-                memory,
-                system,
-                active_persona.as_ref(),
-                conversation_id,
-            );
+            *ctx.conversation_id = newt_core::new_conversation_id();
+            reset_conversation(workspace, active_persona.as_ref(), ctx);
             Ok("Started a new conversation with no active persona.".to_string())
         }
         PersonaCommand::Set { name, keep_context } => {
@@ -5464,23 +6055,17 @@ fn handle_persona_command(
                 // Persistent-actor swap: rebuild the system prompt for the new
                 // role WITHOUT discarding the conversation history — same
                 // conversation, same plan file.
-                *system = rebuild_system_prompt(
+                *ctx.system = rebuild_system_prompt(
                     workspace,
-                    memory,
+                    ctx.memory,
                     active_persona.as_ref(),
-                    conversation_id,
+                    ctx.conversation_id,
                 );
                 Ok(persona_swap_kept_context_message(active_persona.as_ref()))
             } else {
                 // Swapping without keeping context starts a new conversation.
-                *conversation_id = newt_core::new_conversation_id();
-                reset_conversation(
-                    workspace,
-                    memory,
-                    system,
-                    active_persona.as_ref(),
-                    conversation_id,
-                );
+                *ctx.conversation_id = newt_core::new_conversation_id();
+                reset_conversation(workspace, active_persona.as_ref(), ctx);
                 Ok(new_conversation_message(active_persona.as_ref()))
             }
         }
@@ -7798,20 +8383,43 @@ changes). Define personas in config."
         }
         "permissions" => {
             "\
-/permissions — review prompted permission decisions + the active clamp
+/permissions — review prompted permission decisions + the active posture
 
-Read-only: what you've allowed/denied this session and the mode's authority
-floor. Durable grants are made by editing [tui.permissions] in config, not here."
+Read-only: what you've allowed/denied this session and the posture's optional
+authority floor, when configured. Durable grants are made by editing
+[tui.permissions] in config, not here."
         }
         "mode" => {
             "\
-/mode [name] — enter a named mode (skill + authority clamp)
+/mode [name] — show or choose the session's operating mode
 
-  /mode <name>   load that mode's skill and clamp authority to its floor
-  /mode          show the active mode
-  /mode off      clear it
+  /mode              show the active mode and describe every available mode
+  /mode list         same as bare /mode
+  /mode show         show only the active mode
+  /mode <name>       select chat, dev, admin, plan, diagnose, auto, or full-auto
+  /mode reset        return to chat (the default)
 
-A mode can only NARROW authority, never widen it."
+Modes guide working style. Plan may update Newt's plan ledger but cannot mutate
+the workspace; diagnose is bounded read-only research. In Auto, the model may
+select chat, dev, admin, plan, or diagnose for a later action-shaped turn;
+protected intake still wins, and only the human can select full-auto. No mode
+grants authority or bypasses the active permission posture."
+        }
+        "posture" => {
+            "\
+/posture [name] — show or choose a configured permission posture
+
+  /posture              show the active posture and configured names
+  /posture list         same as bare /posture
+  /posture show         show only the active posture
+  /posture status       same as /posture show
+  /posture <name>       preload skill/framing and apply its optional preset floor
+  /posture off          clear the active posture
+  /posture clear
+
+Configured postures continue to use [modes.<name>] entries for compatibility.
+A configured preset can only NARROW authority, never widen it; a posture with
+no preset leaves authority unchanged."
         }
         "loadout" => {
             "\
@@ -8055,9 +8663,9 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /dgx rm <model>          - delete a model from the DGX",
         "  /dgx route <task>        - recommend a formation for a task",
         "  /dgx doctor              - probe every configured endpoint",
-        "  /permissions             - prompted permission decisions + active mode clamp",
-        "  /mode <name>             - enter a named mode: load skill + clamp authority (floor)",
-        "  /mode                    - show the active mode; /mode off clears it",
+        "  /mode [name]             - show/set operating style: chat, dev, admin, plan, diagnose, auto, full-auto",
+        "  /posture [name]          - show/set configured posture; permission floor is optional",
+        "  /permissions             - prompted decisions + active permission posture",
         "  /loadout                 - show the active loadout: declared axes vs what resolved",
         "  /workspace               - show current workspace path",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
@@ -8818,18 +9426,18 @@ mod disable_ocap_session_tests {
 
     /// #774 (P0) — PURE: the operator's `[tui.permissions]` exec clamp is a
     /// NON-OPTIONAL floor, sourced into `exec_floor` even with NO active
-    /// `/mode`. This is the red→green regression for design-review F1: before
-    /// #774 the floor was sourced from the active `/mode` alone, so a configured
-    /// clamp yielded `exec_floor == None` without a `/mode`, and an out-of-clamp
-    /// command took the `--disable-ocap` bypass UNCONFINED.
+    /// `/posture`. This is the red→green regression for design-review F1: before
+    /// #774 the floor was sourced from the active posture alone, so a configured
+    /// clamp yielded `exec_floor == None` without one, and an out-of-clamp
+    /// command took the `--disable-ocap` bypass unconfined.
     #[test]
-    fn tui_permissions_exec_clamp_is_an_always_on_floor_without_mode() {
+    fn tui_permissions_exec_clamp_is_an_always_on_floor_without_posture() {
         use newt_core::caveats::{Scope, ScopeExt as _};
-        // `[tui.permissions]` configures a restrictive exec clamp; NO mode active.
+        // `[tui.permissions]` configures a restrictive exec clamp; no posture.
         let configured_exec: Scope<String> = Scope::only(["cargo".to_string(), "git".to_string()]);
-        let floor = exec_floor_from(&configured_exec, /* mode_active = */ false).expect(
+        let floor = exec_floor_from(&configured_exec, /* posture_active = */ false).expect(
             "a configured [tui.permissions] exec clamp must be an always-on floor \
-             even without a /mode — on the pre-#774 code this was None, so an \
+             even without a /posture — on the pre-#774 code this was None, so an \
              out-of-clamp command ran unconfined under --disable-ocap",
         );
         // An out-of-clamp command is NOT authorized by the floor → it can never
@@ -8844,17 +9452,18 @@ mod disable_ocap_session_tests {
     }
 
     /// #774 (P0) — PURE: the floor only NARROWS (OCAP meet-only). `None` is
-    /// returned ONLY when exec is unrestricted (`Scope::All`) AND no `/mode` is
-    /// active, leaving the unrestricted `--disable-ocap` bypass exactly as it
-    /// was pre-#307; any restriction OR any active mode yields a floor.
+    /// returned ONLY when exec is unrestricted (`Scope::All`) AND no posture
+    /// permission floor is active, leaving the unrestricted `--disable-ocap`
+    /// bypass exactly as it was pre-#307; any restriction OR configured posture
+    /// preset yields a floor.
     #[test]
-    fn exec_floor_none_only_when_unrestricted_and_no_mode() {
+    fn exec_floor_none_only_when_unrestricted_and_no_posture_floor() {
         use newt_core::caveats::Scope;
-        // Unrestricted base + no mode ⇒ no floor (pre-#307 bypass preserved).
+        // Unrestricted base + no posture preset ⇒ no floor.
         assert!(exec_floor_from(&Scope::<String>::All, false).is_none());
-        // Unrestricted base + active mode ⇒ floor present (#307 preserved).
+        // Unrestricted base + configured posture preset ⇒ floor present.
         assert!(exec_floor_from(&Scope::<String>::All, true).is_some());
-        // Restrictive base + active mode ⇒ floor present.
+        // Restrictive base + configured posture preset ⇒ floor present.
         assert!(exec_floor_from(&Scope::only(["git".to_string()]), true).is_some());
     }
 
@@ -8899,7 +9508,11 @@ mod disable_ocap_session_tests {
         assert!(banner.contains("⚠ ocap DISABLED"), "got: {banner}");
         assert!(banner.contains("--disable-ocap"), "got: {banner}");
         assert!(
-            banner.contains("commands run unconfined on the host shell"),
+            banner.contains("permitted commands may run unconfined"),
+            "got: {banner}"
+        );
+        assert!(
+            banner.contains("active exec floors can force confinement or denial"),
             "got: {banner}"
         );
     }
@@ -9202,11 +9815,11 @@ mod disable_ocap_session_tests {
         assert_eq!(state.decisions[0].kind, "fs_read");
     }
 
-    /// #307 FLOOR TEST (a) at the TUI seam: with `--disable-ocap` set, a `/mode`
+    /// #307 FLOOR TEST (a) at the TUI seam: with `--disable-ocap` set, a `/posture`
     /// readonly preset clamp STOPS the unconfined bypass for a denied exec. The
     /// preset's exec floor is threaded as `exec_floor`; `echo` is outside it, so
     /// the command does NOT run unconfined — it falls to the confined dispatch
-    /// (env-seam real shell ⇒ denied). A triage mode is NOT un-clamped by `--yolo`.
+    /// (env-seam real shell ⇒ denied). A triage posture is not un-clamped by `--yolo`.
     #[cfg(unix)]
     #[serial_test::serial(real_fs)]
     #[tokio::test]
@@ -9220,7 +9833,7 @@ mod disable_ocap_session_tests {
         let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let ws = tempfile::TempDir::new().unwrap();
         let base = caveats_no_exec(ws.path());
-        // The readonly-triage preset clamp the active mode supplies.
+        // The readonly-triage preset clamp the active posture supplies.
         let clamp = newt_core::NamedPermissionPreset {
             readonly: true,
             ..Default::default()
@@ -9721,12 +10334,445 @@ mod close_extraction_tests {
 mod skills_integration_tests;
 
 // ---------------------------------------------------------------------------
-// Named permission presets + `/mode` (issue #307). The `build_mode` core is
+// Operating modes (`/mode`). These are behavior controls, never authority
+// grants; permission floors remain the separate `/posture` concern below.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod operating_mode_tests {
+    use super::*;
+    use newt_core::agentic::PromptDisposition;
+
+    #[test]
+    fn operating_modes_have_the_canonical_names_and_human_descriptions() {
+        let names = OperatingMode::all()
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "chat",
+                "dev",
+                "admin",
+                "plan",
+                "diagnose",
+                "auto",
+                "full-auto"
+            ]
+        );
+        for mode in OperatingMode::all() {
+            assert!(
+                !mode.description().trim().is_empty(),
+                "{} needs a human-readable description",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn operating_mode_parser_accepts_canonical_names_and_safe_aliases() {
+        assert_eq!(
+            OperatingMode::from_keyword("chat"),
+            Some(OperatingMode::Chat)
+        );
+        assert_eq!(
+            OperatingMode::from_keyword("developer"),
+            Some(OperatingMode::Dev)
+        );
+        assert_eq!(
+            OperatingMode::from_keyword("sysadmin"),
+            Some(OperatingMode::Admin)
+        );
+        assert_eq!(
+            OperatingMode::from_keyword("diagnostic"),
+            Some(OperatingMode::Diagnose)
+        );
+        assert_eq!(
+            OperatingMode::from_keyword("full_auto"),
+            Some(OperatingMode::FullAuto)
+        );
+        assert_eq!(OperatingMode::from_keyword("unrestricted"), None);
+    }
+
+    #[test]
+    fn mode_command_lists_describes_sets_and_resets_without_invalid_mutation() {
+        let mut active = OperatingMode::Chat;
+        let listing = operating_mode_command_lines("", &mut active).unwrap();
+        for mode in OperatingMode::all() {
+            assert!(
+                listing
+                    .iter()
+                    .any(|line| line.contains(mode.as_str()) && line.contains(mode.description())),
+                "missing {} from {listing:?}",
+                mode.as_str()
+            );
+        }
+
+        let changed = operating_mode_command_lines("dev", &mut active).unwrap();
+        assert_eq!(active, OperatingMode::Dev);
+        assert!(changed.join("\n").contains("operating mode set to dev"));
+
+        let err = operating_mode_command_lines("god-mode", &mut active).unwrap_err();
+        assert!(err.contains("unknown /mode"));
+        assert_eq!(
+            active,
+            OperatingMode::Dev,
+            "invalid input must not change the active mode"
+        );
+
+        operating_mode_command_lines("reset", &mut active).unwrap();
+        assert_eq!(active, OperatingMode::Chat);
+    }
+
+    #[test]
+    fn plan_and_diagnose_share_one_effective_disposition_with_the_executor() {
+        let mut plan = newt_core::agentic::PromptIntake::analyze("Implement the parser change.");
+        apply_operating_mode_to_intake(OperatingMode::Plan, &mut plan);
+        assert_eq!(plan.disposition(), PromptDisposition::Plan);
+        assert!(plan.model_card().contains("disposition: plan"));
+        assert!(newt_core::agentic::tool_allowed(
+            plan.disposition(),
+            "update_plan"
+        ));
+        assert!(!newt_core::agentic::tool_allowed(
+            plan.disposition(),
+            "write_file"
+        ));
+
+        let mut diagnose =
+            newt_core::agentic::PromptIntake::analyze("Implement the parser change.");
+        apply_operating_mode_to_intake(OperatingMode::Diagnose, &mut diagnose);
+        assert_eq!(diagnose.disposition(), PromptDisposition::Research);
+        assert!(diagnose.model_card().contains("disposition: research"));
+        assert!(!newt_core::agentic::tool_allowed(
+            diagnose.disposition(),
+            "update_plan"
+        ));
+
+        let mut ask = newt_core::agentic::PromptIntake::analyze("Delete it.");
+        apply_operating_mode_to_intake(OperatingMode::Plan, &mut ask);
+        assert_eq!(
+            ask.disposition(),
+            PromptDisposition::Ask,
+            "mode must not bypass a pending human decision"
+        );
+
+        let mut research = newt_core::agentic::PromptIntake::analyze("Investigate the parser.");
+        apply_operating_mode_to_intake(OperatingMode::Dev, &mut research);
+        assert_eq!(
+            research.disposition(),
+            PromptDisposition::Research,
+            "dev must not widen a read-only intake disposition"
+        );
+    }
+
+    #[test]
+    fn explicit_action_modes_render_disposition_compatible_instructions() {
+        let cases = [
+            (
+                "Investigate the parser regression.",
+                PromptDisposition::Research,
+                OperatingMode::Diagnose,
+            ),
+            (
+                "Explain how the parser works.",
+                PromptDisposition::Explain,
+                OperatingMode::Chat,
+            ),
+        ];
+        for configured in [
+            OperatingMode::Dev,
+            OperatingMode::Admin,
+            OperatingMode::FullAuto,
+        ] {
+            for (prompt, disposition, expected) in cases {
+                let intake = newt_core::agentic::PromptIntake::analyze(prompt);
+                assert_eq!(intake.disposition(), disposition, "{prompt}");
+                let effective = effective_operating_mode(configured, &intake, false, None);
+                assert_eq!(effective, expected, "{configured:?}: {prompt}");
+                let rendered = operating_mode_prompt(configured, effective);
+                assert!(
+                    rendered.contains(&format!("effective=\"{}\"", expected.as_str())),
+                    "{rendered}"
+                );
+                if configured == OperatingMode::Admin {
+                    assert!(rendered.contains("Do no harm"), "{rendered}");
+                    assert!(rendered.contains("Respect privacy"), "{rendered}");
+                }
+            }
+
+            let mut plan_intake = newt_core::agentic::PromptIntake::analyze("Repair the parser.");
+            plan_intake.enforce_read_only(PromptDisposition::Plan);
+            assert_eq!(
+                effective_operating_mode(configured, &plan_intake, false, None),
+                OperatingMode::Plan,
+                "{configured:?} must render Plan-compatible instructions for protected Plan intake"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_selects_a_bounded_effective_mode_per_turn_and_never_full_auto() {
+        let cases = [
+            ("Implement the parser change.", OperatingMode::Dev),
+            (
+                "Investigate the parser regression.",
+                OperatingMode::Diagnose,
+            ),
+            ("Explain the parser.", OperatingMode::Chat),
+            ("Write a plan for the parser repair.", OperatingMode::Plan),
+            ("Use admin mode for this server task.", OperatingMode::Admin),
+            ("Implement plan mode support.", OperatingMode::Dev),
+            ("Fix the diagnose mode bug.", OperatingMode::Dev),
+            ("Explain plan mode.", OperatingMode::Chat),
+        ];
+        for (prompt, expected) in cases {
+            let intake = newt_core::agentic::PromptIntake::analyze(prompt);
+            let effective = effective_operating_mode(OperatingMode::Auto, &intake, false, None);
+            assert_eq!(effective, expected, "{prompt}");
+            assert_ne!(effective, OperatingMode::FullAuto, "{prompt}");
+        }
+
+        let intake = newt_core::agentic::PromptIntake::analyze("Implement the parser change.");
+        assert_eq!(
+            effective_operating_mode(OperatingMode::Auto, &intake, true, Some(OperatingMode::Dev)),
+            OperatingMode::Plan,
+            "a model-entered plan phase must be visible in the effective mode"
+        );
+    }
+
+    #[test]
+    fn auto_model_selection_applies_only_to_action_turns_and_one_conversation() {
+        let state = AutoModeState::default();
+        let control = state.bind("conversation-a");
+        let result =
+            newt_core::agentic::OperatingModeControl::select_operating_mode(&control, "admin")
+                .unwrap();
+        assert!(result.contains("next action-shaped turn"));
+        assert!(result.contains("current turn"));
+
+        let research = newt_core::agentic::PromptIntake::analyze("Investigate the parser.");
+        assert_eq!(
+            effective_operating_mode(OperatingMode::Auto, &research, false, None,),
+            OperatingMode::Diagnose,
+            "protected intake wins without consuming a stored action style"
+        );
+        assert_eq!(
+            state.pending_for("conversation-a"),
+            Some(OperatingMode::Admin)
+        );
+
+        let action = newt_core::agentic::PromptIntake::analyze("Implement the parser change.");
+        assert_eq!(
+            effective_operating_mode(
+                OperatingMode::Auto,
+                &action,
+                false,
+                state.take_for("conversation-a"),
+            ),
+            OperatingMode::Admin
+        );
+        assert_eq!(
+            state.pending_for("conversation-a"),
+            None,
+            "the model-selected style is consumed by one action turn"
+        );
+        assert_eq!(
+            effective_operating_mode(
+                OperatingMode::Auto,
+                &action,
+                false,
+                state.take_for("conversation-a"),
+            ),
+            OperatingMode::Dev,
+            "later action turns return to deterministic Auto selection"
+        );
+    }
+
+    #[test]
+    fn auto_model_selection_rejects_self_escalation() {
+        let state = AutoModeState::default();
+        let control = state.bind("conversation-a");
+        for mode in ["auto", "full-auto", "unknown"] {
+            let error =
+                newt_core::agentic::OperatingModeControl::select_operating_mode(&control, mode)
+                    .unwrap_err();
+            assert!(
+                error.contains("cannot be model-selected") || error.contains("choose one of"),
+                "{mode}: {error}"
+            );
+        }
+        assert_eq!(state.pending_for("conversation-a"), None);
+    }
+
+    #[test]
+    fn plan_and_diagnose_attenuate_caveats_while_full_auto_preserves_them() {
+        use newt_core::CaveatsExt as _;
+
+        let base = newt_core::Caveats::top();
+        for mode in [OperatingMode::Plan, OperatingMode::Diagnose] {
+            let effective = operating_mode_caveats(mode, base.clone());
+            assert!(effective.leq(&base), "{mode:?} must only attenuate");
+            assert!(effective.permits_fs_read("/workspace/src/lib.rs"));
+            assert!(!effective.permits_fs_write("/workspace/src/lib.rs"));
+            assert!(!effective.permits_exec("cargo"));
+        }
+        assert!(
+            !operating_mode_caveats(OperatingMode::Plan, base.clone()).permits_net("example.com"),
+            "Plan remains offline"
+        );
+        assert!(
+            operating_mode_caveats(OperatingMode::Diagnose, base.clone())
+                .permits_net("example.com"),
+            "Diagnose may gather remote read-only evidence"
+        );
+        assert_eq!(
+            operating_mode_caveats(OperatingMode::FullAuto, base.clone()),
+            base,
+            "full-auto changes persistence, not authority"
+        );
+    }
+
+    #[test]
+    fn mode_instructions_pin_the_human_requested_safety_contracts() {
+        let dev = OperatingMode::Dev.instructions();
+        assert!(dev.contains("TDD") && dev.contains("worktree") && dev.contains("full preflight"));
+
+        let full_auto = OperatingMode::FullAuto.instructions();
+        assert!(
+            full_auto.contains("TDD")
+                && full_auto.contains("worktree")
+                && full_auto.contains("full preflight")
+        );
+
+        let admin = OperatingMode::Admin.instructions();
+        assert!(admin.contains("Do no harm"));
+        assert!(admin.contains("Make minimal changes"));
+        assert!(admin.contains("Respect privacy"));
+        assert!(admin.contains("With great power comes great responsibility"));
+
+        let diagnose = OperatingMode::Diagnose.instructions();
+        assert!(diagnose.contains("Seek only to understand"));
+        assert!(diagnose.contains("switch to /mode plan"));
+
+        let auto = OperatingMode::Auto.instructions();
+        assert!(auto.contains("effective style"));
+        assert!(auto.contains("Ask the human"));
+        assert!(auto.contains("never selects full-auto"));
+    }
+
+    #[test]
+    fn explicit_mode_selection_clears_legacy_plan_phase_but_show_does_not() {
+        let mut active = OperatingMode::Plan;
+        let mode_states = ConversationModeStates::default();
+        let control = mode_states.auto.bind("conversation-a");
+        newt_core::agentic::OperatingModeControl::select_operating_mode(&control, "admin").unwrap();
+        newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
+
+        handle_operating_mode_command("show", &mut active, &mode_states, false, false);
+        assert!(mode_states.plan.is_active());
+        assert_eq!(
+            mode_states.auto.pending_for("conversation-a"),
+            Some(OperatingMode::Admin)
+        );
+
+        handle_operating_mode_command("dev", &mut active, &mode_states, false, false);
+        assert_eq!(active, OperatingMode::Dev);
+        assert!(
+            !mode_states.plan.is_active(),
+            "the human's explicit mode must supersede stale model plan state"
+        );
+        assert_eq!(
+            mode_states.auto.pending_for("conversation-a"),
+            None,
+            "the human's explicit mode must supersede model-selected Auto state"
+        );
+    }
+
+    #[test]
+    fn conversation_boundary_clears_plan_and_auto_state_without_resurrection() {
+        let mode_states = ConversationModeStates::default();
+
+        let a = mode_states.auto.bind("conversation-a");
+        newt_core::agentic::OperatingModeControl::select_operating_mode(&a, "admin").unwrap();
+        newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
+        mode_states.clear();
+        assert_eq!(mode_states.auto.pending_for("conversation-a"), None);
+        assert!(!mode_states.plan.is_active());
+
+        let b = mode_states.auto.bind("conversation-b");
+        newt_core::agentic::OperatingModeControl::select_operating_mode(&b, "dev").unwrap();
+        newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
+        mode_states.clear();
+        assert_eq!(
+            mode_states.auto.pending_for("conversation-b"),
+            None,
+            "A→B→A boundary sequence must not resurrect B's pending Auto selection"
+        );
+        assert_eq!(mode_states.auto.pending_for("conversation-a"), None);
+        assert!(!mode_states.plan.is_active());
+    }
+
+    #[test]
+    fn live_session_control_prompt_composes_mode_and_posture_without_stale_state() {
+        let posture = ActivePosture {
+            name: "triage".to_string(),
+            preset_name: "readonly-triage".to_string(),
+            clamp: newt_core::Caveats::top(),
+            clamp_summary: "readonly".to_string(),
+            skill_body: Some("Inspect evidence before drawing conclusions.".to_string()),
+            framing: Some("Treat this as an on-call incident.".to_string()),
+        };
+        let active = session_control_prompt(
+            OperatingMode::Diagnose,
+            OperatingMode::Diagnose,
+            Some(&posture),
+        );
+        assert!(active.contains("Operating mode: diagnose"), "{active}");
+        assert!(
+            active.contains("Active permission posture: triage"),
+            "{active}"
+        );
+        assert!(active.contains("Inspect evidence"), "{active}");
+        assert!(active.contains("on-call incident"), "{active}");
+
+        let cleared = session_control_prompt(OperatingMode::Chat, OperatingMode::Chat, None);
+        assert!(cleared.contains("Operating mode: chat"), "{cleared}");
+        assert!(!cleared.contains("triage"), "{cleared}");
+        assert!(!cleared.contains("Inspect evidence"), "{cleared}");
+
+        let auto = session_control_prompt(OperatingMode::Auto, OperatingMode::Dev, None);
+        assert!(auto.contains("Configured session mode: auto"), "{auto}");
+        assert!(
+            auto.contains("Effective working style for this turn: dev"),
+            "{auto}"
+        );
+        assert!(auto.contains("select_operating_mode"), "{auto}");
+        assert!(
+            auto.contains(OperatingMode::Dev.instructions()),
+            "effective instructions must be rendered: {auto}"
+        );
+        assert!(
+            !auto.contains(OperatingMode::Auto.instructions()),
+            "configured metadata must not emit conflicting behavioral instructions: {auto}"
+        );
+
+        let overridden = session_control_prompt(OperatingMode::Dev, OperatingMode::Plan, None);
+        assert!(overridden.contains(OperatingMode::Plan.instructions()));
+        assert!(
+            !overridden.contains(OperatingMode::Dev.instructions()),
+            "legacy Plan must not be paired with conflicting Dev instructions: {overridden}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Named permission presets + `/posture` (issue #307). The `build_posture` core is
 // pure (config + an injected skill loader), so the atomic preload-skill +
 // apply-preset + framing contract is exercised here without a live session.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-mod mode_command_tests {
+mod posture_command_tests {
     use super::*;
     use newt_core::CaveatsExt as _;
     use std::fs;
@@ -9773,12 +10819,89 @@ mod mode_command_tests {
         cfg
     }
 
-    /// The acceptance criterion: `/mode <name>` loads the skill body AND
+    #[test]
+    fn posture_status_lists_active_and_available_names() {
+        let mut cfg = newt_core::Config::default();
+        cfg.modes.insert(
+            "triage".to_string(),
+            newt_core::config::ModeConfig {
+                skill: None,
+                preset: Some("readonly-triage".to_string()),
+                framing: None,
+            },
+        );
+        cfg.modes.insert(
+            "coach".to_string(),
+            newt_core::config::ModeConfig {
+                skill: None,
+                preset: None,
+                framing: Some("Ask before acting.".to_string()),
+            },
+        );
+        let active = ActivePosture {
+            name: "triage".to_string(),
+            preset_name: "readonly-triage".to_string(),
+            clamp: newt_core::Caveats::top(),
+            clamp_summary: "read-only".to_string(),
+            skill_body: None,
+            framing: None,
+        };
+
+        assert_eq!(
+            posture_status_lines(&cfg, Some(&active), true),
+            vec![
+                "active permission posture: triage — preset 'readonly-triage' floor: read-only",
+                "available permission postures: coach, triage",
+            ]
+        );
+        assert_eq!(
+            posture_status_lines(&cfg, Some(&active), false),
+            vec!["active permission posture: triage — preset 'readonly-triage' floor: read-only"]
+        );
+    }
+
+    #[test]
+    fn posture_status_reports_an_empty_configuration() {
+        let cfg = newt_core::Config::default();
+        assert_eq!(
+            posture_status_lines(&cfg, None, true),
+            vec![
+                "no active permission posture",
+                "available permission postures: (none configured — define [modes.<name>] in your newt config)",
+            ]
+        );
+    }
+
+    #[test]
+    fn posture_without_preset_carries_guidance_without_changing_authority() {
+        let mut cfg = newt_core::Config::default();
+        cfg.modes.insert(
+            "coach".to_string(),
+            newt_core::config::ModeConfig {
+                skill: None,
+                preset: None,
+                framing: Some("Ask before acting.".to_string()),
+            },
+        );
+        let posture =
+            build_posture("coach", &cfg, |_| panic!("no skill should be loaded")).unwrap();
+        let base = newt_core::Caveats::top();
+
+        assert!(posture.permission_clamp().is_none());
+        assert_eq!(effective_caveats(&base, Some(&posture)), base);
+        assert_eq!(posture.framing.as_deref(), Some("Ask before acting."));
+        assert!(
+            posture_prompt(&posture).contains("no configured permission floor"),
+            "the model must not be told that a guidance-only posture clamps authority"
+        );
+    }
+
+    /// The acceptance criterion: `/posture <name>` loads the skill body AND
     /// applies the preset clamp in ONE invocation. Uses the real `use_skill`
     /// loader (`load_body_from`) over a mock skills dir — no reimplementation.
     #[serial_test::serial(real_fs)]
     #[test]
-    fn build_mode_loads_skill_body_and_applies_preset_atomically() {
+    fn build_posture_loads_skill_body_and_applies_preset_atomically() {
         // `skill_search_dirs()` appends the HOME-relative `~/.newt/skills`, so
         // hold the env read guard: the cw-400 test (this binary) swaps HOME
         // under a write guard, and a mid-test swap would change what
@@ -9789,39 +10912,39 @@ mod mode_command_tests {
         let cfg = triage_config(skills.path());
         let dirs = cfg.skill_search_dirs();
 
-        let app = build_mode("triage", &cfg, |name| {
+        let posture = build_posture("triage", &cfg, |name| {
             newt_skills::load_body_from(&dirs, name)
         })
-        .expect("the mode resolves");
+        .expect("the posture resolves");
 
         // (a) the skill body was preloaded (same payload as use_skill).
-        let body = app.skill_body.expect("skill body");
+        let body = posture.skill_body.as_deref().expect("skill body");
         assert!(body.contains("Read logs. Do not deploy."), "got: {body}");
         // (b) the preset clamp is applied as a floor.
-        assert_eq!(app.mode.preset_name, "readonly-triage");
-        assert!(!app.mode.clamp.permits_fs_write("/anything"), "readonly");
-        assert!(app.mode.clamp.permits_exec("git"), "allow-listed exec");
-        assert!(!app.mode.clamp.permits_exec("rm"), "deny everything else");
-        assert!(!app.mode.clamp.permits_net("evil.example.com"), "deny=*");
+        assert_eq!(posture.preset_name, "readonly-triage");
+        assert!(!posture.clamp.permits_fs_write("/anything"), "readonly");
+        assert!(posture.clamp.permits_exec("git"), "allow-listed exec");
+        assert!(!posture.clamp.permits_exec("rm"), "deny everything else");
+        assert!(!posture.clamp.permits_net("evil.example.com"), "deny=*");
         // (c) the framing is carried for system-prompt injection.
         assert_eq!(
-            app.framing.as_deref(),
+            posture.framing.as_deref(),
             Some("On-call triage: investigate, do not change prod.")
         );
     }
 
-    /// Atomic-or-nothing: a mode naming a missing preset is an ERROR — never a
+    /// Atomic-or-nothing: a posture naming a missing preset is an ERROR — never a
     /// silent skill-load without the clamp (that would be a false claim).
     #[serial_test::serial(real_fs)]
     #[test]
-    fn build_mode_errors_when_the_preset_is_missing() {
+    fn build_posture_errors_when_the_preset_is_missing() {
         let _env = crate::test_env_guard::env_read_guard(); // HOME-stable: see sibling above
         let skills = tempfile::TempDir::new().unwrap();
         write_skill(skills.path(), "oncall-triage", "body");
         let mut cfg = triage_config(skills.path());
         cfg.permission_presets.clear(); // preset gone, mode still references it
         let dirs = cfg.skill_search_dirs();
-        let err = build_mode("triage", &cfg, |name| {
+        let err = build_posture("triage", &cfg, |name| {
             newt_skills::load_body_from(&dirs, name)
         })
         .unwrap_err()
@@ -9832,16 +10955,16 @@ mod mode_command_tests {
         );
     }
 
-    /// A mode naming a missing skill is an ERROR for the same reason — the
-    /// clamp must not apply without the guidance the mode promised.
+    /// A posture naming a missing skill is an ERROR for the same reason — the
+    /// clamp must not apply without its promised guidance.
     #[serial_test::serial(real_fs)]
     #[test]
-    fn build_mode_errors_when_the_skill_is_missing() {
+    fn build_posture_errors_when_the_skill_is_missing() {
         let _env = crate::test_env_guard::env_read_guard(); // HOME-stable: see sibling above
         let skills = tempfile::TempDir::new().unwrap(); // empty — no skill
         let cfg = triage_config(skills.path());
         let dirs = cfg.skill_search_dirs();
-        let err = build_mode("triage", &cfg, |name| {
+        let err = build_posture("triage", &cfg, |name| {
             newt_skills::load_body_from(&dirs, name)
         })
         .unwrap_err()
@@ -9852,36 +10975,38 @@ mod mode_command_tests {
         );
     }
 
-    /// An unknown mode name is an error (no `[modes.<name>]`).
+    /// An unknown posture name is an error (no compatibility `[modes.<name>]`).
     #[test]
-    fn build_mode_errors_on_unknown_mode() {
+    fn build_posture_errors_on_unknown_posture() {
         let cfg = newt_core::Config::default();
-        let err = build_mode("nope", &cfg, |_| Ok(String::new()))
+        let err = build_posture("nope", &cfg, |_| Ok(String::new()))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unknown mode"), "got: {err}");
+        assert!(err.contains("unknown posture"), "got: {err}");
     }
 
-    /// The applied mode's effective caveats are base ∩ clamp — strictly
+    /// The applied posture's effective caveats are base ∩ clamp — strictly
     /// attenuated, the floor property at the wiring level.
     #[test]
-    fn effective_caveats_intersect_base_with_the_mode_clamp() {
+    fn effective_caveats_intersect_base_with_the_posture_clamp() {
         let clamp = newt_core::NamedPermissionPreset {
             readonly: true,
             ..Default::default()
         }
         .clamp();
-        let mode = ActiveMode {
+        let posture = ActivePosture {
             name: "triage".to_string(),
             preset_name: "readonly-triage".to_string(),
             clamp_summary: "readonly".to_string(),
             clamp,
+            skill_body: None,
+            framing: None,
         };
         let base = newt_core::Caveats::top();
-        let eff = effective_caveats(&base, Some(&mode));
-        assert!(eff.leq(&base), "the mode can only attenuate");
+        let eff = effective_caveats(&base, Some(&posture));
+        assert!(eff.leq(&base), "the posture can only attenuate");
         assert!(!eff.permits_fs_write("/x"), "readonly clamp applied");
-        // No mode ⇒ base unchanged (bit-for-bit).
+        // No posture ⇒ base unchanged (bit-for-bit).
         assert_eq!(effective_caveats(&base, None), base);
     }
 }
@@ -10033,6 +11158,8 @@ mod tool_round_cap_tests {
                     live_tool_output: None,
                     git_tool: None,
                     crew_runner: None,
+                    operating_mode_control: None,
+                    plan_mode_control: None,
                 },
                 &mut Mcp::empty(),
             )
@@ -10410,32 +11537,33 @@ mod persona_helper_tests {
         ));
         let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session");
         let mut active_conversation_id = String::from("test-session");
+        let mode_states = ConversationModeStates::default();
 
         // show: reports the active persona, does not reset anything.
-        let msg = handle_persona_command(
-            "/persona show",
-            workspace,
-            &store,
-            &mut memory,
-            &mut system,
-            &mut active,
-            &mut active_conversation_id,
-        )
-        .unwrap();
+        let msg = {
+            let mut ctx = ConversationResetContext {
+                memory: &mut memory,
+                system: &mut system,
+                conversation_id: &mut active_conversation_id,
+                mode_states: &mode_states,
+            };
+            handle_persona_command("/persona show", workspace, &store, &mut active, &mut ctx)
+                .unwrap()
+        };
         assert!(msg.contains("Active persona: terse"));
         assert!(active.is_some(), "show must not clear the persona");
 
         // clear: drops the persona and starts a fresh conversation.
-        let msg = handle_persona_command(
-            "/persona clear",
-            workspace,
-            &store,
-            &mut memory,
-            &mut system,
-            &mut active,
-            &mut active_conversation_id,
-        )
-        .unwrap();
+        let msg = {
+            let mut ctx = ConversationResetContext {
+                memory: &mut memory,
+                system: &mut system,
+                conversation_id: &mut active_conversation_id,
+                mode_states: &mode_states,
+            };
+            handle_persona_command("/persona clear", workspace, &store, &mut active, &mut ctx)
+                .unwrap()
+        };
         assert_eq!(msg, "Started a new conversation with no active persona.");
         assert!(active.is_none());
         assert!(!system.contains("Active persona: terse"));
@@ -10549,17 +11677,24 @@ mod persona_helper_tests {
         let mut active: Option<Persona> = None;
         let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session");
         let mut active_conversation_id = String::from("test-session");
+        let mode_states = ConversationModeStates::default();
 
-        let msg = handle_persona_command(
-            "/persona set terse --keep-context",
-            workspace,
-            &store,
-            &mut memory,
-            &mut system,
-            &mut active,
-            &mut active_conversation_id,
-        )
-        .unwrap();
+        let msg = {
+            let mut ctx = ConversationResetContext {
+                memory: &mut memory,
+                system: &mut system,
+                conversation_id: &mut active_conversation_id,
+                mode_states: &mode_states,
+            };
+            handle_persona_command(
+                "/persona set terse --keep-context",
+                workspace,
+                &store,
+                &mut active,
+                &mut ctx,
+            )
+            .unwrap()
+        };
         assert!(msg.contains("kept conversation context"), "got: {msg}");
         assert_eq!(active.as_ref().unwrap().name, "terse");
         // History survives the swap.
@@ -10570,16 +11705,22 @@ mod persona_helper_tests {
         );
 
         // Without the flag, the same swap resets the conversation.
-        let _ = handle_persona_command(
-            "/persona set terse",
-            workspace,
-            &store,
-            &mut memory,
-            &mut system,
-            &mut active,
-            &mut active_conversation_id,
-        )
-        .unwrap();
+        {
+            let mut ctx = ConversationResetContext {
+                memory: &mut memory,
+                system: &mut system,
+                conversation_id: &mut active_conversation_id,
+                mode_states: &mode_states,
+            };
+            handle_persona_command(
+                "/persona set terse",
+                workspace,
+                &store,
+                &mut active,
+                &mut ctx,
+            )
+            .unwrap();
+        }
         let messages = memory.build_messages(&system, "new task");
         assert!(
             !messages.iter().any(|m| m.content == "old task"),

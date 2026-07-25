@@ -426,21 +426,11 @@ fn shadow_records(host_bypass: bool, full_access: bool) -> bool {
     host_bypass || full_access
 }
 
-/// #1193: is the session in the read-only PLAN phase? Set by `enter_plan_mode`,
-/// cleared by `exit_plan_mode`. Env-signalled like [`ocap_disabled`] /
-/// [`full_access_requested`] so the TUI can read it when resolving per-turn
-/// caveats (it MEETs the read-only clamp in, which only narrows authority —
-/// the model voluntarily restricting itself is always safe). Value must be
-/// exactly "1".
-pub fn in_plan_phase() -> bool {
-    std::env::var("NEWT_PLAN_PHASE").is_ok_and(|v| v == "1")
-}
-
 /// The read-only authority a plan phase clamps the session to (#1193): reads
 /// everywhere, but NO writes, NO exec, NO net. MEETing this into the session
 /// caveats enforces "planning is read-only" — the design's safety guarantee,
-/// not the model's good intentions. `net`/max_calls left permissive here; the
-/// TUI `meet` intersects with the real session net so nothing widens.
+/// not the model's good intentions. The call-count and generation bounds stay
+/// permissive here; the TUI `meet` still preserves any tighter session limits.
 pub fn plan_phase_clamp() -> crate::caveats::Caveats {
     use crate::caveats::{CountBound, Scope};
     crate::caveats::Caveats {
@@ -472,11 +462,12 @@ pub fn routing_disabled() -> bool {
     std::env::var("NEWT_NO_ROUTE").is_ok_and(|v| v == "1")
 }
 
-/// #307: does the named-permission-preset exec FLOOR permit running `cmd` on
-/// the UNCONFINED host shell?
+/// Does the caller's effective exec FLOOR permit running `cmd` on the
+/// UNCONFINED host shell?
 ///
-/// `None` ⇒ no preset is active; the floor imposes nothing, so the answer is
-/// `true` (the `--disable-ocap` bypass behaves exactly as it did pre-#307).
+/// `None` means the caller found no effective exec floor after composing the
+/// session, posture, mode, and persona constraints. The floor therefore
+/// imposes nothing and the `--disable-ocap` bypass behaves as it did pre-#307.
 ///
 /// `Some(scope)` ⇒ the bypass may proceed ONLY for a single, simple command
 /// whose program (leading token) the scope authorizes. This is deliberately
@@ -492,12 +483,12 @@ pub fn routing_disabled() -> bool {
 ///    anything else is denied.
 ///
 /// The denied command isn't refused outright — it falls to the confined-shell
-/// path, which enforces the (already preset-clamped) `caveats`. So a restricted
-/// triage/on-call mode keeps its ceiling even under `--yolo`.
+/// path, which enforces the already-composed effective `caveats`. Every active
+/// exec floor therefore keeps its ceiling even under `--yolo`.
 fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) -> bool {
     use crate::caveats::ScopeExt as _;
     let Some(scope) = floor else {
-        return true; // no preset ⇒ bypass unchanged (bit-for-bit)
+        return true; // no effective exec floor ⇒ bypass unchanged
     };
     // Conservative: any shell control/redirection metacharacter that could
     // introduce a second program defeats leading-token matching, so refuse the
@@ -1928,6 +1919,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "web_fetch" => string("url", ""),
         "request_permissions" => string("capability", ""),
         "request_user_input" => string("question", ""),
+        "select_operating_mode" => string("mode", ""),
         "prompt_read" | "artifact_read" => string("address", "current"),
         "tool_search" | "recall" | "code_search" | "experience_recall" => string("query", ""),
         "where_is" => string("symbol", ""),
@@ -2409,6 +2401,8 @@ pub(crate) struct ToolCollaborators<'a> {
     pub(crate) where_is: Option<&'a crate::where_is::WhereIsIndex>,
     pub(crate) experience_store: Option<&'a dyn super::experiential::ExperienceStore>,
     pub(crate) step_ledger: Option<&'a dyn super::scheduled::StepLedger>,
+    pub(crate) operating_mode_control: Option<&'a dyn super::OperatingModeControl>,
+    pub(crate) plan_mode_control: Option<&'a dyn super::PlanModeControl>,
     pub(crate) spill_store: Option<&'a dyn SpillStore>,
     pub(crate) persona_tools: Option<&'a [String]>,
     pub(crate) live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
@@ -2819,10 +2813,24 @@ async fn execute_tool_inner(
         where_is,
         experience_store,
         step_ledger,
+        operating_mode_control,
+        plan_mode_control,
         spill_store,
         persona_tools,
         live_tool_output,
     } = collab;
+
+    // A model-entered Plan phase takes effect immediately for every later
+    // tool call in the same inference round. The outer TUI also resolves it
+    // into Plan caveats on the next turn; this local clamp closes the
+    // enter-then-write gap before that boundary is rebuilt.
+    let disposition = if plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode)
+        && disposition == PromptDisposition::Act
+    {
+        PromptDisposition::Plan
+    } else {
+        disposition
+    };
 
     // Prompt-comprehension boundary: enforce the validated disposition BEFORE
     // every other routing or grant path. In particular, unknown names (including
@@ -2858,7 +2866,8 @@ async fn execute_tool_inner(
     // active persona does not grant, before any routing (alias, run_command
     // redirect). Checked against the CANONICAL name (aliases resolved first) so a
     // denied tool can't slip past under a foreign spelling; the always-on infra
-    // tools ([`is_always_on_tool`]) always pass or the loop would wedge.
+    // tools (always-on infrastructure plus presence-gated session controls)
+    // always pass or the loop could wedge.
     //
     // Remote MCP tools are EXCLUDED here (FR-2, #1001): they carry no fs/exec/net
     // axis, so instead of a hard veto they fall through to the `mcp.handles`
@@ -3096,23 +3105,45 @@ async fn execute_tool_inner(
             None => "unknown tool: update_plan (scheduled planning is off)".to_string(),
         },
 
-        // #1193: enter/exit the read-only PLAN phase. The env flag is read by
-        // the TUI when resolving per-turn caveats (it MEETs plan_phase_clamp,
-        // which only narrows authority — self-restriction is always safe). The
-        // clamp takes effect on the NEXT turn; this turn's remaining calls stay
-        // under the current authority.
-        "enter_plan_mode" => {
-            // SAFETY: single-threaded session tool dispatch; the TUI reads it
-            // between turns (same pattern as NEWT_FULL_ACCESS / NEWT_DISABLE_OCAP).
-            unsafe { std::env::set_var("NEWT_PLAN_PHASE", "1") };
-            "entered PLAN MODE (read-only): writes are denied until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute."
-                .to_string()
-        }
-        "exit_plan_mode" => {
-            // SAFETY: as above.
-            unsafe { std::env::remove_var("NEWT_PLAN_PHASE") };
-            "exited PLAN MODE: writes re-enabled. Execute your plan step by step, marking each done with update_plan as you go."
-                .to_string()
+        // #1193: enter/exit the session-local, read-only Plan phase. The
+        // dispatcher consults the same collaborator before every call, so a
+        // successful enter clamps later calls in this model tool round.
+        "enter_plan_mode" => match (plan_mode_control, step_ledger) {
+            (Some(control), Some(_)) => match control.set_plan_mode(true) {
+                Ok(()) => "entered PLAN MODE (read-only): subsequent tool calls are immediately limited to Plan reads and the plan ledger until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute.".to_string(),
+                Err(error) => format!("error: enter_plan_mode: {error}"),
+            },
+            _ => {
+                "unknown tool: enter_plan_mode (scheduled planning and a session Plan-mode control are both required)".to_string()
+            }
+        },
+        "exit_plan_mode" => match plan_mode_control {
+            Some(control) => match control.set_plan_mode(false) {
+                Ok(()) => "exited the model-entered PLAN PHASE. Subsequent tool calls return to this turn's validated disposition and underlying session permissions; the next outer turn returns to the human-selected operating mode. `/mode plan` and other clamps still remain read-only.".to_string(),
+                Err(error) => format!("error: exit_plan_mode: {error}"),
+            },
+            None => {
+                "unknown tool: exit_plan_mode (no session Plan-mode control is available)"
+                    .to_string()
+            }
+        },
+        // `/mode auto`: schedule a bounded working-style transition for a
+        // future turn. The injected collaborator owns session-local state;
+        // this call cannot alter the current disposition or caveats.
+        "select_operating_mode" => {
+            let mode = args
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match operating_mode_control {
+                Some(control) => control
+                    .select_operating_mode(mode)
+                    .unwrap_or_else(|error| format!("error: select_operating_mode: {error}")),
+                None => {
+                    "unknown tool: select_operating_mode (available only while /mode auto is active)"
+                        .to_string()
+                }
+            }
         }
         // #716: read-only plan view (the alias target for "what was I doing?"
         // probes) — same presence gate as update_plan.
@@ -3180,6 +3211,9 @@ async fn execute_tool_inner(
                     code_search.is_some(),
                     experience_store.is_some(),
                     step_ledger.is_some(),
+                    operating_mode_control.is_some(),
+                    plan_mode_control.is_some(),
+                    plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode),
                 ),
                 persona_tools,
             );
@@ -4869,7 +4903,8 @@ mod tests {
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
         let merged = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let names: Vec<&str> = merged
             .as_array()
@@ -4932,8 +4967,9 @@ mod tests {
     /// catalog whole (the zero-cost path for every non-persona session).
     #[test]
     fn persona_allow_list_filters_the_advertised_catalog() {
-        let full =
-            merged_tool_definitions(&NoMcp, true, true, true, true, true, true, true, true, true);
+        let full = merged_tool_definitions(
+            &NoMcp, true, true, true, true, true, true, true, true, true, true, true, true,
+        );
         let name_set = |v: &serde_json::Value| -> Vec<String> {
             v.as_array()
                 .unwrap()
@@ -4971,10 +5007,11 @@ mod tests {
             "get_context_remaining",
             "request_user_input",
             "lifecycle",
+            "select_operating_mode",
         ] {
             assert!(
                 got.iter().any(|n| n == infra),
-                "{infra} is always-on and must survive any persona"
+                "{infra} is session infrastructure and must survive any persona"
             );
         }
     }
@@ -4990,6 +5027,10 @@ mod tests {
         assert!(
             persona_tool_allowed("request_user_input", &allow),
             "always-on infra → allowed even when unlisted"
+        );
+        assert!(
+            persona_tool_allowed("select_operating_mode", &allow),
+            "presence-gated session control → allowed even when unlisted"
         );
         assert!(
             !persona_tool_allowed("write_file", &allow),
@@ -5010,6 +5051,9 @@ mod tests {
             { "type": "function", "function": { "name": "read_file" } },
             { "type": "function", "function": { "name": "write_file" } },
             { "type": "function", "function": { "name": "run_command" } },
+            { "type": "function", "function": { "name": "update_plan" } },
+            { "type": "function", "function": { "name": "exit_plan_mode" } },
+            { "type": "function", "function": { "name": "select_operating_mode" } },
             { "type": "function", "function": { "name": "request_permissions" } },
             { "type": "function", "function": { "name": "incident__read" } },
             { "not": "a callable definition" }
@@ -5024,8 +5068,42 @@ mod tests {
         };
 
         let research = filter_tools_for_disposition(defs.clone(), PromptDisposition::Research);
-        assert_eq!(names(&research), vec!["read_file"]);
+        assert_eq!(names(&research), vec!["read_file", "select_operating_mode"]);
+        let plan = filter_tools_for_disposition(defs.clone(), PromptDisposition::Plan);
+        assert_eq!(
+            names(&plan),
+            vec![
+                "read_file",
+                "update_plan",
+                "exit_plan_mode",
+                "select_operating_mode"
+            ]
+        );
         assert!(tool_allowed(PromptDisposition::Explain, "read_file"));
+        assert!(tool_allowed(PromptDisposition::Plan, "update_plan"));
+        assert!(!tool_allowed(PromptDisposition::Explain, "update_plan"));
+        assert!(!tool_allowed(PromptDisposition::Research, "update_plan"));
+        assert!(tool_allowed(PromptDisposition::Plan, "exit_plan_mode"));
+        assert!(
+            !tool_allowed(PromptDisposition::Plan, "web_fetch"),
+            "offline Plan must not advertise a tool its caveat always denies"
+        );
+        assert!(
+            tool_allowed(PromptDisposition::Research, "web_fetch"),
+            "Research (including Diagnose) may gather remote read-only evidence"
+        );
+        assert!(tool_allowed(
+            PromptDisposition::Research,
+            "select_operating_mode"
+        ));
+        assert!(tool_allowed(
+            PromptDisposition::Plan,
+            "select_operating_mode"
+        ));
+        assert!(!tool_allowed(
+            PromptDisposition::Ask,
+            "select_operating_mode"
+        ));
         assert!(!tool_allowed(PromptDisposition::Explain, "write_file"));
         assert!(!tool_allowed(PromptDisposition::Research, "incident__read"));
         assert!(!tool_allowed(PromptDisposition::Ask, "read_file"));
@@ -5218,8 +5296,9 @@ mod tests {
     /// fails here.
     #[test]
     fn advertised_set_matches_all_tool_names_both_directions() {
-        let all =
-            merged_tool_definitions(&NoMcp, true, true, true, true, true, true, true, true, true);
+        let all = merged_tool_definitions(
+            &NoMcp, true, true, true, true, true, true, true, true, true, true, true, true,
+        );
         let advertised: std::collections::HashSet<&str> = all
             .as_array()
             .unwrap()
@@ -5361,12 +5440,14 @@ mod tests {
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
         let with = merged_tool_definitions(
-            &NoMcp, true, false, false, false, false, false, false, false, false,
+            &NoMcp, true, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
@@ -5386,16 +5467,19 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"recall"), "got: {base}");
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(!names(&without).contains(&"recall"));
         let with = merged_tool_definitions(
-            &NoMcp, false, true, false, false, false, false, false, false, false,
+            &NoMcp, false, true, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&with).contains(&"recall"), "got: {with}");
         // The two gates are independent: both on advertises both.
         let both = merged_tool_definitions(
-            &NoMcp, true, true, false, false, false, false, false, false, false,
+            &NoMcp, true, true, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&both).contains(&"save_note"));
         assert!(names(&both).contains(&"recall"));
@@ -5417,17 +5501,19 @@ mod tests {
         assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
         // Flag off (every existing caller, the inert default) → not advertised.
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(!names(&without).contains(&"memory_fetch"));
         // Flag on → advertised.
         let with = merged_tool_definitions(
-            &NoMcp, false, false, true, false, false, false, false, false, false,
+            &NoMcp, false, false, true, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
         // Independent of the save_note / recall gates: all three on lists all.
         let all = merged_tool_definitions(
-            &NoMcp, true, true, true, false, false, false, false, false, false,
+            &NoMcp, true, true, true, false, false, false, false, false, false, false, false, false,
         );
         assert!(names(&all).contains(&"save_note"));
         assert!(names(&all).contains(&"recall"));
@@ -6155,16 +6241,19 @@ mod tests {
                 .collect()
         }
         let with = merged_tool_definitions(
-            &NoMcp, false, false, false, true, false, false, false, false, false,
+            &NoMcp, false, false, false, true, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&with).contains(&"git"), "with_git advertises git");
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(!names(&without).contains(&"git"), "no git without the gate");
         // #479: the /team toggle advertises both crew tools, and only then.
         let team = merged_tool_definitions(
-            &NoMcp, false, false, false, false, true, false, false, false, false,
+            &NoMcp, false, false, false, false, true, false, false, false, false, false, false,
+            false,
         );
         assert!(
             names(&team).contains(&"crew") && names(&team).contains(&"compose_roster"),
@@ -6176,7 +6265,8 @@ mod tests {
         );
         // Step 26.4 (#583): the scratchpad state tools, only with the gate on.
         let scratch = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, true, false, false, false,
+            &NoMcp, false, false, false, false, false, true, false, false, false, false, false,
+            false,
         );
         for t in ["state_set", "state_get", "state_clear"] {
             assert!(
@@ -6191,7 +6281,8 @@ mod tests {
         }
         // Step 26.5.5 (#582): the code_search tool, only with its gate on.
         let code = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, true, false, false,
+            &NoMcp, false, false, false, false, false, false, true, false, false, false, false,
+            false,
         );
         assert!(
             names(&code).contains(&"code_search"),
@@ -6204,7 +6295,8 @@ mod tests {
         assert!(!is_hallucination("code_search", &serde_json::json!({})));
         // Step 26.6a (#585): the experiential record/recall tools, only with the gate.
         let exp = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, true, false,
+            &NoMcp, false, false, false, false, false, false, false, true, false, false, false,
+            false,
         );
         for t in ["experience_record", "experience_recall"] {
             assert!(names(&exp).contains(&t), "{t} advertised with_experiential");
@@ -6217,7 +6309,8 @@ mod tests {
         // Step 26.6b (#586) / #715 PR2: the scheduled update_plan + plan_get tools,
         // only with the gate (plan_set/plan_advance collapsed into update_plan).
         let sched = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, true,
+            &NoMcp, false, false, false, false, false, false, false, false, true, false, false,
+            false,
         );
         for t in ["update_plan", "plan_get"] {
             assert!(names(&sched).contains(&t), "{t} advertised with_scheduled");
@@ -6227,6 +6320,75 @@ mod tests {
                 "{t} is a real tool"
             );
         }
+        for t in ["enter_plan_mode", "exit_plan_mode"] {
+            assert!(
+                !names(&sched).contains(&t),
+                "{t} needs a session Plan control as well as the scheduled ledger"
+            );
+        }
+        let plan_control_only = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, true,
+            false,
+        );
+        assert!(
+            !names(&plan_control_only).contains(&"enter_plan_mode"),
+            "enter_plan_mode needs scheduled planning as well as the session control"
+        );
+        assert!(
+            !names(&plan_control_only).contains(&"exit_plan_mode"),
+            "an inactive control must not advertise an unnecessary exit"
+        );
+        let active_plan_control = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, true,
+            true,
+        );
+        assert!(
+            !names(&active_plan_control).contains(&"enter_plan_mode"),
+            "enter still requires the scheduled ledger"
+        );
+        assert!(
+            names(&active_plan_control).contains(&"exit_plan_mode"),
+            "an active Plan phase must keep exit available if scheduled planning is toggled off"
+        );
+        let plan_ready_inactive = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, true, false, true,
+            false,
+        );
+        assert!(
+            names(&plan_ready_inactive).contains(&"enter_plan_mode"),
+            "scheduled planning plus a control advertises enter"
+        );
+        assert!(
+            names(&plan_ready_inactive).contains(&"exit_plan_mode"),
+            "a frozen multi-round catalog that advertises enter must also advertise same-turn exit"
+        );
+        let plan_mode = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, true, false, true, true,
+        );
+        for t in ["enter_plan_mode", "exit_plan_mode"] {
+            assert!(
+                names(&plan_mode).contains(&t),
+                "{t} is advertised when both required seams are present"
+            );
+        }
+        // `/mode auto`: the model-facing selector exists only when the
+        // session injects its bounded next-turn control.
+        let operating_mode = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false, true, false,
+            false,
+        );
+        assert!(
+            names(&operating_mode).contains(&"select_operating_mode"),
+            "auto-mode control advertises its selector"
+        );
+        assert!(
+            !names(&without).contains(&"select_operating_mode"),
+            "selector is hidden outside /mode auto"
+        );
+        assert!(!is_hallucination(
+            "select_operating_mode",
+            &serde_json::json!({})
+        ));
     }
 
     #[tokio::test]
@@ -6677,32 +6839,30 @@ mod execute_tool_branch_tests {
 
     async fn run_scheduled_tool(
         name: &str,
+        args: &serde_json::Value,
         ws: &tempfile::TempDir,
         ledger: &crate::agentic::scheduled::SessionStepLedger,
+        plan_mode_control: &dyn crate::agentic::PlanModeControl,
     ) -> String {
-        execute_tool(
+        execute_tool_with_collaborators(
             name,
-            &serde_json::json!({}),
+            args,
             &ws.path().to_string_lossy(),
             false,
             20,
             &caveats_rw(ws.path()),
             &mut NoMcp,
+            ToolCollaborators {
+                step_ledger: Some(ledger as &dyn crate::agentic::scheduled::StepLedger),
+                plan_mode_control: Some(plan_mode_control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(ledger as &dyn crate::agentic::scheduled::StepLedger),
         )
         .await
+        .expect("test dispatch is not cancellable")
     }
 
     async fn run_git(
@@ -6820,21 +6980,124 @@ mod execute_tool_branch_tests {
     }
 
     #[tokio::test]
-    async fn enter_and_exit_plan_mode_toggle_the_phase_flag() {
-        // enter_plan_mode / exit_plan_mode are REAL tools that flip the
-        // read-only-phase env the TUI reads when clamping caveats (#1193).
+    async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
+        use crate::agentic::PlanModeControl as _;
+
+        #[derive(Default)]
+        struct TestPlanModeControl(std::sync::atomic::AtomicBool);
+
+        impl crate::agentic::PlanModeControl for TestPlanModeControl {
+            fn is_plan_mode(&self) -> bool {
+                self.0.load(std::sync::atomic::Ordering::Acquire)
+            }
+
+            fn set_plan_mode(&self, active: bool) -> Result<(), String> {
+                self.0.store(active, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        }
+
+        // enter_plan_mode / exit_plan_mode mutate only their injected session
+        // control; there is no process-global flag shared with another session.
         let ws = tempfile::TempDir::new().unwrap();
-        // Ensure a clean starting state.
-        // SAFETY: single-threaded test.
-        unsafe { std::env::remove_var("NEWT_PLAN_PHASE") };
-        assert!(!in_plan_phase());
         let ledger = crate::agentic::scheduled::SessionStepLedger::default();
-        let enter = run_scheduled_tool("enter_plan_mode", &ws, &ledger).await;
+        let control = TestPlanModeControl::default();
+        let other_session = TestPlanModeControl::default();
+        assert!(!control.is_plan_mode());
+        let control_only = execute_tool_with_collaborators(
+            "enter_plan_mode",
+            &serde_json::json!({}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats_rw(ws.path()),
+            &mut NoMcp,
+            ToolCollaborators {
+                plan_mode_control: Some(&control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .expect("test dispatch is not cancellable");
+        assert!(
+            control_only.contains("scheduled planning"),
+            "control-only fabricated call must fail honestly: {control_only}"
+        );
+        assert!(
+            !control.is_plan_mode(),
+            "a control without a plan ledger must not enter Plan"
+        );
+        let control_only_exit = execute_tool_with_collaborators(
+            "exit_plan_mode",
+            &serde_json::json!({}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats_rw(ws.path()),
+            &mut NoMcp,
+            ToolCollaborators {
+                plan_mode_control: Some(&control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Plan,
+            None,
+        )
+        .await
+        .expect("test dispatch is not cancellable");
+        assert!(
+            control_only_exit.contains("exited the model-entered PLAN PHASE"),
+            "exit must remain available when scheduled planning is off: {control_only_exit}"
+        );
+        let enter = run_scheduled_tool(
+            "enter_plan_mode",
+            &serde_json::json!({}),
+            &ws,
+            &ledger,
+            &control,
+        )
+        .await;
         assert!(enter.contains("PLAN MODE"), "{enter}");
-        assert!(in_plan_phase(), "enter_plan_mode set the phase");
-        let exit = run_scheduled_tool("exit_plan_mode", &ws, &ledger).await;
-        assert!(exit.contains("exited PLAN MODE"), "{exit}");
-        assert!(!in_plan_phase(), "exit_plan_mode cleared the phase");
+        assert!(control.is_plan_mode(), "enter_plan_mode set the phase");
+        assert!(
+            !other_session.is_plan_mode(),
+            "one session must not change another"
+        );
+        let denied_write = run_scheduled_tool(
+            "write_file",
+            &serde_json::json!({
+                "path": "must-not-write.txt",
+                "content": "no",
+            }),
+            &ws,
+            &ledger,
+            &control,
+        )
+        .await;
+        assert!(
+            denied_write.contains("current prompt disposition"),
+            "a write later in the same tool round must hit the immediate Plan clamp: {denied_write}"
+        );
+        assert!(
+            !ws.path().join("must-not-write.txt").exists(),
+            "entering Plan must prevent a later call from mutating the workspace"
+        );
+        let exit = run_scheduled_tool(
+            "exit_plan_mode",
+            &serde_json::json!({}),
+            &ws,
+            &ledger,
+            &control,
+        )
+        .await;
+        assert!(
+            exit.contains("exited the model-entered PLAN PHASE"),
+            "{exit}"
+        );
+        assert!(!control.is_plan_mode(), "exit_plan_mode cleared the phase");
     }
 
     #[tokio::test]
@@ -8809,6 +9072,7 @@ mod execute_tool_branch_tests {
         caveats: &Caveats,
         mcp: &mut dyn McpTools,
         gate: Option<&mut MockGate>,
+        step_ledger: Option<&dyn crate::agentic::scheduled::StepLedger>,
         disposition: PromptDisposition,
     ) -> String {
         let gate = gate.map(|gate| gate as &mut dyn PermissionGate);
@@ -8828,14 +9092,14 @@ mod execute_tool_branch_tests {
             None, // artifact_context
             None, // artifact_sink
             gate,
-            None,  // exec_floor
-            None,  // git_tool
-            None,  // crew_runner
-            None,  // scratchpad_store
-            None,  // code_search
-            None,  // where_is
-            None,  // experience_store
-            None,  // step_ledger
+            None, // exec_floor
+            None, // git_tool
+            None, // crew_runner
+            None, // scratchpad_store
+            None, // code_search
+            None, // where_is
+            None, // experience_store
+            step_ledger,
             false, // tool_offload
             None,  // spill_store
             None,  // persona_tools
@@ -8860,6 +9124,7 @@ mod execute_tool_branch_tests {
             &caveats,
             &mut no_mcp,
             None,
+            None,
             PromptDisposition::Research,
         )
         .await;
@@ -8875,6 +9140,7 @@ mod execute_tool_branch_tests {
             ws.path(),
             &caveats,
             &mut no_mcp,
+            None,
             None,
             PromptDisposition::Explain,
         )
@@ -8897,6 +9163,7 @@ mod execute_tool_branch_tests {
             &caveats,
             &mut no_mcp,
             Some(&mut gate),
+            None,
             PromptDisposition::Research,
         )
         .await;
@@ -8913,6 +9180,7 @@ mod execute_tool_branch_tests {
             ws.path(),
             &caveats,
             &mut mcp,
+            None,
             None,
             PromptDisposition::Research,
         )
@@ -8934,6 +9202,7 @@ mod execute_tool_branch_tests {
             &caveats,
             &mut no_mcp,
             None,
+            None,
             PromptDisposition::Research,
         )
         .await;
@@ -8941,6 +9210,103 @@ mod execute_tool_branch_tests {
             read.contains("durable evidence"),
             "safe read must remain usable: {read}"
         );
+    }
+
+    /// Plan is a read-only workspace disposition with one explicit
+    /// control-plane write: the harness-owned step ledger.
+    #[tokio::test]
+    async fn plan_disposition_updates_ledger_but_still_denies_workspace_mutation() {
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+        let ledger = SessionStepLedger::default();
+        let mut no_mcp = NoMcp;
+        let plan = run_tool_with_disposition(
+            "update_plan",
+            serde_json::json!({ "plan": [
+                { "step": "inspect", "status": "completed" },
+                { "step": "repair", "status": "in_progress" }
+            ] }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            Some(&ledger),
+            PromptDisposition::Plan,
+        )
+        .await;
+        assert!(plan.starts_with("<plan>\n"), "{plan}");
+        assert_eq!(ledger.count(), 2);
+
+        let write = run_tool_with_disposition(
+            "write_file",
+            serde_json::json!({ "path": "must-not-write.txt", "content": "no" }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            Some(&ledger),
+            PromptDisposition::Plan,
+        )
+        .await;
+        assert!(write.contains("current prompt disposition"), "{write}");
+        assert!(!ws.path().join("must-not-write.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_selector_dispatches_through_session_control_without_current_widening() {
+        #[derive(Default)]
+        struct RecordingControl(std::sync::Mutex<Vec<String>>);
+
+        impl crate::agentic::OperatingModeControl for RecordingControl {
+            fn select_operating_mode(&self, mode: &str) -> Result<String, String> {
+                self.0.lock().unwrap().push(mode.to_string());
+                Ok(format!("scheduled {mode}; current turn unchanged"))
+            }
+        }
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+        let control = RecordingControl::default();
+        let mut no_mcp = NoMcp;
+        let result = execute_tool_with_collaborators(
+            "select_operating_mode",
+            &serde_json::json!({ "mode": "dev" }),
+            ws.path().to_str().unwrap(),
+            false,
+            20,
+            &caveats,
+            &mut no_mcp,
+            ToolCollaborators {
+                operating_mode_control: Some(&control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Research,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("current turn unchanged"), "{result}");
+        assert_eq!(*control.0.lock().unwrap(), vec!["dev"]);
+
+        let unavailable = execute_tool_with_collaborators(
+            "select_operating_mode",
+            &serde_json::json!({ "mode": "dev" }),
+            ws.path().to_str().unwrap(),
+            false,
+            20,
+            &caveats,
+            &mut no_mcp,
+            ToolCollaborators::default(),
+            false,
+            PromptDisposition::Research,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(unavailable.contains("/mode auto"), "{unavailable}");
     }
 
     /// Permitted non-Act reads still honor their caveats, but they must not
@@ -8960,6 +9326,7 @@ mod execute_tool_branch_tests {
             &caveats,
             &mut mcp,
             Some(&mut gate),
+            None,
             PromptDisposition::Research,
         )
         .await;
@@ -9311,7 +9678,8 @@ mod execute_tool_branch_tests {
         .is_none());
         // The always-advertised def rides in every session (empty MCP).
         let defs = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let names: Vec<&str> = defs
             .as_array()
@@ -9392,7 +9760,8 @@ mod execute_tool_branch_tests {
         .is_none());
         // The always-advertised def rides in every session (empty MCP).
         let defs = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(defs
             .as_array()

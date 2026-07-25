@@ -448,9 +448,9 @@ impl Subtask {
     }
 
     /// Project this subtask into the [`CrewTask`] the active topology's
-    /// `CrewRunner` dispatches — the *same* projection for `/mode
-    /// single|crew|mesh|remote`, so a plan authored once lifts across runners
-    /// unchanged. `caveats = parent.meet(self.caveat_policy.to_caveats())`: the
+    /// `CrewRunner` dispatches — the same projection for every local or remote
+    /// runner, so a plan authored once lifts across runners unchanged.
+    /// `caveats = parent.meet(self.caveat_policy.to_caveats())`: the
     /// plan *requests*, the parent *grants*, `meet` *enforces ⊑* (attenuation
     /// only). Intended for a **leaf** (see [`Plan::leaves`]); a branch is a
     /// grouping node, not a dispatch unit.

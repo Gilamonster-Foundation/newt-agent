@@ -122,14 +122,18 @@ the conversation's workspace identity rather than a caller-supplied workspace.
 ### 5. Prompt comprehension and dispositions
 
 After the prompt receipt is durable and before the general agent loop runs, a
-structured intake pass decomposes the request into atomic asks and returns one
-of four dispositions:
+structured intake pass decomposes the request into atomic asks and the harness
+assigns one of five effective dispositions:
 
 - `ask`: one or more blocking decisions need operator input;
 - `act`: decisions are locked and mutations may begin;
-- `explain`: answer or explain without an execution imperative; or
+- `explain`: answer or explain without an execution imperative;
 - `research`: gather bounded read-only evidence before choosing a later
-  disposition.
+  disposition; and
+- `plan`: read evidence and update only the harness-owned plan ledger, without
+  workspace mutation, command execution, network access, capability grants, or
+  generic MCP tools. This disposition is selected by the harness operating
+  mode rather than inferred from prompt wording.
 
 Multiple asks do not imply ambiguity. Intake asks for clarification only when a
 blocking decision lacks provenance from an explicit operator statement, a
@@ -139,10 +143,11 @@ an LLM cannot mark a decision locked merely by asserting that it is.
 
 The harness validates the structured result and applies capability gates:
 `research` receives read-only tools, `explain` receives no mutation authority,
-and `ask` emits a bounded clarification batch and ends the turn. Only `act`
-enables mutation tools and execution nudges. Research may transition to ask,
-explain, or act after its evidence budget. Clarification answers are new prompt
-receipts explicitly linked to the pending decision manifest.
+`plan` receives read/recovery tools plus the plan-ledger interface, and `ask`
+emits a bounded clarification batch and ends the turn. Only `act` enables
+workspace mutation tools and execution nudges. Research may transition to ask,
+explain, or act after its evidence budget. Clarification answers are new
+prompt receipts explicitly linked to the pending decision manifest.
 
 ## Invariants
 
@@ -160,8 +165,8 @@ receipts explicitly linked to the pending decision manifest.
 8. Derived artifacts remain rooted in the prompt that caused them and are never
    silently reparented after a follow-up prompt.
 9. Prompt text is absent from operational telemetry; IDs and digests are enough.
-10. Mutation tools and act-now nudges are available only in the `act`
-    disposition.
+10. Workspace mutation tools and act-now nudges are available only in the
+    `act` disposition; `plan` may mutate only the harness-owned plan ledger.
 11. Every locked blocking decision has operator, policy, or
     authorized-assumption provenance.
 
@@ -177,7 +182,8 @@ The change lands as five reviewable PRs:
 4. **Compaction policy:** headroom-aware triggering and objective-scoped
    diagnostics.
 5. **Prompt dispositions:** structured ask decomposition, decision manifests,
-   ask/act/explain/research transitions, capability gates, and nudge scoping.
+   ask/act/explain/research/plan dispositions, capability gates, and nudge
+   scoping.
 
 ### PR4 compaction-policy contract
 
@@ -209,13 +215,23 @@ an explicitly authorized low-risk `authorized_assumption`. The manifest is
 recorded as a prompt-rooted `decision` artifact without copying prompt text or
 clarification text into the artifact ledger.
 
-The only dispositions are `ask`, `act`, `explain`, and `research`. `ask` is a
-harness-owned, bounded clarification batch that ends before model/tool work;
+The dispositions are `ask`, `act`, `explain`, `research`, and `plan`. `ask` is
+a harness-owned, bounded clarification batch that ends before model/tool work;
 the next direct operator answer is persisted as an explicit
 `operator_continuation` of the pending objective. Fully specified multi-part
 requests are `act`, not automatically ambiguous. Informational requests are
 `explain`; evidence-gathering requests are `research` and receive a fixed,
-read-only catalog.
+read-only catalog. `plan` is selected by harness operating mode and can update
+the plan ledger, but cannot mutate the workspace or use execution, network,
+capability-grant, or generic MCP paths.
+
+Prompt-comprehension artifacts make this enum extension explicit. Legacy
+`prompt_comprehension_manifest_v1` artifacts retain the original four-value
+enum (`ask`, `act`, `explain`, `research`). New artifacts emit
+`prompt_comprehension_manifest_v2`, whose only schema change is the addition of
+`plan`. The persistence boundary accepts both versions, validates dispositions
+against the declared version, and preserves the version tag; in particular,
+`plan` under a v1 tag is rejected rather than silently reinterpreted.
 
 Pending clarification is not session-local state: restore rebuilds it from the
 verified semantic lineage of immutable operator receipts, ending at the latest
@@ -225,11 +241,13 @@ also fails closed: an over-capacity request remains `ask` until the operator
 starts a smaller task with `/new`.
 
 Catalog filtering is an ergonomic surface, not the authority boundary. The
-tool dispatcher rejects non-`act` mutations, exec, permission-grant attempts,
-and every generic MCP tool before aliasing, routing, or interactive grants can
-run. `act` is the sole disposition with execution-oriented nudges; the default
-agent identity must not override a per-turn `ask`, `explain`, or `research`
-gate with unconditional "act now" language.
+tool dispatcher rejects non-`act` workspace mutations, exec,
+permission-grant attempts, and every generic MCP tool before aliasing, routing,
+or interactive grants can run; `plan` has one explicit exception for the
+harness-owned plan ledger. `act` is the sole disposition with
+execution-oriented nudges; the default agent identity must not override a
+per-turn `ask`, `explain`, `research`, or `plan` gate with unconditional "act
+now" language.
 
 Newt-Agent owns storage, assembly, retrieval, and lifecycle behavior. Backend
 adapters must preserve the active-prompt invariant. TUI code owns capturing raw
@@ -258,8 +276,11 @@ Additional deterministic tests cover:
 - count pressure with ample token headroom versus genuine hard-budget pressure;
 - multi-part but fully specified prompts proceeding directly to `act`;
 - ambiguous high-impact prompts producing one bounded `ask` batch;
-- informational requests selecting `explain` without an execution nudge; and
-- research using read-only tools before a validated disposition transition.
+- informational requests selecting `explain` without an execution nudge;
+- research using read-only tools before a validated disposition transition;
+- v1 prompt-comprehension artifacts retaining their four-value disposition
+  contract; and
+- v2 plan artifacts receiving only plan-ledger mutation authority.
 
 Every PR runs the repository acceptance contract. Live model evaluation is an
 additional quality signal; deterministic wire/store assertions are the CI gate.

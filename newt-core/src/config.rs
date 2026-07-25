@@ -188,16 +188,17 @@ pub struct Config {
 
     /// Named permission presets (`[permission_presets.<name>]`, issue #307).
     /// Each maps onto the role-profile caveat mechanism (a
-    /// [`crate::NamedPermissionPreset`]) and, when applied via `/mode`, clamps
+    /// [`crate::NamedPermissionPreset`]) and, when applied via `/posture`, clamps
     /// the session's authority as a hard floor. Empty by default — no preset,
     /// behavior unchanged.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub permission_presets: std::collections::BTreeMap<String, crate::NamedPermissionPreset>,
 
-    /// Named modes (`[modes.<name>]`, issue #307) for the `/mode` command. Each
-    /// mode atomically binds a skill body to preload, a permission preset to
-    /// apply as an authority floor, and a one-line system-prompt framing. Empty
-    /// by default. See [`ModeConfig`].
+    /// Named permission-posture bindings for `/posture` (issue #307). The
+    /// `[modes.<name>]` key is retained for configuration compatibility. Each
+    /// binding atomically preloads a skill body, applies a permission preset as
+    /// an authority floor, and adds system-prompt framing. Empty by default.
+    /// See [`ModeConfig`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub modes: std::collections::BTreeMap<String, ModeConfig>,
 
@@ -249,8 +250,8 @@ pub struct Config {
     pub plan: Option<PlanConfig>,
 }
 
-/// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
-/// `/mode <name>` command applies in a single invocation.
+/// One named permission-posture binding (`[modes.<name>]`, retained for
+/// compatibility): the atomic binding `/posture <name>` applies.
 ///
 /// ```toml
 /// [modes.triage]
@@ -259,10 +260,10 @@ pub struct Config {
 /// framing = "On-call triage: investigate, do not change production."
 /// ```
 ///
-/// Every field is optional so a mode can do any subset (e.g. preset-only, or
+/// Every field is optional so a posture can do any subset (e.g. preset-only, or
 /// framing-only). A `skill`/`preset` that names a missing entry is reported as
-/// an error by the command rather than silently ignored — a mode that claims a
-/// clamp it never applied would be a false security claim.
+/// an error by the command rather than silently ignored — a posture that claims
+/// a clamp it never applied would be a false security claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModeConfig {
     /// Skill name to preload (the same `use_skill` / `load_body_from` path).

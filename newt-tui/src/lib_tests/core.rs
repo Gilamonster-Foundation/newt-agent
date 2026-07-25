@@ -664,6 +664,7 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
         "dgx",
         "permissions",
         "mode",
+        "posture",
         "loadout",
         "workspace",
         "spill",
