@@ -51,7 +51,7 @@ async fn setup_url_probes_with_token_reference_and_writes_backend_dropin() {
     let backend: newt_core::BackendConfig = toml::from_str(&text).unwrap();
     assert_eq!(backend.endpoint, server.uri());
     assert_eq!(backend.effective_model(), Some("served-model"));
-    assert_eq!(backend.kind, newt_core::BackendKind::Openai);
+    assert_eq!(backend.kind, Some(newt_core::BackendKind::Openai));
     assert_eq!(backend.api_key_env.as_deref(), Some("DGX_SETUP_TEST_TOKEN"));
     assert!(!text.contains("secret-value"));
 

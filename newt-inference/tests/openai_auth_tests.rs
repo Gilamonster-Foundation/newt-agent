@@ -124,7 +124,7 @@ async fn from_config_wires_bearer_auth_from_env() {
         model: Some("m".into()),
         model_path: None,
         tiers: vec![Tier::Fast],
-        kind: BackendKind::Openai,
+        kind: Some(BackendKind::Openai),
         api: Default::default(),
         api_key_file: None,
         api_key_env: Some(var.into()),

@@ -273,7 +273,7 @@ fn backend(
         model: Some(model.into()),
         model_path: None,
         tiers: vec![],
-        kind,
+        kind: Some(kind),
         api: Default::default(),
         api_key_file: None,
         api_key_env: None,

@@ -2949,6 +2949,9 @@ pub(crate) struct BackendChoice {
     pub(crate) url: String,
     pub(crate) model: String,
     pub(crate) kind: newt_core::BackendKind,
+    /// True when the config omitted `kind` — adopt must run `detect_endpoint`
+    /// instead of trusting a placeholder wire protocol.
+    pub(crate) kind_needs_probe: bool,
     pub(crate) api_key: Option<String>,
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
@@ -3031,7 +3034,7 @@ pub(crate) fn active_backend_name(cfg: &newt_core::Config) -> Option<String> {
     let choice = resolve_backend_choice(cfg);
     cfg.backends
         .iter()
-        .find(|b| b.endpoint == choice.url && b.kind == choice.kind)
+        .find(|b| b.endpoint == choice.url && (b.kind.is_none() || b.kind == Some(choice.kind)))
         .map(|b| b.name.clone())
 }
 
@@ -3040,9 +3043,13 @@ pub(crate) fn active_backend_name(cfg: &newt_core::Config) -> Option<String> {
 /// reality via [`newt_core::backend_probe::adopt`]. Returns status lines to
 /// print. Offline/timeout → keep the file-hint model and say so — NEVER a
 /// silent failover to another backend. Embedded backends are not probed.
+///
+/// When the config omitted `kind` (`kind_needs_probe`), race `/api/tags` vs
+/// `/v1/models` via [`newt_core::backend_probe::detect_endpoint`] first so a
+/// minimal `name`+`endpoint` backend still connects.
 fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
     use newt_core::backend_probe::{self, Served};
-    if choice.kind == newt_core::BackendKind::Embedded {
+    if choice.kind == newt_core::BackendKind::Embedded && !choice.kind_needs_probe {
         return Vec::new();
     }
     let mut lines = Vec::new();
@@ -3064,20 +3071,49 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
     // run_chat is sync inside the tokio runtime — bridge like wizard.rs does.
     let fetched = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            backend_probe::api_for(choice.kind)
-                .list_models(&client, &choice.url, choice.api_key.as_deref())
+            if choice.kind_needs_probe {
+                match backend_probe::detect_endpoint(
+                    &client,
+                    &choice.url,
+                    choice.api_key.as_deref(),
+                )
                 .await
+                {
+                    Ok(probe) => {
+                        choice.kind = probe.kind;
+                        choice.kind_needs_probe = false;
+                        if choice.serving.is_none() {
+                            choice.serving = Some(probe.serving);
+                        }
+                        Ok((probe.models, Some(probe.kind)))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                backend_probe::api_for(choice.kind)
+                    .list_models(&client, &choice.url, choice.api_key.as_deref())
+                    .await
+                    .map(|models| (models, None))
+            }
         })
     });
     match fetched {
-        Ok(models) => {
+        Ok((models, detected_kind)) => {
+            if let Some(kind) = detected_kind {
+                lines.push(format!(
+                    "detected {} at {} — {} model(s)",
+                    kind.label(),
+                    choice.url,
+                    models.len()
+                ));
+            }
             // Synthesize the backend view adopt() reasons over: the choice
             // already carries name/kind/serving and the file-hint model.
             let synth = newt_core::BackendConfig {
                 name: choice.name.clone(),
                 endpoint: choice.url.clone(),
                 model: (!choice.model.is_empty()).then(|| choice.model.clone()),
-                kind: choice.kind,
+                kind: Some(choice.kind),
                 serving: choice.serving,
                 ..Default::default()
             };
@@ -3158,7 +3194,7 @@ pub(crate) fn backends_list_items(
             let label = format!(
                 "{} · {} · {} @ {}",
                 b.name,
-                b.kind.label(),
+                b.kind_label(),
                 b.effective_model().unwrap_or("(server decides)"),
                 b.endpoint
             );
@@ -3182,7 +3218,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         model: session_model()
             .or_else(|| b.effective_model().map(str::to_string))
             .unwrap_or_default(),
-        kind: b.kind,
+        kind: b.kind.unwrap_or(newt_core::BackendKind::Ollama),
+        kind_needs_probe: b.needs_kind_probe(),
         api_key: b.resolve_api_key(),
         api: b.api,
         context_window: None,
@@ -3214,6 +3251,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             url,
             model: session_model().unwrap_or_else(|| "llama3.1:8b".into()),
             kind: newt_core::BackendKind::Ollama,
+            kind_needs_probe: false,
             api_key: None,
             api: newt_core::OpenAiApi::default(),
             context_window: None,
@@ -3232,7 +3270,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         } else {
             newt_core::BackendKind::Ollama
         };
-        if let Some(b) = cfg.backends.iter().find(|b| b.kind == want) {
+        if let Some(b) = cfg.backends.iter().find(|b| b.kind == Some(want)) {
             return from_backend(b);
         }
     }
@@ -3256,6 +3294,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             url,
             model,
             kind: newt_core::BackendKind::Ollama,
+            kind_needs_probe: false,
             api_key: None,
             api: newt_core::OpenAiApi::default(),
             context_window: None,
@@ -3266,7 +3305,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
     if let Some(b) = cfg
         .backends
         .iter()
-        .find(|b| b.kind == newt_core::BackendKind::Openai)
+        .find(|b| b.kind == Some(newt_core::BackendKind::Openai))
         .or_else(|| cfg.backends.first())
     {
         return from_backend(b);
@@ -3279,6 +3318,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         url: "http://localhost:11434".into(),
         model: session_model().unwrap_or_else(|| "llama3.1:8b".into()),
         kind: newt_core::BackendKind::Ollama,
+        kind_needs_probe: false,
         api_key: None,
         api: newt_core::OpenAiApi::default(),
         context_window: None,

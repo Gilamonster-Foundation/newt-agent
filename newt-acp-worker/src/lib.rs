@@ -131,7 +131,7 @@ fn select_openai_backend(
     }
     cfg.backends
         .iter()
-        .find(|b| b.kind == newt_core::BackendKind::Openai)
+        .find(|b| b.kind == Some(newt_core::BackendKind::Openai))
 }
 
 fn select_provider_config(
@@ -193,7 +193,7 @@ mod backend_selection_tests {
             model: Some("m".into()),
             model_path: None,
             tiers: vec![Tier::Fast],
-            kind,
+            kind: Some(kind),
             api: Default::default(),
             api_key_file: None,
             api_key_env: None,
@@ -226,7 +226,7 @@ mod backend_selection_tests {
         ]);
         let chosen = select_openai_backend(&c, false).expect("openai backend");
         assert_eq!(chosen.name, "remote");
-        assert_eq!(chosen.kind, BackendKind::Openai);
+        assert_eq!(chosen.kind, Some(BackendKind::Openai));
     }
 
     #[test]
