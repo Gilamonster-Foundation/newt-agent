@@ -74,6 +74,9 @@ pub const GITHUB_APP_BOT_NAME: &str = "newt-agent[bot]";
 /// the User account id in [`DEFAULT_AGENT_EMAIL`].
 pub const GITHUB_APP_BOT_EMAIL: &str = "293447090+newt-agent[bot]@users.noreply.github.com";
 
+/// Filename looked for under each config root (workspace / home / system).
+pub const AGENT_IDENTITY_FILENAME: &str = "agent-identity.toml";
+
 // ---------------------------------------------------------------------------
 // Secret-by-reference primitives
 // ---------------------------------------------------------------------------
@@ -316,6 +319,21 @@ impl IdentitySource {
             Self::Default => "compiled-in default (newt-agent)".to_string(),
         }
     }
+
+    /// Hint for how to override the compiled-in default.
+    ///
+    /// Printed by `newt identity` when no file is configured. The future setup
+    /// dialog will call [`AgentIdentity::save`] into the same home path.
+    #[must_use]
+    pub fn configure_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Default => Some(
+                "Override: write ~/.newt/agent-identity.toml (or `newt identity set --name … --email …`). \
+                 A future setup dialog will use the same path.",
+            ),
+            _ => None,
+        }
+    }
 }
 
 impl AgentIdentity {
@@ -365,6 +383,43 @@ impl AgentIdentity {
         Ok(Self::resolve_with_source()?.0)
     }
 
+    /// Path of the user-level identity file (`~/.newt/agent-identity.toml`,
+    /// or `$NEWT_CONFIG_DIR/agent-identity.toml`).
+    ///
+    /// This is the write target for `newt identity set` and for a future
+    /// setup-dialog identity step. `None` when no home/config dir is resolvable.
+    #[must_use]
+    pub fn user_identity_path() -> Option<PathBuf> {
+        Config::user_config_dir().map(|dir| dir.join(AGENT_IDENTITY_FILENAME))
+    }
+
+    /// Serialize this identity as a complete `[agent-identity]` TOML document.
+    ///
+    /// Secrets stay references (paths / env / cmd) — never raw values — so the
+    /// result is safe to write into a committed or home config file.
+    pub fn to_toml_string(&self) -> Result<String> {
+        // Wrap so the root table is `[agent-identity]`, matching the load path.
+        #[derive(Serialize)]
+        struct File<'a> {
+            #[serde(rename = "agent-identity")]
+            identity: &'a AgentIdentity,
+        }
+        toml::to_string_pretty(&File { identity: self })
+            .map_err(|e| NewtError::Config(e.to_string()))
+    }
+
+    /// Write this identity to `path`, creating parent directories if needed.
+    ///
+    /// Public write seam for `newt identity set` and a future setup dialog —
+    /// both should land here rather than open-coding TOML.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
+        }
+        let text = self.to_toml_string()?;
+        std::fs::write(path, text).map_err(NewtError::Io)
+    }
+
     /// Like [`AgentIdentity::resolve`] but also reports which layer it came
     /// from (for `newt identity`).
     pub fn resolve_with_source() -> Result<(Self, IdentitySource)> {
@@ -395,7 +450,7 @@ impl AgentIdentity {
             if let Some(cfg) = find_project_config_from(start, home) {
                 // find_project_config_from returns `.../.newt/config.toml`;
                 // the identity file is its sibling.
-                let candidate = cfg.with_file_name("agent-identity.toml");
+                let candidate = cfg.with_file_name(AGENT_IDENTITY_FILENAME);
                 if candidate.is_file() {
                     return Ok((
                         Self::load(&candidate)?,
@@ -413,14 +468,14 @@ impl AgentIdentity {
 
         // 2. Home.
         if let Some(dir) = user_config_dir {
-            let candidate = dir.join("agent-identity.toml");
+            let candidate = dir.join(AGENT_IDENTITY_FILENAME);
             if candidate.is_file() {
                 return Ok((Self::load(&candidate)?, IdentitySource::Home(candidate)));
             }
         }
 
         // 3. System.
-        let system = PathBuf::from("/etc/newt/agent-identity.toml");
+        let system = PathBuf::from("/etc/newt").join(AGENT_IDENTITY_FILENAME);
         if system.is_file() {
             return Ok((Self::load(&system)?, IdentitySource::System(system)));
         }
@@ -492,7 +547,7 @@ fn find_identity_walkup(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
         if home == Some(current) {
             break;
         }
-        let candidate = current.join(".newt").join("agent-identity.toml");
+        let candidate = current.join(".newt").join(AGENT_IDENTITY_FILENAME);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -514,11 +569,61 @@ mod tests {
     fn write_identity(dir: &Path, body: &str) -> PathBuf {
         let newt = dir.join(".newt");
         std::fs::create_dir_all(&newt).unwrap();
-        let path = newt.join("agent-identity.toml");
+        let path = newt.join(AGENT_IDENTITY_FILENAME);
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(body.as_bytes()).unwrap();
         f.flush().unwrap();
         path
+    }
+
+    #[test]
+    fn to_toml_string_wraps_agent_identity_table() {
+        let id = AgentIdentity {
+            name: "custom-agent".into(),
+            email: "custom@users.noreply.github.com".into(),
+            ..AgentIdentity::default()
+        };
+        let text = id.to_toml_string().unwrap();
+        assert!(
+            text.contains("[agent-identity]"),
+            "must use the loadable table name: {text}"
+        );
+        assert!(text.contains("name = \"custom-agent\""));
+        assert!(text.contains("email = \"custom@users.noreply.github.com\""));
+        // Round-trip through the loader.
+        let loaded = AgentIdentity::from_toml_str(&text).unwrap();
+        assert_eq!(loaded.name, "custom-agent");
+        assert_eq!(loaded.email, "custom@users.noreply.github.com");
+    }
+
+    #[test]
+    fn save_writes_file_that_resolve_from_home_picks_up() {
+        let home = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let path = home.path().join(".newt").join(AGENT_IDENTITY_FILENAME);
+        let id = AgentIdentity {
+            name: "saved-agent".into(),
+            email: "saved@users.noreply.github.com".into(),
+            ..AgentIdentity::default()
+        };
+        id.save(&path).unwrap();
+        assert!(path.is_file());
+
+        let (resolved, src) =
+            AgentIdentity::resolve_from(Some(elsewhere.path()), Some(home.path())).unwrap();
+        assert_eq!(resolved.name, "saved-agent");
+        assert_eq!(resolved.email, "saved@users.noreply.github.com");
+        assert!(matches!(src, IdentitySource::Home(_)));
+    }
+
+    #[test]
+    fn configure_hint_only_for_compiled_default() {
+        assert!(IdentitySource::Default.configure_hint().is_some());
+        assert!(
+            IdentitySource::Home(PathBuf::from("/h/.newt/agent-identity.toml"))
+                .configure_hint()
+                .is_none()
+        );
     }
 
     #[test]

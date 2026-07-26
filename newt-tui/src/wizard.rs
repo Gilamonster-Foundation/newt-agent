@@ -6,6 +6,10 @@
 //! subsequent runs skip setup. There is **no** interactive UI: this is a
 //! functional bootstrap, not a settings UX. Edit `~/.newt/config.toml`
 //! directly to change anything (see `newt config` to print the resolved view).
+//!
+//! Agent commit identity is separate (`agent-identity.toml` /
+//! `newt identity set`); a future setup dialog should collect it via
+//! [`newt_core::AgentIdentity::save`].
 
 use newt_core::Config;
 

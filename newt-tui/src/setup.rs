@@ -20,6 +20,15 @@
 //! Existing matching drop-ins are reused byte-for-byte; name collisions receive
 //! a numeric suffix. Token values are used only in memory, while configuration
 //! stores an environment-variable or absolute file reference.
+//!
+//! ## Agent commit identity — not yet a setup step
+//!
+//! Harness attribution (`name` / `email`) lives in
+//! `.newt/agent-identity.toml` (see [`newt_core::AgentIdentity`]), defaulting
+//! to the GitHub User <https://github.com/newt-agent>. Operators set it today
+//! with `newt identity set --name … --email …` (or by editing the file). A
+//! future setup-dialog step should call [`newt_core::AgentIdentity::save`]
+//! into that same path — do not open-code a second writer here.
 
 use newt_core::backend_probe::EndpointProbeResult;
 use newt_core::config::Discovery;

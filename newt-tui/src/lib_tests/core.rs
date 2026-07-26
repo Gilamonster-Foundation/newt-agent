@@ -1,10 +1,11 @@
 use super::*;
 
 #[test]
-fn coauthor_trailer_uses_the_github_user_email() {
-    let tr = coauthor_trailer("nemotron-3-nano:30b");
-    // Model name credits the work; the email attributes to the GitHub User
-    // https://github.com/newt-agent (User no-reply, not the App bot).
+fn coauthor_trailer_uses_resolved_identity_email() {
+    let id = newt_core::AgentIdentity::default();
+    let tr = coauthor_trailer("nemotron-3-nano:30b", &id);
+    // Model name credits the work; the email attributes to the resolved
+    // harness identity (default: GitHub User https://github.com/newt-agent).
     assert_eq!(
         tr,
         "Co-authored-by: nemotron-3-nano:30b <309460085+newt-agent@users.noreply.github.com>"
@@ -18,16 +19,37 @@ fn coauthor_trailer_uses_the_github_user_email() {
         !tr.contains("[bot]"),
         "default attribution is the User account, not the App bot"
     );
+
+    let custom = newt_core::AgentIdentity {
+        name: "my-agent".into(),
+        email: "my-agent@example.com".into(),
+        ..newt_core::AgentIdentity::default()
+    };
+    assert_eq!(
+        coauthor_trailer("ornith:35b", &custom),
+        "Co-authored-by: ornith:35b <my-agent@example.com>"
+    );
 }
 
 #[test]
 fn runtime_context_block_instructs_shell_git_identity() {
-    let blk = runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama);
+    let id = newt_core::AgentIdentity::default();
+    let blk = runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama, &id);
     // The shell-git fallback (for a model that bypasses the embedded tool)
-    // must carry the canonical User no-reply email.
+    // must carry the resolved User no-reply email.
     assert!(blk.contains("user.email='309460085+newt-agent@users.noreply.github.com'"));
     assert!(blk.contains("user.name='newt-agent'"));
     assert!(blk.contains("git -c user.name="));
+
+    let custom = newt_core::AgentIdentity {
+        name: "custom".into(),
+        email: "custom@example.com".into(),
+        ..newt_core::AgentIdentity::default()
+    };
+    let custom_blk =
+        runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama, &custom);
+    assert!(custom_blk.contains("user.email='custom@example.com'"));
+    assert!(custom_blk.contains("user.name='custom'"));
 }
 
 #[test]

@@ -457,11 +457,17 @@ pub enum Command {
     /// effective trim trigger, count-vs-token firing, the summarizer backend,
     /// and warnings for over-aggressive firing / the no-abort hang (#979).
     Compaction,
-    /// Print the resolved agent commit identity (`.newt/agent-identity.toml`):
-    /// name, email, the layer it resolved from, the signing-key path +
-    /// fingerprint (if it loads), the GitHub App's public coordinates, and the
-    /// configured token NAMES. Never prints a secret value.
-    Identity,
+    /// Show or set the agent commit identity (`.newt/agent-identity.toml`).
+    ///
+    /// Bare `newt identity` prints name, email, source layer, trailer,
+    /// signing-key path + fingerprint, GitHub App coordinates, and token
+    /// NAMES (never secret values). `newt identity set --name … --email …`
+    /// writes an override file — the same path a future setup dialog will use.
+    /// Default (no file): GitHub User https://github.com/newt-agent.
+    Identity {
+        #[command(subcommand)]
+        cmd: Option<identity_cmd::IdentityCmd>,
+    },
     /// Run (or re-run) the setup wizard: probe Ollama + write ~/.newt/config.toml.
     /// Edit that file directly for everything else — newt has no settings UI.
     Init,
@@ -1124,7 +1130,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Config => config_cmd::run(cli.config.as_deref()),
         Command::Compaction => compaction_cmd::run(cli.config.as_deref()),
-        Command::Identity => identity_cmd::run(cli.config.as_deref()),
+        Command::Identity { cmd } => identity_cmd::run(cli.config.as_deref(), cmd),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
         Command::Setup {
             target,

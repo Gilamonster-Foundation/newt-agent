@@ -82,8 +82,8 @@ pub mod pyo3_module;
 /// `ls`/`cat` shims re-exec against the newt binary itself.
 pub use agent_bridle::maybe_dispatch;
 pub use agent_identity::{
-    AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef, DEFAULT_AGENT_EMAIL,
-    DEFAULT_AGENT_NAME, GITHUB_APP_BOT_EMAIL, GITHUB_APP_BOT_NAME,
+    AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef, AGENT_IDENTITY_FILENAME,
+    DEFAULT_AGENT_EMAIL, DEFAULT_AGENT_NAME, GITHUB_APP_BOT_EMAIL, GITHUB_APP_BOT_NAME,
 };
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Step 9.7: clean top-level import paths for the relocated agentic loop.

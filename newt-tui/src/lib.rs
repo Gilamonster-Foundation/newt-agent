@@ -526,19 +526,13 @@ fn scan_cli_exec_grants() -> Vec<String> {
 /// way to know its identity and confabulates one (e.g. inventing a name for
 /// commit attribution). Kept short — it rides in every request.
 /// The canonical AI-credit trailer the embedded git tool stamps on every commit:
-/// `Co-authored-by: <model> <309460085+newt-agent@users.noreply.github.com>`.
-/// The model name credits which model did the work; the email is the
-/// GitHub User [`newt-agent`](https://github.com/newt-agent) no-reply address
-/// ([`newt_core::DEFAULT_AGENT_EMAIL`]), so GitHub attributes the credit to that
-/// User account. (The old App-bot email and the even older
-/// `<noreply@newt-agent.com>` are retained as override options via
-/// `agent-identity.toml` / [`newt_core::GITHUB_APP_BOT_EMAIL`].) Always
-/// well-formed; the model can't fake it.
-fn coauthor_trailer(model: &str) -> String {
-    format!(
-        "Co-authored-by: {model} <{}>",
-        newt_core::DEFAULT_AGENT_EMAIL
-    )
+/// `Co-authored-by: <model> <email>` where `email` comes from the resolved
+/// [`newt_core::AgentIdentity`] (default: GitHub User
+/// [`newt-agent`](https://github.com/newt-agent) no-reply). The model name
+/// credits which model did the work; the email attributes the credit to the
+/// configured harness account. Always well-formed; the model can't fake it.
+fn coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> String {
+    format!("Co-authored-by: {model} <{}>", identity.email)
 }
 
 fn yolo_runtime_authority_note() -> Option<&'static str> {
@@ -551,7 +545,12 @@ fn yolo_runtime_authority_note() -> Option<&'static str> {
     )
 }
 
-fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKind) -> String {
+fn runtime_context_block(
+    model: &str,
+    endpoint: &str,
+    kind: newt_core::BackendKind,
+    identity: &newt_core::AgentIdentity,
+) -> String {
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
@@ -559,8 +558,8 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
         newt_core::BackendKind::Openai => "openai-compatible",
         _ => "ollama",
     };
-    let bot_email = newt_core::DEFAULT_AGENT_EMAIL;
-    let bot_name = newt_core::DEFAULT_AGENT_NAME;
+    let author_email = identity.email.as_str();
+    let author_name = identity.name.as_str();
     let runtime_authority = yolo_runtime_authority_note()
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
@@ -576,16 +575,16 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          never invent or guess an identity.\n\
          {runtime_authority}\
          # Git commit identity\n\
-         Prefer the `git` tool: it commits as `{bot_name} <{bot_email}>` and \
-         auto-signs `Co-authored-by: {model} <{bot_email}>` — do NOT add that \
+         Prefer the `git` tool: it commits as `{author_name} <{author_email}>` and \
+         auto-signs `Co-authored-by: {model} <{author_email}>` — do NOT add that \
          trailer yourself, just write the plain message; for the last commit use \
          op=amend (don't claim to amend without calling it).\n\
          If you instead commit with the SHELL `git` command (run_command), you \
          MUST set the same identity explicitly — the email is what attributes the \
          commit to the harness account on GitHub. Use:\n\
-         `git -c user.name='{bot_name}' -c user.email='{bot_email}' commit -m \"…\"`\n\
-         (the author name may be `{bot_name}` or this model's name, but the \
-         email must always be `{bot_email}`). Never commit with a guessed or \
+         `git -c user.name='{author_name}' -c user.email='{author_email}' commit -m \"…\"`\n\
+         (the author name may be `{author_name}` or this model's name, but the \
+         email must always be `{author_email}`). Never commit with a guessed or \
          personal email.\n\
          # Filesystem confinement\n\
          You are confined to the workspace (the current directory) plus any paths \
