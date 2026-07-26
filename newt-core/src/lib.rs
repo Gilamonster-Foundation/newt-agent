@@ -52,6 +52,7 @@ pub mod roadmap_eval;
 pub mod roadmap_file;
 pub mod role_profile;
 pub mod router;
+pub mod sas_transcript;
 pub mod scope_grounding;
 pub mod scratch;
 pub mod session;
@@ -70,6 +71,7 @@ pub mod tty;
 pub mod tuning;
 pub mod verify_gate;
 pub mod where_is;
+mod wire_framing;
 pub mod workflows;
 pub mod workspace_key;
 

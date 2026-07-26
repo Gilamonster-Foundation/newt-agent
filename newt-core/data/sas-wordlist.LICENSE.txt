@@ -1,0 +1,50 @@
+Provenance and license for `sas-wordlist.txt`
+=============================================
+
+`sas-wordlist.txt` is the BIP-39 English mnemonic wordlist, vendored verbatim.
+
+  Upstream: https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt
+  SHA-256:  2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda
+  Retrieved: 2026-07-25
+
+Vendored rather than fetched so the short authentication string is reproducible
+offline and byte-for-byte identical in every port (Rust, browser JS, mobile).
+The file is kept pure data — 2048 LF-terminated lowercase ASCII words, no
+comments or header — so a port can load it verbatim without a parser. Its
+digest is pinned by a law test; see `newt-core/tests/sas_transcript.rs`.
+
+Why this list: 2048 entries give exactly 11 bits per word, so a six-word string
+carries 66 bits — above the ceremony's 64-bit floor. Every word is unique in its
+first four characters, which bounds transcription error during a two-ended
+comparison.
+
+The wordlist originates in BIP-39, which is licensed under the 2-clause BSD
+license. newt-agent as a whole is Apache-2.0 (see the repository LICENSE); this
+file is a third-party component under the terms below and is not relicensed.
+
+---
+
+Copyright (c) 2013 Marek Palatinus, Pavol Rusnak
+Copyright (c) 2014 Aaron Voisine
+Copyright (c) 2017 Sean Bowe
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
