@@ -353,6 +353,31 @@ eval-live MODEL="qwen2.5-coder:7b" HOST="http://gnuc:11434" *ARGS:
     OLLAMA_HOST="{{HOST}}" NEWT_DEFAULT_MODEL="{{MODEL}}" \
         ./target/release/newt-eval run --mode live --coder --model "{{MODEL}}" {{ARGS}}
 
+# Practical live regression suite — hard-failing UAT against a real model.
+# Hand-run equivalent of `.github/workflows/practical-regression.yml`.
+# Inference is served by a named provider in ~/.newt (DGX/Nemotron on gnuc);
+# no hosts are committed. See docs/testing/uat-tool-loop.md.
+#
+#   just practical-regression                              # full suite
+#   just practical-regression smoke                        # post-merge smoke
+#   just practical-regression smoke line-count             # one scenario
+#   just practical-regression full '' dgx1-llama Nemotron… # pin provider/model
+#   just practical-regression-self-test                    # no inference
+practical-regression-self-test:
+    docs/testing/scripts/uat_tool_loop.sh --self-test
+    scripts/eval/file-practical-regressions.sh --self-test
+
+practical-regression TIER="full" CASE="" PROVIDER="dgx1-llama" MODEL="NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF_UD-Q4_K_XL" *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cargo build --release --bin newt
+    ARGS=(--suite "{{TIER}}")
+    if [ -n "{{CASE}}" ]; then ARGS+=(--case "{{CASE}}"); fi
+    if [ -n "{{PROVIDER}}" ]; then ARGS+=(--provider "{{PROVIDER}}"); fi
+    if [ -n "{{MODEL}}" ]; then ARGS+=(--model "{{MODEL}}"); fi
+    NEWT_BIN="${CARGO_TARGET_DIR:-target}/release/newt" \
+      docs/testing/scripts/uat_tool_loop.sh "${ARGS[@]}" {{ARGS}}
+
 # --- Hook installation ---
 
 # Point this repo at .githooks/ for pre-push gating, and rewrite GitHub

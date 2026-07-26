@@ -1,0 +1,224 @@
+name: Practical live regression
+
+# Hard-failing practical-task UAT against a real LLM.
+# Driver: docs/testing/scripts/uat_tool_loop.sh
+# Docs:   docs/testing/uat-tool-loop.md / docs/testing/bat-uat.md
+#
+# Contract:
+#   * Per-PR mocked BAT (bat_largest_files) stays the deterministic gate.
+#   * This workflow is the EXPENSIVE live sibling — never a push/PR gate.
+#   * Runner: self-hosted `gnuc`. Inference comes from a named provider in the
+#     runner's local ~/.newt (DGX/Nemotron). No hosts/keys/secrets in this file.
+#
+# Triggers:
+#   * workflow_run after successful CI on main → smoke suite (late post-merge).
+#   * Nightly 03:00 America/New_York → full suite (both UTC offsets + TZ guard).
+#   * workflow_dispatch → smoke|full|one case, optional model override.
+#
+# HOOK PARITY EXCEPTION: outside pre-push (needs real models). Local equivalent:
+#   just practical-regression
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  schedule:
+    # 03:00 America/New_York across DST: EST=08:00 UTC, EDT=07:00 UTC.
+    # A timezone guard below keeps only the true 03:00 Eastern run.
+    - cron: "0 7 * * *"
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Suite to run (smoke|full)"
+        required: false
+        default: "full"
+      case:
+        description: "Single scenario (blank = whole suite)"
+        required: false
+        default: ""
+      model:
+        description: "Model override (blank = default Nemotron)"
+        required: false
+        default: ""
+      dry_run_issues:
+        description: "Grade but do NOT open regression issues"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+concurrency:
+  group: practical-regression
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  # Named provider in the runner's ~/.newt — resolves to DGX. Never a host URL.
+  NEWT_PROVIDER: dgx1-llama
+  NEWT_DGX_MODEL: NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF_UD-Q4_K_XL
+
+jobs:
+  practical-regression:
+    name: practical regression (${{ github.event_name }})
+    runs-on: [self-hosted, gnuc]
+    # Post-merge smoke only when CI on main succeeded. Nightly/dispatch always run
+    # (subject to the Eastern-time guard below).
+    if: >
+      github.event_name == 'workflow_dispatch'
+      || github.event_name == 'schedule'
+      || (github.event_name == 'workflow_run'
+          && github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.head_branch == 'main'
+          && github.event.workflow_run.event == 'push')
+    timeout-minutes: 180
+    steps:
+      - name: Eastern-time guard (nightly 03:00 only)
+        if: github.event_name == 'schedule'
+        run: |
+          set -uo pipefail
+          hour=$(TZ=America/New_York date +%H)
+          if [ "$hour" != "03" ]; then
+            echo "Skipping: local Eastern hour is $hour (want 03)."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          else
+            echo "Eastern hour is 03 — running full nightly suite."
+            echo "SKIP=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve suite / model / ref
+        id: cfg
+        run: |
+          set -uo pipefail
+          if [ "${SKIP:-0}" = "1" ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+          case "${{ github.event_name }}" in
+            workflow_run)
+              echo "suite=smoke" >> "$GITHUB_OUTPUT"
+              echo "case=" >> "$GITHUB_OUTPUT"
+              echo "ref=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+              echo "file_issues=false" >> "$GITHUB_OUTPUT"
+              ;;
+            schedule)
+              echo "suite=full" >> "$GITHUB_OUTPUT"
+              echo "case=" >> "$GITHUB_OUTPUT"
+              echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+              echo "file_issues=true" >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_dispatch)
+              echo "suite=${{ github.event.inputs.suite || 'full' }}" >> "$GITHUB_OUTPUT"
+              echo "case=${{ github.event.inputs.case }}" >> "$GITHUB_OUTPUT"
+              echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+              if [ "${{ github.event.inputs.dry_run_issues }}" = "true" ]; then
+                echo "file_issues=false" >> "$GITHUB_OUTPUT"
+              else
+                echo "file_issues=true" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+          esac
+
+          M="${{ github.event.inputs.model }}"
+          if [ -z "$M" ]; then M="$NEWT_DGX_MODEL"; fi
+          echo "model=$M" >> "$GITHUB_OUTPUT"
+          echo "provider=$NEWT_PROVIDER" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.skip != '1'
+        with:
+          ref: ${{ steps.cfg.outputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.cfg.outputs.skip != '1'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.cfg.outputs.skip != '1'
+        with:
+          key: practical-regression
+
+      - name: Build newt (release)
+        if: steps.cfg.outputs.skip != '1'
+        run: cargo build --release --bin newt
+
+      - name: Backend / model preflight
+        if: steps.cfg.outputs.skip != '1'
+        run: |
+          set -uo pipefail
+          # Named provider must resolve from the runner's local ~/.newt.
+          if [ ! -f "$HOME/.newt/config.toml" ]; then
+            echo "::error::runner missing ~/.newt/config.toml — copy docs/testing/practical-regression.local.example and fill the DGX endpoint"
+            exit 2
+          fi
+          if ! grep -q "name *= *\"${{ steps.cfg.outputs.provider }}\"" "$HOME/.newt/config.toml"; then
+            echo "::error::provider '${{ steps.cfg.outputs.provider }}' not in ~/.newt/config.toml"
+            exit 2
+          fi
+          NEWT_BIN=./target/release/newt
+          # doctor is best-effort: a 403/unreachable backend surfaces as INFRA in the suite.
+          NEWT_PROVIDER="${{ steps.cfg.outputs.provider }}" \
+          NEWT_DGX_MODEL="${{ steps.cfg.outputs.model }}" \
+            "$NEWT_BIN" doctor 2>&1 | tee /tmp/newt-doctor.log || true
+          if grep -qiE 'no reachable|unreachable|connection refused' /tmp/newt-doctor.log; then
+            echo "::warning::doctor reported reachability problems — suite will classify INFRA if inference fails"
+          fi
+
+      - name: Run practical regression suite
+        if: steps.cfg.outputs.skip != '1'
+        id: suite
+        env:
+          NEWT_BIN: ${{ github.workspace }}/target/release/newt
+          NEWT_PROVIDER: ${{ steps.cfg.outputs.provider }}
+          NEWT_DGX_MODEL: ${{ steps.cfg.outputs.model }}
+          NEWT_DEFAULT_MODEL: ${{ steps.cfg.outputs.model }}
+          UAT_WORKDIR: ${{ runner.temp }}/newt-practical-regression
+        run: |
+          set -uo pipefail
+          OUT="${{ runner.temp }}/practical-out"
+          mkdir -p "$OUT"
+          ARGS=(--suite "${{ steps.cfg.outputs.suite }}" --provider "$NEWT_PROVIDER" --model "$NEWT_DGX_MODEL" --out "$OUT")
+          CASE="${{ steps.cfg.outputs.case }}"
+          if [ -n "$CASE" ]; then ARGS+=(--case "$CASE"); fi
+          rc=0
+          docs/testing/scripts/uat_tool_loop.sh "${ARGS[@]}" || rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+          echo "RESULTS_FILE=$OUT/results.tsv" >> "$GITHUB_ENV"
+          # Surface classification in the job summary already written by the driver.
+          echo "suite exit=$rc (0=PASS, 1=FAIL, 2=INFRA)" >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Upload artifacts
+        if: always() && steps.cfg.outputs.skip != '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: practical-regression-${{ steps.cfg.outputs.suite }}-${{ github.run_id }}
+          path: |
+            ${{ env.OUT }}/results.tsv
+            ${{ env.OUT }}/summary.md
+            ${{ env.OUT }}/sessions/
+          if-no-files-found: warn
+
+      - name: File behavioral regressions
+        if: always() && steps.cfg.outputs.skip != '1' && steps.cfg.outputs.file_issues == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NEWT_PROVIDER: ${{ steps.cfg.outputs.provider }}
+          NEWT_DGX_MODEL: ${{ steps.cfg.outputs.model }}
+        run: |
+          set -uo pipefail
+          if [ -z "${RESULTS_FILE:-}" ] || [ ! -f "${RESULTS_FILE:-}" ]; then
+            echo "no results file — nothing to file."
+            exit 0
+          fi
+          dry=""
+          if [ "${{ github.event.inputs.dry_run_issues }}" = "true" ]; then dry="--dry-run"; fi
+          scripts/eval/file-practical-regressions.sh --current "$RESULTS_FILE" $dry

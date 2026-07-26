@@ -1,0 +1,22 @@
+# Example runner-local config for the practical live regression suite.
+# Copy to ~/.newt/config.toml on the gnuc self-hosted runner (or pass via
+# `uat_tool_loop.sh --config PATH`). NEVER commit a real endpoint or secret.
+#
+# The workflow / just recipe pins the named provider with NEWT_PROVIDER and the
+# model with NEWT_DGX_MODEL — hosts stay local to the runner.
+
+[[backends]]
+name = "dgx1-llama"
+endpoint = "http://<your-dgx-host>:<port>"
+model = "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF_UD-Q4_K_XL"
+kind = "openai"
+api = "chat_completions"
+tiers = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
+
+[tui]
+debug = true
+no_splash = true
+inference_timeout_secs = 180
+
+[tui.permissions]
+preset = "workspace_dev"

@@ -61,6 +61,28 @@ The expensive end of the pyramid. `.github/workflows/eval-live.yml` replays the
 - **HOOK PARITY EXCEPTION:** like the `windows` job and `mesh-integration`, this
   is CI-only (it needs real models); the local equivalent is `just eval-live`.
 
+### 3. Practical live regression — post-merge + nightly, in `practical-regression.yml`
+
+Hard-failing practical-task UAT (`docs/testing/scripts/uat_tool_loop.sh`) that
+drives real `newt code` against a named provider in the runner's local
+`~/.newt` (DGX/Nemotron). Complements `eval-live` (golden-diff cases) with
+interactive evidence-path and coding scenarios — including the line-count
+regression that a scripted mock cannot prove a live model will discover.
+
+- **Triggers:**
+  - `workflow_run` after successful `CI` on `main` → **smoke** suite (late
+    post-merge signal; no issue filing).
+  - Nightly **03:00 America/New_York** → **full** suite (deduped regression
+    issues via `scripts/eval/file-practical-regressions.sh`).
+  - `workflow_dispatch` → chosen suite/case; optional dry-run for issues.
+- **Runner:** `[self-hosted, gnuc]`. Inference via `NEWT_PROVIDER=dgx1-llama`
+  (endpoint stays in runner-local config — see
+  `docs/testing/practical-regression.local.example`).
+- **Exit contract:** `0` all PASS, `1` behavioral FAIL, `2` INFRA.
+- **HOOK PARITY EXCEPTION:** live models; local equivalent is
+  `just practical-regression`. Full scenario catalog in
+  [`uat-tool-loop.md`](./uat-tool-loop.md).
+
 #### Setting up the gnuc runner (one-time)
 
 1. On gnuc, register a self-hosted runner with the label `gnuc`
@@ -70,6 +92,10 @@ The expensive end of the pyramid. `.github/workflows/eval-live.yml` replays the
 3. (Optional) set a repo variable `GNUC_OLLAMA_HOST` if Ollama isn't on the
    runner's `http://127.0.0.1:11434` (e.g. point it at `REDACTED-HOST:11434`).
 4. Edit the `matrix.model` list in `eval-live.yml` to track your rig.
+5. For practical regressions, copy
+   `docs/testing/practical-regression.local.example` to `~/.newt/config.toml`
+   on the runner and fill in the DGX endpoint for the `dgx1-llama` provider
+   (Nemotron model name already matches the workflow default).
 
 ## Running it by hand
 
@@ -78,6 +104,11 @@ just eval                                   # mock-mode cases, local Ollama
 just eval-live                              # live, default test model @ gnuc
 just eval-live qwen2.5-coder:7b             # pick a model
 just eval-live llama3.1:8b http://REDACTED-HOST:11434 --difficulty L2,L3   # UAT only
+
+just practical-regression-self-test         # no inference
+just practical-regression smoke             # post-merge smoke locally
+just practical-regression smoke line-count  # the line-count live gate
+just practical-regression                   # full suite vs DGX/Nemotron
 ```
 
 `--difficulty L1` selects the BAT (smoke) cases; `L2,L3` selects UAT.
@@ -85,6 +116,7 @@ just eval-live llama3.1:8b http://REDACTED-HOST:11434 --difficulty L2,L3   # UAT
 ## When you change CI
 
 Per `CLAUDE.md` "Push Hook Governance": the per-PR jobs in `ci.yml` are mirrored
-by `.githooks/pre-push` (`just check` + `just cov-ci`). `eval-live.yml` is a
-documented parity *exception* (the live tier can't run in a push gate). When you
-edit either CI file, re-check the hook/pipeline cross-reference comments.
+by `.githooks/pre-push` (`just check` + `just cov-ci`). `eval-live.yml` and
+`practical-regression.yml` are documented parity *exceptions* (the live tier
+can't run in a push gate). When you edit those CI files, re-check the
+hook/pipeline cross-reference comments.
