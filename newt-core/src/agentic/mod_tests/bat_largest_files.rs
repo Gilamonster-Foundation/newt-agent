@@ -100,6 +100,11 @@ fn simulated_line_workspace() -> tempfile::TempDir {
     // Few long lines → low line count, high bytes (the bytesize trap).
     let fat = format!("{}\n\n", "Y".repeat(5000));
     std::fs::write(ws.path().join("fat.rs"), fat).expect("fat");
+    // Docs / lockfile traps: MORE lines than the Rust sources. Without
+    // `code: true` these would dominate a bare line-count ranking — the
+    // 2026-07-26 regression class (AGENTS.md / Cargo.lock as "code files").
+    std::fs::write(ws.path().join("AGENTS.md"), "d\n".repeat(500)).expect("agents md");
+    std::fs::write(ws.path().join("Cargo.lock"), "l\n".repeat(400)).expect("lock");
     ws
 }
 
@@ -311,31 +316,47 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
                 "tool_calls": [{
                     "id": "c1", "type": "function",
                     "function": { "name": "find",
-                        "arguments": "{\"path\":\".\",\"name\":\"*.rs\",\"type\":\"f\",\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
+                        "arguments": "{\"path\":\".\",\"type\":\"f\",\"code\":true,\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
                 }]
             }),
             serde_json::json!({ "content":
-                "By line count: tall.rs (120 lines), mid.rs (40) and fat.rs (2)." }),
+                "| Path | Lines |\n| --- | ---: |\n| tall.rs | 120 |\n| mid.rs | 40 |\n| fat.rs | 2 |" }),
         ],
     )
     .await;
 
     assert!(
-        reply.contains("line count") || reply.contains("lines"),
-        "final answer returned: {reply}"
+        reply.contains("| Path | Lines |") || reply.contains("tall.rs"),
+        "final answer should be a GFM table (or at least name the code files): {reply}"
     );
-    // The Research turn must teach `find` the line-count measure on the wire —
-    // if the schema loses `sort=lines`/`show_lines`, the live model cannot
-    // discover the capable path (the 2026-07-25 regression class).
+    // The Research turn must teach `find` the line-count measure + code filter
+    // on the wire — if the schema loses `sort=lines`/`show_lines`/`code`, the
+    // live model cannot discover the capable path (2026-07-25/26 regressions).
     assert!(
         wire.contains("\"show_lines\"") && wire.contains("\"lines\""),
         "Research-advertised find schema must teach show_lines + sort=lines: {wire}"
+    );
+    assert!(
+        wire.contains("\"code\"")
+            && (wire.contains("code: true")
+                || wire.contains("`code: true`")
+                || wire.contains("code=true")
+                || wire.contains("language-pack")),
+        "Research-advertised find schema must teach code:true for source files: {wire}"
     );
     // The evidence turn ANSWERED the line-count question through `find` — line
     // counts, descending — no shell, no `wc -l`, no bytesize substitute.
     assert!(
         wire.contains("120\\ttall.rs") || wire.contains("120\ttall.rs"),
         "the lined find result must reach the model, lines-first: {wire}"
+    );
+    // Docs/lockfiles must NOT appear as lined find evidence when code:true.
+    assert!(
+        !(wire.contains("AGENTS.md\t")
+            || wire.contains("\tAGENTS.md")
+            || wire.contains("Cargo.lock\t")
+            || wire.contains("\tCargo.lock")),
+        "code:true must exclude docs/lockfiles from the ranking evidence: {wire}"
     );
     let tall = wire.find("120").expect("most lines present");
     let mid = wire.find("40\\tmid.rs").or_else(|| wire.find("40\tmid.rs"));

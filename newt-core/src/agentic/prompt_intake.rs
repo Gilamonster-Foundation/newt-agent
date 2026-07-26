@@ -396,7 +396,10 @@ impl PromptIntake {
                 "harness_action: answer without mutation; bounded read/recovery tools only"
             }
             PromptDisposition::Research => {
-                "harness_action: gather bounded read-only evidence; do not mutate or request capability grants"
+                "harness_action: gather bounded read-only evidence with the advertised tools \
+                 (for top-N CODE file line/size rankings: find with code=true + sort=lines|size \
+                 + show_lines|show_size; present as a GFM Markdown table); do not mutate or \
+                 request capability grants"
             }
             PromptDisposition::Plan => {
                 "harness_action: read evidence and maintain the harness plan ledger only; do not mutate the workspace, execute commands, or request capability grants"
@@ -845,6 +848,22 @@ mod tests {
         let card = intake.model_card();
         assert!(card.starts_with(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX));
         assert!(!card.contains("private parser"));
+    }
+
+    #[test]
+    fn research_model_card_steers_code_rankings_and_gfm_tables() {
+        let card = PromptIntake::analyze(
+            "show me the 10 code files with the highest line counts in this repository?",
+        )
+        .model_card();
+        assert!(
+            card.contains("disposition: research"),
+            "line-count code question → Research: {card}"
+        );
+        assert!(
+            card.contains("code=true") && card.contains("Markdown table"),
+            "Research card must teach find code=true + GFM table: {card}"
+        );
     }
 
     #[test]

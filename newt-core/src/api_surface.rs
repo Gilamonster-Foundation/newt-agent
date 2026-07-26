@@ -196,6 +196,39 @@ pub fn load_packs_from_dir(dir: &Path) -> Vec<LanguagePack> {
     out
 }
 
+/// Sorted unique file extensions from language packs (no leading dots).
+///
+/// Shared allowlist for "what counts as code":
+/// - [`gather_code_files`] / nav session build (`ensure_nav_indexes`)
+/// - `find` with `code: true` (top-N line/size rankings of *code* files)
+/// - a future warm-up inventory can reuse the same list without inventing a
+///   second definition of "code"
+#[must_use]
+pub fn code_file_extensions(packs: &[LanguagePack]) -> Vec<String> {
+    let mut exts: Vec<String> = packs
+        .iter()
+        .flat_map(|p| p.extensions.iter().cloned())
+        .collect();
+    exts.sort();
+    exts.dedup();
+    exts
+}
+
+/// True when `path`'s extension is in the code allowlist (case-insensitive).
+/// Paths with no extension (e.g. `LICENSE`, `Cargo.lock`) are never code.
+#[must_use]
+pub fn path_is_code_file(path: &str, extensions: &[String]) -> bool {
+    let Some(ext) = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+    else {
+        return false;
+    };
+    extensions
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(ext))
+}
+
 /// Merge pack layers **by name** — later layers win (built-ins < global dir <
 /// project dir < inline config). A custom pack named `rust` replaces the built-in
 /// `rust`; a new name adds a language. Output order is stable (insertion order of
@@ -492,6 +525,22 @@ mod tests {
                 "missing built-in: {lang}"
             );
         }
+    }
+
+    #[test]
+    fn code_file_extensions_are_sorted_unique_pack_allowlist() {
+        let exts = code_file_extensions(&builtin_packs());
+        assert!(exts.contains(&"rs".into()));
+        assert!(exts.contains(&"py".into()));
+        assert!(exts.windows(2).all(|w| w[0] <= w[1]), "sorted: {exts:?}");
+        // Docs / lockfiles are NOT code — no extension match for them.
+        assert!(!path_is_code_file("AGENTS.md", &exts));
+        assert!(!path_is_code_file("CHANGELOG.md", &exts));
+        assert!(!path_is_code_file("Cargo.lock", &exts));
+        assert!(!path_is_code_file("LICENSE", &exts));
+        assert!(!path_is_code_file("README.md", &exts));
+        assert!(path_is_code_file("newt-core/src/lib.rs", &exts));
+        assert!(path_is_code_file("tools/Foo.RS", &exts), "case-insensitive");
     }
 
     #[test]
