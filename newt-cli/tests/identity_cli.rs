@@ -4,7 +4,7 @@
 //! a separate empty tempdir, so resolution never reads the developer's real
 //! `~/.newt`. Because the working directory and `$HOME` are distinct empty
 //! trees, the default case resolves cleanly to the compiled-in
-//! `newt-agent[bot]` identity.
+//! `newt-agent` identity.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -18,7 +18,7 @@ fn newt_identity_in(workspace: &std::path::Path, home: &std::path::Path) -> Comm
 }
 
 #[test]
-fn identity_default_resolves_to_newt_agent_bot() {
+fn identity_default_resolves_to_newt_agent_user() {
     // Empty workspace, empty home: nothing on disk → the compiled-in default.
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -26,16 +26,18 @@ fn identity_default_resolves_to_newt_agent_bot() {
     newt_identity_in(workspace.path(), home.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("newt-agent[bot]"))
         .stdout(predicate::str::contains(
-            "293447090+newt-agent[bot]@users.noreply.github.com",
+            "309460085+newt-agent@users.noreply.github.com",
         ))
         .stdout(predicate::str::contains(
-            "compiled-in default (newt-agent[bot])",
+            "compiled-in default (newt-agent)",
         ))
         .stdout(predicate::str::contains("signing-key: <none>"))
         .stdout(predicate::str::contains("github-app:  <none>"))
-        .stdout(predicate::str::contains("tokens:      <none>"));
+        .stdout(predicate::str::contains("tokens:      <none>"))
+        .stdout(predicate::str::contains("newt-agent").and(
+            predicate::str::contains("[bot]").not(),
+        ));
 }
 
 #[test]

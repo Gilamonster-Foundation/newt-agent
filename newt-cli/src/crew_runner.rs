@@ -278,10 +278,10 @@ fn crew_dispatch_result(report: String, did_land: bool) -> Result<String, String
 }
 
 /// The `Co-authored-by` trailer for a crew's landed commit (#879): the crew's
-/// editing **model** as the display NAME, with the recognized **`newt-agent[bot]`**
-/// app EMAIL (`newt_core::DEFAULT_AGENT_EMAIL`, not a hard-coded string). So
-/// GitHub attributes the commit to https://github.com/apps/newt-agent (via the
-/// shared bot email) while the name records which model actually ran. Pure.
+/// editing **model** as the display NAME, with the recognized **`newt-agent`**
+/// User EMAIL (`newt_core::DEFAULT_AGENT_EMAIL`, not a hard-coded string). So
+/// GitHub attributes the commit to https://github.com/newt-agent (via the
+/// User no-reply email) while the name records which model actually ran. Pure.
 fn crew_coauthor_trailer(model: &str) -> String {
     format!(
         "Co-authored-by: {model} <{}>",
@@ -455,7 +455,7 @@ impl CrewRunner for LocalCrewRunner {
                         .unwrap_or_default()
                         .git_author();
                     // #879: attribute the landed commit — the editing model as the
-                    // co-author NAME, under the newt-agent[bot] app EMAIL.
+                    // co-author NAME, under the newt-agent User EMAIL.
                     let message = format!("{task}\n\n{}", crew_coauthor_trailer(&editor_model));
                     match ws.commit_to_branch(&format!("crew/{id}"), &name, &email, &message) {
                         Ok((branch, sha)) => {
@@ -597,10 +597,10 @@ mod tests {
     }
 
     #[test]
-    fn crew_coauthor_trailer_names_the_model_under_the_bot_email() {
-        // #879: the editing MODEL is the co-author NAME; the newt-agent[bot] app
+    fn crew_coauthor_trailer_names_the_model_under_the_user_email() {
+        // #879: the editing MODEL is the co-author NAME; the GitHub User
         // EMAIL (from the compiled-in identity, not a hard-coded string) makes
-        // GitHub attribute the commit to https://github.com/apps/newt-agent.
+        // GitHub attribute the commit to https://github.com/newt-agent.
         let t = crew_coauthor_trailer("ornith:35b");
         assert_eq!(
             t,
@@ -610,9 +610,10 @@ mod tests {
             )
         );
         assert!(
-            t.contains("newt-agent[bot]@users.noreply.github.com"),
+            t.contains("309460085+newt-agent@users.noreply.github.com"),
             "{t}"
         );
+        assert!(!t.contains("[bot]"), "{t}");
     }
 
     /// #749 step 2 — the `.meet()` seam: a dispatched crew runs under

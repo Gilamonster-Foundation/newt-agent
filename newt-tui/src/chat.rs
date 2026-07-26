@@ -1142,7 +1142,7 @@ pub(crate) fn run_chat(
     // workspace, which led agents to hunt for a (non-existent) MCP git tool and
     // conclude they had "no git tool", giving up on committing. The tool carries
     // an `init` op, so it is useful even before a repo exists. The commit author
-    // is the resolved AgentIdentity (`newt-agent[bot]` default).
+    // is the resolved AgentIdentity (`newt-agent` User default).
     let session_git_tool: Option<newt_git::LocalGitTool> = {
         let id = newt_core::AgentIdentity::resolve().unwrap_or_default();
         Some(newt_git::LocalGitTool {

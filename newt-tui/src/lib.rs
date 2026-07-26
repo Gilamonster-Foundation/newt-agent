@@ -526,12 +526,14 @@ fn scan_cli_exec_grants() -> Vec<String> {
 /// way to know its identity and confabulates one (e.g. inventing a name for
 /// commit attribution). Kept short — it rides in every request.
 /// The canonical AI-credit trailer the embedded git tool stamps on every commit:
-/// `Co-authored-by: <model> <293447090+newt-agent[bot]@users.noreply.github.com>`.
+/// `Co-authored-by: <model> <309460085+newt-agent@users.noreply.github.com>`.
 /// The model name credits which model did the work; the email is the
-/// `newt-agent[bot]` GitHub App's no-reply address ([`newt_core::DEFAULT_AGENT_EMAIL`]),
-/// so GitHub attributes the credit to the bot account. (The old
-/// `<noreply@newt-agent.com>` attributed to no GitHub account at all — the wrong
-/// message.) Always well-formed; the model can't fake it.
+/// GitHub User [`newt-agent`](https://github.com/newt-agent) no-reply address
+/// ([`newt_core::DEFAULT_AGENT_EMAIL`]), so GitHub attributes the credit to that
+/// User account. (The old App-bot email and the even older
+/// `<noreply@newt-agent.com>` are retained as override options via
+/// `agent-identity.toml` / [`newt_core::GITHUB_APP_BOT_EMAIL`].) Always
+/// well-formed; the model can't fake it.
 fn coauthor_trailer(model: &str) -> String {
     format!(
         "Co-authored-by: {model} <{}>",
@@ -558,6 +560,7 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
         _ => "ollama",
     };
     let bot_email = newt_core::DEFAULT_AGENT_EMAIL;
+    let bot_name = newt_core::DEFAULT_AGENT_NAME;
     let runtime_authority = yolo_runtime_authority_note()
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
@@ -573,15 +576,15 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          never invent or guess an identity.\n\
          {runtime_authority}\
          # Git commit identity\n\
-         Prefer the `git` tool: it commits as `newt-agent[bot] <{bot_email}>` and \
+         Prefer the `git` tool: it commits as `{bot_name} <{bot_email}>` and \
          auto-signs `Co-authored-by: {model} <{bot_email}>` — do NOT add that \
          trailer yourself, just write the plain message; for the last commit use \
          op=amend (don't claim to amend without calling it).\n\
          If you instead commit with the SHELL `git` command (run_command), you \
          MUST set the same identity explicitly — the email is what attributes the \
-         commit to the bot on GitHub. Use:\n\
-         `git -c user.name='newt-agent[bot]' -c user.email='{bot_email}' commit -m \"…\"`\n\
-         (the author name may be `newt-agent[bot]` or this model's name, but the \
+         commit to the harness account on GitHub. Use:\n\
+         `git -c user.name='{bot_name}' -c user.email='{bot_email}' commit -m \"…\"`\n\
+         (the author name may be `{bot_name}` or this model's name, but the \
          email must always be `{bot_email}`). Never commit with a guessed or \
          personal email.\n\
          # Filesystem confinement\n\

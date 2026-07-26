@@ -1,18 +1,22 @@
 use super::*;
 
 #[test]
-fn coauthor_trailer_uses_the_bot_github_email() {
+fn coauthor_trailer_uses_the_github_user_email() {
     let tr = coauthor_trailer("nemotron-3-nano:30b");
-    // Model name credits the work; the email attributes to the newt-agent[bot]
-    // GitHub App (the fix — the old noreply@newt-agent.com attributed nowhere).
+    // Model name credits the work; the email attributes to the GitHub User
+    // https://github.com/newt-agent (User no-reply, not the App bot).
     assert_eq!(
         tr,
-        "Co-authored-by: nemotron-3-nano:30b <293447090+newt-agent[bot]@users.noreply.github.com>"
+        "Co-authored-by: nemotron-3-nano:30b <309460085+newt-agent@users.noreply.github.com>"
     );
     assert!(tr.contains(newt_core::DEFAULT_AGENT_EMAIL));
     assert!(
         !tr.contains("noreply@newt-agent.com"),
         "old wrong email is gone"
+    );
+    assert!(
+        !tr.contains("[bot]"),
+        "default attribution is the User account, not the App bot"
     );
 }
 
@@ -20,8 +24,9 @@ fn coauthor_trailer_uses_the_bot_github_email() {
 fn runtime_context_block_instructs_shell_git_identity() {
     let blk = runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama);
     // The shell-git fallback (for a model that bypasses the embedded tool)
-    // must carry the canonical bot email.
-    assert!(blk.contains("user.email='293447090+newt-agent[bot]@users.noreply.github.com'"));
+    // must carry the canonical User no-reply email.
+    assert!(blk.contains("user.email='309460085+newt-agent@users.noreply.github.com'"));
+    assert!(blk.contains("user.name='newt-agent'"));
     assert!(blk.contains("git -c user.name="));
 }
 

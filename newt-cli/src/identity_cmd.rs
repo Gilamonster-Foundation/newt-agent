@@ -115,10 +115,11 @@ mod tests {
     fn prints_default_identity_no_secrets() {
         let out = render(
             &AgentIdentity::default(),
-            "compiled-in default (newt-agent[bot])",
+            "compiled-in default (newt-agent)",
         );
-        assert!(out.contains("newt-agent[bot]"));
-        assert!(out.contains("293447090+newt-agent[bot]@users.noreply.github.com"));
+        assert!(out.contains("newt-agent"));
+        assert!(out.contains("309460085+newt-agent@users.noreply.github.com"));
+        assert!(!out.contains("[bot]"));
         assert!(out.contains("Co-Authored-By:"));
         assert!(out.contains("signing-key: <none>"));
         assert!(out.contains("github-app:  <none>"));

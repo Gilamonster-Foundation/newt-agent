@@ -378,12 +378,12 @@ fn handle_git(args: &Value, granted: &Caveats) -> anyhow::Result<Value> {
                 name: args
                     .get("author_name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("newt-agent[bot]")
+                    .unwrap_or(newt_core::DEFAULT_AGENT_NAME)
                     .to_string(),
                 email: args
                     .get("author_email")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("newt-agent@users.noreply.github.com")
+                    .unwrap_or(newt_core::DEFAULT_AGENT_EMAIL)
                     .to_string(),
             };
             serde_json::to_value(eng.commit(&caps, message, &author).map_err(gerr)?)?
