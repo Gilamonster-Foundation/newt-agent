@@ -29,15 +29,13 @@ fn identity_default_resolves_to_newt_agent_user() {
         .stdout(predicate::str::contains(
             "309460085+newt-agent@users.noreply.github.com",
         ))
-        .stdout(predicate::str::contains(
-            "compiled-in default (newt-agent)",
-        ))
+        .stdout(predicate::str::contains("compiled-in default (newt-agent)"))
         .stdout(predicate::str::contains("signing-key: <none>"))
         .stdout(predicate::str::contains("github-app:  <none>"))
         .stdout(predicate::str::contains("tokens:      <none>"))
-        .stdout(predicate::str::contains("newt-agent").and(
-            predicate::str::contains("[bot]").not(),
-        ));
+        .stdout(
+            predicate::str::contains("newt-agent").and(predicate::str::contains("[bot]").not()),
+        );
 }
 
 #[test]

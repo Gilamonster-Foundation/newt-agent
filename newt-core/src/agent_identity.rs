@@ -72,8 +72,7 @@ pub const GITHUB_APP_BOT_NAME: &str = "newt-agent[bot]";
 ///
 /// The numeric id (`293447090`) is the App's bot user id, distinct from
 /// the User account id in [`DEFAULT_AGENT_EMAIL`].
-pub const GITHUB_APP_BOT_EMAIL: &str =
-    "293447090+newt-agent[bot]@users.noreply.github.com";
+pub const GITHUB_APP_BOT_EMAIL: &str = "293447090+newt-agent[bot]@users.noreply.github.com";
 
 // ---------------------------------------------------------------------------
 // Secret-by-reference primitives
@@ -526,10 +525,7 @@ mod tests {
     fn default_is_newt_agent_github_user() {
         let id = AgentIdentity::default();
         assert_eq!(id.name, "newt-agent");
-        assert_eq!(
-            id.email,
-            "309460085+newt-agent@users.noreply.github.com"
-        );
+        assert_eq!(id.email, "309460085+newt-agent@users.noreply.github.com");
         assert_ne!(id.name, GITHUB_APP_BOT_NAME);
         assert_ne!(id.email, GITHUB_APP_BOT_EMAIL);
         assert!(id.signing_key.is_none());
