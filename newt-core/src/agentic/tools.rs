@@ -1817,6 +1817,9 @@ struct FindOpts<'a> {
     /// Prefix each line with the entry's line (newline) count + a tab. When set
     /// (or `sort=lines`) the metric column is line count, not bytes.
     show_lines: bool,
+    /// Restrict to language-pack source extensions ("code files", not docs /
+    /// lockfiles). When true, directories are also skipped.
+    code: bool,
     /// Result ordering (#1258): [`FindSort::Name`] (default), byte-size- or
     /// line-count-descending.
     sort: FindSort,
@@ -1860,6 +1863,9 @@ fn find_detail(path: &str, opts: &FindOpts) -> String {
     if opts.show_lines {
         parts.push("lines".to_string());
     }
+    if opts.code {
+        parts.push("code".to_string());
+    }
     if parts.is_empty() {
         path.to_string()
     } else {
@@ -1884,6 +1890,7 @@ fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
         case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
         show_size: args["show_size"].as_bool().unwrap_or(false),
         show_lines: args["show_lines"].as_bool().unwrap_or(false),
+        code: args["code"].as_bool().unwrap_or(false),
         sort: match args["sort"].as_str() {
             Some("size") => FindSort::Size,
             Some("lines") => FindSort::Lines,
@@ -2090,6 +2097,7 @@ fn find_walk(
     root: &std::path::Path,
     workspace_root: &std::path::Path,
     opts: &FindOpts<'_>,
+    code_extensions: Option<&[String]>,
     mut on_hit: impl FnMut(&str),
 ) -> Result<(Vec<String>, bool), String> {
     let pattern = match opts.name {
@@ -2145,6 +2153,10 @@ fn find_walk(
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // `code: true` implies source files only (never directories).
+        if opts.code && is_dir {
+            continue;
+        }
         match opts.type_filter {
             FindType::Files if is_dir => continue,
             FindType::Dirs if !is_dir => continue,
@@ -2153,6 +2165,16 @@ fn find_walk(
         if let Some(re) = &pattern {
             let base = entry.file_name().to_string_lossy();
             if !re.is_match(&base) {
+                continue;
+            }
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(workspace_root)
+            .unwrap_or_else(|_| entry.path());
+        let rel_display = rel.to_string_lossy().replace('\\', "/");
+        if let Some(exts) = code_extensions {
+            if !crate::api_surface::path_is_code_file(&rel_display, exts) {
                 continue;
             }
         }
@@ -2173,15 +2195,23 @@ fn find_walk(
         } else {
             0
         };
-        let rel = entry
-            .path()
-            .strip_prefix(workspace_root)
-            .unwrap_or_else(|_| entry.path());
-        let rel_display = rel.to_string_lossy().replace('\\', "/");
         on_hit(&rel_display);
         entries.push((metric, rel_display));
     }
     Ok(finalize_find(entries, opts))
+}
+
+/// Resolve the language-pack extension allowlist for `find` `code: true`.
+/// Same seam as nav gather (`ensure_nav_indexes`) / a future warm-up inventory:
+/// built-in packs plus any inline `[context.api_surface.language_packs]`.
+fn active_code_extensions() -> Vec<String> {
+    let inline = crate::Config::resolve()
+        .ok()
+        .and_then(|cfg| cfg.context)
+        .map(|ctx| ctx.api_surface.language_packs)
+        .unwrap_or_default();
+    let packs = crate::api_surface::merge_packs(vec![crate::api_surface::builtin_packs(), inline]);
+    crate::api_surface::code_file_extensions(&packs)
 }
 
 /// Count newlines in a file, matching `wc -l` semantics (a trailing line without
@@ -4046,7 +4076,14 @@ async fn execute_tool_inner(
                     relay.write(crate::agentic::ToolOutputStream::Stdout, &chunk);
                 }
             };
-            let walked = find_walk(&full, std::path::Path::new(workspace), &opts, on_hit);
+            let code_exts = opts.code.then(active_code_extensions);
+            let walked = find_walk(
+                &full,
+                std::path::Path::new(workspace),
+                &opts,
+                code_exts.as_deref(),
+                on_hit,
+            );
             if let Some(live) = live.as_mut() {
                 live.finish();
             }
@@ -4198,6 +4235,7 @@ mod tests {
             case_sensitive: true,
             show_size,
             show_lines: false,
+            code: false,
             sort,
         }
     }
@@ -4229,6 +4267,16 @@ mod tests {
         // Default: no line column.
         let empty = serde_json::json!({});
         assert!(!find_opts_from_args(&empty).show_lines);
+    }
+
+    #[test]
+    fn find_opts_parses_code_filter() {
+        let coded = serde_json::json!({ "code": true, "sort": "lines", "show_lines": true });
+        let opts = find_opts_from_args(&coded);
+        assert!(opts.code);
+        assert!(opts.show_lines);
+        assert_eq!(opts.sort, FindSort::Lines);
+        assert!(!find_opts_from_args(&serde_json::json!({})).code);
     }
 
     #[test]
@@ -4972,6 +5020,7 @@ mod tests {
             case_sensitive: true,
             show_size: false,
             show_lines: false,
+            code: false,
             sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ".");
@@ -4988,6 +5037,7 @@ mod tests {
             case_sensitive: false,
             show_size: false,
             show_lines: false,
+            code: false,
             sort: FindSort::Name,
         };
         assert_eq!(
@@ -5007,6 +5057,7 @@ mod tests {
             case_sensitive: true,
             show_size: false,
             show_lines: false,
+            code: false,
             sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ". (type=d)");
@@ -5023,6 +5074,7 @@ mod tests {
             case_sensitive: true,
             show_size: true,
             show_lines: false,
+            code: false,
             sort: FindSort::Size,
         };
         assert_eq!(
@@ -5042,11 +5094,32 @@ mod tests {
             case_sensitive: true,
             show_size: false,
             show_lines: true,
+            code: false,
             sort: FindSort::Lines,
         };
         assert_eq!(
             find_detail(".", &opts),
             ". (name=*.rs, type=f, max=10, sort=lines, lines)"
+        );
+    }
+
+    #[test]
+    fn find_detail_notes_the_code_filter() {
+        let opts = FindOpts {
+            name: None,
+            type_filter: FindType::Files,
+            max_depth: None,
+            max_results: 10,
+            respect_gitignore: true,
+            case_sensitive: true,
+            show_size: false,
+            show_lines: true,
+            code: true,
+            sort: FindSort::Lines,
+        };
+        assert_eq!(
+            find_detail(".", &opts),
+            ". (type=f, max=10, sort=lines, lines, code)"
         );
     }
 
@@ -5309,6 +5382,19 @@ mod tests {
         assert!(
             props.get("show_lines").is_some(),
             "Research find schema must expose show_lines: {find_def}"
+        );
+        assert!(
+            props.get("code").is_some(),
+            "Research find schema must expose code (source-only filter): {find_def}"
+        );
+        let desc = find_def["function"]["description"].as_str().unwrap_or("");
+        assert!(
+            desc.contains("code: true") || desc.contains("`code: true`"),
+            "find description must teach code:true for source rankings: {desc}"
+        );
+        assert!(
+            desc.contains("Markdown table") || desc.contains("GFM Markdown table"),
+            "find description must coax a GFM table the TUI renders: {desc}"
         );
         let sort_enum = props["sort"]["enum"]
             .as_array()
@@ -7606,6 +7692,42 @@ mod execute_tool_branch_tests {
         touch(ws.path(), "docs/pyo3_module.md"); // decoy: wrong extension
         let out = run_find(serde_json::json!({ "name": "pyo3_module.rs" }), ws.path()).await;
         assert_eq!(out, "newt-core/src/pyo3_module.rs", "got: {out}");
+    }
+
+    /// 2026-07-26 regression: "code files with the highest line counts" must
+    /// NOT rank AGENTS.md / Cargo.lock. `code: true` keeps language-pack
+    /// source only (same allowlist as nav gather).
+    #[tokio::test]
+    async fn find_code_true_excludes_docs_and_lockfiles_from_line_ranking() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("tall.rs"), "x\n".repeat(20)).unwrap();
+        std::fs::write(ws.path().join("short.rs"), "x\n".repeat(5)).unwrap();
+        std::fs::write(ws.path().join("AGENTS.md"), "d\n".repeat(200)).unwrap();
+        std::fs::write(ws.path().join("Cargo.lock"), "l\n".repeat(100)).unwrap();
+        std::fs::write(ws.path().join("LICENSE"), "L\n".repeat(50)).unwrap();
+        let out = run_find(
+            serde_json::json!({
+                "path": ".",
+                "type": "f",
+                "code": true,
+                "sort": "lines",
+                "show_lines": true,
+                "max_results": 10
+            }),
+            ws.path(),
+        )
+        .await;
+        assert!(
+            out.contains("20\ttall.rs") && out.contains("5\tshort.rs"),
+            "code sources with line counts: {out}"
+        );
+        assert!(
+            !out.contains("AGENTS.md") && !out.contains("Cargo.lock") && !out.contains("LICENSE"),
+            "docs/lockfiles/LICENSE must be excluded: {out}"
+        );
+        let tall = out.find("20\ttall.rs").expect("tall first");
+        let short = out.find("5\tshort.rs").expect("short second");
+        assert!(tall < short, "lines descending: {out}");
     }
 
     /// The other call the blocked agent reached for:

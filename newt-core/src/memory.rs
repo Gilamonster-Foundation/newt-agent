@@ -1402,7 +1402,11 @@ have what was asked, call render_report to present it. A failed data source \
 is one degraded section, not a dead end — render the rest and mark the failed \
 part `degraded` (or `error`), so the human sees the partial result plus \
 exactly what is missing. Ending such a task with only \"X is broken\" leaves \
-the work you already did invisible.\n\
+the work you already did invisible. When ranking files (largest / most lines), \
+emit a GFM Markdown table with Path and the metric (`| Path | Lines |` or \
+`| Path | Bytes |`) — the TUI renders GFM tables. \"Code files\" means source \
+(use find with `code: true`); do not invent a numbered list of docs, lockfiles, \
+or LICENSE when asked for code.\n\
 \n\
 **Exploration budget for `act`.** Treat read-only rounds (list_dir, read_file) as expensive. \
 Spend at most three consecutive rounds on exploration before making a write. \
@@ -1923,6 +1927,21 @@ mod tests {
                 "DEFAULT_SOUL must advertise `{tool}`"
             );
         }
+    }
+
+    #[test]
+    fn default_soul_coaxes_gfm_tables_for_code_file_rankings() {
+        // 2026-07-26: a Research turn invented a numbered list of docs for
+        // "code files with the highest line counts". Soul must steer GFM
+        // tables + find code:true so the TUI renders rankings correctly.
+        assert!(
+            DEFAULT_SOUL.contains("Markdown table") || DEFAULT_SOUL.contains("GFM Markdown table"),
+            "soul must ask for a GFM table the TUI renders"
+        );
+        assert!(
+            DEFAULT_SOUL.contains("code: true"),
+            "soul must teach find code:true for source rankings"
+        );
     }
 
     /// FR-5 (#999) golden contract: the coach identity must instruct the model

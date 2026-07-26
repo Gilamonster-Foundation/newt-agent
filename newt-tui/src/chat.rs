@@ -4577,6 +4577,10 @@ pub(crate) fn run_chat(
 }
 
 /// #1387: build where_is + usage + graph + project model once per session.
+///
+/// Uses the same language-pack extension allowlist as `find` `code: true`
+/// ([`newt_core::api_surface::code_file_extensions`]) so "code" means one thing
+/// across nav gather, ranking finds, and a future warm-up inventory.
 fn ensure_nav_indexes(
     workspace: &str,
     where_is_index: &mut Option<newt_core::WhereIsIndex>,
@@ -4585,12 +4589,7 @@ fn ensure_nav_indexes(
 ) {
     use newt_core::{gather_with_manifest, GatherCaps};
     let packs = newt_core::api_surface::builtin_packs();
-    let exts: Vec<String> = packs
-        .iter()
-        .flat_map(|p| p.extensions.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let exts = newt_core::api_surface::code_file_extensions(&packs);
     let (files, manifest) = gather_with_manifest(workspace, &exts, GatherCaps::default());
     let cuts_open = !manifest.cuts.is_empty();
     let id = index_status.index_id();
