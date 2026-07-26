@@ -467,9 +467,14 @@ pub struct Adoption {
 /// file's declared model on a multiplexer and is overridden (flagged) on an
 /// instance.
 pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) -> Adoption {
-    let serving = backend
-        .serving
-        .unwrap_or_else(|| api_for(backend.kind).serving(served.models.len()));
+    let serving = backend.serving.unwrap_or_else(|| {
+        // Serving derivation needs a concrete wire kind. Callers that omit
+        // `kind` must probe first (`detect_endpoint`) and pass the detected
+        // kind on the backend view; until then treat as multiplexer (Ollama
+        // law) so adopt stays pure and never invents an openai/instance shape.
+        let kind = backend.kind.unwrap_or(BackendKind::Ollama);
+        api_for(kind).serving(served.models.len())
+    });
     match serving {
         Serving::Instance => {
             // The server dictates: the one served model, unconditionally.
@@ -556,7 +561,7 @@ mod tests {
             name: "b".into(),
             endpoint: "http://h:8000".into(),
             model: model.map(str::to_string),
-            kind: BackendKind::Openai,
+            kind: Some(BackendKind::Openai),
             serving,
             ..Default::default()
         }
@@ -905,7 +910,7 @@ mod tests {
             name: "o".into(),
             endpoint: "http://h:11434".into(),
             model: Some("declared".into()),
-            kind: BackendKind::Ollama,
+            kind: Some(BackendKind::Ollama),
             ..Default::default()
         };
         // (C3/#1122: a request must be SERVED to win — unserved requests
@@ -954,7 +959,7 @@ mod tests {
             name: "o".into(),
             endpoint: "http://h:11434".into(),
             model: Some("declared".into()),
-            kind: BackendKind::Ollama,
+            kind: Some(BackendKind::Ollama),
             ..Default::default()
         };
         let s = served(&["declared", "other"]);

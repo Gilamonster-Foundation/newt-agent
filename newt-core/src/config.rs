@@ -2756,10 +2756,12 @@ pub struct BackendConfig {
     pub model_path: Option<String>,
     #[serde(default)]
     pub tiers: Vec<Tier>,
-    /// Which wire protocol this backend speaks. Defaults to `ollama`
-    /// so configs written before this field existed keep working.
-    #[serde(default)]
-    pub kind: BackendKind,
+    /// Which wire protocol this backend speaks. OPTIONAL (#backend-kind-probe):
+    /// unset means "probe at connect" via [`crate::backend_probe::detect_endpoint`]
+    /// (race `/api/tags` vs `/v1/models`). Explicit `kind = "ollama"|"openai"|…`
+    /// keeps today's pinned behavior. Auth stays explicit (`api_key_*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<BackendKind>,
     /// For `kind = "openai"`: which OpenAI HTTP surface to use
     /// (`chat_completions` default, or `responses` for models served only on
     /// `/v1/responses`). Ignored for Ollama. The agent loop also auto-falls-back
@@ -2821,6 +2823,18 @@ impl BackendConfig {
     /// expects the served model to be adopted from the endpoint (Phase B).
     pub fn effective_model(&self) -> Option<&str> {
         self.model.as_deref().filter(|m| !m.trim().is_empty())
+    }
+
+    /// True when `kind` was omitted — session start / doctor must run
+    /// [`crate::backend_probe::detect_endpoint`] before speaking the wire.
+    pub fn needs_kind_probe(&self) -> bool {
+        self.kind.is_none()
+    }
+
+    /// Human label for lists/preambles: the pinned protocol, or `"auto"` when
+    /// unset (probe fills it in at connect).
+    pub fn kind_label(&self) -> &'static str {
+        self.kind.map(BackendKind::label).unwrap_or("auto")
     }
 
     /// Resolve this backend's bearer token, if any.
@@ -3021,7 +3035,7 @@ fn fallback_localhost_backend() -> BackendConfig {
         endpoint: "http://127.0.0.1:11434".into(),
         model: Some("llama3.1:8b".into()),
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
-        kind: BackendKind::Ollama,
+        kind: Some(BackendKind::Ollama),
         ..Default::default()
     }
 }
@@ -5237,7 +5251,7 @@ mod tests {
                     model: Some("old-model".into()),
                     model_path: None,
                     tiers: vec![],
-                    kind: BackendKind::Ollama,
+                    kind: Some(BackendKind::Ollama),
                     api: Default::default(),
                     api_key_file: None,
                     api_key_env: None,
@@ -5249,7 +5263,7 @@ mod tests {
                     model: Some("qwen2.5-coder:14b".into()),
                     model_path: None,
                     tiers: vec![],
-                    kind: BackendKind::Ollama,
+                    kind: Some(BackendKind::Ollama),
                     api: Default::default(),
                     api_key_file: None,
                     api_key_env: None,
@@ -5265,7 +5279,7 @@ mod tests {
         let dgx1 = cfg.backends.iter().find(|b| b.name == "dgx1").unwrap();
         assert_eq!(dgx1.endpoint, "http://REDACTED-HOST:11434", "disk wins");
         assert_eq!(dgx1.effective_model(), Some("qwen3:30b"));
-        assert_eq!(dgx1.kind, BackendKind::Ollama, "kind defaults to ollama");
+        assert_eq!(dgx1.kind, None, "absent kind means probe-at-connect");
         assert!(cfg.backends.iter().any(|b| b.name == "gnuc"), "gnuc kept");
     }
 
@@ -6785,7 +6799,7 @@ net = [\"already.example.com\"]
             model: Some("some-model".into()),
             model_path: None,
             tiers: vec![Tier::Fast],
-            kind: BackendKind::Openai,
+            kind: Some(BackendKind::Openai),
             api: Default::default(),
             api_key_file,
             api_key_env,
@@ -6794,7 +6808,7 @@ net = [\"already.example.com\"]
     }
 
     #[test]
-    fn backend_kind_defaults_to_ollama_when_absent() {
+    fn backend_kind_absent_means_probe_at_connect() {
         let toml = r#"
             [[backends]]
             name = "local"
@@ -6803,7 +6817,9 @@ net = [\"already.example.com\"]
             tiers = ["FAST"]
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.backends[0].kind, BackendKind::Ollama);
+        assert_eq!(cfg.backends[0].kind, None);
+        assert!(cfg.backends[0].needs_kind_probe());
+        assert_eq!(cfg.backends[0].kind_label(), "auto");
         assert!(cfg.backends[0].api_key_file.is_none());
         assert!(cfg.backends[0].api_key_env.is_none());
     }
@@ -6815,7 +6831,11 @@ net = [\"already.example.com\"]
                 "[[backends]]\nname=\"x\"\nendpoint=\"http://e\"\nmodel=\"m\"\ntiers=[\"FAST\"]\nkind=\"{kind_str}\"\n"
             );
             let cfg: Config = toml::from_str(&toml).unwrap();
-            assert_eq!(cfg.backends[0].kind, BackendKind::Openai, "kind={kind_str}");
+            assert_eq!(
+                cfg.backends[0].kind,
+                Some(BackendKind::Openai),
+                "kind={kind_str}"
+            );
         }
     }
 
@@ -6833,7 +6853,7 @@ net = [\"already.example.com\"]
         assert!(toml.contains("api_key_file"));
         assert!(toml.contains("api_key_env"));
         let back: BackendConfig = toml::from_str(&toml).unwrap();
-        assert_eq!(back.kind, BackendKind::Openai);
+        assert_eq!(back.kind, Some(BackendKind::Openai));
         assert_eq!(back.api_key_file.as_deref(), Some("~/.newt/token"));
         assert_eq!(back.api_key_env.as_deref(), Some("MY_TOKEN"));
     }

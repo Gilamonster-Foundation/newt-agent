@@ -95,7 +95,7 @@ fn save_config(path: &std::path::Path, url: &str, model: &str) -> anyhow::Result
         // A HINT, not authority: session start adopts what the server
         // actually serves (#1139); this keeps offline launches sane.
         model: Some(model.to_string()),
-        kind: newt_core::BackendKind::Ollama,
+        kind: Some(newt_core::BackendKind::Ollama),
         serving: Some(newt_core::Serving::Multiplexer),
         provenance: Some(newt_core::config::BackendProvenance {
             source: Some(format!("newt init v{}", env!("CARGO_PKG_VERSION"))),

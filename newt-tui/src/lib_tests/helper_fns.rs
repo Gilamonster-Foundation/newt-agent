@@ -647,13 +647,13 @@ fn resolver_default_backend_beats_the_openai_heuristic() {
         name: "gnuc".into(),
         endpoint: "http://gnuc:11434".into(),
         model: Some("m1".into()),
-        kind: newt_core::BackendKind::Ollama,
+        kind: Some(newt_core::BackendKind::Ollama),
         ..Default::default()
     };
     let vllm = newt_core::BackendConfig {
         name: "dgx1-8000".into(),
         endpoint: "http://dgx1:8000".into(),
-        kind: newt_core::BackendKind::Openai,
+        kind: Some(newt_core::BackendKind::Openai),
         serving: Some(newt_core::Serving::Instance),
         ..Default::default()
     };
@@ -883,7 +883,7 @@ fn resolve_backend_choice_prefers_openai_backend() {
             model: Some("qwen3:32b".into()),
             model_path: None,
             tiers: vec![],
-            kind: newt_core::BackendKind::Openai,
+            kind: Some(newt_core::BackendKind::Openai),
             api: Default::default(),
             api_key_file: None,
             api_key_env: None,
@@ -900,4 +900,193 @@ fn resolve_backend_choice_prefers_openai_backend() {
     assert_eq!(choice.url, "http://vllm.example:8000");
     assert_eq!(choice.model, "qwen3:32b");
     assert!(choice.api_key.is_none(), "no key configured → None");
+}
+
+#[test]
+fn resolve_backend_choice_marks_absent_kind_for_probe() {
+    let cfg = newt_core::Config {
+        backends: vec![newt_core::BackendConfig {
+            name: "dgx1-llama".into(),
+            endpoint: "http://host:8000".into(),
+            // Minimal durable shape: name + endpoint only.
+            kind: None,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let choice = crate::env_resolution_tests::with_env_vars(
+        &[],
+        &[
+            "NEWT_DGX_MODEL",
+            "NEWT_BACKEND",
+            "NEWT_PROVIDER",
+            "NEWT_DGX_OLLAMA_URL",
+            "NEWT_DGX_HOST",
+        ],
+        || resolve_backend_choice(&cfg),
+    );
+    assert!(choice.kind_needs_probe, "absent kind must probe at adopt");
+    assert_eq!(choice.name, "dgx1-llama");
+    assert_eq!(choice.url, "http://host:8000");
+}
+
+#[test]
+fn resolve_backend_choice_explicit_kind_skips_probe_flag() {
+    let cfg = newt_core::Config {
+        backends: vec![newt_core::BackendConfig {
+            name: "local".into(),
+            endpoint: "http://127.0.0.1:11434".into(),
+            kind: Some(newt_core::BackendKind::Ollama),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let choice = crate::env_resolution_tests::with_env_vars(
+        &[],
+        &[
+            "NEWT_DGX_MODEL",
+            "NEWT_BACKEND",
+            "NEWT_PROVIDER",
+            "NEWT_DGX_OLLAMA_URL",
+            "NEWT_DGX_HOST",
+        ],
+        || resolve_backend_choice(&cfg),
+    );
+    assert!(!choice.kind_needs_probe);
+    assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_detects_openai_when_kind_absent() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // OpenAI-only: /v1/models answers, /api/tags does not.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "nemotron"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut choice = BackendChoice {
+        name: "dgx1-llama".into(),
+        serving: None,
+        url: server.uri(),
+        model: String::new(),
+        kind: newt_core::BackendKind::Ollama, // placeholder
+        kind_needs_probe: true,
+        api_key: None,
+        api: newt_core::OpenAiApi::default(),
+        context_window: None,
+    };
+    let lines = adopt_backend_choice(&mut choice);
+    assert_eq!(choice.kind, newt_core::BackendKind::Openai);
+    assert!(!choice.kind_needs_probe);
+    assert_eq!(choice.model, "nemotron");
+    assert!(
+        lines.iter().any(|l| l.contains("detected openai")),
+        "status lines={lines:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_detects_ollama_when_kind_absent() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": [{"name": "llama3.1:8b"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut choice = BackendChoice {
+        name: "local".into(),
+        serving: None,
+        url: server.uri(),
+        model: String::new(),
+        kind: newt_core::BackendKind::Openai, // wrong placeholder — probe must win
+        kind_needs_probe: true,
+        api_key: None,
+        api: newt_core::OpenAiApi::default(),
+        context_window: None,
+    };
+    let _ = adopt_backend_choice(&mut choice);
+    assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
+    assert_eq!(choice.model, "llama3.1:8b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_respects_explicit_kind_without_detect() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // Only OpenAI surface lives here — an explicit ollama kind must NOT flip.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "should-not-adopt"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut choice = BackendChoice {
+        name: "pinned-ollama".into(),
+        serving: None,
+        url: server.uri(),
+        model: "configured".into(),
+        kind: newt_core::BackendKind::Ollama,
+        kind_needs_probe: false,
+        api_key: None,
+        api: newt_core::OpenAiApi::default(),
+        context_window: None,
+    };
+    let lines = adopt_backend_choice(&mut choice);
+    assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
+    assert_eq!(
+        choice.model, "configured",
+        "keep file hint when ollama probe fails"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("unreachable")),
+        "explicit ollama against openai-only endpoint should report unreachable, not detect; lines={lines:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_detects_authenticated_openai_with_bearer() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer secret-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "gated-model"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut choice = BackendChoice {
+        name: "gated".into(),
+        serving: None,
+        url: server.uri(),
+        model: String::new(),
+        kind: newt_core::BackendKind::Ollama,
+        kind_needs_probe: true,
+        api_key: Some("secret-token".into()),
+        api: newt_core::OpenAiApi::default(),
+        context_window: None,
+    };
+    let _ = adopt_backend_choice(&mut choice);
+    assert_eq!(choice.kind, newt_core::BackendKind::Openai);
+    assert_eq!(choice.model, "gated-model");
 }

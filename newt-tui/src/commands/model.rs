@@ -357,7 +357,7 @@ pub(crate) fn dispatch(
             let has_openai = cfg
                 .backends
                 .iter()
-                .any(|b| b.kind == newt_core::BackendKind::Openai);
+                .any(|b| b.kind == Some(newt_core::BackendKind::Openai));
             let kind_name = |c: &BackendChoice| c.kind.label();
             if arg1.is_empty() {
                 let choice = resolve_backend_choice(&cfg);
