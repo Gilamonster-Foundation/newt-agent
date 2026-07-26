@@ -16,6 +16,12 @@
 //! 4. the forensics tell the truth: `TurnEndReason::Completed`,
 //!    `hallucinations == 0`, and a footer with NO ⚠ (#1261, #1262).
 //!
+//! Flow 1b / 2b lock the **line-count** sibling (live-validated against
+//! Nemotron 2026-07-25): "highest line counts" classifies Research, is answered
+//! by `find` `sort=lines`+`show_lines` (NOT a bytesize fallback — the fixture
+//! inverts byte vs line order so a size sort would fail the assertion), and a
+//! `wc -l` shell reach is disposition-denied the same way `du` is for bytes.
+//!
 //! Fast + fully simulated (scripted model, no live inference), so it runs in
 //! the per-PR suite.
 
@@ -76,17 +82,24 @@ fn simulated_workspace() -> tempfile::TempDir {
     ws
 }
 
-/// A simulated workspace whose files have KNOWN, distinct LINE counts (not byte
-/// sizes) so the line ordering is deterministic — `tall.rs` has the most lines
-/// even though it is not necessarily the largest by bytes. (Real tempdir fs —
-/// sanctioned in the BAT tier; the model and every external system stay mocked.)
+/// A simulated workspace whose files have KNOWN, distinct LINE counts that are
+/// deliberately INVERTED vs byte size — so a bytesize fallback would order
+/// differently and fail the assertion. (Real tempdir fs — sanctioned in the
+/// BAT tier; the model and every external system stay mocked.)
+///
+/// | file     | lines | bytes (approx) | line-rank | byte-rank |
+/// |----------|------:|---------------:|----------:|----------:|
+/// | tall.rs  |   120 |            240 |         1 |         2 |
+/// | mid.rs   |    40 |             80 |         2 |         3 |
+/// | fat.rs   |     2 |           5001 |         3 |         1 |
 fn simulated_line_workspace() -> tempfile::TempDir {
     let ws = tempfile::TempDir::new().expect("workspace");
-    for (name, lines) in [("short.rs", 3), ("tall.rs", 120), ("mid.rs", 40)] {
-        // `lines` newline-terminated lines → exactly `lines` per `wc -l`.
-        let body = "x\n".repeat(lines);
-        std::fs::write(ws.path().join(name), body).expect("seed file");
-    }
+    // Many short lines → high line count, low bytes.
+    std::fs::write(ws.path().join("tall.rs"), "x\n".repeat(120)).expect("tall");
+    std::fs::write(ws.path().join("mid.rs"), "x\n".repeat(40)).expect("mid");
+    // Few long lines → low line count, high bytes (the bytesize trap).
+    let fat = format!("{}\n\n", "Y".repeat(5000));
+    std::fs::write(ws.path().join("fat.rs"), fat).expect("fat");
     ws
 }
 
@@ -283,7 +296,9 @@ async fn largest_files_question_answers_with_sized_find_and_clean_footer() {
 /// Flow 1b (#1387) — the line-count sibling of Flow 1: the "highest line counts"
 /// prompt classifies Research by content and is ANSWERED read-only by `find`
 /// with `sort=lines`+`show_lines`. No `wc -l`, no shell, and no bytesize
-/// fallback (which the operator classes a failure). Clean footer.
+/// fallback (which the operator classes a failure). The fixture inverts byte vs
+/// line order so a size-sort would put `fat.rs` first — locking that the metric
+/// is truly lines. Clean footer.
 #[tokio::test]
 async fn line_count_question_answers_with_lined_find_and_clean_footer() {
     let ws = simulated_line_workspace();
@@ -300,7 +315,7 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
                 }]
             }),
             serde_json::json!({ "content":
-                "By line count: tall.rs (120 lines), mid.rs (40) and short.rs (3)." }),
+                "By line count: tall.rs (120 lines), mid.rs (40) and fat.rs (2)." }),
         ],
     )
     .await;
@@ -308,6 +323,13 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
     assert!(
         reply.contains("line count") || reply.contains("lines"),
         "final answer returned: {reply}"
+    );
+    // The Research turn must teach `find` the line-count measure on the wire —
+    // if the schema loses `sort=lines`/`show_lines`, the live model cannot
+    // discover the capable path (the 2026-07-25 regression class).
+    assert!(
+        wire.contains("\"show_lines\"") && wire.contains("\"lines\""),
+        "Research-advertised find schema must teach show_lines + sort=lines: {wire}"
     );
     // The evidence turn ANSWERED the line-count question through `find` — line
     // counts, descending — no shell, no `wc -l`, no bytesize substitute.
@@ -317,9 +339,77 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
     );
     let tall = wire.find("120").expect("most lines present");
     let mid = wire.find("40\\tmid.rs").or_else(|| wire.find("40\tmid.rs"));
+    let fat = wire.find("2\\tfat.rs").or_else(|| wire.find("2\tfat.rs"));
     assert!(
         mid.is_some_and(|m| tall < m),
-        "descending line-count order on the wire"
+        "descending line-count order on the wire (tall before mid)"
+    );
+    assert!(
+        fat.is_some_and(|f| mid.expect("mid present") < f),
+        "descending line-count order: mid before fat (2 lines)"
+    );
+    // Anti-bytesize: a size-sort would put fat.rs FIRST with its byte count.
+    // Seeing that size-first metric on the wire means we fell back to bytes —
+    // the operator-classed failure mode.
+    let fat_bytes = std::fs::metadata(ws.path().join("fat.rs"))
+        .expect("fat.rs")
+        .len();
+    assert!(
+        !(wire.contains(&format!("{fat_bytes}\\tfat.rs"))
+            || wire.contains(&format!("{fat_bytes}\tfat.rs"))),
+        "must NOT answer with fat.rs's byte size ({fat_bytes}) — that is the \
+         bytesize-fallback failure: {wire}"
+    );
+    assert_clean_footer(hallucinations, end_reason);
+}
+
+/// Flow 2b — line-count boxed-in path: the model reaches for `wc -l` (the
+/// shell answer to line counts). Research disposition-denies `run_command`
+/// honestly; the formal escalation stays available. Same shape as Flow 2 for
+/// the `du` pipeline — locks that line count does NOT require Act.
+#[tokio::test]
+async fn line_count_question_wc_denied_then_escalates_cleanly() {
+    let ws = simulated_line_workspace();
+    let (reply, hallucinations, end_reason, wire) = run_scenario_for(
+        LINE_COUNT_PROMPT,
+        ws.path(),
+        vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "run_command",
+                        "arguments": "{\"command\":\"find . -name \\\"*.rs\\\" -type f -print0 | xargs -0 wc -l | sort -rn | head 10\"}" }
+                }]
+            }),
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c2", "type": "function",
+                    "function": { "name": "request_user_input",
+                        "arguments": "{\"question\":\"May I run wc -l, or should I use find sort=lines?\"}" }
+                }]
+            }),
+            serde_json::json!({ "content": "Proceeding with find sort=lines as suggested." }),
+        ],
+    )
+    .await;
+
+    assert!(
+        reply.contains("Proceeding") || reply.contains("sort=lines"),
+        "final answer returned: {reply}"
+    );
+    assert!(
+        wire.contains("Tool `run_command` is unavailable"),
+        "Research refuses the wc -l shell honestly: {wire}"
+    );
+    assert!(
+        wire.contains("no human available this session"),
+        "request_user_input must dispatch in the evidence turn: {wire}"
+    );
+    assert!(
+        !wire.contains("Tool `request_user_input` is unavailable"),
+        "the escalation must not be disposition-refused"
     );
     assert_clean_footer(hallucinations, end_reason);
 }

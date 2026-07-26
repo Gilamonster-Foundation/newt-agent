@@ -5288,6 +5288,35 @@ mod tests {
         // gated tool that would re-box the diagnosed session).
         assert!(tool_allowed(PromptDisposition::Explain, "find"));
         assert!(tool_allowed(PromptDisposition::Research, "find"));
+        // #1387 / line-count lock-in: Research must also keep `find`, AND the
+        // advertised schema must teach `sort=lines` + `show_lines`. Losing either
+        // re-opens the double-bind (Research admits find but can't answer lines
+        // → model dumps or reaches for `wc -l` → empty/denied).
+        let research_catalog = filter_tools_for_disposition(
+            merged_tool_definitions(
+                &NoMcp, false, false, false, false, false, false, false, false, false, false,
+                false, false,
+            ),
+            PromptDisposition::Research,
+        );
+        let find_def = research_catalog
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|d| d["function"]["name"].as_str() == Some("find"))
+            .expect("Research must advertise find");
+        let props = &find_def["function"]["parameters"]["properties"];
+        assert!(
+            props.get("show_lines").is_some(),
+            "Research find schema must expose show_lines: {find_def}"
+        );
+        let sort_enum = props["sort"]["enum"]
+            .as_array()
+            .expect("sort must be an enum");
+        assert!(
+            sort_enum.iter().any(|v| v.as_str() == Some("lines")),
+            "Research find sort enum must include 'lines': {sort_enum:?}"
+        );
         // #1259: the formal ask-the-human escalation IS admitted in evidence
         // turns — a boxed-in model ends as a question, not penalized narration…
         assert!(tool_allowed(
