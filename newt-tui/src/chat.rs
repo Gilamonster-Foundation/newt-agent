@@ -1142,20 +1142,20 @@ pub(crate) fn run_chat(
     // workspace, which led agents to hunt for a (non-existent) MCP git tool and
     // conclude they had "no git tool", giving up on committing. The tool carries
     // an `init` op, so it is useful even before a repo exists. The commit author
-    // is the resolved AgentIdentity (`newt-agent[bot]` default).
+    // is the resolved AgentIdentity (`newt-agent` User default, overridable).
+    let session_identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
     let session_git_tool: Option<newt_git::LocalGitTool> = {
-        let id = newt_core::AgentIdentity::resolve().unwrap_or_default();
         Some(newt_git::LocalGitTool {
             root: std::path::PathBuf::from(workspace),
             author: newt_git::Author {
-                name: id.name,
-                email: id.email,
+                name: session_identity.name.clone(),
+                email: session_identity.email.clone(),
             },
             // Auto-sign commits with the AI credit (the tool owns this so it is
             // always present and correctly formatted — the model is told it's
             // automatic, see runtime_context_block). Model = the session's
-            // model; harness = this newt version.
-            coauthor: Some(coauthor_trailer(&inf_model)),
+            // model; email = the resolved harness identity.
+            coauthor: Some(coauthor_trailer(&inf_model, &session_identity)),
         })
     };
 
@@ -3443,7 +3443,7 @@ pub(crate) fn run_chat(
                     let mut turn_system = format!(
                         "{}\n\n{}\n\n{system}\n\n{session_controls}",
                         workspace_state_block(workspace),
-                        runtime_context_block(&inf_model, &inf_url, inf_kind)
+                        runtime_context_block(&inf_model, &inf_url, inf_kind, &session_identity)
                     );
                     if is_clarification_answer {
                         turn_system = format!(

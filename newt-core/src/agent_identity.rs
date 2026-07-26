@@ -7,8 +7,10 @@
 //! GitHub App coordinates a later autonomous-push path will mint tokens from.
 //!
 //! gilamonster-agent and any other newt-based agent **inherit** the
-//! compiled-in [`AgentIdentity::default`] (`newt-agent[bot]`) and override it
-//! by shipping their own `agent-identity.toml`.
+//! compiled-in [`AgentIdentity::default`] — the GitHub **User**
+//! [`newt-agent`](https://github.com/newt-agent) — and override it by
+//! shipping their own `agent-identity.toml`. To attribute as the GitHub App
+//! bot instead, set [`GITHUB_APP_BOT_NAME`] / [`GITHUB_APP_BOT_EMAIL`].
 //!
 //! # LOAD-BEARING SECURITY RULE — secrets are references, never values
 //!
@@ -43,13 +45,37 @@ use crate::config::{
 use crate::error::{NewtError, Result};
 
 // ---------------------------------------------------------------------------
-// Compiled-in defaults — the inherited `newt-agent[bot]` base
+// Compiled-in defaults — the inherited GitHub User `newt-agent` base
 // ---------------------------------------------------------------------------
 
-/// The default agent name newt commits under when no config overrides it.
-pub const DEFAULT_AGENT_NAME: &str = "newt-agent[bot]";
-/// The default agent email — the GitHub `[bot]` noreply address.
-pub const DEFAULT_AGENT_EMAIL: &str = "293447090+newt-agent[bot]@users.noreply.github.com";
+/// Compiled-in default author name — the GitHub **User**
+/// [`newt-agent`](https://github.com/newt-agent) (not the App bot).
+///
+/// Prefer this for harness attribution so commits link to the User
+/// profile. Override in `agent-identity.toml` when a different author
+/// (or the App bot — see [`GITHUB_APP_BOT_NAME`]) is required.
+pub const DEFAULT_AGENT_NAME: &str = "newt-agent";
+
+/// Compiled-in default author email — GitHub User no-reply form.
+///
+/// Format: `{user_id}+{login}@users.noreply.github.com`. The numeric id
+/// (`309460085`) is the user id for <https://github.com/newt-agent>.
+pub const DEFAULT_AGENT_EMAIL: &str = "309460085+newt-agent@users.noreply.github.com";
+
+/// GitHub App bot display name (`newt-agent[bot]`).
+///
+/// Kept for operators who want App-bot attribution via
+/// `agent-identity.toml` instead of the User default.
+pub const GITHUB_APP_BOT_NAME: &str = "newt-agent[bot]";
+
+/// GitHub App bot no-reply email (`{app_user_id}+newt-agent[bot]@…`).
+///
+/// The numeric id (`293447090`) is the App's bot user id, distinct from
+/// the User account id in [`DEFAULT_AGENT_EMAIL`].
+pub const GITHUB_APP_BOT_EMAIL: &str = "293447090+newt-agent[bot]@users.noreply.github.com";
+
+/// Filename looked for under each config root (workspace / home / system).
+pub const AGENT_IDENTITY_FILENAME: &str = "agent-identity.toml";
 
 // ---------------------------------------------------------------------------
 // Secret-by-reference primitives
@@ -213,10 +239,10 @@ pub struct GithubApp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "agent-identity")]
 pub struct AgentIdentity {
-    /// Git author/committer name (public). Default: `newt-agent[bot]`.
+    /// Git author/committer name (public). Default: [`DEFAULT_AGENT_NAME`].
     pub name: String,
-    /// Git author/committer email (public). Default: the `[bot]` noreply
-    /// address for `newt-agent[bot]`.
+    /// Git author/committer email (public). Default: [`DEFAULT_AGENT_EMAIL`]
+    /// (GitHub User no-reply for <https://github.com/newt-agent>).
     pub email: String,
 
     /// Optional model identifier used in the Co-authored-by header.
@@ -251,7 +277,7 @@ pub struct AgentIdentity {
 }
 
 impl Default for AgentIdentity {
-    /// The compiled-in `newt-agent[bot]` base every newt agent inherits.
+    /// The compiled-in GitHub User `newt-agent` base every newt agent inherits.
     /// No signing key, no GitHub App, no tokens — a fresh newt with zero
     /// config resolves cleanly to this.
     fn default() -> Self {
@@ -278,7 +304,7 @@ pub enum IdentitySource {
     Home(PathBuf),
     /// `/etc/newt/agent-identity.toml`.
     System(PathBuf),
-    /// The compiled-in `newt-agent[bot]` default — no file existed.
+    /// The compiled-in GitHub User `newt-agent` default — no file existed.
     Default,
 }
 
@@ -290,7 +316,22 @@ impl IdentitySource {
             Self::Workspace(p) => format!("workspace ({})", p.display()),
             Self::Home(p) => format!("home ({})", p.display()),
             Self::System(p) => format!("system ({})", p.display()),
-            Self::Default => "compiled-in default (newt-agent[bot])".to_string(),
+            Self::Default => "compiled-in default (newt-agent)".to_string(),
+        }
+    }
+
+    /// Hint for how to override the compiled-in default.
+    ///
+    /// Printed by `newt identity` when no file is configured. The future setup
+    /// dialog will call [`AgentIdentity::save`] into the same home path.
+    #[must_use]
+    pub fn configure_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Default => Some(
+                "Override: write ~/.newt/agent-identity.toml (or `newt identity set --name … --email …`). \
+                 A future setup dialog will use the same path.",
+            ),
+            _ => None,
         }
     }
 }
@@ -306,7 +347,7 @@ impl AgentIdentity {
     ///
     /// The file's top-level table is `[agent-identity]`, so we read that
     /// sub-table and deserialize it over the compiled-in default (any omitted
-    /// field inherits the `newt-agent[bot]` base).
+    /// field inherits the User `newt-agent` base).
     pub fn from_toml_str(text: &str) -> Result<Self> {
         let value: toml::Value =
             toml::from_str(text).map_err(|e| NewtError::Config(e.to_string()))?;
@@ -334,12 +375,49 @@ impl AgentIdentity {
     ///    before `$HOME`),
     /// 2. `~/.newt/agent-identity.toml`,
     /// 3. `/etc/newt/agent-identity.toml`,
-    /// 4. the compiled-in [`AgentIdentity::default`] (`newt-agent[bot]`).
+    /// 4. the compiled-in [`AgentIdentity::default`] (GitHub User `newt-agent`).
     ///
     /// First file found wins; no file → the default. This never requires any
     /// file to exist.
     pub fn resolve() -> Result<Self> {
         Ok(Self::resolve_with_source()?.0)
+    }
+
+    /// Path of the user-level identity file (`~/.newt/agent-identity.toml`,
+    /// or `$NEWT_CONFIG_DIR/agent-identity.toml`).
+    ///
+    /// This is the write target for `newt identity set` and for a future
+    /// setup-dialog identity step. `None` when no home/config dir is resolvable.
+    #[must_use]
+    pub fn user_identity_path() -> Option<PathBuf> {
+        Config::user_config_dir().map(|dir| dir.join(AGENT_IDENTITY_FILENAME))
+    }
+
+    /// Serialize this identity as a complete `[agent-identity]` TOML document.
+    ///
+    /// Secrets stay references (paths / env / cmd) — never raw values — so the
+    /// result is safe to write into a committed or home config file.
+    pub fn to_toml_string(&self) -> Result<String> {
+        // Wrap so the root table is `[agent-identity]`, matching the load path.
+        #[derive(Serialize)]
+        struct File<'a> {
+            #[serde(rename = "agent-identity")]
+            identity: &'a AgentIdentity,
+        }
+        toml::to_string_pretty(&File { identity: self })
+            .map_err(|e| NewtError::Config(e.to_string()))
+    }
+
+    /// Write this identity to `path`, creating parent directories if needed.
+    ///
+    /// Public write seam for `newt identity set` and a future setup dialog —
+    /// both should land here rather than open-coding TOML.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
+        }
+        let text = self.to_toml_string()?;
+        std::fs::write(path, text).map_err(NewtError::Io)
     }
 
     /// Like [`AgentIdentity::resolve`] but also reports which layer it came
@@ -372,7 +450,7 @@ impl AgentIdentity {
             if let Some(cfg) = find_project_config_from(start, home) {
                 // find_project_config_from returns `.../.newt/config.toml`;
                 // the identity file is its sibling.
-                let candidate = cfg.with_file_name("agent-identity.toml");
+                let candidate = cfg.with_file_name(AGENT_IDENTITY_FILENAME);
                 if candidate.is_file() {
                     return Ok((
                         Self::load(&candidate)?,
@@ -390,14 +468,14 @@ impl AgentIdentity {
 
         // 2. Home.
         if let Some(dir) = user_config_dir {
-            let candidate = dir.join("agent-identity.toml");
+            let candidate = dir.join(AGENT_IDENTITY_FILENAME);
             if candidate.is_file() {
                 return Ok((Self::load(&candidate)?, IdentitySource::Home(candidate)));
             }
         }
 
         // 3. System.
-        let system = PathBuf::from("/etc/newt/agent-identity.toml");
+        let system = PathBuf::from("/etc/newt").join(AGENT_IDENTITY_FILENAME);
         if system.is_file() {
             return Ok((Self::load(&system)?, IdentitySource::System(system)));
         }
@@ -469,7 +547,7 @@ fn find_identity_walkup(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
         if home == Some(current) {
             break;
         }
-        let candidate = current.join(".newt").join("agent-identity.toml");
+        let candidate = current.join(".newt").join(AGENT_IDENTITY_FILENAME);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -491,7 +569,7 @@ mod tests {
     fn write_identity(dir: &Path, body: &str) -> PathBuf {
         let newt = dir.join(".newt");
         std::fs::create_dir_all(&newt).unwrap();
-        let path = newt.join("agent-identity.toml");
+        let path = newt.join(AGENT_IDENTITY_FILENAME);
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(body.as_bytes()).unwrap();
         f.flush().unwrap();
@@ -499,13 +577,62 @@ mod tests {
     }
 
     #[test]
-    fn default_is_newt_agent_bot() {
-        let id = AgentIdentity::default();
-        assert_eq!(id.name, "newt-agent[bot]");
-        assert_eq!(
-            id.email,
-            "293447090+newt-agent[bot]@users.noreply.github.com"
+    fn to_toml_string_wraps_agent_identity_table() {
+        let id = AgentIdentity {
+            name: "custom-agent".into(),
+            email: "custom@users.noreply.github.com".into(),
+            ..AgentIdentity::default()
+        };
+        let text = id.to_toml_string().unwrap();
+        assert!(
+            text.contains("[agent-identity]"),
+            "must use the loadable table name: {text}"
         );
+        assert!(text.contains("name = \"custom-agent\""));
+        assert!(text.contains("email = \"custom@users.noreply.github.com\""));
+        // Round-trip through the loader.
+        let loaded = AgentIdentity::from_toml_str(&text).unwrap();
+        assert_eq!(loaded.name, "custom-agent");
+        assert_eq!(loaded.email, "custom@users.noreply.github.com");
+    }
+
+    #[test]
+    fn save_writes_file_that_resolve_from_home_picks_up() {
+        let home = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let path = home.path().join(".newt").join(AGENT_IDENTITY_FILENAME);
+        let id = AgentIdentity {
+            name: "saved-agent".into(),
+            email: "saved@users.noreply.github.com".into(),
+            ..AgentIdentity::default()
+        };
+        id.save(&path).unwrap();
+        assert!(path.is_file());
+
+        let (resolved, src) =
+            AgentIdentity::resolve_from(Some(elsewhere.path()), Some(home.path())).unwrap();
+        assert_eq!(resolved.name, "saved-agent");
+        assert_eq!(resolved.email, "saved@users.noreply.github.com");
+        assert!(matches!(src, IdentitySource::Home(_)));
+    }
+
+    #[test]
+    fn configure_hint_only_for_compiled_default() {
+        assert!(IdentitySource::Default.configure_hint().is_some());
+        assert!(
+            IdentitySource::Home(PathBuf::from("/h/.newt/agent-identity.toml"))
+                .configure_hint()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn default_is_newt_agent_github_user() {
+        let id = AgentIdentity::default();
+        assert_eq!(id.name, "newt-agent");
+        assert_eq!(id.email, "309460085+newt-agent@users.noreply.github.com");
+        assert_ne!(id.name, GITHUB_APP_BOT_NAME);
+        assert_ne!(id.email, GITHUB_APP_BOT_EMAIL);
         assert!(id.signing_key.is_none());
         assert!(id.public_key.is_none());
         assert!(id.github_app.is_none());
@@ -516,7 +643,7 @@ mod tests {
     #[test]
     fn resolve_with_no_files_yields_compiled_default() {
         // cwd is an empty temp dir, home a different empty temp dir: nothing on
-        // disk → the compiled-in newt-agent[bot] default, cleanly.
+        // disk → the compiled-in GitHub User `newt-agent` default, cleanly.
         let cwd = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let (id, src) = AgentIdentity::resolve_from(Some(cwd.path()), Some(home.path())).unwrap();
@@ -581,7 +708,7 @@ name = "custom[bot]"
         let id = AgentIdentity::default();
         assert_eq!(
             id.co_author_trailer(),
-            "Co-Authored-By: newt-agent[bot] <293447090+newt-agent[bot]@users.noreply.github.com>"
+            "Co-Authored-By: newt-agent <309460085+newt-agent@users.noreply.github.com>"
         );
     }
 
@@ -593,7 +720,7 @@ name = "custom[bot]"
         };
         assert_eq!(
             id.co_author_trailer(),
-            "Co-Authored-By: newt-agent[bot] (sakamakismile/Ornith-1.0-35B-NVFP4) <293447090+newt-agent[bot]@users.noreply.github.com>"
+            "Co-Authored-By: newt-agent (sakamakismile/Ornith-1.0-35B-NVFP4) <309460085+newt-agent@users.noreply.github.com>"
         );
     }
 
@@ -601,7 +728,7 @@ name = "custom[bot]"
     fn git_author_returns_name_and_email() {
         let id = AgentIdentity::default();
         let (name, email) = id.git_author();
-        assert_eq!(name, "newt-agent[bot]");
+        assert_eq!(name, "newt-agent");
         assert_eq!(email, DEFAULT_AGENT_EMAIL);
     }
 
@@ -781,7 +908,8 @@ svc = {{ file = '{}' }}
 
     #[test]
     fn identity_source_labels_are_human_readable() {
-        assert!(IdentitySource::Default.label().contains("newt-agent[bot]"));
+        assert!(IdentitySource::Default.label().contains("newt-agent"));
+        assert!(!IdentitySource::Default.label().contains("[bot]"));
         assert!(
             IdentitySource::Workspace(PathBuf::from("/w/.newt/agent-identity.toml"))
                 .label()

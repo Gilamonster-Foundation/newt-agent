@@ -706,10 +706,12 @@ fn trace_mode_env_or_config_and_implies_debug() {
 
 #[test]
 fn runtime_context_block_exposes_model_harness_and_backend() {
+    let id = newt_core::AgentIdentity::default();
     let block = runtime_context_block(
         "qwen3:30b",
         "http://REDACTED-HOST:11434",
         newt_core::BackendKind::Ollama,
+        &id,
     );
     assert!(block.contains("Model: qwen3:30b"), "{block}");
     assert!(block.contains("newt-agent v"), "harness + version: {block}");
@@ -725,6 +727,7 @@ fn runtime_context_block_exposes_model_harness_and_backend() {
         "gpt-4.1",
         "https://api.openai.com",
         newt_core::BackendKind::Openai,
+        &id,
     );
     assert!(
         oa.contains("openai-compatible @ https://api.openai.com"),
@@ -756,8 +759,10 @@ fn yolo_runtime_authority_note_tracks_disable_ocap_env() {
 
 #[test]
 fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
+    let id = newt_core::AgentIdentity::default();
     with_env_vars(&[], &["NEWT_DISABLE_OCAP"], || {
-        let block = runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama);
+        let block =
+            runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama, &id);
         assert!(
             !block.contains("--disable-ocap/--yolo is active"),
             "{block}"
@@ -765,7 +770,8 @@ fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
     });
 
     with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &[], || {
-        let block = runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama);
+        let block =
+            runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama, &id);
         assert!(block.contains("# Runtime authority"), "{block}");
         assert!(
             block.contains("Do not claim run_command is unavailable due to brush in this mode"),
