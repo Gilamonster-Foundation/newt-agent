@@ -43,6 +43,12 @@ const PROMPT: &str = "What are the 10 largest Rust files in this workspace?";
 const LINE_COUNT_PROMPT: &str =
     "show me the 10 code files with the highest line counts in this repository?";
 
+/// The operator's immediate follow-up, verbatim: explicit language + explicit
+/// table presentation. This is a new prompt, not a retry, so the protected
+/// comprehension card must independently preserve both constraints.
+const RUST_TABLE_PROMPT: &str =
+    "can you give me a table of the rust files with the longest line counts instead?";
+
 fn msgs_for(prompt: &str) -> Vec<MemMessage> {
     vec![
         MemMessage::system("you are a test"),
@@ -173,7 +179,7 @@ async fn run_scenario_for(
         narration_nudge_cap: 1,
         action_nudges: true,
         prompt_disposition: intake.disposition(),
-        prompt_intake: None,
+        prompt_intake: Some(&intake),
         workflow_grace_rounds: 0,
         tool_output_lines: 20,
         debug: false,
@@ -311,11 +317,11 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
                 "tool_calls": [{
                     "id": "c1", "type": "function",
                     "function": { "name": "find",
-                        "arguments": "{\"path\":\".\",\"name\":\"*.rs\",\"type\":\"f\",\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
+                        "arguments": "{\"path\":\".\",\"category\":\"source\",\"type\":\"f\",\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
                 }]
             }),
             serde_json::json!({ "content":
-                "By line count: tall.rs (120 lines), mid.rs (40) and fat.rs (2)." }),
+                "| File | line count |\n|---|---:|\n| `tall.rs` | 120 |\n| `mid.rs` | 40 |\n| `fat.rs` | 2 |" }),
         ],
     )
     .await;
@@ -330,6 +336,17 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
     assert!(
         wire.contains("\"show_lines\"") && wire.contains("\"lines\""),
         "Research-advertised find schema must teach show_lines + sort=lines: {wire}"
+    );
+    assert!(
+        wire.contains("\\\"category\\\":\\\"source\\\"")
+            || wire.contains("\"category\":\"source\""),
+        "`code files` must use the harness source category, not an unfiltered walk: {wire}"
+    );
+    assert!(
+        wire.contains("response_format: gfm_markdown")
+            && wire.contains("response_shape: table")
+            && wire.contains("evidence_scope: source_files"),
+        "the protected prompt card must carry Markdown-table + source-only steering: {wire}"
     );
     // The evidence turn ANSWERED the line-count question through `find` — line
     // counts, descending — no shell, no `wc -l`, no bytesize substitute.
@@ -359,6 +376,50 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
             || wire.contains(&format!("{fat_bytes}\tfat.rs"))),
         "must NOT answer with fat.rs's byte size ({fat_bytes}) — that is the \
          bytesize-fallback failure: {wire}"
+    );
+    assert_clean_footer(hallucinations, end_reason);
+}
+
+/// Flow 1c — the exact follow-up that regressed to an empty response. The
+/// protected card resolves Rust through language-pack data, the tool call uses
+/// the harness source category + language alias, and the final answer is a
+/// syntactically complete GFM pipe table for the TUI renderer.
+#[tokio::test]
+async fn rust_followup_answers_with_source_filtered_markdown_table() {
+    let ws = simulated_line_workspace();
+    let (reply, hallucinations, end_reason, wire) = run_scenario_for(
+        RUST_TABLE_PROMPT,
+        ws.path(),
+        vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "find",
+                        "arguments": "{\"path\":\".\",\"category\":\"source\",\"language\":\"rust\",\"type\":\"f\",\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
+                }]
+            }),
+            serde_json::json!({ "content":
+                "| Rust file | Lines |\n|---|---:|\n| `tall.rs` | 120 |\n| `mid.rs` | 40 |\n| `fat.rs` | 2 |" }),
+        ],
+    )
+    .await;
+
+    assert!(
+        reply.starts_with("| Rust file | Lines |\n|---|---:|"),
+        "final answer must be a complete GFM table: {reply}"
+    );
+    assert!(
+        wire.contains("source_extensions: rs")
+            && wire.contains("source_filter: category=source language=rust"),
+        "the protected card must resolve Rust through language-pack data: {wire}"
+    );
+    assert!(
+        (wire.contains("\\\"category\\\":\\\"source\\\"")
+            || wire.contains("\"category\":\"source\""))
+            && (wire.contains("\\\"language\\\":\\\"rust\\\"")
+                || wire.contains("\"language\":\"rust\"")),
+        "the concrete find call must preserve source category + language: {wire}"
     );
     assert_clean_footer(hallucinations, end_reason);
 }

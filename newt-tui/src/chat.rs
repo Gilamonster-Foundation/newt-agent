@@ -336,6 +336,52 @@ fn active_operator_task<'a>(
         .unwrap_or(submitted_task)
 }
 
+/// Cloneable liveness state for work owned by the harness but rendered by an
+/// [`InputSurface`]. Workers only flip the state; the active surface remains
+/// the sole terminal writer.
+#[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) struct BackgroundJob {
+    label: std::sync::Arc<str>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+impl BackgroundJob {
+    pub(crate) fn start(label: impl Into<String>) -> Self {
+        Self {
+            label: std::sync::Arc::from(label.into()),
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn finish(&self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn completion_guard(&self) -> BackgroundJobCompletion {
+        BackgroundJobCompletion(self.clone())
+    }
+}
+
+/// Marks a background job complete on success, cancellation, or unwind.
+struct BackgroundJobCompletion(BackgroundJob);
+
+impl Drop for BackgroundJobCompletion {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
 /// The severable input boundary between the chat loop and the editor widget.
 ///
 /// `run_chat` drives the conversation through this trait so the *input widget*
@@ -365,6 +411,9 @@ pub(crate) trait InputSurface {
     /// the latest fill are reflected. Default no-op: only the rich surface
     /// renders it; the lean surface carries model in the prompt string (or not).
     fn set_runtime_context(&mut self, _model: &str, _endpoint: &str, _gauge: Option<(u32, u32)>) {}
+    /// Replace the harness-owned jobs whose live state the input surface may
+    /// render. Default no-op keeps lean/headless output free of ephemeral UI.
+    fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {}
 }
 
 pub(crate) fn run_chat(
@@ -859,8 +908,9 @@ pub(crate) fn run_chat(
                 .unwrap_or(4);
             let surface_budget =
                 newt_core::resolve_surface_budget(mem_budget as usize, surface_cpt, &api_cfg);
+            let packs = resolved_language_packs(workspace, &api_cfg);
             mgr.add_provider(
-                newt_core::ApiSurfaceProvider::from_config(&api_cfg).with_budget(surface_budget),
+                newt_core::ApiSurfaceProvider::new(packs, &api_cfg).with_budget(surface_budget),
             );
             // #1284: the untruncatable project map (crate/package units + curated
             // purposes) — the navigation floor of the "IDE for LLMs" spine. A
@@ -960,6 +1010,10 @@ pub(crate) fn run_chat(
     // extraction needs no model, so the exact typed-verdict lookup rides every
     // session as the navigation floor.
     let mut where_is_index: Option<newt_core::WhereIsIndex> = None;
+    // Warm the model-free repository navigator in parallel with the remaining
+    // session startup. The first consumer joins this handle; a failed task
+    // leaves the existing synchronous ensure path as the honest fallback.
+    let mut nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
     // Step 26.6a (#585): session-scoped experiential ledger. Unlike the others it
     // SURVIVES /new (cross-task reuse within the session) — see the /new handler.
     let experience_store = newt_core::SessionExperienceStore::default();
@@ -1227,6 +1281,12 @@ pub(crate) fn run_chat(
             // Refresh the rich status header's model @ endpoint each turn (#527)
             // so a mid-session `/model` switch is reflected (no-op for lean).
             surface.set_runtime_context(&inf_model, &inf_url, token_gauge);
+            surface.set_background_jobs(
+                nav_warmup
+                    .as_ref()
+                    .map(|warmup| vec![warmup.job.clone()])
+                    .unwrap_or_default(),
+            );
             let origin =
                 pending_clarification
                     .as_ref()
@@ -1893,8 +1953,15 @@ pub(crate) fn run_chat(
                     if let Some(parsed) = crate::navigator_cmds::parse_nav_command(&task) {
                         match parsed {
                             Ok(cmd) => {
+                                finish_nav_warmup(
+                                    &rt,
+                                    &mut nav_warmup,
+                                    &mut where_is_index,
+                                    &mut nav_session,
+                                );
                                 ensure_nav_indexes(
                                     workspace,
+                                    &cfg,
                                     &mut where_is_index,
                                     &mut nav_session,
                                     &index_status,
@@ -2078,9 +2145,11 @@ pub(crate) fn run_chat(
                                         );
                                         if !semantic_indexed {
                                             semantic_indexed = true;
+                                            let source_extensions =
+                                                resolved_source_extensions(workspace, &cfg);
                                             let (files, manifest) = newt_core::gather_with_manifest(
                                                 workspace,
-                                                &["rs".to_string(), "py".to_string()],
+                                                &source_extensions,
                                                 newt_core::GatherCaps::default(),
                                             );
                                             let (git_head, dirty) = lightweight_git_meta(workspace);
@@ -2522,6 +2591,10 @@ pub(crate) fn run_chat(
                         // #1285: drop the where_is index too so /new re-derives it
                         // (picks up file adds/removes on the next turn).
                         where_is_index = None;
+                        if let Some(warmup) = nav_warmup.take() {
+                            warmup.abort();
+                        }
+                        nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
                         // Step 26.6a (#585): the experiential ledger is INTENTIONALLY
                         // NOT cleared here — it is cross-task by design (a later task
                         // reuses earlier lessons). It is dropped only at session end.
@@ -3532,14 +3605,16 @@ pub(crate) fn run_chat(
                             // whether or not it yields chunks — so a missing
                             // embedding model doesn't re-walk + re-embed every turn.
                             semantic_indexed = true;
-                            // Semantic embedding index keeps the narrow rs/py set
-                            // on purpose (#956 blast-radius note): broadening it
-                            // would embed every language's files each session.
-                            // #1387: keep the GatherManifest (was discarded) so
+                            // Use the harness-owned source registry rather than a
+                            // second rs/py list: prompt steering, exact inventory,
+                            // semantic retrieval, and structural navigation now
+                            // agree on what "code" means. Gather caps still bound
+                            // the embedding work. #1387 keeps the manifest so
                             // completeness / index_id are honest.
+                            let source_extensions = resolved_source_extensions(workspace, &cfg);
                             let (files, manifest) = newt_core::gather_with_manifest(
                                 workspace,
-                                &["rs".to_string(), "py".to_string()],
+                                &source_extensions,
                                 newt_core::GatherCaps::default(),
                             );
                             let (git_head, dirty) = lightweight_git_meta(workspace);
@@ -3914,9 +3989,11 @@ pub(crate) fn run_chat(
                     // #1285: build the model-free where_is index once per session
                     // (the gather is a capped, cheap structural walk — no model,
                     // no network). The typed-verdict lookup then rides this turn.
+                    finish_nav_warmup(&rt, &mut nav_warmup, &mut where_is_index, &mut nav_session);
                     if where_is_index.is_none() || nav_session.usage.is_none() {
                         ensure_nav_indexes(
                             workspace,
+                            &cfg,
                             &mut where_is_index,
                             &mut nav_session,
                             &index_status,
@@ -4579,18 +4656,19 @@ pub(crate) fn run_chat(
 /// #1387: build where_is + usage + graph + project model once per session.
 fn ensure_nav_indexes(
     workspace: &str,
+    cfg: &newt_core::Config,
     where_is_index: &mut Option<newt_core::WhereIsIndex>,
     nav_session: &mut newt_core::NavigatorSession,
     index_status: &newt_core::IndexStatus,
 ) {
     use newt_core::{gather_with_manifest, GatherCaps};
-    let packs = newt_core::api_surface::builtin_packs();
-    let exts: Vec<String> = packs
-        .iter()
-        .flat_map(|p| p.extensions.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let api_cfg = cfg
+        .context
+        .as_ref()
+        .map(|context| context.api_surface.clone())
+        .unwrap_or_default();
+    let packs = resolved_language_packs(workspace, &api_cfg);
+    let exts = newt_core::api_surface::source_extensions_for(&packs, None).unwrap_or_default();
     let (files, manifest) = gather_with_manifest(workspace, &exts, GatherCaps::default());
     let cuts_open = !manifest.cuts.is_empty();
     let id = index_status.index_id();
@@ -4612,6 +4690,74 @@ fn ensure_nav_indexes(
     }
     nav_session.files = files;
     nav_session.ledger.set_index(id);
+}
+
+type NavWarmupOutput = (Option<newt_core::WhereIsIndex>, newt_core::NavigatorSession);
+
+struct NavWarmup {
+    handle: tokio::task::JoinHandle<NavWarmupOutput>,
+    job: BackgroundJob,
+}
+
+impl NavWarmup {
+    fn abort(self) {
+        self.handle.abort();
+    }
+}
+
+fn spawn_nav_warmup(
+    rt: &tokio::runtime::Handle,
+    workspace: &str,
+    cfg: &newt_core::Config,
+    index_status: &newt_core::IndexStatus,
+) -> NavWarmup {
+    let workspace = workspace.to_string();
+    let cfg = cfg.clone();
+    let index_status = index_status.clone();
+    let job = BackgroundJob::start("indexing repository");
+    let completion = job.completion_guard();
+    let handle = rt.spawn_blocking(move || {
+        let _completion = completion;
+        let mut where_is = None;
+        let mut nav = newt_core::NavigatorSession::default();
+        ensure_nav_indexes(&workspace, &cfg, &mut where_is, &mut nav, &index_status);
+        (where_is, nav)
+    });
+    NavWarmup { handle, job }
+}
+
+fn finish_nav_warmup(
+    rt: &tokio::runtime::Handle,
+    warmup: &mut Option<NavWarmup>,
+    where_is: &mut Option<newt_core::WhereIsIndex>,
+    nav: &mut newt_core::NavigatorSession,
+) {
+    let Some(warmup) = warmup.take() else {
+        return;
+    };
+    if let Ok((warmed_where_is, warmed_nav)) =
+        tokio::task::block_in_place(|| rt.block_on(warmup.handle))
+    {
+        *where_is = warmed_where_is;
+        *nav = warmed_nav;
+    }
+}
+
+fn resolved_language_packs(
+    workspace: &str,
+    api_cfg: &newt_core::config::ApiSurfaceConfig,
+) -> Vec<newt_core::config::LanguagePack> {
+    newt_core::api_surface::resolve_language_packs(std::path::Path::new(workspace), api_cfg)
+}
+
+fn resolved_source_extensions(workspace: &str, cfg: &newt_core::Config) -> Vec<String> {
+    let api_cfg = cfg
+        .context
+        .as_ref()
+        .map(|context| context.api_surface.clone())
+        .unwrap_or_default();
+    let packs = resolved_language_packs(workspace, &api_cfg);
+    newt_core::api_surface::source_extensions_for(&packs, None).unwrap_or_default()
 }
 
 fn handle_nav_command(
@@ -4799,6 +4945,44 @@ fn handle_nav_command(
 #[cfg(test)]
 mod prompt_ingress_tests {
     use super::*;
+
+    /// Grounds the background task in a real source workspace: startup may run
+    /// concurrently, but the first consumer joins a complete structural index
+    /// rather than observing a partially built belief.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repository_navigator_warms_in_background_and_joins_complete() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            workspace.path().join("main.rs"),
+            "pub fn warm_marker() {}\n",
+        )
+        .unwrap();
+        let workspace = workspace.path().to_string_lossy().into_owned();
+        let rt = tokio::runtime::Handle::current();
+        let mut warmup = Some(spawn_nav_warmup(
+            &rt,
+            &workspace,
+            &newt_core::Config::default(),
+            &newt_core::IndexStatus::default(),
+        ));
+        let job = warmup.as_ref().unwrap().job.clone();
+        let mut where_is = None;
+        let mut nav = newt_core::NavigatorSession::default();
+
+        finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
+
+        assert!(warmup.is_none());
+        assert!(
+            !job.is_running(),
+            "joining the warm-up must clear its generic liveness indicator"
+        );
+        assert!(where_is.is_some());
+        assert!(
+            nav.files.iter().any(|(path, _)| path == "main.rs"),
+            "the joined navigator must contain the real source file"
+        );
+        assert!(nav.usage.is_some() && nav.graph.is_some());
+    }
 
     fn prompt_store() -> (tempfile::TempDir, newt_core::ConversationStore, String) {
         let tmp = tempfile::TempDir::new().unwrap();

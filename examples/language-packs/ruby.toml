@@ -1,6 +1,7 @@
 # A complete, working example pack: Ruby. Drop at ~/.newt/language-packs/ruby.toml
 # and your .rb files start contributing their public surface — no rebuild.
 name = "ruby"
+aliases = ["ruby", "rb"]
 extensions = ["rb"]
 entry_points = ["*.rb"]
 

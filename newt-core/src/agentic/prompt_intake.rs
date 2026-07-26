@@ -402,6 +402,14 @@ impl PromptIntake {
                 "harness_action: read evidence and maintain the harness plan ledger only; do not mutate the workspace, execute commands, or request capability grants"
             }
         };
+        let prompt = self
+            .manifest
+            .atomic_asks
+            .iter()
+            .map(AtomicAsk::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let presentation = presentation_model_card(&prompt);
         format!(
             "{PROMPT_COMPREHENSION_MODEL_CARD_PREFIX}\n\
              disposition: {}\n\
@@ -409,7 +417,8 @@ impl PromptIntake {
              decision_count: {}\n\
              pending_decision_count: {pending}\n\
              locked_decision_count: {locked}\n\
-             {instruction}",
+             {instruction}\n\
+             {presentation}",
             self.disposition.as_str(),
             self.manifest.atomic_asks.len(),
             self.manifest.decisions.len(),
@@ -555,6 +564,79 @@ fn strip_list_marker(line: &str) -> &str {
         }
     }
     line
+}
+
+fn presentation_model_card(prompt: &str) -> String {
+    let lower = prompt.to_ascii_lowercase();
+    let packs = crate::api_surface::builtin_packs();
+    let language = crate::api_surface::detect_source_language(prompt, &packs);
+    let contains = |needle| crate::api_surface::contains_bounded_ascii(&lower, needle);
+    let names_source_files = ["code file", "code files", "source file", "source files"]
+        .iter()
+        .any(|needle| contains(needle));
+    let names_language_files = language.is_some()
+        && ["file", "files", "script", "scripts"]
+            .iter()
+            .any(|needle| contains(needle));
+    let source_files = names_source_files || names_language_files;
+    let table = contains("table")
+        || [
+            "highest",
+            "lowest",
+            "largest",
+            "biggest",
+            "smallest",
+            "longest",
+            "shortest",
+            "most lines",
+            "fewest lines",
+        ]
+        .iter()
+        .any(|needle| contains(needle));
+
+    let mut lines = vec![
+        "response_format: gfm_markdown".to_string(),
+        format!("response_shape: {}", if table { "table" } else { "prose" }),
+    ];
+    if table {
+        lines.push(
+            "response_instruction: emit a GFM pipe table with a header and delimiter row; \
+             keep paths and measured values in separate columns; do not wrap the table in \
+             a code fence"
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "response_instruction: emit concise, valid GFM Markdown; do not wrap the whole \
+             answer in a code fence"
+                .to_string(),
+        );
+    }
+
+    if source_files {
+        lines.push("evidence_scope: source_files".to_string());
+        match language {
+            Some(pack) => {
+                if let Ok(extensions) =
+                    crate::api_surface::source_extensions_for(&packs, Some(&pack.name))
+                {
+                    lines.push(format!("source_extensions: {}", extensions.join(",")));
+                }
+                lines.push(format!(
+                    "source_filter: category=source language={}",
+                    pack.name
+                ));
+            }
+            None => lines.push("source_filter: category=source".to_string()),
+        }
+        lines.push(
+            "scope_instruction: code/source means registered language source files only; \
+             exclude documentation, manifests, lockfiles, and other repository metadata \
+             before ranking"
+                .to_string(),
+        );
+    }
+    lines.join("\n")
 }
 
 /// The pure-data needle table driving [`infer_disposition`] (#1260, three-Cs):
@@ -1132,6 +1214,77 @@ mod tests {
                 "line-count evidence phrasing → Research: {prompt:?}"
             );
         }
+    }
+
+    #[test]
+    fn ranked_code_file_prompt_steers_source_only_markdown_table() {
+        let intake = PromptIntake::analyze(
+            "show me the 10 code files with the highest line counts in this repository?",
+        );
+        let card = intake.model_card();
+
+        assert!(
+            card.contains("response_format: gfm_markdown"),
+            "every visible answer must target the TUI's Markdown renderer: {card}"
+        );
+        assert!(
+            card.contains("response_shape: table"),
+            "a ranked file result should be a table even when the operator did not \
+             spell out the presentation shape: {card}"
+        );
+        assert!(
+            card.contains("evidence_scope: source_files"),
+            "`code files` means language source, not every repository file: {card}"
+        );
+        assert!(
+            card.contains("source_filter: category=source"),
+            "an unqualified code-file request must use the harness-owned source category: {card}"
+        );
+        assert!(
+            card.contains("exclude documentation, manifests, lockfiles"),
+            "the steering must name the observed false-positive classes: {card}"
+        );
+    }
+
+    #[test]
+    fn explicit_rust_table_prompt_steers_rs_filter_and_gfm_table() {
+        let intake = PromptIntake::analyze(
+            "can you give me a table of the rust files with the longest line counts instead?",
+        );
+        let card = intake.model_card();
+
+        assert!(card.contains("response_format: gfm_markdown"), "{card}");
+        assert!(card.contains("response_shape: table"), "{card}");
+        assert!(card.contains("evidence_scope: source_files"), "{card}");
+        assert!(
+            card.contains("source_extensions: rs"),
+            "Rust must resolve through the language-pack data to its source extension: {card}"
+        );
+        assert!(
+            card.contains("source_filter: category=source language=rust"),
+            "the model needs the concrete harness filter, not just a language label: {card}"
+        );
+        assert!(
+            card.contains("GFM pipe table with a header and delimiter row"),
+            "the table shape must be syntactically renderable by the TUI: {card}"
+        );
+    }
+
+    #[test]
+    fn ordinary_explanation_still_gets_markdown_without_forced_file_scope() {
+        let card = PromptIntake::analyze("explain ownership briefly").model_card();
+
+        assert!(card.contains("response_format: gfm_markdown"), "{card}");
+        assert!(card.contains("response_shape: prose"), "{card}");
+        assert!(!card.contains("evidence_scope:"), "{card}");
+        assert!(!card.contains("source_filter:"), "{card}");
+
+        let comfortable =
+            PromptIntake::analyze("make this interface more comfortable").model_card();
+        assert!(
+            comfortable.contains("response_shape: prose"),
+            "`table` inside another word must not force tabular output: {comfortable}"
+        );
     }
 
     #[test]

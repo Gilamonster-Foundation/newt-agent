@@ -1237,7 +1237,7 @@ pub struct SymbolRule {
 /// language's files, which files expose its public API, and how to extract its
 /// public symbols — entirely as DATA, so a new language is config, not code.
 ///
-/// Built-in packs cover Rust, Python, Bash, and C/C++. A project ships more by
+/// Built-in packs cover common source languages. A project ships more by
 /// dropping a `<name>.toml` into `~/.newt/language-packs/` (global) or
 /// `.newt/language-packs/` (project-local), or inline under
 /// `[[context.api_surface.language_packs]]`. Packs merge **by `name`** (a custom
@@ -1247,6 +1247,12 @@ pub struct SymbolRule {
 pub struct LanguagePack {
     /// Stable id (a config pack with a built-in's name replaces that built-in).
     pub name: String,
+    /// Human spellings accepted by harness source-file classification, e.g.
+    /// `["c++", "cpp"]` or `["c#", "dotnet"]`. The stable `name` is always an
+    /// implicit alias. Pure data keeps language understanding out of prompt-
+    /// specific conditionals.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// File extensions this pack claims, no dot — `["rs"]`, `["h", "hpp", "cpp"]`.
     pub extensions: Vec<String>,
     /// Entry-point filename globs (the public-API files, listed first in the

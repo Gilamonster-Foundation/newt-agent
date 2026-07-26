@@ -122,13 +122,15 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "find",
-                "description": "Find files and directories by name under the workspace, recursively, WITHOUT a shell (use this instead of the `find` shell command). Returns matching paths relative to the workspace root, one per line, already sorted — no need to pipe to `sort`. Respects .gitignore and skips noise (.git, target, node_modules) by default. To answer size questions (e.g. the largest files) set `sort: \"size\"` + `show_size: true`; to answer LINE-COUNT questions (e.g. the files with the most lines) set `sort: \"lines\"` + `show_lines: true` — no `du`/`wc -l`/pipeline needed.",
+                "description": "Find files and directories under the workspace recursively, WITHOUT a shell. Returns relative paths, one per line, already sorted. Respects .gitignore and skips noise by default. IMPORTANT: when the operator asks for code/source files, set `category: \"source\"`; this harness-owned category uses the language-pack registry and excludes docs, manifests, locks, and other metadata. Set `language` to narrow source results (human names/aliases such as Rust, Python, TypeScript, Java, C++, C#, Ruby, bash). For top-N size use sort=size + show_size; for top-N line count use sort=lines + show_lines — no pipeline needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Directory to search under, relative to workspace root. Default '.' (the whole workspace)." },
                         "name": { "type": "string", "description": "Glob matched against each entry's basename, e.g. '*.py' or 'pyo3_module.rs'. '*' matches any run, '?' any single char. Omit to match everything." },
                         "type": { "type": "string", "enum": ["f", "d", "any"], "description": "Restrict to files ('f'), directories ('d'), or both ('any', the default)." },
+                        "category": { "type": "string", "enum": ["any", "source"], "description": "Semantic file category. Use 'source' whenever the operator says code/source files; it filters through the configured language-pack registry and excludes repository metadata. Default 'any' preserves historical behavior." },
+                        "language": { "type": "string", "description": "Optional source-language name or alias (case-insensitive), e.g. Rust, Python, TypeScript/ts, Java, C++/cpp, C#/csharp/dotnet, Ruby/rb, bash/shell. Implies category='source'. Project language-pack aliases work too." },
                         "max_depth": { "type": "integer", "description": "Maximum directory depth below `path` (1 = immediate children only). Omit for unlimited." },
                         "max_results": { "type": "integer", "description": "Cap on the number of matches returned. Default 1000; output notes when truncated." },
                         "respect_gitignore": { "type": "boolean", "description": "When true (default) skip .gitignored paths plus .git/target/node_modules/hidden dirs. Set false to search everything." },
