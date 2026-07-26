@@ -59,6 +59,7 @@
   /docs                    - quick pointers to newt docs and issue tracker
   /allow                   - alias for /permissions
   /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode
+  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)
   /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)
   /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)
   /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt

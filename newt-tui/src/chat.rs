@@ -1299,9 +1299,10 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
-                    // `/mcp` — MCP management surface (#1149): status table +
-                    // enable/disable persisted to config. Handled here because
-                    // it needs the live `mcp` instance.
+                    // `/mcp` — MCP management surface (#1149 + session mute):
+                    // status table, session on/off (instant catalog filter), and
+                    // durable enable/disable (config writeback). Handled here
+                    // because it needs the live `mcp` instance.
                     {
                         let w = task.trim_start_matches('/');
                         let (c, rest) = w
@@ -1328,11 +1329,19 @@ pub(crate) fn run_chat(
                                                     confinement,
                                                     net,
                                                 } => {
-                                                    format!(
-                                                        "  {n}  ✓ connected ({tools} tools){}{}",
-                                                        confinement.note(),
-                                                        net.note()
-                                                    )
+                                                    if mcp.is_muted(n) {
+                                                        format!(
+                                                            "  {n}  ⏸ muted this session ({tools} tools still connected — /mcp on {n}){}{}",
+                                                            confinement.note(),
+                                                            net.note()
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "  {n}  ✓ connected ({tools} tools){}{}",
+                                                            confinement.note(),
+                                                            net.note()
+                                                        )
+                                                    }
                                                 }
                                                 crate::mcp::McpStatus::Skipped(r) => {
                                                     let hint = if r.contains("401")
@@ -1345,13 +1354,81 @@ pub(crate) fn run_chat(
                                                     format!("  {n}  ✗ skipped: {r}{hint}")
                                                 }
                                                 crate::mcp::McpStatus::Disabled => {
-                                                    format!("  {n}  ⏸ disabled (/mcp enable {n})")
+                                                    format!("  {n}  ⏸ disabled in config (/mcp enable {n})")
                                                 }
                                             };
                                             println!("{line}");
                                         }
                                         print_newt(
-                                            "usage: /mcp [enable|disable|auth] <name>",
+                                            "usage: /mcp [on|off|enable|disable|auth] [name]",
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                // Session-scoped mute — tools leave the catalog
+                                // immediately; connection stays for instant /mcp on.
+                                ("off", "") => {
+                                    let muted = mcp.mute_all();
+                                    if muted.is_empty() {
+                                        print_newt("no connected MCP servers to mute", color, verbose);
+                                    } else {
+                                        print_newt(
+                                            &format!(
+                                                "muted {} — tools removed from this session (still connected; /mcp on to restore)",
+                                                muted.join(", ")
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                ("off", n) if !n.is_empty() => {
+                                    if mcp.mute(n) {
+                                        print_newt(
+                                            &format!(
+                                                "{n} muted — tools removed from this session (still connected; /mcp on {n})"
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    } else {
+                                        print_newt(
+                                            &format!(
+                                                "no connected MCP server `{n}` — try /mcp for status"
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                ("on", "") => {
+                                    let unmuted = mcp.unmute_all();
+                                    if unmuted.is_empty() {
+                                        print_newt("no muted MCP servers", color, verbose);
+                                    } else {
+                                        print_newt(
+                                            &format!(
+                                                "unmuted {} — tools restored this session",
+                                                unmuted.join(", ")
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                ("on", n) if !n.is_empty() => {
+                                    if mcp.unmute(n) {
+                                        print_newt(
+                                            &format!("{n} unmuted — tools restored this session"),
+                                            color,
+                                            verbose,
+                                        );
+                                    } else {
+                                        print_newt(
+                                            &format!(
+                                                "no connected MCP server `{n}` — config-disabled servers need `/mcp enable {n}` then relaunch (live reconnect: #1148)"
+                                            ),
                                             color,
                                             verbose,
                                         );
@@ -1371,7 +1448,7 @@ pub(crate) fn run_chat(
                                         }) {
                                         Ok(()) if on => print_newt(
                                             &format!(
-                                                "{n} enabled — connects at next launch                                                  (live connect: #1148)"
+                                                "{n} enabled in config — connects at next launch (live connect: #1148). For this session use `/mcp on {n}` if already connected."
                                             ),
                                             color,
                                             verbose,
@@ -1386,7 +1463,7 @@ pub(crate) fn run_chat(
                                                 }
                                             }
                                             print_newt(
-                                                &format!("{n} disabled — tools removed from this session"),
+                                                &format!("{n} disabled in config — tools removed from this session"),
                                                 color,
                                                 verbose,
                                             );
@@ -1399,7 +1476,11 @@ pub(crate) fn run_chat(
                                     color,
                                     verbose,
                                 ),
-                                _ => print_newt("usage: /mcp [enable|disable|auth] <name>", color, verbose),
+                                _ => print_newt(
+                                    "usage: /mcp [on|off|enable|disable|auth] [name]\n  on/off = this session (instant); enable/disable = config (durable)",
+                                    color,
+                                    verbose,
+                                ),
                             }
                             println!();
                             continue;
