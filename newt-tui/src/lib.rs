@@ -8582,6 +8582,22 @@ identity, and resolved backend details that drive this prompt.
 
 Use /help for the in-session command list."
         }
+        "mcp" => {
+            "\
+/mcp — manage MCP servers for this session
+
+  /mcp                         status of every discovered server
+  /mcp off [name]              mute this session (tools leave the catalog now;
+                               connection stays — /mcp on restores instantly)
+  /mcp on [name]               unmute this session (bare = unmute all)
+  /mcp disable <name>          durable: write enabled=false to config + drop now
+  /mcp enable <name>           durable: write enabled=true (connects next launch;
+                               live reconnect is #1148)
+  /mcp auth <name>             how to (re)authenticate (`newt auth <name>`)
+
+on/off is session-scoped (like /nudge) — use it while testing schema budget.
+enable/disable rewrites ~/.newt/config.toml."
+        }
         "mode" => {
             "\
 /mode [name] — show or choose the session's operating mode
@@ -8868,6 +8884,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /docs                    - quick pointers to newt docs and issue tracker",
         "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
+        "  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)",
         "  /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
@@ -11349,6 +11366,7 @@ mod tool_round_cap_tests {
                     code_search: None,
                     where_is: None,
                     nav: None,
+                    exposure: Default::default(),
                     experience_store: None,
                     step_ledger: None,
                     caveats: &caveats,

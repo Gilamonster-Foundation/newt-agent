@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{NewtError, Result};
 use crate::router::Tier;
 pub use newt_tuner::ModelTuning;
+pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
 pub use tools::ToolsConfig;
 
 mod shell;
+mod tool_exposure;
 mod tools;
 pub use shell::{
     confined_default_engine, full_access_default_engine, mcp_stdio_env_passthrough,
@@ -125,6 +127,12 @@ pub struct Config {
     /// (notably `max_output_tokens` = 10000). See [`ToolsConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsConfig>,
+
+    /// `[tool_exposure]` — the progressive tool-schema controller (Pass 1).
+    /// `None` → [`ExposureProfile::Full`] (identity; advertise the full
+    /// authorized catalog). See [`ToolExposureConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_exposure: Option<ToolExposureConfig>,
 
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3034,6 +3042,7 @@ impl Default for Config {
             intake: None,
             context: None,
             tools: None,
+            tool_exposure: None,
             pricing: None,
             memory: None,
             agents: AgentsConfig::default(),
@@ -3211,6 +3220,12 @@ impl Config {
             .as_ref()
             .map(|t| t.max_output_tokens)
             .unwrap_or_else(default_max_output_tokens)
+    }
+
+    /// The resolved `[tool_exposure]` policy, or the identity (`Full`) default
+    /// when the section is absent. See [`ToolExposureConfig`].
+    pub fn tool_exposure(&self) -> ToolExposureConfig {
+        self.tool_exposure.unwrap_or_default()
     }
 
     /// The configured head allocation for oversized `run_command` output
@@ -7069,5 +7084,50 @@ net = [\"already.example.com\"]
     fn tools_max_output_tokens_zero_is_a_valid_no_cap() {
         let cfg: Config = toml::from_str("[tools]\nmax_output_tokens = 0\n").unwrap();
         assert_eq!(cfg.max_output_tokens(), 0);
+    }
+
+    #[test]
+    fn tool_exposure_defaults_to_full_identity_when_absent() {
+        // No `[tool_exposure]` section ⇒ the identity controller (unchanged
+        // advertised catalog).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.tool_exposure.is_none());
+        let resolved = cfg.tool_exposure();
+        assert_eq!(resolved.profile, ExposureProfile::Full);
+        assert_eq!(resolved.schema_budget_pct, 15);
+        assert_eq!(resolved.max_initial_tools, 0);
+        assert!(resolved.supports_dynamic_catalog);
+        assert_eq!(
+            Config::default().tool_exposure().profile,
+            ExposureProfile::Full
+        );
+    }
+
+    #[test]
+    fn tool_exposure_parses_an_auto_profile_override() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [tool_exposure]
+            profile = "auto"
+            schema_budget_pct = 12
+            max_initial_tools = 8
+            supports_dynamic_catalog = false
+        "#,
+        )
+        .unwrap();
+        let resolved = cfg.tool_exposure();
+        assert_eq!(resolved.profile, ExposureProfile::Auto);
+        assert_eq!(resolved.schema_budget_pct, 12);
+        assert_eq!(resolved.max_initial_tools, 8);
+        assert!(!resolved.supports_dynamic_catalog);
+    }
+
+    #[test]
+    fn tool_exposure_minimal_profile_parses() {
+        let cfg: Config = toml::from_str("[tool_exposure]\nprofile = \"minimal\"\n").unwrap();
+        let resolved = cfg.tool_exposure();
+        assert_eq!(resolved.profile, ExposureProfile::Minimal);
+        // Omitted keys fall back to the shared defaults.
+        assert_eq!(resolved.schema_budget_pct, 15);
     }
 }

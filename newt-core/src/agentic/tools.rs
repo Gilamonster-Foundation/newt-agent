@@ -25,6 +25,7 @@ use output_budget::{
 pub use output_budget::{set_max_output_tokens, set_output_head_tokens};
 
 mod catalog;
+pub(crate) mod exposure;
 mod live_output;
 mod output_budget;
 use live_output::{LiveOutputRelay, LiveOutputSession};
@@ -47,6 +48,8 @@ pub use catalog::{
 use catalog::{
     levenshtein, nearest_tool_name, ALL_TOOL_NAMES, BASE_TOOL_NAMES, EXTENDED_TOOL_REGISTRY,
 };
+pub(crate) use exposure::select_exposed;
+pub use exposure::ExposureSettings;
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///
@@ -1785,12 +1788,15 @@ enum FindType {
 }
 
 /// Result ordering for the embedded `find` tool (#1258). `Name` is the historical
-/// default (paths ascending); `Size` orders by byte size descending so an
-/// evidence-only turn can answer "the N largest files" without shell access.
+/// default (paths ascending); `Size` orders by byte size descending, `Lines` by
+/// newline count descending — so an evidence-only turn can answer "the N largest
+/// files" (bytes) OR "the files with the most lines" without shell access. Line
+/// count is a first-class evidence question, not a bytesize fallback.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FindSort {
     Name,
     Size,
+    Lines,
 }
 
 /// Parsed, validated options for one `find` invocation.
@@ -1808,7 +1814,11 @@ struct FindOpts<'a> {
     case_sensitive: bool,
     /// Prefix each line with the entry's byte size + a tab (#1258).
     show_size: bool,
-    /// Result ordering (#1258): [`FindSort::Name`] (default) or size-descending.
+    /// Prefix each line with the entry's line (newline) count + a tab. When set
+    /// (or `sort=lines`) the metric column is line count, not bytes.
+    show_lines: bool,
+    /// Result ordering (#1258): [`FindSort::Name`] (default), byte-size- or
+    /// line-count-descending.
     sort: FindSort,
 }
 
@@ -1839,11 +1849,16 @@ fn find_detail(path: &str, opts: &FindOpts) -> String {
     if !opts.case_sensitive {
         parts.push("icase".to_string());
     }
-    if matches!(opts.sort, FindSort::Size) {
-        parts.push("sort=size".to_string());
+    match opts.sort {
+        FindSort::Size => parts.push("sort=size".to_string()),
+        FindSort::Lines => parts.push("sort=lines".to_string()),
+        FindSort::Name => {}
     }
     if opts.show_size {
         parts.push("size".to_string());
+    }
+    if opts.show_lines {
+        parts.push("lines".to_string());
     }
     if parts.is_empty() {
         path.to_string()
@@ -1868,8 +1883,10 @@ fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
         respect_gitignore: args["respect_gitignore"].as_bool().unwrap_or(true),
         case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
         show_size: args["show_size"].as_bool().unwrap_or(false),
+        show_lines: args["show_lines"].as_bool().unwrap_or(false),
         sort: match args["sort"].as_str() {
             Some("size") => FindSort::Size,
+            Some("lines") => FindSort::Lines,
             _ => FindSort::Name,
         },
     }
@@ -1891,16 +1908,19 @@ fn finalize_find(mut entries: Vec<(u64, String)>, opts: &FindOpts<'_>) -> (Vec<S
     // sort, which also establishes the Name ordering.
     entries.sort_by(|a, b| a.1.cmp(&b.1));
     entries.dedup_by(|a, b| a.1 == b.1);
-    if matches!(opts.sort, FindSort::Size) {
+    if matches!(opts.sort, FindSort::Size | FindSort::Lines) {
         entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     }
     let truncated = entries.len() > opts.max_results;
     entries.truncate(opts.max_results);
+    // The metric column is line count in line-mode (show_lines or sort=lines),
+    // otherwise byte size — a single tab-prefixed number either way.
+    let show_metric = opts.show_size || opts.show_lines;
     let lines = entries
         .into_iter()
-        .map(|(size, path)| {
-            if opts.show_size {
-                format!("{size}\t{path}")
+        .map(|(metric, path)| {
+            if show_metric {
+                format!("{metric}\t{path}")
             } else {
                 path
             }
@@ -2136,9 +2156,19 @@ fn find_walk(
                 continue;
             }
         }
-        // Size is read only when it will be used (shown or sorted on) — an
-        // unreadable metadata falls back to 0 rather than dropping the match.
-        let size = if opts.show_size || matches!(opts.sort, FindSort::Size) {
+        // The metric is read only when it will be used (shown or sorted on). Line
+        // mode (show_lines / sort=lines) wins over byte mode when both are set:
+        // reads the file and counts newlines (dirs → 0); byte mode reads cheap
+        // metadata. Unreadable → 0 rather than dropping the match.
+        let want_lines = opts.show_lines || matches!(opts.sort, FindSort::Lines);
+        let want_size = opts.show_size || matches!(opts.sort, FindSort::Size);
+        let metric = if want_lines {
+            if is_dir {
+                0
+            } else {
+                count_lines(entry.path())
+            }
+        } else if want_size {
             entry.metadata().map(|m| m.len()).unwrap_or(0)
         } else {
             0
@@ -2149,9 +2179,28 @@ fn find_walk(
             .unwrap_or_else(|_| entry.path());
         let rel_display = rel.to_string_lossy().replace('\\', "/");
         on_hit(&rel_display);
-        entries.push((size, rel_display));
+        entries.push((metric, rel_display));
     }
     Ok(finalize_find(entries, opts))
+}
+
+/// Count newlines in a file, matching `wc -l` semantics (a trailing line without
+/// a newline is not counted). Unreadable files → 0 so the match survives rather
+/// than aborting the walk. Reads the whole file — line count is a legitimate
+/// evidence question and the walk is already bounded to a source workspace. The
+/// counting itself is factored into [`count_newlines`] so it stays unit-testable
+/// without touching the filesystem (the mocked tier).
+fn count_lines(path: &std::path::Path) -> u64 {
+    match std::fs::read(path) {
+        Ok(bytes) => count_newlines(&bytes),
+        Err(_) => 0,
+    }
+}
+
+/// Pure `wc -l` newline count over raw bytes: the number of `\n` bytes, so a
+/// final line lacking a trailing newline is not counted.
+fn count_newlines(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|&&b| b == b'\n').count() as u64
 }
 
 /// Execute a single tool call and return the result string sent back to the model.
@@ -4148,6 +4197,7 @@ mod tests {
             respect_gitignore: true,
             case_sensitive: true,
             show_size,
+            show_lines: false,
             sort,
         }
     }
@@ -4167,6 +4217,55 @@ mod tests {
         let bogus = serde_json::json!({ "sort": "bogus" });
         let bad = find_opts_from_args(&bogus);
         assert_eq!(bad.sort, FindSort::Name);
+    }
+
+    #[test]
+    fn find_opts_parses_line_count_options() {
+        // #1387: line count is a first-class evidence measure, parsed like size.
+        let lined = serde_json::json!({ "show_lines": true, "sort": "lines" });
+        let opts = find_opts_from_args(&lined);
+        assert!(opts.show_lines);
+        assert_eq!(opts.sort, FindSort::Lines);
+        // Default: no line column.
+        let empty = serde_json::json!({});
+        assert!(!find_opts_from_args(&empty).show_lines);
+    }
+
+    #[test]
+    fn finalize_find_line_sort_is_lines_descending_with_show_lines() {
+        // The metric column carries line counts in line mode; ordering is
+        // descending with a path tie-break — the "files with the most lines"
+        // answer, no `wc -l`.
+        let entries = vec![
+            (12, "short.rs".to_string()),
+            (4247, "huge.rs".to_string()),
+            (300, "mid.rs".to_string()),
+        ];
+        let opts = FindOpts {
+            show_lines: true,
+            sort: FindSort::Lines,
+            ..find_opts(1000, false, FindSort::Lines)
+        };
+        let (lines, _) = finalize_find(entries, &opts);
+        assert_eq!(
+            lines,
+            vec!["4247\thuge.rs", "300\tmid.rs", "12\tshort.rs"],
+            "line count descending, each line prefixed '<lines>\\t<path>'"
+        );
+    }
+
+    #[test]
+    fn count_newlines_matches_wc_l_semantics() {
+        // Newlines are counted (a trailing line without a newline is not),
+        // mirroring `wc -l` — verified purely over bytes, no filesystem.
+        assert_eq!(count_newlines(b"a\nb\nc\n"), 3);
+        assert_eq!(
+            count_newlines(b"a\nb"),
+            1,
+            "trailing partial line uncounted"
+        );
+        assert_eq!(count_newlines(b""), 0);
+        assert_eq!(count_newlines(b"no newline at all"), 0);
     }
 
     #[test]
@@ -4872,6 +4971,7 @@ mod tests {
             respect_gitignore: true,
             case_sensitive: true,
             show_size: false,
+            show_lines: false,
             sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ".");
@@ -4887,6 +4987,7 @@ mod tests {
             respect_gitignore: false,
             case_sensitive: false,
             show_size: false,
+            show_lines: false,
             sort: FindSort::Name,
         };
         assert_eq!(
@@ -4905,6 +5006,7 @@ mod tests {
             respect_gitignore: true,
             case_sensitive: true,
             show_size: false,
+            show_lines: false,
             sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ". (type=d)");
@@ -4920,11 +5022,31 @@ mod tests {
             respect_gitignore: true,
             case_sensitive: true,
             show_size: true,
+            show_lines: false,
             sort: FindSort::Size,
         };
         assert_eq!(
             find_detail(".", &opts),
             ". (name=*.rs, type=f, max=10, sort=size, size)"
+        );
+    }
+
+    #[test]
+    fn find_detail_notes_the_line_column_and_line_sort() {
+        let opts = FindOpts {
+            name: Some("*.rs"),
+            type_filter: FindType::Files,
+            max_depth: None,
+            max_results: 10,
+            respect_gitignore: true,
+            case_sensitive: true,
+            show_size: false,
+            show_lines: true,
+            sort: FindSort::Lines,
+        };
+        assert_eq!(
+            find_detail(".", &opts),
+            ". (name=*.rs, type=f, max=10, sort=lines, lines)"
         );
     }
 
@@ -5166,6 +5288,35 @@ mod tests {
         // gated tool that would re-box the diagnosed session).
         assert!(tool_allowed(PromptDisposition::Explain, "find"));
         assert!(tool_allowed(PromptDisposition::Research, "find"));
+        // #1387 / line-count lock-in: Research must also keep `find`, AND the
+        // advertised schema must teach `sort=lines` + `show_lines`. Losing either
+        // re-opens the double-bind (Research admits find but can't answer lines
+        // → model dumps or reaches for `wc -l` → empty/denied).
+        let research_catalog = filter_tools_for_disposition(
+            merged_tool_definitions(
+                &NoMcp, false, false, false, false, false, false, false, false, false, false,
+                false, false,
+            ),
+            PromptDisposition::Research,
+        );
+        let find_def = research_catalog
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|d| d["function"]["name"].as_str() == Some("find"))
+            .expect("Research must advertise find");
+        let props = &find_def["function"]["parameters"]["properties"];
+        assert!(
+            props.get("show_lines").is_some(),
+            "Research find schema must expose show_lines: {find_def}"
+        );
+        let sort_enum = props["sort"]["enum"]
+            .as_array()
+            .expect("sort must be an enum");
+        assert!(
+            sort_enum.iter().any(|v| v.as_str() == Some("lines")),
+            "Research find sort enum must include 'lines': {sort_enum:?}"
+        );
         // #1259: the formal ask-the-human escalation IS admitted in evidence
         // turns — a boxed-in model ends as a question, not penalized narration…
         assert!(tool_allowed(
