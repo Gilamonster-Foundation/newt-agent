@@ -222,6 +222,26 @@ impl RelyingParty {
     }
 }
 
+impl RelyingParty {
+    /// Check the rpIdHash carried *inside* an attestation object.
+    ///
+    /// Registration has no separate `authenticatorData` field — it is nested in
+    /// the attestation — so this is the registration-time counterpart of
+    /// [`RelyingParty::check_rp_id_hash`], and skipping it would let a
+    /// credential registered for another site be staged here.
+    pub fn check_rp_id_hash_of_attestation(
+        &self,
+        attestation_object: &[u8],
+    ) -> Result<(), RpError> {
+        let value: ciborium::value::Value =
+            ciborium::from_reader(attestation_object).map_err(|_| RpError::MalformedAttestation)?;
+        let auth_data = cbor_map_get(&value, "authData")
+            .and_then(|v| v.as_bytes().cloned())
+            .ok_or(RpError::MalformedAttestation)?;
+        self.check_rp_id_hash(&auth_data)
+    }
+}
+
 /// Extract the credential id, COSE public key, and algorithm from a WebAuthn
 /// `attestationObject`.
 ///
