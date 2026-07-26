@@ -1849,7 +1849,7 @@ pub(crate) fn run_chat(
                                 &spill_status(
                                     configured,
                                     spill_lines_override,
-                                    live_spill_capable(),
+                                    live_spill_eligibility(),
                                 ),
                                 color,
                                 verbose,
@@ -1860,7 +1860,7 @@ pub(crate) fn run_chat(
                                     &spill_status(
                                         configured,
                                         spill_lines_override,
-                                        live_spill_capable(),
+                                        live_spill_eligibility(),
                                     ),
                                     color,
                                     verbose,
@@ -1872,7 +1872,7 @@ pub(crate) fn run_chat(
                                     &spill_status(
                                         configured,
                                         spill_lines_override,
-                                        live_spill_capable(),
+                                        live_spill_eligibility(),
                                     ),
                                     color,
                                     verbose,

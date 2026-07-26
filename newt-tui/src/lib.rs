@@ -6405,7 +6405,63 @@ fn effective_spill_lines(configured: usize, session_override: Option<usize>) -> 
     session_override.unwrap_or(configured)
 }
 
-fn spill_status(configured: usize, session_override: Option<usize>, live_capable: bool) -> String {
+/// Why the live spill viewport is, or is not, available right now (#1412).
+///
+/// The predicate used to be a bare `bool`, so `/spill` could say only
+/// "unavailable" — it could not distinguish "stdout is not a TTY" from
+/// "`TERM=dumb`" from "the feature was not compiled in". That silence has a
+/// measured cost: it is why a **stale install** was reported as a vanished
+/// feature. The binary on the reporting machine predated live-spill entirely
+/// and contained no `/spill` command at all, but nothing the product could say
+/// would have distinguished that from a misconfiguration.
+///
+/// A refusing gate should name itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpillEligibility {
+    /// Every gate passed; the live viewport can render.
+    Available,
+    /// Not a Unix-family platform (the viewport needs POSIX terminal control).
+    UnsupportedPlatform,
+    /// Built without the `live-spill` cargo feature — the lean/wyvern tier.
+    FeatureDisabled,
+    /// stdin is a pipe or file, so no keystrokes can drive the viewport.
+    StdinNotTty,
+    /// stdout is redirected, so there is no frame to draw into.
+    StdoutNotTty,
+    /// `TERM=dumb` — the terminal disclaims cursor addressing.
+    TermDumb,
+}
+
+impl SpillEligibility {
+    /// Operator-facing phrase for `/spill`. Names the gate AND, where there is
+    /// one, the lever that changes it — an unavailability the operator cannot
+    /// act on is only marginally better than a bare "unavailable".
+    fn explain(self) -> &'static str {
+        match self {
+            Self::Available => "live interaction available",
+            Self::UnsupportedPlatform => {
+                "live interaction unavailable: unsupported platform (needs a POSIX terminal)"
+            }
+            Self::FeatureDisabled => {
+                "live interaction unavailable: built without the `live-spill` feature \
+                 (this is the lean/wyvern build)"
+            }
+            Self::StdinNotTty => {
+                "live interaction unavailable: stdin is not a terminal (piped or redirected)"
+            }
+            Self::StdoutNotTty => {
+                "live interaction unavailable: stdout is not a terminal (piped or redirected)"
+            }
+            Self::TermDumb => "live interaction unavailable: TERM=dumb disclaims cursor control",
+        }
+    }
+}
+
+fn spill_status(
+    configured: usize,
+    session_override: Option<usize>,
+    eligibility: SpillEligibility,
+) -> String {
     let effective = effective_spill_lines(configured, session_override);
     let rows = if effective == 0 {
         "unbounded".to_string()
@@ -6416,19 +6472,21 @@ fn spill_status(configured: usize, session_override: Option<usize>, live_capable
         Some(_) => format!(" this session (config default {configured}"),
         None => " (config default".to_string(),
     };
+    // Row count is checked here rather than inside `SpillEligibility` on
+    // purpose: zero rows disables the *viewport*, but the terminal is still
+    // perfectly capable — and the mouse tier keys off capability, not rows.
+    // Folding the two would make `/spill 0` look like a broken terminal.
     let live = if effective == 0 {
-        "live viewport disabled"
-    } else if live_capable {
-        "live interaction available"
+        "live viewport disabled: spill_lines is 0 (/spill <n> raises it)"
     } else {
-        "live interaction unavailable"
+        eligibility.explain()
     };
     format!("spill rows: {rows}{source}; {live})")
 }
 
-fn live_spill_capable() -> bool {
+fn live_spill_eligibility() -> SpillEligibility {
     let term = std::env::var("TERM").ok();
-    live_spill_capable_for(
+    spill_eligibility_for(
         cfg!(unix),
         cfg!(feature = "live-spill"),
         std::io::stdin().is_terminal(),
@@ -6437,6 +6495,54 @@ fn live_spill_capable() -> bool {
     )
 }
 
+/// Yes/no form for the turn-level gate in `chat.rs`, which is itself
+/// `#[cfg(feature = "live-spill")]` — hence the matching gate here. Before
+/// #1412 this stayed alive in the lean build only because `/spill status`
+/// called it; that call now wants the *reason*, so the lean build would
+/// otherwise carry it as dead code.
+///
+/// Not `test`-gated: it probes the real stdin/stdout, so the unit tier drives
+/// the injected-bool [`live_spill_capable_for`] instead.
+#[cfg(feature = "live-spill")]
+fn live_spill_capable() -> bool {
+    live_spill_eligibility() == SpillEligibility::Available
+}
+
+/// Same five gates the old boolean ANDed, but reporting *which* one refused.
+///
+/// Precedence is deliberate and tested: the gates the operator cannot change
+/// without a different binary come first (platform, then cargo feature), then
+/// the ones a different invocation fixes (stdin, stdout), then the terminal's
+/// own declaration. Reporting the most fundamental refusal first stops
+/// `/spill` from sending someone to fix their `TERM` when the feature was
+/// never compiled in.
+fn spill_eligibility_for(
+    platform_supported: bool,
+    feature_enabled: bool,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    term: Option<&str>,
+) -> SpillEligibility {
+    if !platform_supported {
+        SpillEligibility::UnsupportedPlatform
+    } else if !feature_enabled {
+        SpillEligibility::FeatureDisabled
+    } else if !stdin_terminal {
+        SpillEligibility::StdinNotTty
+    } else if !stdout_terminal {
+        SpillEligibility::StdoutNotTty
+    } else if term == Some("dumb") {
+        SpillEligibility::TermDumb
+    } else {
+        SpillEligibility::Available
+    }
+}
+
+/// Boolean façade over [`spill_eligibility_for`], kept because the mouse tier
+/// and its acceptance tests ask a yes/no question and should not have to care
+/// about the reason. Gated to match its only non-test caller,
+/// `mouse_capable_for`, which is `#[cfg(feature = "live-spill")]`.
+#[cfg(any(feature = "live-spill", test))]
 fn live_spill_capable_for(
     platform_supported: bool,
     feature_enabled: bool,
@@ -6444,11 +6550,13 @@ fn live_spill_capable_for(
     stdout_terminal: bool,
     term: Option<&str>,
 ) -> bool {
-    platform_supported
-        && feature_enabled
-        && stdin_terminal
-        && stdout_terminal
-        && term != Some("dumb")
+    spill_eligibility_for(
+        platform_supported,
+        feature_enabled,
+        stdin_terminal,
+        stdout_terminal,
+        term,
+    ) == SpillEligibility::Available
 }
 
 /// #1303: the mouse-tier opt-in — config-first (`[tui] mouse_viewport`, default
