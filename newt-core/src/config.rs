@@ -2639,6 +2639,16 @@ pub enum OpenAiApi {
     Responses,
 }
 
+impl OpenAiApi {
+    /// Short human label for the HTTP surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+        }
+    }
+}
+
 /// A single inference backend entry.
 ///
 /// Two ways to define one: an inline `[[backends]]` array element in
@@ -2763,11 +2773,12 @@ pub struct BackendConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<BackendKind>,
     /// For `kind = "openai"`: which OpenAI HTTP surface to use
-    /// (`chat_completions` default, or `responses` for models served only on
-    /// `/v1/responses`). Ignored for Ollama. The agent loop also auto-falls-back
-    /// to `responses` if chat/completions 404s with the responses-only error.
-    #[serde(default)]
-    pub api: OpenAiApi,
+    /// (`chat_completions` or `responses`). OPTIONAL: unset means probe at
+    /// connect (try chat/completions; adopt `responses` when the server says
+    /// the model is responses-only). Explicit values stay pinned. Ignored for
+    /// Ollama. Serialized only when set so a minimal drop-in stays minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<OpenAiApi>,
     /// Optional path to a file whose first non-empty line is a bearer
     /// token, sent as `Authorization: Bearer <token>` by
     /// OpenAI-compatible backends. A leading `~/` is expanded to the
@@ -3023,6 +3034,74 @@ pub fn write_backend_dropin(
     let body = toml::to_string(backend).map_err(|e| format!("serialize backend: {e}"))?;
     std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// Persist probed backend fields into `~/.newt/backends/<name>.toml` (or
+/// `$NEWT_CONFIG_DIR/backends/<name>.toml`) — never into the main
+/// `config.toml`. Reset = delete that one file.
+///
+/// Merges into an existing drop-in of the same name (preserving auth refs and
+/// any operator-set fields not in `patch`), else creates a new minimal drop-in
+/// from `patch`. Returns the written path, or `None` when there is no user
+/// config dir / empty name.
+pub fn writeback_probed_backend(
+    patch: &BackendConfig,
+) -> std::result::Result<Option<std::path::PathBuf>, String> {
+    if patch.name.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(config_path) = Config::user_config_path() else {
+        return Ok(None);
+    };
+    let dir = config_path.with_file_name("backends");
+    let path = dir.join(format!("{}.toml", patch.name));
+    let mut merged = if path.is_file() {
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        toml::from_str::<BackendConfig>(&text)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?
+    } else {
+        BackendConfig {
+            name: patch.name.clone(),
+            endpoint: patch.endpoint.clone(),
+            ..Default::default()
+        }
+    };
+    // Filename stem is authoritative.
+    merged.name = patch.name.clone();
+    if !patch.endpoint.is_empty() {
+        merged.endpoint = patch.endpoint.clone();
+    }
+    if patch.kind.is_some() {
+        merged.kind = patch.kind;
+    }
+    if patch.api.is_some() {
+        merged.api = patch.api;
+    }
+    if patch.model.is_some() {
+        merged.model = patch.model.clone();
+    }
+    if patch.serving.is_some() {
+        merged.serving = patch.serving;
+    }
+    if patch.api_key_env.is_some() {
+        merged.api_key_env = patch.api_key_env.clone();
+    }
+    if patch.api_key_file.is_some() {
+        merged.api_key_file = patch.api_key_file.clone();
+    }
+    merged.provenance = Some(BackendProvenance {
+        source: Some(format!(
+            "newt adopt v{} (probed; delete this file to reset)",
+            env!("CARGO_PKG_VERSION")
+        )),
+        probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        derived_serving: patch
+            .serving
+            .map(|_| true)
+            .or_else(|| merged.provenance.as_ref().and_then(|p| p.derived_serving)),
+    });
+    write_backend_dropin(&config_path, &merged).map(Some)
 }
 
 /// The last-resort localhost Ollama backend: used both as `Config::default()`'s
@@ -5090,20 +5169,20 @@ mod tests {
 
     #[test]
     fn backend_api_axis_defaults_and_parses() {
-        // Absent → chat/completions (back-compat).
+        // Absent → unset (probe-at-connect for openai backends).
         let def: BackendConfig =
             toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\nkind=\"openai\"\n").unwrap();
-        assert_eq!(def.api, OpenAiApi::ChatCompletions);
+        assert_eq!(def.api, None);
         // Explicit responses opt-in.
         let resp: BackendConfig = toml::from_str(
             "endpoint=\"http://h:1\"\nmodel=\"gpt-5-codex\"\nkind=\"openai\"\napi=\"responses\"\n",
         )
         .unwrap();
-        assert_eq!(resp.api, OpenAiApi::Responses);
-        // `chat` is an accepted alias for the default.
+        assert_eq!(resp.api, Some(OpenAiApi::Responses));
+        // `chat` is an accepted alias for chat_completions.
         let alias: BackendConfig =
             toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\napi=\"chat\"\n").unwrap();
-        assert_eq!(alias.api, OpenAiApi::ChatCompletions);
+        assert_eq!(alias.api, Some(OpenAiApi::ChatCompletions));
     }
 
     #[test]
@@ -5281,6 +5360,67 @@ mod tests {
         assert_eq!(dgx1.effective_model(), Some("qwen3:30b"));
         assert_eq!(dgx1.kind, None, "absent kind means probe-at-connect");
         assert!(cfg.backends.iter().any(|b| b.name == "gnuc"), "gnuc kept");
+    }
+
+    #[test]
+    fn writeback_probed_backend_lands_in_dedicated_dropin_not_config_toml() {
+        // Probe write-back must never touch config.toml — only backends/<name>.toml
+        // so reset = delete that one file.
+        let dir = tempfile::tempdir().unwrap();
+        let config_toml = dir.path().join("config.toml");
+        std::fs::write(&config_toml, "# keep me\n").unwrap();
+        // SAFETY: test-local env pin; restored below.
+        let prev = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+        unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, dir.path()) };
+
+        let patch = BackendConfig {
+            name: "dgx1-llama".into(),
+            endpoint: "http://host:8000".into(),
+            kind: Some(BackendKind::Openai),
+            api: Some(OpenAiApi::Responses),
+            model: Some("nemotron".into()),
+            serving: Some(Serving::Instance),
+            ..Default::default()
+        };
+        let written = writeback_probed_backend(&patch)
+            .unwrap()
+            .expect("user config dir is set");
+        assert_eq!(written, dir.path().join("backends").join("dgx1-llama.toml"));
+        let body = std::fs::read_to_string(&written).unwrap();
+        assert!(body.contains("kind = \"openai\""));
+        assert!(body.contains("api = \"responses\""));
+        assert!(body.contains("model = \"nemotron\""));
+        assert!(body.contains("serving = \"instance\""));
+        // Main config untouched.
+        assert_eq!(
+            std::fs::read_to_string(&config_toml).unwrap(),
+            "# keep me\n"
+        );
+
+        // Second write merges and preserves auth refs already on disk.
+        std::fs::write(
+            &written,
+            "endpoint = \"http://host:8000\"\napi_key_env = \"DGX_TOKEN\"\n",
+        )
+        .unwrap();
+        let patch2 = BackendConfig {
+            name: "dgx1-llama".into(),
+            endpoint: "http://host:8000".into(),
+            kind: Some(BackendKind::Openai),
+            api: Some(OpenAiApi::ChatCompletions),
+            model: Some("other".into()),
+            ..Default::default()
+        };
+        writeback_probed_backend(&patch2).unwrap();
+        let body2 = std::fs::read_to_string(&written).unwrap();
+        assert!(body2.contains("api_key_env"), "auth ref preserved: {body2}");
+        assert!(body2.contains("api = \"chat_completions\""));
+        assert!(body2.contains("model = \"other\""));
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, v) },
+            None => unsafe { std::env::remove_var(NEWT_CONFIG_DIR_ENV) },
+        }
     }
 
     #[test]

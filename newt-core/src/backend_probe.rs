@@ -18,7 +18,7 @@
 //!   probe result; an unreachable endpoint is the caller's fallback path (file
 //!   hint + banner), not this module's.
 
-use crate::config::{BackendConfig, BackendKind, Serving};
+use crate::config::{BackendConfig, BackendKind, OpenAiApi as OpenAiApiSurface, Serving};
 
 /// HTTP status returned by a model-list probe. Keeping the status typed lets
 /// endpoint detection distinguish authentication and unsupported APIs from a
@@ -389,6 +389,84 @@ pub async fn detect_endpoint(
     }
 }
 
+/// True when an OpenAI error body says the model is served only on
+/// `/v1/responses` (gpt-5-codex et al.). Pure — unit-tested without a server.
+pub fn is_responses_only_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("v1/responses")
+        && (lower.contains("only supported")
+            || lower.contains("only available")
+            || lower.contains("unsupported_api"))
+}
+
+/// Detect which OpenAI HTTP surface `endpoint` wants for `model`.
+///
+/// Posts a one-token probe to `/v1/chat/completions`. A responses-only error
+/// body selects [`OpenAiApiSurface::Responses`]; any other reachable chat-surface
+/// outcome (2xx or garden-variety 4xx/5xx) keeps [`OpenAiApiSurface::ChatCompletions`].
+/// When chat returns a bare 404, a second one-token probe against
+/// `/v1/responses` decides. Unreachable endpoints error out so the caller can
+/// keep its file hint.
+pub async fn detect_openai_api(
+    client: &reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<OpenAiApiSurface> {
+    let base = endpoint.trim_end_matches('/');
+    let chat_url = format!("{base}/v1/chat/completions");
+    let chat_body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": false,
+    });
+    let mut req = client.post(&chat_url).json(&chat_body);
+    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        return Ok(OpenAiApiSurface::ChatCompletions);
+    }
+    if is_responses_only_error(&body) {
+        return Ok(OpenAiApiSurface::Responses);
+    }
+    if status != reqwest::StatusCode::NOT_FOUND {
+        // Surface exists (auth/rate-limit/validation) — stick with chat.
+        return Ok(OpenAiApiSurface::ChatCompletions);
+    }
+
+    // Bare 404 on chat: see whether /v1/responses is the live surface.
+    let responses_url = format!("{base}/v1/responses");
+    let responses_body = serde_json::json!({
+        "model": model,
+        "input": "ping",
+        "max_output_tokens": 1,
+    });
+    let mut req = client.post(&responses_url).json(&responses_body);
+    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+        req = req.bearer_auth(key);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status.is_success()
+                || status != reqwest::StatusCode::NOT_FOUND
+                || is_responses_only_error(&body)
+            {
+                Ok(OpenAiApiSurface::Responses)
+            } else {
+                Ok(OpenAiApiSurface::ChatCompletions)
+            }
+        }
+        Err(_) => Ok(OpenAiApiSurface::ChatCompletions),
+    }
+}
+
 /// Extract the context window from an Ollama `/api/show` response: the
 /// architecture `*.context_length` (smallest if several), capped by a
 /// Modelfile `num_ctx` override. Pure — unit-tested without a server.
@@ -551,7 +629,7 @@ pub async fn fetch_openai_models(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BackendKind;
+    use crate::config::{BackendKind, OpenAiApi as OpenAiApiSurface};
     use std::time::Duration;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -987,5 +1065,75 @@ mod tests {
         // Nothing anywhere → None; the caller surfaces it.
         let bare = openai_backend(None, Some(Serving::Instance));
         assert_eq!(adopt(&bare, &served(&[]), None).model, None);
+    }
+
+    #[test]
+    fn responses_only_error_recognizes_openai_wording() {
+        assert!(is_responses_only_error(
+            r#"{"error":{"message":"This model is only supported in v1/responses","code":"unsupported_api"}}"#
+        ));
+        assert!(!is_responses_only_error(
+            r#"{"error":{"message":"model not found"}}"#
+        ));
+        assert!(!is_responses_only_error("HTTP 404"));
+    }
+
+    #[tokio::test]
+    async fn detect_openai_api_keeps_chat_when_completions_succeed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let api = detect_openai_api(&reqwest::Client::new(), &server.uri(), "m", None)
+            .await
+            .unwrap();
+        assert_eq!(api, OpenAiApiSurface::ChatCompletions);
+    }
+
+    #[tokio::test]
+    async fn detect_openai_api_selects_responses_on_responses_only_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "This model is only supported in v1/responses",
+                    "code": "unsupported_api"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let api = detect_openai_api(&reqwest::Client::new(), &server.uri(), "gpt-5-codex", None)
+            .await
+            .unwrap();
+        assert_eq!(api, OpenAiApiSurface::Responses);
+    }
+
+    #[tokio::test]
+    async fn detect_openai_api_falls_through_to_responses_on_bare_chat_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": []
+            })))
+            .mount(&server)
+            .await;
+
+        let api = detect_openai_api(&reqwest::Client::new(), &server.uri(), "m", None)
+            .await
+            .unwrap();
+        assert_eq!(api, OpenAiApiSurface::Responses);
     }
 }
