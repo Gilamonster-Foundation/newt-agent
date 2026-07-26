@@ -616,6 +616,16 @@ impl Default for DispositionLexicon {
                 "largest",
                 "biggest",
                 "smallest",
+                // #1387: line count is a first-class evidence question, answered
+                // read-only by `find` (sort=lines/show_lines) — NOT an Act that
+                // needs `wc -l`, and NOT a bytesize fallback. Keeping it in
+                // Research and giving Research the capability is the fix for
+                // "Research is too strict".
+                "line count",
+                "most lines",
+                "fewest lines",
+                "longest file",
+                "shortest file",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1096,6 +1106,32 @@ mod tests {
         // A bare statement matching nothing still defaults to Act.
         let act = PromptIntake::analyze("update the release notes for 0.8.0");
         assert_eq!(act.disposition(), PromptDisposition::Act);
+    }
+
+    #[test]
+    fn line_count_questions_classify_research_not_the_cliff() {
+        // #1387: the regressed prompt. "line count" is evidence phrasing, so it
+        // lands in Research — where `find` (sort=lines/show_lines) can answer it
+        // read-only. It must NOT fall off the `?` cliff to Explain, and must NOT
+        // require Act (a mutation grant) just to count lines.
+        let regressed =
+            PromptIntake::analyze("show me the 10 code files with the highest line counts?");
+        assert_eq!(
+            regressed.disposition(),
+            PromptDisposition::Research,
+            "line-count question is a Research/evidence turn, not Explain or Act"
+        );
+        for prompt in [
+            "which files have the most lines",
+            "the longest file in the repo",
+            "files with the fewest lines",
+        ] {
+            assert_eq!(
+                PromptIntake::analyze(prompt).disposition(),
+                PromptDisposition::Research,
+                "line-count evidence phrasing → Research: {prompt:?}"
+            );
+        }
     }
 
     #[test]

@@ -122,7 +122,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "find",
-                "description": "Find files and directories by name under the workspace, recursively, WITHOUT a shell (use this instead of the `find` shell command). Returns matching paths relative to the workspace root, one per line, already sorted — no need to pipe to `sort`. Respects .gitignore and skips noise (.git, target, node_modules) by default. To answer size questions (e.g. the largest files) set `sort: \"size\"` + `show_size: true` — no `du`/pipeline needed.",
+                "description": "Find files and directories by name under the workspace, recursively, WITHOUT a shell (use this instead of the `find` shell command). Returns matching paths relative to the workspace root, one per line, already sorted — no need to pipe to `sort`. Respects .gitignore and skips noise (.git, target, node_modules) by default. To answer size questions (e.g. the largest files) set `sort: \"size\"` + `show_size: true`; to answer LINE-COUNT questions (e.g. the files with the most lines) set `sort: \"lines\"` + `show_lines: true` — no `du`/`wc -l`/pipeline needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -133,8 +133,9 @@ pub fn tool_definitions() -> serde_json::Value {
                         "max_results": { "type": "integer", "description": "Cap on the number of matches returned. Default 1000; output notes when truncated." },
                         "respect_gitignore": { "type": "boolean", "description": "When true (default) skip .gitignored paths plus .git/target/node_modules/hidden dirs. Set false to search everything." },
                         "case_sensitive": { "type": "boolean", "description": "Case-sensitive basename match. Default true." },
-                        "sort": { "type": "string", "enum": ["name", "size"], "description": "Result order: 'name' (default, paths ascending) or 'size' (byte size descending — combine with max_results for the N largest and show_size to see the bytes)." },
-                        "show_size": { "type": "boolean", "description": "Prefix each result with its byte size and a tab ('<size>\\t<path>'). Default false. Use with sort='size' to answer 'largest files' questions without a shell." }
+                        "sort": { "type": "string", "enum": ["name", "size", "lines"], "description": "Result order: 'name' (default, paths ascending), 'size' (byte size descending) or 'lines' (line count descending). Combine with max_results for the top-N and show_size/show_lines to see the metric." },
+                        "show_size": { "type": "boolean", "description": "Prefix each result with its byte size and a tab ('<size>\\t<path>'). Default false. Use with sort='size' to answer 'largest files' questions without a shell." },
+                        "show_lines": { "type": "boolean", "description": "Prefix each result with its line count and a tab ('<lines>\\t<path>'). Default false. Use with sort='lines' to answer 'files with the most lines' questions without a shell (no `wc -l`). Line mode wins over show_size when both are set." }
                     },
                     "required": []
                 }

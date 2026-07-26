@@ -30,10 +30,17 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 /// The diagnosed session's operator prompt, verbatim.
 const PROMPT: &str = "What are the 10 largest Rust files in this workspace?";
 
-fn msgs() -> Vec<MemMessage> {
+/// #1387 sibling: the line-count regression prompt. Same double-bind shape as
+/// #1257 (an evidence question the read-only turn must answer without shell) —
+/// here the metric is line count, answered by `find` sort=lines/show_lines, not
+/// a bytesize fallback (which the operator classes a failure).
+const LINE_COUNT_PROMPT: &str =
+    "show me the 10 code files with the highest line counts in this repository?";
+
+fn msgs_for(prompt: &str) -> Vec<MemMessage> {
     vec![
         MemMessage::system("you are a test"),
-        MemMessage::user(PROMPT),
+        MemMessage::user(prompt),
     ]
 }
 
@@ -69,6 +76,20 @@ fn simulated_workspace() -> tempfile::TempDir {
     ws
 }
 
+/// A simulated workspace whose files have KNOWN, distinct LINE counts (not byte
+/// sizes) so the line ordering is deterministic — `tall.rs` has the most lines
+/// even though it is not necessarily the largest by bytes. (Real tempdir fs —
+/// sanctioned in the BAT tier; the model and every external system stay mocked.)
+fn simulated_line_workspace() -> tempfile::TempDir {
+    let ws = tempfile::TempDir::new().expect("workspace");
+    for (name, lines) in [("short.rs", 3), ("tall.rs", 120), ("mid.rs", 40)] {
+        // `lines` newline-terminated lines → exactly `lines` per `wc -l`.
+        let body = "x\n".repeat(lines);
+        std::fs::write(ws.path().join(name), body).expect("seed file");
+    }
+    ws
+}
+
 /// Run the scripted turn under the REAL intake classification for the prompt
 /// (composition, not a hardcoded disposition) and return
 /// `(reply, hallucinations, end_reason, wire_bodies)`.
@@ -76,13 +97,25 @@ async fn run_scenario(
     workspace: &std::path::Path,
     script: Vec<serde_json::Value>,
 ) -> (String, u32, Option<crate::TurnEndReason>, String) {
-    let intake = PromptIntake::analyze(PROMPT);
-    // #1260: content classifies (the "largest" evidence needle) — the `?`
-    // cliff no longer decides. Research keeps the bounded evidence loop.
+    run_scenario_for(PROMPT, workspace, script).await
+}
+
+/// As [`run_scenario`], for an arbitrary evidence `prompt`. Both the byte-size
+/// (#1257) and line-count (#1387) prompts are Research by content, so the
+/// classification invariant is asserted here for whichever prompt is replayed.
+async fn run_scenario_for(
+    prompt: &str,
+    workspace: &std::path::Path,
+    script: Vec<serde_json::Value>,
+) -> (String, u32, Option<crate::TurnEndReason>, String) {
+    let intake = PromptIntake::analyze(prompt);
+    // #1260/#1387: content classifies (the "largest"/"line count" evidence
+    // needles) — the `?` cliff no longer decides. Research keeps the bounded
+    // evidence loop.
     assert_eq!(
         intake.disposition(),
         PromptDisposition::Research,
-        "the canonical prompt must classify Research by content"
+        "the evidence prompt must classify Research by content"
     );
 
     let server = MockServer::start().await;
@@ -95,7 +128,7 @@ async fn run_scenario(
         .mount(&server)
         .await;
 
-    let messages = msgs();
+    let messages = msgs_for(prompt);
     let caveats = Caveats::top();
     let uri = server.uri();
     let ws = workspace.to_string_lossy().into_owned();
@@ -106,7 +139,7 @@ async fn run_scenario(
         kind: BackendKind::Openai,
         api_key: None,
         messages: &messages,
-        task: PROMPT,
+        task: prompt,
         workspace: &ws,
         color: false,
         markdown: false,
@@ -243,6 +276,50 @@ async fn largest_files_question_answers_with_sized_find_and_clean_footer() {
     assert!(
         mid.is_some_and(|m| large < m),
         "descending size order on the wire"
+    );
+    assert_clean_footer(hallucinations, end_reason);
+}
+
+/// Flow 1b (#1387) — the line-count sibling of Flow 1: the "highest line counts"
+/// prompt classifies Research by content and is ANSWERED read-only by `find`
+/// with `sort=lines`+`show_lines`. No `wc -l`, no shell, and no bytesize
+/// fallback (which the operator classes a failure). Clean footer.
+#[tokio::test]
+async fn line_count_question_answers_with_lined_find_and_clean_footer() {
+    let ws = simulated_line_workspace();
+    let (reply, hallucinations, end_reason, wire) = run_scenario_for(
+        LINE_COUNT_PROMPT,
+        ws.path(),
+        vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "find",
+                        "arguments": "{\"path\":\".\",\"name\":\"*.rs\",\"type\":\"f\",\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
+                }]
+            }),
+            serde_json::json!({ "content":
+                "By line count: tall.rs (120 lines), mid.rs (40) and short.rs (3)." }),
+        ],
+    )
+    .await;
+
+    assert!(
+        reply.contains("line count") || reply.contains("lines"),
+        "final answer returned: {reply}"
+    );
+    // The evidence turn ANSWERED the line-count question through `find` — line
+    // counts, descending — no shell, no `wc -l`, no bytesize substitute.
+    assert!(
+        wire.contains("120\\ttall.rs") || wire.contains("120\ttall.rs"),
+        "the lined find result must reach the model, lines-first: {wire}"
+    );
+    let tall = wire.find("120").expect("most lines present");
+    let mid = wire.find("40\\tmid.rs").or_else(|| wire.find("40\tmid.rs"));
+    assert!(
+        mid.is_some_and(|m| tall < m),
+        "descending line-count order on the wire"
     );
     assert_clean_footer(hallucinations, end_reason);
 }
