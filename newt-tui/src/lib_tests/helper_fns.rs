@@ -980,6 +980,7 @@ async fn adopt_detects_openai_when_kind_absent() {
         kind_needs_probe: true,
         api_key: None,
         api: newt_core::OpenAiApi::default(),
+        api_needs_probe: false,
         context_window: None,
     };
     let lines = adopt_backend_choice(&mut choice);
@@ -1015,6 +1016,7 @@ async fn adopt_detects_ollama_when_kind_absent() {
         kind_needs_probe: true,
         api_key: None,
         api: newt_core::OpenAiApi::default(),
+        api_needs_probe: false,
         context_window: None,
     };
     let _ = adopt_backend_choice(&mut choice);
@@ -1046,6 +1048,7 @@ async fn adopt_respects_explicit_kind_without_detect() {
         kind_needs_probe: false,
         api_key: None,
         api: newt_core::OpenAiApi::default(),
+        api_needs_probe: false,
         context_window: None,
     };
     let lines = adopt_backend_choice(&mut choice);
@@ -1084,6 +1087,7 @@ async fn adopt_detects_authenticated_openai_with_bearer() {
         kind_needs_probe: true,
         api_key: Some("secret-token".into()),
         api: newt_core::OpenAiApi::default(),
+        api_needs_probe: false,
         context_window: None,
     };
     let _ = adopt_backend_choice(&mut choice);

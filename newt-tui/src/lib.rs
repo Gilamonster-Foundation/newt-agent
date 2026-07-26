@@ -2956,6 +2956,9 @@ pub(crate) struct BackendChoice {
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
     pub(crate) api: newt_core::OpenAiApi,
+    /// True when the config omitted `api` — adopt must run `detect_openai_api`
+    /// for OpenAI backends instead of trusting the chat_completions placeholder.
+    pub(crate) api_needs_probe: bool,
     /// The server-declared context window (#1199), probed FRESH at session-start
     /// adopt — not read from the persisted cache (which could hold a stale
     /// None). `None` when the API can't be asked; the budget then falls back to
@@ -3161,6 +3164,61 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
                         .await
                 })
             });
+            // OpenAI surface probe: absent `api` → try chat/completions, adopt
+            // `responses` when the server says the model is responses-only.
+            let mut api_was_probed = false;
+            if choice.kind == newt_core::BackendKind::Openai
+                && choice.api_needs_probe
+                && !choice.model.is_empty()
+            {
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        backend_probe::detect_openai_api(
+                            &client,
+                            &choice.url,
+                            &choice.model,
+                            choice.api_key.as_deref(),
+                        )
+                        .await
+                    })
+                }) {
+                    Ok(api) => {
+                        choice.api = api;
+                        choice.api_needs_probe = false;
+                        api_was_probed = true;
+                        lines.push(format!(
+                            "detected api={} for {} @ {}",
+                            api.label(),
+                            choice.model,
+                            choice.url
+                        ));
+                    }
+                    Err(e) => lines.push(format!(
+                        "api probe failed ({e}) — using chat_completions until it answers"
+                    )),
+                }
+            }
+            // Persist probed fields to ~/.newt/backends/<name>.toml only — never
+            // the main config.toml. Reset = delete that drop-in file.
+            if !choice.name.is_empty() && (detected_kind.is_some() || api_was_probed) {
+                let patch = newt_core::BackendConfig {
+                    name: choice.name.clone(),
+                    endpoint: choice.url.clone(),
+                    kind: Some(choice.kind),
+                    api: (choice.kind == newt_core::BackendKind::Openai).then_some(choice.api),
+                    model: (!choice.model.is_empty()).then(|| choice.model.clone()),
+                    serving: choice.serving,
+                    ..Default::default()
+                };
+                match newt_core::writeback_probed_backend(&patch) {
+                    Ok(Some(path)) => lines.push(format!(
+                        "wrote probed backend → {} (delete to reset)",
+                        path.display()
+                    )),
+                    Ok(None) => {}
+                    Err(e) => lines.push(format!("could not write backend drop-in: {e}")),
+                }
+            }
         }
         Err(e) => {
             if choice.model.is_empty() {
@@ -3221,7 +3279,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: b.kind.unwrap_or(newt_core::BackendKind::Ollama),
         kind_needs_probe: b.needs_kind_probe(),
         api_key: b.resolve_api_key(),
-        api: b.api,
+        api: b.api.unwrap_or_default(),
+        api_needs_probe: b.api.is_none(),
         context_window: None,
     };
     // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
@@ -3254,6 +3313,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind_needs_probe: false,
             api_key: None,
             api: newt_core::OpenAiApi::default(),
+            api_needs_probe: false,
             context_window: None,
         };
     }
@@ -3297,6 +3357,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind_needs_probe: false,
             api_key: None,
             api: newt_core::OpenAiApi::default(),
+            api_needs_probe: false,
             context_window: None,
         };
     }
@@ -3321,6 +3382,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind_needs_probe: false,
         api_key: None,
         api: newt_core::OpenAiApi::default(),
+        api_needs_probe: false,
         context_window: None,
     }
 }
