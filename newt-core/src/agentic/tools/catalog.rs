@@ -122,19 +122,23 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "find",
-                "description": "Find files and directories by name under the workspace, recursively, WITHOUT a shell (use this instead of the `find` shell command). Returns matching paths relative to the workspace root, one per line, already sorted — no need to pipe to `sort`. Respects .gitignore and skips noise (.git, target, node_modules) by default. To answer size questions (e.g. the largest files) set `sort: \"size\"` + `show_size: true` — no `du`/pipeline needed.",
+                "description": "Find files and directories under the workspace recursively, WITHOUT a shell. Returns relative paths, one per line, already sorted. Respects .gitignore and skips noise by default. For repository code investigation, use category=source by default; this harness-owned category follows the resolved language-pack registry instead of treating docs, manifests, locks, or generated artifacts as code. Use category=any only when the operator requests those artifacts or a full-tree search. Set language to narrow source evidence by a configured name/alias. For top-N size use sort=size + show_size; for top-N line count use sort=lines + show_lines — no pipeline needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Directory to search under, relative to workspace root. Default '.' (the whole workspace)." },
                         "name": { "type": "string", "description": "Glob matched against each entry's basename, e.g. '*.py' or 'pyo3_module.rs'. '*' matches any run, '?' any single char. Omit to match everything." },
                         "type": { "type": "string", "enum": ["f", "d", "any"], "description": "Restrict to files ('f'), directories ('d'), or both ('any', the default)." },
+                        "category": { "type": "string", "enum": ["any", "source"], "description": "Semantic file category. Use 'source' by default for repository code investigation; it filters through the configured language-pack registry and excludes repository metadata. Use 'any' for explicitly requested non-source artifacts or full-tree searches. Omitted preserves historical unfiltered behavior." },
+                        "language": { "type": "string", "description": "Optional source-language name or alias (case-insensitive), e.g. Rust, Python, TypeScript/ts, Java, C++/cpp, C#/csharp/dotnet, Ruby/rb, bash/shell. Implies category='source'. Project language-pack aliases work too." },
                         "max_depth": { "type": "integer", "description": "Maximum directory depth below `path` (1 = immediate children only). Omit for unlimited." },
-                        "max_results": { "type": "integer", "description": "Cap on the number of matches returned. Default 1000; output notes when truncated." },
+                        "max_results": { "type": "integer", "description": "Cap on the number of matches returned. Default 1000; output notes when truncated. Use 10 for 'top 10' rankings." },
                         "respect_gitignore": { "type": "boolean", "description": "When true (default) skip .gitignored paths plus .git/target/node_modules/hidden dirs. Set false to search everything." },
                         "case_sensitive": { "type": "boolean", "description": "Case-sensitive basename match. Default true." },
-                        "sort": { "type": "string", "enum": ["name", "size"], "description": "Result order: 'name' (default, paths ascending) or 'size' (byte size descending — combine with max_results for the N largest and show_size to see the bytes)." },
-                        "show_size": { "type": "boolean", "description": "Prefix each result with its byte size and a tab ('<size>\\t<path>'). Default false. Use with sort='size' to answer 'largest files' questions without a shell." }
+                        "code": { "type": "boolean", "description": "Backward-compatible alias for category='source'. When true, keep only files recognized by the language-pack registry and exclude repository metadata. Implies files only. Default false." },
+                        "sort": { "type": "string", "enum": ["name", "size", "lines"], "description": "Result order: 'name' (default, paths ascending), 'size' (byte size descending) or 'lines' (line count descending). Combine with max_results for the top-N and show_size/show_lines to see the metric." },
+                        "show_size": { "type": "boolean", "description": "Prefix each result with its byte size and a tab ('<size>\\t<path>'). Default false. Use with sort='size' to answer 'largest files' questions without a shell." },
+                        "show_lines": { "type": "boolean", "description": "Prefix each result with its line count and a tab ('<lines>\\t<path>'). Default false. Use with sort='lines' to answer 'files with the most lines' questions without a shell (no `wc -l`). Line mode wins over show_size when both are set." }
                     },
                     "required": []
                 }
@@ -303,6 +307,9 @@ pub(crate) fn merged_tool_definitions(
     with_code_search: bool,
     with_experiential: bool,
     with_scheduled: bool,
+    with_operating_mode_control: bool,
+    with_plan_mode_control: bool,
+    with_plan_mode_active: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -330,6 +337,9 @@ pub(crate) fn merged_tool_definitions(
             with_code_search,
             with_experiential,
             with_scheduled,
+            with_operating_mode_control,
+            with_plan_mode_control,
+            with_plan_mode_active,
         ) {
             defs.push((spec.definition)());
         }
@@ -338,15 +348,17 @@ pub(crate) fn merged_tool_definitions(
     serde_json::Value::Array(defs)
 }
 
-/// The always-on infra tools ([`Gate::Always`] in [`EXTENDED_TOOL_REGISTRY`]:
-/// resume_context / prompt_read / artifact_read / tool_search /
-/// get_context_remaining / request_user_input / lifecycle). The loop depends
-/// on these every round, so a persona allow-list can NEVER fence them off —
-/// they ride every session regardless of `tools:`.
-fn is_always_on_tool(name: &str) -> bool {
-    EXTENDED_TOOL_REGISTRY
-        .iter()
-        .any(|spec| spec.gate == Gate::Always && spec.name == name)
+/// Tools a persona allow-list cannot fence off: always-on loop infrastructure
+/// plus the presence-gated operating/Plan mode controls. These are session
+/// controls, not task authority; hiding an exit could strand the session in a
+/// read-only style, while exposing them still cannot widen human authority.
+fn is_persona_unfenceable_tool(name: &str) -> bool {
+    EXTENDED_TOOL_REGISTRY.iter().any(|spec| {
+        matches!(
+            spec.gate,
+            Gate::Always | Gate::OperatingMode | Gate::PlanMode | Gate::ScheduledPlanMode
+        ) && spec.name == name
+    })
 }
 
 /// FR-1 part 2 (#997): is `name` callable under a persona whose `tools:`
@@ -360,7 +372,7 @@ fn is_always_on_tool(name: &str) -> bool {
 /// (`newt-mcp-server`) filters its own, separately-built catalog by the same
 /// rule rather than reimplementing it.
 pub fn persona_tool_allowed(name: &str, allow: &[String]) -> bool {
-    allow.iter().any(|t| t == name) || is_always_on_tool(name)
+    allow.iter().any(|t| t == name) || is_persona_unfenceable_tool(name)
 }
 
 /// The advertised name of one tool definition (`{"function":{"name":…}}`), or
@@ -401,11 +413,13 @@ pub fn filter_advertised_tools(
 
 /// Whether `name` is available under the prompt's validated disposition.
 ///
-/// `Act` retains the complete catalog. `Explain` and `Research` are deliberately
-/// a small, explicit read/recovery set: an unknown name is denied rather than
-/// assumed safe, which also fences every generic MCP name (`server__tool`) until
-/// MCP supplies machine-readable authority metadata. `Ask` is terminal at the
-/// harness layer, so no model tool invocation is admitted as defense in depth.
+/// `Act` retains the complete catalog. `Explain`, `Research`, and `Plan` are
+/// deliberately a small, explicit read/recovery set (`Plan` additionally gets
+/// the harness-owned ledger writer): an unknown name is denied rather than
+/// assumed safe, which also fences every generic MCP name (`server__tool`)
+/// until MCP supplies machine-readable authority metadata. `Ask` is terminal
+/// at the harness layer, so no model tool invocation is admitted as defense in
+/// depth.
 ///
 /// This predicate is shared by advertisement and dispatch. The latter remains
 /// the security boundary: a model can always fabricate an omitted tool name.
@@ -413,10 +427,28 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
     match disposition {
         PromptDisposition::Act => true,
         PromptDisposition::Ask => false,
-        PromptDisposition::Explain | PromptDisposition::Research => matches!(
-            name,
-            // Workspace / prompt / artifact recovery.
-            "read_file"
+        PromptDisposition::Explain | PromptDisposition::Research => {
+            common_read_only_tool_allowed(name)
+        }
+        PromptDisposition::Plan => {
+            // Human/model Plan mode is deliberately offline. Do not advertise
+            // `web_fetch` when the matching plan caveat always denies network.
+            (name != "web_fetch" && common_read_only_tool_allowed(name))
+                // `update_plan` changes only the harness-owned session ledger
+                // (and its derived audit artifact), never workspace or external
+                // state. `exit_plan_mode` removes only the model-entered
+                // self-clamp; it cannot override a human `/mode plan` or the
+                // session's underlying caveats.
+                || matches!(name, "update_plan" | "exit_plan_mode")
+        }
+    }
+}
+
+fn common_read_only_tool_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        // Workspace / prompt / artifact recovery.
+        "read_file"
                 | "list_dir"
                 | "find"
                 | "prompt_read"
@@ -438,6 +470,11 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
                 | "tool_search"
                 | "get_context_remaining"
                 | "render_report"
+                // Auto-mode selection changes only a future turn's working
+                // style. It cannot change the current disposition, caveats, or
+                // permissions, so a read-only turn may safely schedule its
+                // successor without widening itself.
+                | "select_operating_mode"
                 // #1259: the formal ask-the-human escalation. An evidence turn
                 // that is genuinely boxed in (no capable tool) ends as a
                 // legitimate QUESTION instead of penalized narration — the
@@ -447,8 +484,7 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
                 // nulled non-Act permission gate (headless → a recoverable
                 // no-human message, never a grant, never a hang).
                 | "request_user_input"
-        ),
-    }
+    )
 }
 
 /// Restrict an advertised tool catalog to the current prompt disposition.
@@ -493,6 +529,9 @@ pub(super) fn disposition_tool_denied_message(
         }
         PromptDisposition::Research => {
             "This is a Research turn: only the bounded read-only evidence and recovery tools are available; capability grants, execution, mutations, and generic MCP calls require an Act disposition."
+        }
+        PromptDisposition::Plan => {
+            "This is a Plan turn: reads, the harness-owned update_plan ledger, and exit from a model-entered plan phase are available; workspace mutations, execution, capability grants, and generic MCP calls require an Act disposition."
         }
         PromptDisposition::Act => unreachable!("Act permits every tool"),
     };
@@ -616,6 +655,9 @@ pub(super) enum Gate {
     CodeSearch,
     Experiential,
     Scheduled,
+    PlanMode,
+    ScheduledPlanMode,
+    OperatingMode,
 }
 
 /// One built-in (non-base) tool, declared in exactly one place.
@@ -739,6 +781,59 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
         definition: crate::where_is::where_is_tool_definition,
         gate: Gate::Always,
     },
+    // #1387 Code Navigator — narrow structural/lexical tools (Always; degrade
+    // honestly when session indexes are absent). code_search / where_is keep
+    // their existing names for compatibility.
+    ToolSpec {
+        name: "goto_definition",
+        definition: crate::navigator::goto_definition_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "text_search",
+        definition: crate::navigator::text_search_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_references",
+        definition: crate::navigator::find_references_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_tests",
+        definition: crate::navigator::find_tests_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_callers",
+        definition: crate::navigator::find_callers_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_callees",
+        definition: crate::navigator::find_callees_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_implementations",
+        definition: crate::navigator::find_implementations_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "find_hierarchy",
+        definition: crate::navigator::find_hierarchy_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "inspect_type",
+        definition: crate::navigator::inspect_type_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "impact",
+        definition: crate::navigator::impact_tool_definition,
+        gate: Gate::Always,
+    },
     ToolSpec {
         name: "experience_record",
         definition: super::super::experiential::experience_record_tool_definition,
@@ -762,12 +857,17 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
     ToolSpec {
         name: "enter_plan_mode",
         definition: super::super::scheduled::enter_plan_mode_tool_definition,
-        gate: Gate::Scheduled,
+        gate: Gate::ScheduledPlanMode,
     },
     ToolSpec {
         name: "exit_plan_mode",
         definition: super::super::scheduled::exit_plan_mode_tool_definition,
-        gate: Gate::Scheduled,
+        gate: Gate::PlanMode,
+    },
+    ToolSpec {
+        name: "select_operating_mode",
+        definition: super::super::operating_mode::select_operating_mode_tool_definition,
+        gate: Gate::OperatingMode,
     },
 ];
 
@@ -824,6 +924,9 @@ fn gate_satisfied(
     with_code_search: bool,
     with_experiential: bool,
     with_scheduled: bool,
+    with_operating_mode_control: bool,
+    with_plan_mode_control: bool,
+    with_plan_mode_active: bool,
 ) -> bool {
     match gate {
         Gate::Always => true,
@@ -836,6 +939,14 @@ fn gate_satisfied(
         Gate::CodeSearch => with_code_search,
         Gate::Experiential => with_experiential,
         Gate::Scheduled => with_scheduled,
+        // Provider loops freeze their schema for the whole multi-round turn.
+        // If enter is visible at turn start, exit must be visible too so the
+        // model can enter, write its plan, and leave in that same turn. An
+        // already-active phase also keeps exit visible when scheduled planning
+        // is toggled off between turns.
+        Gate::PlanMode => (with_scheduled && with_plan_mode_control) || with_plan_mode_active,
+        Gate::ScheduledPlanMode => with_scheduled && with_plan_mode_control,
+        Gate::OperatingMode => with_operating_mode_control,
     }
 }
 

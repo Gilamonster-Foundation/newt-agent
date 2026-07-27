@@ -457,10 +457,17 @@ async fn run_one_turn(
             embedder: cs.embedder.as_ref(),
             index: cs.index.as_ref(),
             top_k: cs.top_k,
+            steer: None,
+            status: None,
         }),
         // #1285: headless driver builds no symbol index yet (a follow-up wires
         // it from the leaf's gather) — the where_is tool degrades honestly.
         where_is: None,
+        nav: None,
+        // Headless driver: identity exposure (advertise the full authorized
+        // catalog, unchanged). The `[tool_exposure]` controller is a TUI-session
+        // concern; the driver keeps bit-for-bit behaviour.
+        exposure: crate::agentic::tools::ExposureSettings::default(),
         experience_store: None,
         step_ledger: None,
         caveats: &config.caveats,
@@ -516,6 +523,8 @@ async fn run_one_turn(
         live_tool_output: None,
         git_tool: None,
         crew_runner: None,
+        operating_mode_control: None,
+        plan_mode_control: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.

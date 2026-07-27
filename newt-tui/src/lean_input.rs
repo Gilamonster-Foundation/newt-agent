@@ -540,6 +540,72 @@ mod tests {
         assert_eq!((rows, crow, ccol), (1, 1, 0));
     }
 
+    /// #1409: `layout` is the lean surface's entire wrapping model, and every
+    /// assertion above pins it at `cols=10`. A width-independent identity that
+    /// only holds at one width is not a tested identity — and #1408 is about to
+    /// move terminal ownership underneath this function.
+    ///
+    /// The invariants, restated so they must hold at EVERY width: the cursor
+    /// cell is `prompt_w + chars_before_cursor`; `rows` is that total cell count
+    /// divided into `cols`-wide rows (empty renders as one row, not zero); and
+    /// `(crow, ccol)` is exactly that cell in row-major order.
+    #[test]
+    fn layout_invariants_hold_at_every_width() {
+        for cols in [1usize, 2, 7, 10, 13, 40, 80, 200] {
+            for prompt_w in [0usize, 1, 4, 11] {
+                for buf in ["", "a", "abcdefgh", "hello world, a longer buffer"] {
+                    for cursor in [0usize, buf.len() / 2, buf.len()] {
+                        // Only split on a char boundary; `layout` slices by byte.
+                        if !buf.is_char_boundary(cursor) {
+                            continue;
+                        }
+                        let (rows, crow, ccol) = layout(prompt_w, buf, cursor, cols);
+                        let cell = prompt_w + buf[..cursor].chars().count();
+                        let total = prompt_w + buf.chars().count();
+
+                        let want_rows = if total == 0 {
+                            1
+                        } else {
+                            (total - 1) / cols + 1
+                        };
+                        assert_eq!(
+                            rows, want_rows,
+                            "rows at cols={cols} prompt_w={prompt_w} buf={buf:?}"
+                        );
+                        assert_eq!(
+                            (crow, ccol),
+                            (cell / cols, cell % cols),
+                            "cursor cell {cell} at cols={cols} prompt_w={prompt_w} buf={buf:?}"
+                        );
+                        assert!(ccol < cols, "column must stay inside the terminal");
+                        assert!(rows >= 1, "a rendered line always occupies a row");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #1409: `cols` is clamped to at least 1 (`layout`'s first line), because a
+    /// zero-width terminal would otherwise divide by zero. `crossterm`'s
+    /// `terminal::size()` can legitimately report 0 on a detached or freshly
+    /// resized pty, and `render` feeds that straight in via `.max(1)` — this
+    /// pins the guard on the pure side too.
+    #[test]
+    fn layout_survives_a_zero_width_terminal() {
+        assert_eq!(layout(0, "", 0, 0), (1, 0, 0));
+        // Every cell lands on its own row when the clamp makes cols == 1.
+        // prompt(1) + "ab"(2) = 3 cells → 3 rows; the cursor sits at cell 3,
+        // i.e. row 3 — one past the last occupied row. That is the PENDING-WRAP
+        // position, and `crow == rows` is correct rather than off-by-one: the
+        // terminal has not yet scrolled the next row into existence, and
+        // `render` compensates by parking the cursor from `erow` (the last
+        // printed row) rather than from `rows`. The exact-fill assertion in
+        // `layout_wraps_and_places_cursor` — layout(2, "abcdefgh", 8, 10) ==
+        // (1, 1, 0) — is the same situation at a realistic width.
+        let (rows, crow, ccol) = layout(1, "ab", 2, 0);
+        assert_eq!((rows, crow, ccol), (3, 3, 0));
+    }
+
     #[test]
     fn add_history_skips_empty_and_consecutive_dupes() {
         let mut surf = LeanSurface::new(None).unwrap();

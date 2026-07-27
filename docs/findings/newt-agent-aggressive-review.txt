@@ -1,0 +1,1594 @@
+AGGRESSIVE REPOSITORY REVIEW
+Gilamonster-Foundation/newt-agent
+Repository: https://github.com/Gilamonster-Foundation/newt-agent
+
+PURPOSE
+=======
+
+Treat newt-agent as the evolutionary laboratory and common ancestor from which two distinct products are extracted:
+
+- wyvern-agent: a deliberately minimalist agent
+- gilamonster-agent: a deliberately maximalist agent
+- newt-agent: the prototype, integration laboratory, and proving ground
+
+The refactoring goal is not merely to create two binaries. It is to establish architectural boundaries strong enough that Wyvern cannot accidentally inherit Gilamonster's complexity, while Gilamonster remains free to grow sophisticated orchestration, memory, policy, scheduling, mesh, and evaluation systems.
+
+
+EXECUTIVE VERDICT
+=================
+
+newt-agent has successfully outgrown its original architecture.
+
+That is the charitable reading.
+
+The adversarial reading is that the repository currently has a workspace-shaped monolith with one especially dense singularity named newt-core. The workspace has many crates, but several of those crates depend on newt-core, while newt-core itself contains configuration, persistence, terminal machinery, agent execution, permissions, memory, MCP, DGX support, roadmap evaluation, model metadata, prompts, plans, pricing, tuning, Git/SSH caveats, and more.
+
+The repository is modular in directory layout but substantially less modular in authority, dependency direction, compilation boundaries, and conceptual ownership.
+
+The central recommendation is:
+
+Do not extract Wyvern and Gilamonster directly from the current crate graph. First establish a small agent kernel underneath it, then compose Wyvern and Gilamonster independently above that kernel.
+
+Otherwise:
+
+- Wyvern becomes “Newt with features disabled.”
+- Gilamonster becomes “Newt with every feature enabled.”
+- Newt remains the only real architecture.
+- The project gains three names but only one dependency graph.
+
+Minimalism must be encoded structurally, not cosmetically.
+
+
+MOST SERIOUS FINDINGS
+=====================
+
+1. newt-core is not a core crate
+--------------------------------
+
+newt-core publicly exposes a very broad collection of modules, including agent execution, configuration, persistence, terminal support, memory, MCP, DGX support, pricing, roadmap evaluation, OCAP policy, project maps, templates, tuning, and verification gates.
+
+Its dependency list similarly pulls together asynchronous execution, HTTP, terminal handling, SQLite, markdown rendering, Python bindings, Agent Bridle machinery, skills, and mesh protocol types.
+
+A true core should be explainable in one sentence:
+
+“The agent kernel advances a turn using abstract inference, tools, authority, and event ports.”
+
+The current effective definition of newt-core is closer to:
+
+“Anything sufficiently central, inconvenient to place elsewhere, or consumed by more than one caller.”
+
+That definition guarantees perpetual expansion.
+
+Why this blocks Wyvern and Gilamonster:
+
+- Wyvern must not merely disable maximalist systems. Those systems should be absent from its dependency graph.
+- Gilamonster should be free to use richer policy, memory, scheduling, crews, mesh, evaluation, and UI without forcing those concepts into the minimalist product's shared vocabulary.
+- As long as both depend on the current newt-core, Wyvern inherits Gilamonster concepts even when they are unused.
+
+Recommended action:
+
+- Freeze additions to newt-core.
+- Treat every new feature added there as an architectural regression unless it is part of the minimal turn state machine.
+- Replace newt-core gradually with smaller foundations.
+- Preserve newt-core temporarily as a compatibility façade during migration.
+
+
+2. Several files are subsystems pretending to be files
+------------------------------------------------------
+
+Observed large files include approximately:
+
+- newt-core/src/agentic/tools.rs: 11,862 lines
+- newt-core/src/config.rs: 7,482 lines
+- newt-core/src/store.rs: 5,202 lines
+- newt-tui/src/chat.rs: 4,363 lines
+- newt-cli/src/lib.rs: 1,820 lines
+
+These are not merely oversized modules. They are missing ownership and package boundaries.
+
+Splitting each into many smaller files would improve navigation, but it would not necessarily improve architecture. File splitting without dependency splitting creates confetti.
+
+2.1 tools.rs is several systems
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The tool system appears to combine at least:
+
+1. Tool catalog construction and advertisement
+2. Name resolution, aliases, typo handling, and visibility
+3. Permission and capability enforcement
+4. Concrete tool execution
+5. Shell confinement and host bypass
+6. Live output and spill handling
+7. UI-specific presentation
+
+The shell execution path reportedly carries a long parameter train and suppresses clippy::too_many_arguments. That is a strong indicator that several responsibilities are crossing one call boundary.
+
+Recommended decomposition:
+
+- Tool catalog: What tools exist?
+- Tool policy: May this invocation be attempted?
+- Tool executor: How is the tool executed?
+- Tool observer: Where do progress and output events go?
+- Tool presenter: How is the result rendered on a particular surface?
+
+Do not replace the large parameter list with a giant ToolContext carrying the entire application. That merely hides the coupling in a bag.
+
+A tool executor should not know whether output is colored, paginated in a TUI, stored in a transcript, streamed over ACP, or formatted for MCP.
+
+2.2 config.rs is a product ontology
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The top-level configuration object appears to know about backend discovery, providers, scratch space, profiles, techniques, retry policy, verification gates, persistence, skills, logs, memory, merge behavior, and setup/doctor concerns.
+
+This causes:
+
+- Every consumer to see every configuration concern
+- Product-specific concepts to become shared schema commitments
+- Extraction to require moving one enormous recursive object
+- Changes in one subsystem to create recompilation and review noise elsewhere
+
+Recommended layering:
+
+- config-format
+  - Parsing
+  - Source locations
+  - Merge primitives
+  - Diagnostics
+- agent-config
+  - Kernel-level configuration only
+- wyvern-config
+  - Minimal product schema
+- gilamonster-config
+  - Maximal product schema
+- newt-config
+  - Prototype/superset schema and migrations
+
+Products may reuse parsing and merge machinery without sharing one universal Config structure.
+
+2.3 store.rs mixes multiple domains
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ConversationStore appears to own SQLite access, workspace identity, writer fingerprints, pruning, WAL fallback, injected clocks, hostnames, boot identity, and process ownership.
+
+These are several coherent systems inside one object.
+
+Recommended decomposition:
+
+- agent-conversation
+  - Transcript and conversation domain types
+  - Repository trait
+- agent-conversation-sqlite
+  - SQLite implementation
+  - Migrations
+  - Transactions
+- agent-process-lease
+  - Host, boot, and PID ownership/liveness claims
+- agent-recall-sqlite
+  - Full-text indexing
+  - Recall queries
+  - Retrieval policy
+
+These can begin as internal modules but should have independent APIs and tests before publication.
+
+2.4 chat.rs is application orchestration, not UI
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The TUI chat path reportedly resolves configuration, creates stores, manages identities, loads tuning, resolves permission prompting, loads durable authority policy, tracks Git state, manages retries, and coordinates the session.
+
+That is application orchestration living in a UI crate.
+
+The existing InputSurface abstraction sounds valuable. Keep that kind of port.
+
+Move the rest into an application/session layer:
+
+SessionRunner
+- AgentKernel
+- SessionConfig
+- ConversationRepository
+- InferenceBackend
+- ToolExecutor
+- AuthorityGate
+- SessionEventSink
+
+The TUI should translate input into application commands and render events. It should not construct the agent's entire policy universe.
+
+
+3. Wyvern as a Cargo feature is the wrong abstraction
+-----------------------------------------------------
+
+The current workspace appears to use default features and --no-default-features to approximate lean/headless/Wyvern configurations.
+
+Cargo features are appropriate for implementation alternatives:
+
+- cuda
+- metal
+- pyo3
+- sqlite
+- markdown
+- rustls-native-roots
+
+Cargo features are dangerous as product definitions.
+
+Products should be encoded by manifests and composition roots:
+
+- wyvern-agent/Cargo.toml
+- gilamonster-agent/Cargo.toml
+- newt-agent/Cargo.toml
+
+Each product should choose its dependencies intentionally.
+
+A useful test is:
+
+cargo tree -p wyvern-agent
+
+That graph should prove that scheduler, crews, SQLite recall, DGX discovery, rich TUI, data-science systems, mesh orchestration, and other maximalist machinery do not exist in Wyvern.
+
+That is a stronger architectural guarantee than “compiled out behind flags.”
+
+Avoid feature names such as:
+
+- minimal
+- maximal
+- wyvern
+- gilamonster
+
+These tend to become unsupported combinatorial matrices.
+
+Use product manifests for product philosophy and features for local adapter variation.
+
+
+4. Several dependencies point in the wrong direction
+-----------------------------------------------------
+
+Potentially reusable crates depend on newt-core, including inference, tools, identity, Git support, scheduler, and coder systems.
+
+This suggests foundations depend on the product rather than the product depending on foundations.
+
+Identity is especially revealing. Identity and capability vocabulary should usually be beneath the agent kernel. Instead, identity-related concepts appear both inside newt-core and in separate crates that still depend on newt-core.
+
+Desired dependency direction:
+
+agent-protocol
+    ↑
+agent-capability
+    ↑
+agent-kernel
+  ↑         ↑
+tools     inference
+  ↑         ↑
+product composition roots
+
+Adapters depend inward. Foundations must not import the product.
+
+A lower-level crate should be explainable and usable without mentioning Newt.
+
+
+5. The README no longer describes the repository honestly
+---------------------------------------------------------
+
+The repository was born from a minimalist necessity, but now contains a large workspace spanning inference, tools, skills, TUI, ACP, MCP, Python, scheduling, Git, tuning, evaluation, plugins, providers, data science, identity, and more.
+
+That is not a failure. The experiment generated a valuable corpus.
+
+The documentation should say so explicitly:
+
+“Newt-Agent is the integration laboratory and reference implementation from which the Wyvern and Gilamonster agent families are extracted.”
+
+This turns complexity from an apparent contradiction into an intentional lifecycle.
+
+
+6. Cargo manifests contain too much archaeology
+-----------------------------------------------
+
+Manifest comments reportedly preserve release history, issue chronology, dependency incidents, prior MSRV constraints, old pins, and planned follow-ups.
+
+Preserving rationale is good. Preserving it inside executable manifests is noisy.
+
+A manifest comment should answer:
+
+“Why must this dependency or setting remain this way today?”
+
+Move historical narratives to:
+
+- CHANGELOG.md
+- docs/decisions/
+- docs/dependencies/
+- docs/incidents/
+
+Leave short invariant-oriented comments with ADR links.
+
+Example:
+
+# Pinned pending SQLite migration validation on NFS.
+# See docs/decisions/ADR-0042-sqlite-version.md.
+rusqlite = "0.31"
+
+Also correct stale repository and homepage metadata when crates move between organizations.
+
+
+7. Repository topology leaks local checkout assumptions
+-------------------------------------------------------
+
+newt-mesh reportedly expects a sibling agent-mesh checkout and is excluded from the main workspace because ordinary CI checkouts do not contain that sibling.
+
+This creates a hidden “real graph” that appears only under particular local directory arrangements.
+
+Choose an explicit model:
+
+1. Publish agent-mesh and depend on a released version
+2. Use a Git dependency pinned to a revision
+3. Create a super-workspace repository for coordinated development
+4. Publish or vendor a narrow protocol-only crate
+
+Avoid semi-permanent sibling-path assumptions. They weaken reproducibility and make CI coverage easy to misinterpret.
+
+
+DUPLICATE PATTERNS AND CONSOLIDATION CANDIDATES
+===============================================
+
+1. Capability and identity duplication
+--------------------------------------
+
+Likely overlapping surfaces include:
+
+- agent_identity
+- newt-identity
+- caveats
+- git_caveats
+- ssh_caveats
+- ocap
+- ocap_propose
+- ocap_store
+- Agent Bridle integration
+- agent-mesh protocol identity/authority types
+
+Suggested split:
+
+agent-authority-types
+- Capability types
+- Caveats
+- Requests
+- Decisions
+- Attestation/witness vocabulary
+
+agent-identity
+- Keys
+- Delegation
+- Signing
+- Verification
+
+agent-authority-policy
+- Durable approvals and denials
+- Interactive prompting policy
+- Security stance configuration
+
+agent-bridle adapters
+- Tool-specific enforcement
+- Shell confinement
+- External process controls
+
+Git and SSH should define attenuation extensions over the shared authority vocabulary rather than importing Newt's product core.
+
+
+2. Protocol duplication
+-----------------------
+
+ACP, MCP, provider-plugin JSON-RPC, PyO3, and agent-mesh protocol layers all need some variation of:
+
+- Messages
+- Tool definitions
+- Tool calls
+- Results and errors
+- Streaming events
+- Correlation identifiers
+- Capability envelopes
+- Serialization adapters
+
+Create a small neutral semantic vocabulary.
+
+Do not create one giant “universal protocol” crate. Share only concepts that are genuinely identical, then preserve separate ACP, MCP, provider, Python, and mesh adapters.
+
+
+3. Tool definition and execution duplication
+--------------------------------------------
+
+The repository appears to have several tool families:
+
+- File/code tools
+- Shell tools
+- Git tools
+- MCP tools
+- Memory and recall tools
+- Reports
+- Notes and artifacts
+- Crew tools
+- Prompt and planning tools
+
+A stable contract should separate metadata, authority, execution, and observation.
+
+Illustrative API:
+
+pub struct ToolSpec {
+    pub name: ToolName,
+    pub description: String,
+    pub input_schema: JsonSchema,
+    pub effects: EffectSet,
+}
+
+pub trait ToolExecutor {
+    async fn execute(
+        &self,
+        request: ToolRequest,
+        authority: &Authority,
+        events: &dyn ToolEventSink,
+    ) -> Result<ToolResult, ToolError>;
+}
+
+The authority layer may approve, reject, or attenuate requests before dispatch.
+
+The UI observes events but does not participate in execution.
+
+Avoid introducing a procedural macro until at least three meaningfully different tools have been migrated. First prove the repetition. Then automate it.
+
+
+4. Probe and discovery duplication
+----------------------------------
+
+Backend probes, MCP probes, DGX probes, setup checks, and doctor commands likely repeat a diagnostic shape.
+
+Extract a shared vocabulary:
+
+- Probe
+- ProbeTarget
+- ProbeObservation
+- ProbeFailure
+- Remediation
+- Health
+
+Keep the actual DGX, MCP, backend, and environment probes in their adapter crates.
+
+The shared framework models observations. It should not own every probe implementation.
+
+
+5. Persistence primitives
+-------------------------
+
+Conversation storage, notes, notebooks, policy files, roadmaps, tuning state, drift caches, and logs likely repeat some subset of:
+
+- Workspace-scoped paths
+- Atomic replacement
+- fsync behavior
+- Schema/version headers
+- Hashing and fingerprints
+- Locking
+- Corruption detection
+- Retention
+
+Do not create newt-utils.
+
+Extract only narrow mechanisms whose semantics are truly shared.
+
+A possible durable-file crate could own:
+
+- Atomic write-and-rename
+- Optional fsync policy
+- Version headers
+- Corruption-safe reads
+- Recovery behavior
+
+Domain-specific formats and retention policies should remain in their own domains.
+
+
+6. PyO3 façade repetition
+-------------------------
+
+The Python umbrella appears to enable bindings across many internal crates.
+
+This risks exposing the Rust workspace organization as the Python API.
+
+The Python package should provide a deliberate stable domain API rather than mirroring every internal crate.
+
+Bind public domain-level contracts, not implementation topology.
+
+
+7. Bespoke Base64 implementation
+--------------------------------
+
+newt-data reportedly includes its own RFC 4648 implementation despite the workspace already depending on the base64 crate.
+
+Unless there is a measured binary-size, performance, auditability, no_std, or dependency-policy requirement, remove the bespoke implementation.
+
+“Self-contained” is not automatically “maintainable.”
+
+Padding, malformed input, edge cases, interoperability, and security behavior become permanent project responsibilities.
+
+
+PROPOSED PRODUCT AND CRATE ARCHITECTURE
+======================================
+
+                         +----------------------+
+                         |      newt-agent      |
+                         | prototype / lab / CI |
+                         +----------+-----------+
+                                    |
+             +----------------------+----------------------+
+             |                      |                      |
+    +--------v--------+   +---------v----------+  +--------v--------+
+    |  wyvern-agent   |   | gilamonster-agent |  | test/eval rigs  |
+    | minimal product |   | maximal product   |  | compatibility   |
+    +--------+--------+   +---------+----------+  +--------+--------+
+             |                      |                      |
+             +----------------------+----------------------+
+                                    |
+                         +----------v-----------+
+                         |    agent-kernel      |
+                         | turn state machine   |
+                         +----------+-----------+
+                                    |
+       +----------------------------+----------------------------+
+       |                            |                            |
++------v---------+          +-------v----------+         +-------v---------+
+| agent-protocol |          | agent-authority  |         | agent-events    |
+| value types    |          | requests/caveats |         | observations    |
++----------------+          +------------------+         +-----------------+
+
+Adapters above the kernel:
+
+- inference-http
+- inference-candle
+- provider-openai or provider-plugin host
+- file-tools
+- git-tools
+- shell-bridle
+- mcp-tools
+- conversation-sqlite
+- recall-sqlite
+- terminal-ui
+- acp-worker
+- mcp-server
+- scheduler
+- crews
+- mesh
+- data
+- tuning
+- evaluation
+
+
+WYVERN PRODUCT BOUNDARY
+=======================
+
+Wyvern should begin with an explicit dependency and concept budget.
+
+Suggested initial capabilities:
+
+- Kernel turn loop
+- One inference interface
+- One HTTP inference adapter
+- A small file/code tool set
+- Agent Bridle authority enforcement
+- Plain CLI or line-oriented terminal interface
+- In-memory transcript
+- Optional JSONL transcript export
+- Cancellation
+- Basic retry/error classification
+
+Initially exclude:
+
+- Crews
+- Scheduler
+- Rich TUI
+- Data-science engine
+- SQLite recall
+- DGX discovery
+- Roadmap orchestration
+- Generalized plugin hosting
+- Mesh
+- Automatic tuning
+- Evaluation farms
+- Multiple persistence systems
+- Large product-wide configuration ontology
+
+Minimalism is defined by what does not exist in cargo tree.
+
+
+GILAMONSTER PRODUCT BOUNDARY
+============================
+
+Gilamonster may intentionally compose:
+
+- Durable conversations
+- Recall and memory
+- Scheduling
+- Heterogeneous backend pools
+- Crews and role orchestration
+- Mesh integration
+- Rich terminal UI
+- MCP
+- Provider plugins
+- Data-science and notebook systems
+- Evaluation
+- Self-tuning
+- DGX discovery
+- Roadmap-as-code
+- Persistent authority policy
+- Attestation ceremonies
+- Multiple interfaces and transports
+
+The maximalist product does not need to apologize for being large.
+
+It needs boundaries strong enough that the organism remains intelligible.
+
+
+NEWT PRODUCT BOUNDARY
+=====================
+
+Newt remains:
+
+- The prototype
+- The integration laboratory
+- The first consumer of experiments
+- The compatibility test bed
+- The place where APIs may temporarily remain rough
+- The staging ground for future crates
+
+Prototype status should not mean that every experiment enters newt-core.
+
+Prefer:
+
+- newt-experiments/<feature>
+- Independent workspace crates
+- Feature-local modules behind narrow internal ports
+
+Promote experiments into shared crates only after contracts stabilize.
+
+
+REFACTORING STRATEGIES
+======================
+
+1. Characterization tests before surgery
+----------------------------------------
+
+Capture current behavior at product boundaries before moving code.
+
+Essential characterization coverage:
+
+- CLI argument and environment precedence
+- Configuration loading and merging
+- Tool catalog visibility by persona and authority
+- Permission approvals and denials
+- Confined versus host shell execution
+- Tool-call request/result serialization
+- Transcript serialization
+- Conversation migrations
+- Recall behavior
+- Retry transitions
+- Verification-gate transitions
+- Headless execution
+- TUI command-to-application-command translation
+- Provider-plugin fixtures
+- MCP fixtures
+- Cancellation and timeout behavior
+
+Use golden tests where output is contract-like.
+
+Normalize:
+
+- Timestamps
+- Generated identifiers
+- Paths
+- Nondeterministic ordering
+- Host-specific values
+
+The characterization suite is the surgical safety net.
+
+
+2. Build a Wyvern walking skeleton immediately
+----------------------------------------------
+
+Do not wait for newt-core to become clean.
+
+Create a real wyvern-agent binary that performs one complete turn:
+
+input
+  -> kernel
+  -> inference
+  -> optional tool request
+  -> authority decision
+  -> tool execution
+  -> model continuation
+  -> output
+
+Initially, its adapters may delegate to existing Newt implementations.
+
+The purpose is to prove the desired dependency direction early.
+
+Every time the walking skeleton must import another enormous Newt type, that reveals the next seam to cut.
+
+
+3. Branch by abstraction
+------------------------
+
+Introduce narrow ports at existing call sites while preserving current implementations.
+
+Transform conceptual dependencies such as:
+
+run_chat
+  -> Config
+  -> ConversationStore
+  -> concrete inference
+  -> tools.rs
+
+into:
+
+SessionRunner
+- AgentKernel
+- SessionConfig
+- ConversationRepository
+- InferenceBackend
+- ToolExecutor
+- AuthorityGate
+- SessionEventSink
+
+First make old implementations satisfy the new interfaces.
+
+Then move implementations into new crates.
+
+This separates:
+
+- Changing dependency direction
+from
+- Rewriting implementation
+
+That dramatically reduces refactoring risk.
+
+
+4. Strangler-style extraction
+-----------------------------
+
+Use newt-core as a temporary compatibility façade.
+
+Example:
+
+#[deprecated(note = "use agent_protocol::ToolCall")]
+pub use agent_protocol::ToolCall;
+
+Sequence:
+
+1. Define the new crate
+2. Move or duplicate narrow types
+3. Re-export them temporarily from newt-core
+4. Migrate consumers one crate at a time
+5. Add CI rules forbidding new compatibility imports
+6. Delete the compatibility export after migration
+
+This avoids a flag day.
+
+Every extraction receives a measurable completion condition.
+
+
+5. Split mechanism from policy
+------------------------------
+
+This is often more useful than splitting solely by feature name.
+
+Examples:
+
+- Config merge algorithm: mechanism
+- Wyvern/Gilamonster schemas: policy
+
+- Capability attenuation: mechanism
+- Interactive approval behavior: policy
+
+- SQLite repository: mechanism
+- Retention limits: policy
+
+- Tool execution: mechanism
+- Persona visibility: policy
+
+- Transcript events: mechanism
+- TUI rendering: policy
+
+- Backend health observations: mechanism
+- Scheduling decisions: policy
+
+Mechanism crates should be conservative and reusable.
+
+Product policy belongs close to product composition roots.
+
+
+6. Replace feature-defined products with manifest-defined products
+------------------------------------------------------------------
+
+Create separate manifests early.
+
+Features remain appropriate for adapter variations within a product:
+
+[features]
+default = ["http-inference"]
+http-inference = ["dep:agent-inference-http"]
+candle = ["dep:agent-inference-candle"]
+cuda = ["candle", "agent-inference-candle/cuda"]
+
+Do not represent product philosophy with:
+
+minimal
+maximal
+wyvern
+gilamonster
+
+Product identities should be first-class packages.
+
+
+7. Contract tests across all three products
+-------------------------------------------
+
+Newt, Wyvern, and Gilamonster should agree on kernel semantics:
+
+- Tool-call lifecycle
+- Authority attenuation
+- Cancellation
+- Continuation after tool results
+- Error classification
+- Transcript events
+- Token/accounting behavior
+- Untrusted-content boundaries
+- Serialization compatibility
+
+Products may differ in policy and available adapters.
+
+They should not drift on what an agent turn means.
+
+
+8. Crate maturity ladder
+------------------------
+
+Do not publish every extracted module immediately.
+
+Use this progression:
+
+1. Internal module
+2. Internal workspace crate
+3. Documented workspace crate with external-style API
+4. Published crates.io package
+5. Separate repository when governance or release cadence requires it
+
+A crate should reach crates.io only when:
+
+- It has a credible consumer beyond its originating subsystem
+- Its API can be explained without referring to Newt internals
+- It does not depend on newt-core
+- Public API and semver impact have been reviewed
+- It has focused documentation and examples
+- Its feature matrix is intentionally small
+- Its name describes the problem, not only the originating product
+
+
+CANDIDATE CRATES FOR CRATES.IO
+==============================
+
+Best candidates now
+-------------------
+
+1. newt-skills
+~~~~~~~~~~~~~~
+
+This appears to be one of the cleanest packages:
+
+- Focused purpose
+- Light dependencies
+- No dependency on newt-core
+- Clear external use case: skill discovery and SKILL.md parsing
+
+Before publication:
+
+- Separate frontmatter errors from filesystem discovery errors
+- Inject search roots rather than assuming Newt paths
+- Document precedence and collision behavior
+- Test malformed YAML, duplicate names, symlinks, hidden directories, and traversal
+- Consider a neutral name if the format is intended for broader use
+
+Readiness: High
+
+
+2. plugins-protocol
+~~~~~~~~~~~~~~~~~~~
+
+This appears to be a focused JSON-RPC schema and client SDK.
+
+Before publication:
+
+- Rename it because plugins-protocol is too generic
+- Version the wire protocol independently from Newt releases
+- Separate protocol types from Tokio client machinery if useful
+- Add golden JSON fixtures
+- Specify unknown-field behavior
+- Specify capability negotiation
+- Specify streaming compatibility
+- Avoid lockstep versioning with the whole workspace
+
+Possible names:
+
+- agent-provider-protocol
+- newt-provider-protocol
+- llm-provider-rpc
+
+Readiness: High after naming and version cleanup
+
+
+3. newt-data
+~~~~~~~~~~~~
+
+This appears to have a coherent headless data-engine identity and does not depend on newt-core. The thin MCP adapter is a strong example of the desired architecture.
+
+Before publication:
+
+- Remove the bespoke Base64 implementation
+- Separate SQLite/CSV engine from Jupyter transport
+- Decide whether notebook construction belongs in a companion crate
+- Remove internal phase/history language from public descriptions
+- Clearly define transaction, type-conversion, path, and resource-limit behavior
+
+Possible family:
+
+- centaur-data
+- centaur-notebook
+- centaur-jupyter
+- centaur-mcp
+
+Readiness: Medium-high
+
+
+4. newt-tuner
+~~~~~~~~~~~~~
+
+The package appears independent of newt-core and relatively focused.
+
+The likely issue is that filesystem layout such as ~/.newt is product policy.
+
+Split:
+
+- model-tuning-profile
+  - Data model
+  - Validation
+  - Merge/effective-value logic
+
+- newt-tuner
+  - Newt-specific paths and CLI
+
+Readiness: Medium-high for the library portion
+
+
+Strong candidates after decoupling
+----------------------------------
+
+5. newt-tools
+~~~~~~~~~~~~~
+
+The crate already appears to recognize narrower seams such as thoon-fileops and thoon-toolreg, but still depends on newt-core.
+
+Suggested extraction:
+
+- agent-tool-protocol
+  - ToolSpec
+  - ToolRequest
+  - ToolResult
+  - Effect metadata
+
+- thoon-fileops
+  - Read
+  - Search
+  - Edit
+  - Apply-patch mechanisms
+
+- agent-code-tools
+  - Tool adapters and schemas
+
+The fuzzy patcher deserves a separate crate only if it has:
+
+- A defined algorithm
+- A useful standalone API
+- An adversarial test corpus
+- Behavior independent of Newt's UI and policy
+
+Readiness: Medium after dependency inversion
+
+
+6. newt-inference
+~~~~~~~~~~~~~~~~~
+
+This is a valuable domain boundary but appears to combine:
+
+- Backend traits
+- HTTP implementations
+- Provider-plugin hosting
+- Identity concerns
+- Optional embedded Candle inference
+- Product routing policy
+
+Suggested split:
+
+- agent-inference
+  - Request types
+  - Response types
+  - Streaming traits
+  - Error taxonomy
+
+- agent-inference-http
+  - Ollama/vLLM-compatible adapter
+
+- agent-inference-candle
+  - Embedded implementation
+
+- agent-provider-host
+  - Provider-plugin client/host
+
+- newt-model-routing
+  - Newt/Gilamonster selection policy
+
+The foundational crate should have a tiny dependency surface.
+
+Readiness: Medium-low currently, but high-value
+
+
+7. newt-git
+~~~~~~~~~~~
+
+An embedded Git engine behind an attenuated capability surface could be independently useful.
+
+Remove its dependency on newt-core.
+
+Move Git-specific authority types into:
+
+- agent-git-capability
+
+or into a small extension module of the general capability crate.
+
+Readiness: Medium after authority extraction
+
+
+8. Conversation storage
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Potential package family:
+
+- agent-transcript
+- agent-conversation-store
+- agent-conversation-sqlite
+- agent-recall-sqlite
+- agent-process-lease
+
+Do not publish the current store.rs as one crate.
+
+First separate domain types, storage mechanics, recall, and process ownership.
+
+Readiness: Low now, strong eventual candidate
+
+
+9. Capability-aware MCP client
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A Bridle-aware MCP client could be strategically distinctive.
+
+Possible name:
+
+- bridled-mcp-client
+
+It should depend on:
+
+- MCP protocol types
+- Small authority contracts
+- Capability and provenance types
+
+It should not depend on newt-core.
+
+Readiness: Low-medium, strategically interesting
+
+
+10. Roadmap-as-code engine
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The plan, roadmap_file, and roadmap_eval areas suggest a potentially coherent standalone system:
+
+- Serialized task graphs
+- Objective completion evaluators
+- Repository-backed state
+- Human/agent update semantics
+
+Extract only after removing:
+
+- Newt command assumptions
+- GitHub-specific assumptions
+- UI-specific rendering
+- Product-specific configuration
+
+Readiness: Exploratory but promising
+
+
+DO NOT PUBLISH IN CURRENT FORM
+==============================
+
+newt-core
+---------
+
+Publishing it would freeze accidental coupling as public API.
+
+newt-tui
+--------
+
+It currently appears to own application orchestration, persistence setup, permission behavior, tuning, and session policy. It is not yet a reusable UI crate.
+
+newt-cli
+--------
+
+This is a composition root and should remain product-specific.
+
+newt-scheduler
+--------------
+
+Scheduling policy is likely Gilamonster-specific at present and reportedly depends on both newt-core and inference concerns. Extract lower-level scheduling mechanisms first:
+
+- Backend health model
+- Queue model
+- Selection strategy trait
+- Resource observation types
+
+Keep crew semantics and product routing policy in Gilamonster until the abstraction proves itself.
+
+newt-coder
+----------
+
+This likely composes too many internal systems to be a stable standalone crate today. It may eventually become an application layer atop kernel, inference, tools, and authority, but should not become another “everything needed for coding” façade.
+
+newt-python
+-----------
+
+The umbrella binding crate should remain a product integration package. Publish smaller Rust domain crates first, then expose a deliberate Python API.
+
+newt-mesh
+---------
+
+Resolve the sibling-checkout dependency and determine whether the reusable unit is:
+
+- Mesh protocol
+- Mesh transport
+- Mesh scheduler
+- Gilamonster integration
+
+Do not publish a crate whose normal build requires an undocumented neighboring repository layout.
+
+
+READABILITY AND MAINTAINABILITY IMPROVEMENTS
+============================================
+
+1. Enforce architectural boundaries in CI
+-----------------------------------------
+
+Add checks such as:
+
+- cargo deny
+- cargo machete
+- cargo semver-checks for published candidates
+- cargo public-api
+- cargo tree snapshots for Wyvern
+- dependency-cycle checks
+- forbidden-dependency checks
+
+Example invariant:
+
+“wyvern-agent and all transitive dependencies must not depend on rusqlite, ratatui, pyo3, Candle, DGX discovery, scheduler, crews, roadmap evaluation, or mesh.”
+
+This converts philosophy into an executable rule.
+
+
+2. Add package-level architecture documentation
+-----------------------------------------------
+
+Every crate should answer in its README or lib.rs:
+
+- What problem does this crate own?
+- What does it explicitly not own?
+- Which direction may dependencies point?
+- What are its public invariants?
+- Is it mechanism, policy, adapter, or composition root?
+- Is it intended for publication?
+
+A short “Non-goals” section is especially valuable.
+
+
+3. Reduce crate-root re-export façades
+--------------------------------------
+
+Large glob-like re-export surfaces make it difficult to know where a type belongs.
+
+Prefer imports that reveal ownership:
+
+use agent_protocol::ToolCall;
+use agent_authority::Capability;
+use agent_kernel::Turn;
+
+Avoid making newt_core::* the universal vocabulary.
+
+Compatibility re-exports are acceptable temporarily during strangler migration, but should be marked deprecated and tracked.
+
+
+4. Name by domain, not historical origin
+----------------------------------------
+
+Names such as newt-core, newt-tools, and newt-data are understandable internally but obscure whether a crate is reusable.
+
+Published crates should describe their domain:
+
+- agent-kernel
+- agent-inference
+- agent-authority
+- agent-transcript
+- agent-provider-protocol
+- durable-file
+- bridled-mcp-client
+
+Product-prefixed crates should generally remain product policy or composition packages.
+
+
+5. Replace “manager” and “context” objects with explicit ports
+-------------------------------------------------------------
+
+Watch for types named:
+
+- Manager
+- Context
+- Runtime
+- State
+- Environment
+- Services
+
+These often become dependency bags.
+
+Prefer narrow interfaces:
+
+- InferenceBackend
+- ToolExecutor
+- AuthorityGate
+- ConversationRepository
+- EventSink
+- Clock
+- ProcessInspector
+- PathResolver
+
+A type should receive only the capabilities it actually needs.
+
+
+6. Move rendering out of domain and execution code
+--------------------------------------------------
+
+Terminal color, markdown formatting, progress bars, truncation, and pagination should consume semantic events.
+
+Domain layers should emit:
+
+- ToolStarted
+- ToolStdoutChunk
+- ToolStderrChunk
+- ToolCompleted
+- PermissionRequested
+- PermissionDenied
+- InferenceStarted
+- TokenUsageObserved
+
+Each surface decides how to render them.
+
+
+7. Introduce structured error taxonomies
+----------------------------------------
+
+Avoid generic anyhow errors at public domain boundaries.
+
+Use domain errors with stable classifications:
+
+- InvalidRequest
+- Unauthorized
+- CapabilityAttenuated
+- BackendUnavailable
+- BackendRejected
+- ToolFailed
+- ToolTimedOut
+- Cancelled
+- PersistenceConflict
+- CorruptRecord
+- ProtocolViolation
+
+Convert to anyhow only at application composition roots.
+
+
+8. Keep functions below orchestration scale
+-------------------------------------------
+
+Not every long function is bad, but functions that perform several policy transitions should be split into named phases.
+
+Example turn phases:
+
+- prepare_turn
+- request_inference
+- classify_model_output
+- authorize_tool_call
+- execute_tool
+- record_tool_result
+- continue_turn
+- finalize_turn
+
+The names become a readable state machine.
+
+
+9. Replace implicit booleans with domain enums
+----------------------------------------------
+
+Avoid parameter combinations such as:
+
+- confined: bool
+- host: bool
+- live: bool
+- spill: bool
+- prompt: bool
+
+Prefer:
+
+ExecutionTarget::Confined
+ExecutionTarget::Host
+
+OutputMode::Buffered
+OutputMode::Streaming
+
+AuthorityMode::Preauthorized
+AuthorityMode::Interactive
+AuthorityMode::Deny
+
+This prevents invalid combinations and makes call sites self-documenting.
+
+
+10. Track architectural debt explicitly
+---------------------------------------
+
+Create an extraction ledger:
+
+docs/refactoring/extraction-ledger.md
+
+For each candidate:
+
+- Current owner
+- Desired owner
+- Forbidden dependencies
+- Compatibility façade
+- Characterization tests
+- Migration progress
+- Publication readiness
+- Blocking design questions
+
+This keeps the prototype from silently accumulating permanent temporary structures.
+
+
+PRIORITIZED REFACTORING PLAN
+============================
+
+Phase 0: Freeze and measure
+---------------------------
+
+- Freeze additions to newt-core
+- Generate cargo tree and module metrics
+- Add characterization tests
+- Document current product behavior
+- Establish dependency rules
+- Correct stale metadata
+- Create ADR structure
+
+Deliverable:
+
+A reproducible baseline and executable architectural constraints.
+
+
+Phase 1: Establish the kernel
+-----------------------------
+
+Extract minimal crates:
+
+- agent-protocol
+- agent-events
+- agent-authority-types
+- agent-kernel
+
+The kernel should not depend on:
+
+- SQLite
+- TUI
+- MCP
+- ACP
+- PyO3
+- Git
+- DGX
+- Scheduler
+- Crews
+- Data science
+- Roadmaps
+- Product configuration
+
+Deliverable:
+
+A deterministic, testable turn state machine with fake inference and fake tools.
+
+
+Phase 2: Build the Wyvern walking skeleton
+------------------------------------------
+
+Create wyvern-agent using:
+
+- agent-kernel
+- one inference adapter
+- a minimal tool set
+- Bridle authority enforcement
+- line-oriented CLI
+- in-memory or JSONL transcript
+
+Deliverable:
+
+A genuinely minimal agent whose dependency tree proves minimalism.
+
+
+Phase 3: Extract execution adapters
+-----------------------------------
+
+Extract:
+
+- agent-inference
+- agent-inference-http
+- agent-tool-protocol
+- file tools
+- shell-bridle
+- Git tools
+- MCP adapter boundaries
+
+Deliverable:
+
+Newt and Wyvern consume the same stable ports through different compositions.
+
+
+Phase 4: Extract persistence and session orchestration
+------------------------------------------------------
+
+Move:
+
+- SessionRunner out of the TUI
+- Conversation domain out of store.rs
+- SQLite implementation into an adapter
+- Recall into a separate subsystem
+- Process leases into a narrow mechanism
+
+Deliverable:
+
+UI crates no longer own application policy or persistence construction.
+
+
+Phase 5: Establish Gilamonster composition
+------------------------------------------
+
+Compose the maximalist product from:
+
+- Kernel
+- Durable conversations
+- Recall
+- Scheduler
+- Crews
+- Mesh
+- Rich TUI
+- MCP
+- Plugins
+- Data
+- Evaluation
+- Tuning
+- DGX discovery
+- Roadmap systems
+- Persistent authority policy
+
+Deliverable:
+
+Gilamonster grows by composition rather than by enlarging a universal core.
+
+
+Phase 6: Publish stable independent crates
+------------------------------------------
+
+Promote candidates using the maturity ladder.
+
+Likely first wave:
+
+- skills parser/discovery
+- provider protocol
+- data engine components
+- tuning profile library
+
+Likely second wave:
+
+- agent-protocol
+- agent-kernel
+- agent-inference
+- agent-tool-protocol
+- Git capability adapter
+- conversation store components
+- capability-aware MCP client
+
+Deliverable:
+
+A crates.io ecosystem with narrow responsibilities and independent semver.
+
+
+SUCCESS METRICS
+===============
+
+Wyvern
+------
+
+- Small cargo tree
+- No maximalist dependencies
+- Fast clean builds
+- Small configuration schema
+- One obvious execution path
+- No SQLite or rich UI by default
+- No scheduler, crew, mesh, or roadmap concepts
+- Minimal public vocabulary
+
+Gilamonster
+-----------
+
+- Large but layered
+- Product features composed through ports
+- Scheduler, memory, crews, and mesh do not leak into the kernel
+- UI replaceable without changing session logic
+- Persistence replaceable without changing turn semantics
+- Product-specific policies live near the composition root
+
+Newt
+----
+
+- Remains the integration laboratory
+- May consume unstable experiments
+- Stops serving as the source of universal foundational types
+- Compatibility façades shrink over time
+- Experiments have an explicit promotion path
+
+Repository-wide
+---------------
+
+- No new dependencies on newt-core
+- Declining line counts in giant files
+- Declining transitive fan-in to product crates
+- Increasing tests at port boundaries
+- Published crates have independent versioning
+- Dependency direction enforced in CI
+- Configuration schemas become product-specific
+- UI crates contain rendering and input, not application policy
+
+
+FINAL ASSESSMENT
+================
+
+The repository's central problem is not that it contains too much functionality.
+
+The problem is that the project grew from a necessity-driven minimalist implementation into a broad agent platform without replacing the original center of gravity.
+
+That is precisely why the Wyvern/Newt/Gilamonster split is valuable.
+
+The correct evolutionary interpretation is:
+
+- Newt is the fossil record and living laboratory.
+- Wyvern is the distilled kernel and minimal field animal.
+- Gilamonster is the fully armored, maximalist platform.
+- Shared crates are the stable organs that no longer belong to any one creature.
+
+The key is to extract from below rather than fork from above.
+
+Build the kernel.
+Build the Wyvern walking skeleton.
+Introduce ports around existing Newt implementations.
+Strangle newt-core gradually.
+Compose Gilamonster from independently owned systems.
+Publish only the crates that can stand without Newt mythology or Newt dependencies.
+
+The anti-goal is three binaries sharing one swollen core.
+
+The goal is a small common semantic kernel, independently useful mechanisms, and three intentionally different products.

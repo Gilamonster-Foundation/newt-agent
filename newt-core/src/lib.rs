@@ -33,6 +33,7 @@ pub mod memory;
 pub mod metrics;
 pub mod model_card;
 pub mod model_id;
+pub mod navigator;
 pub mod notes;
 pub mod notes_scan;
 pub mod nudger;
@@ -84,8 +85,8 @@ pub mod pyo3_module;
 /// `ls`/`cat` shims re-exec against the newt binary itself.
 pub use agent_bridle::maybe_dispatch;
 pub use agent_identity::{
-    AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef, DEFAULT_AGENT_EMAIL,
-    DEFAULT_AGENT_NAME,
+    AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef, AGENT_IDENTITY_FILENAME,
+    DEFAULT_AGENT_EMAIL, DEFAULT_AGENT_NAME, GITHUB_APP_BOT_EMAIL, GITHUB_APP_BOT_NAME,
 };
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Step 9.7: clean top-level import paths for the relocated agentic loop.
@@ -100,19 +101,23 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 pub use agentic::wrap_untrusted;
 pub use agentic::{
     append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
-    compress_user_initiated_for_task, execute_tool, experience_block, gather_code_files,
-    index_files, load_denials, memory_fetch_tool_definition, openai_chat_complete,
-    openai_chat_complete_with_prompt, openai_responses_complete,
-    openai_responses_complete_with_prompt, plan_block, retrieve_evidence, set_spill_lines,
-    transcript_lines, transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx,
-    CodeSearch, CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient,
-    ExperienceStore, HeadlessCodeSearch, LiveToolOutput, ManualCompressOutcome, McpTools, MemAddr,
+    compress_user_initiated_for_task, execute_tool, experience_block, format_index_status,
+    format_search_hits, format_search_model, format_search_preview, format_search_rejects,
+    gather_code_files, gather_with_manifest, index_files, load_denials,
+    memory_fetch_tool_definition, openai_chat_complete, openai_chat_complete_with_prompt,
+    openai_responses_complete, openai_responses_complete_with_prompt, plan_block,
+    render_code_evidence, retrieve_evidence, retrieve_evidence_steered, retrieve_ranked,
+    set_spill_lines, transcript_lines, transcript_lines_styled, trim_for_summary, widen_caveats,
+    ChatCtx, CodeSearch, CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient,
+    EvidenceKind, ExperienceStore, ExposureSettings, GatherCaps, GatherManifest,
+    HeadlessCodeSearch, IndexStatus, LiveToolOutput, ManualCompressOutcome, McpTools, MemAddr,
     MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision, PermissionGate,
-    PermissionRecord, PermissionRequest, PlanSnapshot, RecallSource, RoundObservation,
-    ScratchpadStore, SemanticIndex, SessionExperienceStore, SessionScratchpadStore,
-    SessionSemanticIndex, SessionSpillStore, SessionStepLedger, ShellObservation, SpillStore, Step,
-    StepLedger, StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture,
-    Summarizer, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
+    PermissionRecord, PermissionRequest, PlanModeControl, PlanSnapshot, RankedHit, RecallSource,
+    RejectReason, RetrievalResult, RetrievalSteer, RoundObservation, ScratchpadStore,
+    SemanticIndex, SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex,
+    SessionSpillStore, SessionStepLedger, ShellObservation, SpillStore, Step, StepLedger,
+    StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
+    ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
     TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
 };
 pub use agents::AgentsProvider;
@@ -128,20 +133,29 @@ pub use classifiers::{
 pub use config::{
     confined_default_engine, derive_serving, full_access_default_engine, mcp_stdio_env_passthrough,
     ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
-    shell_env_passthrough_default, write_backend_dropin, AgentsConfig, BackendConfig, BackendKind,
-    BundleConfig, ChatStyle, ColorMode, CompactionTriggerPolicy, Config, ContextConfig,
-    ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager, ConversationsConfig,
-    CrewPolicyConfig, EditMode, FooterMode, IntakeConfig, Loadout, LoadoutSettings, LogConfig,
-    MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure, OpenAiApi,
-    PermissionPreset, PickVia, PlanConfig, PlanPruneConfig, ProfilePick, ProviderConfig,
-    ScratchConfig, SemanticConfig, Serving, ShellConfig, ShellEngine, SkillsConfig,
-    SummarizerConfig, ThinkingMode, ToolPermissions, TuiConfig,
+    shell_env_passthrough_default, write_backend_dropin, writeback_probed_backend, AgentsConfig,
+    BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, CompactionTriggerPolicy,
+    Config, ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager,
+    ConversationsConfig, CrewPolicyConfig, EditMode, ExposureProfile, FooterMode, IntakeConfig,
+    Loadout, LoadoutSettings, LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure,
+    MemoryProviderKind, OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia, PlanConfig,
+    PlanPruneConfig, ProfilePick, ProviderConfig, ScratchConfig, SemanticConfig, Serving,
+    ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode, ToolExposureConfig,
+    ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
     ConversationSummary, ConversationTurn, PhantomReach, PhantomResolution, ToolEvent,
 };
 pub use ffi_surface::FfiSurfaceProvider;
+pub use navigator::{
+    compare_ledgers, compare_semantic_lexical, execute_nav_tool, export_ledger_json,
+    export_ledger_markdown, find_callees, find_callers, find_hierarchy, find_implementations,
+    find_references, find_tests, format_ledger_diff, format_ledger_human, format_ledger_model,
+    goto_definition, hash_context, impact_analysis, inspect_type, project_map_nav, text_search,
+    GotoDefinitionArgs, GraphIndex, ImpactReport, NavHit, NavResult, NavToolCtx, NavigatorSession,
+    RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
+};
 pub use project_map::ProjectMapProvider;
 pub use where_is::{
     build_where_is_index, build_where_is_index_from_workspace, execute_where_is,

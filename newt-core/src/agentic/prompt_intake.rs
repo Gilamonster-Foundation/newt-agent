@@ -2,8 +2,9 @@
 //!
 //! The intake runs after a durable prompt receipt exists and before the model,
 //! tool catalog, or action nudges run. It makes a small, inspectable decision:
-//! whether the turn is an `ask`, `act`, `explain`, or `research` turn; which
-//! atomic asks it contains; and whether an operator decision remains unlocked.
+//! whether the turn is an `ask`, `act`, `explain`, `research`, or harness-
+//! selected `plan` turn; which atomic asks it contains; and whether an operator
+//! decision remains unlocked.
 //!
 //! This is deliberately a bounded heuristic, not an LLM judge. The security
 //! contract is fail-closed at the dispatcher: classification changes what is
@@ -27,6 +28,9 @@ const MAX_CONCRETE_DECISIONS: usize = MAX_DECISIONS - 1;
 const MAX_ASK_BYTES: usize = 4_096;
 const MAX_CLARIFICATION_BYTES: usize = 384;
 const RESEARCH_TOOL_ROUND_LIMIT: usize = 3;
+pub(super) const PROMPT_COMPREHENSION_SCHEMA_V1: &str = "prompt_comprehension_manifest_v1";
+pub(super) const PROMPT_COMPREHENSION_SCHEMA_V2: &str = "prompt_comprehension_manifest_v2";
+pub(super) const PROMPT_COMPREHENSION_SCHEMA_CURRENT: &str = PROMPT_COMPREHENSION_SCHEMA_V2;
 
 /// The harness-selected mode for one accepted prompt receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +46,10 @@ pub enum PromptDisposition {
     /// Gather bounded read-only evidence; mutations and capability grants are
     /// unavailable.
     Research,
+    /// Read/recover and update only the harness-owned plan ledger; workspace,
+    /// execution, network, capability-grant, and generic MCP mutation paths
+    /// remain unavailable.
+    Plan,
 }
 
 impl PromptDisposition {
@@ -51,6 +59,7 @@ impl PromptDisposition {
             Self::Act => "act",
             Self::Explain => "explain",
             Self::Research => "research",
+            Self::Plan => "plan",
         }
     }
 
@@ -63,6 +72,7 @@ impl PromptDisposition {
             Self::Act => max,
             Self::Explain => max,
             Self::Research => max.min(RESEARCH_TOOL_ROUND_LIMIT),
+            Self::Plan => max,
         }
     }
 }
@@ -258,6 +268,28 @@ impl PromptIntake {
         self.disposition
     }
 
+    /// Select an explicit non-action disposition for this accepted intake.
+    ///
+    /// Operating modes are applied after deterministic prompt intake. They may
+    /// choose `Explain`, `Research`, or `Plan`, but must never turn a pending
+    /// `Ask` into executable work or select `Act`. Updating both live and
+    /// post-lock state keeps the model card, durable artifact, advertised
+    /// catalog, and dispatcher on one effective disposition.
+    pub fn enforce_read_only(&mut self, disposition: PromptDisposition) {
+        if !matches!(
+            disposition,
+            PromptDisposition::Explain | PromptDisposition::Research | PromptDisposition::Plan
+        ) {
+            debug_assert!(false, "read-only disposition required");
+            return;
+        }
+        if self.disposition != PromptDisposition::Ask {
+            self.disposition = disposition;
+            self.post_lock_disposition = disposition;
+        }
+        debug_assert!(self.validate().is_ok());
+    }
+
     pub fn atomic_asks(&self) -> &[AtomicAsk] {
         self.manifest.atomic_asks()
     }
@@ -366,8 +398,19 @@ impl PromptIntake {
             PromptDisposition::Research => {
                 "harness_action: gather bounded read-only evidence; do not mutate or request capability grants"
             }
+            PromptDisposition::Plan => {
+                "harness_action: read evidence and maintain the harness plan ledger only; do not mutate the workspace, execute commands, or request capability grants"
+            }
         };
-        format!(
+        let prompt = self
+            .manifest
+            .atomic_asks
+            .iter()
+            .map(AtomicAsk::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let refinement = request_refinement_model_card(&prompt);
+        let mut card = format!(
             "{PROMPT_COMPREHENSION_MODEL_CARD_PREFIX}\n\
              disposition: {}\n\
              atomic_ask_count: {}\n\
@@ -378,7 +421,12 @@ impl PromptIntake {
             self.disposition.as_str(),
             self.manifest.atomic_asks.len(),
             self.manifest.decisions.len(),
-        )
+        );
+        if !refinement.is_empty() {
+            card.push('\n');
+            card.push_str(&refinement);
+        }
+        card
     }
 
     /// Exact persistence projection for a bodyless `Decision` artifact. The
@@ -411,7 +459,7 @@ impl PromptIntake {
         }
 
         json!({
-            "schema": "prompt_comprehension_manifest_v1",
+            "schema": PROMPT_COMPREHENSION_SCHEMA_CURRENT,
             "disposition": self.disposition.as_str(),
             "atomic_ask_count": self.manifest.atomic_asks.len() as u64,
             "clarification_count": self.manifest.pending_decision_count() as u64,
@@ -522,6 +570,55 @@ fn strip_list_marker(line: &str) -> &str {
     line
 }
 
+/// Prompt-specific refinements layered over the standing response/repository
+/// policy in the protected active-prompt card. Keep this narrow: general
+/// Markdown shape and source-first evidence belong to the harness policy, not
+/// an incident-derived prompt lexicon.
+fn request_refinement_model_card(prompt: &str) -> String {
+    let lower = prompt.to_ascii_lowercase();
+    let packs = crate::api_surface::builtin_packs();
+    let language = crate::api_surface::detect_source_language(prompt, &packs);
+    let contains = |needle| crate::api_surface::contains_bounded_ascii(&lower, needle);
+    let names_source_files = ["code file", "code files", "source file", "source files"]
+        .iter()
+        .any(|needle| contains(needle));
+    let names_language_files = language.is_some()
+        && ["file", "files", "script", "scripts"]
+            .iter()
+            .any(|needle| contains(needle));
+    let source_files = names_source_files || names_language_files;
+
+    let mut lines = Vec::new();
+    if contains("table") {
+        lines.push("response_shape: table".to_string());
+    }
+
+    if source_files {
+        lines.push("evidence_scope: source_files".to_string());
+        match language {
+            Some(pack) => {
+                if let Ok(extensions) =
+                    crate::api_surface::source_extensions_for(&packs, Some(&pack.name))
+                {
+                    lines.push(format!("source_extensions: {}", extensions.join(",")));
+                }
+                lines.push(format!(
+                    "source_filter: category=source language={}",
+                    pack.name
+                ));
+            }
+            None => lines.push("source_filter: category=source".to_string()),
+        }
+        lines.push(
+            "scope_instruction: code/source means registered language source files only; \
+             exclude documentation, manifests, lockfiles, and other repository metadata \
+             from the primary evidence set"
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
 /// The pure-data needle table driving [`infer_disposition`] (#1260, three-Cs):
 /// the English phrase lists and the trailing-`?` fallback are LANGUAGE
 /// knowledge, so they live in droppable/overridable data — the lexicon
@@ -581,6 +678,16 @@ impl Default for DispositionLexicon {
                 "largest",
                 "biggest",
                 "smallest",
+                // #1387: line count is a first-class evidence question, answered
+                // read-only by `find` (sort=lines/show_lines) — NOT an Act that
+                // needs `wc -l`, and NOT a bytesize fallback. Keeping it in
+                // Research and giving Research the capability is the fix for
+                // "Research is too strict".
+                "line count",
+                "most lines",
+                "fewest lines",
+                "longest file",
+                "shortest file",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -789,7 +896,12 @@ mod tests {
         assert_eq!(intake.disposition(), PromptDisposition::Act);
         assert_eq!(intake.atomic_asks().len(), 1);
         intake.validate().unwrap();
-        let metadata = intake.artifact_metadata().to_string();
+        let artifact_metadata = intake.artifact_metadata();
+        assert_eq!(
+            artifact_metadata["schema"],
+            "prompt_comprehension_manifest_v2"
+        );
+        let metadata = artifact_metadata.to_string();
         assert!(!metadata.contains("private parser"));
         assert!(metadata.contains("atomic_ask_digests"));
         let card = intake.model_card();
@@ -917,6 +1029,35 @@ mod tests {
         assert_eq!(PromptDisposition::Ask.tool_round_limit(40), 0);
         assert_eq!(PromptDisposition::Explain.tool_round_limit(40), 40);
         assert_eq!(PromptDisposition::Research.tool_round_limit(40), 3);
+        assert_eq!(PromptDisposition::Plan.tool_round_limit(40), 40);
+    }
+
+    #[test]
+    fn read_only_attenuation_keeps_model_card_and_artifact_in_sync() {
+        let mut action = PromptIntake::analyze("Implement the requested parser change.");
+        assert_eq!(action.disposition(), PromptDisposition::Act);
+
+        action.enforce_read_only(PromptDisposition::Plan);
+
+        assert_eq!(action.disposition(), PromptDisposition::Plan);
+        assert!(
+            action.model_card().contains("disposition: plan"),
+            "{}",
+            action.model_card()
+        );
+        assert_eq!(
+            action.artifact_metadata()["schema"],
+            "prompt_comprehension_manifest_v2"
+        );
+        assert_eq!(action.artifact_metadata()["disposition"], "plan");
+
+        let mut research = PromptIntake::analyze("Investigate the parser behavior.");
+        research.enforce_read_only(PromptDisposition::Research);
+        assert_eq!(
+            research.disposition(),
+            PromptDisposition::Research,
+            "the mode-selected read-only disposition must remain consistent"
+        );
     }
 
     #[test]
@@ -1027,6 +1168,101 @@ mod tests {
         // A bare statement matching nothing still defaults to Act.
         let act = PromptIntake::analyze("update the release notes for 0.8.0");
         assert_eq!(act.disposition(), PromptDisposition::Act);
+    }
+
+    #[test]
+    fn line_count_questions_classify_research_not_the_cliff() {
+        // #1387: the regressed prompt. "line count" is evidence phrasing, so it
+        // lands in Research — where `find` (sort=lines/show_lines) can answer it
+        // read-only. It must NOT fall off the `?` cliff to Explain, and must NOT
+        // require Act (a mutation grant) just to count lines.
+        let regressed =
+            PromptIntake::analyze("show me the 10 code files with the highest line counts?");
+        assert_eq!(
+            regressed.disposition(),
+            PromptDisposition::Research,
+            "line-count question is a Research/evidence turn, not Explain or Act"
+        );
+        for prompt in [
+            "which files have the most lines",
+            "the longest file in the repo",
+            "files with the fewest lines",
+        ] {
+            assert_eq!(
+                PromptIntake::analyze(prompt).disposition(),
+                PromptDisposition::Research,
+                "line-count evidence phrasing → Research: {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_file_prompt_adds_source_scope_without_incident_specific_shape_guessing() {
+        let intake = PromptIntake::analyze(
+            "show me the 10 code files with the highest line counts in this repository?",
+        );
+        let card = intake.model_card();
+
+        assert!(
+            !card.contains("response_shape:"),
+            "line-count/ranking keywords must not own presentation policy: {card}"
+        );
+        assert!(
+            card.contains("evidence_scope: source_files"),
+            "`code files` means language source, not every repository file: {card}"
+        );
+        assert!(
+            card.contains("source_filter: category=source"),
+            "an unqualified code-file request must use the harness-owned source category: {card}"
+        );
+        assert!(
+            card.contains("exclude documentation, manifests, lockfiles"),
+            "the steering must name the observed false-positive classes: {card}"
+        );
+        assert!(
+            !card.contains("highest")
+                && !card.contains("longest")
+                && !card.contains("most lines")
+                && !card.contains("line/size rankings")
+                && !card.contains("code=true"),
+            "the model card must carry a general source refinement, not an incident lexicon: {card}"
+        );
+    }
+
+    #[test]
+    fn explicit_rust_table_prompt_steers_rs_filter_and_gfm_table() {
+        let intake = PromptIntake::analyze(
+            "can you give me a table of the rust files with the longest line counts instead?",
+        );
+        let card = intake.model_card();
+
+        assert!(card.contains("response_shape: table"), "{card}");
+        assert!(card.contains("evidence_scope: source_files"), "{card}");
+        assert!(
+            card.contains("source_extensions: rs"),
+            "Rust must resolve through the language-pack data to its source extension: {card}"
+        );
+        assert!(
+            card.contains("source_filter: category=source language=rust"),
+            "the model needs the concrete harness filter, not just a language label: {card}"
+        );
+    }
+
+    #[test]
+    fn ordinary_prompt_gets_no_incident_specific_refinement() {
+        let card = PromptIntake::analyze("explain ownership briefly").model_card();
+
+        assert!(!card.contains("response_format:"), "{card}");
+        assert!(!card.contains("response_shape:"), "{card}");
+        assert!(!card.contains("evidence_scope:"), "{card}");
+        assert!(!card.contains("source_filter:"), "{card}");
+
+        let comfortable =
+            PromptIntake::analyze("make this interface more comfortable").model_card();
+        assert!(
+            !comfortable.contains("response_shape:"),
+            "presentation inference must not match `table` inside another word: {comfortable}"
+        );
     }
 
     #[test]

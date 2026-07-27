@@ -31,6 +31,8 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         scratchpad_store: None,
         code_search: None,
         where_is: None,
+        nav: None,
+        exposure: Default::default(),
         experience_store: None,
         step_ledger: None,
         caveats,
@@ -76,6 +78,8 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         live_tool_output: None,
         git_tool: None,
         crew_runner: None,
+        operating_mode_control: None,
+        plan_mode_control: None,
     }
 }
 
@@ -882,7 +886,9 @@ async fn context_overflow_trims_and_retries_then_recovers() {
     // (Step 18.1: the check compares the largest single prompt against the
     // window — the old multi-round sum, 180 here, inflated past 85% after
     // two rounds on EVERY long turn, firing spurious overflow retries.)
-    let safe_context = (builtin_catalog_tokens(PromptDisposition::Act) + 311) as u32;
+    let safe_context = (builtin_catalog_tokens(PromptDisposition::Act)
+        + prompt_read::response_repository_policy_tokens()
+        + 311) as u32;
     let overflow_prompt = safe_context * 88 / 100; // ≥85% of the window
     let probes = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))

@@ -102,7 +102,9 @@ mod mcp;
 mod memory_fetch;
 mod note_sink;
 mod observation;
+mod operating_mode;
 mod permissions;
+mod plan_mode;
 // PR5: deterministic prompt-comprehension intake owns the turn disposition,
 // bounded clarification manifest, and content-free model projection.
 mod prompt_intake;
@@ -172,6 +174,8 @@ pub use prompt_intake::{
     AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
     PromptComprehensionManifest, PromptDisposition, PromptIntake,
 };
+#[cfg(test)]
+pub(crate) use prompt_read::response_repository_policy_tokens;
 pub use prompt_read::{
     prompt_read_tool_definition, PromptReadContext, PromptSource, SessionPromptSource,
     SessionPromptStore, StorePromptSource,
@@ -181,10 +185,13 @@ pub use scheduled::{
 };
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
-    chunk_source, code_evidence_block, code_search_tool_definition, cosine, gather_code_files,
-    gather_with_manifest, index_files, plan_gather, retrieve_evidence, CodeChunk, CodeSearch, Cut,
-    CutClass, Embedder, EmbeddingsClient, GatherCaps, GatherManifest, SemanticIndex,
-    SessionSemanticIndex,
+    chunk_source, code_evidence_block, code_search_tool_definition, cosine, format_index_status,
+    format_search_hits, format_search_model, format_search_preview, format_search_rejects,
+    gather_code_files, gather_with_manifest, index_files, plan_gather, render_code_evidence,
+    retrieve_evidence, retrieve_evidence_steered, retrieve_ranked, retrieve_ranked_with_cap,
+    CodeChunk, CodeSearch, Cut, CutClass, Embedder, EmbeddingsClient, EvidenceKind, GatherCaps,
+    GatherManifest, IndexStatus, RankedHit, RejectReason, RetrievalResult, RetrievalSteer,
+    SemanticIndex, SessionSemanticIndex,
 };
 pub use spill::{SessionSpillStore, SpillStore};
 
@@ -243,18 +250,20 @@ pub use memory_fetch::{
 };
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use observation::{ShellObservation, SHELL_OBSERVATION_PREFIX};
+pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeControl};
 pub use permissions::{
     append_denial, load_denials, widen_caveats, DenialKind, PermissionDecision, PermissionGate,
     PermissionRecord, PermissionRequest, PersistentDenial,
 };
+pub use plan_mode::PlanModeControl;
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
-    filter_tools_for_disposition, full_access_requested, in_plan_phase, ocap_disabled,
-    persona_tool_allowed, plan_phase_clamp, set_max_output_tokens, set_output_head_tokens,
-    tool_definitions, venv_cmd_prefix,
+    filter_tools_for_disposition, full_access_requested, ocap_disabled, persona_tool_allowed,
+    plan_phase_clamp, set_max_output_tokens, set_output_head_tokens, tool_allowed,
+    tool_definitions, venv_cmd_prefix, ExposureSettings,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -297,6 +306,17 @@ fn tui_retry_policy() -> RetryPolicy {
 /// Tightest whole-request ceiling that carries authoritative semantics for
 /// this turn. A proven-good high-water mark by itself is deliberately not a
 /// ceiling; configured token thresholds and believed/declared windows are.
+/// The LIVE usable input budget (in estimated tokens) the tool-exposure
+/// controller sizes the schema set against — the initial send budget when known
+/// (derived from probed `max_ok_input` / `safe_context` / `num_ctx`), else the
+/// declared `safe_context`. `None` means no live signal: the controller then
+/// does NOT clip (no starvation without a measurement). Deliberately not a
+/// function of the model name (#TEC): a bigger probed window widens exposure
+/// automatically.
+fn exposure_budget_tokens(send_budget: Option<usize>, safe_context: Option<u32>) -> Option<usize> {
+    send_budget.or_else(|| safe_context.map(|s| s as usize))
+}
+
 fn authoritative_request_budget(
     send_budget: Option<usize>,
     send_budget_authoritative: bool,
@@ -542,6 +562,15 @@ pub struct ChatCtx<'a> {
     /// from the honest gather + language packs — model-free, so it can ride
     /// every session.
     pub where_is: Option<&'a crate::where_is::WhereIsIndex>,
+    /// #1387 Code Navigator tool context (usage/graph/project).
+    pub nav: Option<crate::navigator::NavToolCtx<'a>>,
+    /// Tool-exposure controller policy (Pass 1). `Default` is
+    /// [`crate::agentic::tools::ExposureSettings::default`] =
+    /// `ExposureProfile::Full`, i.e. the identity controller (advertise the full
+    /// authorized catalog). Resolved by the TUI from `[tool_exposure]`; headless
+    /// / eval callers take the default. Budget-driven selection uses the LIVE
+    /// send budget (probed `safe_context`), never the model name.
+    pub exposure: crate::agentic::tools::ExposureSettings,
     /// Experiential store for the record/recall tools (Step 26.6a). `None` = the
     /// tools are not advertised (experiential off). Shared `&dyn` (interior mut).
     pub experience_store: Option<&'a dyn crate::agentic::experiential::ExperienceStore>,
@@ -738,11 +767,11 @@ pub struct ChatCtx<'a> {
     /// loop treats the turn as "low budget" and nudges toward wrapping up.
     /// Historically hardcoded at 15.
     pub low_budget_pct: usize,
-    /// #307 named-permission-preset exec FLOOR. When a `/mode` preset is active
+    /// #307 named-permission-preset exec FLOOR. When a `/posture` preset is active
     /// its exec clamp is threaded here so the `--disable-ocap` / `--yolo`
     /// bypass in `execute_tool` cannot raise exec authority above the preset:
     /// an out-of-floor command falls through to the confined shell and is
-    /// denied. `None` (no active preset, and every headless caller) leaves the
+    /// denied. `None` (no active posture, and every headless caller) leaves the
     /// bypass bit-for-bit. The floor is also already `meet`-ed into `caveats`,
     /// so the confined-shell and gate paths enforce it too; this field is the
     /// one extra place the otherwise caveats-blind bypass must consult.
@@ -780,6 +809,17 @@ pub struct ChatCtx<'a> {
     /// ⇒ never advertised. Trait-injection seam like `git_tool` (newt-scheduler
     /// depends on newt-core, so the dep can't be direct).
     pub crew_runner: Option<&'a dyn CrewRunner>,
+    /// Session-local working-style selector behind `/mode auto`. `Some` only
+    /// when the human configured Auto mode, so every other session omits the
+    /// model-facing selector entirely. A selection affects a future turn and
+    /// cannot change this turn's disposition or caveats.
+    pub operating_mode_control: Option<&'a dyn OperatingModeControl>,
+    /// Session-local state behind `enter_plan_mode` / `exit_plan_mode`.
+    ///
+    /// The dispatcher checks this collaborator before every tool call, so
+    /// entering Plan immediately clamps subsequent calls in the same model
+    /// round. `None` means the model-entered Plan phase is unavailable.
+    pub plan_mode_control: Option<&'a dyn PlanModeControl>,
 }
 
 /// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
@@ -1104,6 +1144,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         scratchpad_store,
         code_search,
         where_is,
+        nav,
+        exposure,
         experience_store,
         step_ledger,
         caveats,
@@ -1149,6 +1191,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         live_tool_output,
         git_tool,
         crew_runner,
+        operating_mode_control,
+        plan_mode_control,
     } = ctx;
     // Explain / Research / Ask turns may still use bounded read-only tools, but
     // must never inherit the harness's execution-pressure repairs.
@@ -1197,6 +1241,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
+    let advertise_operating_mode = operating_mode_control.is_some();
+    let advertise_plan_mode = plan_mode_control.is_some();
+    let advertise_plan_mode_active =
+        plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
     // Convert MemMessage list to Ollama JSON format.
     // The memory manager already included the current task as the last user message.
@@ -1277,12 +1325,28 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         advertise_code_search,
         advertise_experiential,
         advertise_scheduled,
+        advertise_operating_mode,
+        advertise_plan_mode,
+        advertise_plan_mode_active,
     );
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona's
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
     let tools = filter_tools_for_disposition(tools, prompt_disposition);
+    // #TEC Pass 1: the exposure stage. Clip the AUTHORIZED catalog to what the
+    // model's LIVE usable budget can afford (probed `safe_context` → send
+    // budget), never by model name. `ExposureProfile::Full` (the default) is
+    // identity, so this is bit-for-bit unchanged unless `[tool_exposure]` opts
+    // in. Applied before the token estimate so what we count equals what we
+    // send. Dispatch still authorizes on the full set — exposure ≠ authority.
+    let tools = crate::agentic::tools::select_exposed(
+        tools,
+        &exposure,
+        exposure_budget_tokens(send_budget, safe_context),
+        &std::collections::BTreeSet::new(),
+        estimation,
+    );
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
     // tool-schema overhead converts to real-token space once — the schema
@@ -2643,8 +2707,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         scratchpad_store,
                         code_search,
                         where_is,
+                        nav,
                         experience_store,
                         step_ledger,
+                        operating_mode_control,
+                        plan_mode_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -4403,6 +4470,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         scratchpad_store,
         code_search,
         where_is,
+        nav,
+        exposure,
         experience_store,
         step_ledger,
         caveats,
@@ -4448,6 +4517,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         live_tool_output,
         git_tool,
         crew_runner,
+        operating_mode_control,
+        plan_mode_control,
     } = ctx;
     // See the Ollama path: a non-Act turn is allowed bounded reads but never
     // execution-pressure nudges.
@@ -4481,6 +4552,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
+    let advertise_operating_mode = operating_mode_control.is_some();
+    let advertise_plan_mode = plan_mode_control.is_some();
+    let advertise_plan_mode_active =
+        plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
@@ -4546,12 +4621,25 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         advertise_code_search,
         advertise_experiential,
         advertise_scheduled,
+        advertise_operating_mode,
+        advertise_plan_mode,
+        advertise_plan_mode_active,
     );
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona's
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
     let tools = filter_tools_for_disposition(tools, prompt_disposition);
+    // #TEC Pass 1: exposure stage — clip the authorized catalog to the live
+    // usable budget (identity under `ExposureProfile::Full`). See the Ollama
+    // path for the full rationale.
+    let tools = crate::agentic::tools::select_exposed(
+        tools,
+        &exposure,
+        exposure_budget_tokens(send_budget, safe_context),
+        &std::collections::BTreeSet::new(),
+        estimation,
+    );
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
@@ -5392,8 +5480,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         scratchpad_store,
                         code_search,
                         where_is,
+                        nav,
                         experience_store,
                         step_ledger,
+                        operating_mode_control,
+                        plan_mode_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -5679,6 +5770,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         scratchpad_store,
         code_search,
         where_is,
+        nav,
+        exposure,
         experience_store,
         step_ledger,
         caveats,
@@ -5728,6 +5821,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         live_tool_output,
         git_tool,
         crew_runner,
+        operating_mode_control,
+        plan_mode_control,
     } = ctx;
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // The OpenAI-Responses loop offloads tool output (spill_store) but does not
@@ -5753,6 +5848,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
+    let advertise_operating_mode = operating_mode_control.is_some();
+    let advertise_plan_mode = plan_mode_control.is_some();
+    let advertise_plan_mode_active =
+        plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
     let mut msgs_json: Vec<serde_json::Value> = mem_messages
         .iter()
@@ -5787,11 +5886,28 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         advertise_code_search,
         advertise_experiential,
         advertise_scheduled,
+        advertise_operating_mode,
+        advertise_plan_mode,
+        advertise_plan_mode_active,
     );
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona
     // (Responses wire). No-op when `persona_tools` is `None`.
     let tools_chat = filter_advertised_tools(tools_chat, persona_tools);
     let tools_chat = filter_tools_for_disposition(tools_chat, prompt_disposition);
+    // #TEC Pass 1: exposure stage on the chat-shaped catalog before it is
+    // projected to Responses tools, so the estimate and the wire agree.
+    // Identity under `ExposureProfile::Full`. The send budget is computed just
+    // below on this wire, so derive the live budget inline here.
+    let tools_chat = crate::agentic::tools::select_exposed(
+        tools_chat,
+        &exposure,
+        exposure_budget_tokens(
+            initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct),
+            safe_context,
+        ),
+        &std::collections::BTreeSet::new(),
+        estimation,
+    );
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
     let cal = sanitize_estimate_ratio(estimate_ratio);
@@ -6012,8 +6128,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         scratchpad_store,
                         code_search,
                         where_is,
+                        nav,
                         experience_store,
                         step_ledger,
+                        operating_mode_control,
+                        plan_mode_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -7115,7 +7234,8 @@ mod cap_exit_unit_tests {
 pub(crate) fn builtin_catalog_tokens(disposition: PromptDisposition) -> usize {
     let tools = filter_tools_for_disposition(
         merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         ),
         disposition,
     );
@@ -7307,6 +7427,8 @@ mod tool_round_cap_tests {
             scratchpad_store: None,
             code_search: None,
             where_is: None,
+            nav: None,
+            exposure: Default::default(),
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -7352,6 +7474,8 @@ mod tool_round_cap_tests {
             live_tool_output: None,
             git_tool: None,
             crew_runner: None,
+            operating_mode_control: None,
+            plan_mode_control: None,
         }
     }
 
@@ -7477,6 +7601,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -7522,6 +7648,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -7777,6 +7905,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -7822,6 +7952,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -7868,6 +8000,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -7913,6 +8047,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -8039,7 +8175,8 @@ mod tool_round_cap_tests {
         );
         let head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
         let chat_tools = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let tools = if responses_wire {
             serde_json::Value::Array(tools_to_responses(&chat_tools))
@@ -8467,6 +8604,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8512,6 +8651,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             Some(&turn_prompt),
             Some(&prompt_source),
@@ -8570,6 +8711,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8615,6 +8758,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -8682,6 +8827,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8727,6 +8874,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -8806,6 +8955,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8851,6 +9002,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -8922,6 +9075,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -8967,6 +9122,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -9080,6 +9237,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9125,6 +9284,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -9247,6 +9408,8 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 where_is: None,
+                nav: None,
+                exposure: Default::default(),
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
@@ -9292,6 +9455,8 @@ mod tool_round_cap_tests {
                 live_tool_output: None,
                 git_tool: None,
                 crew_runner: None,
+                operating_mode_control: None,
+                plan_mode_control: None,
             },
             &mut NoMcp,
         )
@@ -9380,6 +9545,8 @@ mod save_note_loop_tests {
             scratchpad_store: None,
             code_search: None,
             where_is: None,
+            nav: None,
+            exposure: Default::default(),
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -9425,6 +9592,8 @@ mod save_note_loop_tests {
             live_tool_output: None,
             git_tool: None,
             crew_runner: None,
+            operating_mode_control: None,
+            plan_mode_control: None,
         }
     }
 
@@ -9876,6 +10045,8 @@ mod compression_loop_tests {
             scratchpad_store: None,
             code_search: None,
             where_is: None,
+            nav: None,
+            exposure: Default::default(),
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -9923,6 +10094,8 @@ mod compression_loop_tests {
             live_tool_output: None,
             git_tool: None,
             crew_runner: None,
+            operating_mode_control: None,
+            plan_mode_control: None,
         }
     }
 
@@ -10087,7 +10260,11 @@ mod compression_loop_tests {
         // summarizing pass; catalog growth shifts the threshold with it. The
         // >40% reclaim assertion below still measures actual dispatched
         // requests.
-        c.mid_loop_trim_tokens = Some(builtin_catalog_tokens(PromptDisposition::Act) + 5_600);
+        c.mid_loop_trim_tokens = Some(
+            builtin_catalog_tokens(PromptDisposition::Act)
+                + prompt_read::response_repository_policy_tokens()
+                + 5_600,
+        );
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _streamed, _usage, hallu) = chat_complete(c, &mut NoMcp)
@@ -10131,9 +10308,13 @@ mod compression_loop_tests {
             .map(|&(_, t, _)| t)
             .expect("a compressed request was dispatched");
         println!("e2e reclaim: ~{before} -> ~{after} est. message tokens");
+        let fixed = prompt_read::response_repository_policy_tokens();
+        let reclaimable_before = before.saturating_sub(fixed);
+        let reclaimable_after = after.saturating_sub(fixed);
         assert!(
-            after < before * 6 / 10,
-            "compression must reclaim >40% here (got {before} -> {after})"
+            reclaimable_after < reclaimable_before * 6 / 10,
+            "compression must reclaim >40% of the non-policy messages here \
+             (got {before} -> {after}, fixed policy ~{fixed})"
         );
     }
 
@@ -10202,7 +10383,9 @@ mod compression_loop_tests {
         // full request through compression before its first dispatch. (At
         // today's catalog this reproduces the historical 6,144 num_ctx /
         // 4,915-token ceiling.)
-        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act) + 1_130;
+        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act)
+            + prompt_read::response_repository_policy_tokens()
+            + 1_130;
         let num_ctx = (input_ceiling * 100).div_ceil(c.input_ceiling_pct as usize) as u32;
         // The actual ceiling the loop derives (`num_ctx_input_ceiling`), reused
         // by the fit assertion below so budget and check stay in lockstep.
@@ -10316,7 +10499,11 @@ mod compression_loop_tests {
         // summarizer failure rather than tipping into an irreducible-window
         // refusal as the catalog grows. (Reproduces the historical 5,600 at
         // today's catalog size.)
-        c.mid_loop_trim_tokens = Some(builtin_catalog_tokens(PromptDisposition::Act) + 1_815);
+        c.mid_loop_trim_tokens = Some(
+            builtin_catalog_tokens(PromptDisposition::Act)
+                + prompt_read::response_repository_policy_tokens()
+                + 1_815,
+        );
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -10505,7 +10692,8 @@ mod compression_loop_tests {
     /// catalog rather than a stale numeric snapshot of its schema overhead.
     fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         let tools = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let mut wire_messages: Vec<serde_json::Value> = messages
             .iter()
@@ -10786,11 +10974,14 @@ mod compression_loop_tests {
         let mut compress_state = CompressState::new();
         let mut c = ctx(&uri, &messages, &caveats, &workspace);
         c.max_tool_rounds = 12;
-        // The full request includes ~3.4k tokens of always-on schemas. Keep
-        // enough room for one complete fresh result group and make the
-        // request (rather than message-only accounting) drive compression.
-        // The tools-disabled cap-exit then truthfully fits the same budget.
-        c.mid_loop_trim_tokens = Some(8_000); // hard trigger, fires most rounds
+        // Derive the trigger from the live Always-on catalog (#1387 grew it)
+        // plus a catalog-independent headroom for one complete fresh result
+        // group — same shape as the other compression-loop fixtures.
+        c.mid_loop_trim_tokens = Some(
+            builtin_catalog_tokens(PromptDisposition::Act)
+                + prompt_read::response_repository_policy_tokens()
+                + 4_600,
+        );
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -10906,12 +11097,17 @@ mod compression_loop_tests {
             .respond_with(OversizedRoundResponder { log: log.clone() })
             .mount(&server)
             .await;
-        // Three ~7 KB results plus ~3.4k tokens of schemas exceed an 8,192
-        // num_ctx (6,553-token input ceiling) — the trailing group makes the
-        // COMPLETE request exceed the window; no boundary can split it
-        // (B6's shape).
+        // Three ~7 KB results plus Always-on schemas must exceed the input
+        // ceiling before reclaim (B6's shape). Derive num_ctx from the live
+        // catalog (#1387 grew Always-on tools) plus fixed headroom so the
+        // relative property stays stable as the catalog changes.
         // Distinct contents per file: identical results would engage the
         // dedupe pass, which is not what this test pins.
+        let catalog = builtin_catalog_tokens(PromptDisposition::Act);
+        // ~3.2k tokens of message/result headroom after reclaim (matches the
+        // pre-#1387 6,553 − ~3.4k catalog gap).
+        let input_ceiling = catalog + prompt_read::response_repository_policy_tokens() + 3_200;
+        let num_ctx = ((input_ceiling as f64) / 0.8).ceil() as u32;
         let ws = tempfile::TempDir::new().unwrap();
         std::fs::write(
             ws.path().join("a.txt"),
@@ -10944,7 +11140,7 @@ mod compression_loop_tests {
         c.max_ok_input = None;
         c.safe_context = None;
         c.mid_loop_trim_tokens = None;
-        c.num_ctx = Some(8_192);
+        c.num_ctx = Some(num_ctx);
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -10958,15 +11154,12 @@ mod compression_loop_tests {
         // Never a silent wrong answer: the model answered from real data.
         assert_eq!(reply, "the three files are summarized");
 
-        // THE #285 property: no dispatch ships over the window. The newest
-        // result plus schemas fits the ceiling here, so there is no truthful
-        // still-over residual to excuse an oversized request — pre-fix the
-        // round-1 dispatch went out at ~5.5k est tokens against 3,276.
+        // THE #285 property: no dispatch ships over the window.
         for (i, &(tokens, ..)) in log.iter().enumerate() {
             assert!(
-                tokens <= 6_553,
+                tokens <= input_ceiling,
                 "request {i} dispatched over the window: ~{tokens} est. \
-                 full-request tokens > 6,553 (the pre-#285 B6 residual)"
+                 full-request tokens > {input_ceiling}"
             );
         }
 
@@ -10983,16 +11176,15 @@ mod compression_loop_tests {
             "#285: the NEWEST result must reach the model whole"
         );
         assert!(task_present, "the task survives the within-group reclaim");
-        // The dispatch fits the same input ceiling the #284 test pins:
-        // 80% of 8,192 = 6,553 estimated full-request tokens.
         assert!(
-            tokens <= 6_553,
+            tokens <= input_ceiling,
             "#285: the reclaimed dispatch must fit the window \
-             (got ~{tokens} est. full-request tokens > 6,553)"
+             (got ~{tokens} est. full-request tokens > {input_ceiling})"
         );
         println!(
             "#285 e2e trace: reclaimed dispatch ~{tokens} est. tokens \
-             (full-request ceiling 6,553), a/b one-lined, c intact"
+             (full-request ceiling {input_ceiling}, num_ctx {num_ctx}), \
+             a/b one-lined, c intact"
         );
     }
 
@@ -11142,6 +11334,8 @@ mod observation_hook_tests {
             scratchpad_store: None,
             code_search: None,
             where_is: None,
+            nav: None,
+            exposure: Default::default(),
             experience_store: None,
             step_ledger: None,
             caveats,
@@ -11188,6 +11382,8 @@ mod observation_hook_tests {
             live_tool_output: None,
             git_tool: None,
             crew_runner: None,
+            operating_mode_control: None,
+            plan_mode_control: None,
         }
     }
 
@@ -11196,7 +11392,8 @@ mod observation_hook_tests {
     /// than making this regression depend on a frozen catalog size.
     fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         let tools = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let mut wire_messages: Vec<serde_json::Value> = messages
             .iter()
@@ -11524,7 +11721,9 @@ mod observation_hook_tests {
         // (Reproduces the historical 5,120 num_ctx / 4,096 ceiling / ~5,000
         // report at today's catalog size.)
         const INPUT_CEILING_PCT: usize = 80; // matches ctx() default below
-        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act) + 311;
+        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act)
+            + prompt_read::response_repository_policy_tokens()
+            + 311;
         let num_ctx = (input_ceiling * 100).div_ceil(INPUT_CEILING_PCT) as u32;
         let suspect_prompt = num_ctx * 98 / 100; // ≥95% of num_ctx → suspect
         let tools_rounds = Arc::new(AtomicUsize::new(0));
@@ -11689,7 +11888,11 @@ mod observation_hook_tests {
         // the catalog grows. The reported 8_734-token prompt stays far above
         // 85% of this window, so the silent-overflow gate still fires.
         // (Reproduces the historical 4_000 at today's catalog size.)
-        c.safe_context = Some((builtin_catalog_tokens(PromptDisposition::Act) + 215) as u32);
+        c.safe_context = Some(
+            (builtin_catalog_tokens(PromptDisposition::Act)
+                + prompt_read::response_repository_policy_tokens()
+                + 215) as u32,
+        );
         c.on_round_usage = Some(&mut hook);
         let (_reply, streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
             .await

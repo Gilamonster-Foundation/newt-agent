@@ -106,6 +106,12 @@ pub(crate) struct Mcp {
     /// status table (#1149). Includes disabled + skipped servers.
     pub(crate) statuses: Vec<(String, McpStatus)>,
     servers: Vec<ConnectedServer>,
+    /// Session-scoped mute set (`/mcp off <name>`). Muted servers stay
+    /// *connected* (so `/mcp on` is instant) but their tools leave the
+    /// advertised catalog and `handles`/`call` refuse them. Distinct from
+    /// config `enabled = false` / [`Self::drop_server`] (`/mcp disable`),
+    /// which is durable and tears the connection down.
+    session_muted: std::collections::BTreeSet<String>,
     /// When `true`, hyphens in server names are replaced with underscores in
     /// advertised tool names and routing lookups.  Matches the behaviour of
     /// API proxies that normalise tool-name characters.  Controlled by
@@ -205,8 +211,79 @@ fn apply_transport_security(
 impl Mcp {
     /// Remove a live server by name (`/mcp disable`, #1149): its tools leave
     /// the surface immediately; config persistence is the caller's job.
+    /// Also clears any session mute for that name (the connection is gone).
     pub(crate) fn drop_server(&mut self, name: &str) {
         self.servers.retain(|s| s.name != name);
+        self.session_muted.remove(name);
+    }
+
+    /// Whether `name` is currently session-muted (`/mcp off`).
+    #[must_use]
+    pub(crate) fn is_muted(&self, name: &str) -> bool {
+        self.session_muted.contains(name)
+    }
+
+    /// Whether a connected server is advertising tools this turn (connected
+    /// and not session-muted).
+    fn is_advertising(&self, server: &ConnectedServer) -> bool {
+        !self.session_muted.contains(&server.name)
+    }
+
+    /// Session-mute a connected server (`/mcp off <name>`). Keeps the
+    /// connection alive so `/mcp on` is instant. Returns `false` when no
+    /// connected server matches `name`.
+    pub(crate) fn mute(&mut self, name: &str) -> bool {
+        let connected = self.servers.iter().any(|s| s.name == name)
+            || self
+                .statuses
+                .iter()
+                .any(|(n, st)| n == name && matches!(st, McpStatus::Connected { .. }));
+        if !connected {
+            return false;
+        }
+        self.session_muted.insert(name.to_owned());
+        true
+    }
+
+    /// Clear a session mute (`/mcp on <name>`). Returns `false` when no
+    /// connected server matches `name` (config-disabled / skipped servers
+    /// cannot be unmuted — use `/mcp enable` + relaunch, or #1148).
+    pub(crate) fn unmute(&mut self, name: &str) -> bool {
+        let connected = self.servers.iter().any(|s| s.name == name)
+            || self
+                .statuses
+                .iter()
+                .any(|(n, st)| n == name && matches!(st, McpStatus::Connected { .. }));
+        if !connected {
+            return false;
+        }
+        self.session_muted.remove(name);
+        true
+    }
+
+    /// Mute every currently connected server (`/mcp off`). Returns the names
+    /// that were muted.
+    pub(crate) fn mute_all(&mut self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> =
+            self.servers.iter().map(|s| s.name.clone()).collect();
+        for (n, st) in &self.statuses {
+            if matches!(st, McpStatus::Connected { .. }) {
+                names.insert(n.clone());
+            }
+        }
+        let names: Vec<String> = names.into_iter().collect();
+        for n in &names {
+            self.session_muted.insert(n.clone());
+        }
+        names
+    }
+
+    /// Unmute every session-muted server (`/mcp on`). Returns the names that
+    /// were unmuted.
+    pub(crate) fn unmute_all(&mut self) -> Vec<String> {
+        let names: Vec<String> = self.session_muted.iter().cloned().collect();
+        self.session_muted.clear();
+        names
     }
 
     /// An empty set — connects to nothing. Used by tests (the live session
@@ -216,6 +293,7 @@ impl Mcp {
         Self {
             statuses: Vec::new(),
             servers: Vec::new(),
+            session_muted: std::collections::BTreeSet::new(),
             sanitize_server_names: true,
         }
     }
@@ -326,6 +404,7 @@ impl Mcp {
         Self {
             statuses,
             servers,
+            session_muted: std::collections::BTreeSet::new(),
             sanitize_server_names,
         }
     }
@@ -352,6 +431,9 @@ impl Mcp {
     pub(crate) fn tool_defs(&self) -> Vec<Value> {
         let mut out = Vec::new();
         for server in &self.servers {
+            if !self.is_advertising(server) {
+                continue;
+            }
             for tool in &server.tools {
                 out.push(json!({
                     "type": "function",
@@ -370,13 +452,13 @@ impl Mcp {
     ///
     /// Matches the sanitized form (hyphens → underscores in the server prefix)
     /// so that a tool advertised as `acme_server__X` routes to the server
-    /// stored as `acme-server`.
+    /// stored as `acme-server`. Session-muted servers do not handle calls.
     pub(crate) fn handles(&self, name: &str) -> bool {
         match split_namespaced(name) {
-            Some((server, _)) => self
-                .servers
-                .iter()
-                .any(|s| server_prefix(&s.name, self.sanitize_server_names) == server),
+            Some((server, _)) => self.servers.iter().any(|s| {
+                self.is_advertising(s)
+                    && server_prefix(&s.name, self.sanitize_server_names) == server
+            }),
             None => false,
         }
     }
@@ -387,6 +469,16 @@ impl Mcp {
         let Some((server_name, tool)) = split_namespaced(name) else {
             return format!("error: `{name}` is not a namespaced MCP tool");
         };
+        // Check mute before taking a mutable borrow of `servers`.
+        if let Some(muted) = self
+            .session_muted
+            .iter()
+            .find(|n| server_prefix(n, self.sanitize_server_names) == server_name)
+        {
+            return format!(
+                "error: MCP server `{muted}` is muted this session — `/mcp on {muted}` to restore its tools"
+            );
+        }
         let Some(server) = self
             .servers
             .iter_mut()
@@ -461,6 +553,80 @@ mod tests {
         assert!(mcp.is_empty());
         assert!(!mcp.handles("git__status"));
         assert!(mcp.tool_defs().is_empty());
+    }
+
+    #[test]
+    fn session_mute_round_trip_on_connected_status() {
+        // Status-only Connected entry (no live transport) is enough to exercise
+        // the mute set — the advertise path filters on `session_muted`.
+        let mut mcp = Mcp::empty();
+        mcp.statuses.push((
+            "github".into(),
+            McpStatus::Connected {
+                tools: 4,
+                confinement: Confinement::Remote,
+                net: NetGate::Advisory,
+            },
+        ));
+        assert!(!mcp.is_muted("github"));
+        assert!(mcp.mute("github"));
+        assert!(mcp.is_muted("github"));
+        assert!(mcp.unmute("github"));
+        assert!(!mcp.is_muted("github"));
+    }
+
+    #[test]
+    fn mute_unknown_or_disabled_server_fails() {
+        let mut mcp = Mcp::empty();
+        mcp.statuses.push(("dead".into(), McpStatus::Disabled));
+        assert!(!mcp.mute("dead"));
+        assert!(!mcp.mute("missing"));
+        assert!(!mcp.unmute("missing"));
+    }
+
+    #[test]
+    fn mute_all_and_unmute_all() {
+        let mut mcp = Mcp::empty();
+        mcp.statuses.push((
+            "a".into(),
+            McpStatus::Connected {
+                tools: 1,
+                confinement: Confinement::Remote,
+                net: NetGate::Advisory,
+            },
+        ));
+        mcp.statuses.push((
+            "b".into(),
+            McpStatus::Connected {
+                tools: 2,
+                confinement: Confinement::Remote,
+                net: NetGate::Advisory,
+            },
+        ));
+        let muted = mcp.mute_all();
+        assert_eq!(muted, vec!["a".to_string(), "b".to_string()]);
+        assert!(mcp.is_muted("a"));
+        assert!(mcp.is_muted("b"));
+        let unmuted = mcp.unmute_all();
+        assert_eq!(unmuted, vec!["a".to_string(), "b".to_string()]);
+        assert!(!mcp.is_muted("a"));
+        assert!(!mcp.is_muted("b"));
+    }
+
+    #[test]
+    fn drop_server_clears_session_mute() {
+        let mut mcp = Mcp::empty();
+        mcp.statuses.push((
+            "x".into(),
+            McpStatus::Connected {
+                tools: 1,
+                confinement: Confinement::Remote,
+                net: NetGate::Advisory,
+            },
+        ));
+        assert!(mcp.mute("x"));
+        mcp.drop_server("x");
+        assert!(!mcp.is_muted("x"));
     }
 
     #[test]

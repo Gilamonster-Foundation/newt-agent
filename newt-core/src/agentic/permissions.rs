@@ -52,7 +52,7 @@ pub enum DenialKind {
     /// this call" (it widens no `Caveats` axis; the git arm re-dispatches under a
     /// local-write `GitCaveats`). `target` is the git op (`commit`, `add`, …).
     /// The network verbs (push/fetch/clone) are NOT this capability — they stay
-    /// deferred / shell-net-gated. A readonly `/mode` still denies it (the gate
+    /// deferred / shell-net-gated. A readonly `/posture` still denies it (the gate
     /// refuses the grant when the preset floor projects no git write).
     GitWrite,
 }

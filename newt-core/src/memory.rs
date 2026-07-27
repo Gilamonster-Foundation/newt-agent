@@ -1352,7 +1352,7 @@ pub const DEFAULT_SOUL: &str = "\
 You are newt, a free, friendly, local agentic coder. \
 Be concise and direct. \
 You have tools: run_command, read_file, write_file, edit_file, list_dir, find, use_skill, web_fetch, render_report. \
-Follow the per-turn disposition card supplied by the harness: only an `act` turn may mutate or receive execution pressure; `ask` asks its bounded clarification and stops, `explain` answers without mutation, and `research` gathers bounded read-only evidence.\n\
+Follow the per-turn disposition card supplied by the harness: only an `act` turn may mutate the workspace or receive execution pressure; `ask` asks its bounded clarification and stops, `explain` answers without mutation, `research` gathers bounded read-only evidence, and `plan` may update only the harness-owned plan ledger.\n\
 \n\
 ## How to work\n\
 \n\
@@ -1393,7 +1393,7 @@ If the task requires a code change and the disposition is `act`, call edit_file 
 A markdown code block in the conversation is invisible to the filesystem — \
 it does not modify any file. Write the code once, into the file, via the tool. \
 Showing code in text is NOT completing an `act` task; calling the tool IS. \
-For `ask`, `explain`, or `research`, respect the disposition instead of forcing a write.\n\
+For `ask`, `explain`, `research`, or `plan`, respect the disposition instead of forcing a workspace write.\n\
 \n\
 **Present findings — don't just report a blocker.** When the task is to \
 gather or summarize (a status roll-up, a triage sweep, a morning briefing), \
@@ -2589,12 +2589,15 @@ mod tests {
     /// summarised" placeholder is deleted with the rest of the legacy path.
     #[tokio::test]
     async fn summarizing_fallback_placeholder_when_no_summarizer() {
-        let mut s = Summarizing::new(256); // 204-token budget; prompt pair fits
+        let policy_tokens = crate::agentic::response_repository_policy_tokens() as u32;
+        // Preserve the original 204-token history budget after accounting for
+        // the standing policy carried by the transient protected prompt card.
+        let mut s = Summarizing::new(256 + policy_tokens * 5 / 4);
         for i in 0..6u32 {
             s.sync_turn(
                 &format!("question {i}"),
                 &format!("answer {i}"),
-                &metrics_with_input(if i == 5 { 300 } else { 10 }),
+                &metrics_with_input(if i == 5 { 300 + policy_tokens } else { 10 }),
             )
             .await;
         }
@@ -2623,7 +2626,9 @@ mod tests {
 
     #[tokio::test]
     async fn summarizing_on_pre_compress_returns_prev_summary() {
-        let mut s = Summarizing::new(256).with_summarizer(stub_summarizer("PRIOR SUMMARY"));
+        let policy_tokens = crate::agentic::response_repository_policy_tokens() as u32;
+        let mut s = Summarizing::new(256 + policy_tokens * 5 / 4)
+            .with_summarizer(stub_summarizer("PRIOR SUMMARY"));
         // Build up history UNDER budget first: the pipeline's boundary needs
         // enough turns to leave a summarizable middle (Step 18.5 — head +
         // ≥3-message tail are protected), and a too-early trigger would burn
@@ -2633,8 +2638,12 @@ mod tests {
                 .await;
         }
         // Now cross the 204-token budget → compression sets prev_summary.
-        s.sync_turn("question text", "answer text", &metrics_with_input(300))
-            .await;
+        s.sync_turn(
+            "question text",
+            "answer text",
+            &metrics_with_input(300 + policy_tokens),
+        )
+        .await;
         let pre = s.on_pre_compress(&[]).await;
         assert!(
             pre.contains("PRIOR SUMMARY"),

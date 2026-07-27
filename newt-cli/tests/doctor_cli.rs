@@ -172,21 +172,22 @@ tiers = ["FAST"]
 
     cmd.assert()
         .success()
-        // #1212: probes route by KIND and report the served-model count.
+        // Absent kind → label "auto" and detect_endpoint (race tags vs models).
         .stdout(predicate::str::contains(format!(
-            "good ({}, Ollama) — OK (0 model(s) served)",
+            "good ({}, auto) — OK (detected ollama, 0 model(s) served)",
             ok_server.uri()
         )))
         .stdout(predicate::str::contains(format!(
-            "vllm-like ({}, Openai) — OK (1 model(s) served)",
+            "vllm-like ({}, openai) — OK (1 model(s) served)",
             openai_server.uri()
         )))
         .stdout(predicate::str::contains(format!(
-            "bad-status ({}, Ollama) — HTTP 500",
+            "bad-status ({}, auto) — unreachable: unsupported inference endpoint {}",
+            err_server.uri(),
             err_server.uri()
         )))
         .stdout(predicate::str::contains(
-            "down (http://127.0.0.1:1, Ollama) — unreachable",
+            "down (http://127.0.0.1:1, auto) — unreachable: unreachable inference endpoint",
         ))
         .stdout(predicate::str::contains(format!(
             "present (command: {present_command}) — found on PATH"

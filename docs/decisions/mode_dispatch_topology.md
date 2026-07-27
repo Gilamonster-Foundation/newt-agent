@@ -1,8 +1,15 @@
 # Decision: `/mode` Dispatch Topology (single · crew · mesh · remote) + plan
 
-**Status:** Proposed
+**Status:** Superseded as a command-surface proposal
 **Date:** 2026-06-21
 **Tracking issue:** Gilamonster-Foundation/newt-agent#554
+
+> **2026-07-24 terminology decision:** `/mode` now selects an operating
+> behavior and `/posture` owns permission floors. Dispatch topology remains a
+> valid separate design axis, but it must receive a distinct control instead of
+> overloading either command. See
+> [`operating_modes_and_permission_postures.md`](./operating_modes_and_permission_postures.md).
+
 **Extends** `docs/decisions/agentic_object_capability_security.md` (the OCAP
 Caveats lattice is the authority substrate this composes with) and the `/mode`
 named-permission-preset mechanism (#307). **Relates to**

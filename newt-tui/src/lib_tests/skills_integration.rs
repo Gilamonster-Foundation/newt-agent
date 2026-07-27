@@ -378,17 +378,28 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
     let mut system = rebuild_system_prompt(workspace, &memory, None, "test-session");
     let mut active_persona = None;
     let mut active_conversation_id = String::from("test-session");
+    let mode_states = ConversationModeStates::default();
+    let auto_control = mode_states.auto.bind(&active_conversation_id);
+    newt_core::agentic::OperatingModeControl::select_operating_mode(&auto_control, "admin")
+        .unwrap();
+    newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
 
-    let message = handle_persona_command(
-        "/persona reviewer",
-        workspace,
-        &store,
-        &mut memory,
-        &mut system,
-        &mut active_persona,
-        &mut active_conversation_id,
-    )
-    .unwrap();
+    let message = {
+        let mut ctx = ConversationResetContext {
+            memory: &mut memory,
+            system: &mut system,
+            conversation_id: &mut active_conversation_id,
+            mode_states: &mode_states,
+        };
+        handle_persona_command(
+            "/persona reviewer",
+            workspace,
+            &store,
+            &mut active_persona,
+            &mut ctx,
+        )
+        .unwrap()
+    };
 
     assert_eq!(
         message,
@@ -403,6 +414,15 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
     let messages = memory.build_messages(&system, "new task");
     assert!(!messages.iter().any(|m| m.content == "old task"));
     assert!(!messages.iter().any(|m| m.content == "old reply"));
+    assert_eq!(
+        mode_states.auto.pending_for("test-session"),
+        None,
+        "persona-created conversations clear pending Auto state"
+    );
+    assert!(
+        !mode_states.plan.is_active(),
+        "persona-created conversations clear model-entered Plan"
+    );
 }
 
 #[serial_test::serial(real_fs)]
@@ -430,12 +450,21 @@ async fn new_conversation_preserves_active_persona() {
     compress_state.latch_disabled_for_tests();
 
     let mut session_opted_fresh = false;
+    let mode_states = ConversationModeStates::default();
+    let auto_control = mode_states.auto.bind(&active_conversation_id);
+    newt_core::agentic::OperatingModeControl::select_operating_mode(&auto_control, "admin")
+        .unwrap();
+    newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
+    let mut ctx = ConversationResetContext {
+        memory: &mut memory,
+        system: &mut system,
+        conversation_id: &mut active_conversation_id,
+        mode_states: &mode_states,
+    };
     let message = handle_new_conversation(
         workspace,
-        &mut memory,
-        &mut system,
         active_persona.as_ref(),
-        &mut active_conversation_id,
+        &mut ctx,
         &mut compress_state,
         &mut session_opted_fresh,
     );
@@ -456,6 +485,11 @@ async fn new_conversation_preserves_active_persona() {
     let messages = memory.build_messages(&system, "new task");
     assert!(!messages.iter().any(|m| m.content == "old task"));
     assert!(!messages.iter().any(|m| m.content == "old reply"));
+    assert_eq!(mode_states.auto.pending_for("test-session"), None);
+    assert!(
+        !mode_states.plan.is_active(),
+        "/new clears model-entered Plan state"
+    );
 }
 
 #[test]
@@ -1810,6 +1844,12 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
+    let mode_states = ConversationModeStates::default();
+    let original_conversation_id = active_conversation_id.clone();
+    let auto_control = mode_states.auto.bind(&original_conversation_id);
+    newt_core::agentic::OperatingModeControl::select_operating_mode(&auto_control, "admin")
+        .unwrap();
+    newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
     let mut conversation_ctx = ConversationCommandContext {
         store: &store,
         persona_store: &persona_store,
@@ -1822,6 +1862,7 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &mode_states,
     };
 
     let message = handle_conversation_command(
@@ -1831,13 +1872,23 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
     .unwrap();
 
     assert!(
-        !compress_state.is_disabled(),
+        !conversation_ctx.compress_state.is_disabled(),
         "/conversation restore must reset compression anti-thrash (F4)"
     );
     assert!(message.contains("Restored conversation"));
-    assert_eq!(active_conversation_id, id);
+    assert_eq!(*conversation_ctx.active_conversation_id, id);
     assert_eq!(
-        active_prompt_context
+        mode_states.auto.pending_for(&original_conversation_id),
+        None,
+        "restore eagerly clears the outgoing conversation's Auto selection"
+    );
+    assert!(
+        !mode_states.plan.is_active(),
+        "restore clears the model-entered Plan phase"
+    );
+    assert_eq!(
+        conversation_ctx
+            .active_prompt_context
             .as_ref()
             .expect("restore rehydrates prompt metadata without executing it")
             .submitted_prompt()
@@ -1845,14 +1896,39 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
         saved_prompt.submitted_prompt().id()
     );
     assert_eq!(
-        active_persona.as_ref().map(|p| p.name.as_str()),
+        conversation_ctx
+            .active_persona
+            .as_ref()
+            .map(|p| p.name.as_str()),
         Some("reviewer")
     );
-    assert!(system.contains("Review from disk."));
-    let messages = memory.build_messages(&system, "next task");
+    assert!(conversation_ctx.system.contains("Review from disk."));
+    let messages = conversation_ctx
+        .memory
+        .build_messages(conversation_ctx.system, "next task");
     assert!(!messages.iter().any(|m| m.content == "old task"));
     assert!(messages.iter().any(|m| m.content == "saved task"));
     assert!(messages.iter().any(|m| m.content == "saved reply"));
+
+    let other = store.create("Other work", None).unwrap();
+    let auto_control = mode_states.auto.bind(&id);
+    newt_core::agentic::OperatingModeControl::select_operating_mode(&auto_control, "admin")
+        .unwrap();
+    newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
+    restore_conversation_into_session(&mut conversation_ctx, &other).unwrap();
+    assert_eq!(mode_states.auto.pending_for(&id), None);
+    assert!(!mode_states.plan.is_active());
+
+    let auto_control = mode_states.auto.bind(&other);
+    newt_core::agentic::OperatingModeControl::select_operating_mode(&auto_control, "dev").unwrap();
+    restore_conversation_into_session(&mut conversation_ctx, &id).unwrap();
+    assert_eq!(
+        mode_states.auto.pending_for(&other),
+        None,
+        "A→B→A restores cannot resurrect an Auto selection from either conversation"
+    );
+    assert_eq!(mode_states.auto.pending_for(&id), None);
+    assert!(!mode_states.plan.is_active());
 }
 
 #[tokio::test]
@@ -1906,6 +1982,7 @@ async fn prompt_only_restore_rehydrates_receipt_without_replaying_it_as_input() 
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &ConversationModeStates::default(),
     };
 
     resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -2055,6 +2132,7 @@ async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &ConversationModeStates::default(),
     };
 
     let banner = auto_resume_latest(&mut ctx).unwrap().expect("a banner");
@@ -2102,6 +2180,7 @@ fn auto_resume_empty_workspace_is_silent_fresh_start() {
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &ConversationModeStates::default(),
     };
 
     assert_eq!(auto_resume_latest(&mut ctx).unwrap(), None);
@@ -2143,6 +2222,7 @@ async fn resume_exact_restores_that_conversation() {
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &ConversationModeStates::default(),
     };
 
     let banner = resume_exact_conversation(&mut ctx, &target).unwrap();
@@ -2195,6 +2275,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &ConversationModeStates::default(),
     };
 
     let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -2266,6 +2347,7 @@ async fn resume_rehydrates_plan_into_live_ledger() {
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &ConversationModeStates::default(),
     };
 
     let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -2322,6 +2404,7 @@ fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &ConversationModeStates::default(),
     };
 
     for id in [newt_core::new_conversation_id(), foreign_id] {
@@ -2606,6 +2689,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
         scratchpad: &scratchpad_store,
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
+        mode_states: &ConversationModeStates::default(),
     };
     handle_conversation_command(&format!("/conversation restore {id}"), &mut ctx).unwrap();
 

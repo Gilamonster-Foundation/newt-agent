@@ -2,11 +2,15 @@
 # .newt/language-packs/<name>.toml (project-local), or inline under
 # [[context.api_surface.language_packs]] in config.toml.
 #
-# Packs merge by `name`: a built-in's name (rust/python/bash/c_cpp/go/java)
+# Packs merge by `name`: a built-in's name
 # REPLACES that built-in; a new name ADDS a language. No rebuild required.
 # See docs/language-packs.md.
 
 name = "mylang"
+
+# Human spellings the harness accepts for source-language filtering. The stable
+# `name` is always accepted too. Optional.
+aliases = ["my language", "mylang"]
 
 # File extensions this pack claims (no dot).
 extensions = ["ext"]

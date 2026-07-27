@@ -4,7 +4,11 @@ The `knowledge_base` technique injects an **authoritative API surface** of your
 workspace into the model's frozen system prompt — the real public symbols, so the
 model grounds against them instead of inventing APIs. *How* a language's public
 symbols are recognized is a **language pack**: pure data, so adding a language is
-config, not a code change.
+config, not a code change. The same registry is the harness definition of
+**source/code files** for source-first repository investigation, including
+`find(category="source", language="C++")`; docs, manifests, lockfiles, and
+generated artifacts remain supporting evidence rather than substitutes for
+code unless the operator explicitly requests them.
 
 > **Extraction engines.** Today a pack extracts with **regex** rules (zero deps,
 > the bootstrap). The right long-term engine is an **AST parser (tree-sitter)** —
@@ -15,8 +19,9 @@ config, not a code change.
 
 ## Built-in packs (first-class)
 
-Rust, Python, Bash, C/C++, Go, Java ship built in (`newt-core::api_surface::builtin_packs`).
-They double as worked examples — copy one and adapt.
+Rust, Python, Bash, C/C++, C#, Go, Java, Ruby, Dart, and TypeScript ship built
+in (`newt-core::api_surface::builtin_packs`). They double as worked examples —
+copy one and adapt.
 
 ## Adding / overriding a pack
 
@@ -35,6 +40,7 @@ So you can ship a Ruby pack, sharpen the C/C++ rules, or override anything —
 
 ```toml
 name = "ruby"                 # stable id (a built-in's name replaces that built-in)
+aliases = ["ruby", "rb"]      # human spellings for prompt/tool language filters
 extensions = ["rb"]           # file extensions, no dot
 
 # Entry-point file globs — these files are the public API, listed first in the

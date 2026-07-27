@@ -22,8 +22,10 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         // not here (three-Cs).
         let status = probe_configured_backend(backend).await;
         println!(
-            "  {} ({}, {:?}) — {status}",
-            backend.name, backend.endpoint, backend.kind
+            "  {} ({}, {}) — {status}",
+            backend.name,
+            backend.endpoint,
+            backend.kind_label()
         );
     }
 
@@ -194,10 +196,11 @@ async fn probe_dgx(dgx: &DgxConfig) {
 
 /// Probe a `[[backends]]` entry the way a session would reach it (#1212):
 /// route by `kind` through [`newt_core::backend_probe::api_for`] — the same
-/// list-models call session-start adoption makes, with the same auth. An
-/// `embedded` backend has no endpoint to probe; report it as in-process.
+/// list-models call session-start adoption makes, with the same auth. When
+/// `kind` is unset, race protocols via [`newt_core::backend_probe::detect_endpoint`].
+/// An `embedded` backend has no endpoint to probe; report it as in-process.
 async fn probe_configured_backend(backend: &newt_core::config::BackendConfig) -> String {
-    if backend.kind == newt_core::config::BackendKind::Embedded {
+    if backend.kind == Some(newt_core::config::BackendKind::Embedded) {
         return "in-process (embedded — no endpoint to probe)".to_string();
     }
     let client = reqwest::Client::builder()
@@ -205,7 +208,25 @@ async fn probe_configured_backend(backend: &newt_core::config::BackendConfig) ->
         .build()
         .unwrap();
     let api_key = backend.resolve_api_key();
-    match newt_core::backend_probe::api_for(backend.kind)
+    if backend.needs_kind_probe() {
+        return match newt_core::backend_probe::detect_endpoint(
+            &client,
+            &backend.endpoint,
+            api_key.as_deref(),
+        )
+        .await
+        {
+            Ok(probe) => format!(
+                "OK (detected {}, {} model(s) served)",
+                probe.kind.label(),
+                probe.models.len()
+            ),
+            Err(e) if e.to_string().starts_with("HTTP ") => e.to_string(),
+            Err(e) => format!("unreachable: {e}"),
+        };
+    }
+    let kind = backend.kind.expect("needs_kind_probe was false");
+    match newt_core::backend_probe::api_for(kind)
         .list_models(&client, &backend.endpoint, api_key.as_deref())
         .await
     {

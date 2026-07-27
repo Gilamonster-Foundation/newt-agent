@@ -11,7 +11,12 @@
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml.
 #   - `just check` matches the lint + test + lean-build jobs (fmt + clippy +
 #     cargo test, plus the `--no-default-features` lean build for issue #416 —
-#     rich-tui is a default feature now, so the main jobs already cover it)
+#     rich-tui is a default feature now, so the main jobs already cover it —
+#     plus the #1409 lean TEST firewall: `cargo test -p newt-agent
+#     --no-default-features` and `cargo test -p newt-tui`. The latter is the
+#     lean surface's own suite: newt-tui declares no `default` features, so
+#     testing it package-alone strips rich-tui + live-spill, which the
+#     workspace build always unifies back on.)
 #   - `just cov-ci` matches the coverage job (cargo llvm-cov with floor)
 #   - `just audit` matches the "Security audit" job (cargo audit against the
 #     tracked ignore-list in .cargo/audit.toml; local best-effort if cargo-audit

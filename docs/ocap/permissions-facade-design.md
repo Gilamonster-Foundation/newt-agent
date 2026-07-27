@@ -2,6 +2,11 @@
 
 **Shawn Hartsock** · Gilamonster Foundation · `hartsock@users.noreply.github.com`
 
+> **Terminology update (2026-07-24):** historical `/mode` permission-preset
+> references in this pinned design now map to `/posture`. `/mode` selects
+> operating behavior and never grants authority. See
+> [`../decisions/operating_modes_and_permission_postures.md`](../decisions/operating_modes_and_permission_postures.md).
+
 *Design doc + paper material. Companion to
 [`caveat-lattice-paper.md`](./caveat-lattice-paper.md) and
 [`authority-model-design-review.md`](./authority-model-design-review.md).*

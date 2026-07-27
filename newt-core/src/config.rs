@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{NewtError, Result};
 use crate::router::Tier;
 pub use newt_tuner::ModelTuning;
+pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
 pub use tools::ToolsConfig;
 
 mod shell;
+mod tool_exposure;
 mod tools;
 pub use shell::{
     confined_default_engine, full_access_default_engine, mcp_stdio_env_passthrough,
@@ -126,6 +128,12 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsConfig>,
 
+    /// `[tool_exposure]` — the progressive tool-schema controller (Pass 1).
+    /// `None` → [`ExposureProfile::Full`] (identity; advertise the full
+    /// authorized catalog). See [`ToolExposureConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_exposure: Option<ToolExposureConfig>,
+
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<crate::pricing::PricingConfig>,
@@ -188,16 +196,17 @@ pub struct Config {
 
     /// Named permission presets (`[permission_presets.<name>]`, issue #307).
     /// Each maps onto the role-profile caveat mechanism (a
-    /// [`crate::NamedPermissionPreset`]) and, when applied via `/mode`, clamps
+    /// [`crate::NamedPermissionPreset`]) and, when applied via `/posture`, clamps
     /// the session's authority as a hard floor. Empty by default — no preset,
     /// behavior unchanged.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub permission_presets: std::collections::BTreeMap<String, crate::NamedPermissionPreset>,
 
-    /// Named modes (`[modes.<name>]`, issue #307) for the `/mode` command. Each
-    /// mode atomically binds a skill body to preload, a permission preset to
-    /// apply as an authority floor, and a one-line system-prompt framing. Empty
-    /// by default. See [`ModeConfig`].
+    /// Named permission-posture bindings for `/posture` (issue #307). The
+    /// `[modes.<name>]` key is retained for configuration compatibility. Each
+    /// binding atomically preloads a skill body, applies a permission preset as
+    /// an authority floor, and adds system-prompt framing. Empty by default.
+    /// See [`ModeConfig`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub modes: std::collections::BTreeMap<String, ModeConfig>,
 
@@ -249,8 +258,8 @@ pub struct Config {
     pub plan: Option<PlanConfig>,
 }
 
-/// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
-/// `/mode <name>` command applies in a single invocation.
+/// One named permission-posture binding (`[modes.<name>]`, retained for
+/// compatibility): the atomic binding `/posture <name>` applies.
 ///
 /// ```toml
 /// [modes.triage]
@@ -259,10 +268,10 @@ pub struct Config {
 /// framing = "On-call triage: investigate, do not change production."
 /// ```
 ///
-/// Every field is optional so a mode can do any subset (e.g. preset-only, or
+/// Every field is optional so a posture can do any subset (e.g. preset-only, or
 /// framing-only). A `skill`/`preset` that names a missing entry is reported as
-/// an error by the command rather than silently ignored — a mode that claims a
-/// clamp it never applied would be a false security claim.
+/// an error by the command rather than silently ignored — a posture that claims
+/// a clamp it never applied would be a false security claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModeConfig {
     /// Skill name to preload (the same `use_skill` / `load_body_from` path).
@@ -1228,7 +1237,7 @@ pub struct SymbolRule {
 /// language's files, which files expose its public API, and how to extract its
 /// public symbols — entirely as DATA, so a new language is config, not code.
 ///
-/// Built-in packs cover Rust, Python, Bash, and C/C++. A project ships more by
+/// Built-in packs cover common source languages. A project ships more by
 /// dropping a `<name>.toml` into `~/.newt/language-packs/` (global) or
 /// `.newt/language-packs/` (project-local), or inline under
 /// `[[context.api_surface.language_packs]]`. Packs merge **by `name`** (a custom
@@ -1238,6 +1247,12 @@ pub struct SymbolRule {
 pub struct LanguagePack {
     /// Stable id (a config pack with a built-in's name replaces that built-in).
     pub name: String,
+    /// Human spellings accepted by harness source-file classification, e.g.
+    /// `["c++", "cpp"]` or `["c#", "dotnet"]`. The stable `name` is always an
+    /// implicit alias. Pure data keeps language understanding out of prompt-
+    /// specific conditionals.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// File extensions this pack claims, no dot — `["rs"]`, `["h", "hpp", "cpp"]`.
     pub extensions: Vec<String>,
     /// Entry-point filename globs (the public-API files, listed first in the
@@ -2630,6 +2645,16 @@ pub enum OpenAiApi {
     Responses,
 }
 
+impl OpenAiApi {
+    /// Short human label for the HTTP surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+        }
+    }
+}
+
 /// A single inference backend entry.
 ///
 /// Two ways to define one: an inline `[[backends]]` array element in
@@ -2747,16 +2772,19 @@ pub struct BackendConfig {
     pub model_path: Option<String>,
     #[serde(default)]
     pub tiers: Vec<Tier>,
-    /// Which wire protocol this backend speaks. Defaults to `ollama`
-    /// so configs written before this field existed keep working.
-    #[serde(default)]
-    pub kind: BackendKind,
+    /// Which wire protocol this backend speaks. OPTIONAL (#backend-kind-probe):
+    /// unset means "probe at connect" via [`crate::backend_probe::detect_endpoint`]
+    /// (race `/api/tags` vs `/v1/models`). Explicit `kind = "ollama"|"openai"|…`
+    /// keeps today's pinned behavior. Auth stays explicit (`api_key_*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<BackendKind>,
     /// For `kind = "openai"`: which OpenAI HTTP surface to use
-    /// (`chat_completions` default, or `responses` for models served only on
-    /// `/v1/responses`). Ignored for Ollama. The agent loop also auto-falls-back
-    /// to `responses` if chat/completions 404s with the responses-only error.
-    #[serde(default)]
-    pub api: OpenAiApi,
+    /// (`chat_completions` or `responses`). OPTIONAL: unset means probe at
+    /// connect (try chat/completions; adopt `responses` when the server says
+    /// the model is responses-only). Explicit values stay pinned. Ignored for
+    /// Ollama. Serialized only when set so a minimal drop-in stays minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<OpenAiApi>,
     /// Optional path to a file whose first non-empty line is a bearer
     /// token, sent as `Authorization: Bearer <token>` by
     /// OpenAI-compatible backends. A leading `~/` is expanded to the
@@ -2812,6 +2840,18 @@ impl BackendConfig {
     /// expects the served model to be adopted from the endpoint (Phase B).
     pub fn effective_model(&self) -> Option<&str> {
         self.model.as_deref().filter(|m| !m.trim().is_empty())
+    }
+
+    /// True when `kind` was omitted — session start / doctor must run
+    /// [`crate::backend_probe::detect_endpoint`] before speaking the wire.
+    pub fn needs_kind_probe(&self) -> bool {
+        self.kind.is_none()
+    }
+
+    /// Human label for lists/preambles: the pinned protocol, or `"auto"` when
+    /// unset (probe fills it in at connect).
+    pub fn kind_label(&self) -> &'static str {
+        self.kind.map(BackendKind::label).unwrap_or("auto")
     }
 
     /// Resolve this backend's bearer token, if any.
@@ -3002,6 +3042,74 @@ pub fn write_backend_dropin(
     Ok(path)
 }
 
+/// Persist probed backend fields into `~/.newt/backends/<name>.toml` (or
+/// `$NEWT_CONFIG_DIR/backends/<name>.toml`) — never into the main
+/// `config.toml`. Reset = delete that one file.
+///
+/// Merges into an existing drop-in of the same name (preserving auth refs and
+/// any operator-set fields not in `patch`), else creates a new minimal drop-in
+/// from `patch`. Returns the written path, or `None` when there is no user
+/// config dir / empty name.
+pub fn writeback_probed_backend(
+    patch: &BackendConfig,
+) -> std::result::Result<Option<std::path::PathBuf>, String> {
+    if patch.name.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(config_path) = Config::user_config_path() else {
+        return Ok(None);
+    };
+    let dir = config_path.with_file_name("backends");
+    let path = dir.join(format!("{}.toml", patch.name));
+    let mut merged = if path.is_file() {
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        toml::from_str::<BackendConfig>(&text)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?
+    } else {
+        BackendConfig {
+            name: patch.name.clone(),
+            endpoint: patch.endpoint.clone(),
+            ..Default::default()
+        }
+    };
+    // Filename stem is authoritative.
+    merged.name = patch.name.clone();
+    if !patch.endpoint.is_empty() {
+        merged.endpoint = patch.endpoint.clone();
+    }
+    if patch.kind.is_some() {
+        merged.kind = patch.kind;
+    }
+    if patch.api.is_some() {
+        merged.api = patch.api;
+    }
+    if patch.model.is_some() {
+        merged.model = patch.model.clone();
+    }
+    if patch.serving.is_some() {
+        merged.serving = patch.serving;
+    }
+    if patch.api_key_env.is_some() {
+        merged.api_key_env = patch.api_key_env.clone();
+    }
+    if patch.api_key_file.is_some() {
+        merged.api_key_file = patch.api_key_file.clone();
+    }
+    merged.provenance = Some(BackendProvenance {
+        source: Some(format!(
+            "newt adopt v{} (probed; delete this file to reset)",
+            env!("CARGO_PKG_VERSION")
+        )),
+        probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        derived_serving: patch
+            .serving
+            .map(|_| true)
+            .or_else(|| merged.provenance.as_ref().and_then(|p| p.derived_serving)),
+    });
+    write_backend_dropin(&config_path, &merged).map(Some)
+}
+
 /// The last-resort localhost Ollama backend: used both as `Config::default()`'s
 /// sole backend (no config file at all) and as the [`Config::resolve`] fallback
 /// when neither inline `[[backends]]` nor per-file drop-ins supply any, so a
@@ -3012,7 +3120,7 @@ fn fallback_localhost_backend() -> BackendConfig {
         endpoint: "http://127.0.0.1:11434".into(),
         model: Some("llama3.1:8b".into()),
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
-        kind: BackendKind::Ollama,
+        kind: Some(BackendKind::Ollama),
         ..Default::default()
     }
 }
@@ -3033,6 +3141,7 @@ impl Default for Config {
             intake: None,
             context: None,
             tools: None,
+            tool_exposure: None,
             pricing: None,
             memory: None,
             agents: AgentsConfig::default(),
@@ -3210,6 +3319,12 @@ impl Config {
             .as_ref()
             .map(|t| t.max_output_tokens)
             .unwrap_or_else(default_max_output_tokens)
+    }
+
+    /// The resolved `[tool_exposure]` policy, or the identity (`Full`) default
+    /// when the section is absent. See [`ToolExposureConfig`].
+    pub fn tool_exposure(&self) -> ToolExposureConfig {
+        self.tool_exposure.unwrap_or_default()
     }
 
     /// The configured head allocation for oversized `run_command` output
@@ -3587,6 +3702,39 @@ impl Config {
         }
 
         dirs
+    }
+
+    /// Fill in a default `[skills].bundled_dir` when the user left it unset, so
+    /// an agent running **inside a newt checkout gets the repo's bundled skills
+    /// surfaced out-of-the-box** (progressive-disclosure index → `use_skill`)
+    /// without any config. Detection walks up from `cwd` for a
+    /// `.newt/bundled-skills` directory; if none is found (or the field is
+    /// already set), the config is returned unchanged. Kept off the pure
+    /// [`Self::skill_search_dirs`] path — the filesystem probe lives only here.
+    ///
+    /// This is the smallest first step (dev/agent-in-checkout); packaging a
+    /// default bundled dir for an *installed* newt is a follow-up (see the
+    /// bundled-skills epic).
+    #[must_use]
+    pub fn with_bundled_default(mut self) -> Self {
+        let already_set = self
+            .skills
+            .as_ref()
+            .is_some_and(|s| !s.bundled_dir.is_empty());
+        if already_set {
+            return self;
+        }
+        let Ok(cwd) = std::env::current_dir() else {
+            return self;
+        };
+        if let Some(dir) =
+            find_ancestor_dir(&cwd, Path::new(".newt/bundled-skills"), |p| p.is_dir())
+        {
+            self.skills
+                .get_or_insert_with(SkillsConfig::default)
+                .bundled_dir = dir.to_string_lossy().into_owned();
+        }
+        self
     }
 
     /// The personas directory: sibling of `~/.newt/config.toml`, i.e.
@@ -4113,6 +4261,23 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// Walk `start` and its ancestors, returning the first `ancestor.join(rel)` for
+/// which `exists` is true. Pure: the filesystem probe is the injected `exists`
+/// closure, so the walk logic is unit-testable without touching disk.
+pub(crate) fn find_ancestor_dir(
+    start: &Path,
+    rel: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join(rel);
+        if exists(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5010,20 +5175,20 @@ mod tests {
 
     #[test]
     fn backend_api_axis_defaults_and_parses() {
-        // Absent → chat/completions (back-compat).
+        // Absent → unset (probe-at-connect for openai backends).
         let def: BackendConfig =
             toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\nkind=\"openai\"\n").unwrap();
-        assert_eq!(def.api, OpenAiApi::ChatCompletions);
+        assert_eq!(def.api, None);
         // Explicit responses opt-in.
         let resp: BackendConfig = toml::from_str(
             "endpoint=\"http://h:1\"\nmodel=\"gpt-5-codex\"\nkind=\"openai\"\napi=\"responses\"\n",
         )
         .unwrap();
-        assert_eq!(resp.api, OpenAiApi::Responses);
-        // `chat` is an accepted alias for the default.
+        assert_eq!(resp.api, Some(OpenAiApi::Responses));
+        // `chat` is an accepted alias for chat_completions.
         let alias: BackendConfig =
             toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\napi=\"chat\"\n").unwrap();
-        assert_eq!(alias.api, OpenAiApi::ChatCompletions);
+        assert_eq!(alias.api, Some(OpenAiApi::ChatCompletions));
     }
 
     #[test]
@@ -5171,7 +5336,7 @@ mod tests {
                     model: Some("old-model".into()),
                     model_path: None,
                     tiers: vec![],
-                    kind: BackendKind::Ollama,
+                    kind: Some(BackendKind::Ollama),
                     api: Default::default(),
                     api_key_file: None,
                     api_key_env: None,
@@ -5183,7 +5348,7 @@ mod tests {
                     model: Some("qwen2.5-coder:14b".into()),
                     model_path: None,
                     tiers: vec![],
-                    kind: BackendKind::Ollama,
+                    kind: Some(BackendKind::Ollama),
                     api: Default::default(),
                     api_key_file: None,
                     api_key_env: None,
@@ -5199,8 +5364,69 @@ mod tests {
         let dgx1 = cfg.backends.iter().find(|b| b.name == "dgx1").unwrap();
         assert_eq!(dgx1.endpoint, "http://REDACTED-HOST:11434", "disk wins");
         assert_eq!(dgx1.effective_model(), Some("qwen3:30b"));
-        assert_eq!(dgx1.kind, BackendKind::Ollama, "kind defaults to ollama");
+        assert_eq!(dgx1.kind, None, "absent kind means probe-at-connect");
         assert!(cfg.backends.iter().any(|b| b.name == "gnuc"), "gnuc kept");
+    }
+
+    #[test]
+    fn writeback_probed_backend_lands_in_dedicated_dropin_not_config_toml() {
+        // Probe write-back must never touch config.toml — only backends/<name>.toml
+        // so reset = delete that one file.
+        let dir = tempfile::tempdir().unwrap();
+        let config_toml = dir.path().join("config.toml");
+        std::fs::write(&config_toml, "# keep me\n").unwrap();
+        // SAFETY: test-local env pin; restored below.
+        let prev = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+        unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, dir.path()) };
+
+        let patch = BackendConfig {
+            name: "dgx1-llama".into(),
+            endpoint: "http://host:8000".into(),
+            kind: Some(BackendKind::Openai),
+            api: Some(OpenAiApi::Responses),
+            model: Some("nemotron".into()),
+            serving: Some(Serving::Instance),
+            ..Default::default()
+        };
+        let written = writeback_probed_backend(&patch)
+            .unwrap()
+            .expect("user config dir is set");
+        assert_eq!(written, dir.path().join("backends").join("dgx1-llama.toml"));
+        let body = std::fs::read_to_string(&written).unwrap();
+        assert!(body.contains("kind = \"openai\""));
+        assert!(body.contains("api = \"responses\""));
+        assert!(body.contains("model = \"nemotron\""));
+        assert!(body.contains("serving = \"instance\""));
+        // Main config untouched.
+        assert_eq!(
+            std::fs::read_to_string(&config_toml).unwrap(),
+            "# keep me\n"
+        );
+
+        // Second write merges and preserves auth refs already on disk.
+        std::fs::write(
+            &written,
+            "endpoint = \"http://host:8000\"\napi_key_env = \"DGX_TOKEN\"\n",
+        )
+        .unwrap();
+        let patch2 = BackendConfig {
+            name: "dgx1-llama".into(),
+            endpoint: "http://host:8000".into(),
+            kind: Some(BackendKind::Openai),
+            api: Some(OpenAiApi::ChatCompletions),
+            model: Some("other".into()),
+            ..Default::default()
+        };
+        writeback_probed_backend(&patch2).unwrap();
+        let body2 = std::fs::read_to_string(&written).unwrap();
+        assert!(body2.contains("api_key_env"), "auth ref preserved: {body2}");
+        assert!(body2.contains("api = \"chat_completions\""));
+        assert!(body2.contains("model = \"other\""));
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, v) },
+            None => unsafe { std::env::remove_var(NEWT_CONFIG_DIR_ENV) },
+        }
     }
 
     #[test]
@@ -5443,6 +5669,50 @@ mod tests {
             no_bundled.skill_search_dirs().len(),
             1,
             "empty bundled_dir contributes no directory"
+        );
+    }
+
+    #[test]
+    fn find_ancestor_dir_returns_first_matching_ancestor() {
+        // Only the workspace root has `.newt/bundled-skills`; the walk from a
+        // nested cwd must find it there, not stop short or overshoot.
+        let root = Path::new("/home/u/repo");
+        let target = root.join(".newt/bundled-skills");
+        let exists = |p: &Path| p == target;
+        let got = find_ancestor_dir(
+            Path::new("/home/u/repo/newt-core/src"),
+            Path::new(".newt/bundled-skills"),
+            exists,
+        );
+        assert_eq!(got, Some(target));
+    }
+
+    #[test]
+    fn find_ancestor_dir_none_when_no_ancestor_has_it() {
+        let got = find_ancestor_dir(
+            Path::new("/home/u/repo/newt-core/src"),
+            Path::new(".newt/bundled-skills"),
+            |_| false,
+        );
+        assert_eq!(got, None, "no ancestor matches → None, never a bogus path");
+    }
+
+    #[test]
+    fn with_bundled_default_leaves_a_configured_value_untouched() {
+        // A user who set `bundled_dir` must win — the checkout default only
+        // fills the gap, it never overrides an explicit choice.
+        let cfg = Config {
+            skills: Some(SkillsConfig {
+                search: vec![],
+                bundled_dir: "/explicit/bundled".into(),
+            }),
+            ..Config::default()
+        }
+        .with_bundled_default();
+        assert_eq!(
+            cfg.skills.unwrap().bundled_dir,
+            "/explicit/bundled",
+            "an explicitly configured bundled_dir is never overridden"
         );
     }
 
@@ -6675,7 +6945,7 @@ net = [\"already.example.com\"]
             model: Some("some-model".into()),
             model_path: None,
             tiers: vec![Tier::Fast],
-            kind: BackendKind::Openai,
+            kind: Some(BackendKind::Openai),
             api: Default::default(),
             api_key_file,
             api_key_env,
@@ -6684,7 +6954,7 @@ net = [\"already.example.com\"]
     }
 
     #[test]
-    fn backend_kind_defaults_to_ollama_when_absent() {
+    fn backend_kind_absent_means_probe_at_connect() {
         let toml = r#"
             [[backends]]
             name = "local"
@@ -6693,7 +6963,9 @@ net = [\"already.example.com\"]
             tiers = ["FAST"]
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.backends[0].kind, BackendKind::Ollama);
+        assert_eq!(cfg.backends[0].kind, None);
+        assert!(cfg.backends[0].needs_kind_probe());
+        assert_eq!(cfg.backends[0].kind_label(), "auto");
         assert!(cfg.backends[0].api_key_file.is_none());
         assert!(cfg.backends[0].api_key_env.is_none());
     }
@@ -6705,7 +6977,11 @@ net = [\"already.example.com\"]
                 "[[backends]]\nname=\"x\"\nendpoint=\"http://e\"\nmodel=\"m\"\ntiers=[\"FAST\"]\nkind=\"{kind_str}\"\n"
             );
             let cfg: Config = toml::from_str(&toml).unwrap();
-            assert_eq!(cfg.backends[0].kind, BackendKind::Openai, "kind={kind_str}");
+            assert_eq!(
+                cfg.backends[0].kind,
+                Some(BackendKind::Openai),
+                "kind={kind_str}"
+            );
         }
     }
 
@@ -6723,7 +6999,7 @@ net = [\"already.example.com\"]
         assert!(toml.contains("api_key_file"));
         assert!(toml.contains("api_key_env"));
         let back: BackendConfig = toml::from_str(&toml).unwrap();
-        assert_eq!(back.kind, BackendKind::Openai);
+        assert_eq!(back.kind, Some(BackendKind::Openai));
         assert_eq!(back.api_key_file.as_deref(), Some("~/.newt/token"));
         assert_eq!(back.api_key_env.as_deref(), Some("MY_TOKEN"));
     }
@@ -6974,5 +7250,50 @@ net = [\"already.example.com\"]
     fn tools_max_output_tokens_zero_is_a_valid_no_cap() {
         let cfg: Config = toml::from_str("[tools]\nmax_output_tokens = 0\n").unwrap();
         assert_eq!(cfg.max_output_tokens(), 0);
+    }
+
+    #[test]
+    fn tool_exposure_defaults_to_full_identity_when_absent() {
+        // No `[tool_exposure]` section ⇒ the identity controller (unchanged
+        // advertised catalog).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.tool_exposure.is_none());
+        let resolved = cfg.tool_exposure();
+        assert_eq!(resolved.profile, ExposureProfile::Full);
+        assert_eq!(resolved.schema_budget_pct, 15);
+        assert_eq!(resolved.max_initial_tools, 0);
+        assert!(resolved.supports_dynamic_catalog);
+        assert_eq!(
+            Config::default().tool_exposure().profile,
+            ExposureProfile::Full
+        );
+    }
+
+    #[test]
+    fn tool_exposure_parses_an_auto_profile_override() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [tool_exposure]
+            profile = "auto"
+            schema_budget_pct = 12
+            max_initial_tools = 8
+            supports_dynamic_catalog = false
+        "#,
+        )
+        .unwrap();
+        let resolved = cfg.tool_exposure();
+        assert_eq!(resolved.profile, ExposureProfile::Auto);
+        assert_eq!(resolved.schema_budget_pct, 12);
+        assert_eq!(resolved.max_initial_tools, 8);
+        assert!(!resolved.supports_dynamic_catalog);
+    }
+
+    #[test]
+    fn tool_exposure_minimal_profile_parses() {
+        let cfg: Config = toml::from_str("[tool_exposure]\nprofile = \"minimal\"\n").unwrap();
+        let resolved = cfg.tool_exposure();
+        assert_eq!(resolved.profile, ExposureProfile::Minimal);
+        // Omitted keys fall back to the shared defaults.
+        assert_eq!(resolved.schema_budget_pct, 15);
     }
 }

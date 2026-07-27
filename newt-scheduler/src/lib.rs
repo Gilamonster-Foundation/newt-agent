@@ -144,11 +144,19 @@ impl From<&BackendConfig> for PoolBackend {
     /// A config-declared backend becomes a pool entry serving its single default
     /// model. (Richer per-backend model inventories come from a probe / mesh source.)
     fn from(c: &BackendConfig) -> Self {
-        PoolBackend::new(c.name.clone(), c.endpoint.clone(), c.kind)
-            .with_tiers(c.tiers.clone())
-            .with_models(c.effective_model().map(str::to_string))
-            .with_api_key(c.resolve_api_key())
-            .with_model_path(c.model_path.clone())
+        // Unset kind means probe-at-connect (session/setup). The pool needs a
+        // concrete wire kind for dispatch; until a probe fills it in, treat as
+        // Ollama — the historical default — so undeclared-kind backends still
+        // appear in the pool rather than being dropped.
+        PoolBackend::new(
+            c.name.clone(),
+            c.endpoint.clone(),
+            c.kind.unwrap_or(BackendKind::Ollama),
+        )
+        .with_tiers(c.tiers.clone())
+        .with_models(c.effective_model().map(str::to_string))
+        .with_api_key(c.resolve_api_key())
+        .with_model_path(c.model_path.clone())
     }
 }
 
@@ -445,7 +453,7 @@ mod tests {
             model: Some("qwen3:32b".into()),
             model_path: None,
             tiers: vec![Tier::Standard],
-            kind: BackendKind::Openai,
+            kind: Some(BackendKind::Openai),
             api: Default::default(),
             api_key_file: None,
             api_key_env: None,
@@ -462,7 +470,7 @@ mod tests {
         assert_eq!(pb.model_path, None, "HTTP backend has no model_path");
         // An embedded backend carries its GGUF path through to the pool entry.
         let emb = BackendConfig {
-            kind: BackendKind::Embedded,
+            kind: Some(BackendKind::Embedded),
             endpoint: String::new(),
             model: Some("qwen2.5-1.5b".into()),
             model_path: Some("/models/qwen.gguf".into()),

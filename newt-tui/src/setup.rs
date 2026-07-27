@@ -20,6 +20,15 @@
 //! Existing matching drop-ins are reused byte-for-byte; name collisions receive
 //! a numeric suffix. Token values are used only in memory, while configuration
 //! stores an environment-variable or absolute file reference.
+//!
+//! ## Agent commit identity — not yet a setup step
+//!
+//! Harness attribution (`name` / `email`) lives in
+//! `.newt/agent-identity.toml` (see [`newt_core::AgentIdentity`]), defaulting
+//! to the GitHub User <https://github.com/newt-agent>. Operators set it today
+//! with `newt identity set --name … --email …` (or by editing the file). A
+//! future setup-dialog step should call [`newt_core::AgentIdentity::save`]
+//! into that same path — do not open-code a second writer here.
 
 use newt_core::backend_probe::EndpointProbeResult;
 use newt_core::config::Discovery;
@@ -703,7 +712,7 @@ fn backend_from_probe(
         endpoint: probe.endpoint.clone(),
         model: probe.models.first().cloned(),
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
-        kind: probe.kind,
+        kind: Some(probe.kind),
         api_key_file: token_file,
         api_key_env: token_env.map(str::to_string),
         serving: Some(probe.serving),
@@ -895,7 +904,7 @@ fn read_existing_setup_backends(dir: &Path) -> anyhow::Result<Vec<ExistingSetupB
             api_key_file: parsed
                 .as_ref()
                 .and_then(|backend| backend.api_key_file.clone()),
-            kind: parsed.as_ref().map(|backend| backend.kind),
+            kind: parsed.as_ref().and_then(|backend| backend.kind),
             serving: parsed.as_ref().and_then(|backend| backend.serving),
             model: parsed.as_ref().and_then(|backend| backend.model.clone()),
             generated_by_setup: parsed.as_ref().is_some_and(|backend| {
@@ -1218,7 +1227,7 @@ fn build_backend_pair(
         // A hint, not authority — session start adopts served reality (#1139).
         model: Some(model.to_string()),
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
-        kind,
+        kind: Some(kind),
         api_key_env,
         serving: Some(serving),
         provenance: Some(newt_core::config::BackendProvenance {
@@ -1382,7 +1391,7 @@ mod tests {
         assert_eq!(cfg.default_backend.as_deref(), Some("default"));
         assert_eq!(backend.endpoint, "http://127.0.0.1:11434");
         assert_eq!(backend.effective_model(), Some("qwen2.5-coder:7b"));
-        assert_eq!(backend.kind, BackendKind::Ollama);
+        assert_eq!(backend.kind, Some(BackendKind::Ollama));
         assert_eq!(backend.serving, Some(newt_core::Serving::Multiplexer));
         assert!(
             backend.provenance.is_some(),
@@ -1401,7 +1410,7 @@ mod tests {
         );
         assert_eq!(cfg.default_backend.as_deref(), Some("dgx-vllm"));
         assert!(cfg.dgx.is_none() && cfg.backends.is_empty());
-        assert_eq!(backend.kind, BackendKind::Openai);
+        assert_eq!(backend.kind, Some(BackendKind::Openai));
         assert_eq!(backend.serving, Some(newt_core::Serving::Instance));
         assert_eq!(backend.api_key_env.as_deref(), Some("DGX_API_KEY"));
         assert_eq!(
@@ -2247,7 +2256,7 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.default_backend.as_deref(), Some("dgx-vllm"));
         let b = read_dropin(&path, "dgx-vllm");
-        assert_eq!(b.kind, BackendKind::Openai);
+        assert_eq!(b.kind, Some(BackendKind::Openai));
         assert_eq!(b.serving, Some(newt_core::Serving::Instance));
         assert_eq!(b.effective_model(), Some("meta/llama-3.1-8b-instruct"));
         assert_eq!(b.endpoint, server.uri());

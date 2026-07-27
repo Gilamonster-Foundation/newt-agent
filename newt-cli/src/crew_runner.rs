@@ -278,15 +278,12 @@ fn crew_dispatch_result(report: String, did_land: bool) -> Result<String, String
 }
 
 /// The `Co-authored-by` trailer for a crew's landed commit (#879): the crew's
-/// editing **model** as the display NAME, with the recognized **`newt-agent[bot]`**
-/// app EMAIL (`newt_core::DEFAULT_AGENT_EMAIL`, not a hard-coded string). So
-/// GitHub attributes the commit to https://github.com/apps/newt-agent (via the
-/// shared bot email) while the name records which model actually ran. Pure.
-fn crew_coauthor_trailer(model: &str) -> String {
-    format!(
-        "Co-authored-by: {model} <{}>",
-        newt_core::DEFAULT_AGENT_EMAIL
-    )
+/// editing **model** as the display NAME, with the resolved harness identity
+/// EMAIL (default: GitHub User https://github.com/newt-agent). So GitHub
+/// attributes the commit to the configured account while the name records
+/// which model actually ran. Pure.
+fn crew_coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> String {
+    format!("Co-authored-by: {model} <{}>", identity.email)
 }
 
 #[async_trait]
@@ -451,12 +448,14 @@ impl CrewRunner for LocalCrewRunner {
                 // AND a commit was produced). `did_land` is the structural signal
                 // `plan_exec` needs: anything else delivered nothing.
                 let (landed, did_land) = if passed {
-                    let (name, email) = newt_core::AgentIdentity::resolve()
-                        .unwrap_or_default()
-                        .git_author();
+                    let identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
+                    let (name, email) = identity.git_author();
                     // #879: attribute the landed commit — the editing model as the
-                    // co-author NAME, under the newt-agent[bot] app EMAIL.
-                    let message = format!("{task}\n\n{}", crew_coauthor_trailer(&editor_model));
+                    // co-author NAME, under the resolved harness identity EMAIL.
+                    let message = format!(
+                        "{task}\n\n{}",
+                        crew_coauthor_trailer(&editor_model, &identity)
+                    );
                     match ws.commit_to_branch(&format!("crew/{id}"), &name, &email, &message) {
                         Ok((branch, sha)) => {
                             // Advance the chain cursor to this landed tip so the
@@ -597,21 +596,25 @@ mod tests {
     }
 
     #[test]
-    fn crew_coauthor_trailer_names_the_model_under_the_bot_email() {
-        // #879: the editing MODEL is the co-author NAME; the newt-agent[bot] app
-        // EMAIL (from the compiled-in identity, not a hard-coded string) makes
-        // GitHub attribute the commit to https://github.com/apps/newt-agent.
-        let t = crew_coauthor_trailer("ornith:35b");
-        assert_eq!(
-            t,
-            format!(
-                "Co-authored-by: ornith:35b <{}>",
-                newt_core::DEFAULT_AGENT_EMAIL
-            )
-        );
+    fn crew_coauthor_trailer_names_the_model_under_resolved_email() {
+        // #879: the editing MODEL is the co-author NAME; the resolved harness
+        // EMAIL makes GitHub attribute the commit to the configured account.
+        let id = newt_core::AgentIdentity::default();
+        let t = crew_coauthor_trailer("ornith:35b", &id);
+        assert_eq!(t, format!("Co-authored-by: ornith:35b <{}>", id.email));
         assert!(
-            t.contains("newt-agent[bot]@users.noreply.github.com"),
+            t.contains("309460085+newt-agent@users.noreply.github.com"),
             "{t}"
+        );
+        assert!(!t.contains("[bot]"), "{t}");
+
+        let custom = newt_core::AgentIdentity {
+            email: "custom@example.com".into(),
+            ..newt_core::AgentIdentity::default()
+        };
+        assert_eq!(
+            crew_coauthor_trailer("m", &custom),
+            "Co-authored-by: m <custom@example.com>"
         );
     }
 

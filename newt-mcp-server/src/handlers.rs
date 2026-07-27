@@ -374,16 +374,17 @@ fn handle_git(args: &Value, granted: &Caveats) -> anyhow::Result<Value> {
                 .get("message")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("git commit requires 'message'"))?;
+            let identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
             let author = Author {
                 name: args
                     .get("author_name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("newt-agent[bot]")
+                    .unwrap_or(identity.name.as_str())
                     .to_string(),
                 email: args
                     .get("author_email")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("newt-agent@users.noreply.github.com")
+                    .unwrap_or(identity.email.as_str())
                     .to_string(),
             };
             serde_json::to_value(eng.commit(&caps, message, &author).map_err(gerr)?)?

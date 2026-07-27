@@ -23,7 +23,7 @@
 //! *default-deny invariant* is the load-bearing rule: a session that cannot
 //! answer a TTY prompt never silently allows — see [`should_prompt_permissions`].
 //!
-//! The `/mode` named-preset clamp (issue #307) is a *sibling* concern and
+//! The `/posture` named-preset clamp (issue #307) is a *sibling* concern and
 //! deliberately stays in `lib.rs` next to the session state it floors.
 
 use std::io;
@@ -498,7 +498,7 @@ impl PermissionPromptState {
 pub(crate) struct PromptPermissionGate<'a, F: FnMut(&PromptWindow, &str) -> PromptChoice> {
     pub(crate) state: &'a mut PermissionPromptState,
     /// The session's enforced caveats at turn start — the re-mint baseline.
-    /// When a `/mode` preset is active this is ALREADY the clamped (base ∩
+    /// When a `/posture` preset is active this is ALREADY the clamped (base ∩
     /// preset) value, so `widen_caveats` starts below the preset ceiling.
     pub(crate) base: newt_core::Caveats,
     /// Per-user root key path; `None` degrades the re-mint to a plain
@@ -703,7 +703,7 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
         // loop don't collide with the shared-borrow at the prompt seam below.
         let web = self.state.web_store.clone();
         for req in requests {
-            // #1056 FLOOR: a readonly `/mode` denies LOCAL git writes just as it
+            // #1056 FLOOR: a readonly `/posture` denies LOCAL git writes just as it
             // denies fs writes. The git-write capability is non-axis, so `mint`'s
             // preset re-clamp can't attenuate it (it widens nothing) — enforce the
             // floor HERE: if a preset is active and projects no git commit
@@ -958,7 +958,7 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
 mod permission_prompt_tests {
     use super::*;
     use crate::mcp::Mcp;
-    use crate::{close_out_message, help_lines, permissions_command_lines, ActiveMode};
+    use crate::{close_out_message, help_lines, permissions_command_lines, ActivePosture};
     use newt_core::caveats::{Caveats, CountBound, Scope};
     use newt_core::{CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
     use std::cell::Cell;
@@ -1843,7 +1843,7 @@ mod permission_prompt_tests {
         );
     }
 
-    /// #1056 FLOOR: a readonly `/mode` projects no git-commit authority, so the
+    /// #1056 FLOOR: a readonly `/posture` projects no git-commit authority, so the
     /// gate REFUSES a git-write grant outright — even `[a]llow once` cannot pierce
     /// it, and it does not even prompt (the git-write capability is non-axis, so
     /// `mint`'s re-clamp can't attenuate it — this explicit check is the floor).
@@ -2405,7 +2405,7 @@ mod permission_prompt_tests {
     fn permissions_command_lists_decisions_and_log_location() {
         let mut state = PermissionPromptState::default();
         // Disabled + empty: says how to enable, says there's nothing yet.
-        // No active mode ⇒ no preset line; behavior is the pre-#307 listing.
+        // No active posture ⇒ no preset line; behavior is the pre-#307 listing.
         let lines = permissions_command_lines(&state, false, None, None);
         assert!(lines[0].contains("OFF"), "got: {lines:?}");
         assert!(lines
@@ -2431,10 +2431,10 @@ mod permission_prompt_tests {
         assert!(!lines[0].contains("OFF"));
     }
 
-    /// #307: an active mode is reflected at the top of `/permissions`, even
+    /// #307: an active posture is reflected at the top of `/permissions`, even
     /// with prompting OFF — the clamp in force is always visible.
     #[test]
-    fn permissions_command_reflects_the_active_mode() {
+    fn permissions_command_reflects_the_active_posture() {
         let state = PermissionPromptState::default();
         let preset = newt_core::NamedPermissionPreset {
             // fs_read: None preserves pre-#755 behavior (reads unrestricted).
@@ -2444,15 +2444,17 @@ mod permission_prompt_tests {
             deny: vec!["*".to_string()],
             max_calls: Some(40),
         };
-        let mode = ActiveMode {
+        let posture = ActivePosture {
             name: "triage".to_string(),
             preset_name: "readonly-triage".to_string(),
             clamp: preset.clamp(),
             clamp_summary: preset.summary(),
+            skill_body: None,
+            framing: None,
         };
-        let lines = permissions_command_lines(&state, false, None, Some(&mode));
+        let lines = permissions_command_lines(&state, false, None, Some(&posture));
         assert!(
-            lines[0].contains("active mode: triage")
+            lines[0].contains("active permission posture: triage")
                 && lines[0].contains("readonly-triage")
                 && lines[0].contains("readonly"),
             "got: {lines:?}"
@@ -2469,8 +2471,9 @@ mod permission_prompt_tests {
     }
 
     #[test]
-    fn help_lists_the_mode_command() {
+    fn help_lists_the_mode_and_posture_commands() {
         assert!(help_lines().iter().any(|l| l.contains("/mode")));
+        assert!(help_lines().iter().any(|l| l.contains("/posture")));
     }
 
     #[test]

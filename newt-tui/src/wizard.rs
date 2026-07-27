@@ -6,6 +6,10 @@
 //! subsequent runs skip setup. There is **no** interactive UI: this is a
 //! functional bootstrap, not a settings UX. Edit `~/.newt/config.toml`
 //! directly to change anything (see `newt config` to print the resolved view).
+//!
+//! Agent commit identity is separate (`agent-identity.toml` /
+//! `newt identity set`); a future setup dialog should collect it via
+//! [`newt_core::AgentIdentity::save`].
 
 use newt_core::Config;
 
@@ -95,7 +99,7 @@ fn save_config(path: &std::path::Path, url: &str, model: &str) -> anyhow::Result
         // A HINT, not authority: session start adopts what the server
         // actually serves (#1139); this keeps offline launches sane.
         model: Some(model.to_string()),
-        kind: newt_core::BackendKind::Ollama,
+        kind: Some(newt_core::BackendKind::Ollama),
         serving: Some(newt_core::Serving::Multiplexer),
         provenance: Some(newt_core::config::BackendProvenance {
             source: Some(format!("newt init v{}", env!("CARGO_PKG_VERSION"))),

@@ -1,28 +1,55 @@
 use super::*;
 
 #[test]
-fn coauthor_trailer_uses_the_bot_github_email() {
-    let tr = coauthor_trailer("nemotron-3-nano:30b");
-    // Model name credits the work; the email attributes to the newt-agent[bot]
-    // GitHub App (the fix — the old noreply@newt-agent.com attributed nowhere).
+fn coauthor_trailer_uses_resolved_identity_email() {
+    let id = newt_core::AgentIdentity::default();
+    let tr = coauthor_trailer("nemotron-3-nano:30b", &id);
+    // Model name credits the work; the email attributes to the resolved
+    // harness identity (default: GitHub User https://github.com/newt-agent).
     assert_eq!(
         tr,
-        "Co-authored-by: nemotron-3-nano:30b <293447090+newt-agent[bot]@users.noreply.github.com>"
+        "Co-authored-by: nemotron-3-nano:30b <309460085+newt-agent@users.noreply.github.com>"
     );
     assert!(tr.contains(newt_core::DEFAULT_AGENT_EMAIL));
     assert!(
         !tr.contains("noreply@newt-agent.com"),
         "old wrong email is gone"
     );
+    assert!(
+        !tr.contains("[bot]"),
+        "default attribution is the User account, not the App bot"
+    );
+
+    let custom = newt_core::AgentIdentity {
+        name: "my-agent".into(),
+        email: "my-agent@example.com".into(),
+        ..newt_core::AgentIdentity::default()
+    };
+    assert_eq!(
+        coauthor_trailer("ornith:35b", &custom),
+        "Co-authored-by: ornith:35b <my-agent@example.com>"
+    );
 }
 
 #[test]
 fn runtime_context_block_instructs_shell_git_identity() {
-    let blk = runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama);
+    let id = newt_core::AgentIdentity::default();
+    let blk = runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama, &id);
     // The shell-git fallback (for a model that bypasses the embedded tool)
-    // must carry the canonical bot email.
-    assert!(blk.contains("user.email='293447090+newt-agent[bot]@users.noreply.github.com'"));
+    // must carry the resolved User no-reply email.
+    assert!(blk.contains("user.email='309460085+newt-agent@users.noreply.github.com'"));
+    assert!(blk.contains("user.name='newt-agent'"));
     assert!(blk.contains("git -c user.name="));
+
+    let custom = newt_core::AgentIdentity {
+        name: "custom".into(),
+        email: "custom@example.com".into(),
+        ..newt_core::AgentIdentity::default()
+    };
+    let custom_blk =
+        runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama, &custom);
+    assert!(custom_blk.contains("user.email='custom@example.com'"));
+    assert!(custom_blk.contains("user.name='custom'"));
 }
 
 #[test]
@@ -459,22 +486,172 @@ fn spill_commands_parse_expected_forms() {
 }
 
 #[test]
+fn search_commands_parse_expected_forms() {
+    assert_eq!(
+        parse_search_command("/search").unwrap(),
+        SearchCommand::Help
+    );
+    assert_eq!(
+        parse_search_command("/search help").unwrap(),
+        SearchCommand::Help
+    );
+    assert_eq!(
+        parse_search_command("/search auth handshake").unwrap(),
+        SearchCommand::Query("auth handshake".into())
+    );
+    assert_eq!(
+        parse_search_command("/search preview").unwrap(),
+        SearchCommand::Preview(1)
+    );
+    assert_eq!(
+        parse_search_command("/search preview 3").unwrap(),
+        SearchCommand::Preview(3)
+    );
+    assert_eq!(
+        parse_search_command("/search model").unwrap(),
+        SearchCommand::Model
+    );
+    assert_eq!(
+        parse_search_command("/search rejects").unwrap(),
+        SearchCommand::Rejects
+    );
+    assert_eq!(
+        parse_search_command("/search pin 2").unwrap(),
+        SearchCommand::Pin(2)
+    );
+    assert_eq!(
+        parse_search_command("/search exclude 1").unwrap(),
+        SearchCommand::Exclude(1)
+    );
+    assert_eq!(
+        parse_search_command("/search status").unwrap(),
+        SearchCommand::Status
+    );
+    assert_eq!(
+        parse_search_command("/search clear").unwrap(),
+        SearchCommand::Clear
+    );
+    assert!(parse_search_command("/searching foo").is_err());
+    assert!(parse_search_command("/search pin").is_err());
+}
+
+#[test]
 fn spill_override_resolves_and_reports_live_capability() {
     assert_eq!(effective_spill_lines(3, None), 3);
     assert_eq!(effective_spill_lines(3, Some(7)), 7);
     assert_eq!(effective_spill_lines(3, Some(0)), 0);
     assert_eq!(
-        spill_status(3, None, true),
+        spill_status(3, None, SpillEligibility::Available),
         "spill rows: 3 (config default; live interaction available)"
     );
+    // #1412: the unavailable arm now NAMES the refusing gate instead of saying
+    // only "unavailable" — that silence is why a stale install was reported as
+    // a vanished feature.
     assert_eq!(
-        spill_status(3, Some(7), false),
-        "spill rows: 7 this session (config default 3; live interaction unavailable)"
+        spill_status(3, Some(7), SpillEligibility::StdoutNotTty),
+        "spill rows: 7 this session (config default 3; live interaction unavailable: \
+         stdout is not a terminal (piped or redirected))"
     );
     assert_eq!(
-        spill_status(3, Some(0), true),
-        "spill rows: unbounded this session (config default 3; live viewport disabled)"
+        spill_status(3, Some(0), SpillEligibility::Available),
+        "spill rows: unbounded this session (config default 3; live viewport disabled: \
+         spill_lines is 0 (/spill <n> raises it))"
     );
+}
+
+/// #1412: every refusal reason reaches the operator, and zero rows is reported
+/// as a config choice rather than a broken terminal.
+#[test]
+fn spill_status_names_the_gate_that_refused() {
+    for (eligibility, needle) in [
+        (
+            SpillEligibility::UnsupportedPlatform,
+            "unsupported platform",
+        ),
+        (SpillEligibility::FeatureDisabled, "`live-spill` feature"),
+        (SpillEligibility::StdinNotTty, "stdin is not a terminal"),
+        (SpillEligibility::StdoutNotTty, "stdout is not a terminal"),
+        (SpillEligibility::TermDumb, "TERM=dumb"),
+    ] {
+        let status = spill_status(3, None, eligibility);
+        assert!(
+            status.contains(needle),
+            "{eligibility:?} must surface {needle:?} to the operator, got: {status}"
+        );
+    }
+
+    // Rows are a separate axis from capability: a capable terminal with zero
+    // rows must not be reported as an incapable terminal.
+    let zero = spill_status(0, None, SpillEligibility::Available);
+    assert!(zero.contains("spill_lines is 0"), "{zero}");
+    assert!(
+        !zero.contains("unavailable"),
+        "zero rows is a config choice, not a broken terminal: {zero}"
+    );
+}
+
+/// #1412: precedence is part of the contract. When several gates refuse at
+/// once, the one the operator cannot change without a different binary must
+/// win — otherwise `/spill` sends someone to fix `TERM` on a build that never
+/// compiled the feature in.
+#[test]
+fn spill_eligibility_reports_the_most_fundamental_refusal_first() {
+    // Every gate failing at once: platform outranks all.
+    assert_eq!(
+        spill_eligibility_for(false, false, false, false, Some("dumb")),
+        SpillEligibility::UnsupportedPlatform
+    );
+    // Supported platform, everything else failing: the cargo feature is next.
+    assert_eq!(
+        spill_eligibility_for(true, false, false, false, Some("dumb")),
+        SpillEligibility::FeatureDisabled
+    );
+    // Then the invocation-shaped gates, stdin before stdout.
+    assert_eq!(
+        spill_eligibility_for(true, true, false, false, Some("dumb")),
+        SpillEligibility::StdinNotTty
+    );
+    assert_eq!(
+        spill_eligibility_for(true, true, true, false, Some("dumb")),
+        SpillEligibility::StdoutNotTty
+    );
+    // Only the terminal's own declaration remains.
+    assert_eq!(
+        spill_eligibility_for(true, true, true, true, Some("dumb")),
+        SpillEligibility::TermDumb
+    );
+    assert_eq!(
+        spill_eligibility_for(true, true, true, true, Some("xterm-256color")),
+        SpillEligibility::Available
+    );
+    // A terminal that declares nothing is not "dumb".
+    assert_eq!(
+        spill_eligibility_for(true, true, true, true, None),
+        SpillEligibility::Available
+    );
+}
+
+/// #1412: the boolean façade must agree with the typed answer at every input,
+/// so the mouse tier cannot drift from `/spill`'s account of the same gates.
+#[test]
+fn capable_bool_agrees_with_typed_eligibility() {
+    for platform in [true, false] {
+        for feature in [true, false] {
+            for stdin in [true, false] {
+                for stdout in [true, false] {
+                    for term in [Some("xterm"), Some("dumb"), None] {
+                        assert_eq!(
+                            live_spill_capable_for(platform, feature, stdin, stdout, term),
+                            spill_eligibility_for(platform, feature, stdin, stdout, term)
+                                == SpillEligibility::Available,
+                            "disagreement at platform={platform} feature={feature} \
+                             stdin={stdin} stdout={stdout} term={term:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -664,11 +841,17 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
         "dgx",
         "permissions",
         "mode",
+        "posture",
         "loadout",
+        "plan",
+        "status",
+        "info",
+        "docs",
         "workspace",
         "spill",
         "config",
         "prompt",
+        "allow",
         "vi",
         "emacs",
         "nano",
@@ -684,6 +867,14 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
     assert_eq!(command_help_page("restart"), command_help_page("new"));
     assert_eq!(command_help_page("emacs"), command_help_page("vi"));
     assert_eq!(command_help_page("quit"), command_help_page("exit"));
+    assert_eq!(command_help_page("plan"), command_help_page("roadmap"));
+    assert_eq!(command_help_page("allow"), command_help_page("permissions"));
+    assert!(help_lines().iter().any(|l| l.contains("/loadout")));
+    assert!(help_lines().iter().any(|l| l.contains("/status")));
+    assert!(help_lines().iter().any(|l| l.contains("/info")));
+    assert!(help_lines().iter().any(|l| l.contains("/docs")));
+    assert!(help_lines().iter().any(|l| l.contains("/allow")));
+    assert!(help_lines().iter().any(|l| l.contains("/plan")));
     let spill_help = command_help_page("spill").expect("spill help page");
     assert!(spill_help.contains("Space or Enter"));
     assert!(spill_help.contains("⧉"));
@@ -757,6 +948,41 @@ fn slash_version_returns_true() {
 #[test]
 fn slash_workspace_returns_true() {
     assert!(dispatch_slash("/workspace", "/ws", false, false).unwrap());
+}
+
+#[test]
+fn permission_audit_lines_lists_newest_entries_and_ignores_bad_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permission-log.jsonl");
+    std::fs::write(
+        &path,
+        "\
+{\"ts_claim\":\"t0\",\"conversation_id\":\"c\",\"tool\":\"run_command\",\"kind\":\"exec\",\"target\":\"/bin/echo\",\"decision\":\"allow\",\"scope\":\"session\"}\n\
+this is not json\n\
+{\"ts_claim\":\"t1\",\"conversation_id\":\"c\",\"tool\":\"run_command\",\"kind\":\"net\",\"target\":\"https://example.com\",\"decision\":\"deny\",\"scope\":\"once\"}\n\
+",
+    )
+    .unwrap();
+
+    let lines = permission_audit_lines(&path, 5);
+    assert_eq!(
+        lines.first(),
+        Some(&"permission audit: 2 of 2 (newest first)".to_string())
+    );
+    assert!(lines[1].contains("deny"));
+    assert!(lines[1].contains("once"));
+    assert!(lines[1].contains("net"));
+    assert!(lines[1].contains("https://example.com"));
+    assert!(lines[2].contains("allow"));
+
+    let limited = permission_audit_lines(&path, 1);
+    assert_eq!(
+        limited,
+        vec![
+            "permission audit: 1 of 2 (newest first)".to_string(),
+            "  deny    once      net      https://example.com via run_command".to_string()
+        ]
+    );
 }
 
 #[test]

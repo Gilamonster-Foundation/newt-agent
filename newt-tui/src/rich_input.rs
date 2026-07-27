@@ -50,8 +50,8 @@
 //! - No in-session history recall (Up/Down navigate the buffer, not history);
 //!   submitted entries are still **persisted** to the shared history file so the
 //!   lean path sees them next session.
-//! - The status row shows the live clock + edit mode only; model / plan-mode
-//!   tokens land with the status-row work (issue #416 follow-up).
+//! - Harness background jobs share a final liveness row below the input. The
+//!   surface owns its rendering; workers publish state but never terminal bytes.
 //! - The per-turn event loop (`read_line`) needs a real TTY and is exercised by
 //!   creature-testing, not unit tests; the editing/state logic below is fully
 //!   unit-tested.
@@ -74,6 +74,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, TextArea};
 
+use crate::chat::BackgroundJob;
 use crate::{footer_continues, InputSurface, ReadOutcome};
 
 // Opt-in wide-gutter width (`NEWT_GUTTER=auto`/`tui.gutter=N`): a fixed left
@@ -499,10 +500,11 @@ fn status_options() -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// The rich surface's two-line live view (issue #527): a status HEADER row
-/// (`[header_line`]) over an input-indicator row ([`prompt_line`]). The PS1 token
-/// prompt (`[tui] prompt`) is the LEAN surface's job (it lands in logfiles); the
-/// rich surface renders these instead.
+/// The rich surface's live view (issue #527): a status HEADER row
+/// ([`header_line`]) over an input-indicator row ([`prompt_line`]), plus a
+/// harness-background row when work is live. The PS1 token prompt
+/// (`[tui] prompt`) is the LEAN surface's job (it lands in logfiles); the rich
+/// surface renders these instead.
 ///
 /// The header is `[YYYY-MM-DD HH:MM:SS] vi --INSERT-- <model> @ <endpoint>` plus
 /// an optional `[options]` session-override block. The clock + editor mode update
@@ -594,26 +596,82 @@ fn ex_bottom_line(editor: &Editor, textarea: &TextArea) -> Option<String> {
         .map(str::to_string)
 }
 
+/// One surface-owned row for every currently live harness task. The shared
+/// spinner alphabet is advanced by the rich input loop's existing 250 ms
+/// repaint; no worker thread writes terminal bytes.
+fn background_line(jobs: &[BackgroundJob], frame: usize) -> Option<Line<'static>> {
+    let active = jobs
+        .iter()
+        .filter(|job| job.is_running())
+        .map(BackgroundJob::label)
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return None;
+    }
+    let count = if active.len() == 1 {
+        String::new()
+    } else {
+        format!(" ({})", active.len())
+    };
+    let labels = active.join(", ");
+    let spinner = newt_core::tty::SPINNER_FRAMES[frame % newt_core::tty::SPINNER_FRAMES.len()];
+    Some(Line::from(vec![
+        Span::styled(
+            format!("{spinner} background{count}"),
+            Style::default().fg(Color::Rgb(255, 165, 90)),
+        ),
+        Span::styled(format!(" · {labels}"), Style::default().fg(Color::DarkGray)),
+    ]))
+}
+
+fn background_frame() -> usize {
+    chrono::Local::now().timestamp_subsec_millis() as usize / 100
+}
+
+#[derive(Default)]
+struct RichStatus<'a> {
+    model: &'a str,
+    endpoint: &'a str,
+    gauge: Option<(u32, u32)>,
+    background_jobs: &'a [BackgroundJob],
+}
+
 fn draw(
     f: &mut Frame,
     textarea: &TextArea,
     editor: &Editor,
     gutter: Option<u16>,
-    model: &str,
-    endpoint: &str,
-    gauge: Option<(u32, u32)>,
+    status: RichStatus<'_>,
 ) {
     let area = f.area();
     // "active" = the line has content, so the header mode word brightens and the
     // dim mode hint clears as you type. The hint shows only on an empty line.
     let empty = buffer_is_empty(textarea);
-    // Two-line layout (#527): the status header on row 0, the input row(s) below.
-    let [header_area, input_area] =
+    // The status header stays on row 0. A live harness task reserves the final
+    // row below the prompt/input; otherwise the input keeps the full remainder.
+    let [header_area, body_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
     f.render_widget(
-        Paragraph::new(header_line(editor, model, endpoint, gauge, !empty)),
+        Paragraph::new(header_line(
+            editor,
+            status.model,
+            status.endpoint,
+            status.gauge,
+            !empty,
+        )),
         header_area,
     );
+    let background = background_line(status.background_jobs, background_frame());
+    let (input_area, background_area) = if background.is_some() {
+        let [input_area, background_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(body_area);
+        (input_area, Some(background_area))
+    } else {
+        (body_area, None)
+    };
+    if let (Some(line), Some(background_area)) = (background, background_area) {
+        f.render_widget(Paragraph::new(line), background_area);
+    }
     let g = resolve_gutter(gutter, input_area.width);
 
     // #531: a `:`-command on a multi-line buffer renders on its own row at the
@@ -932,6 +990,8 @@ pub(crate) struct RichSurface {
     endpoint: String,
     /// Context-budget gauge `(used, budget)` for the header (Step 24.6, #559).
     gauge: Option<(u32, u32)>,
+    /// Harness tasks rendered by this surface while their shared state is live.
+    background_jobs: Vec<BackgroundJob>,
 }
 
 impl RichSurface {
@@ -945,6 +1005,7 @@ impl RichSurface {
             model: String::new(),
             endpoint: String::new(),
             gauge: None,
+            background_jobs: Vec::new(),
         })
     }
 
@@ -1010,8 +1071,11 @@ impl RichSurface {
                 .0
                 .len() as u16
             };
-            // #531 ex-bottom row + #527 status header row both add height.
-            let want = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1;
+            // #531 ex-bottom row + #527 status header row + an optional
+            // harness-background row all contribute to the inline viewport.
+            let background_extra =
+                u16::from(self.background_jobs.iter().any(BackgroundJob::is_running));
+            let want = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra;
             if want != cur_h {
                 // Blank the CURRENT region before resizing. ratatui reserves
                 // space for a taller inline viewport by scrolling whatever is on
@@ -1029,9 +1093,12 @@ impl RichSurface {
                     &textarea,
                     &editor,
                     self.gutter,
-                    &self.model,
-                    &self.endpoint,
-                    self.gauge,
+                    RichStatus {
+                        model: &self.model,
+                        endpoint: &self.endpoint,
+                        gauge: self.gauge,
+                        background_jobs: &self.background_jobs,
+                    },
                 );
             })?;
 
@@ -1175,6 +1242,10 @@ impl InputSurface for RichSurface {
         self.model = model.to_string();
         self.endpoint = endpoint.to_string();
         self.gauge = gauge;
+    }
+
+    fn set_background_jobs(&mut self, jobs: Vec<BackgroundJob>) {
+        self.background_jobs = jobs;
     }
 }
 
@@ -1433,7 +1504,7 @@ mod tests {
         // Two-line layout (#527): row 0 is the status header; the message renders
         // below it, and the `:`-command on the last (bottom) row.
         let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
-        term.draw(|f| draw(f, &ta, &ed, Some(1), "", "", None))
+        term.draw(|f| draw(f, &ta, &ed, Some(1), RichStatus::default()))
             .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String {
@@ -1486,7 +1557,7 @@ mod tests {
         ed.input(key(':'), &mut ta);
         type_chars(&mut ed, &mut ta, "wq");
         let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
-        term.draw(|f| draw(f, &ta, &ed, Some(25), "", "", None))
+        term.draw(|f| draw(f, &ta, &ed, Some(25), RichStatus::default()))
             .unwrap(); // 25 >= GUTTER_W (19)
         let buf = term.backend().buffer();
         let last: String = (0..80)
@@ -1509,8 +1580,20 @@ mod tests {
         // height 3: row 0 = status header (#527), rows 1-2 = the input.
         let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
         // gutter = 1 → the overhang layout (the default).
-        term.draw(|f| draw(f, &ta, &editor, Some(1), "m", "http://e:1", None))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &ta,
+                &editor,
+                Some(1),
+                RichStatus {
+                    model: "m",
+                    endpoint: "http://e:1",
+                    ..RichStatus::default()
+                },
+            );
+        })
+        .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String {
             (0..80)
@@ -1535,6 +1618,71 @@ mod tests {
             "continuation is 1-space hang-indented: {:?}",
             row(2)
         );
+    }
+
+    #[test]
+    fn running_background_job_renders_on_the_bottom_row_below_the_prompt() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let editor = vi_editor();
+        let textarea = TextArea::default();
+        let job = BackgroundJob::start("indexing repository");
+        let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &textarea,
+                &editor,
+                Some(1),
+                RichStatus {
+                    model: "m",
+                    endpoint: "http://e:1",
+                    background_jobs: std::slice::from_ref(&job),
+                    ..RichStatus::default()
+                },
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..80)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
+
+        assert!(row(1).contains('❯'), "the prompt stays above the job row");
+        assert!(
+            row(2).contains("background") && row(2).contains("indexing repository"),
+            "the live job occupies the bottom row: {:?}",
+            row(2)
+        );
+    }
+
+    #[test]
+    fn completed_background_job_has_no_indicator_row() {
+        let first = BackgroundJob::start("indexing repository");
+        let second = BackgroundJob::start("warming symbols");
+        let text = |jobs: &[BackgroundJob]| {
+            background_line(jobs, 0).map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+        };
+        let both = text(&[first.clone(), second.clone()]).unwrap();
+        assert!(both.contains("background (2)"), "{both}");
+        assert!(both.contains(first.label()) && both.contains(second.label()));
+
+        first.finish();
+        let one = text(&[first, second.clone()]).unwrap();
+        assert!(!one.contains("background (2)"), "{one}");
+        assert!(!one.contains("indexing repository"), "{one}");
+        assert!(one.contains(second.label()), "{one}");
+
+        second.finish();
+        assert!(text(&[second]).is_none());
     }
 
     fn row_text(editor: &Editor) -> String {

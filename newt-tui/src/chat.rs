@@ -336,6 +336,52 @@ fn active_operator_task<'a>(
         .unwrap_or(submitted_task)
 }
 
+/// Cloneable liveness state for work owned by the harness but rendered by an
+/// [`InputSurface`]. Workers only flip the state; the active surface remains
+/// the sole terminal writer.
+#[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) struct BackgroundJob {
+    label: std::sync::Arc<str>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+impl BackgroundJob {
+    pub(crate) fn start(label: impl Into<String>) -> Self {
+        Self {
+            label: std::sync::Arc::from(label.into()),
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn finish(&self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn completion_guard(&self) -> BackgroundJobCompletion {
+        BackgroundJobCompletion(self.clone())
+    }
+}
+
+/// Marks a background job complete on success, cancellation, or unwind.
+struct BackgroundJobCompletion(BackgroundJob);
+
+impl Drop for BackgroundJobCompletion {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
 /// The severable input boundary between the chat loop and the editor widget.
 ///
 /// `run_chat` drives the conversation through this trait so the *input widget*
@@ -365,6 +411,9 @@ pub(crate) trait InputSurface {
     /// the latest fill are reflected. Default no-op: only the rich surface
     /// renders it; the lean surface carries model in the prompt string (or not).
     fn set_runtime_context(&mut self, _model: &str, _endpoint: &str, _gauge: Option<(u32, u32)>) {}
+    /// Replace the harness-owned jobs whose live state the input surface may
+    /// render. Default no-op keeps lean/headless output free of ephemeral UI.
+    fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {}
 }
 
 pub(crate) fn run_chat(
@@ -499,10 +548,15 @@ pub(crate) fn run_chat(
     apply_openai_api_env(choice.api);
     let key_path = newt_identity::default_key_path().ok();
     let mut cap = SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace);
-    // #307: the active `/mode` preset clamp (an authority FLOOR), if any. `None`
-    // ⇒ no mode active ⇒ effective authority is the session base, exactly as
-    // before. Set by `/mode <name>`; lives for the rest of the session.
-    let mut active_mode: Option<ActiveMode> = None;
+    // Session working style. This never grants authority; plan/diagnose only
+    // narrow the existing prompt-disposition and caveat boundaries.
+    let mut active_operating_mode = OperatingMode::Chat;
+    // Model-selected working style while the human leaves `/mode auto`
+    // active. Bound to the requesting conversation and never authority.
+    let conversation_mode_states = ConversationModeStates::default();
+    // #307: the active `/posture` preset clamp (an authority FLOOR), if any.
+    // It persists across conversations for the life of this process.
+    let mut active_posture: Option<ActivePosture> = None;
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
     let mut markdown_override: Option<bool> = None;
@@ -854,8 +908,9 @@ pub(crate) fn run_chat(
                 .unwrap_or(4);
             let surface_budget =
                 newt_core::resolve_surface_budget(mem_budget as usize, surface_cpt, &api_cfg);
+            let packs = resolved_language_packs(workspace, &api_cfg);
             mgr.add_provider(
-                newt_core::ApiSurfaceProvider::from_config(&api_cfg).with_budget(surface_budget),
+                newt_core::ApiSurfaceProvider::new(packs, &api_cfg).with_budget(surface_budget),
             );
             // #1284: the untruncatable project map (crate/package units + curated
             // purposes) — the navigation floor of the "IDE for LLMs" spine. A
@@ -944,11 +999,21 @@ pub(crate) fn run_chat(
     // re-walk + re-embed the repo every turn — reset on /new to re-index.
     let semantic_index = newt_core::SessionSemanticIndex::default();
     let mut semantic_indexed = false;
+    // #1387 Phase 1: session pin/exclude + lightweight index status + last
+    // `/search` result (for preview/model/pin). Cleared on `/new`.
+    let mut retrieval_steer = newt_core::RetrievalSteer::default();
+    let mut index_status = newt_core::IndexStatus::default();
+    let mut last_search: Option<newt_core::RetrievalResult> = None;
+    let mut nav_session = newt_core::NavigatorSession::default();
     // #1285: the model-free `where_is` symbol index, built once per session on
     // the first turn (reset on /new). Independent of the embedder — structural
     // extraction needs no model, so the exact typed-verdict lookup rides every
     // session as the navigation floor.
     let mut where_is_index: Option<newt_core::WhereIsIndex> = None;
+    // Warm the model-free repository navigator in parallel with the remaining
+    // session startup. The first consumer joins this handle; a failed task
+    // leaves the existing synchronous ensure path as the honest fallback.
+    let mut nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
     // Step 26.6a (#585): session-scoped experiential ledger. Unlike the others it
     // SURVIVES /new (cross-task reuse within the session) — see the /new handler.
     let experience_store = newt_core::SessionExperienceStore::default();
@@ -1024,6 +1089,7 @@ pub(crate) fn run_chat(
             scratchpad: &scratchpad_store as &dyn newt_core::ScratchpadStore,
             step_ledger: &step_ledger as &dyn newt_core::StepLedger,
             active_prompt_context: &mut active_prompt_context,
+            mode_states: &conversation_mode_states,
         };
         match &session_start {
             // NEWT_CONVERSATION_ID: an explicit override — errors are hard
@@ -1077,12 +1143,16 @@ pub(crate) fn run_chat(
                     color,
                     verbose,
                 );
+                let mut reset_ctx = ConversationResetContext {
+                    memory: &mut memory,
+                    system: &mut system,
+                    conversation_id: &mut active_conversation_id,
+                    mode_states: &conversation_mode_states,
+                };
                 handle_new_conversation(
                     workspace,
-                    &mut memory,
-                    &mut system,
                     active_persona.as_ref(),
-                    &mut active_conversation_id,
+                    &mut reset_ctx,
                     &mut compress_state,
                     &mut session_opted_fresh,
                 );
@@ -1126,20 +1196,20 @@ pub(crate) fn run_chat(
     // workspace, which led agents to hunt for a (non-existent) MCP git tool and
     // conclude they had "no git tool", giving up on committing. The tool carries
     // an `init` op, so it is useful even before a repo exists. The commit author
-    // is the resolved AgentIdentity (`newt-agent[bot]` default).
+    // is the resolved AgentIdentity (`newt-agent` User default, overridable).
+    let session_identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
     let session_git_tool: Option<newt_git::LocalGitTool> = {
-        let id = newt_core::AgentIdentity::resolve().unwrap_or_default();
         Some(newt_git::LocalGitTool {
             root: std::path::PathBuf::from(workspace),
             author: newt_git::Author {
-                name: id.name,
-                email: id.email,
+                name: session_identity.name.clone(),
+                email: session_identity.email.clone(),
             },
             // Auto-sign commits with the AI credit (the tool owns this so it is
             // always present and correctly formatted — the model is told it's
             // automatic, see runtime_context_block). Model = the session's
-            // model; harness = this newt version.
-            coauthor: Some(coauthor_trailer(&inf_model)),
+            // model; email = the resolved harness identity.
+            coauthor: Some(coauthor_trailer(&inf_model, &session_identity)),
         })
     };
 
@@ -1211,6 +1281,12 @@ pub(crate) fn run_chat(
             // Refresh the rich status header's model @ endpoint each turn (#527)
             // so a mid-session `/model` switch is reflected (no-op for lean).
             surface.set_runtime_context(&inf_model, &inf_url, token_gauge);
+            surface.set_background_jobs(
+                nav_warmup
+                    .as_ref()
+                    .map(|warmup| vec![warmup.job.clone()])
+                    .unwrap_or_default(),
+            );
             let origin =
                 pending_clarification
                     .as_ref()
@@ -1283,9 +1359,10 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
-                    // `/mcp` — MCP management surface (#1149): status table +
-                    // enable/disable persisted to config. Handled here because
-                    // it needs the live `mcp` instance.
+                    // `/mcp` — MCP management surface (#1149 + session mute):
+                    // status table, session on/off (instant catalog filter), and
+                    // durable enable/disable (config writeback). Handled here
+                    // because it needs the live `mcp` instance.
                     {
                         let w = task.trim_start_matches('/');
                         let (c, rest) = w
@@ -1312,11 +1389,19 @@ pub(crate) fn run_chat(
                                                     confinement,
                                                     net,
                                                 } => {
-                                                    format!(
-                                                        "  {n}  ✓ connected ({tools} tools){}{}",
-                                                        confinement.note(),
-                                                        net.note()
-                                                    )
+                                                    if mcp.is_muted(n) {
+                                                        format!(
+                                                            "  {n}  ⏸ muted this session ({tools} tools still connected — /mcp on {n}){}{}",
+                                                            confinement.note(),
+                                                            net.note()
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "  {n}  ✓ connected ({tools} tools){}{}",
+                                                            confinement.note(),
+                                                            net.note()
+                                                        )
+                                                    }
                                                 }
                                                 crate::mcp::McpStatus::Skipped(r) => {
                                                     let hint = if r.contains("401")
@@ -1329,13 +1414,81 @@ pub(crate) fn run_chat(
                                                     format!("  {n}  ✗ skipped: {r}{hint}")
                                                 }
                                                 crate::mcp::McpStatus::Disabled => {
-                                                    format!("  {n}  ⏸ disabled (/mcp enable {n})")
+                                                    format!("  {n}  ⏸ disabled in config (/mcp enable {n})")
                                                 }
                                             };
                                             println!("{line}");
                                         }
                                         print_newt(
-                                            "usage: /mcp [enable|disable|auth] <name>",
+                                            "usage: /mcp [on|off|enable|disable|auth] [name]",
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                // Session-scoped mute — tools leave the catalog
+                                // immediately; connection stays for instant /mcp on.
+                                ("off", "") => {
+                                    let muted = mcp.mute_all();
+                                    if muted.is_empty() {
+                                        print_newt("no connected MCP servers to mute", color, verbose);
+                                    } else {
+                                        print_newt(
+                                            &format!(
+                                                "muted {} — tools removed from this session (still connected; /mcp on to restore)",
+                                                muted.join(", ")
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                ("off", n) if !n.is_empty() => {
+                                    if mcp.mute(n) {
+                                        print_newt(
+                                            &format!(
+                                                "{n} muted — tools removed from this session (still connected; /mcp on {n})"
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    } else {
+                                        print_newt(
+                                            &format!(
+                                                "no connected MCP server `{n}` — try /mcp for status"
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                ("on", "") => {
+                                    let unmuted = mcp.unmute_all();
+                                    if unmuted.is_empty() {
+                                        print_newt("no muted MCP servers", color, verbose);
+                                    } else {
+                                        print_newt(
+                                            &format!(
+                                                "unmuted {} — tools restored this session",
+                                                unmuted.join(", ")
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                ("on", n) if !n.is_empty() => {
+                                    if mcp.unmute(n) {
+                                        print_newt(
+                                            &format!("{n} unmuted — tools restored this session"),
+                                            color,
+                                            verbose,
+                                        );
+                                    } else {
+                                        print_newt(
+                                            &format!(
+                                                "no connected MCP server `{n}` — config-disabled servers need `/mcp enable {n}` then relaunch (live reconnect: #1148)"
+                                            ),
                                             color,
                                             verbose,
                                         );
@@ -1355,7 +1508,7 @@ pub(crate) fn run_chat(
                                         }) {
                                         Ok(()) if on => print_newt(
                                             &format!(
-                                                "{n} enabled — connects at next launch                                                  (live connect: #1148)"
+                                                "{n} enabled in config — connects at next launch (live connect: #1148). For this session use `/mcp on {n}` if already connected."
                                             ),
                                             color,
                                             verbose,
@@ -1370,7 +1523,7 @@ pub(crate) fn run_chat(
                                                 }
                                             }
                                             print_newt(
-                                                &format!("{n} disabled — tools removed from this session"),
+                                                &format!("{n} disabled in config — tools removed from this session"),
                                                 color,
                                                 verbose,
                                             );
@@ -1383,7 +1536,11 @@ pub(crate) fn run_chat(
                                     color,
                                     verbose,
                                 ),
-                                _ => print_newt("usage: /mcp [enable|disable|auth] <name>", color, verbose),
+                                _ => print_newt(
+                                    "usage: /mcp [on|off|enable|disable|auth] [name]\n  on/off = this session (instant); enable/disable = config (durable)",
+                                    color,
+                                    verbose,
+                                ),
                             }
                             println!();
                             continue;
@@ -1409,16 +1566,125 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
+                    let slash_body = task.trim_start_matches('/');
+                    // #1030: `/status` / `/info` quick state surfaces.
+                    if slash_body == "status" || slash_body == "info" {
+                        let mut lines = vec![
+                            format!("workspace: {workspace}"),
+                            format!("conversation: {active_conversation_id}"),
+                            format!("backend: {inf_model} @ {inf_url} ({})", inf_kind.label()),
+                            format!(
+                                "prompt permissions: {}",
+                                if prompt_permissions_enabled {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
+                            ),
+                        ];
+                        if slash_body == "info" {
+                            lines.push(format!("newt version: {VERSION}"));
+                            lines.push(format!("active mode: {}", active_operating_mode.as_str()));
+                            lines.push(format!(
+                                "active posture: {}",
+                                active_posture.as_ref().map_or("off", |p| p.name.as_str())
+                            ));
+                            if let Some(path) = permission_log_path.as_deref() {
+                                lines.push(format!("permission log: {}", path.display()));
+                            }
+                        }
+                        let mut it = lines.into_iter();
+                        if let Some(first) = it.next() {
+                            print_newt(&first, color, verbose);
+                        }
+                        for line in it {
+                            println!("{line}");
+                        }
+                        println!();
+                        continue;
+                    }
+                    if slash_body == "docs" {
+                        print_newt("docs and help:", color, verbose);
+                        println!("  https://github.com/Gilamonster-Foundation/newt-agent");
+                        println!("  https://github.com/Gilamonster-Foundation/newt-agent/blob/main/README.md");
+                        println!("  https://github.com/Gilamonster-Foundation/newt-agent/issues");
+                        println!(
+                            "  https://github.com/Gilamonster-Foundation/newt-agent/tree/main/docs"
+                        );
+                        println!("  /help (command list) · /help <cmd> (command detail)");
+                        println!();
+                        continue;
+                    }
                     // #263: review surface for prompted permission decisions.
                     // Read-only by design — promoting an allow to a durable
                     // grant is a human editing [tui.permissions] in config.
-                    if task.trim_start_matches('/') == "permissions" {
+                    if slash_body == "permissions"
+                        || slash_body == "allow"
+                        || slash_body.starts_with("permissions ")
+                        || slash_body.starts_with("allow ")
+                    {
+                        let perm_tail = if let Some(tail) = slash_body.strip_prefix("permissions") {
+                            tail.trim()
+                        } else if let Some(tail) = slash_body.strip_prefix("allow") {
+                            tail.trim()
+                        } else {
+                            ""
+                        };
+                        if let Some(tail) = perm_tail.strip_prefix("audit") {
+                            let tail = tail.trim();
+                            let limit = if tail.is_empty() {
+                                50
+                            } else {
+                                match tail.parse::<usize>() {
+                                    Ok(n) => n,
+                                    Err(_) => {
+                                        print_newt(
+                                            "usage: /permissions audit [N] (N must be an integer)",
+                                            color,
+                                            verbose,
+                                        );
+                                        println!();
+                                        continue;
+                                    }
+                                }
+                            };
+                            match permission_log_path.as_deref() {
+                                Some(path) => {
+                                    let mut lines = permission_audit_lines(path, limit).into_iter();
+                                    if let Some(first) = lines.next() {
+                                        print_newt(&first, color, verbose);
+                                    }
+                                    for line in lines {
+                                        println!("{line}");
+                                    }
+                                    if perm_tail.trim() == "audit" {
+                                        print_newt(
+                                            "showing newest 50 (default). use /permissions audit N",
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                None => print_newt(
+                                    "permission log not configured for this session yet",
+                                    color,
+                                    verbose,
+                                ),
+                            }
+                            println!();
+                            continue;
+                        }
+                        if !perm_tail.is_empty() {
+                            print_newt("usage: /permissions [audit N]", color, verbose);
+                            println!();
+                            continue;
+                        }
                         let mut lines = permissions_command_lines(
                             &permission_state,
                             prompt_permissions_enabled,
                             permission_log_path.as_deref(),
-                            // #307: surface the active mode's preset clamp.
-                            active_mode.as_ref(),
+                            // #307: surface the active posture's preset clamp.
+                            active_posture.as_ref(),
                         )
                         .into_iter();
                         if let Some(first) = lines.next() {
@@ -1430,17 +1696,25 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
-                    // #307: `/mode <name>` — atomically preload a skill body,
+                    // #307: `/posture <name>` — atomically preload a skill body,
                     // apply a named permission preset (an authority floor), and
-                    // inject a one-line system-prompt framing. All three or none.
-                    let slash_mode = task.trim_start_matches('/');
-                    if slash_mode == "mode" || slash_mode.starts_with("mode ") {
-                        let arg = slash_mode.strip_prefix("mode").unwrap_or("").trim();
-                        handle_mode_command(
+                    // carry its guidance into each live turn. All three or none.
+                    let slash_command = task.trim_start_matches('/');
+                    if slash_command == "posture" || slash_command.starts_with("posture ") {
+                        let arg = slash_command.strip_prefix("posture").unwrap_or("").trim();
+                        handle_posture_command(arg, &cfg, &mut active_posture, color, verbose);
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // Operating modes guide how the harness works; they do not
+                    // alter the authority posture above.
+                    if slash_command == "mode" || slash_command.starts_with("mode ") {
+                        let arg = slash_command.strip_prefix("mode").unwrap_or("").trim();
+                        handle_operating_mode_command(
                             arg,
-                            &cfg,
-                            &mut active_mode,
-                            &mut system,
+                            &mut active_operating_mode,
+                            &conversation_mode_states,
                             color,
                             verbose,
                         );
@@ -1635,7 +1909,7 @@ pub(crate) fn run_chat(
                                 &spill_status(
                                     configured,
                                     spill_lines_override,
-                                    live_spill_capable(),
+                                    live_spill_eligibility(),
                                 ),
                                 color,
                                 verbose,
@@ -1646,7 +1920,7 @@ pub(crate) fn run_chat(
                                     &spill_status(
                                         configured,
                                         spill_lines_override,
-                                        live_spill_capable(),
+                                        live_spill_eligibility(),
                                     ),
                                     color,
                                     verbose,
@@ -1658,7 +1932,7 @@ pub(crate) fn run_chat(
                                     &spill_status(
                                         configured,
                                         spill_lines_override,
-                                        live_spill_capable(),
+                                        live_spill_eligibility(),
                                     ),
                                     color,
                                     verbose,
@@ -1669,6 +1943,305 @@ pub(crate) fn run_chat(
                                 color,
                                 verbose,
                             ),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+
+                    // #1387 Phases 2–4: structural nav + retrieval debug + impact.
+                    if let Some(parsed) = crate::navigator_cmds::parse_nav_command(&task) {
+                        match parsed {
+                            Ok(cmd) => {
+                                finish_nav_warmup(
+                                    &rt,
+                                    &mut nav_warmup,
+                                    &mut where_is_index,
+                                    &mut nav_session,
+                                );
+                                ensure_nav_indexes(
+                                    workspace,
+                                    &cfg,
+                                    &mut where_is_index,
+                                    &mut nav_session,
+                                    &index_status,
+                                );
+                                let msg = handle_nav_command(
+                                    cmd,
+                                    workspace,
+                                    &mut nav_session,
+                                    where_is_index.as_ref(),
+                                    &index_status,
+                                );
+                                print_newt(&msg, color, verbose);
+                            }
+                            Err(e) => print_newt(&e, color, verbose),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+
+                    // #1387 Phase 1: Code Navigator `/search` cockpit — same
+                    // structured retrieve path as auto-inject + code_search.
+                    if slash_md == "search" || slash_md.starts_with("search ") {
+                        match parse_search_command(&task) {
+                            Ok(SearchCommand::Help) => {
+                                for line in search_help_text().lines() {
+                                    print_newt(line, color, verbose);
+                                }
+                            }
+                            Ok(SearchCommand::Status) => {
+                                print_newt(
+                                    &newt_core::format_index_status(
+                                        &index_status,
+                                        &retrieval_steer,
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(SearchCommand::Clear) => {
+                                retrieval_steer.clear();
+                                print_newt(
+                                    "cleared session pins/exclusions (applies on next inject)",
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(SearchCommand::Preview(n)) => match last_search.as_ref() {
+                                Some(r) => print_newt(
+                                    &newt_core::format_search_preview(r, n),
+                                    color,
+                                    verbose,
+                                ),
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Model) => match last_search.as_ref() {
+                                Some(r) => match newt_core::render_code_evidence(r) {
+                                    Some(block) => {
+                                        print_newt(
+                                            "model view (exact evidence packet):",
+                                            color,
+                                            verbose,
+                                        );
+                                        println!("{block}");
+                                    }
+                                    None => print_newt(
+                                        "last search selected no hits for the model packet",
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Rejects) => match last_search.as_ref() {
+                                Some(r) => {
+                                    print_newt(
+                                        &newt_core::format_search_rejects(r),
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Pin(n)) => match last_search.as_ref() {
+                                Some(r) => match r.hits.get(n.saturating_sub(1)) {
+                                    Some(hit) => {
+                                        retrieval_steer.pin(hit.clone());
+                                        print_newt(
+                                            &format!(
+                                                "pinned {} for next inject/tool retrieve",
+                                                hit.loc_key()
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                    None => print_newt(
+                                        &format!("no hit #{n} in last search"),
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Exclude(n)) => match last_search.as_ref() {
+                                Some(r) => match r.hits.get(n.saturating_sub(1)) {
+                                    Some(hit) => {
+                                        let path = hit.chunk.file.clone();
+                                        retrieval_steer.exclude_path(path.clone());
+                                        print_newt(
+                                            &format!(
+                                                "excluded path `{path}` from automatic retrieval"
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                    None => print_newt(
+                                        &format!("no hit #{n} in last search"),
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                None => print_newt(
+                                    "no search yet — run /search <query> first",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            Ok(SearchCommand::Query(query)) => {
+                                let manager = context_manager(&cfg, context_manager_override);
+                                let features = context_features(
+                                    &cfg,
+                                    manager,
+                                    &context_features_override,
+                                    inf_kind,
+                                );
+                                if !features.semantic {
+                                    print_newt(
+                                        "semantic feature is off — enable with /context feature semantic on",
+                                        color,
+                                        verbose,
+                                    );
+                                } else {
+                                    let mut semantic_cfg = cfg
+                                        .context
+                                        .as_ref()
+                                        .map(|c| c.semantic.clone())
+                                        .unwrap_or_default();
+                                    semantic_cfg.embedding_model_path =
+                                        effective_embedding_model_path(
+                                            semantic_cfg.embedding_model_path.take(),
+                                            newt_inference::palette::embed_model_dir_if_present(),
+                                        );
+                                    if let Some(reason) =
+                                        semantic_embedder_unavailable_reason(&semantic_cfg)
+                                    {
+                                        print_newt(&reason, color, verbose);
+                                    } else {
+                                        let embedder = build_semantic_embedder(
+                                            &semantic_cfg,
+                                            &inf_url,
+                                            inf_kind,
+                                            inf_key.as_deref(),
+                                        );
+                                        if !semantic_indexed {
+                                            semantic_indexed = true;
+                                            let source_extensions =
+                                                resolved_source_extensions(workspace, &cfg);
+                                            let (files, manifest) = newt_core::gather_with_manifest(
+                                                workspace,
+                                                &source_extensions,
+                                                newt_core::GatherCaps::default(),
+                                            );
+                                            let (git_head, dirty) = lightweight_git_meta(workspace);
+                                            index_status.generation =
+                                                index_status.generation.saturating_add(1);
+                                            index_status.manifest = Some(manifest);
+                                            index_status.git_head = git_head;
+                                            index_status.dirty = dirty;
+                                            if !files.is_empty() {
+                                                print_newt(
+                                                    &format!(
+                                                        "indexing {} files for semantic retrieval…",
+                                                        files.len()
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                );
+                                                let n = tokio::task::block_in_place(|| {
+                                                    rt.block_on(newt_core::index_files(
+                                                        &files,
+                                                        embedder.as_ref(),
+                                                        &semantic_index,
+                                                        semantic_cfg.on_embed_failure,
+                                                    ))
+                                                });
+                                                print_newt(
+                                                    &format!("semantic: indexed {n} code chunks"),
+                                                    color,
+                                                    verbose,
+                                                );
+                                            }
+                                        }
+                                        match tokio::task::block_in_place(|| {
+                                            rt.block_on(newt_core::retrieve_ranked(
+                                                &query,
+                                                embedder.as_ref(),
+                                                &semantic_index,
+                                                semantic_cfg.top_k,
+                                                Some(&retrieval_steer),
+                                                Some(&index_status),
+                                            ))
+                                        }) {
+                                            Some(result) => {
+                                                print_newt(
+                                                    &newt_core::format_search_hits(&result),
+                                                    color,
+                                                    verbose,
+                                                );
+                                                nav_session.turn_counter =
+                                                    nav_session.turn_counter.saturating_add(1);
+                                                let pins: Vec<_> = retrieval_steer
+                                                    .pinned
+                                                    .iter()
+                                                    .map(|h| h.loc_key())
+                                                    .collect();
+                                                let ctx_hash =
+                                                    newt_core::render_code_evidence(&result)
+                                                        .map(|b| {
+                                                            newt_core::hash_context(b.as_bytes())
+                                                        })
+                                                        .unwrap_or_else(|| {
+                                                            newt_core::hash_context(
+                                                                result
+                                                                    .hits
+                                                                    .iter()
+                                                                    .map(|h| h.loc_key())
+                                                                    .collect::<Vec<_>>()
+                                                                    .join("\n")
+                                                                    .as_bytes(),
+                                                            )
+                                                        });
+                                                nav_session.ledger.record_semantic(
+                                                    nav_session.turn_counter,
+                                                    &query,
+                                                    &result,
+                                                    &pins,
+                                                    &retrieval_steer.excluded_paths,
+                                                    &ctx_hash,
+                                                );
+                                                nav_session.last_semantic = Some(result.clone());
+                                                last_search = Some(result);
+                                            }
+                                            None => print_newt(
+                                                "no code matched — index empty or embed failed",
+                                                color,
+                                                verbose,
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                         }
                         surface.save_history();
                         println!();
@@ -1963,12 +2536,16 @@ pub(crate) fn run_chat(
                             let _ = store.release(&outgoing_id);
                         }
                         turns_this_conversation = 0;
+                        let mut reset_ctx = ConversationResetContext {
+                            memory: &mut memory,
+                            system: &mut system,
+                            conversation_id: &mut active_conversation_id,
+                            mode_states: &conversation_mode_states,
+                        };
                         let started = handle_new_conversation(
                             workspace,
-                            &mut memory,
-                            &mut system,
                             active_persona.as_ref(),
-                            &mut active_conversation_id,
+                            &mut reset_ctx,
                             &mut compress_state,
                             &mut session_opted_fresh,
                         );
@@ -2005,9 +2582,19 @@ pub(crate) fn run_chat(
                             semantic_index.clear();
                         }
                         semantic_indexed = false;
+                        // #1387: pins/exclusions and search cockpit state are
+                        // session-task scoped — clear with the index on /new.
+                        retrieval_steer.clear();
+                        index_status = newt_core::IndexStatus::default();
+                        last_search = None;
+                        nav_session.clear();
                         // #1285: drop the where_is index too so /new re-derives it
                         // (picks up file adds/removes on the next turn).
                         where_is_index = None;
+                        if let Some(warmup) = nav_warmup.take() {
+                            warmup.abort();
+                        }
+                        nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
                         // Step 26.6a (#585): the experiential ledger is INTENTIONALLY
                         // NOT cleared here — it is cross-task by design (a later task
                         // reuses earlier lessons). It is dropped only at session end.
@@ -2109,6 +2696,7 @@ pub(crate) fn run_chat(
                                         as &dyn newt_core::ScratchpadStore,
                                     step_ledger: &step_ledger as &dyn newt_core::StepLedger,
                                     active_prompt_context: &mut active_prompt_context,
+                                    mode_states: &conversation_mode_states,
                                 };
                                 match handle_conversation_command(&task, &mut conversation_ctx) {
                                     Ok(msg) => print_newt(&msg, color, verbose),
@@ -2260,6 +2848,7 @@ pub(crate) fn run_chat(
                                                         as &dyn newt_core::StepLedger,
                                                     active_prompt_context:
                                                         &mut active_prompt_context,
+                                                    mode_states: &conversation_mode_states,
                                                 };
                                                 match resume_session_conversation(
                                                     &mut resume_ctx,
@@ -2329,10 +2918,16 @@ pub(crate) fn run_chat(
                     // tree; /tree renders the active roadmap (alias of /roadmap show).
                     if slash_body == "roadmap"
                         || slash_body.starts_with("roadmap ")
+                        || slash_body == "plan"
+                        || slash_body.starts_with("plan ")
                         || slash_body == "tree"
                     {
                         let cmd = if slash_body == "tree" {
                             "/roadmap show".to_string()
+                        } else if slash_body == "plan" {
+                            "/roadmap".to_string()
+                        } else if let Some(rest) = slash_body.strip_prefix("plan ") {
+                            format!("/roadmap {rest}")
                         } else {
                             task.clone()
                         };
@@ -2385,6 +2980,7 @@ pub(crate) fn run_chat(
                                                                 as &dyn newt_core::StepLedger,
                                                             active_prompt_context:
                                                                 &mut active_prompt_context,
+                                                            mode_states: &conversation_mode_states,
                                                         };
                                                         match resume_session_conversation(
                                                             &mut ctx, &target,
@@ -2457,14 +3053,18 @@ pub(crate) fn run_chat(
                         // plan path follows (issue #220).
                         let persona_name_before = active_persona.as_ref().map(|p| p.name.clone());
                         let conversation_id_before = active_conversation_id.clone();
+                        let mut reset_ctx = ConversationResetContext {
+                            memory: &mut memory,
+                            system: &mut system,
+                            conversation_id: &mut active_conversation_id,
+                            mode_states: &conversation_mode_states,
+                        };
                         match handle_persona_command(
                             &task,
                             workspace,
                             &persona_store,
-                            &mut memory,
-                            &mut system,
                             &mut active_persona,
-                            &mut active_conversation_id,
+                            &mut reset_ctx,
                         ) {
                             Ok(msg) => print_newt(&msg, color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
@@ -2662,7 +3262,7 @@ pub(crate) fn run_chat(
                         .as_ref()
                         .map(newt_core::IntakeConfig::to_lexicon)
                         .unwrap_or_default();
-                    let prompt_intake = if is_clarification_answer {
+                    let mut prompt_intake = if is_clarification_answer {
                         pending_clarification
                             .as_ref()
                             .map(|pending| pending.intake.resolve_with_operator_answer(&task))
@@ -2675,6 +3275,28 @@ pub(crate) fn run_chat(
                     } else {
                         newt_core::agentic::PromptIntake::analyze_with(&task, &intake_lexicon)
                     };
+                    // A model-selected Auto style is a one-shot instruction
+                    // for the next action-shaped turn. Protected intake does
+                    // not consume it; it remains pending until an Act turn or
+                    // an explicit conversation/mode boundary clears it.
+                    let plan_mode_active = conversation_mode_states.plan.is_active();
+                    let auto_selected = (active_operating_mode == OperatingMode::Auto
+                        && !plan_mode_active
+                        && prompt_intake.disposition()
+                            == newt_core::agentic::PromptDisposition::Act)
+                        .then(|| {
+                            conversation_mode_states
+                                .auto
+                                .take_for(&active_conversation_id)
+                        })
+                        .flatten();
+                    let turn_operating_mode = effective_operating_mode(
+                        active_operating_mode,
+                        &prompt_intake,
+                        plan_mode_active,
+                        auto_selected,
+                    );
+                    apply_operating_mode_to_intake(turn_operating_mode, &mut prompt_intake);
 
                     // The manifest artifact deliberately contains only bounded
                     // counts and digests. It is written before an Ask handoff
@@ -2876,6 +3498,7 @@ pub(crate) fn run_chat(
                     // is safe.
                     // Step 26.3/26.4: resolve the per-turn feature set once (used
                     // for the <state> injection here and the ChatCtx fields below).
+                    let turn_disposition = prompt_intake.disposition();
                     let turn_features = context_features(
                         &cfg,
                         context_manager(&cfg, context_manager_override),
@@ -2885,10 +3508,15 @@ pub(crate) fn run_chat(
                     let tool_offload_on = turn_features.tool_offload;
                     let scratchpad_on = turn_features.scratchpad;
                     let semantic_on = turn_features.semantic;
+                    let session_controls = session_control_prompt(
+                        active_operating_mode,
+                        turn_operating_mode,
+                        active_posture.as_ref(),
+                    );
                     let mut turn_system = format!(
-                        "{}\n\n{}\n{system}",
+                        "{}\n\n{}\n\n{system}\n\n{session_controls}",
                         workspace_state_block(workspace),
-                        runtime_context_block(&inf_model, &inf_url, inf_kind)
+                        runtime_context_block(&inf_model, &inf_url, inf_kind, &session_identity)
                     );
                     if is_clarification_answer {
                         turn_system = format!(
@@ -2977,13 +3605,23 @@ pub(crate) fn run_chat(
                             // whether or not it yields chunks — so a missing
                             // embedding model doesn't re-walk + re-embed every turn.
                             semantic_indexed = true;
-                            // Semantic embedding index keeps the narrow rs/py set
-                            // on purpose (#956 blast-radius note): broadening it
-                            // would embed every language's files each session.
-                            let files = newt_core::gather_code_files(
+                            // Use the harness-owned source registry rather than a
+                            // second rs/py list: prompt steering, exact inventory,
+                            // semantic retrieval, and structural navigation now
+                            // agree on what "code" means. Gather caps still bound
+                            // the embedding work. #1387 keeps the manifest so
+                            // completeness / index_id are honest.
+                            let source_extensions = resolved_source_extensions(workspace, &cfg);
+                            let (files, manifest) = newt_core::gather_with_manifest(
                                 workspace,
-                                &["rs".to_string(), "py".to_string()],
+                                &source_extensions,
+                                newt_core::GatherCaps::default(),
                             );
+                            let (git_head, dirty) = lightweight_git_meta(workspace);
+                            index_status.generation = index_status.generation.saturating_add(1);
+                            index_status.manifest = Some(manifest);
+                            index_status.git_head = git_head;
+                            index_status.dirty = dirty;
                             if !files.is_empty() {
                                 print_newt(
                                     &format!(
@@ -3015,15 +3653,33 @@ pub(crate) fn run_chat(
                                 }
                             }
                         }
-                        if let Some(block) = tokio::task::block_in_place(|| {
-                            rt.block_on(newt_core::retrieve_evidence(
+                        if let Some(result) = tokio::task::block_in_place(|| {
+                            rt.block_on(newt_core::retrieve_ranked(
                                 &task,
                                 embedder,
                                 &semantic_index,
                                 semantic_cfg.top_k,
+                                Some(&retrieval_steer),
+                                Some(&index_status),
                             ))
                         }) {
-                            turn_system = format!("{block}\n\n{turn_system}");
+                            if let Some(block) = newt_core::render_code_evidence(&result) {
+                                nav_session.turn_counter =
+                                    nav_session.turn_counter.saturating_add(1);
+                                let pins: Vec<_> =
+                                    retrieval_steer.pinned.iter().map(|h| h.loc_key()).collect();
+                                let ctx_hash = newt_core::hash_context(block.as_bytes());
+                                nav_session.ledger.record_semantic(
+                                    nav_session.turn_counter,
+                                    &task,
+                                    &result,
+                                    &pins,
+                                    &retrieval_steer.excluded_paths,
+                                    &ctx_hash,
+                                );
+                                nav_session.last_semantic = Some(result);
+                                turn_system = format!("{block}\n\n{turn_system}");
+                            }
                         }
                     }
                     // Step 26.6a (#585): inject the <experience> block (relevant
@@ -3177,25 +3833,20 @@ pub(crate) fn run_chat(
                     let mut turn_phantom_reaches: Vec<newt_core::PhantomReach> = Vec::new();
                     let mut turn_end_reason: Option<newt_core::TurnEndReason> = None;
                     // #307: the EFFECTIVE caveats for this turn — the session
-                    // base intersected with the active mode's preset clamp (a
-                    // FLOOR). This single `meet` is what the gate base, the
+                    // base intersected with the active posture's preset clamp
+                    // (a FLOOR). This single `meet` is what the gate base, the
                     // ChatCtx dispatch, and (via the preset clamp + exec_floor)
                     // the --disable-ocap bypass all enforce, so authority can
-                    // never exceed the preset. With no mode it is the base
+                    // never exceed the preset. With no posture it is the base
                     // unchanged. Computed once so all three consult one value.
                     let mut turn_caveats = meet_persona_caveats(
-                        effective_caveats(cap.caveats(), active_mode.as_ref()),
+                        effective_caveats(cap.caveats(), active_posture.as_ref()),
                         active_persona.as_ref(),
                     );
-                    // #1193: in the read-only PLAN phase, MEET the read-only
-                    // clamp so writes/exec are DENIED while the model plans —
-                    // the design's safety guarantee, not the model's good
-                    // intentions. `meet` only narrows, so this can never widen
-                    // the session grant; exit_plan_mode drops the flag and the
-                    // next turn returns to the base authority.
-                    if newt_core::agentic::in_plan_phase() {
-                        turn_caveats = turn_caveats.meet(&newt_core::agentic::plan_phase_clamp());
-                    }
+                    // The effective turn mode includes both `/mode` and any
+                    // model-entered legacy plan phase, so one clamp keeps the
+                    // prompt card, catalog, and authority boundary aligned.
+                    turn_caveats = operating_mode_caveats(turn_operating_mode, turn_caveats);
                     // FR-1 part 2 (#997): the active persona's tool allow-list
                     // (its `tools:` front-matter). Threaded into `ChatCtx` so the
                     // loop advertises ONLY these tools and the executor refuses
@@ -3206,18 +3857,20 @@ pub(crate) fn run_chat(
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());
-                    // The active preset clamp threaded to the gate (re-clamps
-                    // any session grant); `None` when no mode is active.
-                    let preset_clamp = active_mode.as_ref().map(|m| m.clamp.clone());
+                    // The active posture's optional clamp is threaded to the
+                    // gate (re-clamps any session grant). A skill/framing-only
+                    // compatibility binding is genuinely `None` here.
+                    let preset_clamp = active_posture
+                        .as_ref()
+                        .and_then(ActivePosture::permission_clamp)
+                        .cloned();
                     // #774 (P0): the exec FLOOR threaded to the bypass is the
                     // operator's `[tui.permissions]` exec clamp — a NON-OPTIONAL
-                    // floor enforced even with no active `/mode`. `turn_caveats.exec`
-                    // is the base clamp already met with the mode (meet-only), so
-                    // `/mode` only tightens it. `None` only when exec is
-                    // unrestricted AND no mode is active. Before #774 this was
-                    // sourced from the mode alone, so a configured clamp imposed
-                    // no floor without a `/mode` (design-review F1).
-                    let exec_floor = exec_floor_from(&turn_caveats.exec, active_mode.is_some());
+                    // floor enforced even with no active `/posture`.
+                    // `turn_caveats.exec` is the base clamp already met with the
+                    // posture preset (meet-only), so `/posture` only tightens
+                    // it when a permission floor is actually configured.
+                    let exec_floor = exec_floor_from(&turn_caveats.exec, preset_clamp.is_some());
                     // Prompted ocap grants (issue #263): only an interactive
                     // session constructs a gate — headless paths (ACP worker,
                     // newt-eval) never reach this code, so a denial there can
@@ -3336,11 +3989,26 @@ pub(crate) fn run_chat(
                     // #1285: build the model-free where_is index once per session
                     // (the gather is a capped, cheap structural walk — no model,
                     // no network). The typed-verdict lookup then rides this turn.
-                    if where_is_index.is_none() {
-                        where_is_index = Some(tokio::task::block_in_place(|| {
-                            newt_core::build_where_is_index_from_workspace(workspace)
-                        }));
+                    finish_nav_warmup(&rt, &mut nav_warmup, &mut where_is_index, &mut nav_session);
+                    if where_is_index.is_none() || nav_session.usage.is_none() {
+                        ensure_nav_indexes(
+                            workspace,
+                            &cfg,
+                            &mut where_is_index,
+                            &mut nav_session,
+                            &index_status,
+                        );
                     }
+                    // The core sees this collaborator only in human-selected
+                    // Auto. It is bound to this conversation and any model
+                    // selection takes effect on a later outer turn.
+                    let turn_auto_mode_control =
+                        conversation_mode_states.auto.bind(&active_conversation_id);
+                    let operating_mode_control = (active_operating_mode == OperatingMode::Auto)
+                        .then_some(
+                            &turn_auto_mode_control
+                                as &dyn newt_core::agentic::OperatingModeControl,
+                        );
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -3383,12 +4051,31 @@ pub(crate) fn run_chat(
                                                 embedder: e,
                                                 index: &semantic_index,
                                                 top_k: semantic_cfg.top_k,
+                                                steer: Some(&retrieval_steer),
+                                                status: Some(&index_status),
                                             }
                                         }),
                                         // #1285: the exact typed-verdict symbol
                                         // lookup — Some once the model-free index
                                         // is built (first turn), degrading honestly.
                                         where_is: where_is_index.as_ref(),
+                                        nav: Some(newt_core::NavToolCtx {
+                                            workspace,
+                                            where_is: where_is_index.as_ref(),
+                                            usage: nav_session.usage.as_ref(),
+                                            graph: nav_session.graph.as_ref(),
+                                            project: nav_session.project.as_ref(),
+                                            files: Some(nav_session.files.as_slice()),
+                                            status: Some(&index_status),
+                                        }),
+                                        // #TEC Pass 1: resolve the tool-exposure
+                                        // controller policy from `[tool_exposure]`.
+                                        // Default `full` = identity (unchanged
+                                        // advertised catalog); `auto`/`minimal`
+                                        // size the schema set to the live budget.
+                                        exposure: newt_core::ExposureSettings::from(
+                                            cfg.tool_exposure(),
+                                        ),
                                         // Step 26.6a (#585): the experiential store
                                         // for record/recall — Some only when on.
                                         experience_store: experiential_on.then_some(
@@ -3400,7 +4087,7 @@ pub(crate) fn run_chat(
                                             .then_some(&step_ledger as &dyn newt_core::StepLedger),
                                         // #307: the clamped effective caveats (base ∩
                                         // preset). Identical to `cap.caveats()` when no
-                                        // mode is active.
+                                        // posture is active.
                                         caveats: &turn_caveats,
                                         persona_tools,
                                         max_tool_rounds: eff_max_tool_rounds,
@@ -3408,7 +4095,7 @@ pub(crate) fn run_chat(
                                         // #1162: the /nudge dial — env set by the
                                         // /nudge command; off = no action-pressure.
                                         action_nudges: !nudges_off,
-                                        prompt_disposition: prompt_intake.disposition(),
+                                        prompt_disposition: turn_disposition,
                                         prompt_intake: Some(&prompt_intake),
                                         workflow_grace_rounds: eff_workflow_grace_rounds,
                                         tool_output_lines: tool_output_lines(&cfg),
@@ -3480,7 +4167,7 @@ pub(crate) fn run_chat(
                                             .clamp(1, 50),
                                         // #307: the active preset's exec floor — the
                                         // ceiling the --disable-ocap bypass cannot
-                                        // cross. None when no mode is active.
+                                        // cross. None when no posture is active.
                                         exec_floor: exec_floor.as_ref(),
                                         // retry technique: the per-turn write ledger (Some
                                         // only under a `retry` profile). The write tools
@@ -3505,6 +4192,11 @@ pub(crate) fn run_chat(
                                         // the binary (newt-cli) — advertises + dispatches
                                         // the `/team` tools when present.
                                         crew_runner,
+                                        operating_mode_control,
+                                        plan_mode_control: Some(
+                                            &conversation_mode_states.plan
+                                                as &dyn newt_core::agentic::PlanModeControl,
+                                        ),
                                     },
                                     active_prompt_context.as_ref(),
                                     prompt_source,
@@ -3961,9 +4653,339 @@ pub(crate) fn run_chat(
     Ok(())
 }
 
+/// #1387: build where_is + usage + graph + project model once per session.
+///
+/// Uses the same language-pack registry as `find` `category=source` so "code"
+/// means one thing everywhere.
+fn ensure_nav_indexes(
+    workspace: &str,
+    cfg: &newt_core::Config,
+    where_is_index: &mut Option<newt_core::WhereIsIndex>,
+    nav_session: &mut newt_core::NavigatorSession,
+    index_status: &newt_core::IndexStatus,
+) {
+    use newt_core::{gather_with_manifest, GatherCaps};
+    let api_cfg = cfg
+        .context
+        .as_ref()
+        .map(|context| context.api_surface.clone())
+        .unwrap_or_default();
+    let packs = resolved_language_packs(workspace, &api_cfg);
+    let exts = newt_core::api_surface::source_extensions_for(&packs, None).unwrap_or_default();
+    let (files, manifest) = gather_with_manifest(workspace, &exts, GatherCaps::default());
+    let cuts_open = !manifest.cuts.is_empty();
+    let id = index_status.index_id();
+    if where_is_index.is_none() {
+        *where_is_index = Some(newt_core::build_where_is_index(&files, &packs, &manifest));
+    }
+    if nav_session.usage.is_none() {
+        nav_session.usage = Some(newt_core::UsageIndex::build(&files, cuts_open, &id));
+    }
+    if nav_session.graph.is_none() {
+        nav_session.graph = Some(newt_core::GraphIndex::build(&files, cuts_open, &id));
+    }
+    if nav_session.project.is_none() {
+        let root = std::path::Path::new(workspace);
+        nav_session.project = newt_core::project_model::scan_project(
+            root,
+            &newt_core::project_model::builtin_project_packs(),
+        );
+    }
+    nav_session.files = files;
+    nav_session.ledger.set_index(id);
+}
+
+type NavWarmupOutput = (Option<newt_core::WhereIsIndex>, newt_core::NavigatorSession);
+
+struct NavWarmup {
+    handle: tokio::task::JoinHandle<NavWarmupOutput>,
+    job: BackgroundJob,
+}
+
+impl NavWarmup {
+    fn abort(self) {
+        self.handle.abort();
+    }
+}
+
+fn spawn_nav_warmup(
+    rt: &tokio::runtime::Handle,
+    workspace: &str,
+    cfg: &newt_core::Config,
+    index_status: &newt_core::IndexStatus,
+) -> NavWarmup {
+    let workspace = workspace.to_string();
+    let cfg = cfg.clone();
+    let index_status = index_status.clone();
+    let job = BackgroundJob::start("indexing repository");
+    let completion = job.completion_guard();
+    let handle = rt.spawn_blocking(move || {
+        let _completion = completion;
+        let mut where_is = None;
+        let mut nav = newt_core::NavigatorSession::default();
+        ensure_nav_indexes(&workspace, &cfg, &mut where_is, &mut nav, &index_status);
+        (where_is, nav)
+    });
+    NavWarmup { handle, job }
+}
+
+fn finish_nav_warmup(
+    rt: &tokio::runtime::Handle,
+    warmup: &mut Option<NavWarmup>,
+    where_is: &mut Option<newt_core::WhereIsIndex>,
+    nav: &mut newt_core::NavigatorSession,
+) {
+    let Some(warmup) = warmup.take() else {
+        return;
+    };
+    if let Ok((warmed_where_is, warmed_nav)) =
+        tokio::task::block_in_place(|| rt.block_on(warmup.handle))
+    {
+        *where_is = warmed_where_is;
+        *nav = warmed_nav;
+    }
+}
+
+fn resolved_language_packs(
+    workspace: &str,
+    api_cfg: &newt_core::config::ApiSurfaceConfig,
+) -> Vec<newt_core::config::LanguagePack> {
+    newt_core::api_surface::resolve_language_packs(std::path::Path::new(workspace), api_cfg)
+}
+
+fn resolved_source_extensions(workspace: &str, cfg: &newt_core::Config) -> Vec<String> {
+    let api_cfg = cfg
+        .context
+        .as_ref()
+        .map(|context| context.api_surface.clone())
+        .unwrap_or_default();
+    let packs = resolved_language_packs(workspace, &api_cfg);
+    newt_core::api_surface::source_extensions_for(&packs, None).unwrap_or_default()
+}
+
+fn handle_nav_command(
+    cmd: crate::navigator_cmds::NavCommand,
+    workspace: &str,
+    nav_session: &mut newt_core::NavigatorSession,
+    where_is: Option<&newt_core::WhereIsIndex>,
+    index_status: &newt_core::IndexStatus,
+) -> String {
+    use crate::navigator_cmds::{NavCommand, RetrievalView};
+    use newt_core::{
+        compare_ledgers, compare_semantic_lexical, export_ledger_json, export_ledger_markdown,
+        find_callees, find_callers, find_hierarchy, find_implementations, find_references,
+        find_tests, format_ledger_diff, format_ledger_human, format_ledger_model, goto_definition,
+        hash_context, impact_analysis, inspect_type, project_map_nav, text_search,
+        GotoDefinitionArgs,
+    };
+    let id = index_status.index_id();
+    let record =
+        |nav_session: &mut newt_core::NavigatorSession, query: &str, nav: newt_core::NavResult| {
+            nav_session.turn_counter = nav_session.turn_counter.saturating_add(1);
+            let ctx = hash_context(nav.render().as_bytes());
+            nav_session
+                .ledger
+                .record_nav(nav_session.turn_counter, query, &nav, &ctx);
+            let rendered = nav.render();
+            nav_session.last_nav = Some(nav);
+            rendered
+        };
+    match cmd {
+        NavCommand::Help(msg) => msg.to_string(),
+        NavCommand::Def(sym) => {
+            let Some(idx) = where_is else {
+                return "where_is index not ready".into();
+            };
+            let nav = goto_definition(
+                idx,
+                GotoDefinitionArgs {
+                    symbol: &sym,
+                    kind: None,
+                    index_id: &id,
+                    files: Some(nav_session.files.as_slice()),
+                },
+            );
+            record(nav_session, &sym, nav)
+        }
+        NavCommand::Text(q) => {
+            let nav = text_search(&q, std::path::Path::new(workspace), &id);
+            nav_session.last_lexical = Some(nav.clone());
+            record(nav_session, &q, nav)
+        }
+        NavCommand::Uses(sym) => {
+            let Some(idx) = nav_session.usage.as_ref() else {
+                return "usage index not ready".into();
+            };
+            let nav = find_references(idx, &sym);
+            record(nav_session, &sym, nav)
+        }
+        NavCommand::Tests(sym) => {
+            let Some(idx) = nav_session.usage.as_ref() else {
+                return "usage index not ready".into();
+            };
+            let nav = find_tests(idx, &sym);
+            record(nav_session, &sym, nav)
+        }
+        NavCommand::Map { expand } => {
+            if nav_session.project.is_none() {
+                return "no project model detected for this workspace".into();
+            }
+            let seed = newt_core::project_map::load_seed(std::path::Path::new(workspace));
+            let (out, nav) = {
+                let model = nav_session.project.as_ref().expect("checked above");
+                let mut out = newt_core::project_map::render_project_map(model, &seed)
+                    .unwrap_or_else(|| "(empty project map)\n".into());
+                if let Some(unit) = expand.as_ref() {
+                    if let Some(u) = model
+                        .units
+                        .iter()
+                        .find(|u| u.name == *unit || u.dir == *unit)
+                    {
+                        out.push_str(&format!(
+                            "\nexpanded `{unit}`:\n  dir: {}\n  roots: {:?}\n  deps: {:?}\n  langs: {:?}\n",
+                            u.dir, u.source_roots, u.deps, u.languages
+                        ));
+                    } else {
+                        out.push_str(&format!("\n(no unit named `{unit}`)\n"));
+                    }
+                }
+                let nav = project_map_nav(model, expand.as_deref(), &id);
+                (out, nav)
+            };
+            if let Some(unit) = expand.clone() {
+                nav_session.map_expand = Some(unit);
+            }
+            let _ = record(nav_session, expand.as_deref().unwrap_or("map"), nav);
+            out
+        }
+        NavCommand::Callers(sym) => {
+            let Some(idx) = nav_session.graph.as_ref() else {
+                return "graph index not ready".into();
+            };
+            record(nav_session, &sym, find_callers(idx, &sym))
+        }
+        NavCommand::Callees(sym) => {
+            let Some(idx) = nav_session.graph.as_ref() else {
+                return "graph index not ready".into();
+            };
+            record(nav_session, &sym, find_callees(idx, &sym))
+        }
+        NavCommand::Implementations(sym) => {
+            let Some(idx) = nav_session.graph.as_ref() else {
+                return "graph index not ready".into();
+            };
+            record(nav_session, &sym, find_implementations(idx, &sym))
+        }
+        NavCommand::Hierarchy(sym) => {
+            let Some(idx) = nav_session.graph.as_ref() else {
+                return "graph index not ready".into();
+            };
+            record(nav_session, &sym, find_hierarchy(idx, &sym))
+        }
+        NavCommand::Type(sym) => {
+            let nav = inspect_type(&sym, &nav_session.files, where_is, &id);
+            record(nav_session, &sym, nav)
+        }
+        NavCommand::Impact(unit) => {
+            let Some(model) = nav_session.project.as_ref() else {
+                return "no project model — cannot compute impact".into();
+            };
+            let report = impact_analysis(
+                &unit,
+                model,
+                &nav_session.files,
+                std::path::Path::new(workspace),
+            );
+            let nav = report.to_nav(&id);
+            let text = report.render();
+            let _ = record(nav_session, &unit, nav);
+            text
+        }
+        NavCommand::Retrieval { turn, view } => {
+            let t = match turn {
+                Some(n) => nav_session.ledger.get_turn(n),
+                None => nav_session.ledger.turns.last(),
+            };
+            match t {
+                None => "no retrieval ledger entries yet".into(),
+                Some(tr) => match view {
+                    RetrievalView::Human => format_ledger_human(tr),
+                    RetrievalView::Model => format_ledger_model(tr),
+                    RetrievalView::Diff => {
+                        let prior = match turn {
+                            Some(n) => nav_session.ledger.prior_turn(n),
+                            None => {
+                                let len = nav_session.ledger.turns.len();
+                                if len >= 2 {
+                                    Some(&nav_session.ledger.turns[len - 2])
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        match prior {
+                            Some(a) => format_ledger_diff(a, tr),
+                            None => format_ledger_human(tr),
+                        }
+                    }
+                },
+            }
+        }
+        NavCommand::CompareSemanticLexical => compare_semantic_lexical(
+            nav_session.last_semantic.as_ref(),
+            nav_session.last_lexical.as_ref(),
+        ),
+        NavCommand::CompareTurns(a, b) => compare_ledgers(&nav_session.ledger, a, b),
+        NavCommand::CompareIndex => format!(
+            "session-index previous={:?} current={:?}\n",
+            nav_session.ledger.previous_index_id, nav_session.ledger.current_index_id
+        ),
+        NavCommand::ExportJson => export_ledger_json(&nav_session.ledger),
+        NavCommand::ExportMarkdown => export_ledger_markdown(&nav_session.ledger),
+    }
+}
+
 #[cfg(test)]
 mod prompt_ingress_tests {
     use super::*;
+
+    /// Grounds the background task in a real source workspace: startup may run
+    /// concurrently, but the first consumer joins a complete structural index
+    /// rather than observing a partially built belief.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repository_navigator_warms_in_background_and_joins_complete() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            workspace.path().join("main.rs"),
+            "pub fn warm_marker() {}\n",
+        )
+        .unwrap();
+        let workspace = workspace.path().to_string_lossy().into_owned();
+        let rt = tokio::runtime::Handle::current();
+        let mut warmup = Some(spawn_nav_warmup(
+            &rt,
+            &workspace,
+            &newt_core::Config::default(),
+            &newt_core::IndexStatus::default(),
+        ));
+        let job = warmup.as_ref().unwrap().job.clone();
+        let mut where_is = None;
+        let mut nav = newt_core::NavigatorSession::default();
+
+        finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
+
+        assert!(warmup.is_none());
+        assert!(
+            !job.is_running(),
+            "joining the warm-up must clear its generic liveness indicator"
+        );
+        assert!(where_is.is_some());
+        assert!(
+            nav.files.iter().any(|(path, _)| path == "main.rs"),
+            "the joined navigator must contain the real source file"
+        );
+        assert!(nav.usage.is_some() && nav.graph.is_some());
+    }
 
     fn prompt_store() -> (tempfile::TempDir, newt_core::ConversationStore, String) {
         let tmp = tempfile::TempDir::new().unwrap();

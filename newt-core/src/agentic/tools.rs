@@ -25,6 +25,7 @@ use output_budget::{
 pub use output_budget::{set_max_output_tokens, set_output_head_tokens};
 
 mod catalog;
+pub(crate) mod exposure;
 mod live_output;
 mod output_budget;
 use live_output::{LiveOutputRelay, LiveOutputSession};
@@ -47,6 +48,8 @@ pub use catalog::{
 use catalog::{
     levenshtein, nearest_tool_name, ALL_TOOL_NAMES, BASE_TOOL_NAMES, EXTENDED_TOOL_REGISTRY,
 };
+pub(crate) use exposure::select_exposed;
+pub use exposure::ExposureSettings;
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///
@@ -443,21 +446,11 @@ fn shadow_records(host_bypass: bool, full_access: bool) -> bool {
     host_bypass || full_access
 }
 
-/// #1193: is the session in the read-only PLAN phase? Set by `enter_plan_mode`,
-/// cleared by `exit_plan_mode`. Env-signalled like [`ocap_disabled`] /
-/// [`full_access_requested`] so the TUI can read it when resolving per-turn
-/// caveats (it MEETs the read-only clamp in, which only narrows authority —
-/// the model voluntarily restricting itself is always safe). Value must be
-/// exactly "1".
-pub fn in_plan_phase() -> bool {
-    std::env::var("NEWT_PLAN_PHASE").is_ok_and(|v| v == "1")
-}
-
 /// The read-only authority a plan phase clamps the session to (#1193): reads
 /// everywhere, but NO writes, NO exec, NO net. MEETing this into the session
 /// caveats enforces "planning is read-only" — the design's safety guarantee,
-/// not the model's good intentions. `net`/max_calls left permissive here; the
-/// TUI `meet` intersects with the real session net so nothing widens.
+/// not the model's good intentions. The call-count and generation bounds stay
+/// permissive here; the TUI `meet` still preserves any tighter session limits.
 pub fn plan_phase_clamp() -> crate::caveats::Caveats {
     use crate::caveats::{CountBound, Scope};
     crate::caveats::Caveats {
@@ -489,11 +482,12 @@ pub fn routing_disabled() -> bool {
     std::env::var("NEWT_NO_ROUTE").is_ok_and(|v| v == "1")
 }
 
-/// #307: does the named-permission-preset exec FLOOR permit running `cmd` on
-/// the UNCONFINED host shell?
+/// Does the caller's effective exec FLOOR permit running `cmd` on the
+/// UNCONFINED host shell?
 ///
-/// `None` ⇒ no preset is active; the floor imposes nothing, so the answer is
-/// `true` (the `--disable-ocap` bypass behaves exactly as it did pre-#307).
+/// `None` means the caller found no effective exec floor after composing the
+/// session, posture, mode, and persona constraints. The floor therefore
+/// imposes nothing and the `--disable-ocap` bypass behaves as it did pre-#307.
 ///
 /// `Some(scope)` ⇒ the bypass may proceed ONLY for a single, simple command
 /// whose program (leading token) the scope authorizes. This is deliberately
@@ -509,12 +503,12 @@ pub fn routing_disabled() -> bool {
 ///    anything else is denied.
 ///
 /// The denied command isn't refused outright — it falls to the confined-shell
-/// path, which enforces the (already preset-clamped) `caveats`. So a restricted
-/// triage/on-call mode keeps its ceiling even under `--yolo`.
+/// path, which enforces the already-composed effective `caveats`. Every active
+/// exec floor therefore keeps its ceiling even under `--yolo`.
 fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) -> bool {
     use crate::caveats::ScopeExt as _;
     let Some(scope) = floor else {
-        return true; // no preset ⇒ bypass unchanged (bit-for-bit)
+        return true; // no effective exec floor ⇒ bypass unchanged
     };
     // Conservative: any shell control/redirection metacharacter that could
     // introduce a second program defeats leading-token matching, so refuse the
@@ -1793,13 +1787,25 @@ enum FindType {
     Any,
 }
 
+/// Harness-owned semantic category for repository entries. `Source` is backed
+/// by the resolved language-pack registry; it is not a prompt-specific
+/// extension list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FindCategory {
+    Any,
+    Source,
+}
+
 /// Result ordering for the embedded `find` tool (#1258). `Name` is the historical
-/// default (paths ascending); `Size` orders by byte size descending so an
-/// evidence-only turn can answer "the N largest files" without shell access.
+/// default (paths ascending); `Size` orders by byte size descending, `Lines` by
+/// newline count descending — so an evidence-only turn can answer "the N largest
+/// files" (bytes) OR "the files with the most lines" without shell access. Line
+/// count is a first-class evidence question, not a bytesize fallback.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FindSort {
     Name,
     Size,
+    Lines,
 }
 
 /// Parsed, validated options for one `find` invocation.
@@ -1807,6 +1813,10 @@ struct FindOpts<'a> {
     /// Glob matched against each basename; `None` matches everything.
     name: Option<&'a str>,
     type_filter: FindType,
+    /// Semantic file category. A named language implies `Source`.
+    category: FindCategory,
+    /// Optional language-pack name or human alias.
+    language: Option<&'a str>,
     /// Max depth below the search root (1 = immediate children); `None` =
     /// unlimited.
     max_depth: Option<usize>,
@@ -1817,7 +1827,11 @@ struct FindOpts<'a> {
     case_sensitive: bool,
     /// Prefix each line with the entry's byte size + a tab (#1258).
     show_size: bool,
-    /// Result ordering (#1258): [`FindSort::Name`] (default) or size-descending.
+    /// Prefix each line with the entry's line (newline) count + a tab. When set
+    /// (or `sort=lines`) the metric column is line count, not bytes.
+    show_lines: bool,
+    /// Result ordering (#1258): [`FindSort::Name`] (default), byte-size- or
+    /// line-count-descending.
     sort: FindSort,
 }
 
@@ -1835,6 +1849,12 @@ fn find_detail(path: &str, opts: &FindOpts) -> String {
         FindType::Dirs => parts.push("type=d".to_string()),
         FindType::Any => {}
     }
+    if opts.category == FindCategory::Source {
+        parts.push("category=source".to_string());
+    }
+    if let Some(language) = opts.language {
+        parts.push(format!("language={language}"));
+    }
     if let Some(d) = opts.max_depth {
         parts.push(format!("depth={d}"));
     }
@@ -1848,11 +1868,16 @@ fn find_detail(path: &str, opts: &FindOpts) -> String {
     if !opts.case_sensitive {
         parts.push("icase".to_string());
     }
-    if matches!(opts.sort, FindSort::Size) {
-        parts.push("sort=size".to_string());
+    match opts.sort {
+        FindSort::Size => parts.push("sort=size".to_string()),
+        FindSort::Lines => parts.push("sort=lines".to_string()),
+        FindSort::Name => {}
     }
     if opts.show_size {
         parts.push("size".to_string());
+    }
+    if opts.show_lines {
+        parts.push("lines".to_string());
     }
     if parts.is_empty() {
         path.to_string()
@@ -1869,6 +1894,18 @@ fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
             Some("d") => FindType::Dirs,
             _ => FindType::Any,
         },
+        // `code: true` is the backward-compatible alias for the source category
+        // (#1405 shipped it; #1406 makes `category`/`language` canonical). A
+        // named language also implies source.
+        category: if args["category"].as_str() == Some("source")
+            || args["language"].as_str().is_some()
+            || args["code"].as_bool() == Some(true)
+        {
+            FindCategory::Source
+        } else {
+            FindCategory::Any
+        },
+        language: args["language"].as_str(),
         max_depth: args["max_depth"].as_u64().map(|d| d as usize),
         max_results: args["max_results"]
             .as_u64()
@@ -1877,11 +1914,28 @@ fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
         respect_gitignore: args["respect_gitignore"].as_bool().unwrap_or(true),
         case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
         show_size: args["show_size"].as_bool().unwrap_or(false),
+        show_lines: args["show_lines"].as_bool().unwrap_or(false),
         sort: match args["sort"].as_str() {
             Some("size") => FindSort::Size,
+            Some("lines") => FindSort::Lines,
             _ => FindSort::Name,
         },
     }
+}
+
+fn find_source_extensions(
+    workspace: &std::path::Path,
+    opts: &FindOpts<'_>,
+) -> Result<Option<Vec<String>>, String> {
+    if opts.category == FindCategory::Any {
+        return Ok(None);
+    }
+    let api_cfg = crate::Config::resolve()
+        .ok()
+        .and_then(|cfg| cfg.context.map(|context| context.api_surface))
+        .unwrap_or_default();
+    let packs = crate::api_surface::resolve_language_packs(workspace, &api_cfg);
+    crate::api_surface::source_extensions_for(&packs, opts.language).map(Some)
 }
 
 /// Pure: order, de-duplicate, truncate, and format the collected `(size, path)`
@@ -1900,16 +1954,19 @@ fn finalize_find(mut entries: Vec<(u64, String)>, opts: &FindOpts<'_>) -> (Vec<S
     // sort, which also establishes the Name ordering.
     entries.sort_by(|a, b| a.1.cmp(&b.1));
     entries.dedup_by(|a, b| a.1 == b.1);
-    if matches!(opts.sort, FindSort::Size) {
+    if matches!(opts.sort, FindSort::Size | FindSort::Lines) {
         entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     }
     let truncated = entries.len() > opts.max_results;
     entries.truncate(opts.max_results);
+    // The metric column is line count in line-mode (show_lines or sort=lines),
+    // otherwise byte size — a single tab-prefixed number either way.
+    let show_metric = opts.show_size || opts.show_lines;
     let lines = entries
         .into_iter()
-        .map(|(size, path)| {
-            if opts.show_size {
-                format!("{size}\t{path}")
+        .map(|(metric, path)| {
+            if show_metric {
+                format!("{metric}\t{path}")
             } else {
                 path
             }
@@ -1945,6 +2002,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "web_fetch" => string("url", ""),
         "request_permissions" => string("capability", ""),
         "request_user_input" => string("question", ""),
+        "select_operating_mode" => string("mode", ""),
         "prompt_read" | "artifact_read" => string("address", "current"),
         "tool_search" | "recall" | "code_search" | "experience_recall" => string("query", ""),
         "where_is" => string("symbol", ""),
@@ -2078,6 +2136,7 @@ fn find_walk(
     root: &std::path::Path,
     workspace_root: &std::path::Path,
     opts: &FindOpts<'_>,
+    source_extensions: Option<&[String]>,
     mut on_hit: impl FnMut(&str),
 ) -> Result<(Vec<String>, bool), String> {
     let pattern = match opts.name {
@@ -2133,6 +2192,21 @@ fn find_walk(
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if let Some(extensions) = source_extensions {
+            if is_dir
+                || !entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extensions
+                            .iter()
+                            .any(|known| known.eq_ignore_ascii_case(extension))
+                    })
+            {
+                continue;
+            }
+        }
         match opts.type_filter {
             FindType::Files if is_dir => continue,
             FindType::Dirs if !is_dir => continue,
@@ -2144,22 +2218,51 @@ fn find_walk(
                 continue;
             }
         }
-        // Size is read only when it will be used (shown or sorted on) — an
-        // unreadable metadata falls back to 0 rather than dropping the match.
-        let size = if opts.show_size || matches!(opts.sort, FindSort::Size) {
-            entry.metadata().map(|m| m.len()).unwrap_or(0)
-        } else {
-            0
-        };
         let rel = entry
             .path()
             .strip_prefix(workspace_root)
             .unwrap_or_else(|_| entry.path());
         let rel_display = rel.to_string_lossy().replace('\\', "/");
+        // The metric is read only when it will be used (shown or sorted on). Line
+        // mode (show_lines / sort=lines) wins over byte mode when both are set:
+        // reads the file and counts newlines (dirs → 0); byte mode reads cheap
+        // metadata. Unreadable → 0 rather than dropping the match.
+        let want_lines = opts.show_lines || matches!(opts.sort, FindSort::Lines);
+        let want_size = opts.show_size || matches!(opts.sort, FindSort::Size);
+        let metric = if want_lines {
+            if is_dir {
+                0
+            } else {
+                count_lines(entry.path())
+            }
+        } else if want_size {
+            entry.metadata().map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
         on_hit(&rel_display);
-        entries.push((size, rel_display));
+        entries.push((metric, rel_display));
     }
     Ok(finalize_find(entries, opts))
+}
+
+/// Count newlines in a file, matching `wc -l` semantics (a trailing line without
+/// a newline is not counted). Unreadable files → 0 so the match survives rather
+/// than aborting the walk. Reads the whole file — line count is a legitimate
+/// evidence question and the walk is already bounded to a source workspace. The
+/// counting itself is factored into [`count_newlines`] so it stays unit-testable
+/// without touching the filesystem (the mocked tier).
+fn count_lines(path: &std::path::Path) -> u64 {
+    match std::fs::read(path) {
+        Ok(bytes) => count_newlines(&bytes),
+        Err(_) => 0,
+    }
+}
+
+/// Pure `wc -l` newline count over raw bytes: the number of `\n` bytes, so a
+/// final line lacking a trailing newline is not counted.
+fn count_newlines(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|&&b| b == b'\n').count() as u64
 }
 
 /// Execute a single tool call and return the result string sent back to the model.
@@ -2424,8 +2527,12 @@ pub(crate) struct ToolCollaborators<'a> {
     pub(crate) scratchpad_store: Option<&'a dyn super::scratchpad::ScratchpadStore>,
     pub(crate) code_search: Option<super::semantic::CodeSearch<'a>>,
     pub(crate) where_is: Option<&'a crate::where_is::WhereIsIndex>,
+    /// #1387 navigator tool context (usage/graph/project). `None` ⇒ tools degrade.
+    pub(crate) nav: Option<crate::navigator::NavToolCtx<'a>>,
     pub(crate) experience_store: Option<&'a dyn super::experiential::ExperienceStore>,
     pub(crate) step_ledger: Option<&'a dyn super::scheduled::StepLedger>,
+    pub(crate) operating_mode_control: Option<&'a dyn super::OperatingModeControl>,
+    pub(crate) plan_mode_control: Option<&'a dyn super::PlanModeControl>,
     pub(crate) spill_store: Option<&'a dyn SpillStore>,
     pub(crate) persona_tools: Option<&'a [String]>,
     pub(crate) live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
@@ -2470,6 +2577,7 @@ pub async fn execute_tool(
         scratchpad_store,
         code_search,
         where_is,
+        nav: None,
         experience_store,
         step_ledger,
         ..Default::default()
@@ -2531,6 +2639,7 @@ pub async fn execute_tool_with_offload(
         scratchpad_store,
         code_search,
         where_is,
+        nav: None,
         experience_store,
         step_ledger,
         spill_store,
@@ -2601,6 +2710,7 @@ pub async fn execute_tool_with_offload_and_prompt(
         scratchpad_store,
         code_search,
         where_is,
+        nav: None,
         experience_store,
         step_ledger,
         spill_store,
@@ -2673,6 +2783,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         scratchpad_store,
         code_search,
         where_is,
+        nav: None,
         experience_store,
         step_ledger,
         spill_store,
@@ -2834,12 +2945,27 @@ async fn execute_tool_inner(
         scratchpad_store,
         code_search,
         where_is,
+        nav,
         experience_store,
         step_ledger,
+        operating_mode_control,
+        plan_mode_control,
         spill_store,
         persona_tools,
         live_tool_output,
     } = collab;
+
+    // A model-entered Plan phase takes effect immediately for every later
+    // tool call in the same inference round. The outer TUI also resolves it
+    // into Plan caveats on the next turn; this local clamp closes the
+    // enter-then-write gap before that boundary is rebuilt.
+    let disposition = if plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode)
+        && disposition == PromptDisposition::Act
+    {
+        PromptDisposition::Plan
+    } else {
+        disposition
+    };
 
     // Prompt-comprehension boundary: enforce the validated disposition BEFORE
     // every other routing or grant path. In particular, unknown names (including
@@ -2875,7 +3001,8 @@ async fn execute_tool_inner(
     // active persona does not grant, before any routing (alias, run_command
     // redirect). Checked against the CANONICAL name (aliases resolved first) so a
     // denied tool can't slip past under a foreign spelling; the always-on infra
-    // tools ([`is_always_on_tool`]) always pass or the loop would wedge.
+    // tools (always-on infrastructure plus presence-gated session controls)
+    // always pass or the loop could wedge.
     //
     // Remote MCP tools are EXCLUDED here (FR-2, #1001): they carry no fs/exec/net
     // axis, so instead of a hard veto they fall through to the `mcp.handles`
@@ -3067,6 +3194,22 @@ async fn execute_tool_inner(
             None => "unknown tool: where_is (no symbol index built for this session)".to_string(),
         },
 
+        // #1387 Code Navigator narrow tools — degrade via execute_nav_tool when
+        // session indexes are absent.
+        name if crate::navigator::NAV_TOOL_NAMES.contains(&name) => {
+            let ctx = nav.unwrap_or(crate::navigator::NavToolCtx {
+                workspace,
+                where_is,
+                usage: None,
+                graph: None,
+                project: None,
+                files: None,
+                status: None,
+            });
+            crate::navigator::execute_nav_tool(name, args, &ctx)
+                .unwrap_or_else(|| format!("unknown tool: {name}"))
+        }
+
         // Step 26.6a (#585): experiential record/recall — presence-gated on the
         // store (advertised only when the `experiential` feature is on).
         "experience_record" => match experience_store {
@@ -3113,23 +3256,45 @@ async fn execute_tool_inner(
             None => "unknown tool: update_plan (scheduled planning is off)".to_string(),
         },
 
-        // #1193: enter/exit the read-only PLAN phase. The env flag is read by
-        // the TUI when resolving per-turn caveats (it MEETs plan_phase_clamp,
-        // which only narrows authority — self-restriction is always safe). The
-        // clamp takes effect on the NEXT turn; this turn's remaining calls stay
-        // under the current authority.
-        "enter_plan_mode" => {
-            // SAFETY: single-threaded session tool dispatch; the TUI reads it
-            // between turns (same pattern as NEWT_FULL_ACCESS / NEWT_DISABLE_OCAP).
-            unsafe { std::env::set_var("NEWT_PLAN_PHASE", "1") };
-            "entered PLAN MODE (read-only): writes are denied until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute."
-                .to_string()
-        }
-        "exit_plan_mode" => {
-            // SAFETY: as above.
-            unsafe { std::env::remove_var("NEWT_PLAN_PHASE") };
-            "exited PLAN MODE: writes re-enabled. Execute your plan step by step, marking each done with update_plan as you go."
-                .to_string()
+        // #1193: enter/exit the session-local, read-only Plan phase. The
+        // dispatcher consults the same collaborator before every call, so a
+        // successful enter clamps later calls in this model tool round.
+        "enter_plan_mode" => match (plan_mode_control, step_ledger) {
+            (Some(control), Some(_)) => match control.set_plan_mode(true) {
+                Ok(()) => "entered PLAN MODE (read-only): subsequent tool calls are immediately limited to Plan reads and the plan ledger until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute.".to_string(),
+                Err(error) => format!("error: enter_plan_mode: {error}"),
+            },
+            _ => {
+                "unknown tool: enter_plan_mode (scheduled planning and a session Plan-mode control are both required)".to_string()
+            }
+        },
+        "exit_plan_mode" => match plan_mode_control {
+            Some(control) => match control.set_plan_mode(false) {
+                Ok(()) => "exited the model-entered PLAN PHASE. Subsequent tool calls return to this turn's validated disposition and underlying session permissions; the next outer turn returns to the human-selected operating mode. `/mode plan` and other clamps still remain read-only.".to_string(),
+                Err(error) => format!("error: exit_plan_mode: {error}"),
+            },
+            None => {
+                "unknown tool: exit_plan_mode (no session Plan-mode control is available)"
+                    .to_string()
+            }
+        },
+        // `/mode auto`: schedule a bounded working-style transition for a
+        // future turn. The injected collaborator owns session-local state;
+        // this call cannot alter the current disposition or caveats.
+        "select_operating_mode" => {
+            let mode = args
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match operating_mode_control {
+                Some(control) => control
+                    .select_operating_mode(mode)
+                    .unwrap_or_else(|error| format!("error: select_operating_mode: {error}")),
+                None => {
+                    "unknown tool: select_operating_mode (available only while /mode auto is active)"
+                        .to_string()
+                }
+            }
         }
         // #716: read-only plan view (the alias target for "what was I doing?"
         // probes) — same presence gate as update_plan.
@@ -3197,6 +3362,9 @@ async fn execute_tool_inner(
                     code_search.is_some(),
                     experience_store.is_some(),
                     step_ledger.is_some(),
+                    operating_mode_control.is_some(),
+                    plan_mode_control.is_some(),
+                    plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode),
                 ),
                 persona_tools,
             );
@@ -3911,6 +4079,11 @@ async fn execute_tool_inner(
                 );
             }
             let opts = find_opts_from_args(args);
+            let source_extensions =
+                match find_source_extensions(std::path::Path::new(workspace), &opts) {
+                    Ok(extensions) => extensions,
+                    Err(error) => return format!("error: {error}"),
+                };
             if !full.exists() {
                 return format!("error: no such path '{path}'");
             }
@@ -3940,7 +4113,13 @@ async fn execute_tool_inner(
                     relay.write(crate::agentic::ToolOutputStream::Stdout, &chunk);
                 }
             };
-            let walked = find_walk(&full, std::path::Path::new(workspace), &opts, on_hit);
+            let walked = find_walk(
+                &full,
+                std::path::Path::new(workspace),
+                &opts,
+                source_extensions.as_deref(),
+                on_hit,
+            );
             if let Some(live) = live.as_mut() {
                 live.finish();
             }
@@ -4086,11 +4265,14 @@ mod tests {
         FindOpts {
             name: None,
             type_filter: FindType::Any,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results,
             respect_gitignore: true,
             case_sensitive: true,
             show_size,
+            show_lines: false,
             sort,
         }
     }
@@ -4110,6 +4292,68 @@ mod tests {
         let bogus = serde_json::json!({ "sort": "bogus" });
         let bad = find_opts_from_args(&bogus);
         assert_eq!(bad.sort, FindSort::Name);
+    }
+
+    #[test]
+    fn find_opts_parses_line_count_options() {
+        // #1387: line count is a first-class evidence measure, parsed like size.
+        let lined = serde_json::json!({ "show_lines": true, "sort": "lines" });
+        let opts = find_opts_from_args(&lined);
+        assert!(opts.show_lines);
+        assert_eq!(opts.sort, FindSort::Lines);
+        // Default: no line column.
+        let empty = serde_json::json!({});
+        assert!(!find_opts_from_args(&empty).show_lines);
+    }
+
+    #[test]
+    fn find_opts_parse_harness_source_category_and_language() {
+        let source = serde_json::json!({ "category": "source", "language": "C++" });
+        let opts = find_opts_from_args(&source);
+
+        assert_eq!(opts.category, FindCategory::Source);
+        assert_eq!(opts.language, Some("C++"));
+        let empty = serde_json::json!({});
+        let defaults = find_opts_from_args(&empty);
+        assert_eq!(defaults.category, FindCategory::Any);
+        assert_eq!(defaults.language, None);
+    }
+
+    #[test]
+    fn finalize_find_line_sort_is_lines_descending_with_show_lines() {
+        // The metric column carries line counts in line mode; ordering is
+        // descending with a path tie-break — the "files with the most lines"
+        // answer, no `wc -l`.
+        let entries = vec![
+            (12, "short.rs".to_string()),
+            (4247, "huge.rs".to_string()),
+            (300, "mid.rs".to_string()),
+        ];
+        let opts = FindOpts {
+            show_lines: true,
+            sort: FindSort::Lines,
+            ..find_opts(1000, false, FindSort::Lines)
+        };
+        let (lines, _) = finalize_find(entries, &opts);
+        assert_eq!(
+            lines,
+            vec!["4247\thuge.rs", "300\tmid.rs", "12\tshort.rs"],
+            "line count descending, each line prefixed '<lines>\\t<path>'"
+        );
+    }
+
+    #[test]
+    fn count_newlines_matches_wc_l_semantics() {
+        // Newlines are counted (a trailing line without a newline is not),
+        // mirroring `wc -l` — verified purely over bytes, no filesystem.
+        assert_eq!(count_newlines(b"a\nb\nc\n"), 3);
+        assert_eq!(
+            count_newlines(b"a\nb"),
+            1,
+            "trailing partial line uncounted"
+        );
+        assert_eq!(count_newlines(b""), 0);
+        assert_eq!(count_newlines(b"no newline at all"), 0);
     }
 
     #[test]
@@ -4810,11 +5054,14 @@ mod tests {
         let opts = FindOpts {
             name: None,
             type_filter: FindType::Any,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results: 1000,
             respect_gitignore: true,
             case_sensitive: true,
             show_size: false,
+            show_lines: false,
             sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ".");
@@ -4825,11 +5072,14 @@ mod tests {
         let opts = FindOpts {
             name: Some("*.rs"),
             type_filter: FindType::Files,
+            category: FindCategory::Any,
+            language: None,
             max_depth: Some(2),
             max_results: 50,
             respect_gitignore: false,
             case_sensitive: false,
             show_size: false,
+            show_lines: false,
             sort: FindSort::Name,
         };
         assert_eq!(
@@ -4843,11 +5093,14 @@ mod tests {
         let opts = FindOpts {
             name: None,
             type_filter: FindType::Dirs,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results: 1000,
             respect_gitignore: true,
             case_sensitive: true,
             show_size: false,
+            show_lines: false,
             sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ". (type=d)");
@@ -4858,16 +5111,63 @@ mod tests {
         let opts = FindOpts {
             name: Some("*.rs"),
             type_filter: FindType::Files,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results: 10,
             respect_gitignore: true,
             case_sensitive: true,
             show_size: true,
+            show_lines: false,
             sort: FindSort::Size,
         };
         assert_eq!(
             find_detail(".", &opts),
             ". (name=*.rs, type=f, max=10, sort=size, size)"
+        );
+    }
+
+    #[test]
+    fn find_detail_notes_the_line_column_and_line_sort() {
+        let opts = FindOpts {
+            name: Some("*.rs"),
+            type_filter: FindType::Files,
+            category: FindCategory::Any,
+            language: None,
+            max_depth: None,
+            max_results: 10,
+            respect_gitignore: true,
+            case_sensitive: true,
+            show_size: false,
+            show_lines: true,
+            sort: FindSort::Lines,
+        };
+        assert_eq!(
+            find_detail(".", &opts),
+            ". (name=*.rs, type=f, max=10, sort=lines, lines)"
+        );
+    }
+
+    #[test]
+    fn find_detail_notes_the_source_category_filter() {
+        // #1406: the `code:true` boolean was replaced by the language-pack
+        // `category=source` filter; find_detail now surfaces that instead.
+        let opts = FindOpts {
+            name: None,
+            type_filter: FindType::Files,
+            max_depth: None,
+            max_results: 10,
+            respect_gitignore: true,
+            case_sensitive: true,
+            show_size: false,
+            show_lines: true,
+            category: FindCategory::Source,
+            language: None,
+            sort: FindSort::Lines,
+        };
+        assert_eq!(
+            find_detail(".", &opts),
+            ". (type=f, category=source, max=10, sort=lines, lines)"
         );
     }
 
@@ -4886,7 +5186,8 @@ mod tests {
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
         let merged = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let names: Vec<&str> = merged
             .as_array()
@@ -4939,6 +5240,18 @@ mod tests {
                 // tool_search; degrades honestly when no symbol index is built),
                 // pushed after render_report.
                 "where_is",
+                // #1387 Code Navigator — Always-gated structural/lexical tools
+                // (degrade when session indexes are absent).
+                "goto_definition",
+                "text_search",
+                "find_references",
+                "find_tests",
+                "find_callers",
+                "find_callees",
+                "find_implementations",
+                "find_hierarchy",
+                "inspect_type",
+                "impact",
             ]
         );
     }
@@ -4949,8 +5262,9 @@ mod tests {
     /// catalog whole (the zero-cost path for every non-persona session).
     #[test]
     fn persona_allow_list_filters_the_advertised_catalog() {
-        let full =
-            merged_tool_definitions(&NoMcp, true, true, true, true, true, true, true, true, true);
+        let full = merged_tool_definitions(
+            &NoMcp, true, true, true, true, true, true, true, true, true, true, true, true,
+        );
         let name_set = |v: &serde_json::Value| -> Vec<String> {
             v.as_array()
                 .unwrap()
@@ -4988,10 +5302,11 @@ mod tests {
             "get_context_remaining",
             "request_user_input",
             "lifecycle",
+            "select_operating_mode",
         ] {
             assert!(
                 got.iter().any(|n| n == infra),
-                "{infra} is always-on and must survive any persona"
+                "{infra} is session infrastructure and must survive any persona"
             );
         }
     }
@@ -5007,6 +5322,10 @@ mod tests {
         assert!(
             persona_tool_allowed("request_user_input", &allow),
             "always-on infra → allowed even when unlisted"
+        );
+        assert!(
+            persona_tool_allowed("select_operating_mode", &allow),
+            "presence-gated session control → allowed even when unlisted"
         );
         assert!(
             !persona_tool_allowed("write_file", &allow),
@@ -5027,6 +5346,9 @@ mod tests {
             { "type": "function", "function": { "name": "read_file" } },
             { "type": "function", "function": { "name": "write_file" } },
             { "type": "function", "function": { "name": "run_command" } },
+            { "type": "function", "function": { "name": "update_plan" } },
+            { "type": "function", "function": { "name": "exit_plan_mode" } },
+            { "type": "function", "function": { "name": "select_operating_mode" } },
             { "type": "function", "function": { "name": "request_permissions" } },
             { "type": "function", "function": { "name": "incident__read" } },
             { "not": "a callable definition" }
@@ -5041,8 +5363,42 @@ mod tests {
         };
 
         let research = filter_tools_for_disposition(defs.clone(), PromptDisposition::Research);
-        assert_eq!(names(&research), vec!["read_file"]);
+        assert_eq!(names(&research), vec!["read_file", "select_operating_mode"]);
+        let plan = filter_tools_for_disposition(defs.clone(), PromptDisposition::Plan);
+        assert_eq!(
+            names(&plan),
+            vec![
+                "read_file",
+                "update_plan",
+                "exit_plan_mode",
+                "select_operating_mode"
+            ]
+        );
         assert!(tool_allowed(PromptDisposition::Explain, "read_file"));
+        assert!(tool_allowed(PromptDisposition::Plan, "update_plan"));
+        assert!(!tool_allowed(PromptDisposition::Explain, "update_plan"));
+        assert!(!tool_allowed(PromptDisposition::Research, "update_plan"));
+        assert!(tool_allowed(PromptDisposition::Plan, "exit_plan_mode"));
+        assert!(
+            !tool_allowed(PromptDisposition::Plan, "web_fetch"),
+            "offline Plan must not advertise a tool its caveat always denies"
+        );
+        assert!(
+            tool_allowed(PromptDisposition::Research, "web_fetch"),
+            "Research (including Diagnose) may gather remote read-only evidence"
+        );
+        assert!(tool_allowed(
+            PromptDisposition::Research,
+            "select_operating_mode"
+        ));
+        assert!(tool_allowed(
+            PromptDisposition::Plan,
+            "select_operating_mode"
+        ));
+        assert!(!tool_allowed(
+            PromptDisposition::Ask,
+            "select_operating_mode"
+        ));
         assert!(!tool_allowed(PromptDisposition::Explain, "write_file"));
         assert!(!tool_allowed(PromptDisposition::Research, "incident__read"));
         assert!(!tool_allowed(PromptDisposition::Ask, "read_file"));
@@ -5053,6 +5409,62 @@ mod tests {
         // gated tool that would re-box the diagnosed session).
         assert!(tool_allowed(PromptDisposition::Explain, "find"));
         assert!(tool_allowed(PromptDisposition::Research, "find"));
+        // #1387 / line-count lock-in: Research must also keep `find`, AND the
+        // advertised schema must teach `sort=lines` + `show_lines`. Losing either
+        // re-opens the double-bind (Research admits find but can't answer lines
+        // → model dumps or reaches for `wc -l` → empty/denied).
+        let research_catalog = filter_tools_for_disposition(
+            merged_tool_definitions(
+                &NoMcp, false, false, false, false, false, false, false, false, false, false,
+                false, false,
+            ),
+            PromptDisposition::Research,
+        );
+        let find_def = research_catalog
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|d| d["function"]["name"].as_str() == Some("find"))
+            .expect("Research must advertise find");
+        let props = &find_def["function"]["parameters"]["properties"];
+        assert!(
+            props.get("show_lines").is_some(),
+            "Research find schema must expose show_lines: {find_def}"
+        );
+        assert!(
+            props.get("code").is_some(),
+            "Research find schema must expose code (source-only filter): {find_def}"
+        );
+        let desc = find_def["function"]["description"].as_str().unwrap_or("");
+        assert!(
+            desc.contains("category") && desc.contains("source"),
+            "find description must teach category=source for source rankings: {desc}"
+        );
+        // #1406: GFM-table response steering moved out of the tool description
+        // into the prompt-intake layer (see prompt_intake.rs
+        // `*_steers_*_markdown_table` tests); the description no longer carries it.
+        let sort_enum = props["sort"]["enum"]
+            .as_array()
+            .expect("sort must be an enum");
+        assert!(
+            sort_enum.iter().any(|v| v.as_str() == Some("lines")),
+            "Research find sort enum must include 'lines': {sort_enum:?}"
+        );
+        assert!(
+            props.get("category").is_some() && props.get("language").is_some(),
+            "Research find schema must teach the harness source category + language filter: \
+             {find_def}"
+        );
+        assert!(
+            find_def["function"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("repository code investigation")
+                        && description.contains("source by default")
+                }),
+            "the tool catalog must reinforce the standing source-first repository policy: \
+             {find_def}"
+        );
         // #1259: the formal ask-the-human escalation IS admitted in evidence
         // turns — a boxed-in model ends as a question, not penalized narration…
         assert!(tool_allowed(
@@ -5235,8 +5647,9 @@ mod tests {
     /// fails here.
     #[test]
     fn advertised_set_matches_all_tool_names_both_directions() {
-        let all =
-            merged_tool_definitions(&NoMcp, true, true, true, true, true, true, true, true, true);
+        let all = merged_tool_definitions(
+            &NoMcp, true, true, true, true, true, true, true, true, true, true, true, true,
+        );
         let advertised: std::collections::HashSet<&str> = all
             .as_array()
             .unwrap()
@@ -5378,12 +5791,14 @@ mod tests {
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
         let with = merged_tool_definitions(
-            &NoMcp, true, false, false, false, false, false, false, false, false,
+            &NoMcp, true, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
@@ -5403,16 +5818,19 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"recall"), "got: {base}");
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(!names(&without).contains(&"recall"));
         let with = merged_tool_definitions(
-            &NoMcp, false, true, false, false, false, false, false, false, false,
+            &NoMcp, false, true, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&with).contains(&"recall"), "got: {with}");
         // The two gates are independent: both on advertises both.
         let both = merged_tool_definitions(
-            &NoMcp, true, true, false, false, false, false, false, false, false,
+            &NoMcp, true, true, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&both).contains(&"save_note"));
         assert!(names(&both).contains(&"recall"));
@@ -5434,17 +5852,19 @@ mod tests {
         assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
         // Flag off (every existing caller, the inert default) → not advertised.
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(!names(&without).contains(&"memory_fetch"));
         // Flag on → advertised.
         let with = merged_tool_definitions(
-            &NoMcp, false, false, true, false, false, false, false, false, false,
+            &NoMcp, false, false, true, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
         // Independent of the save_note / recall gates: all three on lists all.
         let all = merged_tool_definitions(
-            &NoMcp, true, true, true, false, false, false, false, false, false,
+            &NoMcp, true, true, true, false, false, false, false, false, false, false, false, false,
         );
         assert!(names(&all).contains(&"save_note"));
         assert!(names(&all).contains(&"recall"));
@@ -6172,16 +6592,19 @@ mod tests {
                 .collect()
         }
         let with = merged_tool_definitions(
-            &NoMcp, false, false, false, true, false, false, false, false, false,
+            &NoMcp, false, false, false, true, false, false, false, false, false, false, false,
+            false,
         );
         assert!(names(&with).contains(&"git"), "with_git advertises git");
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(!names(&without).contains(&"git"), "no git without the gate");
         // #479: the /team toggle advertises both crew tools, and only then.
         let team = merged_tool_definitions(
-            &NoMcp, false, false, false, false, true, false, false, false, false,
+            &NoMcp, false, false, false, false, true, false, false, false, false, false, false,
+            false,
         );
         assert!(
             names(&team).contains(&"crew") && names(&team).contains(&"compose_roster"),
@@ -6193,7 +6616,8 @@ mod tests {
         );
         // Step 26.4 (#583): the scratchpad state tools, only with the gate on.
         let scratch = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, true, false, false, false,
+            &NoMcp, false, false, false, false, false, true, false, false, false, false, false,
+            false,
         );
         for t in ["state_set", "state_get", "state_clear"] {
             assert!(
@@ -6208,7 +6632,8 @@ mod tests {
         }
         // Step 26.5.5 (#582): the code_search tool, only with its gate on.
         let code = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, true, false, false,
+            &NoMcp, false, false, false, false, false, false, true, false, false, false, false,
+            false,
         );
         assert!(
             names(&code).contains(&"code_search"),
@@ -6221,7 +6646,8 @@ mod tests {
         assert!(!is_hallucination("code_search", &serde_json::json!({})));
         // Step 26.6a (#585): the experiential record/recall tools, only with the gate.
         let exp = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, true, false,
+            &NoMcp, false, false, false, false, false, false, false, true, false, false, false,
+            false,
         );
         for t in ["experience_record", "experience_recall"] {
             assert!(names(&exp).contains(&t), "{t} advertised with_experiential");
@@ -6234,7 +6660,8 @@ mod tests {
         // Step 26.6b (#586) / #715 PR2: the scheduled update_plan + plan_get tools,
         // only with the gate (plan_set/plan_advance collapsed into update_plan).
         let sched = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, true,
+            &NoMcp, false, false, false, false, false, false, false, false, true, false, false,
+            false,
         );
         for t in ["update_plan", "plan_get"] {
             assert!(names(&sched).contains(&t), "{t} advertised with_scheduled");
@@ -6244,6 +6671,75 @@ mod tests {
                 "{t} is a real tool"
             );
         }
+        for t in ["enter_plan_mode", "exit_plan_mode"] {
+            assert!(
+                !names(&sched).contains(&t),
+                "{t} needs a session Plan control as well as the scheduled ledger"
+            );
+        }
+        let plan_control_only = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, true,
+            false,
+        );
+        assert!(
+            !names(&plan_control_only).contains(&"enter_plan_mode"),
+            "enter_plan_mode needs scheduled planning as well as the session control"
+        );
+        assert!(
+            !names(&plan_control_only).contains(&"exit_plan_mode"),
+            "an inactive control must not advertise an unnecessary exit"
+        );
+        let active_plan_control = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, true,
+            true,
+        );
+        assert!(
+            !names(&active_plan_control).contains(&"enter_plan_mode"),
+            "enter still requires the scheduled ledger"
+        );
+        assert!(
+            names(&active_plan_control).contains(&"exit_plan_mode"),
+            "an active Plan phase must keep exit available if scheduled planning is toggled off"
+        );
+        let plan_ready_inactive = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, true, false, true,
+            false,
+        );
+        assert!(
+            names(&plan_ready_inactive).contains(&"enter_plan_mode"),
+            "scheduled planning plus a control advertises enter"
+        );
+        assert!(
+            names(&plan_ready_inactive).contains(&"exit_plan_mode"),
+            "a frozen multi-round catalog that advertises enter must also advertise same-turn exit"
+        );
+        let plan_mode = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, true, false, true, true,
+        );
+        for t in ["enter_plan_mode", "exit_plan_mode"] {
+            assert!(
+                names(&plan_mode).contains(&t),
+                "{t} is advertised when both required seams are present"
+            );
+        }
+        // `/mode auto`: the model-facing selector exists only when the
+        // session injects its bounded next-turn control.
+        let operating_mode = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false, true, false,
+            false,
+        );
+        assert!(
+            names(&operating_mode).contains(&"select_operating_mode"),
+            "auto-mode control advertises its selector"
+        );
+        assert!(
+            !names(&without).contains(&"select_operating_mode"),
+            "selector is hidden outside /mode auto"
+        );
+        assert!(!is_hallucination(
+            "select_operating_mode",
+            &serde_json::json!({})
+        ));
     }
 
     #[tokio::test]
@@ -6348,6 +6844,8 @@ mod tests {
             embedder: &E,
             index: &idx,
             top_k: 1,
+            steer: None,
+            status: None,
         };
         let out = execute_tool(
             "code_search",
@@ -6694,32 +7192,30 @@ mod execute_tool_branch_tests {
 
     async fn run_scheduled_tool(
         name: &str,
+        args: &serde_json::Value,
         ws: &tempfile::TempDir,
         ledger: &crate::agentic::scheduled::SessionStepLedger,
+        plan_mode_control: &dyn crate::agentic::PlanModeControl,
     ) -> String {
-        execute_tool(
+        execute_tool_with_collaborators(
             name,
-            &serde_json::json!({}),
+            args,
             &ws.path().to_string_lossy(),
             false,
             20,
             &caveats_rw(ws.path()),
             &mut NoMcp,
+            ToolCollaborators {
+                step_ledger: Some(ledger as &dyn crate::agentic::scheduled::StepLedger),
+                plan_mode_control: Some(plan_mode_control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(ledger as &dyn crate::agentic::scheduled::StepLedger),
         )
         .await
+        .expect("test dispatch is not cancellable")
     }
 
     async fn run_git(
@@ -6837,21 +7333,124 @@ mod execute_tool_branch_tests {
     }
 
     #[tokio::test]
-    async fn enter_and_exit_plan_mode_toggle_the_phase_flag() {
-        // enter_plan_mode / exit_plan_mode are REAL tools that flip the
-        // read-only-phase env the TUI reads when clamping caveats (#1193).
+    async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
+        use crate::agentic::PlanModeControl as _;
+
+        #[derive(Default)]
+        struct TestPlanModeControl(std::sync::atomic::AtomicBool);
+
+        impl crate::agentic::PlanModeControl for TestPlanModeControl {
+            fn is_plan_mode(&self) -> bool {
+                self.0.load(std::sync::atomic::Ordering::Acquire)
+            }
+
+            fn set_plan_mode(&self, active: bool) -> Result<(), String> {
+                self.0.store(active, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        }
+
+        // enter_plan_mode / exit_plan_mode mutate only their injected session
+        // control; there is no process-global flag shared with another session.
         let ws = tempfile::TempDir::new().unwrap();
-        // Ensure a clean starting state.
-        // SAFETY: single-threaded test.
-        unsafe { std::env::remove_var("NEWT_PLAN_PHASE") };
-        assert!(!in_plan_phase());
         let ledger = crate::agentic::scheduled::SessionStepLedger::default();
-        let enter = run_scheduled_tool("enter_plan_mode", &ws, &ledger).await;
+        let control = TestPlanModeControl::default();
+        let other_session = TestPlanModeControl::default();
+        assert!(!control.is_plan_mode());
+        let control_only = execute_tool_with_collaborators(
+            "enter_plan_mode",
+            &serde_json::json!({}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats_rw(ws.path()),
+            &mut NoMcp,
+            ToolCollaborators {
+                plan_mode_control: Some(&control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .expect("test dispatch is not cancellable");
+        assert!(
+            control_only.contains("scheduled planning"),
+            "control-only fabricated call must fail honestly: {control_only}"
+        );
+        assert!(
+            !control.is_plan_mode(),
+            "a control without a plan ledger must not enter Plan"
+        );
+        let control_only_exit = execute_tool_with_collaborators(
+            "exit_plan_mode",
+            &serde_json::json!({}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats_rw(ws.path()),
+            &mut NoMcp,
+            ToolCollaborators {
+                plan_mode_control: Some(&control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Plan,
+            None,
+        )
+        .await
+        .expect("test dispatch is not cancellable");
+        assert!(
+            control_only_exit.contains("exited the model-entered PLAN PHASE"),
+            "exit must remain available when scheduled planning is off: {control_only_exit}"
+        );
+        let enter = run_scheduled_tool(
+            "enter_plan_mode",
+            &serde_json::json!({}),
+            &ws,
+            &ledger,
+            &control,
+        )
+        .await;
         assert!(enter.contains("PLAN MODE"), "{enter}");
-        assert!(in_plan_phase(), "enter_plan_mode set the phase");
-        let exit = run_scheduled_tool("exit_plan_mode", &ws, &ledger).await;
-        assert!(exit.contains("exited PLAN MODE"), "{exit}");
-        assert!(!in_plan_phase(), "exit_plan_mode cleared the phase");
+        assert!(control.is_plan_mode(), "enter_plan_mode set the phase");
+        assert!(
+            !other_session.is_plan_mode(),
+            "one session must not change another"
+        );
+        let denied_write = run_scheduled_tool(
+            "write_file",
+            &serde_json::json!({
+                "path": "must-not-write.txt",
+                "content": "no",
+            }),
+            &ws,
+            &ledger,
+            &control,
+        )
+        .await;
+        assert!(
+            denied_write.contains("current prompt disposition"),
+            "a write later in the same tool round must hit the immediate Plan clamp: {denied_write}"
+        );
+        assert!(
+            !ws.path().join("must-not-write.txt").exists(),
+            "entering Plan must prevent a later call from mutating the workspace"
+        );
+        let exit = run_scheduled_tool(
+            "exit_plan_mode",
+            &serde_json::json!({}),
+            &ws,
+            &ledger,
+            &control,
+        )
+        .await;
+        assert!(
+            exit.contains("exited the model-entered PLAN PHASE"),
+            "{exit}"
+        );
+        assert!(!control.is_plan_mode(), "exit_plan_mode cleared the phase");
     }
 
     #[tokio::test]
@@ -7157,6 +7756,42 @@ mod execute_tool_branch_tests {
         assert_eq!(out, "newt-core/src/pyo3_module.rs", "got: {out}");
     }
 
+    /// 2026-07-26 regression: "code files with the highest line counts" must
+    /// NOT rank AGENTS.md / Cargo.lock. `code: true` keeps language-pack
+    /// source only (same allowlist as nav gather).
+    #[tokio::test]
+    async fn find_code_true_excludes_docs_and_lockfiles_from_line_ranking() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("tall.rs"), "x\n".repeat(20)).unwrap();
+        std::fs::write(ws.path().join("short.rs"), "x\n".repeat(5)).unwrap();
+        std::fs::write(ws.path().join("AGENTS.md"), "d\n".repeat(200)).unwrap();
+        std::fs::write(ws.path().join("Cargo.lock"), "l\n".repeat(100)).unwrap();
+        std::fs::write(ws.path().join("LICENSE"), "L\n".repeat(50)).unwrap();
+        let out = run_find(
+            serde_json::json!({
+                "path": ".",
+                "type": "f",
+                "code": true,
+                "sort": "lines",
+                "show_lines": true,
+                "max_results": 10
+            }),
+            ws.path(),
+        )
+        .await;
+        assert!(
+            out.contains("20\ttall.rs") && out.contains("5\tshort.rs"),
+            "code sources with line counts: {out}"
+        );
+        assert!(
+            !out.contains("AGENTS.md") && !out.contains("Cargo.lock") && !out.contains("LICENSE"),
+            "docs/lockfiles/LICENSE must be excluded: {out}"
+        );
+        let tall = out.find("20\ttall.rs").expect("tall first");
+        let short = out.find("5\tshort.rs").expect("short second");
+        assert!(tall < short, "lines descending: {out}");
+    }
+
     /// The other call the blocked agent reached for:
     /// `find examples -maxdepth 2 -type f -name '*.py'`. Exercises glob + type
     /// filter + max_depth together, and confirms output is pre-sorted.
@@ -7178,6 +7813,73 @@ mod execute_tool_branch_tests {
         // Pre-sorted, exactly the two in-depth .py files, no dir, no .md, no
         // depth-3 file — and no shell `| sort` needed.
         assert_eq!(out, "examples/a.py\nexamples/sub/b.py", "got: {out}");
+    }
+
+    /// `code` is a harness-owned semantic category: it includes source files
+    /// from every registered language pack and excludes docs/manifests/locks.
+    /// This real-filesystem test grounds the pure language-registry classifier.
+    #[tokio::test]
+    async fn find_source_category_filters_repository_metadata_across_languages() {
+        let ws = tempfile::TempDir::new().unwrap();
+        for file in [
+            "src/main.rs",
+            "src/app.py",
+            "web/app.ts",
+            "java/App.java",
+            "native/app.cpp",
+            "dotnet/App.cs",
+            "ruby/app.rb",
+            "scripts/build.sh",
+            "AGENTS.md",
+            "Cargo.toml",
+            "Cargo.lock",
+        ] {
+            touch(ws.path(), file);
+        }
+
+        let out = run_find(
+            serde_json::json!({ "category": "source", "type": "f" }),
+            ws.path(),
+        )
+        .await;
+
+        for source in [
+            "src/main.rs",
+            "src/app.py",
+            "web/app.ts",
+            "java/App.java",
+            "native/app.cpp",
+            "dotnet/App.cs",
+            "ruby/app.rb",
+            "scripts/build.sh",
+        ] {
+            assert!(
+                out.lines().any(|line| line == source),
+                "missing {source}: {out}"
+            );
+        }
+        for metadata in ["AGENTS.md", "Cargo.toml", "Cargo.lock"] {
+            assert!(
+                !out.lines().any(|line| line == metadata),
+                "metadata is not source code ({metadata}): {out}"
+            );
+        }
+    }
+
+    /// A named language narrows the generic source category through pack
+    /// aliases. The mocked tool schema and pure registry tests sit underneath;
+    /// this real walk proves the filter reaches filesystem behavior.
+    #[tokio::test]
+    async fn find_language_alias_narrows_source_files() {
+        let ws = tempfile::TempDir::new().unwrap();
+        for file in ["native/a.c", "native/b.cpp", "dotnet/App.cs", "src/main.rs"] {
+            touch(ws.path(), file);
+        }
+
+        let cpp = run_find(serde_json::json!({ "language": "C++" }), ws.path()).await;
+        assert_eq!(cpp, "native/a.c\nnative/b.cpp");
+        let csharp = run_find(serde_json::json!({ "language": "C#" }), ws.path()).await;
+        assert_eq!(csharp, "dotnet/App.cs");
     }
 
     /// Output is sorted ascending regardless of filesystem/creation order.
@@ -8826,6 +9528,7 @@ mod execute_tool_branch_tests {
         caveats: &Caveats,
         mcp: &mut dyn McpTools,
         gate: Option<&mut MockGate>,
+        step_ledger: Option<&dyn crate::agentic::scheduled::StepLedger>,
         disposition: PromptDisposition,
     ) -> String {
         let gate = gate.map(|gate| gate as &mut dyn PermissionGate);
@@ -8845,14 +9548,14 @@ mod execute_tool_branch_tests {
             None, // artifact_context
             None, // artifact_sink
             gate,
-            None,  // exec_floor
-            None,  // git_tool
-            None,  // crew_runner
-            None,  // scratchpad_store
-            None,  // code_search
-            None,  // where_is
-            None,  // experience_store
-            None,  // step_ledger
+            None, // exec_floor
+            None, // git_tool
+            None, // crew_runner
+            None, // scratchpad_store
+            None, // code_search
+            None, // where_is
+            None, // experience_store
+            step_ledger,
             false, // tool_offload
             None,  // spill_store
             None,  // persona_tools
@@ -8877,6 +9580,7 @@ mod execute_tool_branch_tests {
             &caveats,
             &mut no_mcp,
             None,
+            None,
             PromptDisposition::Research,
         )
         .await;
@@ -8892,6 +9596,7 @@ mod execute_tool_branch_tests {
             ws.path(),
             &caveats,
             &mut no_mcp,
+            None,
             None,
             PromptDisposition::Explain,
         )
@@ -8914,6 +9619,7 @@ mod execute_tool_branch_tests {
             &caveats,
             &mut no_mcp,
             Some(&mut gate),
+            None,
             PromptDisposition::Research,
         )
         .await;
@@ -8930,6 +9636,7 @@ mod execute_tool_branch_tests {
             ws.path(),
             &caveats,
             &mut mcp,
+            None,
             None,
             PromptDisposition::Research,
         )
@@ -8951,6 +9658,7 @@ mod execute_tool_branch_tests {
             &caveats,
             &mut no_mcp,
             None,
+            None,
             PromptDisposition::Research,
         )
         .await;
@@ -8958,6 +9666,103 @@ mod execute_tool_branch_tests {
             read.contains("durable evidence"),
             "safe read must remain usable: {read}"
         );
+    }
+
+    /// Plan is a read-only workspace disposition with one explicit
+    /// control-plane write: the harness-owned step ledger.
+    #[tokio::test]
+    async fn plan_disposition_updates_ledger_but_still_denies_workspace_mutation() {
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+        let ledger = SessionStepLedger::default();
+        let mut no_mcp = NoMcp;
+        let plan = run_tool_with_disposition(
+            "update_plan",
+            serde_json::json!({ "plan": [
+                { "step": "inspect", "status": "completed" },
+                { "step": "repair", "status": "in_progress" }
+            ] }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            Some(&ledger),
+            PromptDisposition::Plan,
+        )
+        .await;
+        assert!(plan.starts_with("<plan>\n"), "{plan}");
+        assert_eq!(ledger.count(), 2);
+
+        let write = run_tool_with_disposition(
+            "write_file",
+            serde_json::json!({ "path": "must-not-write.txt", "content": "no" }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            Some(&ledger),
+            PromptDisposition::Plan,
+        )
+        .await;
+        assert!(write.contains("current prompt disposition"), "{write}");
+        assert!(!ws.path().join("must-not-write.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_selector_dispatches_through_session_control_without_current_widening() {
+        #[derive(Default)]
+        struct RecordingControl(std::sync::Mutex<Vec<String>>);
+
+        impl crate::agentic::OperatingModeControl for RecordingControl {
+            fn select_operating_mode(&self, mode: &str) -> Result<String, String> {
+                self.0.lock().unwrap().push(mode.to_string());
+                Ok(format!("scheduled {mode}; current turn unchanged"))
+            }
+        }
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+        let control = RecordingControl::default();
+        let mut no_mcp = NoMcp;
+        let result = execute_tool_with_collaborators(
+            "select_operating_mode",
+            &serde_json::json!({ "mode": "dev" }),
+            ws.path().to_str().unwrap(),
+            false,
+            20,
+            &caveats,
+            &mut no_mcp,
+            ToolCollaborators {
+                operating_mode_control: Some(&control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Research,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("current turn unchanged"), "{result}");
+        assert_eq!(*control.0.lock().unwrap(), vec!["dev"]);
+
+        let unavailable = execute_tool_with_collaborators(
+            "select_operating_mode",
+            &serde_json::json!({ "mode": "dev" }),
+            ws.path().to_str().unwrap(),
+            false,
+            20,
+            &caveats,
+            &mut no_mcp,
+            ToolCollaborators::default(),
+            false,
+            PromptDisposition::Research,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(unavailable.contains("/mode auto"), "{unavailable}");
     }
 
     /// Permitted non-Act reads still honor their caveats, but they must not
@@ -8977,6 +9782,7 @@ mod execute_tool_branch_tests {
             &caveats,
             &mut mcp,
             Some(&mut gate),
+            None,
             PromptDisposition::Research,
         )
         .await;
@@ -9328,7 +10134,8 @@ mod execute_tool_branch_tests {
         .is_none());
         // The always-advertised def rides in every session (empty MCP).
         let defs = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         let names: Vec<&str> = defs
             .as_array()
@@ -9409,7 +10216,8 @@ mod execute_tool_branch_tests {
         .is_none());
         // The always-advertised def rides in every session (empty MCP).
         let defs = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
         );
         assert!(defs
             .as_array()

@@ -20,6 +20,28 @@ use std::sync::Mutex;
 /// model request. Public within the crate so wire tests can assert cardinality.
 pub(crate) const ACTIVE_PROMPT_PREFIX: &str = "[NEWT ACTIVE PROMPT v1]";
 
+/// Standing harness policy carried by every protected active-prompt card.
+///
+/// This is deliberately independent of prompt classification and persona
+/// text: Markdown is the display protocol for every answer, and source-first
+/// repository investigation is the default evidence policy for every agent
+/// surface. Prompt intake may add refinements, but it does not decide whether
+/// this policy exists.
+const RESPONSE_REPOSITORY_POLICY: &str = "\
+[NEWT RESPONSE AND REPOSITORY POLICY v1]\n\
+response_format: gfm_markdown\n\
+response_structure: adaptive\n\
+markdown_instruction: valid GFM; tables for repeated or comparable fields; headings/lists otherwise; no whole-answer fence\n\
+repository_evidence: source_first\n\
+source_definition: resolved_language_packs\n\
+repository_instruction: inspect source first via find category=source; narrow by language; docs/manifests/lockfiles/generated only if requested or necessary; never replace code evidence with metadata";
+
+#[cfg(test)]
+pub(crate) fn response_repository_policy_tokens() -> usize {
+    crate::tokens::TokenEstimation::default()
+        .tokens_for_chars(RESPONSE_REPOSITORY_POLICY.chars().count())
+}
+
 const DEFAULT_PROMPT_READ_CHARS: usize = 32_000;
 const MAX_PROMPT_READ_CHARS: usize = 100_000;
 // Keep ephemeral lineage validation aligned with the durable store's bound.
@@ -554,7 +576,8 @@ pub(crate) fn active_prompt_card(context: PromptReadContext<'_>) -> String {
          model_digest: {digest}\n\
          {submitted_block}\n\
          recovery: prompt_read current\n\
-         artifact_recovery: for prompt-rooted work, artifact_read {{\"address\":\"root\"}}"
+         artifact_recovery: for prompt-rooted work, artifact_read {{\"address\":\"root\"}}\n\
+         {RESPONSE_REPOSITORY_POLICY}"
     )
 }
 
@@ -1277,6 +1300,38 @@ mod tests {
                 .count(),
             2,
             "one protected recovery copy plus the tail presentation copy"
+        );
+    }
+
+    #[test]
+    fn active_prompt_card_always_steers_markdown_and_source_first_repository_evidence() {
+        let card = active_prompt_card(PromptReadContext::new(
+            None,
+            "How does authentication work in this repository?",
+            None,
+        ));
+
+        assert!(
+            card.contains("response_format: gfm_markdown"),
+            "all agent surfaces must target the Markdown renderer even without prompt intake: \
+             {card}"
+        );
+        assert!(
+            card.contains("response_structure: adaptive")
+                && card.contains("tables for repeated or comparable fields"),
+            "the harness should choose Markdown structure by result semantics, not incident \
+             keywords: {card}"
+        );
+        assert!(
+            card.contains("repository_evidence: source_first")
+                && card.contains("source_definition: resolved_language_packs")
+                && card.contains("find category=source"),
+            "general repository investigation must begin with harness-defined code files: {card}"
+        );
+        assert!(
+            card.contains("docs/manifests/lockfiles/generated")
+                && card.contains("requested or necessary"),
+            "metadata remains available as supporting evidence without replacing code: {card}"
         );
     }
 

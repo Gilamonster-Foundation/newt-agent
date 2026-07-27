@@ -38,6 +38,8 @@ fn ctx<'a>(
         scratchpad_store: None,
         code_search: None,
         where_is: None,
+        nav: None,
+        exposure: Default::default(),
         experience_store: None,
         step_ledger: None,
         caveats,
@@ -83,6 +85,8 @@ fn ctx<'a>(
         live_tool_output: None,
         git_tool: None,
         crew_runner: None,
+        operating_mode_control: None,
+        plan_mode_control: None,
     }
 }
 
