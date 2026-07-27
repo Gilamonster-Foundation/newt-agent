@@ -54,6 +54,7 @@ pub mod roadmap_eval;
 pub mod roadmap_file;
 pub mod role_profile;
 pub mod router;
+pub mod sas_confirm;
 pub mod sas_transcript;
 pub mod scope_grounding;
 pub mod scratch;
