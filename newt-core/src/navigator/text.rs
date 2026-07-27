@@ -76,10 +76,18 @@ pub fn text_search_scoped(
         Some(p) => {
             let scoped = root.join(p);
             if !scoped.exists() {
-                result.complete = false;
+                // Iteration #7: this is a COMPLETE answer — the path is
+                // definitively absent. Leaving `complete=false` here appended
+                // the generic "do not treat misses as proof of absence" note,
+                // and the harness contradicting its own verdict sent a local
+                // model into a retry loop on the same phantom file (live,
+                // 2026-07-27). Absence of the scope IS proof of absence.
+                result.complete = true;
                 result.warnings.push(format!(
-                    "scope `{p}` does not exist in this workspace — nothing was \
-                     searched (NOT a whole-workspace fallback)"
+                    "scope `{p}` does not exist in this workspace — this is \
+                     definitive: there is no such file or directory. Do not \
+                     search for it again; re-check where the name came from \
+                     (quoted fixture text is not code)."
                 ));
                 return result;
             }
@@ -329,12 +337,14 @@ mod tests {
         let r = text_search_scoped("wanted_here", &dir, Some("src/a.rs"), "gen0");
         assert_eq!(r.hits.len(), 1);
         assert_eq!(r.hits[0].path, "src/a.rs");
-        // Missing scope: honest refusal, no silent widen.
+        // Missing scope: a DEFINITIVE answer (complete=true so the generic
+        // "do not treat misses as proof of absence" note cannot contradict
+        // the verdict), no silent widen.
         let r = text_search_scoped("wanted_here", &dir, Some("no/such/dir"), "gen0");
         assert!(r.hits.is_empty());
-        assert!(!r.complete);
+        assert!(r.complete, "a nonexistent scope is a definitive answer");
         assert!(
-            r.warnings.iter().any(|w| w.contains("does not exist")),
+            r.warnings.iter().any(|w| w.contains("definitive")),
             "{:?}",
             r.warnings
         );
