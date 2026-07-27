@@ -78,13 +78,21 @@ jobs:
         run: cargo test --workspace --features newt-data/kernel
 
   lean-build:
-    name: lean strip-down build (--no-default-features)
+    name: lean strip-down build + tests (--no-default-features)
     runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
-    # PIPELINE PARITY: mirrors the `--no-default-features` step in the justfile
+    # PIPELINE PARITY: mirrors the `--no-default-features` steps in the justfile
     # `check` recipe (and the pre-push hook via `just check`). rich-tui (issue
     # #416) is now a DEFAULT feature, so the lint/test/coverage jobs above
     # already cover it; this job guards the LEAN wyvern/headless build (rich
     # surface stripped out) so it can't rot.
+    #
+    # The two test steps are the #1409 lean firewall. Before them this job only
+    # LINTED the lean tier, and `-p newt-agent` never compiles newt-tui's test
+    # targets — so the lean surface's tests had never been executed anywhere.
+    # newt-tui declares no `default` features, so `cargo test -p newt-tui` alone
+    # is the lean configuration (584 tests, vs 696 when the workspace default
+    # unifies rich-tui + live-spill on). Every story under #1408 moves terminal
+    # ownership behind this gate.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -94,6 +102,12 @@ jobs:
       - name: clippy (lean, no default features)
         if: always()
         run: cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings
+      - name: test (lean cli, no default features)
+        if: always()
+        run: cargo test -p newt-agent --no-default-features
+      - name: test (newt-tui, rich-tui + live-spill stripped)
+        if: always()
+        run: cargo test -p newt-tui
 
   coverage:
     name: Workspace coverage (cargo-llvm-cov)

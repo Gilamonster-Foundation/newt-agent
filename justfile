@@ -139,11 +139,26 @@ check:
     # cover it. Guard the LEAN strip-down build instead — the wyvern/headless
     # tier (`--no-default-features`) must still compile + lint clean.
     cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings || rc=1
+    # LEAN TEST GATE (#1409). The clippy line above only *lints* the lean tier,
+    # and `-p newt-agent` never compiles newt-tui's own test targets at all, so
+    # until now no gate had ever EXECUTED the lean surface's tests.
+    #
+    # Measured 2026-07-26: newt-tui declares no `default` feature set, so
+    # `cargo test -p newt-tui` alone IS the lean configuration. It runs 584
+    # tests; under the workspace default (newt-cli unifies rich-tui + live-spill
+    # on) it runs 696. The 112-test delta is rich-only — and the 584 lean tests
+    # had never been run by the justfile, the pre-push hook, or CI.
+    #
+    # Both configurations are green as of this commit. These two lines are a
+    # ratchet that keeps them that way while #1408 consolidates terminal
+    # ownership underneath them.
+    cargo test -p newt-agent --no-default-features || rc=1
+    cargo test -p newt-tui || rc=1
     exit $rc
 
 [windows]
 check:
-    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-agent --no-default-features; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
 
 # README staleness lint (#1023): the README states invariants and links to
 # live sources of truth — it must never carry operator-local paths, cluster
