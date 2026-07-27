@@ -328,7 +328,7 @@ fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
     console.say("\nWhere does your model run?");
     console.say("  1) Ollama  (local, or a plain self-hosted Ollama host)");
     console.say("  2) DGX     (remote NVIDIA endpoint: Ollama or vLLM)");
-    console.say("  3) Cloud   (any OpenAI-compatible endpoint, e.g. https://inference-api.nvidia.com/v1)");
+    console.say("  3) Remote  (any OpenAI-compatible endpoint — llama.cpp, vLLM, a hosted API)");
     let ans = console.ask("Choose [1]: ")?;
     match parse_choice(&ans, 3).unwrap_or(1) {
         2 => Ok(BackendChoice::Dgx),
@@ -403,7 +403,7 @@ async fn configure_dgx(
 
     let cfg = match kind {
         EndpointKind::Vllm => {
-            let key_env = console.ask("API-key env var (optional, e.g. DGX_API_KEY) [none]: ")?;
+            let key_env = console.ask("API-key env var (optional) [none]: ")?;
             let key_env = if key_env.is_empty() {
                 None
             } else {
@@ -437,7 +437,7 @@ fn normalize_cloud_url(raw: &str) -> String {
 }
 
 /// Derive a short backend name from the hostname of a URL.
-/// `https://inference-api.nvidia.com/v1` → `inference-api.nvidia.com`
+/// `https://inference.example.com/v1` → `inference.example.com`
 fn derive_name_from_url(url: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()
@@ -449,35 +449,45 @@ async fn configure_cloud(
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<(Config, BackendConfig)> {
-    let default_url = "https://inference-api.nvidia.com/v1";
-
-    let raw_url = console.ask(&format!("base_url [{default_url}]: "))?;
-    let raw_url = if raw_url.is_empty() {
-        default_url.to_string()
-    } else {
-        raw_url
+    // No default endpoint, deliberately. There is no sensible default for
+    // "somebody else's inference host": inventing one bakes whatever host we
+    // chose into every checkout, and lets a stray Enter configure a backend the
+    // operator never named.
+    let endpoint = loop {
+        let raw = console.ask("Endpoint URL: ")?;
+        if !raw.trim().is_empty() {
+            break normalize_cloud_url(&raw);
+        }
+        console.say("  An endpoint URL is required (e.g. http://host:8080).");
     };
-    let endpoint = normalize_cloud_url(&raw_url);
 
-    let api_key_raw = console.ask("api_key [none]: ")?;
+    // Optional, and asked second: a self-hosted llama.cpp or vLLM usually needs
+    // no key at all, so leading with it would be a prompt most operators answer
+    // blank.
+    let api_key_raw = console.ask("API key [none]: ")?;
     let api_key = if api_key_raw.trim().is_empty() {
         None
     } else {
         Some(api_key_raw.trim().to_string())
     };
 
-    let default_name = derive_name_from_url(&endpoint)
-        .unwrap_or_else(|| "cloud".to_string());
-    let raw_name = console.ask(&format!("name [{default_name}]: "))?;
-    let name = if raw_name.trim().is_empty() {
-        default_name
-    } else {
-        raw_name.trim().to_string()
-    };
+    // The name is DERIVED from the host, never asked and never a shared
+    // literal. The drop-in filename comes from it, so a fixed default means the
+    // second endpoint you configure silently overwrites the first (#1448).
+    let name = derive_name_from_url(&endpoint).unwrap_or_else(|| "remote".to_string());
 
     let model = pick_cloud_model(console, client, &endpoint, api_key.as_deref()).await?;
+    console.say(&format!(
+        "  → ~/.newt/backends/{name}.toml  (model: {model})"
+    ));
 
-    Ok(build_cloud_config(config_path, &name, &endpoint, &model, api_key.as_deref()))
+    Ok(build_cloud_config(
+        config_path,
+        &name,
+        &endpoint,
+        &model,
+        api_key.as_deref(),
+    ))
 }
 
 /// Probe with auth and present the model list; fall back to manual entry.
@@ -502,13 +512,7 @@ async fn pick_cloud_model(
         }
     };
 
-    console.say("\nAvailable models:");
-    for (i, m) in models.iter().enumerate() {
-        console.say(&format!("  {}) {m}", i + 1));
-    }
-    let ans = console.ask("Choose [1]: ")?;
-    let idx = parse_choice(&ans, models.len()).map(|n| n - 1).unwrap_or(0);
-    Ok(models[idx].clone())
+    select_model(console, &models)
 }
 
 /// Build a cloud backend config and, when an API key is provided, write it to
@@ -545,10 +549,7 @@ fn build_cloud_config(
         api_key_file,
         serving: Some(newt_core::Serving::Instance),
         provenance: Some(newt_core::config::BackendProvenance {
-            source: Some(format!(
-                "newt setup v{} (cloud)",
-                env!("CARGO_PKG_VERSION")
-            )),
+            source: Some(format!("newt setup v{} (cloud)", env!("CARGO_PKG_VERSION"))),
             probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
             derived_serving: Some(true),
         }),
@@ -596,13 +597,51 @@ async fn pick_model(
         }
     };
 
+    select_model(console, &models)
+}
+
+/// Above this many models, a flat numbered list stops being a menu and starts
+/// being a wall — a llama.cpp router routinely serves 30+. At or below it, the
+/// list is faster to read than any filter prompt would be.
+const FILTER_THRESHOLD: usize = 9;
+
+/// Choose one entry from `models`, filtering first when the list is long.
+///
+/// Deliberately built on the line-based [`Console`] rather than a raw-mode
+/// arrow-key widget: setup frequently runs over SSH, piped, or with stdin
+/// redirected, and a raw-mode picker would either hang or have to be bypassed
+/// in exactly those cases. Filtering gets the same "find it among 36" result
+/// while staying pipe-safe and unit-testable.
+fn select_model(console: &mut dyn Console, models: &[String]) -> anyhow::Result<String> {
+    let mut pool: Vec<String> = models.to_vec();
+
+    if pool.len() > FILTER_THRESHOLD {
+        console.say(&format!("\n{} models available.", pool.len()));
+        let needle = console.ask("Filter (blank = show all): ")?;
+        let needle = needle.trim().to_ascii_lowercase();
+        if !needle.is_empty() {
+            let matched: Vec<String> = pool
+                .iter()
+                .filter(|m| m.to_ascii_lowercase().contains(&needle))
+                .cloned()
+                .collect();
+            // A filter that matches nothing falls back to the full list rather
+            // than dead-ending the operator in an empty menu.
+            if matched.is_empty() {
+                console.say(&format!("  No model matches {needle:?}; showing all."));
+            } else {
+                pool = matched;
+            }
+        }
+    }
+
     console.say("\nAvailable models:");
-    for (i, m) in models.iter().enumerate() {
+    for (i, m) in pool.iter().enumerate() {
         console.say(&format!("  {}) {m}", i + 1));
     }
     let ans = console.ask("Choose [1]: ")?;
-    let idx = parse_choice(&ans, models.len()).map(|n| n - 1).unwrap_or(0);
-    Ok(models[idx].clone())
+    let idx = parse_choice(&ans, pool.len()).map(|n| n - 1).unwrap_or(0);
+    Ok(pool[idx].clone())
 }
 
 fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
@@ -622,7 +661,9 @@ fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
 /// List models from an Ollama endpoint via `GET /api/tags`.
 // The endpoint fetchers moved to `newt_core::backend_probe` (#1136) so the
 // TUI session, setup, and doctor share one probe path.
-use newt_core::backend_probe::{fetch_ollama_models, fetch_openai_models, fetch_openai_models_auth};
+use newt_core::backend_probe::{
+    fetch_ollama_models, fetch_openai_models, fetch_openai_models_auth,
+};
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested directly)
@@ -2476,48 +2517,48 @@ mod tests {
     #[test]
     fn normalize_cloud_url_strips_v1() {
         assert_eq!(
-            normalize_cloud_url("https://inference-api.nvidia.com/v1"),
-            "https://inference-api.nvidia.com"
+            normalize_cloud_url("https://inference.example.com/v1"),
+            "https://inference.example.com"
         );
     }
 
     #[test]
     fn normalize_cloud_url_strips_v1_trailing_slash() {
         assert_eq!(
-            normalize_cloud_url("https://inference-api.nvidia.com/v1/"),
-            "https://inference-api.nvidia.com"
+            normalize_cloud_url("https://inference.example.com/v1/"),
+            "https://inference.example.com"
         );
     }
 
     #[test]
     fn normalize_cloud_url_strips_models_path() {
         assert_eq!(
-            normalize_cloud_url("https://inference-api.nvidia.com/v1/models"),
-            "https://inference-api.nvidia.com"
+            normalize_cloud_url("https://inference.example.com/v1/models"),
+            "https://inference.example.com"
         );
     }
 
     #[test]
     fn normalize_cloud_url_strips_chat_completions_path() {
         assert_eq!(
-            normalize_cloud_url("https://inference-api.nvidia.com/v1/chat/completions"),
-            "https://inference-api.nvidia.com"
+            normalize_cloud_url("https://inference.example.com/v1/chat/completions"),
+            "https://inference.example.com"
         );
     }
 
     #[test]
     fn normalize_cloud_url_passthrough_bare_host() {
         assert_eq!(
-            normalize_cloud_url("https://inference-api.nvidia.com"),
-            "https://inference-api.nvidia.com"
+            normalize_cloud_url("https://inference.example.com"),
+            "https://inference.example.com"
         );
     }
 
     #[test]
     fn derive_name_from_url_extracts_host() {
         assert_eq!(
-            derive_name_from_url("https://inference-api.nvidia.com/v1"),
-            Some("inference-api.nvidia.com".to_string())
+            derive_name_from_url("https://inference.example.com/v1"),
+            Some("inference.example.com".to_string())
         );
     }
 
@@ -2532,13 +2573,13 @@ mod tests {
             .and(path("/v1/models"))
             .and(wiremock::matchers::header(
                 "Authorization",
-                "Bearer test-nvidia-key",
+                "Bearer test-remote-key",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "object": "list",
                 "data": [
-                    {"id": "nvidia/openai/eccn-gpt-oss-20b", "object": "model"},
-                    {"id": "nvidia/openai/eccn-nemotron-3-ultra", "object": "model"}
+                    {"id": "example/model-a", "object": "model"},
+                    {"id": "example/model-b", "object": "model"}
                 ]
             })))
             .mount(&server)
@@ -2548,26 +2589,23 @@ mod tests {
         let path = dir.path().join("config.toml");
         let client = reqwest::Client::new();
 
-        // Choose Cloud (3), accept default URL (blank → server URI), key, default name, pick model 1, write Y.
+        // Remote (3) → endpoint (with /v1, must be stripped) → key → model → write.
+        // No name prompt: the drop-in is named for the host.
         let server_url = server.uri(); // e.g. http://127.0.0.1:PORT
         let server_with_v1 = format!("{server_url}/v1");
         let mut console = ScriptedConsole::new(&[
-            "3",                  // Cloud
-            &server_with_v1,      // base_url (includes /v1 — should be stripped)
-            "test-nvidia-key",    // api_key
-            "",                   // name (use default from hostname)
-            "1",                  // pick model 1
-            "y",                  // write
+            "3",               // Cloud
+            &server_with_v1,   // base_url (includes /v1 — should be stripped)
+            "test-remote-key", // API key
+            "1",               // pick model 1
+            "y",               // write
         ]);
 
         run_with(&mut console, &client, &path).await.unwrap();
 
         let cfg = Config::load(&path).unwrap();
         let dropin = read_dropin(&path, "127.0.0.1");
-        assert_eq!(
-            dropin.effective_model(),
-            Some("nvidia/openai/eccn-gpt-oss-20b")
-        );
+        assert_eq!(dropin.effective_model(), Some("example/model-a"));
         assert_eq!(dropin.kind, Some(BackendKind::Openai));
         // The endpoint must NOT include /v1.
         assert!(!dropin.endpoint.ends_with("/v1"));
@@ -2582,7 +2620,10 @@ mod tests {
         // The config reports a non-empty default.
         assert_eq!(cfg.default_backend.as_deref(), Some("127.0.0.1"));
         // Token file exists with the right content.
-        assert_eq!(std::fs::read_to_string(token_path).unwrap(), "test-nvidia-key");
+        assert_eq!(
+            std::fs::read_to_string(token_path).unwrap(),
+            "test-remote-key"
+        );
     }
 
     #[serial_test::serial(real_fs)]
@@ -2603,21 +2644,95 @@ mod tests {
         let client = reqwest::Client::new();
         let server_url = server.uri();
 
-        // No api_key (blank), custom name "mycloud".
+        // No API key — the common self-hosted case. The drop-in is still named
+        // for the host, so no name prompt appears.
         let mut console = ScriptedConsole::new(&[
-            "3",           // Cloud
-            &server_url,   // base_url without /v1
-            "",            // no api_key
-            "mycloud",     // custom name
-            "1",           // pick model 1
-            "y",           // write
+            "3",         // Remote
+            &server_url, // endpoint, already bare
+            "",          // no API key
+            "1",         // pick model 1
+            "y",         // write
         ]);
 
         run_with(&mut console, &client, &path).await.unwrap();
 
-        let dropin = read_dropin(&path, "mycloud");
+        // Named for the host, not for anything the operator typed.
+        let dropin = read_dropin(&path, "127.0.0.1");
         assert_eq!(dropin.effective_model(), Some("open-model"));
-        assert!(dropin.api_key_file.is_none());
+        assert!(
+            dropin.api_key_file.is_none(),
+            "no key given, so no token file may be written"
+        );
+    }
+
+    // --- model selector (#1452): a llama.cpp router serves 30+ models, so the
+    // operator must never have to type an id exactly. ---
+
+    #[test]
+    fn a_short_list_is_shown_directly_with_no_filter_prompt() {
+        let models: Vec<String> = (1..=3).map(|i| format!("model-{i}")).collect();
+        let mut console = ScriptedConsole::new(&["2"]);
+        assert_eq!(select_model(&mut console, &models).unwrap(), "model-2");
+        // Asking to filter three items would be pure ceremony.
+        assert!(
+            !console.transcript().contains("Filter"),
+            "no filter prompt below the threshold: {}",
+            console.transcript()
+        );
+    }
+
+    #[test]
+    fn a_long_list_filters_then_picks_by_number() {
+        let mut models: Vec<String> = (1..=30).map(|i| format!("filler-{i}")).collect();
+        models.push("qwen3.6_35b".into());
+        models.push("qwen3-coder_30b".into());
+
+        // Type a fragment, then choose from the two matches — the operator
+        // never types the full id.
+        let mut console = ScriptedConsole::new(&["qwen", "2"]);
+        assert_eq!(
+            select_model(&mut console, &models).unwrap(),
+            "qwen3-coder_30b"
+        );
+        let seen = console.transcript();
+        assert!(seen.contains("32 models available"), "{seen}");
+        assert!(!seen.contains("filler-1)"), "filtered out: {seen}");
+    }
+
+    #[test]
+    fn the_filter_is_case_insensitive_and_matches_substrings() {
+        let mut models: Vec<String> = (1..=20).map(|i| format!("filler-{i}")).collect();
+        models.push("Qwen3-Coder".into());
+        let mut console = ScriptedConsole::new(&["CODER", "1"]);
+        assert_eq!(select_model(&mut console, &models).unwrap(), "Qwen3-Coder");
+    }
+
+    /// A filter that matches nothing must not dead-end the operator in an empty
+    /// menu — it falls back to the whole list.
+    #[test]
+    fn a_filter_matching_nothing_falls_back_to_the_full_list() {
+        let models: Vec<String> = (1..=20).map(|i| format!("model-{i}")).collect();
+        let mut console = ScriptedConsole::new(&["zzz-no-such-model", "3"]);
+        assert_eq!(select_model(&mut console, &models).unwrap(), "model-3");
+        assert!(console.transcript().contains("showing all"));
+    }
+
+    #[test]
+    fn a_blank_filter_shows_everything() {
+        let models: Vec<String> = (1..=15).map(|i| format!("model-{i}")).collect();
+        let mut console = ScriptedConsole::new(&["", "15"]);
+        assert_eq!(select_model(&mut console, &models).unwrap(), "model-15");
+    }
+
+    /// An out-of-range or unparseable choice takes the first entry rather than
+    /// erroring out mid-setup.
+    #[test]
+    fn an_invalid_choice_falls_back_to_the_first_entry() {
+        let models: Vec<String> = vec!["a".into(), "b".into()];
+        for answer in ["", "99", "nonsense", "0", "-1"] {
+            let mut console = ScriptedConsole::new(&[answer]);
+            assert_eq!(select_model(&mut console, &models).unwrap(), "a");
+        }
     }
 
     #[serial_test::serial(real_fs)]
