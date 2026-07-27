@@ -1,5 +1,9 @@
 //! Live probe for tool-call wire format — only runs when `NEWT_LIVE_TEST=1`.
 //!
+//! Endpoint and model are supplied by the operator; this file names no host and
+//! no vendor, so a public checkout reveals nothing about where anyone runs
+//! inference.
+//!
 //! Sends a one-shot POST to the configured inference endpoint with a tool
 //! definition that contains a hyphenated namespaced name to determine whether
 //! the backend proxy normalises hyphens to underscores in tool names.
@@ -10,7 +14,7 @@
 //!   NEWT_LIVE_MODEL=<model-id>  — model to probe (default: reads ~/.newt/config)
 //!
 //! Run with:
-//!   NEWT_LIVE_TEST=1 cargo test -p newt-inference --test nvidia_tool_probe -- --nocapture
+//!   NEWT_LIVE_TEST=1 cargo test -p newt-inference --test live_tool_probe -- --nocapture
 
 #[tokio::test]
 async fn probe_tool_call_wire_format() {
@@ -26,10 +30,15 @@ async fn probe_tool_call_wire_format() {
         .trim()
         .to_string();
 
-    let endpoint = std::env::var("NEWT_LIVE_ENDPOINT")
-        .unwrap_or_else(|_| "https://inference-api.nvidia.com".into());
-    let model = std::env::var("NEWT_LIVE_MODEL")
-        .unwrap_or_else(|_| "us/aws/anthropic/eccn-claude-sonnet-4-6".into());
+    // No defaults: a hardcoded fallback is how an internal hostname ends up in
+    // a public repo. Absent configuration skips the probe instead.
+    let (Ok(endpoint), Ok(model)) = (
+        std::env::var("NEWT_LIVE_ENDPOINT"),
+        std::env::var("NEWT_LIVE_MODEL"),
+    ) else {
+        eprintln!("skipped — set NEWT_LIVE_ENDPOINT and NEWT_LIVE_MODEL");
+        return;
+    };
 
     let url = format!("{endpoint}/v1/chat/completions");
 

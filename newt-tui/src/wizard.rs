@@ -143,11 +143,12 @@ fn pick_default_model(models: &[String]) -> Option<String> {
 }
 
 fn probe_candidates() -> Vec<String> {
-    let mut candidates = vec![
-        "http://localhost:11434".to_string(),
-        "http://REDACTED-HOST:11434".to_string(),
-        "http://REDACTED-HOST:11434".to_string(),
-    ];
+    // Localhost only. Two `http://REDACTED-HOST:11434` entries used to sit here
+    // — a previous scrub replaced real hostnames with the placeholder text and
+    // left them in as live probe targets, so every first run spent 2s apiece
+    // resolving a host literally named "REDACTED-HOST". Operator-specific hosts
+    // belong in the env override below, never baked into a public default.
+    let mut candidates = vec!["http://localhost:11434".to_string()];
     // Probe NEWT_DGX_HOST first when set.
     if let Ok(host) = std::env::var("NEWT_DGX_HOST") {
         let scheme = std::env::var("NEWT_DGX_SCHEME").unwrap_or_else(|_| "http".into());

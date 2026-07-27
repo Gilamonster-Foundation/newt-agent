@@ -290,6 +290,7 @@ async fn run_with(
     let (cfg, backend) = match choose_backend(console)? {
         BackendChoice::Ollama => configure_ollama(console, client).await?,
         BackendChoice::Dgx => configure_dgx(console, client).await?,
+        BackendChoice::Cloud => configure_cloud(console, client, config_path).await?,
     };
 
     // Preview before committing anything to disk: the backend drop-in is the
@@ -320,15 +321,18 @@ async fn run_with(
 enum BackendChoice {
     Ollama,
     Dgx,
+    Cloud,
 }
 
 fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
     console.say("\nWhere does your model run?");
     console.say("  1) Ollama  (local, or a plain self-hosted Ollama host)");
     console.say("  2) DGX     (remote NVIDIA endpoint: Ollama or vLLM)");
+    console.say("  3) Remote  (any OpenAI-compatible endpoint — llama.cpp, vLLM, a hosted API)");
     let ans = console.ask("Choose [1]: ")?;
-    match parse_choice(&ans, 2).unwrap_or(1) {
+    match parse_choice(&ans, 3).unwrap_or(1) {
         2 => Ok(BackendChoice::Dgx),
+        3 => Ok(BackendChoice::Cloud),
         _ => Ok(BackendChoice::Ollama),
     }
 }
@@ -399,7 +403,7 @@ async fn configure_dgx(
 
     let cfg = match kind {
         EndpointKind::Vllm => {
-            let key_env = console.ask("API-key env var (optional, e.g. DGX_API_KEY) [none]: ")?;
+            let key_env = console.ask("API-key env var (optional) [none]: ")?;
             let key_env = if key_env.is_empty() {
                 None
             } else {
@@ -410,6 +414,170 @@ async fn configure_dgx(
         _ => build_ollama_config(Config::default(), "dgx", kind, &url, &model),
     };
     Ok(cfg)
+}
+
+// ---------------------------------------------------------------------------
+// Cloud / OpenAI-compatible remote endpoint path
+// ---------------------------------------------------------------------------
+
+/// Strip `/v1` (and any trailing path suffix) from a user-supplied URL so the
+/// stored endpoint is the bare base that newt appends `/v1/…` paths to itself.
+///
+/// Handles: trailing `/`, `/v1`, `/v1/`, `/v1/models`, `/v1/chat/completions`.
+fn normalize_cloud_url(raw: &str) -> String {
+    let s = raw.trim().trim_end_matches('/');
+    // Strip common API-suffix paths the user might paste from docs.
+    let s = s
+        .trim_end_matches("/v1/chat/completions")
+        .trim_end_matches("/v1/completions")
+        .trim_end_matches("/v1/models")
+        .trim_end_matches("/v1/")
+        .trim_end_matches("/v1");
+    s.trim_end_matches('/').to_string()
+}
+
+/// Derive a short backend name from the hostname of a URL.
+/// `https://inference.example.com/v1` → `inference.example.com`
+fn derive_name_from_url(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+}
+
+async fn configure_cloud(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    config_path: &Path,
+) -> anyhow::Result<(Config, BackendConfig)> {
+    // No default endpoint, deliberately. There is no sensible default for
+    // "somebody else's inference host": inventing one bakes whatever host we
+    // chose into every checkout, and lets a stray Enter configure a backend the
+    // operator never named.
+    let endpoint = loop {
+        let raw = console.ask("Endpoint URL: ")?;
+        if !raw.trim().is_empty() {
+            break normalize_cloud_url(&raw);
+        }
+        console.say("  An endpoint URL is required (e.g. http://host:8080).");
+    };
+
+    // Optional, and asked second: a self-hosted llama.cpp or vLLM usually needs
+    // no key at all, so leading with it would be a prompt most operators answer
+    // blank.
+    let api_key_raw = console.ask("API key [none]: ")?;
+    let api_key = if api_key_raw.trim().is_empty() {
+        None
+    } else {
+        Some(api_key_raw.trim().to_string())
+    };
+
+    // The name is DERIVED from the host, never asked and never a shared
+    // literal. The drop-in filename comes from it, so a fixed default means the
+    // second endpoint you configure silently overwrites the first (#1448).
+    let name = derive_name_from_url(&endpoint).unwrap_or_else(|| "remote".to_string());
+
+    let model = pick_cloud_model(console, client, &endpoint, api_key.as_deref()).await?;
+    console.say(&format!(
+        "  → ~/.newt/backends/{name}.toml  (model: {model})"
+    ));
+
+    Ok(build_cloud_config(
+        config_path,
+        &name,
+        &endpoint,
+        &model,
+        api_key.as_deref(),
+    ))
+}
+
+/// Probe with auth and present the model list; fall back to manual entry.
+async fn pick_cloud_model(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<String> {
+    console.say(&format!("Probing {endpoint}/v1/models…"));
+    let models = fetch_openai_models_auth(client, endpoint, api_key).await;
+
+    let models = match models {
+        Ok(m) if !m.is_empty() => m,
+        Ok(_) => {
+            console.say("  Endpoint answered but listed no models.");
+            return ask_model_name(console);
+        }
+        Err(e) => {
+            console.say(&format!("  Could not reach the endpoint ({e})."));
+            return ask_model_name(console);
+        }
+    };
+
+    select_model(console, &models)
+}
+
+/// Build a cloud backend config and, when an API key is provided, write it to
+/// `backends/<name>.token` beside the config file and store the absolute path
+/// in `api_key_file`.
+/// Render `path` as `~/…` when it sits under the home directory, else as an
+/// absolute path.
+///
+/// Checks `USERPROFILE` as well as `HOME` so Windows collapses too, and always
+/// returns *something*: a portable-looking path is a nicety, and must never be
+/// the reason a configured credential goes unrecorded.
+fn collapse_home(path: &Path) -> String {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(home) = home {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn build_cloud_config(
+    config_path: &Path,
+    name: &str,
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> (Config, BackendConfig) {
+    let api_key_file = api_key.and_then(|key| {
+        // Write the key to backends/<name>.token next to config.toml.
+        let backends_dir = config_path.parent()?.join("backends");
+        std::fs::create_dir_all(&backends_dir).ok()?;
+        let token_path = backends_dir.join(format!("{name}.token"));
+        std::fs::write(&token_path, key).ok()?;
+        // Tilde-collapse when we can, but NEVER let that decide whether the key
+        // is referenced at all. This previously read `var_os("HOME")?`, and on
+        // Windows — where the variable is USERPROFILE — the `?` bailed out of
+        // the whole closure: the token file landed on disk and `api_key_file`
+        // stayed None, so the backend silently authenticated with nothing.
+        Some(collapse_home(&token_path))
+    });
+
+    let backend = BackendConfig {
+        name: name.to_string(),
+        endpoint: endpoint.to_string(),
+        model: Some(model.to_string()),
+        tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+        kind: Some(BackendKind::Openai),
+        api_key_file,
+        serving: Some(newt_core::Serving::Instance),
+        provenance: Some(newt_core::config::BackendProvenance {
+            source: Some(format!("newt setup v{} (cloud)", env!("CARGO_PKG_VERSION"))),
+            probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            derived_serving: Some(true),
+        }),
+        ..Default::default()
+    };
+    let config = Config {
+        backends: vec![],
+        default_backend: Some(backend.name.clone()),
+        ..Default::default()
+    };
+    (config, backend)
 }
 
 // ---------------------------------------------------------------------------
@@ -446,13 +614,51 @@ async fn pick_model(
         }
     };
 
+    select_model(console, &models)
+}
+
+/// Above this many models, a flat numbered list stops being a menu and starts
+/// being a wall — a llama.cpp router routinely serves 30+. At or below it, the
+/// list is faster to read than any filter prompt would be.
+const FILTER_THRESHOLD: usize = 9;
+
+/// Choose one entry from `models`, filtering first when the list is long.
+///
+/// Deliberately built on the line-based [`Console`] rather than a raw-mode
+/// arrow-key widget: setup frequently runs over SSH, piped, or with stdin
+/// redirected, and a raw-mode picker would either hang or have to be bypassed
+/// in exactly those cases. Filtering gets the same "find it among 36" result
+/// while staying pipe-safe and unit-testable.
+fn select_model(console: &mut dyn Console, models: &[String]) -> anyhow::Result<String> {
+    let mut pool: Vec<String> = models.to_vec();
+
+    if pool.len() > FILTER_THRESHOLD {
+        console.say(&format!("\n{} models available.", pool.len()));
+        let needle = console.ask("Filter (blank = show all): ")?;
+        let needle = needle.trim().to_ascii_lowercase();
+        if !needle.is_empty() {
+            let matched: Vec<String> = pool
+                .iter()
+                .filter(|m| m.to_ascii_lowercase().contains(&needle))
+                .cloned()
+                .collect();
+            // A filter that matches nothing falls back to the full list rather
+            // than dead-ending the operator in an empty menu.
+            if matched.is_empty() {
+                console.say(&format!("  No model matches {needle:?}; showing all."));
+            } else {
+                pool = matched;
+            }
+        }
+    }
+
     console.say("\nAvailable models:");
-    for (i, m) in models.iter().enumerate() {
+    for (i, m) in pool.iter().enumerate() {
         console.say(&format!("  {}) {m}", i + 1));
     }
     let ans = console.ask("Choose [1]: ")?;
-    let idx = parse_choice(&ans, models.len()).map(|n| n - 1).unwrap_or(0);
-    Ok(models[idx].clone())
+    let idx = parse_choice(&ans, pool.len()).map(|n| n - 1).unwrap_or(0);
+    Ok(pool[idx].clone())
 }
 
 fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
@@ -472,7 +678,9 @@ fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
 /// List models from an Ollama endpoint via `GET /api/tags`.
 // The endpoint fetchers moved to `newt_core::backend_probe` (#1136) so the
 // TUI session, setup, and doctor share one probe path.
-use newt_core::backend_probe::{fetch_ollama_models, fetch_openai_models};
+use newt_core::backend_probe::{
+    fetch_ollama_models, fetch_openai_models, fetch_openai_models_auth,
+};
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested directly)
@@ -2319,6 +2527,278 @@ mod tests {
         let mut console = ScriptedConsole::new(&["1", &server.uri(), "1", "n"]);
         run_with(&mut console, &client, &path).await.unwrap();
         assert!(!path.exists());
+    }
+
+    // --- normalize_cloud_url pure tests -------------------------------------
+
+    #[test]
+    fn normalize_cloud_url_strips_v1() {
+        assert_eq!(
+            normalize_cloud_url("https://inference.example.com/v1"),
+            "https://inference.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_cloud_url_strips_v1_trailing_slash() {
+        assert_eq!(
+            normalize_cloud_url("https://inference.example.com/v1/"),
+            "https://inference.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_cloud_url_strips_models_path() {
+        assert_eq!(
+            normalize_cloud_url("https://inference.example.com/v1/models"),
+            "https://inference.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_cloud_url_strips_chat_completions_path() {
+        assert_eq!(
+            normalize_cloud_url("https://inference.example.com/v1/chat/completions"),
+            "https://inference.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_cloud_url_passthrough_bare_host() {
+        assert_eq!(
+            normalize_cloud_url("https://inference.example.com"),
+            "https://inference.example.com"
+        );
+    }
+
+    #[test]
+    fn derive_name_from_url_extracts_host() {
+        assert_eq!(
+            derive_name_from_url("https://inference.example.com/v1"),
+            Some("inference.example.com".to_string())
+        );
+    }
+
+    // --- cloud wizard integration test --------------------------------------
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn cloud_wizard_writes_backend_with_token_file() {
+        let server = MockServer::start().await;
+        // Serve /v1/models with an auth header.
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer test-remote-key",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "example/model-a", "object": "model"},
+                    {"id": "example/model-b", "object": "model"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let client = reqwest::Client::new();
+
+        // Remote (3) → endpoint (with /v1, must be stripped) → key → model → write.
+        // No name prompt: the drop-in is named for the host.
+        let server_url = server.uri(); // e.g. http://127.0.0.1:PORT
+        let server_with_v1 = format!("{server_url}/v1");
+        let mut console = ScriptedConsole::new(&[
+            "3",               // Cloud
+            &server_with_v1,   // base_url (includes /v1 — should be stripped)
+            "test-remote-key", // API key
+            "1",               // pick model 1
+            "y",               // write
+        ]);
+
+        run_with(&mut console, &client, &path).await.unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        let dropin = read_dropin(&path, "127.0.0.1");
+        assert_eq!(dropin.effective_model(), Some("example/model-a"));
+        assert_eq!(dropin.kind, Some(BackendKind::Openai));
+        // The endpoint must NOT include /v1.
+        assert!(!dropin.endpoint.ends_with("/v1"));
+        // A token file was written.
+        assert!(dropin.api_key_file.is_some());
+        let token_path_str = dropin.api_key_file.as_deref().unwrap();
+        let token_path = if let Some(rest) = token_path_str.strip_prefix("~/") {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(rest)
+        } else {
+            std::path::PathBuf::from(token_path_str)
+        };
+        // The config reports a non-empty default.
+        assert_eq!(cfg.default_backend.as_deref(), Some("127.0.0.1"));
+        // Token file exists with the right content.
+        assert_eq!(
+            std::fs::read_to_string(token_path).unwrap(),
+            "test-remote-key"
+        );
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn cloud_wizard_no_key_skips_token_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"id": "open-model", "object": "model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let client = reqwest::Client::new();
+        let server_url = server.uri();
+
+        // No API key — the common self-hosted case. The drop-in is still named
+        // for the host, so no name prompt appears.
+        let mut console = ScriptedConsole::new(&[
+            "3",         // Remote
+            &server_url, // endpoint, already bare
+            "",          // no API key
+            "1",         // pick model 1
+            "y",         // write
+        ]);
+
+        run_with(&mut console, &client, &path).await.unwrap();
+
+        // Named for the host, not for anything the operator typed.
+        let dropin = read_dropin(&path, "127.0.0.1");
+        assert_eq!(dropin.effective_model(), Some("open-model"));
+        assert!(
+            dropin.api_key_file.is_none(),
+            "no key given, so no token file may be written"
+        );
+    }
+
+    /// Regression: the token path used `var_os("HOME")?`, so on Windows — where
+    /// the variable is `USERPROFILE` — the `?` bailed out of the whole closure.
+    /// The token file was written and `api_key_file` stayed `None`, leaving the
+    /// backend silently unauthenticated. Caught by the Windows CI job; this
+    /// pins it without needing one.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn a_token_path_is_recorded_even_when_home_is_unset() {
+        let saved = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
+        // SAFETY: guarded by the `real_fs` serial lane, and restored below.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (_cfg, backend) = build_cloud_config(
+            &path,
+            "example.com",
+            "http://example.com:8080",
+            "model-a",
+            Some("a-secret"),
+        );
+
+        // SAFETY: same lane; restore before asserting so a failure cannot leak.
+        unsafe {
+            if let Some(v) = saved.0 {
+                std::env::set_var("HOME", v);
+            }
+            if let Some(v) = saved.1 {
+                std::env::set_var("USERPROFILE", v);
+            }
+        }
+
+        let recorded = backend
+            .api_key_file
+            .expect("a supplied key must always be recorded, home dir or not");
+        assert!(
+            !recorded.starts_with('~'),
+            "with no home to collapse against, the path stays absolute: {recorded}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&recorded).unwrap(),
+            "a-secret",
+            "the recorded path must point at the token actually written"
+        );
+    }
+
+    // --- model selector (#1452): a llama.cpp router serves 30+ models, so the
+    // operator must never have to type an id exactly. ---
+
+    #[test]
+    fn a_short_list_is_shown_directly_with_no_filter_prompt() {
+        let models: Vec<String> = (1..=3).map(|i| format!("model-{i}")).collect();
+        let mut console = ScriptedConsole::new(&["2"]);
+        assert_eq!(select_model(&mut console, &models).unwrap(), "model-2");
+        // Asking to filter three items would be pure ceremony.
+        assert!(
+            !console.transcript().contains("Filter"),
+            "no filter prompt below the threshold: {}",
+            console.transcript()
+        );
+    }
+
+    #[test]
+    fn a_long_list_filters_then_picks_by_number() {
+        let mut models: Vec<String> = (1..=30).map(|i| format!("filler-{i}")).collect();
+        models.push("qwen3.6_35b".into());
+        models.push("qwen3-coder_30b".into());
+
+        // Type a fragment, then choose from the two matches — the operator
+        // never types the full id.
+        let mut console = ScriptedConsole::new(&["qwen", "2"]);
+        assert_eq!(
+            select_model(&mut console, &models).unwrap(),
+            "qwen3-coder_30b"
+        );
+        let seen = console.transcript();
+        assert!(seen.contains("32 models available"), "{seen}");
+        assert!(!seen.contains("filler-1)"), "filtered out: {seen}");
+    }
+
+    #[test]
+    fn the_filter_is_case_insensitive_and_matches_substrings() {
+        let mut models: Vec<String> = (1..=20).map(|i| format!("filler-{i}")).collect();
+        models.push("Qwen3-Coder".into());
+        let mut console = ScriptedConsole::new(&["CODER", "1"]);
+        assert_eq!(select_model(&mut console, &models).unwrap(), "Qwen3-Coder");
+    }
+
+    /// A filter that matches nothing must not dead-end the operator in an empty
+    /// menu — it falls back to the whole list.
+    #[test]
+    fn a_filter_matching_nothing_falls_back_to_the_full_list() {
+        let models: Vec<String> = (1..=20).map(|i| format!("model-{i}")).collect();
+        let mut console = ScriptedConsole::new(&["zzz-no-such-model", "3"]);
+        assert_eq!(select_model(&mut console, &models).unwrap(), "model-3");
+        assert!(console.transcript().contains("showing all"));
+    }
+
+    #[test]
+    fn a_blank_filter_shows_everything() {
+        let models: Vec<String> = (1..=15).map(|i| format!("model-{i}")).collect();
+        let mut console = ScriptedConsole::new(&["", "15"]);
+        assert_eq!(select_model(&mut console, &models).unwrap(), "model-15");
+    }
+
+    /// An out-of-range or unparseable choice takes the first entry rather than
+    /// erroring out mid-setup.
+    #[test]
+    fn an_invalid_choice_falls_back_to_the_first_entry() {
+        let models: Vec<String> = vec!["a".into(), "b".into()];
+        for answer in ["", "99", "nonsense", "0", "-1"] {
+            let mut console = ScriptedConsole::new(&[answer]);
+            assert_eq!(select_model(&mut console, &models).unwrap(), "a");
+        }
     }
 
     #[serial_test::serial(real_fs)]
