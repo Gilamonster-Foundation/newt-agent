@@ -211,6 +211,223 @@ use crossterm::{
     },
 };
 
+/// Runs `restore` on every exit path of the scope holding it — normal return,
+/// `?`, or panic. Split out from [`SplashScreenGuard`] so the "it always runs"
+/// property is unit-testable without owning a real terminal: the guard proper
+/// closes over crossterm calls, this closes over anything.
+struct RestoreOnDrop<F: FnMut()> {
+    restore: F,
+}
+
+impl<F: FnMut()> Drop for RestoreOnDrop<F> {
+    fn drop(&mut self) {
+        (self.restore)();
+    }
+}
+
+/// RAII owner of the splash's terminal state: raw mode, the alternate screen,
+/// and cursor visibility.
+///
+/// **#1411.** The splash used to enable raw mode and restore it ~30 lines
+/// later, with *three* fallible `?` operators in between: the `execute!` that
+/// enters the alternate screen, `run_setup_screen`, and `show_splash`. Any I/O
+/// error in that window returned early past the restore and left the operator
+/// in the alternate screen, in raw mode, with the cursor hidden — a terminal
+/// that echoes nothing and shows no cursor, recoverable only via `reset`. A
+/// panic did the same. Of the three crossterm raw-mode pairs in this crate this
+/// was the only one with no guard at all (`lean_input::RawGuard` has one;
+/// `rich_input::read_turn` avoids `?` around its event loop).
+///
+/// Per the repo's "make the bug unrepresentable" rule, the fix is ownership
+/// rather than another restore call: the terminal cannot be taken without
+/// binding something that gives it back.
+///
+/// **This deliberately adds a fourth mode guard** to a crate whose #1408 story
+/// C1 is *consolidating* mode ownership into one nesting-aware owner. That is
+/// intentional sequencing, not an oversight: C1 needs the lean firewall
+/// (#1409) under it first, and leaving a reachable terminal-corrupting bug
+/// parked until then is the worse trade. This type is written to be absorbed —
+/// enter/restore is exactly the shape C1 needs.
+struct SplashScreenGuard {
+    _restore: RestoreOnDrop<fn()>,
+}
+
+impl SplashScreenGuard {
+    /// Take the terminal: raw mode, then the alternate screen on a cleared
+    /// frame with the cursor hidden.
+    ///
+    /// The guard is bound *before* the fallible `execute!`, so a failure
+    /// entering the alternate screen still gives raw mode back — that path was
+    /// itself one of the three leaks.
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let guard = Self {
+            _restore: RestoreOnDrop {
+                restore: || {
+                    let _ = disable_raw_mode();
+                    let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+                },
+            },
+        };
+        // Flush the tty input queue on taking the terminal. A slow pre-splash step
+        // — notably the first-run summarizer model pull (#661 group C), which runs
+        // for seconds in cooked mode — lets impatient keystrokes or echoed bytes
+        // queue up; entering raw mode does NOT discard them, so the splash's first
+        // input poll would consume one (a lone Esc / q / Ctrl-C reads as quit) and
+        // newt would exit before the splash is ever seen. TCIFLUSH drops the
+        // pending input atomically — no poll/read drain race.
+        #[cfg(unix)]
+        // SAFETY: tcflush on the stdin tty fd passes no pointers and touches no
+        // memory; the worst case on a non-tty fd is a harmless ENOTTY.
+        unsafe {
+            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+        }
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            Hide,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        Ok(guard)
+    }
+}
+
+/// #1411 regression cover for the splash's terminal-restore contract.
+///
+/// These drive [`RestoreOnDrop`] rather than a real terminal, deliberately:
+/// the defect was never "the restore call is wrong", it was "the restore call
+/// is *skipped* on some exit paths". That is a control-flow property, and
+/// control flow is exactly what a fully-mocked unit test can prove. The
+/// end-to-end proof that the restored terminal actually echoes again is a
+/// real-PTY concern and lands with the shared harness in #1410.
+///
+/// Each test below mirrors one of the three `?` operators that used to sit
+/// between `enable_raw_mode()` and `disable_raw_mode()`; the pre-#1411 shape —
+/// a bare `disable_raw_mode()` call at the bottom of the block — fails all of
+/// them, because on those paths control never reaches the bottom.
+#[cfg(test)]
+mod splash_guard_tests {
+    use super::RestoreOnDrop;
+    use std::cell::Cell;
+
+    /// The ordinary path: the scope ends, the terminal comes back.
+    #[test]
+    fn restore_runs_on_normal_scope_exit() {
+        let ran = Cell::new(0);
+        {
+            let _g = RestoreOnDrop {
+                restore: || ran.set(ran.get() + 1),
+            };
+        }
+        assert_eq!(ran.get(), 1, "restore must run exactly once on normal exit");
+    }
+
+    /// The path that actually bit: an inner `?` returns early, jumping over
+    /// every statement below it. `run_setup_screen(..)?` and
+    /// `show_splash(..)?` are both this shape.
+    #[test]
+    fn restore_runs_when_an_inner_question_mark_returns_early() {
+        let ran = Cell::new(0);
+
+        fn splash_body(ran: &Cell<u32>) -> std::io::Result<()> {
+            let _g = RestoreOnDrop {
+                restore: || ran.set(ran.get() + 1),
+            };
+            // Stands in for a failing `run_setup_screen` / `show_splash`.
+            Err(std::io::Error::other("splash step failed"))?;
+            unreachable!("the ? above returns");
+        }
+
+        assert!(splash_body(&ran).is_err());
+        assert_eq!(
+            ran.get(),
+            1,
+            "restore must run on the error path — this is the #1411 leak: an I/O \
+             error inside the splash used to skip disable_raw_mode + \
+             LeaveAlternateScreen and strand the operator in a hidden-cursor, \
+             non-echoing terminal"
+        );
+    }
+
+    /// A panic inside the splash must also give the terminal back, or the
+    /// process dies leaving the operator's shell unusable.
+    #[test]
+    fn restore_runs_while_unwinding_a_panic() {
+        let ran = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let seen = std::sync::Arc::clone(&ran);
+
+        let result = std::panic::catch_unwind(move || {
+            let _g = RestoreOnDrop {
+                restore: || *seen.lock().unwrap() += 1,
+            };
+            panic!("splash panicked");
+        });
+
+        assert!(result.is_err(), "the panic propagates");
+        assert_eq!(
+            *ran.lock().unwrap(),
+            1,
+            "restore must run during unwind — Drop is the only mechanism that \
+             covers this path at all"
+        );
+    }
+
+    /// NEGATIVE CONTROL — the defect, preserved as an executable statement.
+    ///
+    /// The repo's regression rule asks for a test that fails before the fix.
+    /// Taken literally that is impossible here: the fix *is* the introduction of
+    /// a type, so any test naming `RestoreOnDrop` cannot compile against the old
+    /// code. This test closes that gap honestly by modelling the pre-#1411
+    /// control flow directly — restore as a trailing statement instead of a
+    /// `Drop` — and asserting it leaks.
+    ///
+    /// If someone later "simplifies" the guard back into a trailing call, the
+    /// test above (`restore_runs_when_an_inner_question_mark_returns_early`)
+    /// starts failing and this one explains why.
+    #[test]
+    fn the_pre_fix_shape_skips_restore_on_the_error_path() {
+        // Exactly the old block: take the terminal, do fallible work, give it
+        // back at the bottom. The `?` jumps over the giving-back.
+        fn pre_fix_splash_body(restored: &Cell<u32>) -> std::io::Result<()> {
+            // enable_raw_mode()? + EnterAlternateScreen happened here.
+            Err(std::io::Error::other("splash step failed"))?;
+            // …and this is the `disable_raw_mode()` / `LeaveAlternateScreen`
+            // pair at lib.rs:289-290 that control flow never reaches.
+            restored.set(restored.get() + 1);
+            Ok(())
+        }
+
+        let restored = Cell::new(0);
+        assert!(pre_fix_splash_body(&restored).is_err());
+        assert_eq!(
+            restored.get(),
+            0,
+            "this is the bug #1411 fixes: the terminal was never restored on the \
+             error path, so the operator was left in the alternate screen with \
+             raw mode on and the cursor hidden"
+        );
+    }
+
+    /// Guards nest (the splash sits inside the process, and #1408 C1 will nest
+    /// more), so restores must run innermost-first and exactly once each.
+    #[test]
+    fn nested_guards_restore_in_reverse_order_exactly_once() {
+        let order = std::cell::RefCell::new(Vec::new());
+        {
+            let _outer = RestoreOnDrop {
+                restore: || order.borrow_mut().push("outer"),
+            };
+            {
+                let _inner = RestoreOnDrop {
+                    restore: || order.borrow_mut().push("inner"),
+                };
+            }
+        }
+        assert_eq!(*order.borrow(), vec!["inner", "outer"]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -257,28 +474,10 @@ pub fn run_code(
 
     if !inline {
         // Default: full ANSI splash in alt screen — blinks off on Enter.
-        enable_raw_mode()?;
-        // Flush the tty input queue on taking the terminal. A slow pre-splash step
-        // — notably the first-run summarizer model pull (#661 group C), which runs
-        // for seconds in cooked mode — lets impatient keystrokes or echoed bytes
-        // queue up; entering raw mode does NOT discard them, so the splash's first
-        // input poll would consume one (a lone Esc / q / Ctrl-C reads as quit) and
-        // newt would exit before the splash is ever seen. TCIFLUSH drops the
-        // pending input atomically — no poll/read drain race.
-        #[cfg(unix)]
-        // SAFETY: tcflush on the stdin tty fd passes no pointers and touches no
-        // memory; the worst case on a non-tty fd is a harmless ENOTTY.
-        unsafe {
-            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
-        }
+        // #1411: the guard owns raw mode + the alternate screen + the cursor for
+        // this whole block, so the `?`s below cannot strand the terminal.
+        let screen = SplashScreenGuard::enter()?;
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            Hide,
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        )?;
         // First-run setup, COVERED by the splash (#985): a spinner + status under
         // the logo while the model provisions on a background thread; input is
         // blocked except a triple abort. Then the normal Enter-to-continue splash.
@@ -286,8 +485,10 @@ pub fn run_code(
             run_setup_screen(&mut stdout, color, setup)?;
         }
         let cont = splash::show_splash(&mut stdout, &workspace, color)?;
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        // Give the terminal back before anything else prints: chat must not run
+        // inside the alternate screen. Explicit rather than implicit at the end
+        // of the block so the ordering stays visible to a reader.
+        drop(screen);
         if !cont {
             return Ok(());
         }
