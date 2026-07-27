@@ -1648,6 +1648,141 @@ impl ConversationStore {
         Ok(changed == 1)
     }
 
+    /// How long a staged enrollment candidate stays promotable. An enrollment
+    /// asks a human to compare two six-word strings on two screens, so it is
+    /// given the same 5 minutes as a permission decision — long enough to read
+    /// carefully, short enough that an abandoned candidate cannot be promoted
+    /// by whoever walks up next.
+    pub(crate) const ENROLLMENT_REQUEST_TTL_NANOS: i64 = 5 * 60 * 1_000_000_000;
+
+    /// Stage a candidate binding for terminal confirmation, returning the
+    /// unguessable `request_id` the terminal echoes back.
+    ///
+    /// The web calls this. It confers nothing: the row is a proposal, and only
+    /// [`take_enrollment_candidate`](Self::take_enrollment_candidate) followed
+    /// by a signed registry append turns it into authority. Workspace-fenced.
+    pub fn publish_enrollment_candidate(
+        &self,
+        conversation_id: &str,
+        candidate_json: &str,
+    ) -> anyhow::Result<String> {
+        validate_record_id(conversation_id)?;
+        let now = (self.claim_clock)();
+        let request_id = new_conversation_id();
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT workspace_key FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match owner.as_deref() {
+            None => anyhow::bail!(
+                "cannot stage an enrollment for unknown conversation `{conversation_id}`"
+            ),
+            Some(key) if key != self.workspace_id => {
+                anyhow::bail!("conversation `{conversation_id}` belongs to another workspace")
+            }
+            _ => {}
+        }
+        tx.execute(
+            "INSERT INTO enrollment_requests
+               (request_id, conversation_id, workspace_key, candidate_json, resolved, created_tick)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            rusqlite::params![
+                request_id,
+                conversation_id,
+                self.workspace_id,
+                candidate_json,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(request_id)
+    }
+
+    /// The unexpired staged candidate for `conversation_id`, if any — what the
+    /// terminal renders beside its own independently derived word string.
+    /// Workspace-fenced, non-blocking read.
+    pub fn pending_enrollment_candidate(
+        &self,
+        conversation_id: &str,
+    ) -> anyhow::Result<Option<PendingEnrollment>> {
+        let conn = self.lock_conn();
+        let cutoff = (self.claim_clock)().saturating_sub(Self::ENROLLMENT_REQUEST_TTL_NANOS);
+        conn.query_row(
+            "SELECT request_id, candidate_json FROM enrollment_requests
+              WHERE conversation_id = ?1 AND workspace_key = ?2 AND resolved = 0
+                AND created_tick > ?3
+              ORDER BY created_tick ASC LIMIT 1",
+            rusqlite::params![conversation_id, self.workspace_id, cutoff],
+            |row| {
+                Ok(PendingEnrollment {
+                    request_id: row.get(0)?,
+                    candidate_json: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// The terminal's confirmation: consume `request_id` exactly once and hand
+    /// back the staged candidate for promotion.
+    ///
+    /// Exactly-once is the point — a candidate that has been taken, declined,
+    /// or aged out yields `None`, so a replayed confirmation cannot enroll a
+    /// second credential. The caller promotes what it receives; if that append
+    /// fails the candidate is spent and the human re-runs the ceremony, which
+    /// is the safe direction to fail.
+    pub fn take_enrollment_candidate(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let cutoff = (self.claim_clock)().saturating_sub(Self::ENROLLMENT_REQUEST_TTL_NANOS);
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let candidate: Option<String> = tx
+            .query_row(
+                "SELECT candidate_json FROM enrollment_requests
+                  WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3
+                    AND resolved = 0 AND created_tick > ?4",
+                rusqlite::params![request_id, conversation_id, self.workspace_id, cutoff],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if candidate.is_some() {
+            tx.execute(
+                "UPDATE enrollment_requests SET resolved = 1, resolved_by = 'terminal'
+                  WHERE request_id = ?1",
+                [request_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(candidate)
+    }
+
+    /// The terminal declined (or the surface withdrew) — a CAS that retires the
+    /// candidate. `true` when this call retired it; `false` when it was already
+    /// taken or declined.
+    pub fn decline_enrollment_candidate(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.lock_conn();
+        let changed = conn.execute(
+            "UPDATE enrollment_requests SET resolved = 1, resolved_by = 'declined'
+              WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3
+                AND resolved = 0",
+            rusqlite::params![request_id, conversation_id, self.workspace_id],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// The most-recently-active **open** conversation in this workspace —
     /// highest `activity_tick` whose `end_reason` is still NULL — or `None`
     /// when every conversation has been ended (or none exist). This is the
@@ -3093,7 +3228,25 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              created_tick    INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_permission_requests_pending
-             ON permission_requests (conversation_id, workspace_key, resolved);",
+             ON permission_requests (conversation_id, workspace_key, resolved);
+
+         -- Passkey enrollment staging (#1369). The WEB stages a candidate
+         -- binding here; the TERMINAL promotes it to the signed credential
+         -- registry. Deliberately UNLIKE permission_requests, there is no
+         -- `verdict` column and no web-writable answer: a web actor can only
+         -- ever propose, never confer authority. Nothing in this table is
+         -- authority — a row is a proposal that expires.
+         CREATE TABLE IF NOT EXISTS enrollment_requests (
+             request_id      TEXT PRIMARY KEY,        -- unguessable nonce (new_conversation_id)
+             conversation_id TEXT NOT NULL,
+             workspace_key   TEXT NOT NULL,           -- same fence every table carries
+             candidate_json  TEXT NOT NULL,           -- serialized EnrollmentCandidate
+             resolved        INTEGER NOT NULL DEFAULT 0,
+             resolved_by     TEXT,                    -- audit: 'terminal' | 'declined'
+             created_tick    INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_enrollment_requests_pending
+             ON enrollment_requests (conversation_id, workspace_key, resolved);",
     )?;
     Ok(())
 }
@@ -3724,6 +3877,20 @@ pub struct PendingPermission {
     pub requests_json: String,
     /// Gate-stamped per-target danger tier (the web renders, never classifies).
     pub danger_json: String,
+}
+
+/// A staged passkey binding awaiting terminal confirmation
+/// ([`ConversationStore::pending_enrollment_candidate`]).
+///
+/// There is no verdict field, and that absence is the design: the web stages,
+/// the terminal promotes. Nothing here is authority until a signed row lands in
+/// the credential registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEnrollment {
+    /// The unguessable nonce binding a confirmation to THIS candidate.
+    pub request_id: String,
+    /// Serialized [`crate::enrollment::EnrollmentCandidate`].
+    pub candidate_json: String,
 }
 
 /// The outcome of [`ConversationStore::answer_permission_request`].

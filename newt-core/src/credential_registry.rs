@@ -206,6 +206,67 @@ pub fn sign_record(
     record
 }
 
+/// Append a signed binding to `credentials.d/<subject>.toml`, returning the
+/// file written.
+///
+/// This is the registry's only write path and it is terminal-gated by
+/// construction: the caller must hold the operator root key, and a row this
+/// function did not sign does not survive the next [`load_credentials`]. The
+/// issuer is taken from the key rather than the caller, so a promotion cannot
+/// name an issuer it cannot sign for.
+///
+/// Refuses a subject that is not a bare filename, a bundle belonging to another
+/// operator, and a handle already present — the last making promotion safe to
+/// retry without shadowing an existing credential.
+pub fn append_credential(
+    config_path: &Path,
+    subject: &str,
+    record: CredentialRecord,
+    root_key: &UserKey,
+) -> anyhow::Result<PathBuf> {
+    if subject.is_empty()
+        || !subject
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        || subject.starts_with('.')
+    {
+        anyhow::bail!("subject `{subject}` is not a safe bundle filename");
+    }
+    let issuer = root_key.public().fingerprint().hex();
+    let dir = credentials_dir(config_path);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{subject}.toml"));
+
+    let mut bundle = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str::<CredentialBundle>(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CredentialBundle {
+            issuer: issuer.clone(),
+            subject: subject.to_owned(),
+            credentials: Vec::new(),
+        },
+        Err(error) => return Err(error.into()),
+    };
+    if bundle.issuer != issuer || bundle.subject != subject {
+        anyhow::bail!("{} belongs to another operator", path.display());
+    }
+    if bundle
+        .credentials
+        .iter()
+        .any(|held| held.credential_id_handle == record.credential_id_handle)
+    {
+        anyhow::bail!(
+            "credential `{}` is already enrolled",
+            record.credential_id_handle
+        );
+    }
+
+    bundle
+        .credentials
+        .push(sign_record(&issuer, subject, record, root_key));
+    std::fs::write(&path, toml::to_string(&bundle)?)?;
+    Ok(path)
+}
+
 fn credentials_dir(config_path: &Path) -> PathBuf {
     config_path.with_file_name("ocap").join("credentials.d")
 }
