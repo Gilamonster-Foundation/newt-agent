@@ -103,6 +103,36 @@ wyvern-faithful surface. The ratatui inline rich surface stays behind the
 `rich-tui` cargo feature; `cargo build --no-default-features` yields a lean-only
 build, and `just check` guards that it compiles + lints clean.
 
+## Terminal-capability floor for the rich tier (#1426, decided 2026-07-27)
+
+**The rich surface requires an emulator that reflows on width change. One that
+does not is a lean-tier terminal — run `--lean`.**
+
+Surfaced by #1426: `live_spill.rs`'s `erase_output` computes its rewind by
+dividing the painted line widths by the CURRENT column count, so a width shrink
+assumes the emulator rewrapped the already-painted rows. That is what mainstream
+emulators do, and ANSI exposes **no portable reflow capability query** — there is
+nothing to probe, so the code must simply assume one behavior.
+
+Assuming reflow is the right assumption because the alternative is worse in the
+case that matters. The two available assumptions fail differently:
+
+| Assumption | Reflowing emulator | Non-reflowing emulator |
+|---|---|---|
+| **reflow** (chosen) | correct | over-rewinds |
+| no-reflow | leaves stale rows on every shrink | correct |
+
+Choosing no-reflow would degrade the *common* case to be safe in the rare one.
+Choosing reflow keeps the common case exact and pushes the rare one to the tier
+built for it: `--lean` is a plain scroller with minimal formatting and no redraw
+region, so it has no rewind to get wrong. **If the emulator has word wrap we use
+it; if it does not, we do not** — the same either/or that already governs color
+(`NO_COLOR` / `TERM=dumb`) and the mouse tier (#1303).
+
+This is therefore a stated **requirement of the rich tier**, not a latent bug.
+`erase_output` needs no height clamp: `MoveUp` already saturates at row 0, so a
+clamp changes the emitted bytes without changing where the cursor lands.
+
 ## Consequences
 
 - The default footer-off prompt changed from the legacy `\w $` to `[ts] ❯`. A
