@@ -151,21 +151,30 @@ impl SessionPromptStore {
             }
             None => prompt_id,
         };
-        let active_operator = match prompt.origin() {
-            PromptOrigin::Operator => None,
-            PromptOrigin::HarnessRetry => {
-                let (active, parent_depth) = resolve_session_active_operator(
-                    &state.receipts,
-                    conversation_id,
-                    parent.as_ref().expect("retry parent checked above"),
-                )?;
+        let active_operator = match (prompt.origin(), parent.as_ref()) {
+            // A fresh operator submission is its own active authority.
+            (PromptOrigin::Operator, None) => None,
+            // bug/steering-regressions: an operator CONTINUATION (a decision
+            // or clarification reply bound to a parent ask) REFINES the parent
+            // objective — it must not usurp it as the active operator prompt.
+            // Otherwise the protected active-prompt card carries the ceremony
+            // ("1: proceed") for the whole agentic turn and mid-turn
+            // compaction evicts the real task (live gpt-4.1 + Qwen3-Coder
+            // drives, 2026-07-26/27: post-compaction the goal was gone and
+            // both models wandered).
+            (PromptOrigin::Operator, Some(parent)) | (PromptOrigin::HarnessRetry, Some(parent)) => {
+                let (active, parent_depth) =
+                    resolve_session_active_operator(&state.receipts, conversation_id, parent)?;
                 if parent_depth >= MAX_SESSION_PROMPT_LINEAGE_DEPTH {
                     anyhow::bail!(
-                        "harness retry would exceed the maximum prompt lineage depth of \
+                        "prompt lineage would exceed the maximum prompt lineage depth of \
                          {MAX_SESSION_PROMPT_LINEAGE_DEPTH} receipts"
                     );
                 }
                 Some(active)
+            }
+            (PromptOrigin::HarnessRetry, None) => {
+                anyhow::bail!("harness retry requires a parent prompt")
             }
         };
         let active_operator_id = active_operator
@@ -288,39 +297,41 @@ fn resolve_session_active_operator(
                 current.id()
             );
         }
-        match current.origin() {
-            PromptOrigin::Operator => {
-                if current.active_operator_id() != Some(current.id()) {
+        // A continuation hop: an operator DECISION/CLARIFICATION reply (or a
+        // harness retry) names its lineage's authority rather than itself
+        // (bug/steering-regressions). Both walk to their parent; only an
+        // operator prompt that IS its own authority terminates the walk.
+        // Parent-bearing is the primary signal so v1 rows (no persisted
+        // pointer) recover the same authority by walking explicit parents.
+        let is_operator_continuation = current.origin() == PromptOrigin::Operator
+            && current.parent_prompt_id().is_some()
+            && current.active_operator_id() != Some(current.id());
+        if current.origin() == PromptOrigin::HarnessRetry || is_operator_continuation {
+            let parent_id = current.parent_prompt_id().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "prompt {} continues a lineage but has no parent",
+                    current.id()
+                )
+            })?;
+            retry_authorities.push((current.id(), current.active_operator_id()));
+            current =
+                prompt_in_conversation(receipts, conversation_id, parent_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "prompt {} references missing parent {parent_id}",
+                        current.id()
+                    )
+                })?;
+        } else {
+            for (retry_id, stored_authority) in retry_authorities {
+                if stored_authority != Some(current.id()) {
                     anyhow::bail!(
-                        "operator prompt {} names a different active authority",
+                        "prompt {retry_id} active operator disagrees with parent \
+                         authority {}",
                         current.id()
                     );
                 }
-                for (retry_id, stored_authority) in retry_authorities {
-                    if stored_authority != Some(current.id()) {
-                        anyhow::bail!(
-                            "harness retry {retry_id} active operator disagrees with parent \
-                             authority {}",
-                            current.id()
-                        );
-                    }
-                }
-                return Ok((current, depth));
             }
-            PromptOrigin::HarnessRetry => {
-                let parent_id = current.parent_prompt_id().ok_or_else(|| {
-                    anyhow::anyhow!("harness retry {} has no parent", current.id())
-                })?;
-                retry_authorities.push((current.id(), current.active_operator_id()));
-                current = prompt_in_conversation(receipts, conversation_id, parent_id).ok_or_else(
-                    || {
-                        anyhow::anyhow!(
-                            "harness retry {} references missing parent {parent_id}",
-                            current.id()
-                        )
-                    },
-                )?;
-            }
+            return Ok((current, depth));
         }
     }
 

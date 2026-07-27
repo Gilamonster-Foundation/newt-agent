@@ -489,12 +489,17 @@ impl ConversationStore {
             }
             None => prompt_id,
         };
-        let active_operator = match prompt.origin {
-            PromptOrigin::Operator => None,
-            PromptOrigin::HarnessRetry => {
-                let parent = parent.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("a harness retry must name an operator-prompt parent")
-                })?;
+        let active_operator = match (prompt.origin, parent.as_ref()) {
+            // A fresh operator submission is its own active authority.
+            (PromptOrigin::Operator, None) => None,
+            // bug/steering-regressions: an operator CONTINUATION (a decision
+            // or clarification reply bound to a parent ask) REFINES the parent
+            // objective — it must not usurp it as the active operator prompt.
+            // Otherwise the protected active-prompt card carries the ceremony
+            // ("1: proceed") for the whole agentic turn and mid-turn
+            // compaction evicts the real task (live gpt-4.1 + Qwen3-Coder
+            // drives, 2026-07-26/27).
+            (PromptOrigin::Operator, Some(parent)) | (PromptOrigin::HarnessRetry, Some(parent)) => {
                 let (active, parent_depth) = resolve_active_operator_on_conn(
                     &tx,
                     conversation_id,
@@ -503,11 +508,14 @@ impl ConversationStore {
                 )?;
                 if parent_depth >= MAX_PROMPT_LINEAGE_DEPTH {
                     anyhow::bail!(
-                        "harness retry would exceed the maximum prompt lineage depth of \
+                        "prompt lineage would exceed the maximum prompt lineage depth of \
                          {MAX_PROMPT_LINEAGE_DEPTH} receipts"
                     );
                 }
                 Some(active)
+            }
+            (PromptOrigin::HarnessRetry, None) => {
+                anyhow::bail!("a harness retry must name an operator-prompt parent")
             }
         };
         let active_operator_id = active_operator
@@ -2648,46 +2656,46 @@ fn resolve_active_operator_on_conn(
             );
         }
 
-        match current.origin() {
-            PromptOrigin::Operator => {
-                if current
-                    .active_operator_id()
-                    .is_some_and(|active| active != current.id())
-                {
+        // A continuation hop: an operator DECISION/CLARIFICATION reply (or a
+        // harness retry) names its lineage's authority rather than itself
+        // (bug/steering-regressions). Both walk to their parent; only an
+        // operator prompt that IS its own authority terminates the walk.
+        // Parent-bearing is the primary signal so v1 rows (no persisted
+        // pointer) recover the same authority by walking explicit parents.
+        let is_operator_continuation = current.origin() == PromptOrigin::Operator
+            && current.parent_prompt_id().is_some()
+            && current.active_operator_id() != Some(current.id());
+        if current.origin() == PromptOrigin::HarnessRetry || is_operator_continuation {
+            let parent_id = current.parent_prompt_id().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "prompt {} continues a lineage but has no parent",
+                    current.id()
+                )
+            })?;
+            retry_authorities.push((current.id(), current.active_operator_id()));
+            current = load_prompt_in_conversation_on_conn(
+                conn,
+                conversation_id,
+                parent_id,
+                workspace_id,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "prompt {} references missing parent {parent_id}",
+                    current.id()
+                )
+            })?;
+        } else {
+            for (retry_id, stored_authority) in retry_authorities {
+                if stored_authority.is_some_and(|stored| stored != current.id()) {
                     anyhow::bail!(
-                        "operator prompt {} names a different active authority",
+                        "prompt {retry_id} active operator disagrees with parent \
+                         authority {}",
                         current.id()
                     );
                 }
-                for (retry_id, stored_authority) in retry_authorities {
-                    if stored_authority.is_some_and(|stored| stored != current.id()) {
-                        anyhow::bail!(
-                            "harness retry {retry_id} active operator disagrees with parent \
-                             authority {}",
-                            current.id()
-                        );
-                    }
-                }
-                return Ok((current, depth));
             }
-            PromptOrigin::HarnessRetry => {
-                let parent_id = current.parent_prompt_id().ok_or_else(|| {
-                    anyhow::anyhow!("harness retry {} has no parent", current.id())
-                })?;
-                retry_authorities.push((current.id(), current.active_operator_id()));
-                current = load_prompt_in_conversation_on_conn(
-                    conn,
-                    conversation_id,
-                    parent_id,
-                    workspace_id,
-                )?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "harness retry {} references missing parent {parent_id}",
-                        current.id()
-                    )
-                })?;
-            }
+            return Ok((current, depth));
         }
     }
 
@@ -4771,8 +4779,14 @@ mod tests {
         assert_eq!(store.load(conversation_id).unwrap().title, "original");
     }
 
+    /// bug/steering-regressions: this test previously pinned the OPPOSITE
+    /// contract ("…but_is_itself_active") — a continuation usurped the parent
+    /// ask as the active operator prompt, so the protected active-prompt card
+    /// carried decision ceremony ("1: proceed") and mid-turn compaction
+    /// evicted the real task (live gpt-4.1 + Qwen3-Coder drives, 2026-07-26/27).
+    /// A continuation refines the parent objective; the parent stays active.
     #[test]
-    fn operator_continuation_inherits_root_but_is_itself_active() {
+    fn operator_continuation_inherits_root_and_parent_stays_active() {
         let root = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
@@ -4801,7 +4815,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(continuation.submitted().root_prompt_id(), root_prompt.id());
-        assert_eq!(continuation.active().id(), continuation.submitted().id());
+        assert_eq!(
+            continuation.active().id(),
+            root_prompt.id(),
+            "a continuation must not usurp the parent ask as the active \
+             operator prompt — the task the card protects lives there"
+        );
     }
 
     #[test]
@@ -4810,7 +4829,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let conv = "continuation-retry-authority";
 
-        let (a_id, b_id, retry_id, retry_again_id) = {
+        let (a_id, _b_id, retry_id, retry_again_id) = {
             let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
             let a = store
                 .begin_prompt(
@@ -4858,10 +4877,12 @@ mod tests {
                 .unwrap();
 
             assert_eq!(b.submitted().root_prompt_id(), a.submitted().id());
-            assert_eq!(b.active().id(), b.submitted().id());
+            // bug/steering-regressions: b is a CONTINUATION of a — a remains
+            // the active authority; retries through b resolve to a as well.
+            assert_eq!(b.active().id(), a.submitted().id());
             assert_eq!(retry.submitted().root_prompt_id(), a.submitted().id());
-            assert_eq!(retry.active().id(), b.submitted().id());
-            assert_eq!(retry_again.active().id(), b.submitted().id());
+            assert_eq!(retry.active().id(), a.submitted().id());
+            assert_eq!(retry_again.active().id(), a.submitted().id());
 
             // Simulate receipts written by the v1 schema: no persisted active
             // pointer, and the canonical v1 hash. Reopen must recover the same
@@ -4897,7 +4918,7 @@ mod tests {
                 .turn_prompt_context(conv, retry_id)
                 .unwrap()
                 .expect("retry receipt survives reopen");
-            assert_eq!(context.active().id(), b_id);
+            assert_eq!(context.active().id(), a_id);
             assert_eq!(context.submitted().root_prompt_id(), a_id);
         }
     }
@@ -4916,12 +4937,16 @@ mod tests {
                 crate::prompt::NewPrompt::operator("A", "A"),
             )
             .unwrap();
+        // b is a FRESH operator prompt (not a continuation): under the
+        // bug/steering-regressions contract a continuation's authority IS its
+        // parent, so pointing a retry-of-a-continuation at A would agree with
+        // the recomputed walk. A fresh b keeps the forgery a real disagreement.
         let b = store
             .begin_prompt(
                 conv,
                 "title",
                 None,
-                crate::prompt::NewPrompt::operator_continuation("B", "B", a.submitted().id()),
+                crate::prompt::NewPrompt::operator("B", "B"),
             )
             .unwrap();
         let retry = store
@@ -5003,7 +5028,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let conv = "v1-authority-migration";
-        let (b_id, retry_id) = {
+        let (a_id, retry_id) = {
             let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
             let a = store
                 .begin_prompt(
@@ -5050,7 +5075,8 @@ mod tests {
                 conn.execute_batch("ALTER TABLE prompt_receipts DROP COLUMN active_operator_id")
                     .unwrap();
             }
-            (b.submitted().id(), retry.submitted().id())
+            let _ = &b; // continuation node in the walk; authority is a
+            (a.submitted().id(), retry.submitted().id())
         };
 
         let reopened = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
@@ -5058,7 +5084,7 @@ mod tests {
             .turn_prompt_context(conv, retry_id)
             .unwrap()
             .unwrap();
-        assert_eq!(context.active().id(), b_id);
+        assert_eq!(context.active().id(), a_id);
         assert_eq!(context.submitted().receipt().active_operator_id(), None);
         let columns: Vec<String> = {
             let conn = reopened.lock_conn();
