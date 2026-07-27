@@ -541,17 +541,117 @@ fn spill_override_resolves_and_reports_live_capability() {
     assert_eq!(effective_spill_lines(3, Some(7)), 7);
     assert_eq!(effective_spill_lines(3, Some(0)), 0);
     assert_eq!(
-        spill_status(3, None, true),
+        spill_status(3, None, SpillEligibility::Available),
         "spill rows: 3 (config default; live interaction available)"
     );
+    // #1412: the unavailable arm now NAMES the refusing gate instead of saying
+    // only "unavailable" — that silence is why a stale install was reported as
+    // a vanished feature.
     assert_eq!(
-        spill_status(3, Some(7), false),
-        "spill rows: 7 this session (config default 3; live interaction unavailable)"
+        spill_status(3, Some(7), SpillEligibility::StdoutNotTty),
+        "spill rows: 7 this session (config default 3; live interaction unavailable: \
+         stdout is not a terminal (piped or redirected))"
     );
     assert_eq!(
-        spill_status(3, Some(0), true),
-        "spill rows: unbounded this session (config default 3; live viewport disabled)"
+        spill_status(3, Some(0), SpillEligibility::Available),
+        "spill rows: unbounded this session (config default 3; live viewport disabled: \
+         spill_lines is 0 (/spill <n> raises it))"
     );
+}
+
+/// #1412: every refusal reason reaches the operator, and zero rows is reported
+/// as a config choice rather than a broken terminal.
+#[test]
+fn spill_status_names_the_gate_that_refused() {
+    for (eligibility, needle) in [
+        (
+            SpillEligibility::UnsupportedPlatform,
+            "unsupported platform",
+        ),
+        (SpillEligibility::FeatureDisabled, "`live-spill` feature"),
+        (SpillEligibility::StdinNotTty, "stdin is not a terminal"),
+        (SpillEligibility::StdoutNotTty, "stdout is not a terminal"),
+        (SpillEligibility::TermDumb, "TERM=dumb"),
+    ] {
+        let status = spill_status(3, None, eligibility);
+        assert!(
+            status.contains(needle),
+            "{eligibility:?} must surface {needle:?} to the operator, got: {status}"
+        );
+    }
+
+    // Rows are a separate axis from capability: a capable terminal with zero
+    // rows must not be reported as an incapable terminal.
+    let zero = spill_status(0, None, SpillEligibility::Available);
+    assert!(zero.contains("spill_lines is 0"), "{zero}");
+    assert!(
+        !zero.contains("unavailable"),
+        "zero rows is a config choice, not a broken terminal: {zero}"
+    );
+}
+
+/// #1412: precedence is part of the contract. When several gates refuse at
+/// once, the one the operator cannot change without a different binary must
+/// win — otherwise `/spill` sends someone to fix `TERM` on a build that never
+/// compiled the feature in.
+#[test]
+fn spill_eligibility_reports_the_most_fundamental_refusal_first() {
+    // Every gate failing at once: platform outranks all.
+    assert_eq!(
+        spill_eligibility_for(false, false, false, false, Some("dumb")),
+        SpillEligibility::UnsupportedPlatform
+    );
+    // Supported platform, everything else failing: the cargo feature is next.
+    assert_eq!(
+        spill_eligibility_for(true, false, false, false, Some("dumb")),
+        SpillEligibility::FeatureDisabled
+    );
+    // Then the invocation-shaped gates, stdin before stdout.
+    assert_eq!(
+        spill_eligibility_for(true, true, false, false, Some("dumb")),
+        SpillEligibility::StdinNotTty
+    );
+    assert_eq!(
+        spill_eligibility_for(true, true, true, false, Some("dumb")),
+        SpillEligibility::StdoutNotTty
+    );
+    // Only the terminal's own declaration remains.
+    assert_eq!(
+        spill_eligibility_for(true, true, true, true, Some("dumb")),
+        SpillEligibility::TermDumb
+    );
+    assert_eq!(
+        spill_eligibility_for(true, true, true, true, Some("xterm-256color")),
+        SpillEligibility::Available
+    );
+    // A terminal that declares nothing is not "dumb".
+    assert_eq!(
+        spill_eligibility_for(true, true, true, true, None),
+        SpillEligibility::Available
+    );
+}
+
+/// #1412: the boolean façade must agree with the typed answer at every input,
+/// so the mouse tier cannot drift from `/spill`'s account of the same gates.
+#[test]
+fn capable_bool_agrees_with_typed_eligibility() {
+    for platform in [true, false] {
+        for feature in [true, false] {
+            for stdin in [true, false] {
+                for stdout in [true, false] {
+                    for term in [Some("xterm"), Some("dumb"), None] {
+                        assert_eq!(
+                            live_spill_capable_for(platform, feature, stdin, stdout, term),
+                            spill_eligibility_for(platform, feature, stdin, stdout, term)
+                                == SpillEligibility::Available,
+                            "disagreement at platform={platform} feature={feature} \
+                             stdin={stdin} stdout={stdout} term={term:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
