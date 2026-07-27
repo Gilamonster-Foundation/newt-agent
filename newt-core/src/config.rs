@@ -3388,7 +3388,23 @@ impl Config {
                     // The filename is authoritative for the name (collision-free).
                     backend.name = stem.to_string();
                     match self.backends.iter_mut().find(|b| b.name == backend.name) {
-                        Some(existing) => *existing = backend,
+                        Some(existing) => {
+                            // A probe-cache drop-in records probed REALITY
+                            // (endpoint / model / api / serving) — it must never
+                            // CLEAR auth the config declared. Preserve api_key_*
+                            // when the drop-in omits them; otherwise an
+                            // OpenAI-kind backend silently loses its bearer token
+                            // after the first adopt writeback (the writeback
+                            // never persists secrets), and every later session
+                            // 401s. See writeback_probed_backend.
+                            if backend.api_key_env.is_none() {
+                                backend.api_key_env = existing.api_key_env.clone();
+                            }
+                            if backend.api_key_file.is_none() {
+                                backend.api_key_file = existing.api_key_file.clone();
+                            }
+                            *existing = backend;
+                        }
                         None => self.backends.push(backend),
                     }
                 }
@@ -5366,6 +5382,46 @@ mod tests {
         assert_eq!(dgx1.effective_model(), Some("qwen3:30b"));
         assert_eq!(dgx1.kind, None, "absent kind means probe-at-connect");
         assert!(cfg.backends.iter().any(|b| b.name == "gnuc"), "gnuc kept");
+    }
+
+    #[test]
+    fn dropin_probe_cache_preserves_config_declared_auth() {
+        // Regression: an OpenAI-kind backend declares its bearer token in
+        // config.toml (api_key_env / api_key_file). The adopt writeback persists
+        // probed endpoint/model but NEVER secrets, so the drop-in carries no
+        // auth. The load-merge must PRESERVE the config's auth, not clear it —
+        // otherwise every session after the first adopt writeback 401s.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("gpt41.toml"),
+            "endpoint = \"https://api.openai.com\"\nmodel = \"gpt-4.1\"\nkind = \"openai\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "gpt41".into(),
+                endpoint: "https://api.openai.com".into(),
+                model: Some("gpt-4.1".into()),
+                kind: Some(BackendKind::Openai),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                api_key_file: Some("/vault/openai".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg.merge_backends_from_dir(dir.path());
+        let b = cfg.backends.iter().find(|b| b.name == "gpt41").unwrap();
+        assert_eq!(b.model.as_deref(), Some("gpt-4.1"), "probed model applied");
+        assert_eq!(
+            b.api_key_env.as_deref(),
+            Some("OPENAI_API_KEY"),
+            "config-declared api_key_env must survive a keyless probe drop-in"
+        );
+        assert_eq!(
+            b.api_key_file.as_deref(),
+            Some("/vault/openai"),
+            "config-declared api_key_file must survive a keyless probe drop-in"
+        );
     }
 
     #[test]
