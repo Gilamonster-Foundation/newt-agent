@@ -51,8 +51,6 @@ pub struct SetupHandle {
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 /// Is this key an abort press (Esc or Ctrl+C)? Three in a row abort setup.
 fn is_abort_key(ev: &Event) -> bool {
     match ev {
@@ -137,7 +135,8 @@ pub(crate) fn run_setup_screen(
         let row = logo_rows + 1;
         let (glyph, line, hint) = match &finished {
             None => (
-                SPINNER[frame % SPINNER.len()].to_string(),
+                newt_core::tty::SPINNER_FRAMES[frame % newt_core::tty::SPINNER_FRAMES.len()]
+                    .to_string(),
                 setup_status_line(&setup.what, &step, done, total),
                 "triple-Esc to skip (uses the session model instead)",
             ),
@@ -210,7 +209,7 @@ pub(crate) fn run_setup_inline(setup: &SetupHandle) {
             None => {
                 eprint!(
                     "\r  {}  {}   ",
-                    SPINNER[frame % SPINNER.len()],
+                    newt_core::tty::SPINNER_FRAMES[frame % newt_core::tty::SPINNER_FRAMES.len()],
                     setup_status_line(&setup.what, &step, done, total)
                 );
                 let _ = io::stderr().flush();

@@ -7642,10 +7642,15 @@ fn print_thinking(color: bool) {
         // Frame-0 placeholder matching the animated spinner the inference loop
         // takes over (newt-core animates the probe wait in place), so there is
         // no glyph jump between this instant feedback and the live line.
+        //
+        // #1413: taken from the canonical frame set rather than written as a
+        // literal. The "no glyph jump" promise above is only true if this glyph
+        // and the one newt-core animates come from the same array — a literal
+        // makes that a coincidence maintained by hand.
         execute!(
             io::stdout(),
             SetForegroundColor(CtColor::DarkGrey),
-            Print("⠋ thinking…"),
+            Print(format!("{} thinking…", newt_core::tty::SPINNER_FRAMES[0])),
             ResetColor,
         )
         .ok();
@@ -7656,6 +7661,24 @@ fn print_thinking(color: bool) {
 fn erase_line() {
     // Clear-to-end-of-line: the animated thinking line ("⏳ ⠋ thinking… 12.3s")
     // can be wider than a fixed blank run, so `\x1b[K` wipes whatever is there.
+    //
+    // #1413 — STILL ARBITER-BYPASSING, deliberately, and here is why the
+    // obvious fix is wrong.
+    //
+    // This erase pairs with `print_thinking` (~800 lines up in `run_chat`), so
+    // the row is ephemeral for the whole turn. The tempting fix is to hold a
+    // `Terminal::lease` across that span and let `LineLease::drop` erase. It
+    // would deadlock the spinner: `lease` is exclusive on `Inner.line_held`,
+    // and `print_thinking`'s own comment says newt-core "takes over" this row —
+    // `Spinner::start_with_caps` inside `stream_response` leases it. A
+    // turn-length lease here starves that call for `LEASE_WAIT` and it returns
+    // `None`: no thinking spinner, every turn. That is the same failure mode
+    // rejected for the live-spill viewport in #1410.
+    //
+    // The real fix is to model the HANDOFF — newt-tui paints a placeholder,
+    // newt-core adopts the same row — which is #1312's spinner migration, not a
+    // local change. Until then this stays open-coded, and the pairing above is
+    // the reason, not an oversight.
     print!("\r\x1b[K");
     io::stdout().flush().ok();
 }
