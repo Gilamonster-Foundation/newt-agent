@@ -51,6 +51,10 @@ package-lock.json
 # Eval analysis workflow TEMPLATES are canonical, committed sources (#805) —
 # carve them out of the blanket *.js ignore above.
 !scripts/eval/workflows/*.workflow.js
+# Vendored browser assets are SOURCE, not build output. newt-web include_str!'s
+# them and hashes them for SRI, so an ignored asset silently breaks the build
+# for everyone but the author (#1372).
+!newt-web/assets/*.js
 
 # ...but the reconstituted Claude Code commands are GENERATED artifacts:
 # scripts/eval/workflows/install.sh recreates them on any fresh machine.

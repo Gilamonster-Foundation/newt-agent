@@ -929,13 +929,47 @@ mod tests {
                     self.ensure_cursor_row();
                     self.rows[self.cursor_row].clear();
                 }
+                // #1427: bare `ESC[K` (== `ESC[0K`) erases from the cursor to
+                // end of line. This is what `Clear(UntilNewLine)` emits, and
+                // therefore what `LineLease::erase` puts on the wire — so the
+                // model needs it to observe the ARBITER, not just this
+                // renderer. Distinct from `ESC[2K` above, which clears the whole
+                // row regardless of cursor position.
+                ("" | "0", 'K') => {
+                    self.ensure_cursor_row();
+                    let col = self.cursor_col;
+                    let row = &mut self.rows[self.cursor_row];
+                    // `cursor_col` is a DISPLAY column, not a byte offset —
+                    // walk to the matching boundary so a wide or multibyte
+                    // glyph is never split (these frames carry ▒/▓/▲ and CJK).
+                    let mut width = 0usize;
+                    let mut cut = row.len();
+                    for (i, ch) in row.char_indices() {
+                        if width >= col {
+                            cut = i;
+                            break;
+                        }
+                        width += display_width(&ch.to_string()).max(1);
+                    }
+                    row.truncate(cut);
+                }
                 (_, 'J') => {
                     self.ensure_cursor_row();
                     self.rows.truncate(self.cursor_row + 1);
                     self.rows[self.cursor_row].clear();
                 }
                 (_, 'm') => {}
-                other => panic!("unsupported screen-model CSI: {other:?}"),
+                // #1427 asked whether this should record instead of panic.
+                // It should NOT. This is a test double: a model that silently
+                // ignores a sequence it does not understand keeps returning
+                // green while diverging from the real terminal, which is the
+                // one failure a screen model exists to prevent. Aborting loudly
+                // is the feature — add an arm above when a new sequence is
+                // legitimately in play, and pin its semantics with a test.
+                other => panic!(
+                    "unsupported screen-model CSI: {other:?} — add an arm above \
+                     rather than widening the model silently"
+                ),
             }
         }
 
@@ -1505,6 +1539,41 @@ mod tests {
         assert!(
             rendered.contains("\u{1b}[14A"),
             "old reflowed frame was not fully erased before resize: {rendered:?}"
+        );
+    }
+
+    /// #1427: the screen model must survive the bytes the ARBITER emits, not
+    /// only the ones this renderer emits.
+    ///
+    /// `LineLease::erase` writes `\r` + `Clear(UntilNewLine)`, and crossterm
+    /// renders that as a **parameterless** `ESC[K`. The model only had a
+    /// `("2", 'K')` arm, so that sequence fell through to `panic!` and aborted
+    /// the whole test binary. Any future test that drives a leased spinner and
+    /// this viewport through one byte stream — exactly what #1408's
+    /// consolidation needs — would have hit it.
+    ///
+    /// Semantics pinned here: bare `ESC[K` == `ESC[0K` == erase from the cursor
+    /// to end of line, which is NOT `ESC[2K` (erase the entire line).
+    #[test]
+    fn screen_model_handles_the_parameterless_erase_the_arbiter_emits() {
+        let mut screen = ScreenModel::new(40);
+        screen.apply(b"keep this|and drop this");
+
+        // Park the cursor after "keep this|" (column 11, 1-based) and clear to
+        // end of line — what `LineLease::erase` puts on the wire after its
+        // leading carriage return.
+        screen.apply(b"\x1b[11G\x1b[K");
+        assert_eq!(
+            screen.nonempty_rows(),
+            vec!["keep this|"],
+            "bare ESC[K must erase from the cursor to end of line"
+        );
+
+        // The whole-line form must still mean the whole line.
+        screen.apply(b"\x1b[2K");
+        assert!(
+            screen.nonempty_rows().is_empty(),
+            "ESC[2K must still clear the entire row"
         );
     }
 

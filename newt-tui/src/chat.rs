@@ -5791,13 +5791,20 @@ mod prompt_ingress_tests {
             original.submitted_prompt().receipt().root_prompt_id(),
             "a clarification answer must retain the original objective root"
         );
+        // bug/steering-regressions (#1443): a clarification/decision CONTINUATION
+        // refines the parent objective — it must NOT become the active operator
+        // authority. Otherwise the protected prompt card carries the ceremony
+        // reply ("1: SQLite") for the whole turn and mid-turn compaction can
+        // evict the real task.
         assert_eq!(
             answer.active_operator_prompt().id(),
             original.submitted_prompt().id(),
-            "bug/steering-regressions: a clarification answer REFINES the \
-             pending objective — the original ask stays the active operator \
-             prompt so the compression-immune card keeps the real task, not \
-             the ceremony reply"
+            "a clarification answer must keep the original objective as active authority"
+        );
+        assert_ne!(
+            answer.active_operator_prompt().id(),
+            answer.submitted_prompt().id(),
+            "the ceremony reply itself is not the active operator prompt"
         );
     }
 
