@@ -405,6 +405,16 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("newt-web: cannot bind {bind}: {e}"));
     eprintln!("newt-web listening on http://{bind}");
+    // Fail-closed posture, stated at startup so an operator can see whether
+    // passkey verification is armed rather than discovering it at answer time.
+    match newt_web::webauthn::RelyingParty::from_env() {
+        Ok(rp) => eprintln!(
+            "newt-web: passkey relying party {} @ {}",
+            rp.rp_id(),
+            rp.origin()
+        ),
+        Err(why) => eprintln!("newt-web: passkey verification DISABLED — {why}"),
+    }
     axum::serve(listener, app()).await.expect("serve");
 }
 

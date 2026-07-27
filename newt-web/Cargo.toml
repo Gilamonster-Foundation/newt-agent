@@ -20,6 +20,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 ammonia = "4"
 serde = { version = "1", features = ["derive"] }
+# WebAuthn attestation objects are CBOR; COSE keys are CBOR maps inside them.
+# ciborium is pure-Rust, no_std-friendly, and already the ecosystem default.
+ciborium = "0.2"
+# rpIdHash is SHA-256(rp_id) — the one hash WebAuthn fixes by spec, so this is
+# not a place the multihash rule applies.
+sha2 = "0.10"
+base64 = "0.22"
 serde_json = "1"
 async-stream = "0.3"
 futures-core = "0.3"
