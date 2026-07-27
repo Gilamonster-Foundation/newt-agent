@@ -3464,6 +3464,198 @@ pub(crate) fn backends_list_items(
         .collect()
 }
 
+/// Operator decision for the Codex-compat OPENAI_* environment (iteration #9):
+/// "OPENAI env detected: use it? use/ignore/use-always/ignore-always".
+///
+/// `use`/`ignore` are session-scoped; the `-always` forms persist as the
+/// drop-in `~/.newt/openai-env.toml` (`decision = "use-always" |
+/// "ignore-always"` — the config law: core config stays lean, new knobs are
+/// drop-ins; delete the file to be asked again). Non-interactive sessions
+/// never prompt: they honor a stored `use-always` and otherwise ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexEnvDecision {
+    UseIt,
+    Skip,
+}
+
+/// Parse a stored decision file body. Unknown content → `None` (ask again),
+/// never a silent yes.
+fn parse_codex_env_decision(body: &str) -> Option<CodexEnvDecision> {
+    for line in body.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(value) = line.strip_prefix("decision") {
+            let value = value
+                .trim_start_matches([' ', '='])
+                .trim()
+                .trim_matches('"');
+            return match value {
+                // Canonical vocabulary + tolerated aliases.
+                "use-always" | "always" | "use" => Some(CodexEnvDecision::UseIt),
+                "ignore-always" | "never" | "ignore" => Some(CodexEnvDecision::Skip),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn codex_env_decision_path() -> Option<std::path::PathBuf> {
+    newt_core::Config::user_config_path().map(|p| p.with_file_name("openai-env.toml"))
+}
+
+/// Resolve the operator's stance on the detected OPENAI_* env, prompting at
+/// most once per process (OnceLock) and only on a TTY. `detected` names the
+/// variables found, for the prompt line.
+fn codex_env_allowed(detected: &str) -> bool {
+    use std::io::IsTerminal;
+    static DECISION: std::sync::OnceLock<CodexEnvDecision> = std::sync::OnceLock::new();
+    *DECISION.get_or_init(|| {
+        // Durable decision first.
+        if let Some(path) = codex_env_decision_path() {
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                if let Some(decision) = parse_codex_env_decision(&body) {
+                    return decision;
+                }
+            }
+        }
+        if !std::io::stdin().is_terminal() {
+            // Headless: only a stored `always` may adopt the env.
+            return CodexEnvDecision::Skip;
+        }
+        eprint!(
+            "OPENAI env detected ({detected}): use it? \
+             [use/ignore/use-always/ignore-always] "
+        );
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        let answer = line.trim().to_ascii_lowercase();
+        let (decision, persist) = match answer.as_str() {
+            "use" | "u" | "y" | "yes" => (CodexEnvDecision::UseIt, None),
+            "use-always" | "always" | "a" => (CodexEnvDecision::UseIt, Some("use-always")),
+            "ignore-always" | "never" => (CodexEnvDecision::Skip, Some("ignore-always")),
+            // "ignore", empty, or anything unrecognized: ignore this session.
+            _ => (CodexEnvDecision::Skip, None),
+        };
+        if let (Some(value), Some(path)) = (persist, codex_env_decision_path()) {
+            let body = format!(
+                "# Written by newt: Codex-compat OPENAI_* env adoption.\n\
+                 # \"use-always\" adopts silently; \"ignore-always\" ignores silently; delete to be asked again.\n\
+                 decision = \"{value}\"\n"
+            );
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, body);
+        }
+        decision
+    }) == CodexEnvDecision::UseIt
+}
+
+/// Codex-parity environment resolution, pure for the mocked test tier: given
+/// the raw `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` values,
+/// synthesize an OpenAI-kind [`BackendChoice`] or decline.
+///
+/// - `OPENAI_BASE_URL` set (non-empty) → always fires: an explicit redirect,
+///   usable against any OpenAI-compatible server (a lab llama.cpp router
+///   included). A trailing `/v1` is trimmed — newt appends the wire path
+///   itself, and the Codex convention includes `/v1` in the base URL.
+/// - Only `OPENAI_API_KEY` set → fires ONLY when no `[[backends]]` are
+///   configured (zero-config onboarding; never hijacks a configured setup).
+/// - `OPENAI_MODEL` (else the session override) names the model; empty means
+///   adopt() fills it from the served list at session start (#1126).
+fn codex_env_backend(
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+    session_model: Option<String>,
+    have_configured_backends: bool,
+) -> Option<BackendChoice> {
+    let base_url = base_url.map(str::trim).filter(|s| !s.is_empty());
+    let api_key = api_key.map(str::trim).filter(|s| !s.is_empty());
+    let model = model.map(str::trim).filter(|s| !s.is_empty());
+    let fires = base_url.is_some() || (api_key.is_some() && !have_configured_backends);
+    if !fires {
+        return None;
+    }
+    let url = base_url.unwrap_or("https://api.openai.com");
+    let url = url.trim_end_matches('/');
+    let url = url.strip_suffix("/v1").unwrap_or(url).to_string();
+    Some(BackendChoice {
+        name: "openai-env".into(),
+        serving: None,
+        url,
+        model: model
+            .map(str::to_string)
+            .or(session_model)
+            .unwrap_or_default(),
+        kind: newt_core::BackendKind::Openai,
+        kind_needs_probe: false,
+        api_key: api_key.map(str::to_string),
+        api: newt_core::OpenAiApi::default(),
+        api_needs_probe: true,
+        context_window: None,
+    })
+}
+
+#[cfg(test)]
+mod codex_env_tests {
+    use super::*;
+
+    #[test]
+    fn base_url_fires_even_with_configured_backends_and_trims_v1() {
+        let c = codex_env_backend(
+            Some("https://api.openai.com/v1/"),
+            Some("sk-x"),
+            Some("gpt-4.1"),
+            None,
+            true,
+        )
+        .expect("explicit base url is a deliberate redirect");
+        assert_eq!(c.url, "https://api.openai.com");
+        assert_eq!(c.model, "gpt-4.1");
+        assert_eq!(c.api_key.as_deref(), Some("sk-x"));
+        assert_eq!(c.kind, newt_core::BackendKind::Openai);
+    }
+
+    #[test]
+    fn bare_key_fires_only_with_no_configured_backends() {
+        assert!(
+            codex_env_backend(None, Some("sk-x"), None, None, true).is_none(),
+            "a stray OPENAI_API_KEY must never hijack a configured setup"
+        );
+        let c = codex_env_backend(None, Some("sk-x"), None, None, false)
+            .expect("zero-config onboarding");
+        assert_eq!(c.url, "https://api.openai.com");
+        assert!(
+            c.model.is_empty(),
+            "adopt() fills the model at session start"
+        );
+    }
+
+    #[test]
+    fn empty_values_do_not_fire() {
+        assert!(codex_env_backend(Some("  "), Some(""), None, None, false).is_none());
+        assert!(codex_env_backend(None, None, Some("gpt-4.1"), None, false).is_none());
+    }
+
+    #[test]
+    fn stored_decisions_parse_with_canonical_and_alias_spellings() {
+        for (body, want) in [
+            ("decision = \"use-always\"\n", Some(CodexEnvDecision::UseIt)),
+            (
+                "decision = \"ignore-always\"\n",
+                Some(CodexEnvDecision::Skip),
+            ),
+            ("# c\ndecision=\"always\"", Some(CodexEnvDecision::UseIt)),
+            ("decision = \"never\"", Some(CodexEnvDecision::Skip)),
+            ("decision = \"maybe\"", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_codex_env_decision(body), want, "{body:?}");
+        }
+    }
+}
+
 pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
     let session_model = || {
         std::env::var("NEWT_DGX_MODEL")
@@ -3495,6 +3687,39 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
     {
         if let Some(b) = cfg.backends.iter().find(|b| b.name == name) {
             return from_backend(b);
+        }
+    }
+    // 1.5 Codex-compatible environment (bug/steering-regressions #9): honor
+    //     OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL the way Codex does,
+    //     so `OPENAI_API_KEY=… newt` just works with zero config and
+    //     `OPENAI_BASE_URL` can redirect a session at any local-compatible
+    //     server. Local-first guard: a bare key only fires when NO backends
+    //     are configured — a stray OPENAI_API_KEY in the shell must never
+    //     silently reroute a configured setup (and its cost) to OpenAI; an
+    //     explicit OPENAI_BASE_URL is a deliberate redirect and always wins.
+    {
+        let base = std::env::var("OPENAI_BASE_URL").ok();
+        let key = std::env::var("OPENAI_API_KEY").ok();
+        let model = std::env::var("OPENAI_MODEL").ok();
+        if let Some(choice) = codex_env_backend(
+            base.as_deref(),
+            key.as_deref(),
+            model.as_deref(),
+            session_model(),
+            !cfg.backends.is_empty(),
+        ) {
+            let detected = [
+                base.as_ref().map(|_| "OPENAI_BASE_URL"),
+                key.as_ref().map(|_| "OPENAI_API_KEY"),
+                model.as_ref().map(|_| "OPENAI_MODEL"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            if codex_env_allowed(&detected) {
+                return choice;
+            }
         }
     }
     // 2. Legacy env shim (one release, #1126): explicit NEWT_DGX_OLLAMA_URL /
