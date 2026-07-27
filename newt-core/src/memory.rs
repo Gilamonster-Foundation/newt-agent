@@ -1402,11 +1402,7 @@ have what was asked, call render_report to present it. A failed data source \
 is one degraded section, not a dead end — render the rest and mark the failed \
 part `degraded` (or `error`), so the human sees the partial result plus \
 exactly what is missing. Ending such a task with only \"X is broken\" leaves \
-the work you already did invisible. When ranking files (largest / most lines), \
-emit a GFM Markdown table with Path and the metric (`| Path | Lines |` or \
-`| Path | Bytes |`) — the TUI renders GFM tables. \"Code files\" means source \
-(use find with `code: true`); do not invent a numbered list of docs, lockfiles, \
-or LICENSE when asked for code.\n\
+the work you already did invisible.\n\
 \n\
 **Exploration budget for `act`.** Treat read-only rounds (list_dir, read_file) as expensive. \
 Spend at most three consecutive rounds on exploration before making a write. \
@@ -1927,21 +1923,6 @@ mod tests {
                 "DEFAULT_SOUL must advertise `{tool}`"
             );
         }
-    }
-
-    #[test]
-    fn default_soul_coaxes_gfm_tables_for_code_file_rankings() {
-        // 2026-07-26: a Research turn invented a numbered list of docs for
-        // "code files with the highest line counts". Soul must steer GFM
-        // tables + find code:true so the TUI renders rankings correctly.
-        assert!(
-            DEFAULT_SOUL.contains("Markdown table") || DEFAULT_SOUL.contains("GFM Markdown table"),
-            "soul must ask for a GFM table the TUI renders"
-        );
-        assert!(
-            DEFAULT_SOUL.contains("code: true"),
-            "soul must teach find code:true for source rankings"
-        );
     }
 
     /// FR-5 (#999) golden contract: the coach identity must instruct the model
@@ -2608,12 +2589,15 @@ mod tests {
     /// summarised" placeholder is deleted with the rest of the legacy path.
     #[tokio::test]
     async fn summarizing_fallback_placeholder_when_no_summarizer() {
-        let mut s = Summarizing::new(256); // 204-token budget; prompt pair fits
+        let policy_tokens = crate::agentic::response_repository_policy_tokens() as u32;
+        // Preserve the original 204-token history budget after accounting for
+        // the standing policy carried by the transient protected prompt card.
+        let mut s = Summarizing::new(256 + policy_tokens * 5 / 4);
         for i in 0..6u32 {
             s.sync_turn(
                 &format!("question {i}"),
                 &format!("answer {i}"),
-                &metrics_with_input(if i == 5 { 300 } else { 10 }),
+                &metrics_with_input(if i == 5 { 300 + policy_tokens } else { 10 }),
             )
             .await;
         }
@@ -2642,7 +2626,9 @@ mod tests {
 
     #[tokio::test]
     async fn summarizing_on_pre_compress_returns_prev_summary() {
-        let mut s = Summarizing::new(256).with_summarizer(stub_summarizer("PRIOR SUMMARY"));
+        let policy_tokens = crate::agentic::response_repository_policy_tokens() as u32;
+        let mut s = Summarizing::new(256 + policy_tokens * 5 / 4)
+            .with_summarizer(stub_summarizer("PRIOR SUMMARY"));
         // Build up history UNDER budget first: the pipeline's boundary needs
         // enough turns to leave a summarizable middle (Step 18.5 — head +
         // ≥3-message tail are protected), and a too-early trigger would burn
@@ -2652,8 +2638,12 @@ mod tests {
                 .await;
         }
         // Now cross the 204-token budget → compression sets prev_summary.
-        s.sync_turn("question text", "answer text", &metrics_with_input(300))
-            .await;
+        s.sync_turn(
+            "question text",
+            "answer text",
+            &metrics_with_input(300 + policy_tokens),
+        )
+        .await;
         let pre = s.on_pre_compress(&[]).await;
         assert!(
             pre.contains("PRIOR SUMMARY"),

@@ -5455,6 +5455,16 @@ mod tests {
             "Research find schema must teach the harness source category + language filter: \
              {find_def}"
         );
+        assert!(
+            find_def["function"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("repository code investigation")
+                        && description.contains("source by default")
+                }),
+            "the tool catalog must reinforce the standing source-first repository policy: \
+             {find_def}"
+        );
         // #1259: the formal ask-the-human escalation IS admitted in evidence
         // turns — a boxed-in model ends as a question, not penalized narration…
         assert!(tool_allowed(

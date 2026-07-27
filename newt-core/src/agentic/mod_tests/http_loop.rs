@@ -886,7 +886,9 @@ async fn context_overflow_trims_and_retries_then_recovers() {
     // (Step 18.1: the check compares the largest single prompt against the
     // window — the old multi-round sum, 180 here, inflated past 85% after
     // two rounds on EVERY long turn, firing spurious overflow retries.)
-    let safe_context = (builtin_catalog_tokens(PromptDisposition::Act) + 311) as u32;
+    let safe_context = (builtin_catalog_tokens(PromptDisposition::Act)
+        + prompt_read::response_repository_policy_tokens()
+        + 311) as u32;
     let overflow_prompt = safe_context * 88 / 100; // ≥85% of the window
     let probes = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))

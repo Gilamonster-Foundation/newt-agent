@@ -396,10 +396,7 @@ impl PromptIntake {
                 "harness_action: answer without mutation; bounded read/recovery tools only"
             }
             PromptDisposition::Research => {
-                "harness_action: gather bounded read-only evidence with the advertised tools \
-                 (for top-N CODE file line/size rankings: find with code=true + sort=lines|size \
-                 + show_lines|show_size; present as a GFM Markdown table); do not mutate or \
-                 request capability grants"
+                "harness_action: gather bounded read-only evidence; do not mutate or request capability grants"
             }
             PromptDisposition::Plan => {
                 "harness_action: read evidence and maintain the harness plan ledger only; do not mutate the workspace, execute commands, or request capability grants"
@@ -412,20 +409,24 @@ impl PromptIntake {
             .map(AtomicAsk::text)
             .collect::<Vec<_>>()
             .join("\n");
-        let presentation = presentation_model_card(&prompt);
-        format!(
+        let refinement = request_refinement_model_card(&prompt);
+        let mut card = format!(
             "{PROMPT_COMPREHENSION_MODEL_CARD_PREFIX}\n\
              disposition: {}\n\
              atomic_ask_count: {}\n\
              decision_count: {}\n\
              pending_decision_count: {pending}\n\
              locked_decision_count: {locked}\n\
-             {instruction}\n\
-             {presentation}",
+             {instruction}",
             self.disposition.as_str(),
             self.manifest.atomic_asks.len(),
             self.manifest.decisions.len(),
-        )
+        );
+        if !refinement.is_empty() {
+            card.push('\n');
+            card.push_str(&refinement);
+        }
+        card
     }
 
     /// Exact persistence projection for a bodyless `Decision` artifact. The
@@ -569,7 +570,11 @@ fn strip_list_marker(line: &str) -> &str {
     line
 }
 
-fn presentation_model_card(prompt: &str) -> String {
+/// Prompt-specific refinements layered over the standing response/repository
+/// policy in the protected active-prompt card. Keep this narrow: general
+/// Markdown shape and source-first evidence belong to the harness policy, not
+/// an incident-derived prompt lexicon.
+fn request_refinement_model_card(prompt: &str) -> String {
     let lower = prompt.to_ascii_lowercase();
     let packs = crate::api_surface::builtin_packs();
     let language = crate::api_surface::detect_source_language(prompt, &packs);
@@ -582,38 +587,10 @@ fn presentation_model_card(prompt: &str) -> String {
             .iter()
             .any(|needle| contains(needle));
     let source_files = names_source_files || names_language_files;
-    let table = contains("table")
-        || [
-            "highest",
-            "lowest",
-            "largest",
-            "biggest",
-            "smallest",
-            "longest",
-            "shortest",
-            "most lines",
-            "fewest lines",
-        ]
-        .iter()
-        .any(|needle| contains(needle));
 
-    let mut lines = vec![
-        "response_format: gfm_markdown".to_string(),
-        format!("response_shape: {}", if table { "table" } else { "prose" }),
-    ];
-    if table {
-        lines.push(
-            "response_instruction: emit a GFM pipe table with a header and delimiter row; \
-             keep paths and measured values in separate columns; do not wrap the table in \
-             a code fence"
-                .to_string(),
-        );
-    } else {
-        lines.push(
-            "response_instruction: emit concise, valid GFM Markdown; do not wrap the whole \
-             answer in a code fence"
-                .to_string(),
-        );
+    let mut lines = Vec::new();
+    if contains("table") {
+        lines.push("response_shape: table".to_string());
     }
 
     if source_files {
@@ -635,7 +612,7 @@ fn presentation_model_card(prompt: &str) -> String {
         lines.push(
             "scope_instruction: code/source means registered language source files only; \
              exclude documentation, manifests, lockfiles, and other repository metadata \
-             before ranking"
+             from the primary evidence set"
                 .to_string(),
         );
     }
@@ -933,22 +910,6 @@ mod tests {
     }
 
     #[test]
-    fn research_model_card_steers_code_rankings_and_gfm_tables() {
-        let card = PromptIntake::analyze(
-            "show me the 10 code files with the highest line counts in this repository?",
-        )
-        .model_card();
-        assert!(
-            card.contains("disposition: research"),
-            "line-count code question → Research: {card}"
-        );
-        assert!(
-            card.contains("code=true") && card.contains("Markdown table"),
-            "Research card must teach find code=true + GFM table: {card}"
-        );
-    }
-
-    #[test]
     fn empty_headless_input_is_a_bounded_ask_not_act() {
         let empty = PromptIntake::analyze("   \n");
         assert_eq!(empty.disposition(), PromptDisposition::Ask);
@@ -1236,20 +1197,15 @@ mod tests {
     }
 
     #[test]
-    fn ranked_code_file_prompt_steers_source_only_markdown_table() {
+    fn code_file_prompt_adds_source_scope_without_incident_specific_shape_guessing() {
         let intake = PromptIntake::analyze(
             "show me the 10 code files with the highest line counts in this repository?",
         );
         let card = intake.model_card();
 
         assert!(
-            card.contains("response_format: gfm_markdown"),
-            "every visible answer must target the TUI's Markdown renderer: {card}"
-        );
-        assert!(
-            card.contains("response_shape: table"),
-            "a ranked file result should be a table even when the operator did not \
-             spell out the presentation shape: {card}"
+            !card.contains("response_shape:"),
+            "line-count/ranking keywords must not own presentation policy: {card}"
         );
         assert!(
             card.contains("evidence_scope: source_files"),
@@ -1263,6 +1219,14 @@ mod tests {
             card.contains("exclude documentation, manifests, lockfiles"),
             "the steering must name the observed false-positive classes: {card}"
         );
+        assert!(
+            !card.contains("highest")
+                && !card.contains("longest")
+                && !card.contains("most lines")
+                && !card.contains("line/size rankings")
+                && !card.contains("code=true"),
+            "the model card must carry a general source refinement, not an incident lexicon: {card}"
+        );
     }
 
     #[test]
@@ -1272,7 +1236,6 @@ mod tests {
         );
         let card = intake.model_card();
 
-        assert!(card.contains("response_format: gfm_markdown"), "{card}");
         assert!(card.contains("response_shape: table"), "{card}");
         assert!(card.contains("evidence_scope: source_files"), "{card}");
         assert!(
@@ -1283,26 +1246,22 @@ mod tests {
             card.contains("source_filter: category=source language=rust"),
             "the model needs the concrete harness filter, not just a language label: {card}"
         );
-        assert!(
-            card.contains("GFM pipe table with a header and delimiter row"),
-            "the table shape must be syntactically renderable by the TUI: {card}"
-        );
     }
 
     #[test]
-    fn ordinary_explanation_still_gets_markdown_without_forced_file_scope() {
+    fn ordinary_prompt_gets_no_incident_specific_refinement() {
         let card = PromptIntake::analyze("explain ownership briefly").model_card();
 
-        assert!(card.contains("response_format: gfm_markdown"), "{card}");
-        assert!(card.contains("response_shape: prose"), "{card}");
+        assert!(!card.contains("response_format:"), "{card}");
+        assert!(!card.contains("response_shape:"), "{card}");
         assert!(!card.contains("evidence_scope:"), "{card}");
         assert!(!card.contains("source_filter:"), "{card}");
 
         let comfortable =
             PromptIntake::analyze("make this interface more comfortable").model_card();
         assert!(
-            comfortable.contains("response_shape: prose"),
-            "`table` inside another word must not force tabular output: {comfortable}"
+            !comfortable.contains("response_shape:"),
+            "presentation inference must not match `table` inside another word: {comfortable}"
         );
     }
 

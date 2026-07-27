@@ -5,9 +5,10 @@ workspace into the model's frozen system prompt — the real public symbols, so 
 model grounds against them instead of inventing APIs. *How* a language's public
 symbols are recognized is a **language pack**: pure data, so adding a language is
 config, not a code change. The same registry is the harness definition of
-**source/code files** for inventory tools such as
-`find(category="source", language="C++")`; docs, manifests, and lockfiles are
-not code unless a project deliberately declares their extension in a pack.
+**source/code files** for source-first repository investigation, including
+`find(category="source", language="C++")`; docs, manifests, lockfiles, and
+generated artifacts remain supporting evidence rather than substitutes for
+code unless the operator explicitly requests them.
 
 > **Extraction engines.** Today a pack extracts with **regex** rules (zero deps,
 > the bootstrap). The right long-term engine is an **AST parser (tree-sitter)** —

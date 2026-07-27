@@ -247,11 +247,9 @@ pub fn load_packs_from_dir(dir: &Path) -> Vec<LanguagePack> {
 
 /// Sorted unique file extensions from language packs (no leading dots).
 ///
-/// Shared allowlist for "what counts as code":
-/// - [`gather_code_files`] / nav session build (`ensure_nav_indexes`)
-/// - `find` with `code: true` (top-N line/size rankings of *code* files)
-/// - a future warm-up inventory can reuse the same list without inventing a
-///   second definition of "code"
+/// Compatibility projection of the language-pack registry for callers that
+/// need the complete extension set. Repository evidence tools should prefer
+/// [`source_extensions_for`] so they can also honor language names and aliases.
 #[must_use]
 pub fn code_file_extensions(packs: &[LanguagePack]) -> Vec<String> {
     let mut exts: Vec<String> = packs

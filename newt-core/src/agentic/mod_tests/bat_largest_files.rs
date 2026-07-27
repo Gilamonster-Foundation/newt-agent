@@ -49,6 +49,11 @@ const LINE_COUNT_PROMPT: &str =
 const RUST_TABLE_PROMPT: &str =
     "can you give me a table of the rust files with the longest line counts instead?";
 
+/// A repository-understanding request with no inventory metric, ranking word,
+/// file extension, or requested presentation shape. It proves the policy is a
+/// standing harness default rather than a repair for the observed prompts.
+const GENERAL_REPOSITORY_PROMPT: &str = "analyze how authentication works in this repository";
+
 fn msgs_for(prompt: &str) -> Vec<MemMessage> {
     vec![
         MemMessage::system("you are a test"),
@@ -349,9 +354,11 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
     );
     assert!(
         wire.contains("response_format: gfm_markdown")
-            && wire.contains("response_shape: table")
+            && wire.contains("response_structure: adaptive")
+            && wire.contains("repository_evidence: source_first")
             && wire.contains("evidence_scope: source_files"),
-        "the protected prompt card must carry Markdown-table + source-only steering: {wire}"
+        "the protected card must combine general Markdown/source-first policy with the \
+         request's explicit code-file scope: {wire}"
     );
     // The evidence turn ANSWERED the line-count question through `find` — line
     // counts, descending — no shell, no `wc -l`, no bytesize substitute.
@@ -389,6 +396,51 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
             || wire.contains(&format!("{fat_bytes}\tfat.rs"))),
         "must NOT answer with fat.rs's byte size ({fat_bytes}) — that is the \
          bytesize-fallback failure: {wire}"
+    );
+    assert_clean_footer(hallucinations, end_reason);
+}
+
+/// The broad contract behind the incident regressions: ordinary repository
+/// understanding starts from registered source files and returns structured
+/// Markdown even when the prompt says nothing about lines, ranking, tables, or
+/// a particular language.
+#[tokio::test]
+async fn general_repository_explanation_is_markdown_and_source_first() {
+    let ws = simulated_workspace();
+    let (reply, hallucinations, end_reason, wire) = run_scenario_for(
+        GENERAL_REPOSITORY_PROMPT,
+        ws.path(),
+        vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "find",
+                        "arguments": "{\"path\":\".\",\"category\":\"source\",\"type\":\"f\",\"max_results\":20}" }
+                }]
+            }),
+            serde_json::json!({ "content":
+                "## Authentication implementation\n\n- Source evidence lives in `large.rs`.\n- No repository metadata was substituted for code." }),
+        ],
+    )
+    .await;
+
+    assert!(
+        reply.starts_with("## Authentication implementation\n\n- "),
+        "general repository findings must remain renderable GFM: {reply}"
+    );
+    assert!(
+        wire.contains("response_format: gfm_markdown")
+            && wire.contains("response_structure: adaptive")
+            && wire.contains("repository_evidence: source_first")
+            && wire.contains("source_definition: resolved_language_packs"),
+        "standing response/repository policy must reach the model without incident keywords: \
+         {wire}"
+    );
+    assert!(
+        wire.contains("\\\"category\\\":\\\"source\\\"")
+            || wire.contains("\"category\":\"source\""),
+        "the general repository investigation must use the harness source category: {wire}"
     );
     assert_clean_footer(hallucinations, end_reason);
 }
