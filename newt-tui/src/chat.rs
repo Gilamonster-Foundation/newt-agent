@@ -4654,6 +4654,10 @@ pub(crate) fn run_chat(
 }
 
 /// #1387: build where_is + usage + graph + project model once per session.
+///
+/// Uses the same language-pack extension allowlist as `find` `code: true`
+/// ([`newt_core::api_surface::code_file_extensions`]) so "code" means one thing
+/// across nav gather, ranking finds, and a future warm-up inventory.
 fn ensure_nav_indexes(
     workspace: &str,
     cfg: &newt_core::Config,

@@ -1894,8 +1894,12 @@ fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
             Some("d") => FindType::Dirs,
             _ => FindType::Any,
         },
+        // `code: true` is the backward-compatible alias for the source category
+        // (#1405 shipped it; #1406 makes `category`/`language` canonical). A
+        // named language also implies source.
         category: if args["category"].as_str() == Some("source")
             || args["language"].as_str().is_some()
+            || args["code"].as_bool() == Some(true)
         {
             FindCategory::Source
         } else {
@@ -2214,6 +2218,11 @@ fn find_walk(
                 continue;
             }
         }
+        let rel = entry
+            .path()
+            .strip_prefix(workspace_root)
+            .unwrap_or_else(|_| entry.path());
+        let rel_display = rel.to_string_lossy().replace('\\', "/");
         // The metric is read only when it will be used (shown or sorted on). Line
         // mode (show_lines / sort=lines) wins over byte mode when both are set:
         // reads the file and counts newlines (dirs → 0); byte mode reads cheap
@@ -2231,11 +2240,6 @@ fn find_walk(
         } else {
             0
         };
-        let rel = entry
-            .path()
-            .strip_prefix(workspace_root)
-            .unwrap_or_else(|_| entry.path());
-        let rel_display = rel.to_string_lossy().replace('\\', "/");
         on_hit(&rel_display);
         entries.push((metric, rel_display));
     }
@@ -5145,6 +5149,29 @@ mod tests {
     }
 
     #[test]
+    fn find_detail_notes_the_source_category_filter() {
+        // #1406: the `code:true` boolean was replaced by the language-pack
+        // `category=source` filter; find_detail now surfaces that instead.
+        let opts = FindOpts {
+            name: None,
+            type_filter: FindType::Files,
+            max_depth: None,
+            max_results: 10,
+            respect_gitignore: true,
+            case_sensitive: true,
+            show_size: false,
+            show_lines: true,
+            category: FindCategory::Source,
+            language: None,
+            sort: FindSort::Lines,
+        };
+        assert_eq!(
+            find_detail(".", &opts),
+            ". (type=f, category=source, max=10, sort=lines, lines)"
+        );
+    }
+
+    #[test]
     fn use_skill_tool_is_advertised_in_definitions() {
         let defs = tool_definitions();
         let names: Vec<&str> = defs
@@ -5404,6 +5431,18 @@ mod tests {
             props.get("show_lines").is_some(),
             "Research find schema must expose show_lines: {find_def}"
         );
+        assert!(
+            props.get("code").is_some(),
+            "Research find schema must expose code (source-only filter): {find_def}"
+        );
+        let desc = find_def["function"]["description"].as_str().unwrap_or("");
+        assert!(
+            desc.contains("category") && desc.contains("source"),
+            "find description must teach category=source for source rankings: {desc}"
+        );
+        // #1406: GFM-table response steering moved out of the tool description
+        // into the prompt-intake layer (see prompt_intake.rs
+        // `*_steers_*_markdown_table` tests); the description no longer carries it.
         let sort_enum = props["sort"]["enum"]
             .as_array()
             .expect("sort must be an enum");
@@ -7705,6 +7744,42 @@ mod execute_tool_branch_tests {
         touch(ws.path(), "docs/pyo3_module.md"); // decoy: wrong extension
         let out = run_find(serde_json::json!({ "name": "pyo3_module.rs" }), ws.path()).await;
         assert_eq!(out, "newt-core/src/pyo3_module.rs", "got: {out}");
+    }
+
+    /// 2026-07-26 regression: "code files with the highest line counts" must
+    /// NOT rank AGENTS.md / Cargo.lock. `code: true` keeps language-pack
+    /// source only (same allowlist as nav gather).
+    #[tokio::test]
+    async fn find_code_true_excludes_docs_and_lockfiles_from_line_ranking() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("tall.rs"), "x\n".repeat(20)).unwrap();
+        std::fs::write(ws.path().join("short.rs"), "x\n".repeat(5)).unwrap();
+        std::fs::write(ws.path().join("AGENTS.md"), "d\n".repeat(200)).unwrap();
+        std::fs::write(ws.path().join("Cargo.lock"), "l\n".repeat(100)).unwrap();
+        std::fs::write(ws.path().join("LICENSE"), "L\n".repeat(50)).unwrap();
+        let out = run_find(
+            serde_json::json!({
+                "path": ".",
+                "type": "f",
+                "code": true,
+                "sort": "lines",
+                "show_lines": true,
+                "max_results": 10
+            }),
+            ws.path(),
+        )
+        .await;
+        assert!(
+            out.contains("20\ttall.rs") && out.contains("5\tshort.rs"),
+            "code sources with line counts: {out}"
+        );
+        assert!(
+            !out.contains("AGENTS.md") && !out.contains("Cargo.lock") && !out.contains("LICENSE"),
+            "docs/lockfiles/LICENSE must be excluded: {out}"
+        );
+        let tall = out.find("20\ttall.rs").expect("tall first");
+        let short = out.find("5\tshort.rs").expect("short second");
+        assert!(tall < short, "lines descending: {out}");
     }
 
     /// The other call the blocked agent reached for:
