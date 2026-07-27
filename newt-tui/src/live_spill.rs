@@ -31,6 +31,15 @@ struct OutputState {
     writer: TerminalWriter,
     painted_line_widths: Vec<usize>,
     painted_generation: Option<u64>,
+    /// Arbiter registration (#1410). Present for the real stdout viewport;
+    /// `None` for the `#[cfg(test)]` in-memory renderers, which register
+    /// explicitly (`register_for_test`) when a test wants the suspend gate.
+    ///
+    /// It lives HERE, behind the same mutex `paint_generation` already takes
+    /// first, so the gate costs one check on a lock the paint path holds
+    /// anyway — no new parameter threaded through `write`, and the handle's
+    /// lifetime is exactly the renderer's.
+    registration: Option<newt_core::tty::EphemeralRegistration>,
 }
 
 enum TerminalWriter {
@@ -86,12 +95,44 @@ pub(crate) struct LiveSpillRenderer {
 }
 
 impl LiveSpillRenderer {
-    pub(crate) fn stdout(rows: usize, color: bool) -> Option<Self> {
-        Self::with_output_and_geometry(TerminalWriter::Stdout, rows, color, || {
-            crossterm::terminal::size()
-                .ok()
-                .map(|(columns, rows)| (usize::from(columns), usize::from(rows)))
-        })
+    /// The real stdout viewport, registered with the line arbiter (#1410).
+    ///
+    /// Returns an `Arc` because registration needs `Arc<dyn Ephemeral>`. The
+    /// arbiter holds only a `Weak` and the handle stores only a `u64`, so this
+    /// is not a reference cycle: the last `Arc` dropping runs `OutputState`'s
+    /// drop, which deregisters.
+    pub(crate) fn stdout(rows: usize, color: bool) -> Option<Arc<Self>> {
+        let me = Arc::new(Self::with_output_and_geometry(
+            TerminalWriter::Stdout,
+            rows,
+            color,
+            || {
+                crossterm::terminal::size()
+                    .ok()
+                    .map(|(columns, rows)| (usize::from(columns), usize::from(rows)))
+            },
+        )?);
+        me.register_with_arbiter();
+        Some(me)
+    }
+
+    /// Bind this viewport to the line arbiter so `suspend_for_prompt` erases it
+    /// before a question and restores it after.
+    fn register_with_arbiter(self: &Arc<Self>) {
+        let ephemeral: Arc<dyn newt_core::tty::Ephemeral> = self.clone();
+        let registration = newt_core::tty::Terminal::register_ephemeral(&ephemeral);
+        self.output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .registration = Some(registration);
+    }
+
+    /// Test-only registration: the in-memory renderers are constructed bare so
+    /// the ~15 existing paint tests keep running with the gate inert. A test
+    /// that wants to prove the gate opts in.
+    #[cfg(test)]
+    fn register_for_test(self: &Arc<Self>) {
+        self.register_with_arbiter();
     }
 
     #[cfg(test)]
@@ -146,6 +187,7 @@ impl LiveSpillRenderer {
                 writer,
                 painted_line_widths: Vec::new(),
                 painted_generation: None,
+                registration: None,
             })),
             abandoned_through: Arc::new(AtomicU64::new(0)),
             #[cfg(any(unix, test))]
@@ -309,6 +351,80 @@ impl LiveSpillRenderer {
     }
 }
 
+/// #1410 — the viewport is the workspace's other cursor owner, so the arbiter
+/// has to be able to get it off the screen before a question renders.
+///
+/// `arbiter.rs`'s own trait doc named this as an unfinished step, and named the
+/// hazard: this renderer's `Clear(FromCursorDown)` rewind "can destroy rows it
+/// does not own".
+impl newt_core::tty::Ephemeral for LiveSpillRenderer {
+    /// Erase whatever generation is currently painted.
+    ///
+    /// Idempotent by construction: `erase_output` clears both
+    /// `painted_line_widths` and `painted_generation`, and the guard below then
+    /// makes every subsequent call write zero bytes — the same shape as
+    /// `LineLease::erase`.
+    ///
+    /// The lock is **blocking**, deliberately. A `try_lock` that gave up would
+    /// return having written nothing while `painted_generation` is still set,
+    /// and the *next* `erase_output` would then rewind from a cursor now below
+    /// the question and the operator's typed answer, deleting both. A wedged
+    /// stdout blocks everything anyway; a skipped erase corrupts.
+    fn erase(&self) {
+        // Re-sync geometry BEFORE reading `columns`. `erase_output` divides
+        // `painted_line_widths` by it to recover the physical row count, so a
+        // stale width makes `MoveUp` land *inside* the frame and strands the
+        // rows above it permanently (nothing else clears them — the erase
+        // discards its own bookkeeping unconditionally). `finish` takes exactly
+        // this precaution, and
+        // `finish_rechecks_geometry_even_without_another_output_chunk` is the
+        // test pinning it.
+        //
+        // Scoped so `state` is released before `output` is taken: every other
+        // path here locks state-then-output and drops state in between.
+        let columns = {
+            let mut state = self.lock_state();
+            let _ = sync_geometry(&mut state);
+            state.columns
+        };
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(generation) = output.painted_generation {
+            erase_output(&mut output, columns, &self.abandoned_through, generation);
+        }
+    }
+
+    /// Repaint the frame the prompt displaced.
+    ///
+    /// **Synchronous**, not `repaint_async`. `PromptWindow::drop` documents
+    /// that the terminal mode goes back "only after the screen is whole
+    /// again"; an async restore returns before the frame exists, and the
+    /// spawned repaint would then race the caller's canonical output — landing
+    /// the frame *after* a denial message, recording rows it does not own, and
+    /// leaving the next erase to rewind through that message.
+    ///
+    /// Unwind-guarded because a panic here escapes through
+    /// `suspend_for_prompt`, which would leave the arbiter's `suspended` flag
+    /// set with no `PromptWindow` ever constructed — silencing every spinner in
+    /// the process for good. A viewport that fails to repaint is a cosmetic
+    /// loss; that is not.
+    fn restore(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let generation = self.lock_state().generation;
+            if let Some(generation) = generation {
+                paint_generation(
+                    &self.state,
+                    &self.output,
+                    &self.abandoned_through,
+                    generation,
+                );
+            }
+        }));
+    }
+}
+
 impl LiveToolOutput for LiveSpillRenderer {
     fn start(&self, generation: u64) {
         if self.is_abandoned(generation) {
@@ -466,6 +582,31 @@ fn paint_generation(
     let mut output = output
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // #1410 — THE PAINT GATE. Registration alone is not enough: it guarantees
+    // the frame is erased *before* a question renders, not that nothing paints
+    // *over* it a moment later. Two painters would:
+    //
+    //   * the `newt-live-output-{gen}` worker, on the next tool chunk; and
+    //   * `run_input_repaint`, because `watch_for_interrupt_fd` calls
+    //     `refresh_geometry()` every 10 ms while a prompt owns stdin
+    //     (lib.rs) — so a terminal RESIZE during a permission question
+    //     repaints on top of it, with no tool call-ordering involved.
+    //
+    // Worse, `suspend_for_prompt`'s erase clears `painted_generation`, so a
+    // paint that slipped through would skip the erase-previous branch below and
+    // land at the cursor — i.e. directly under the question — and the following
+    // `restore()` would rewind `MoveUp + Clear(FromCursorDown)` straight
+    // through it. That is the 8x/second overwrite bug with a 4-row frame.
+    //
+    // Checked under the `output` lock that the whole paint holds, so a paint
+    // that beat the flag is still undone by the erase that follows it.
+    if output
+        .registration
+        .as_ref()
+        .is_some_and(newt_core::tty::EphemeralRegistration::suspended)
+    {
+        return;
+    }
     if is_abandoned(abandoned_through, generation) {
         discard_generation(&mut output, generation);
         return;
@@ -656,6 +797,9 @@ fn rendered_width(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::LiveSpillRenderer;
+    // #1410: the gate tests drive the paint path directly, standing in for the
+    // `run_input_repaint` painter that a geometry change wakes.
+    use super::paint_generation;
     use crate::spill_view::display_width;
     use newt_core::{LiveToolOutput, ToolOutputStream};
     use std::io::Write;
@@ -970,6 +1114,143 @@ mod tests {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #1410 — arbiter registration + the paint gate
+    //
+    // These take the `prompt_stdin` serial lane. `Terminal::suspend_for_prompt`
+    // sets a PROCESS-GLOBAL flag, so a window held while the ~15 unserialized
+    // paint tests above run in parallel would make them fail intermittently.
+    // That global reach is also exactly why the gate hangs off the per-renderer
+    // registration handle rather than reading the flag unconditionally: the
+    // in-memory test renderers are unregistered, so the gate is inert for them
+    // unless a test opts in with `register_for_test`.
+    // -----------------------------------------------------------------------
+
+    /// A registered viewport must not paint while a question is on screen.
+    ///
+    /// This is the whole point of #1410. `suspend_for_prompt` erases the frame,
+    /// but *nothing* stopped the next paint from putting it straight back —
+    /// under the question — and `restore()` would then rewind through the
+    /// question to erase it.
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn a_registered_viewport_paints_nothing_while_a_prompt_is_up() {
+        let writer = SharedWriter::default();
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        renderer.register_for_test();
+
+        renderer.start(1);
+        renderer.write(1, ToolOutputStream::Stdout, b"a\nb\nc\n");
+        let before = writer.0.lock().unwrap().len();
+        assert!(before > 0, "the frame painted before the prompt");
+
+        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        // The arbiter erased us on the way in; that write is expected.
+        let after_erase = writer.0.lock().unwrap().len();
+
+        // Now the two real painters try again, exactly as they would in
+        // production: a further tool chunk, and a geometry-driven repaint.
+        renderer.write(1, ToolOutputStream::Stdout, b"d\ne\nf\n");
+        paint_generation(
+            &renderer.state,
+            &renderer.output,
+            &renderer.abandoned_through,
+            1,
+        );
+
+        assert_eq!(
+            writer.0.lock().unwrap().len(),
+            after_erase,
+            "a registered viewport wrote bytes while a question was on screen — \
+             this is the overwrite bug #1410 exists to close"
+        );
+
+        drop(window);
+    }
+
+    /// Negative control: the same sequence with NO registration paints happily
+    /// over the question. Without this, the test above could pass for the wrong
+    /// reason (e.g. the writes were dropped for some unrelated cause).
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn an_unregistered_viewport_is_what_the_bug_looked_like() {
+        let writer = SharedWriter::default();
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        // deliberately NOT registered
+
+        renderer.start(1);
+        renderer.write(1, ToolOutputStream::Stdout, b"a\nb\nc\n");
+
+        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let after_prompt = writer.0.lock().unwrap().len();
+        renderer.write(1, ToolOutputStream::Stdout, b"d\ne\nf\n");
+
+        assert!(
+            writer.0.lock().unwrap().len() > after_prompt,
+            "an unregistered viewport should still paint — if it does not, the \
+             gate test above proves nothing"
+        );
+
+        drop(window);
+    }
+
+    /// `Ephemeral::erase` must be idempotent: the trait doc requires it, and
+    /// `Terminal::emit_line` relies on it (it erases every registered ephemeral
+    /// with no matching restore, so a second erase must write nothing).
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn erase_is_idempotent_and_writes_nothing_when_nothing_is_painted() {
+        use newt_core::tty::Ephemeral as _;
+
+        let writer = SharedWriter::default();
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        renderer.register_for_test();
+
+        // Nothing painted yet: erase must be a no-op, not a blind rewind.
+        renderer.erase();
+        assert!(
+            writer.0.lock().unwrap().is_empty(),
+            "erase wrote a rewind with no frame on screen — that would delete \
+             rows the viewport does not own"
+        );
+
+        renderer.start(1);
+        renderer.write(1, ToolOutputStream::Stdout, b"a\nb\nc\n");
+        renderer.erase();
+        let after_first = writer.0.lock().unwrap().len();
+        renderer.erase();
+        assert_eq!(
+            writer.0.lock().unwrap().len(),
+            after_first,
+            "the second erase wrote bytes; Ephemeral::erase must be idempotent"
+        );
+    }
+
+    /// Dropping the renderer must deregister it, or the arbiter accumulates
+    /// dead entries and `suspend_for_prompt` walks them on every prompt.
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn dropping_the_renderer_deregisters_it() {
+        let writer = SharedWriter::default();
+        {
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.register_for_test();
+            renderer.start(1);
+            renderer.write(1, ToolOutputStream::Stdout, b"a\n");
+        }
+        // The renderer is gone. A prompt must not touch it — if the weak
+        // registration were a strong one, or the handle leaked, this would
+        // paint into a dropped writer's buffer or panic.
+        let before = writer.0.lock().unwrap().len();
+        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        drop(window);
+        assert_eq!(
+            writer.0.lock().unwrap().len(),
+            before,
+            "a dropped renderer was still driven by the arbiter"
+        );
     }
 
     #[test]

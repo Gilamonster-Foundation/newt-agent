@@ -146,6 +146,42 @@ pub(crate) fn suspended() -> bool {
     lock().suspended
 }
 
+/// A **non-exclusive** registration with the arbiter (#1410). Deregisters on
+/// drop.
+///
+/// Distinct from [`LineLease`] on purpose. A lease is exclusive ownership of
+/// the one ephemeral bottom row and carries that row's erase strategy. This
+/// carries no row, no erase strategy and no exclusion — only the promise that
+/// [`Terminal::suspend_for_prompt`] will call [`Ephemeral::erase`] before a
+/// question renders, and the right to ask whether a question is on screen.
+///
+/// A multi-row surface that owns its own geometry registers; it does not lease.
+#[must_use = "dropping the registration immediately deregisters the ephemeral"]
+pub struct EphemeralRegistration {
+    id: u64,
+}
+
+impl EphemeralRegistration {
+    /// Is a [`PromptWindow`] alive right now? A registered ephemeral **must
+    /// not** paint while this is true: `suspend_for_prompt` has already erased
+    /// it, and a repaint would land on top of the question.
+    ///
+    /// [`LineLease::paint`] gets this check for free because it paints through
+    /// the arbiter. A writer with its own paint path has to ask, and asks
+    /// *here* rather than through a free function so the query and the
+    /// obligation travel together: only a writer that actually registered can
+    /// pose the question.
+    pub fn suspended(&self) -> bool {
+        suspended()
+    }
+}
+
+impl Drop for EphemeralRegistration {
+    fn drop(&mut self) {
+        lock().registered.retain(|(id, _)| *id != self.id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The line lease
 // ---------------------------------------------------------------------------
@@ -349,6 +385,35 @@ impl Terminal {
     /// Held weakly — dropping the writer deregisters it.
     pub(crate) fn register(id: u64, e: &Arc<dyn Ephemeral>) {
         lock().registered.push((id, Arc::downgrade(e)));
+    }
+
+    /// Register an ephemeral writer that owns rows of its own, so
+    /// [`Terminal::suspend_for_prompt`] erases it before a question renders and
+    /// restores it after (#1410).
+    ///
+    /// **Takes no lease.** This neither acquires nor blocks on
+    /// [`Inner::line_held`] — a bottom-row spinner and a multi-row viewport
+    /// coexist, and a suspension erases both. That distinction is the whole
+    /// point of this entry point: a [`LineLease`] is exclusive ownership of the
+    /// ONE ephemeral bottom row and carries *that row's* erase (`\r` +
+    /// `ESC[K`), which is the wrong erase for a writer that owns N rows above
+    /// the cursor. A lease also never touches `registered` at all, so a
+    /// leaseholder is never erased at a suspension — leasing would deliver none
+    /// of what this method exists for.
+    ///
+    /// Held **weakly**: the returned handle stores only an id, so neither the
+    /// arbiter nor a leaked handle can pin the writer alive.
+    ///
+    /// A registered writer with its own paint path MUST consult
+    /// [`EphemeralRegistration::suspended`] before painting. Registration alone
+    /// is not enough — it guarantees the frame is erased *before* the question,
+    /// not that nothing repaints *over* it a moment later.
+    pub fn register_ephemeral(e: &Arc<dyn Ephemeral>) -> EphemeralRegistration {
+        let mut state = lock();
+        state.next_id += 1;
+        let id = state.next_id;
+        state.registered.push((id, Arc::downgrade(e)));
+        EphemeralRegistration { id }
     }
 
     /// **THE seam.** Erase and quiesce every registered ephemeral, take stdin,

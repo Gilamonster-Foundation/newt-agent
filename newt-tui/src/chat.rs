@@ -3965,11 +3965,14 @@ pub(crate) fn run_chat(
                     let live_spill = (resolved_spill_lines > 0 && live_spill_capable())
                         .then_some(())
                         .and_then(|()| {
+                            // #1410: `stdout` now returns the `Arc` itself —
+                            // registration with the line arbiter needs
+                            // `Arc<dyn Ephemeral>`, so the constructor owns the
+                            // wrapping rather than leaving it to each caller.
                             crate::live_spill::LiveSpillRenderer::stdout(
                                 resolved_spill_lines,
                                 color,
                             )
-                            .map(std::sync::Arc::new)
                         });
                     #[cfg(feature = "live-spill")]
                     let spill_input = live_spill
