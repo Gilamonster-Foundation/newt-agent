@@ -18,6 +18,7 @@ pub mod credential_registry;
 pub mod denial_journal;
 pub mod dgx;
 pub mod drift_cache;
+pub mod enrollment;
 pub mod error;
 pub mod ffi_manifest;
 pub mod ffi_surface;
