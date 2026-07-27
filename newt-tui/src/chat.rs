@@ -95,6 +95,106 @@ impl ModelInputOrigin {
     }
 }
 
+/// bug/steering-regressions iteration #2: upgrade a fresh operator prompt to
+/// an [`ModelInputOrigin::OperatorContinuation`] when the previous agentic
+/// turn was interrupted by the round cap AND the input is a bare continuation
+/// nudge ("continue", "keep going", "1: proceed"). Minted fresh, such a nudge
+/// becomes the active operator prompt itself — the compression-immune card
+/// then protects the word "continue" while the real task drifts into the
+/// summarizable middle (observed live 2026-07-27). Linking it re-enters the
+/// interrupted objective's lineage, so fix #1's authority walk keeps the real
+/// task active. A substantive new ask never upgrades — the classifier is
+/// conservative by construction ([`newt_core::classifiers::is_bare_continuation`]).
+fn upgrade_origin_for_interrupted_objective(
+    origin: ModelInputOrigin,
+    task: &str,
+    interrupted: Option<&newt_core::TurnPromptContext>,
+) -> ModelInputOrigin {
+    match (&origin, interrupted) {
+        (ModelInputOrigin::Operator, Some(parent))
+            if newt_core::classifiers::is_bare_continuation(task) =>
+        {
+            ModelInputOrigin::OperatorContinuation {
+                parent: Box::new(parent.clone()),
+            }
+        }
+        _ => origin,
+    }
+}
+
+#[cfg(test)]
+mod origin_upgrade_tests {
+    use super::*;
+
+    fn ctx() -> newt_core::TurnPromptContext {
+        newt_core::TurnPromptContext::ephemeral_operator(
+            "conv",
+            b"extract the module and open a PR".to_vec(),
+            b"extract the module and open a PR".to_vec(),
+        )
+    }
+
+    #[test]
+    fn bare_continue_after_round_cap_links_to_the_interrupted_objective() {
+        let parent = ctx();
+        let got = upgrade_origin_for_interrupted_objective(
+            ModelInputOrigin::Operator,
+            "continue",
+            Some(&parent),
+        );
+        match got {
+            ModelInputOrigin::OperatorContinuation { parent: linked } => assert_eq!(
+                linked.submitted_prompt().id(),
+                parent.submitted_prompt().id(),
+                "the nudge must re-enter the interrupted objective's lineage"
+            ),
+            other => panic!("bare continue must link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substantive_input_stays_fresh_even_with_an_interrupted_objective() {
+        let parent = ctx();
+        let got = upgrade_origin_for_interrupted_objective(
+            ModelInputOrigin::Operator,
+            "now refactor newt-tui/src/lib.rs instead and open a PR",
+            Some(&parent),
+        );
+        assert!(
+            matches!(got, ModelInputOrigin::Operator),
+            "a new ask must never be silently chained to a stale objective"
+        );
+    }
+
+    #[test]
+    fn no_interrupted_objective_means_no_upgrade() {
+        let got =
+            upgrade_origin_for_interrupted_objective(ModelInputOrigin::Operator, "continue", None);
+        assert!(matches!(got, ModelInputOrigin::Operator));
+    }
+
+    #[test]
+    fn pending_clarification_continuations_are_left_untouched() {
+        let parent = ctx();
+        let pending = ModelInputOrigin::OperatorContinuation {
+            parent: Box::new(ctx()),
+        };
+        let before_id = match &pending {
+            ModelInputOrigin::OperatorContinuation { parent } => parent.submitted_prompt().id(),
+            _ => unreachable!(),
+        };
+        let got = upgrade_origin_for_interrupted_objective(pending, "continue", Some(&parent));
+        match got {
+            ModelInputOrigin::OperatorContinuation { parent: kept } => assert_eq!(
+                kept.submitted_prompt().id(),
+                before_id,
+                "a pending-clarification link outranks the round-cap link"
+            ),
+            other => panic!("existing continuation must be preserved, got {other:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingRetry {
     text: String,
@@ -1072,6 +1172,10 @@ pub(crate) fn run_chat(
     // prompt for execution. An outstanding clarification is separately
     // reconstructed from this receipt's durable lineage below.
     let mut active_prompt_context: Option<newt_core::TurnPromptContext> = None;
+    // bug/steering-regressions iteration #2: when an agentic turn ends at the
+    // round cap, its objective stays linkable — the next bare "continue"
+    // re-enters that lineage instead of becoming a goal-less fresh prompt.
+    let mut interrupted_objective: Option<newt_core::TurnPromptContext> = None;
     let mut pending_clarification: Option<PendingClarification> = None;
 
     // 17.7 session-start resume. Both arms go through the SAME restore
@@ -1230,7 +1334,7 @@ pub(crate) fn run_chat(
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before reading even starts.
-        let (outcome, model_input_origin) = if let Some(retry) = pending_retry.take() {
+        let (outcome, mut model_input_origin) = if let Some(retry) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
             // decremented when it was queued.
@@ -1305,6 +1409,11 @@ pub(crate) fn run_chat(
                 if task.is_empty() {
                     continue;
                 }
+                model_input_origin = upgrade_origin_for_interrupted_objective(
+                    model_input_origin,
+                    &task,
+                    interrupted_objective.as_ref(),
+                );
                 if model_input_origin.is_operator() {
                     surface.add_history(&task);
                 }
@@ -4391,6 +4500,12 @@ pub(crate) fn run_chat(
                                     hallucinations,
                                     end_reason: turn_end_reason,
                                 };
+                                // Iteration #2: keep a RoundCap-interrupted
+                                // objective linkable for the next bare nudge.
+                                interrupted_objective = (turn_end_reason
+                                    == Some(newt_core::TurnEndReason::RoundCap))
+                                .then(|| active_prompt_context.clone())
+                                .flatten();
                                 let memory_task =
                                     active_operator_task(active_prompt_context.as_ref(), &task);
                                 tokio::task::block_in_place(|| {
@@ -5443,8 +5558,11 @@ mod prompt_ingress_tests {
         );
         assert_eq!(
             answer.active_operator_prompt().id(),
-            answer.submitted_prompt().id(),
-            "the direct clarification answer is new operator authority"
+            original.submitted_prompt().id(),
+            "bug/steering-regressions: a clarification answer REFINES the \
+             pending objective — the original ask stays the active operator \
+             prompt so the compression-immune card keeps the real task, not \
+             the ceremony reply"
         );
     }
 
