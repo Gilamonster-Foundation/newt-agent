@@ -22,6 +22,7 @@ members = [
     "plugins-protocol",
     "providers/openai",
     "tests/common",
+    "tests/pty",
 ]
 # `newt-mesh` is intentionally NOT a workspace member: it depends on
 # `../agent-mesh/` via path, which isn't present on stock GitHub
@@ -214,6 +215,9 @@ predicates = "3"
 tokio-test = "0.4"
 insta = "1"
 tests-common = { path = "tests/common" }
+# One pty harness for the real-resource tier (#1410). libc-only by design —
+# see tests/pty/Cargo.toml for why it is not part of tests-common.
+tests-pty = { path = "tests/pty" }
 
 # Signed wire types — `Caveats`, `CountBound`, `Scope`, `AgentKey`,
 # `UserKey`, `CertChain`, `AgentMetadata`, `MeshError`. Pulled from

@@ -52,8 +52,9 @@
 //! a re-exec.
 
 use std::io::Write as _;
-use std::os::unix::io::{FromRawFd as _, RawFd};
 use std::time::Duration;
+
+use tests_pty::Pty;
 
 use super::widgets::{Level, Notice};
 use super::{LineCaps, Sink, Spinner, Terminal};
@@ -148,83 +149,19 @@ fn legacy_notice_under_prompt_window_child() {
 // The parent: allocate the pty, drive a child, read the screen.
 // ---------------------------------------------------------------------------
 
-/// A pty pair. The slave becomes the child's stdin+stdout; the master is what
-/// we read the screen from.
-struct Pty {
-    master: RawFd,
-    slave: RawFd,
-}
-
-impl Pty {
-    fn open() -> Self {
-        unsafe {
-            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(master >= 0, "posix_openpt failed");
-            assert_eq!(libc::grantpt(master), 0, "grantpt failed");
-            assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
-            let name = libc::ptsname(master);
-            assert!(!name.is_null(), "ptsname failed");
-            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
-            assert!(slave >= 0, "opening the pty slave failed");
-            // A realistic geometry: a 0x0 pty drives `term_cols()` to its
-            // 8-column floor and `fit_line` would truncate the labels into
-            // something the assertions could not recognize.
-            let ws = libc::winsize {
-                ws_row: 50,
-                ws_col: 200,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            libc::ioctl(slave, libc::TIOCSWINSZ, &ws);
-            Self { master, slave }
-        }
-    }
-
-    /// Everything the terminal has been shown so far.
-    fn screen(&self) -> String {
-        unsafe {
-            let flags = libc::fcntl(self.master, libc::F_GETFL);
-            libc::fcntl(self.master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    self.master,
-                    buf.as_mut_ptr().cast::<libc::c_void>(),
-                    buf.len(),
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-}
-
-impl Drop for Pty {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.slave);
-            libc::close(self.master);
-        }
-    }
-}
-
 /// Run one scenario on a fresh pty and return everything the terminal saw.
+///
+/// The pty plumbing lives in `tests-pty` (#1410) — the slave becomes the
+/// child's stdin+stdout, the master is what we read the screen from.
 fn run_scenario(scenario: &str, child_test: &str) -> String {
     let pty = Pty::open();
-    let dup = |fd: RawFd| unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) };
     let mut child = std::process::Command::new(
         std::env::current_exe().expect("the test binary re-invokes itself"),
     )
     .args(["--exact", child_test, "--ignored", "--nocapture"])
     .env("NEWT_NOTICE_PTY_CHILD", scenario)
-    .stdin(std::process::Stdio::from(dup(pty.slave)))
-    .stdout(std::process::Stdio::from(dup(pty.slave)))
+    .stdin(pty.slave_stdio())
+    .stdout(pty.slave_stdio())
     .stderr(std::process::Stdio::null())
     .spawn()
     .expect("spawn the pty child");

@@ -1,0 +1,22 @@
+[package]
+name = "tests-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# DELIBERATELY MINIMAL. This crate exists so the real-PTY tier has ONE pty
+# harness instead of a copy per consumer (#1410, epic #1408). It must never
+# grow a newt dependency:
+#
+#   * `tests-common` was the obvious home and is the wrong one — it depends on
+#     `newt-core` (and `newt-inference`, i.e. candle), so `newt-core`'s own
+#     `pty_notice_test` could only reach it through a dev-dependency CYCLE, and
+#     would drag candle into every `cargo test -p newt-core`.
+#   * A libc-only crate has no such problem: every consumer, including
+#     `newt-core` itself, can dev-depend on it freely.
+#
+# If this file ever gains a `newt-*` dependency, that reasoning has been lost.
+[dependencies]
+libc.workspace = true
