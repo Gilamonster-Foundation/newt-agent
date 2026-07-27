@@ -7,6 +7,7 @@
 pub mod agent_identity;
 pub mod agentic;
 pub mod agents;
+pub mod answer_authz;
 pub mod api_surface;
 pub mod artifact;
 pub mod backend_probe;
@@ -40,6 +41,7 @@ pub mod nudger;
 pub mod ocap;
 pub mod ocap_propose;
 pub mod ocap_store;
+pub mod permission_challenge;
 pub mod plan;
 pub mod pricing;
 pub mod project_map;

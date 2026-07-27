@@ -4,4 +4,6 @@
 //! pieces are importable — by the binary, and by suites in `tests/` that would
 //! otherwise have to live inside the source files they exercise.
 
+pub mod csp;
+pub mod enroll;
 pub mod webauthn;
