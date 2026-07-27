@@ -4877,9 +4877,22 @@ fn spawn_semantic_indexing(
 ) -> SemanticIndexWarmup {
     let job = BackgroundJob::start("embedding repository for semantic retrieval");
     let completion = job.completion_guard();
-    let handle = rt.spawn(async move {
+    // Iteration #8: the embedded candle engine's forwards are SYNCHRONOUS
+    // compute. Run on a plain async task they poll-block the runtime workers
+    // themselves — observed live as total executor starvation (frozen pane,
+    // zero network, every rt-worker pegged) MINUTES after iteration #4 moved
+    // this off the turn. spawn_blocking confines the drive to one parked
+    // blocking-pool thread; candle's internal parallelism is unaffected and
+    // the async runtime stays responsive.
+    let inner = rt.clone();
+    let handle = rt.spawn_blocking(move || {
         let _completion = completion;
-        newt_core::index_files(&files, embedder.as_ref(), index.as_ref(), on_failure).await
+        inner.block_on(newt_core::index_files(
+            &files,
+            embedder.as_ref(),
+            index.as_ref(),
+            on_failure,
+        ))
     });
     SemanticIndexWarmup { handle, job }
 }
