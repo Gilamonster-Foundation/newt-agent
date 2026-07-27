@@ -24,6 +24,24 @@ pub struct TextHit {
 /// Regex search under `root`, returned as a [`NavResult`] with `[LEXICAL]` labels.
 #[must_use]
 pub fn text_search(query: &str, root: &Path, index_id: &str) -> NavResult {
+    text_search_scoped(query, root, None, index_id)
+}
+
+/// [`text_search`] with an optional workspace-relative `scope` (a file or a
+/// directory). bug/steering-regressions iteration #6: the model narrows a
+/// noisy search with `path` and the tool used to DROP the argument silently —
+/// returning whole-workspace hits (tracked eval corpora included) against an
+/// explicitly file-scoped query, then feeding the bait loop iteration #5
+/// tagged. A scope is honored, fenced inside the workspace, and a missing or
+/// escaping scope is an honest warning — never a silent widen.
+#[must_use]
+pub fn text_search_scoped(
+    query: &str,
+    workspace: &Path,
+    scope: Option<&str>,
+    index_id: &str,
+) -> NavResult {
+    let root = workspace;
     let mut result = NavResult::empty(EvidenceKind::Lexical, "lexical-regex", index_id);
     let q = query.trim();
     if q.is_empty() {
@@ -41,8 +59,41 @@ pub fn text_search(query: &str, root: &Path, index_id: &str) -> NavResult {
             return result;
         }
     };
+    let scope = scope.map(str::trim).filter(|p| !p.is_empty());
+    let search_root = match scope {
+        Some(p)
+            if Path::new(p).is_absolute()
+                || Path::new(p)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+        {
+            result.complete = false;
+            result.warnings.push(format!(
+                "scope `{p}` must be a workspace-relative path without `..`"
+            ));
+            return result;
+        }
+        Some(p) => {
+            let scoped = root.join(p);
+            if !scoped.exists() {
+                result.complete = false;
+                result.warnings.push(format!(
+                    "scope `{p}` does not exist in this workspace — nothing was \
+                     searched (NOT a whole-workspace fallback)"
+                ));
+                return result;
+            }
+            scoped
+        }
+        None => root.to_path_buf(),
+    };
     let mut hits = Vec::new();
-    if let Err(e) = search_dir(root, root, &re, &mut hits) {
+    let searched = if search_root.is_file() {
+        search_file(root, &search_root, &re, &mut hits)
+    } else {
+        search_dir(root, &search_root, &re, &mut hits)
+    };
+    if let Err(e) = searched {
         result.complete = false;
         result.warnings.push(format!("search error: {e}"));
     }
@@ -245,6 +296,51 @@ mod tests {
             "identifier query with only quoted matches needs the verdict: {:?}",
             r.warnings
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// bug/steering-regressions iteration #6: a `path` scope must be HONORED
+    /// (the tool silently dropped it, returning whole-workspace corpus noise
+    /// against a file-scoped query), and a missing scope is an honest warning,
+    /// never a silent whole-workspace fallback.
+    #[test]
+    fn scope_is_honored_and_missing_scope_is_an_honest_warning() {
+        let dir = std::env::temp_dir().join(format!(
+            "newt-text-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("corpus")).unwrap();
+        fs::write(dir.join("src/a.rs"), "fn wanted_here() {}\n").unwrap();
+        fs::write(dir.join("corpus/junk.txt"), "wanted_here in noise\n").unwrap();
+
+        // Directory scope: only src/ hits.
+        let r = text_search_scoped("wanted_here", &dir, Some("src"), "gen0");
+        assert!(
+            r.hits.iter().all(|h| h.path.starts_with("src/")),
+            "{:?}",
+            r.hits
+        );
+        // File scope: exactly the one file, path still workspace-relative.
+        let r = text_search_scoped("wanted_here", &dir, Some("src/a.rs"), "gen0");
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].path, "src/a.rs");
+        // Missing scope: honest refusal, no silent widen.
+        let r = text_search_scoped("wanted_here", &dir, Some("no/such/dir"), "gen0");
+        assert!(r.hits.is_empty());
+        assert!(!r.complete);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("does not exist")),
+            "{:?}",
+            r.warnings
+        );
+        // Escape attempts are refused.
+        let r = text_search_scoped("wanted_here", &dir, Some("../elsewhere"), "gen0");
+        assert!(!r.complete && r.hits.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
