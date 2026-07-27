@@ -150,6 +150,14 @@ pyo3 = ["dep:pyo3"]
 # stand-in. Enable it in `[dev-dependencies]`, never in `[dependencies]`.
 test-util = []
 
+# The shared pty harness for the real-resource tier (#1410) — replaces the
+# byte-identical copy `tty::pty_notice_test` used to carry. It is libc-only ON
+# PURPOSE: `tests-common` depends on this crate (and on newt-inference/candle),
+# so reaching the harness through it would be a dev-dependency cycle that also
+# dragged candle into every `cargo test -p newt-core`.
+[target.'cfg(unix)'.dev-dependencies]
+tests-pty.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }

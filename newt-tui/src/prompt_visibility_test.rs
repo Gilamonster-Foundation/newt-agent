@@ -63,8 +63,9 @@
 //!    over it;
 //! 3. the `> ` menu is the **last thing written** before the human typed.
 
-use std::os::unix::io::{FromRawFd as _, RawFd};
 use std::time::Duration;
+
+use tests_pty::Pty;
 
 use crate::danger;
 use crate::permissions::{
@@ -158,95 +159,23 @@ fn prompt_scenario_child() {
 // The parent: allocate the pty, drive the child, judge the capture.
 // ---------------------------------------------------------------------------
 
-/// A pty pair. The slave becomes the child's stdin+stdout; the master is what
-/// the "operator" types on and what we read the screen from.
-struct Pty {
-    master: RawFd,
-    slave: RawFd,
-}
-
-impl Pty {
-    fn open() -> Self {
-        unsafe {
-            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(master >= 0, "posix_openpt failed");
-            assert_eq!(libc::grantpt(master), 0, "grantpt failed");
-            assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
-            let name = libc::ptsname(master);
-            assert!(!name.is_null(), "ptsname failed");
-            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
-            assert!(slave >= 0, "opening the pty slave failed");
-
-            // A realistic geometry. A 0x0 pty would drive `term_cols()` to its
-            // 8-column floor and truncate the spinner into something the
-            // assertions could not recognize.
-            let ws = libc::winsize {
-                ws_row: 50,
-                ws_col: 200,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            libc::ioctl(slave, libc::TIOCSWINSZ, &ws);
-
-            Self { master, slave }
-        }
-    }
-
-    /// Send bytes as if the operator typed them.
-    fn type_in(&self, s: &str) {
-        let n = unsafe { libc::write(self.master, s.as_ptr().cast::<libc::c_void>(), s.len()) };
-        assert!(n > 0, "writing the operator's keystrokes to the pty failed");
-    }
-
-    /// Everything the terminal has been shown so far.
-    fn screen(&self) -> String {
-        unsafe {
-            let flags = libc::fcntl(self.master, libc::F_GETFL);
-            libc::fcntl(self.master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    self.master,
-                    buf.as_mut_ptr().cast::<libc::c_void>(),
-                    buf.len(),
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-}
-
-impl Drop for Pty {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.slave);
-            libc::close(self.master);
-        }
-    }
-}
-
+/// Drive the scenario child on a real pty and judge what the terminal saw.
+///
+/// The pty plumbing lives in `tests-pty` (#1410) — the slave becomes the
+/// child's stdin+stdout, the master is what the "operator" types on and what
+/// we read the screen from.
 #[serial_test::serial(prompt_stdin)]
 #[test]
 fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
     let pty = Pty::open();
 
-    // Hand the child its own duplicates of the slave: `Stdio::from(File)`
-    // consumes the fd, and we need three of them plus our own copy.
-    let dup = |fd: RawFd| unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) };
     let mut child = std::process::Command::new(
         std::env::current_exe().expect("the test binary re-invokes itself"),
     )
     .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
     .env("NEWT_PROMPT_VISIBILITY_CHILD", "1")
-    .stdin(std::process::Stdio::from(dup(pty.slave)))
-    .stdout(std::process::Stdio::from(dup(pty.slave)))
+    .stdin(pty.slave_stdio())
+    .stdout(pty.slave_stdio())
     .stderr(std::process::Stdio::null())
     .spawn()
     .expect("spawn the pty child");

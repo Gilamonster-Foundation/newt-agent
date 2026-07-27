@@ -67,6 +67,14 @@ embedded = ["newt-inference/embedded"]
 # from inside `newt_core::agentic`. See newt-core/Cargo.toml for the rationale
 # and the stub-shell caveat (reubeno/brush#1184).
 
+# The shared pty harness for the real-resource tier (#1410) — replaces the
+# byte-identical copy `prompt_visibility_test` used to carry. libc-only, no
+# newt dependencies, so it costs this crate's test build nothing. Unix-gated
+# because a pty pair is unix-only, matching `#[cfg(all(test, unix))]` on the
+# module that uses it.
+[target.'cfg(unix)'.dev-dependencies]
+tests-pty.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 # Chain-rooting unit tests for the TUI's subprocess-spawn envelope
