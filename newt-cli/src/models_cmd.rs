@@ -10,7 +10,7 @@
 
 use clap::Subcommand;
 use newt_inference::palette::{self, MiniModel};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Subcommand, Debug)]
 pub enum ModelsCmd {
@@ -60,12 +60,8 @@ async fn pull_embed() -> anyhow::Result<()> {
         palette::EMBED_HF_REPO,
         dir.display()
     );
-    for file in palette::EMBED_REQUIRED_FILES {
-        let url = format!(
-            "https://huggingface.co/{}/resolve/main/{file}",
-            palette::EMBED_HF_REPO
-        );
-        fetch_if_absent(&url, &dir.join(file), file).await?;
+    for fetch in embed_fetches(&dir) {
+        fetch_if_absent(&fetch.url, &fetch.dest, &fetch.label).await?;
     }
     println!(
         "OK {} fully provisioned — semantic retrieval will use it automatically",
@@ -246,35 +242,96 @@ pub fn spawn_setup() -> Option<newt_tui::SetupHandle> {
     if !std::io::stdout().is_terminal() || std::env::var_os("NEWT_NO_MODEL_PULL").is_some() {
         return None;
     }
-    let m = palette::default_model();
-    if palette::resolve_local(m.name).is_some() {
-        return None; // already provisioned (GGUF + tokenizer)
+    let (plan, what) = provisioning_plan();
+    if plan.is_empty() {
+        return None; // everything already provisioned
     }
-    let (gguf, tok) = (
-        palette::local_gguf_path(m)?,
-        palette::local_tokenizer_path(m)?,
-    );
-    let gguf_url = format!(
-        "https://huggingface.co/{}/resolve/main/{}",
-        m.hf_repo, m.gguf_file
-    );
-    let tok_url = format!(
-        "https://huggingface.co/{}/resolve/main/tokenizer.json",
-        m.tokenizer_repo
-    );
+
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_thread = std::sync::Arc::clone(&cancel);
     // A std::thread with its OWN current-thread runtime, so the download is
     // independent of the main runtime that run_code blocks in — no nesting.
     std::thread::spawn(move || {
-        run_setup_thread(&gguf_url, &gguf, &tok_url, &tok, &tx, &cancel_thread);
+        run_setup_thread(&plan, &tx, &cancel_thread);
     });
-    Some(newt_tui::SetupHandle {
-        what: format!("on-host summarizer ({})", m.name),
-        rx,
-        cancel,
-    })
+    Some(newt_tui::SetupHandle { what, rx, cancel })
+}
+
+/// One file to fetch: where it comes from, where it lands, what to call it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fetch {
+    pub(crate) label: String,
+    pub(crate) url: String,
+    pub(crate) dest: PathBuf,
+}
+
+/// Everything missing that first run should fetch.
+///
+/// Both capabilities go through ONE plan so they share one spinner, one cancel,
+/// and one progress stream. Previously only the summarizer was provisioned
+/// here; the embedding model had to be fetched by hand with
+/// `newt models pull-embed`, so semantic retrieval silently did not work out of
+/// the box (#1454).
+#[cfg(feature = "embedded")]
+pub(crate) fn provisioning_plan() -> (Vec<Fetch>, String) {
+    let mut plan = Vec::new();
+    let mut capabilities: Vec<&str> = Vec::new();
+
+    let m = palette::default_model();
+    if palette::resolve_local(m.name).is_none() {
+        if let (Some(gguf), Some(tok)) = (
+            palette::local_gguf_path(m),
+            palette::local_tokenizer_path(m),
+        ) {
+            plan.push(Fetch {
+                label: "weights".into(),
+                url: format!(
+                    "https://huggingface.co/{}/resolve/main/{}",
+                    m.hf_repo, m.gguf_file
+                ),
+                dest: gguf,
+            });
+            plan.push(Fetch {
+                label: "tokenizer".into(),
+                url: format!(
+                    "https://huggingface.co/{}/resolve/main/tokenizer.json",
+                    m.tokenizer_repo
+                ),
+                dest: tok,
+            });
+        }
+    }
+
+    if !plan.is_empty() {
+        capabilities.push("on-host summarizer");
+    }
+    if let Some(dir) = palette::embed_model_dir() {
+        if !palette::embed_model_present_in(&dir) {
+            plan.extend(embed_fetches(&dir));
+            capabilities.push("embeddings");
+        }
+    }
+    // Names capabilities, not filenames: an operator should read what they are
+    // getting, not what is being downloaded.
+    (plan, capabilities.join(" + "))
+}
+
+/// The embedding model's files. Shared by the first-run plan and
+/// `newt models pull-embed`, so the two cannot disagree about what "provisioned"
+/// means.
+pub(crate) fn embed_fetches(dir: &Path) -> Vec<Fetch> {
+    palette::EMBED_REQUIRED_FILES
+        .iter()
+        .map(|file| Fetch {
+            label: (*file).to_string(),
+            url: format!(
+                "https://huggingface.co/{}/resolve/main/{file}",
+                palette::EMBED_HF_REPO
+            ),
+            dest: dir.join(file),
+        })
+        .collect()
 }
 
 /// Lean build: no embedded engine, so there is nothing to provision.
@@ -289,10 +346,7 @@ pub fn spawn_setup() -> Option<newt_tui::SetupHandle> {
 /// dir is completed in place. Honours `cancel` (triple-Esc from the splash).
 #[cfg(feature = "embedded")]
 fn run_setup_thread(
-    gguf_url: &str,
-    gguf: &Path,
-    tok_url: &str,
-    tok: &Path,
+    plan: &[Fetch],
     tx: &std::sync::mpsc::Sender<newt_tui::SetupEvent>,
     cancel: &std::sync::atomic::AtomicBool,
 ) {
@@ -308,19 +362,19 @@ fn run_setup_thread(
         }
     };
     rt.block_on(async {
-        if let Some(parent) = gguf.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                let _ = tx.send(SetupEvent::Failed(e.to_string()));
-                return;
+        for fetch in plan {
+            if let Some(parent) = fetch.dest.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    let _ = tx.send(SetupEvent::Failed(e.to_string()));
+                    return;
+                }
+                write_models_readme(parent);
             }
-            write_models_readme(parent);
-        }
-        for (label, url, dest) in [("weights", gguf_url, gguf), ("tokenizer", tok_url, tok)] {
-            let _ = tx.send(SetupEvent::Step(label.into()));
-            if dest.is_file() {
+            let _ = tx.send(SetupEvent::Step(fetch.label.clone()));
+            if fetch.dest.is_file() {
                 continue;
             }
-            if let Err(e) = download_stream(url, dest, tx, cancel).await {
+            if let Err(e) = download_stream(&fetch.url, &fetch.dest, tx, cancel).await {
                 let _ = tx.send(SetupEvent::Failed(e.to_string()));
                 return;
             }
@@ -405,3 +459,73 @@ overloads it and can stall the turn (#979). A small CPU model decouples them.
 
 See docs/decisions/embedded_inference.md and issues #639 / #661 / #979.
 ";
+
+#[cfg(all(test, feature = "embedded"))]
+mod provisioning_tests {
+    use super::*;
+
+    fn embed_dir() -> PathBuf {
+        PathBuf::from("/tmp/does-not-exist-embed-dir")
+    }
+
+    /// #1454: the embedding model must ride the SAME plan as the summarizer, so
+    /// first run provisions semantic retrieval instead of leaving the operator
+    /// to discover `newt models pull-embed` on their own.
+    #[test]
+    fn the_embed_fetches_cover_every_required_file() {
+        let fetches = embed_fetches(&embed_dir());
+        assert_eq!(fetches.len(), palette::EMBED_REQUIRED_FILES.len());
+        for file in palette::EMBED_REQUIRED_FILES {
+            let f = fetches
+                .iter()
+                .find(|f| f.label == *file)
+                .unwrap_or_else(|| panic!("{file} missing from the plan"));
+            assert!(
+                f.dest.ends_with(file),
+                "lands at the right path: {:?}",
+                f.dest
+            );
+            assert!(
+                f.url.contains(palette::EMBED_HF_REPO),
+                "fetched from the pinned repo: {}",
+                f.url
+            );
+        }
+    }
+
+    /// `pull_embed` and the first-run plan share `embed_fetches`, so the two
+    /// cannot disagree about what "provisioned" means. This pins that the set
+    /// the plan fetches is exactly the set `embed_model_present_in` checks.
+    #[test]
+    fn the_plan_and_the_presence_check_agree() {
+        let dir = embed_dir();
+        let planned: Vec<_> = embed_fetches(&dir).into_iter().map(|f| f.dest).collect();
+        let checked: Vec<_> = palette::EMBED_REQUIRED_FILES
+            .iter()
+            .map(|f| dir.join(f))
+            .collect();
+        assert_eq!(planned, checked);
+    }
+
+    /// The label names capabilities, not filenames — an operator should read
+    /// what they are getting, not what is being downloaded. Derived by
+    /// `provisioning_plan` alongside the work, so the two cannot drift.
+    #[test]
+    fn the_plan_label_names_capabilities() {
+        let (plan, label) = provisioning_plan();
+        // On any given box some of this may already be present; the invariant
+        // is that work and label agree, in both directions.
+        assert_eq!(
+            plan.is_empty(),
+            label.is_empty(),
+            "work and label must agree: {} fetches, label {label:?}",
+            plan.len()
+        );
+        for word in label.split(" + ").filter(|w| !w.is_empty()) {
+            assert!(
+                matches!(word, "on-host summarizer" | "embeddings"),
+                "unexpected capability in label: {word:?}"
+            );
+        }
+    }
+}
