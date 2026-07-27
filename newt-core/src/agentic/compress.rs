@@ -2050,6 +2050,106 @@ mod tests {
         );
     }
 
+    /// bug/steering-regressions REGRESSION (live drives 2026-07-26/27, gpt-4.1
+    /// + Qwen3-Coder both): the operator states the REAL task, the harness
+    /// decision-surface asks for confirmation, and the operator's next turn is
+    /// pure ceremony ("1: proceed"). That NEW turn's active prompt — and thus
+    /// the protected active-prompt card — is the ceremony text, while the real
+    /// task is now just a prior-turn user message in the summarizable middle.
+    /// Mid-turn compaction then evicts the actual goal; the model keeps
+    /// working, on nothing ("context summarized: 13,628 → 11,805" was followed
+    /// by hunting hallucinated files in the live gpt-4.1 drive). The task must
+    /// survive compaction VERBATIM even when the current turn's active prompt
+    /// is a bare go-ahead.
+    #[tokio::test]
+    async fn prior_turn_task_survives_compaction_when_active_prompt_is_ceremony() {
+        let real_task = "STEER-TASK-7c41: extract one cohesive #[cfg(test)] module \
+             from newt-core/src/agentic/mod.rs into a sibling file by pure code \
+             motion, keep the build green, then open exactly one PR.";
+        let ceremony = "1: proceed";
+        let mut msgs = vec![
+            sys("you are newt"),
+            user(real_task),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "I need these decisions locked before I can execute. \
+                     Reply using an explicit ordinal: 1. Pick the single largest…"
+            }),
+            user(ceremony),
+        ];
+        // The long agentic middle: bulky read_file rounds dwarfing the budget.
+        for i in 0..12 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": "newt-core/src/agentic/mod.rs", "offset": i * 500}),
+            ));
+            msgs.push(tool_result(&"m".repeat(4_000)));
+        }
+        // Drive the REAL seam the loop uses: receipts through the session
+        // prompt store, the ceremony turn recorded as an operator
+        // CONTINUATION of the task (exactly what chat.rs does for a pending
+        // decision reply), then `active_text()` — the string mod.rs protects.
+        let store = crate::agentic::prompt_read::SessionPromptStore::default();
+        let task_turn = store
+            .begin_prompt(
+                "conv-steer",
+                crate::prompt::NewPrompt::operator(real_task.as_bytes(), real_task.as_bytes()),
+            )
+            .expect("task receipt");
+        let ceremony_turn = store
+            .begin_prompt(
+                "conv-steer",
+                crate::prompt::NewPrompt::operator_continuation(
+                    ceremony.as_bytes(),
+                    ceremony.as_bytes(),
+                    task_turn.submitted_prompt().id(),
+                ),
+            )
+            .expect("ceremony receipt");
+        let active_task = crate::agentic::prompt_read::PromptReadContext::new(
+            Some(&ceremony_turn),
+            ceremony,
+            None,
+        )
+        .active_text();
+        let protected = protect_active_prompt_for_compression(&msgs, active_task);
+        let before = estimate_tokens(&protected, EST);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "## Summary\nreads happened");
+        let mut state = CompressState::new();
+        let out = compress(
+            CompressRequest {
+                messages: &protected,
+                budget: before / 4,
+                max_messages: None,
+                task: active_task,
+                hard_budget: true,
+                authoritative: true,
+                focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
+                compaction_store: None,
+            },
+            Some(&*s),
+            &mut state,
+        )
+        .await;
+        assert!(out.fired, "the oversized middle must trigger compaction");
+        let visible: String = out
+            .messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            visible.contains("STEER-TASK-7c41"),
+            "the REAL task from the prior turn must survive compaction verbatim \
+             even when the current turn's active prompt is decision ceremony \
+             (\"{ceremony}\") — otherwise the agent keeps working with no goal. \
+             Post-compaction visible content:\n{visible}"
+        );
+    }
+
     /// #319 REGRESSION GUARD: an API surface read EARLY then needed LATER is
     /// summarized out of the middle (the freshest trailing group + ~budget/4
     /// token tail are protected; an older read is not). The summary is prose,
