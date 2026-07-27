@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use agent_mesh_protocol::{SerdeSig, UserKey, UserPublic};
 use serde::{Deserialize, Serialize};
 
+use crate::wire_framing::push_field;
+
 const DOMAIN: &[u8] = b"newt/credential-registry/v1";
 
 /// A passkey binding signed by the operator root.
@@ -241,11 +243,6 @@ fn signing_payload(issuer: &str, subject: &str, record: &CredentialRecord) -> Ve
     push_field(&mut payload, record.transcript_id.as_bytes());
     push_field(&mut payload, &[u8::from(record.revoked)]);
     payload
-}
-
-fn push_field(out: &mut Vec<u8>, field: &[u8]) {
-    out.extend_from_slice(&(field.len() as u64).to_be_bytes());
-    out.extend_from_slice(field);
 }
 
 #[cfg(test)]
