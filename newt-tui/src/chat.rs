@@ -2068,13 +2068,26 @@ pub(crate) fn run_chat(
                                     &mut where_is_index,
                                     &mut nav_session,
                                 );
-                                ensure_nav_indexes(
-                                    workspace,
-                                    &cfg,
-                                    &mut where_is_index,
-                                    &mut nav_session,
-                                    &index_status,
-                                );
+                                // Iteration #3: a still-building warm-up must not
+                                // stall the command either — regex floor now,
+                                // full index on a later invocation.
+                                if nav_warmup.is_some() {
+                                    print_newt(
+                                        "repository index is still building — structural \
+                                         answers use the regex floor until it finishes",
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                                if nav_warmup.is_none() {
+                                    ensure_nav_indexes(
+                                        workspace,
+                                        &cfg,
+                                        &mut where_is_index,
+                                        &mut nav_session,
+                                        &index_status,
+                                    );
+                                }
                                 let msg = handle_nav_command(
                                     cmd,
                                     workspace,
@@ -4102,7 +4115,11 @@ pub(crate) fn run_chat(
                     // (the gather is a capped, cheap structural walk — no model,
                     // no network). The typed-verdict lookup then rides this turn.
                     finish_nav_warmup(&rt, &mut nav_warmup, &mut where_is_index, &mut nav_session);
-                    if where_is_index.is_none() || nav_session.usage.is_none() {
+                    // Iteration #3: while the warm-up is still building, do NOT
+                    // rebuild inline either — this turn rides the regex floor.
+                    if nav_warmup.is_none()
+                        && (where_is_index.is_none() || nav_session.usage.is_none())
+                    {
                         ensure_nav_indexes(
                             workspace,
                             &cfg,
@@ -4847,17 +4864,31 @@ fn spawn_nav_warmup(
     NavWarmup { handle, job }
 }
 
+/// Adopt the background navigator warm-up ONLY if it has already finished.
+///
+/// bug/steering-regressions iteration #3: this used to `block_on` the join,
+/// so the turn stalled for as long as the index build ran — observed live
+/// twice (2026-07-27): 40+ minutes at ~6 cores on a corpus-heavy workspace,
+/// the session apparently wedged (no output, no inference, no tool calls).
+/// The navigator's own contract already degrades honestly without an index
+/// (regex floor, `complete=false`), so a still-running warm-up now simply
+/// keeps running: this turn uses the floor and a later turn adopts the
+/// finished index. Never trade turn liveness for index completeness.
 fn finish_nav_warmup(
     rt: &tokio::runtime::Handle,
     warmup: &mut Option<NavWarmup>,
     where_is: &mut Option<newt_core::WhereIsIndex>,
     nav: &mut newt_core::NavigatorSession,
 ) {
-    let Some(warmup) = warmup.take() else {
+    let Some(pending) = warmup.take() else {
         return;
     };
+    if !pending.handle.is_finished() {
+        *warmup = Some(pending);
+        return;
+    }
     if let Ok((warmed_where_is, warmed_nav)) =
-        tokio::task::block_in_place(|| rt.block_on(warmup.handle))
+        tokio::task::block_in_place(|| rt.block_on(pending.handle))
     {
         *where_is = warmed_where_is;
         *nav = warmed_nav;
@@ -5090,9 +5121,18 @@ mod prompt_ingress_tests {
         let mut where_is = None;
         let mut nav = newt_core::NavigatorSession::default();
 
+        // Iteration #3 contract: adoption happens only once the build is done —
+        // wait for readiness (bounded), then adopt. A still-running warm-up is
+        // covered by `unfinished_warmup_is_left_running_and_the_turn_degrades`.
+        for _ in 0..200 {
+            if warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
 
-        assert!(warmup.is_none());
+        assert!(warmup.is_none(), "a finished warm-up must be adopted");
         assert!(
             !job.is_running(),
             "joining the warm-up must clear its generic liveness indicator"
@@ -5103,6 +5143,54 @@ mod prompt_ingress_tests {
             "the joined navigator must contain the real source file"
         );
         assert!(nav.usage.is_some() && nav.graph.is_some());
+    }
+
+    /// bug/steering-regressions iteration #3 (live wedges 2026-07-27): the
+    /// turn must NEVER block on a still-running index warm-up. Two live
+    /// sessions sat 40+ minutes at ~6 cores — no output, no inference —
+    /// because the consumer `block_on`-joined an unbounded build. A
+    /// still-running warm-up stays running; adoption happens on a later turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfinished_warmup_is_left_running_and_the_turn_degrades() {
+        let rt = tokio::runtime::Handle::current();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let job = BackgroundJob::start("indexing repository");
+        let completion = job.completion_guard();
+        let handle = rt.spawn_blocking(move || {
+            let _completion = completion;
+            // Hold the "build" open until the test releases it.
+            let _ = gate.recv();
+            (None, newt_core::NavigatorSession::default())
+        });
+        let mut warmup = Some(NavWarmup { handle, job });
+        let mut where_is = None;
+        let mut nav = newt_core::NavigatorSession::default();
+
+        let started = std::time::Instant::now();
+        finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "finish must return promptly, never join an unfinished build"
+        );
+        assert!(
+            warmup.is_some(),
+            "a still-running warm-up must be left running for a later turn"
+        );
+        assert!(
+            where_is.is_none(),
+            "nothing adopted from an unfinished build"
+        );
+
+        // Release the build; a later turn adopts it.
+        release.send(()).unwrap();
+        for _ in 0..200 {
+            if warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
+        assert!(warmup.is_none(), "the finished build is adopted next turn");
     }
 
     fn prompt_store() -> (tempfile::TempDir, newt_core::ConversationStore, String) {
