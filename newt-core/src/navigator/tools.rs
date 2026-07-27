@@ -10,8 +10,8 @@ use crate::where_is::WhereIsIndex;
 
 use super::{
     find_callees, find_callers, find_hierarchy, find_implementations, find_references, find_tests,
-    goto_definition, impact_analysis, inspect_type, text_search, GotoDefinitionArgs, GraphIndex,
-    NavResult, UsageIndex,
+    goto_definition, impact_analysis, inspect_type, GotoDefinitionArgs, GraphIndex, NavResult,
+    UsageIndex,
 };
 
 /// Tool names registered for navigation (#1387).
