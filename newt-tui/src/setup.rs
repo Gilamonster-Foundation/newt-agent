@@ -290,6 +290,7 @@ async fn run_with(
     let (cfg, backend) = match choose_backend(console)? {
         BackendChoice::Ollama => configure_ollama(console, client).await?,
         BackendChoice::Dgx => configure_dgx(console, client).await?,
+        BackendChoice::Cloud => configure_cloud(console, client, config_path).await?,
     };
 
     // Preview before committing anything to disk: the backend drop-in is the
@@ -320,15 +321,18 @@ async fn run_with(
 enum BackendChoice {
     Ollama,
     Dgx,
+    Cloud,
 }
 
 fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
     console.say("\nWhere does your model run?");
     console.say("  1) Ollama  (local, or a plain self-hosted Ollama host)");
     console.say("  2) DGX     (remote NVIDIA endpoint: Ollama or vLLM)");
+    console.say("  3) Cloud   (any OpenAI-compatible endpoint, e.g. https://inference-api.nvidia.com/v1)");
     let ans = console.ask("Choose [1]: ")?;
-    match parse_choice(&ans, 2).unwrap_or(1) {
+    match parse_choice(&ans, 3).unwrap_or(1) {
         2 => Ok(BackendChoice::Dgx),
+        3 => Ok(BackendChoice::Cloud),
         _ => Ok(BackendChoice::Ollama),
     }
 }
@@ -413,6 +417,152 @@ async fn configure_dgx(
 }
 
 // ---------------------------------------------------------------------------
+// Cloud / OpenAI-compatible remote endpoint path
+// ---------------------------------------------------------------------------
+
+/// Strip `/v1` (and any trailing path suffix) from a user-supplied URL so the
+/// stored endpoint is the bare base that newt appends `/v1/…` paths to itself.
+///
+/// Handles: trailing `/`, `/v1`, `/v1/`, `/v1/models`, `/v1/chat/completions`.
+fn normalize_cloud_url(raw: &str) -> String {
+    let s = raw.trim().trim_end_matches('/');
+    // Strip common API-suffix paths the user might paste from docs.
+    let s = s
+        .trim_end_matches("/v1/chat/completions")
+        .trim_end_matches("/v1/completions")
+        .trim_end_matches("/v1/models")
+        .trim_end_matches("/v1/")
+        .trim_end_matches("/v1");
+    s.trim_end_matches('/').to_string()
+}
+
+/// Derive a short backend name from the hostname of a URL.
+/// `https://inference-api.nvidia.com/v1` → `inference-api.nvidia.com`
+fn derive_name_from_url(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+}
+
+async fn configure_cloud(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    config_path: &Path,
+) -> anyhow::Result<(Config, BackendConfig)> {
+    let default_url = "https://inference-api.nvidia.com/v1";
+
+    let raw_url = console.ask(&format!("base_url [{default_url}]: "))?;
+    let raw_url = if raw_url.is_empty() {
+        default_url.to_string()
+    } else {
+        raw_url
+    };
+    let endpoint = normalize_cloud_url(&raw_url);
+
+    let api_key_raw = console.ask("api_key [none]: ")?;
+    let api_key = if api_key_raw.trim().is_empty() {
+        None
+    } else {
+        Some(api_key_raw.trim().to_string())
+    };
+
+    let default_name = derive_name_from_url(&endpoint)
+        .unwrap_or_else(|| "cloud".to_string());
+    let raw_name = console.ask(&format!("name [{default_name}]: "))?;
+    let name = if raw_name.trim().is_empty() {
+        default_name
+    } else {
+        raw_name.trim().to_string()
+    };
+
+    let model = pick_cloud_model(console, client, &endpoint, api_key.as_deref()).await?;
+
+    Ok(build_cloud_config(config_path, &name, &endpoint, &model, api_key.as_deref()))
+}
+
+/// Probe with auth and present the model list; fall back to manual entry.
+async fn pick_cloud_model(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<String> {
+    console.say(&format!("Probing {endpoint}/v1/models…"));
+    let models = fetch_openai_models_auth(client, endpoint, api_key).await;
+
+    let models = match models {
+        Ok(m) if !m.is_empty() => m,
+        Ok(_) => {
+            console.say("  Endpoint answered but listed no models.");
+            return ask_model_name(console);
+        }
+        Err(e) => {
+            console.say(&format!("  Could not reach the endpoint ({e})."));
+            return ask_model_name(console);
+        }
+    };
+
+    console.say("\nAvailable models:");
+    for (i, m) in models.iter().enumerate() {
+        console.say(&format!("  {}) {m}", i + 1));
+    }
+    let ans = console.ask("Choose [1]: ")?;
+    let idx = parse_choice(&ans, models.len()).map(|n| n - 1).unwrap_or(0);
+    Ok(models[idx].clone())
+}
+
+/// Build a cloud backend config and, when an API key is provided, write it to
+/// `backends/<name>.token` beside the config file and store the absolute path
+/// in `api_key_file`.
+fn build_cloud_config(
+    config_path: &Path,
+    name: &str,
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> (Config, BackendConfig) {
+    let api_key_file = api_key.and_then(|key| {
+        // Write the key to backends/<name>.token next to config.toml.
+        let backends_dir = config_path.parent()?.join("backends");
+        std::fs::create_dir_all(&backends_dir).ok()?;
+        let token_path = backends_dir.join(format!("{name}.token"));
+        std::fs::write(&token_path, key).ok()?;
+        // Store the tilde-collapsed path so it's portable across home dirs.
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        token_path
+            .strip_prefix(&home)
+            .ok()
+            .map(|rel| format!("~/{}", rel.display()))
+            .or_else(|| Some(token_path.display().to_string()))
+    });
+
+    let backend = BackendConfig {
+        name: name.to_string(),
+        endpoint: endpoint.to_string(),
+        model: Some(model.to_string()),
+        tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+        kind: Some(BackendKind::Openai),
+        api_key_file,
+        serving: Some(newt_core::Serving::Instance),
+        provenance: Some(newt_core::config::BackendProvenance {
+            source: Some(format!(
+                "newt setup v{} (cloud)",
+                env!("CARGO_PKG_VERSION")
+            )),
+            probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            derived_serving: Some(true),
+        }),
+        ..Default::default()
+    };
+    let config = Config {
+        backends: vec![],
+        default_backend: Some(backend.name.clone()),
+        ..Default::default()
+    };
+    (config, backend)
+}
+
+// ---------------------------------------------------------------------------
 // Model selection (probe → numbered list → pick, with manual fallback)
 // ---------------------------------------------------------------------------
 
@@ -472,7 +622,7 @@ fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
 /// List models from an Ollama endpoint via `GET /api/tags`.
 // The endpoint fetchers moved to `newt_core::backend_probe` (#1136) so the
 // TUI session, setup, and doctor share one probe path.
-use newt_core::backend_probe::{fetch_ollama_models, fetch_openai_models};
+use newt_core::backend_probe::{fetch_ollama_models, fetch_openai_models, fetch_openai_models_auth};
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested directly)
@@ -2319,6 +2469,155 @@ mod tests {
         let mut console = ScriptedConsole::new(&["1", &server.uri(), "1", "n"]);
         run_with(&mut console, &client, &path).await.unwrap();
         assert!(!path.exists());
+    }
+
+    // --- normalize_cloud_url pure tests -------------------------------------
+
+    #[test]
+    fn normalize_cloud_url_strips_v1() {
+        assert_eq!(
+            normalize_cloud_url("https://inference-api.nvidia.com/v1"),
+            "https://inference-api.nvidia.com"
+        );
+    }
+
+    #[test]
+    fn normalize_cloud_url_strips_v1_trailing_slash() {
+        assert_eq!(
+            normalize_cloud_url("https://inference-api.nvidia.com/v1/"),
+            "https://inference-api.nvidia.com"
+        );
+    }
+
+    #[test]
+    fn normalize_cloud_url_strips_models_path() {
+        assert_eq!(
+            normalize_cloud_url("https://inference-api.nvidia.com/v1/models"),
+            "https://inference-api.nvidia.com"
+        );
+    }
+
+    #[test]
+    fn normalize_cloud_url_strips_chat_completions_path() {
+        assert_eq!(
+            normalize_cloud_url("https://inference-api.nvidia.com/v1/chat/completions"),
+            "https://inference-api.nvidia.com"
+        );
+    }
+
+    #[test]
+    fn normalize_cloud_url_passthrough_bare_host() {
+        assert_eq!(
+            normalize_cloud_url("https://inference-api.nvidia.com"),
+            "https://inference-api.nvidia.com"
+        );
+    }
+
+    #[test]
+    fn derive_name_from_url_extracts_host() {
+        assert_eq!(
+            derive_name_from_url("https://inference-api.nvidia.com/v1"),
+            Some("inference-api.nvidia.com".to_string())
+        );
+    }
+
+    // --- cloud wizard integration test --------------------------------------
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn cloud_wizard_writes_backend_with_token_file() {
+        let server = MockServer::start().await;
+        // Serve /v1/models with an auth header.
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer test-nvidia-key",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "nvidia/openai/eccn-gpt-oss-20b", "object": "model"},
+                    {"id": "nvidia/openai/eccn-nemotron-3-ultra", "object": "model"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let client = reqwest::Client::new();
+
+        // Choose Cloud (3), accept default URL (blank → server URI), key, default name, pick model 1, write Y.
+        let server_url = server.uri(); // e.g. http://127.0.0.1:PORT
+        let server_with_v1 = format!("{server_url}/v1");
+        let mut console = ScriptedConsole::new(&[
+            "3",                  // Cloud
+            &server_with_v1,      // base_url (includes /v1 — should be stripped)
+            "test-nvidia-key",    // api_key
+            "",                   // name (use default from hostname)
+            "1",                  // pick model 1
+            "y",                  // write
+        ]);
+
+        run_with(&mut console, &client, &path).await.unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        let dropin = read_dropin(&path, "127.0.0.1");
+        assert_eq!(
+            dropin.effective_model(),
+            Some("nvidia/openai/eccn-gpt-oss-20b")
+        );
+        assert_eq!(dropin.kind, Some(BackendKind::Openai));
+        // The endpoint must NOT include /v1.
+        assert!(!dropin.endpoint.ends_with("/v1"));
+        // A token file was written.
+        assert!(dropin.api_key_file.is_some());
+        let token_path_str = dropin.api_key_file.as_deref().unwrap();
+        let token_path = if let Some(rest) = token_path_str.strip_prefix("~/") {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(rest)
+        } else {
+            std::path::PathBuf::from(token_path_str)
+        };
+        // The config reports a non-empty default.
+        assert_eq!(cfg.default_backend.as_deref(), Some("127.0.0.1"));
+        // Token file exists with the right content.
+        assert_eq!(std::fs::read_to_string(token_path).unwrap(), "test-nvidia-key");
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn cloud_wizard_no_key_skips_token_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"id": "open-model", "object": "model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let client = reqwest::Client::new();
+        let server_url = server.uri();
+
+        // No api_key (blank), custom name "mycloud".
+        let mut console = ScriptedConsole::new(&[
+            "3",           // Cloud
+            &server_url,   // base_url without /v1
+            "",            // no api_key
+            "mycloud",     // custom name
+            "1",           // pick model 1
+            "y",           // write
+        ]);
+
+        run_with(&mut console, &client, &path).await.unwrap();
+
+        let dropin = read_dropin(&path, "mycloud");
+        assert_eq!(dropin.effective_model(), Some("open-model"));
+        assert!(dropin.api_key_file.is_none());
     }
 
     #[serial_test::serial(real_fs)]
