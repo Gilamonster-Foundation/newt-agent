@@ -267,6 +267,56 @@ pub fn append_credential(
     Ok(path)
 }
 
+/// Revoke an enrolled credential by handle prefix, returning the full handle.
+///
+/// Revocation is a *signed* edit, not a deletion: the row stays and its
+/// `revoked` flag flips, then the whole row is re-signed. A tamperer who clears
+/// the flag by hand invalidates the signature, so the row is dropped at load
+/// rather than silently coming back to life — which is why this needs the root
+/// key exactly as [`append_credential`] does.
+///
+/// Matching is by prefix so an operator can type the short form they were
+/// shown. An ambiguous prefix is refused rather than guessed.
+pub fn revoke_credential(
+    config_path: &Path,
+    subject: &str,
+    handle_prefix: &str,
+    root_key: &UserKey,
+) -> anyhow::Result<String> {
+    if handle_prefix.is_empty() {
+        anyhow::bail!("a credential handle prefix is required");
+    }
+    let issuer = root_key.public().fingerprint().hex();
+    let path = credentials_dir(config_path).join(format!("{subject}.toml"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+    let mut bundle: CredentialBundle = toml::from_str(&text)?;
+    if bundle.issuer != issuer || bundle.subject != subject {
+        anyhow::bail!("{} belongs to another operator", path.display());
+    }
+
+    let matches: Vec<usize> = bundle
+        .credentials
+        .iter()
+        .enumerate()
+        .filter(|(_, held)| held.credential_id_handle.starts_with(handle_prefix) && !held.revoked)
+        .map(|(index, _)| index)
+        .collect();
+    let [index] = matches[..] else {
+        anyhow::bail!(
+            "`{handle_prefix}` matches {} live credentials; use a longer prefix",
+            matches.len()
+        );
+    };
+
+    let mut record = bundle.credentials[index].clone();
+    record.revoked = true;
+    let handle = record.credential_id_handle.clone();
+    bundle.credentials[index] = sign_record(&issuer, subject, record, root_key);
+    std::fs::write(&path, toml::to_string(&bundle)?)?;
+    Ok(handle)
+}
+
 fn credentials_dir(config_path: &Path) -> PathBuf {
     config_path.with_file_name("ocap").join("credentials.d")
 }

@@ -51,6 +51,9 @@ impl Fixture {
             cose_alg: -7,
             mesh_agent_fingerprint: "agent-fp".into(),
             transcript_id: "tx-1".into(),
+            rp_id: "newt.example".into(),
+            commitment: "00".repeat(32),
+            enroll_nonce: "bm9uY2U=".into(),
         };
         self.store
             .publish_enrollment_candidate(
@@ -227,6 +230,9 @@ fn append_refuses_an_unsafe_subject() {
         cose_alg: -7,
         mesh_agent_fingerprint: "fp".into(),
         transcript_id: "tx".into(),
+        rp_id: "newt.example".into(),
+        commitment: "00".repeat(32),
+        enroll_nonce: "bm9uY2U=".into(),
     };
     for subject in ["../escape", "a/b", "", ".hidden", "sub ject"] {
         assert!(
@@ -264,6 +270,9 @@ fn append_refuses_a_duplicate_handle_and_a_foreign_bundle() {
         cose_alg: -7,
         mesh_agent_fingerprint: "fp".into(),
         transcript_id: "tx".into(),
+        rp_id: "newt.example".into(),
+        commitment: "00".repeat(32),
+        enroll_nonce: "bm9uY2U=".into(),
     };
     assert!(
         append_credential(

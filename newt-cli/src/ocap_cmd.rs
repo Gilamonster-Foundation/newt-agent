@@ -47,6 +47,23 @@ pub enum OcapCmd {
         #[arg(long, value_name = "FILE")]
         capture: Option<PathBuf>,
     },
+    /// Revoke an enrolled passkey credential.
+    ///
+    /// Gated by the same terminal window the enrollment ceremony uses: a
+    /// headless session cannot revoke, because it cannot be asked. The row is
+    /// flagged and re-signed rather than deleted, so clearing the flag by hand
+    /// invalidates the signature and the credential stays dead.
+    RevokeCredential {
+        /// Credential handle, or any unambiguous prefix of one.
+        #[arg(value_name = "CRED-SHORT")]
+        handle: String,
+        /// Registry bundle to edit (`~/.newt/ocap/credentials.d/<subject>.toml`).
+        #[arg(long, default_value = "operator")]
+        subject: String,
+        /// Operator root key. Default: `~/.newt/identity.pem`.
+        #[arg(long, env = "NEWT_OPERATOR_KEY", value_name = "FILE")]
+        operator_key_path: Option<PathBuf>,
+    },
 }
 
 /// Dispatch `newt ocap <cmd>`.
@@ -54,6 +71,60 @@ pub fn run(cmd: OcapCmd, config: Option<&Path>) -> anyhow::Result<i32> {
     match cmd {
         OcapCmd::Denials { journal } => run_denials(journal, config),
         OcapCmd::Propose { save, capture } => run_propose(save, capture, config),
+        OcapCmd::RevokeCredential {
+            handle,
+            subject,
+            operator_key_path,
+        } => run_revoke_credential(&handle, &subject, operator_key_path, config),
+    }
+}
+
+/// `newt ocap revoke-credential <cred-short>` — confirm at the terminal, then
+/// flip and re-sign the row.
+fn run_revoke_credential(
+    handle: &str,
+    subject: &str,
+    operator_key_path: Option<PathBuf>,
+    config: Option<&Path>,
+) -> anyhow::Result<i32> {
+    let config_path = config
+        .map(Path::to_path_buf)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot locate the newt config directory"))?;
+    let key_path = match operator_key_path {
+        Some(path) => path,
+        None => newt_identity::default_key_path()?,
+    };
+    let root_key = newt_identity::load_user_key(&key_path)?;
+
+    // The capability, not a flag: a session with no terminal cannot obtain one,
+    // so it reaches the default-deny arm below instead of revoking unattended.
+    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    window.ask(&format!(
+        "revoke credential `{handle}` for `{subject}`? [y/N] "
+    ))?;
+    let mut answer = String::new();
+    if window.read_line_into(&mut answer)? == 0
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        window.notice("revoke declined; nothing changed")?;
+        return Ok(1);
+    }
+
+    match newt_core::credential_registry::revoke_credential(
+        &config_path,
+        subject,
+        handle,
+        &root_key,
+    ) {
+        Ok(full) => {
+            window.notice(&format!("revoked {full}"))?;
+            Ok(0)
+        }
+        Err(error) => {
+            window.notice(&format!("revoke failed: {error}"))?;
+            Ok(1)
+        }
     }
 }
 
