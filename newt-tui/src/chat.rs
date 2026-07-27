@@ -95,6 +95,106 @@ impl ModelInputOrigin {
     }
 }
 
+/// bug/steering-regressions iteration #2: upgrade a fresh operator prompt to
+/// an [`ModelInputOrigin::OperatorContinuation`] when the previous agentic
+/// turn was interrupted by the round cap AND the input is a bare continuation
+/// nudge ("continue", "keep going", "1: proceed"). Minted fresh, such a nudge
+/// becomes the active operator prompt itself — the compression-immune card
+/// then protects the word "continue" while the real task drifts into the
+/// summarizable middle (observed live 2026-07-27). Linking it re-enters the
+/// interrupted objective's lineage, so fix #1's authority walk keeps the real
+/// task active. A substantive new ask never upgrades — the classifier is
+/// conservative by construction ([`newt_core::classifiers::is_bare_continuation`]).
+fn upgrade_origin_for_interrupted_objective(
+    origin: ModelInputOrigin,
+    task: &str,
+    interrupted: Option<&newt_core::TurnPromptContext>,
+) -> ModelInputOrigin {
+    match (&origin, interrupted) {
+        (ModelInputOrigin::Operator, Some(parent))
+            if newt_core::classifiers::is_bare_continuation(task) =>
+        {
+            ModelInputOrigin::OperatorContinuation {
+                parent: Box::new(parent.clone()),
+            }
+        }
+        _ => origin,
+    }
+}
+
+#[cfg(test)]
+mod origin_upgrade_tests {
+    use super::*;
+
+    fn ctx() -> newt_core::TurnPromptContext {
+        newt_core::TurnPromptContext::ephemeral_operator(
+            "conv",
+            b"extract the module and open a PR".to_vec(),
+            b"extract the module and open a PR".to_vec(),
+        )
+    }
+
+    #[test]
+    fn bare_continue_after_round_cap_links_to_the_interrupted_objective() {
+        let parent = ctx();
+        let got = upgrade_origin_for_interrupted_objective(
+            ModelInputOrigin::Operator,
+            "continue",
+            Some(&parent),
+        );
+        match got {
+            ModelInputOrigin::OperatorContinuation { parent: linked } => assert_eq!(
+                linked.submitted_prompt().id(),
+                parent.submitted_prompt().id(),
+                "the nudge must re-enter the interrupted objective's lineage"
+            ),
+            other => panic!("bare continue must link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substantive_input_stays_fresh_even_with_an_interrupted_objective() {
+        let parent = ctx();
+        let got = upgrade_origin_for_interrupted_objective(
+            ModelInputOrigin::Operator,
+            "now refactor newt-tui/src/lib.rs instead and open a PR",
+            Some(&parent),
+        );
+        assert!(
+            matches!(got, ModelInputOrigin::Operator),
+            "a new ask must never be silently chained to a stale objective"
+        );
+    }
+
+    #[test]
+    fn no_interrupted_objective_means_no_upgrade() {
+        let got =
+            upgrade_origin_for_interrupted_objective(ModelInputOrigin::Operator, "continue", None);
+        assert!(matches!(got, ModelInputOrigin::Operator));
+    }
+
+    #[test]
+    fn pending_clarification_continuations_are_left_untouched() {
+        let parent = ctx();
+        let pending = ModelInputOrigin::OperatorContinuation {
+            parent: Box::new(ctx()),
+        };
+        let before_id = match &pending {
+            ModelInputOrigin::OperatorContinuation { parent } => parent.submitted_prompt().id(),
+            _ => unreachable!(),
+        };
+        let got = upgrade_origin_for_interrupted_objective(pending, "continue", Some(&parent));
+        match got {
+            ModelInputOrigin::OperatorContinuation { parent: kept } => assert_eq!(
+                kept.submitted_prompt().id(),
+                before_id,
+                "a pending-clarification link outranks the round-cap link"
+            ),
+            other => panic!("existing continuation must be preserved, got {other:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingRetry {
     text: String,
@@ -997,8 +1097,11 @@ pub(crate) fn run_chat(
     // `semantic_indexed` records that indexing was ATTEMPTED (not that it found
     // chunks) so a total embed failure (e.g. the model isn't pulled) doesn't
     // re-walk + re-embed the repo every turn — reset on /new to re-index.
-    let semantic_index = newt_core::SessionSemanticIndex::default();
+    let semantic_index = std::sync::Arc::new(newt_core::SessionSemanticIndex::default());
     let mut semantic_indexed = false;
+    // Iteration #4 (bug/steering-regressions): corpus embedding runs in the
+    // background; the turn NEVER waits on it (see spawn_semantic_indexing).
+    let mut semantic_warmup: Option<SemanticIndexWarmup> = None;
     // #1387 Phase 1: session pin/exclude + lightweight index status + last
     // `/search` result (for preview/model/pin). Cleared on `/new`.
     let mut retrieval_steer = newt_core::RetrievalSteer::default();
@@ -1072,6 +1175,10 @@ pub(crate) fn run_chat(
     // prompt for execution. An outstanding clarification is separately
     // reconstructed from this receipt's durable lineage below.
     let mut active_prompt_context: Option<newt_core::TurnPromptContext> = None;
+    // bug/steering-regressions iteration #2: when an agentic turn ends at the
+    // round cap, its objective stays linkable — the next bare "continue"
+    // re-enters that lineage instead of becoming a goal-less fresh prompt.
+    let mut interrupted_objective: Option<newt_core::TurnPromptContext> = None;
     let mut pending_clarification: Option<PendingClarification> = None;
 
     // 17.7 session-start resume. Both arms go through the SAME restore
@@ -1230,7 +1337,7 @@ pub(crate) fn run_chat(
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before reading even starts.
-        let (outcome, model_input_origin) = if let Some(retry) = pending_retry.take() {
+        let (outcome, mut model_input_origin) = if let Some(retry) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
             // decremented when it was queued.
@@ -1305,6 +1412,11 @@ pub(crate) fn run_chat(
                 if task.is_empty() {
                     continue;
                 }
+                model_input_origin = upgrade_origin_for_interrupted_objective(
+                    model_input_origin,
+                    &task,
+                    interrupted_objective.as_ref(),
+                );
                 if model_input_origin.is_operator() {
                     surface.add_history(&task);
                 }
@@ -1959,13 +2071,26 @@ pub(crate) fn run_chat(
                                     &mut where_is_index,
                                     &mut nav_session,
                                 );
-                                ensure_nav_indexes(
-                                    workspace,
-                                    &cfg,
-                                    &mut where_is_index,
-                                    &mut nav_session,
-                                    &index_status,
-                                );
+                                // Iteration #3: a still-building warm-up must not
+                                // stall the command either — regex floor now,
+                                // full index on a later invocation.
+                                if nav_warmup.is_some() {
+                                    print_newt(
+                                        "repository index is still building — structural \
+                                         answers use the regex floor until it finishes",
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                                if nav_warmup.is_none() {
+                                    ensure_nav_indexes(
+                                        workspace,
+                                        &cfg,
+                                        &mut where_is_index,
+                                        &mut nav_session,
+                                        &index_status,
+                                    );
+                                }
                                 let msg = handle_nav_command(
                                     cmd,
                                     workspace,
@@ -2137,12 +2262,31 @@ pub(crate) fn run_chat(
                                     {
                                         print_newt(&reason, color, verbose);
                                     } else {
-                                        let embedder = build_semantic_embedder(
-                                            &semantic_cfg,
-                                            &inf_url,
-                                            inf_kind,
-                                            inf_key.as_deref(),
-                                        );
+                                        let embedder: std::sync::Arc<dyn newt_core::Embedder> =
+                                            std::sync::Arc::from(build_semantic_embedder(
+                                                &semantic_cfg,
+                                                &inf_url,
+                                                inf_kind,
+                                                inf_key.as_deref(),
+                                            ));
+                                        if let Some(n) =
+                                            poll_semantic_indexing(&rt, &mut semantic_warmup)
+                                        {
+                                            print_newt(
+                                                &format!(
+                                                    "semantic: indexed {n} code chunks (background)"
+                                                ),
+                                                color,
+                                                verbose,
+                                            );
+                                        } else if semantic_warmup.is_some() {
+                                            print_newt(
+                                                "semantic index is still embedding in the \
+                                                 background — results ride the lexical floor",
+                                                color,
+                                                verbose,
+                                            );
+                                        }
                                         if !semantic_indexed {
                                             semantic_indexed = true;
                                             let source_extensions =
@@ -2161,32 +2305,27 @@ pub(crate) fn run_chat(
                                             if !files.is_empty() {
                                                 print_newt(
                                                     &format!(
-                                                        "indexing {} files for semantic retrieval…",
+                                                        "embedding {} files for semantic \
+                                                         retrieval in the background…",
                                                         files.len()
                                                     ),
                                                     color,
                                                     verbose,
                                                 );
-                                                let n = tokio::task::block_in_place(|| {
-                                                    rt.block_on(newt_core::index_files(
-                                                        &files,
-                                                        embedder.as_ref(),
-                                                        &semantic_index,
-                                                        semantic_cfg.on_embed_failure,
-                                                    ))
-                                                });
-                                                print_newt(
-                                                    &format!("semantic: indexed {n} code chunks"),
-                                                    color,
-                                                    verbose,
-                                                );
+                                                semantic_warmup = Some(spawn_semantic_indexing(
+                                                    &rt,
+                                                    files,
+                                                    std::sync::Arc::clone(&embedder),
+                                                    std::sync::Arc::clone(&semantic_index),
+                                                    semantic_cfg.on_embed_failure,
+                                                ));
                                             }
                                         }
                                         match tokio::task::block_in_place(|| {
                                             rt.block_on(newt_core::retrieve_ranked(
                                                 &query,
                                                 embedder.as_ref(),
-                                                &semantic_index,
+                                                semantic_index.as_ref(),
                                                 semantic_cfg.top_k,
                                                 Some(&retrieval_steer),
                                                 Some(&index_status),
@@ -2580,6 +2719,12 @@ pub(crate) fn run_chat(
                         {
                             use newt_core::SemanticIndex;
                             semantic_index.clear();
+                            if let Some(warmup) = semantic_warmup.take() {
+                                // Iteration #4: a stale-corpus embed must not
+                                // keep burning cores into the fresh session.
+                                warmup.handle.abort();
+                                drop(warmup.job);
+                            }
                         }
                         semantic_indexed = false;
                         // #1387: pins/exclusions and search cockpit state are
@@ -3585,21 +3730,34 @@ pub(crate) fn run_chat(
                     // embedder (when `embeddings_api = "embedded"`) — the latter
                     // computes embeddings locally so retrieval never touches the
                     // DGX chat model's VRAM. The selection is a pure helper.
-                    let semantic_embedder: Option<Box<dyn newt_core::Embedder>> = if semantic_on {
-                        if semantic_embedder_unavailable_reason(&semantic_cfg).is_some() {
-                            None
+                    let semantic_embedder: Option<std::sync::Arc<dyn newt_core::Embedder>> =
+                        if semantic_on {
+                            if semantic_embedder_unavailable_reason(&semantic_cfg).is_some() {
+                                None
+                            } else {
+                                Some(std::sync::Arc::from(build_semantic_embedder(
+                                    &semantic_cfg,
+                                    &inf_url,
+                                    inf_kind,
+                                    inf_key.as_deref(),
+                                )))
+                            }
                         } else {
-                            Some(build_semantic_embedder(
-                                &semantic_cfg,
-                                &inf_url,
-                                inf_kind,
-                                inf_key.as_deref(),
-                            ))
+                            None
+                        };
+                    // Iteration #4: surface a finished background embed once.
+                    if let Some(n) = poll_semantic_indexing(&rt, &mut semantic_warmup) {
+                        if n == 0 {
+                            print_harness_notice(&semantic_zero_index_hint(&semantic_cfg), color);
+                        } else {
+                            print_newt(
+                                &format!("semantic: indexed {n} code chunks (background)"),
+                                color,
+                                verbose,
+                            );
                         }
-                    } else {
-                        None
-                    };
-                    if let Some(embedder) = semantic_embedder.as_deref() {
+                    }
+                    if let Some(embedder) = semantic_embedder.as_ref() {
                         if !semantic_indexed {
                             // Attempt indexing ONCE per session (reset on /new),
                             // whether or not it yields chunks — so a missing
@@ -3625,39 +3783,28 @@ pub(crate) fn run_chat(
                             if !files.is_empty() {
                                 print_newt(
                                     &format!(
-                                        "indexing {} files for semantic retrieval…",
+                                        "embedding {} files for semantic retrieval in the \
+                                         background — retrieval rides the lexical floor \
+                                         until it finishes",
                                         files.len()
                                     ),
                                     color,
                                     verbose,
                                 );
-                                let n = tokio::task::block_in_place(|| {
-                                    rt.block_on(newt_core::index_files(
-                                        &files,
-                                        embedder,
-                                        &semantic_index,
-                                        semantic_cfg.on_embed_failure,
-                                    ))
-                                });
-                                if n == 0 {
-                                    print_harness_notice(
-                                        &semantic_zero_index_hint(&semantic_cfg),
-                                        color,
-                                    );
-                                } else {
-                                    print_newt(
-                                        &format!("semantic: indexed {n} code chunks"),
-                                        color,
-                                        verbose,
-                                    );
-                                }
+                                semantic_warmup = Some(spawn_semantic_indexing(
+                                    &rt,
+                                    files,
+                                    std::sync::Arc::clone(embedder),
+                                    std::sync::Arc::clone(&semantic_index),
+                                    semantic_cfg.on_embed_failure,
+                                ));
                             }
                         }
                         if let Some(result) = tokio::task::block_in_place(|| {
                             rt.block_on(newt_core::retrieve_ranked(
                                 &task,
-                                embedder,
-                                &semantic_index,
+                                embedder.as_ref(),
+                                semantic_index.as_ref(),
                                 semantic_cfg.top_k,
                                 Some(&retrieval_steer),
                                 Some(&index_status),
@@ -3993,7 +4140,11 @@ pub(crate) fn run_chat(
                     // (the gather is a capped, cheap structural walk — no model,
                     // no network). The typed-verdict lookup then rides this turn.
                     finish_nav_warmup(&rt, &mut nav_warmup, &mut where_is_index, &mut nav_session);
-                    if where_is_index.is_none() || nav_session.usage.is_none() {
+                    // Iteration #3: while the warm-up is still building, do NOT
+                    // rebuild inline either — this turn rides the regex floor.
+                    if nav_warmup.is_none()
+                        && (where_is_index.is_none() || nav_session.usage.is_none())
+                    {
                         ensure_nav_indexes(
                             workspace,
                             &cfg,
@@ -4052,7 +4203,7 @@ pub(crate) fn run_chat(
                                         code_search: semantic_embedder.as_deref().map(|e| {
                                             newt_core::CodeSearch {
                                                 embedder: e,
-                                                index: &semantic_index,
+                                                index: semantic_index.as_ref(),
                                                 top_k: semantic_cfg.top_k,
                                                 steer: Some(&retrieval_steer),
                                                 status: Some(&index_status),
@@ -4391,6 +4542,12 @@ pub(crate) fn run_chat(
                                     hallucinations,
                                     end_reason: turn_end_reason,
                                 };
+                                // Iteration #2: keep a RoundCap-interrupted
+                                // objective linkable for the next bare nudge.
+                                interrupted_objective = (turn_end_reason
+                                    == Some(newt_core::TurnEndReason::RoundCap))
+                                .then(|| active_prompt_context.clone())
+                                .flatten();
                                 let memory_task =
                                     active_operator_task(active_prompt_context.as_ref(), &task);
                                 tokio::task::block_in_place(|| {
@@ -4698,6 +4855,64 @@ fn ensure_nav_indexes(
     nav_session.ledger.set_index(id);
 }
 
+struct SemanticIndexWarmup {
+    handle: tokio::task::JoinHandle<usize>,
+    job: BackgroundJob,
+}
+
+/// Iteration #4 of bug/steering-regressions: embedding the gathered corpus
+/// through the in-process CPU embedder ran SYNCHRONOUSLY inside the first
+/// agentic turn (`block_on(index_files…)`) — observed live as 40–80 minutes at
+/// ~6.5 cores with the session apparently wedged between a tool result and the
+/// next dispatch. Same defect class as the navigator warm-up join (iteration
+/// #3), one layer down. Indexing now runs as a background task; retrieval
+/// rides the lexical floor until the index is ready. Never trade turn
+/// liveness for index completeness.
+fn spawn_semantic_indexing(
+    rt: &tokio::runtime::Handle,
+    files: Vec<(String, String)>,
+    embedder: std::sync::Arc<dyn newt_core::Embedder>,
+    index: std::sync::Arc<newt_core::SessionSemanticIndex>,
+    on_failure: newt_core::OnEmbedFailure,
+) -> SemanticIndexWarmup {
+    let job = BackgroundJob::start("embedding repository for semantic retrieval");
+    let completion = job.completion_guard();
+    // Iteration #8: the embedded candle engine's forwards are SYNCHRONOUS
+    // compute. Run on a plain async task they poll-block the runtime workers
+    // themselves — observed live as total executor starvation (frozen pane,
+    // zero network, every rt-worker pegged) MINUTES after iteration #4 moved
+    // this off the turn. spawn_blocking confines the drive to one parked
+    // blocking-pool thread; candle's internal parallelism is unaffected and
+    // the async runtime stays responsive.
+    let inner = rt.clone();
+    let handle = rt.spawn_blocking(move || {
+        let _completion = completion;
+        inner.block_on(newt_core::index_files(
+            &files,
+            embedder.as_ref(),
+            index.as_ref(),
+            on_failure,
+        ))
+    });
+    SemanticIndexWarmup { handle, job }
+}
+
+/// Adopt a FINISHED semantic-indexing warm-up (never blocks): returns the
+/// chunk count once, for the completion notice. A still-running build is left
+/// running; a panicked/aborted build is consumed silently (the lexical floor
+/// already covers the gap).
+fn poll_semantic_indexing(
+    rt: &tokio::runtime::Handle,
+    warmup: &mut Option<SemanticIndexWarmup>,
+) -> Option<usize> {
+    let pending = warmup.take()?;
+    if !pending.handle.is_finished() {
+        *warmup = Some(pending);
+        return None;
+    }
+    tokio::task::block_in_place(|| rt.block_on(pending.handle)).ok()
+}
+
 type NavWarmupOutput = (Option<newt_core::WhereIsIndex>, newt_core::NavigatorSession);
 
 struct NavWarmup {
@@ -4732,17 +4947,31 @@ fn spawn_nav_warmup(
     NavWarmup { handle, job }
 }
 
+/// Adopt the background navigator warm-up ONLY if it has already finished.
+///
+/// bug/steering-regressions iteration #3: this used to `block_on` the join,
+/// so the turn stalled for as long as the index build ran — observed live
+/// twice (2026-07-27): 40+ minutes at ~6 cores on a corpus-heavy workspace,
+/// the session apparently wedged (no output, no inference, no tool calls).
+/// The navigator's own contract already degrades honestly without an index
+/// (regex floor, `complete=false`), so a still-running warm-up now simply
+/// keeps running: this turn uses the floor and a later turn adopts the
+/// finished index. Never trade turn liveness for index completeness.
 fn finish_nav_warmup(
     rt: &tokio::runtime::Handle,
     warmup: &mut Option<NavWarmup>,
     where_is: &mut Option<newt_core::WhereIsIndex>,
     nav: &mut newt_core::NavigatorSession,
 ) {
-    let Some(warmup) = warmup.take() else {
+    let Some(pending) = warmup.take() else {
         return;
     };
+    if !pending.handle.is_finished() {
+        *warmup = Some(pending);
+        return;
+    }
     if let Ok((warmed_where_is, warmed_nav)) =
-        tokio::task::block_in_place(|| rt.block_on(warmup.handle))
+        tokio::task::block_in_place(|| rt.block_on(pending.handle))
     {
         *where_is = warmed_where_is;
         *nav = warmed_nav;
@@ -4975,9 +5204,18 @@ mod prompt_ingress_tests {
         let mut where_is = None;
         let mut nav = newt_core::NavigatorSession::default();
 
+        // Iteration #3 contract: adoption happens only once the build is done —
+        // wait for readiness (bounded), then adopt. A still-running warm-up is
+        // covered by `unfinished_warmup_is_left_running_and_the_turn_degrades`.
+        for _ in 0..200 {
+            if warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
 
-        assert!(warmup.is_none());
+        assert!(warmup.is_none(), "a finished warm-up must be adopted");
         assert!(
             !job.is_running(),
             "joining the warm-up must clear its generic liveness indicator"
@@ -4988,6 +5226,118 @@ mod prompt_ingress_tests {
             "the joined navigator must contain the real source file"
         );
         assert!(nav.usage.is_some() && nav.graph.is_some());
+    }
+
+    /// bug/steering-regressions iteration #4 (live wedge #3, 2026-07-27): the
+    /// first agentic turn block_on-joined `index_files` over the gathered
+    /// corpus through the in-process CPU embedder — 40–80 minutes at ~6.5
+    /// cores, the session frozen between a tool result and the next dispatch.
+    /// Spawning must return promptly, leave the build running, and adopt only
+    /// once finished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn semantic_indexing_never_blocks_the_turn() {
+        struct GatedEmbedder(std::sync::Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl newt_core::Embedder for GatedEmbedder {
+            async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                // Hold the "model forward" open until the test releases it.
+                self.0.notified().await;
+                Ok(vec![1.0, 0.0])
+            }
+        }
+        let rt = tokio::runtime::Handle::current();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let embedder: std::sync::Arc<dyn newt_core::Embedder> =
+            std::sync::Arc::new(GatedEmbedder(std::sync::Arc::clone(&release)));
+        let index = std::sync::Arc::new(newt_core::SessionSemanticIndex::default());
+        let files = vec![("main.rs".to_string(), "pub fn f() {}".to_string())];
+
+        let started = std::time::Instant::now();
+        let mut warmup = Some(spawn_semantic_indexing(
+            &rt,
+            files,
+            embedder,
+            std::sync::Arc::clone(&index),
+            newt_core::OnEmbedFailure::default(),
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "spawning the embed must never block the turn"
+        );
+        assert!(
+            poll_semantic_indexing(&rt, &mut warmup).is_none(),
+            "an unfinished embed is never joined"
+        );
+        assert!(warmup.is_some(), "the running embed is left running");
+        {
+            use newt_core::SemanticIndex as _;
+            assert_eq!(index.chunks_indexed(), 0, "nothing adopted early");
+        }
+
+        // Release the gated forward; the build finishes and a later poll
+        // adopts it.
+        release.notify_waiters();
+        for _ in 0..200 {
+            if warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
+                break;
+            }
+            release.notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let adopted = poll_semantic_indexing(&rt, &mut warmup);
+        assert!(warmup.is_none(), "a finished embed is consumed");
+        assert!(
+            adopted.is_some_and(|n| n >= 1),
+            "the finished embed reports its chunk count, got {adopted:?}"
+        );
+    }
+
+    /// bug/steering-regressions iteration #3 (live wedges 2026-07-27): the
+    /// turn must NEVER block on a still-running index warm-up. Two live
+    /// sessions sat 40+ minutes at ~6 cores — no output, no inference —
+    /// because the consumer `block_on`-joined an unbounded build. A
+    /// still-running warm-up stays running; adoption happens on a later turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfinished_warmup_is_left_running_and_the_turn_degrades() {
+        let rt = tokio::runtime::Handle::current();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let job = BackgroundJob::start("indexing repository");
+        let completion = job.completion_guard();
+        let handle = rt.spawn_blocking(move || {
+            let _completion = completion;
+            // Hold the "build" open until the test releases it.
+            let _ = gate.recv();
+            (None, newt_core::NavigatorSession::default())
+        });
+        let mut warmup = Some(NavWarmup { handle, job });
+        let mut where_is = None;
+        let mut nav = newt_core::NavigatorSession::default();
+
+        let started = std::time::Instant::now();
+        finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "finish must return promptly, never join an unfinished build"
+        );
+        assert!(
+            warmup.is_some(),
+            "a still-running warm-up must be left running for a later turn"
+        );
+        assert!(
+            where_is.is_none(),
+            "nothing adopted from an unfinished build"
+        );
+
+        // Release the build; a later turn adopts it.
+        release.send(()).unwrap();
+        for _ in 0..200 {
+            if warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
+        assert!(warmup.is_none(), "the finished build is adopted next turn");
     }
 
     fn prompt_store() -> (tempfile::TempDir, newt_core::ConversationStore, String) {

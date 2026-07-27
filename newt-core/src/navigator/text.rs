@@ -24,6 +24,24 @@ pub struct TextHit {
 /// Regex search under `root`, returned as a [`NavResult`] with `[LEXICAL]` labels.
 #[must_use]
 pub fn text_search(query: &str, root: &Path, index_id: &str) -> NavResult {
+    text_search_scoped(query, root, None, index_id)
+}
+
+/// [`text_search`] with an optional workspace-relative `scope` (a file or a
+/// directory). bug/steering-regressions iteration #6: the model narrows a
+/// noisy search with `path` and the tool used to DROP the argument silently —
+/// returning whole-workspace hits (tracked eval corpora included) against an
+/// explicitly file-scoped query, then feeding the bait loop iteration #5
+/// tagged. A scope is honored, fenced inside the workspace, and a missing or
+/// escaping scope is an honest warning — never a silent widen.
+#[must_use]
+pub fn text_search_scoped(
+    query: &str,
+    workspace: &Path,
+    scope: Option<&str>,
+    index_id: &str,
+) -> NavResult {
+    let root = workspace;
     let mut result = NavResult::empty(EvidenceKind::Lexical, "lexical-regex", index_id);
     let q = query.trim();
     if q.is_empty() {
@@ -41,8 +59,49 @@ pub fn text_search(query: &str, root: &Path, index_id: &str) -> NavResult {
             return result;
         }
     };
+    let scope = scope.map(str::trim).filter(|p| !p.is_empty());
+    let search_root = match scope {
+        Some(p)
+            if Path::new(p).is_absolute()
+                || Path::new(p)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+        {
+            result.complete = false;
+            result.warnings.push(format!(
+                "scope `{p}` must be a workspace-relative path without `..`"
+            ));
+            return result;
+        }
+        Some(p) => {
+            let scoped = root.join(p);
+            if !scoped.exists() {
+                // Iteration #7: this is a COMPLETE answer — the path is
+                // definitively absent. Leaving `complete=false` here appended
+                // the generic "do not treat misses as proof of absence" note,
+                // and the harness contradicting its own verdict sent a local
+                // model into a retry loop on the same phantom file (live,
+                // 2026-07-27). Absence of the scope IS proof of absence.
+                result.complete = true;
+                result.warnings.push(format!(
+                    "scope `{p}` does not exist in this workspace — this is \
+                     definitive: there is no such file or directory. Do not \
+                     search for it again; re-check where the name came from \
+                     (quoted fixture text is not code)."
+                ));
+                return result;
+            }
+            scoped
+        }
+        None => root.to_path_buf(),
+    };
     let mut hits = Vec::new();
-    if let Err(e) = search_dir(root, root, &re, &mut hits) {
+    let searched = if search_root.is_file() {
+        search_file(root, &search_root, &re, &mut hits)
+    } else {
+        search_dir(root, &search_root, &re, &mut hits)
+    };
+    if let Err(e) = searched {
         result.complete = false;
         result.warnings.push(format!("search error: {e}"));
     }
@@ -53,7 +112,19 @@ pub fn text_search(query: &str, root: &Path, index_id: &str) -> NavResult {
             .warnings
             .push(format!("hit cap {MAX_HITS} reached — results truncated"));
     }
+    // bug/steering-regressions iteration #5: matches that live INSIDE string
+    // literals are quoted message/fixture text, not code. Untagged, they bait
+    // the model into chasing phantom files/symbols quoted by test fixtures
+    // (every live drive orbited `help_sections.rs` this way). Tag each such
+    // hit, and when an identifier-shaped query matches ONLY quoted text, say
+    // so as a first-class verdict.
+    let mut quoted_only_hits = 0usize;
+    let total_hits = hits.len();
     for h in hits {
+        let quoted = matches_only_inside_string_literals(&re, &h.line);
+        if quoted {
+            quoted_only_hits += 1;
+        }
         result.hits.push(NavHit {
             path: h.path,
             start_line: h.line_number,
@@ -61,10 +132,61 @@ pub fn text_search(query: &str, root: &Path, index_id: &str) -> NavResult {
             kind: EvidenceKind::Lexical,
             snippet: h.line,
             symbol: None,
-            detail: Some("text".into()),
+            detail: Some(if quoted {
+                "text (inside a string literal — quoted text, not code)".into()
+            } else {
+                "text".into()
+            }),
         });
     }
+    let identifier_query = q.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && q.chars().next().is_some_and(|c| !c.is_ascii_digit());
+    if identifier_query && total_hits > 0 && quoted_only_hits == total_hits {
+        result.warnings.push(format!(
+            "every match for `{q}` is inside string literals — quoted \
+             message/fixture text, not code. `{q}` has NO code occurrence in \
+             this workspace; do not treat quoted paths or symbols as real."
+        ));
+    }
     result
+}
+
+/// Does every `re` match on `line` fall inside a double-quoted string
+/// literal? A cheap, language-agnostic heuristic (no parser): track `"…"`
+/// spans honoring backslash escapes. Raw/multi-line strings whose quotes are
+/// on other lines are NOT detected — the heuristic errs toward "code", which
+/// is today's behavior, never toward hiding real code.
+fn matches_only_inside_string_literals(re: &Regex, line: &str) -> bool {
+    // Build the in-string byte spans for this line.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => match start.take() {
+                Some(s) => spans.push((s, idx)),
+                None => start = Some(idx + ch.len_utf8()),
+            },
+            _ => {}
+        }
+    }
+    if spans.is_empty() {
+        return false;
+    }
+    let mut any = false;
+    for m in re.find_iter(line) {
+        any = true;
+        let inside = spans.iter().any(|&(s, e)| m.start() >= s && m.end() <= e);
+        if !inside {
+            return false;
+        }
+    }
+    any
 }
 
 fn search_dir(root: &Path, dir: &Path, re: &Regex, hits: &mut Vec<TextHit>) -> anyhow::Result<()> {
@@ -143,6 +265,119 @@ mod tests {
         assert_eq!(r.kind, EvidenceKind::Lexical);
         assert!(!r.hits.is_empty());
         assert!(r.render().contains("[LEXICAL]"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// bug/steering-regressions iteration #5: fixture strings quoting phantom
+    /// files/symbols must be tagged as quoted text, and an identifier query
+    /// with ONLY quoted matches gets an explicit no-code-occurrence verdict —
+    /// otherwise the model grounds its plan on bait (every live drive chased
+    /// `help_sections.rs` out of a quoted compiler error).
+    #[test]
+    fn quoted_only_identifier_matches_get_a_no_code_occurrence_verdict() {
+        let dir = std::env::temp_dir().join(format!(
+            "newt-text-quoted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("fixture.rs"),
+            "fn t() { assert!(msg.contains(\"PHANTOM_TOKEN missing\"), \"{msg}\"); }\n",
+        )
+        .unwrap();
+        let r = text_search("PHANTOM_TOKEN", &dir, "gen0");
+        assert!(!r.hits.is_empty());
+        assert!(
+            r.hits.iter().all(|h| h
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("string literal"))),
+            "quoted-only hits must be tagged: {:?}",
+            r.hits
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("NO code occurrence")),
+            "identifier query with only quoted matches needs the verdict: {:?}",
+            r.warnings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// bug/steering-regressions iteration #6: a `path` scope must be HONORED
+    /// (the tool silently dropped it, returning whole-workspace corpus noise
+    /// against a file-scoped query), and a missing scope is an honest warning,
+    /// never a silent whole-workspace fallback.
+    #[test]
+    fn scope_is_honored_and_missing_scope_is_an_honest_warning() {
+        let dir = std::env::temp_dir().join(format!(
+            "newt-text-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("corpus")).unwrap();
+        fs::write(dir.join("src/a.rs"), "fn wanted_here() {}\n").unwrap();
+        fs::write(dir.join("corpus/junk.txt"), "wanted_here in noise\n").unwrap();
+
+        // Directory scope: only src/ hits.
+        let r = text_search_scoped("wanted_here", &dir, Some("src"), "gen0");
+        assert!(
+            r.hits.iter().all(|h| h.path.starts_with("src/")),
+            "{:?}",
+            r.hits
+        );
+        // File scope: exactly the one file, path still workspace-relative.
+        let r = text_search_scoped("wanted_here", &dir, Some("src/a.rs"), "gen0");
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].path, "src/a.rs");
+        // Missing scope: a DEFINITIVE answer (complete=true so the generic
+        // "do not treat misses as proof of absence" note cannot contradict
+        // the verdict), no silent widen.
+        let r = text_search_scoped("wanted_here", &dir, Some("no/such/dir"), "gen0");
+        assert!(r.hits.is_empty());
+        assert!(r.complete, "a nonexistent scope is a definitive answer");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("definitive")),
+            "{:?}",
+            r.warnings
+        );
+        // Escape attempts are refused.
+        let r = text_search_scoped("wanted_here", &dir, Some("../elsewhere"), "gen0");
+        assert!(!r.complete && r.hits.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_code_matches_are_not_tagged_as_quoted() {
+        let dir = std::env::temp_dir().join(format!(
+            "newt-text-code-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        // The symbol appears BOTH in code and in a string on another line:
+        // the code hit stays untagged and no verdict fires.
+        fs::write(
+            dir.join("real.rs"),
+            "const REAL_TOKEN: usize = 1;\nfn t() { assert!(m.contains(\"REAL_TOKEN\")); }\n",
+        )
+        .unwrap();
+        let r = text_search("REAL_TOKEN", &dir, "gen0");
+        assert!(r.hits.iter().any(|h| h.detail.as_deref() == Some("text")));
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("NO code occurrence")),
+            "a real code occurrence must never trigger the quoted-only verdict"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

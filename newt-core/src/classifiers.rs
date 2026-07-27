@@ -621,3 +621,96 @@ mod invites_action_tests {
         assert!(user_turn_invites_action(""));
     }
 }
+
+/// Phrase table for [`is_bare_continuation`]: operator nudges that carry no
+/// objective of their own. Knowledge is data (three Cs) — extend here, not in
+/// logic. Deliberately conservative: ambiguous acknowledgments ("ok", "good")
+/// are NOT continuations; a fresh prompt is always the safe default.
+const BARE_CONTINUATION_PHRASES: &[&str] = &[
+    "continue",
+    "please continue",
+    "continue please",
+    "yes continue",
+    "keep going",
+    "go on",
+    "carry on",
+    "resume",
+    "proceed",
+    "go ahead",
+    "next",
+    "finish",
+    "finish up",
+    "keep at it",
+    "don't stop",
+    "onward",
+];
+
+/// Is this operator input a BARE continuation — a nudge like "continue" /
+/// "keep going" / "1: proceed" that carries no objective of its own?
+///
+/// bug/steering-regressions iteration #2: when a round cap interrupts an
+/// objective mid-flight, the operator's natural reply is a bare nudge. Minting
+/// that nudge as a FRESH prompt makes it the active operator prompt — the
+/// compression-immune card then protects the word "continue" while the real
+/// task drifts into the summarizable middle (observed live 2026-07-27: the
+/// agent re-read an 11.7k-line file from line 1 with zero goal). Chat re-links
+/// a bare continuation to the interrupted objective's lineage instead, so
+/// fix #1's authority walk keeps the REAL task active.
+///
+/// Conservative by construction: multi-line input, anything longer than a
+/// short nudge, or any phrase not in the table is NOT a continuation — a
+/// substantive new ask must never be silently chained to a stale objective.
+/// A leading decision ordinal ("1: proceed", "2. continue") is stripped so
+/// decision-surface replies match.
+pub fn is_bare_continuation(input: &str) -> bool {
+    let t = input.trim();
+    if t.is_empty() || t.contains('\n') || t.chars().count() > 48 {
+        return false;
+    }
+    let t = t.trim_end_matches(['.', '!', '…', ' ']).to_lowercase();
+    // Strip one leading decision ordinal: "1:", "2.", "3)" — the shape the
+    // decision-surface asks for ("reply using an explicit ordinal").
+    let t = match t.split_once([':', '.', ')']) {
+        Some((head, rest)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
+            rest.trim().to_string()
+        }
+        _ => t,
+    };
+    BARE_CONTINUATION_PHRASES.iter().any(|p| *p == t)
+}
+
+#[cfg(test)]
+mod bare_continuation_tests {
+    use super::is_bare_continuation;
+
+    #[test]
+    fn bare_nudges_match() {
+        for input in [
+            "continue",
+            "Continue.",
+            "  keep going  ",
+            "go ahead!",
+            "resume",
+            "1: proceed",
+            "2. continue",
+            "don't stop",
+        ] {
+            assert!(is_bare_continuation(input), "{input:?} must link");
+        }
+    }
+
+    #[test]
+    fn substantive_or_ambiguous_input_stays_fresh() {
+        for input in [
+            "",
+            "ok",
+            "thanks",
+            "continue with the newt-tui refactor instead",
+            "extract the next largest module and open a PR",
+            "continue\nand also fix the tests",
+            "proceed to delete the production database",
+        ] {
+            assert!(!is_bare_continuation(input), "{input:?} must stay fresh");
+        }
+    }
+}

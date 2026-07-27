@@ -10,8 +10,8 @@ use crate::where_is::WhereIsIndex;
 
 use super::{
     find_callees, find_callers, find_hierarchy, find_implementations, find_references, find_tests,
-    goto_definition, impact_analysis, inspect_type, text_search, GotoDefinitionArgs, GraphIndex,
-    NavResult, UsageIndex,
+    goto_definition, impact_analysis, inspect_type, GotoDefinitionArgs, GraphIndex, NavResult,
+    UsageIndex,
 };
 
 /// Tool names registered for navigation (#1387).
@@ -57,12 +57,21 @@ pub fn goto_definition_tool_definition() -> serde_json::Value {
 
 #[must_use]
 pub fn text_search_tool_definition() -> serde_json::Value {
-    tool(
-        "text_search",
-        "Lexical regex search across the workspace ([LEXICAL]). Use for exact strings/patterns; use code_search for meaning.",
-        "query",
-        "Regex pattern to search for",
-    )
+    json!({
+        "type": "function",
+        "function": {
+            "name": "text_search",
+            "description": "Lexical regex search across the workspace ([LEXICAL]). Use for exact strings/patterns; use code_search for meaning. Scope with `path` to cut noise — hits inside string literals are tagged as quoted text, not code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Regex pattern to search for" },
+                    "path": { "type": "string", "description": "Optional workspace-relative file or directory to scope the search (e.g. 'newt-core/src' or 'src/lib.rs'). Omit for the whole workspace." }
+                },
+                "required": ["query"]
+            }
+        }
+    })
 }
 
 #[must_use]
@@ -200,7 +209,14 @@ pub fn execute_nav_tool(
         }
         "text_search" => {
             let query = args["query"].as_str().unwrap_or("").trim();
-            text_search(query, std::path::Path::new(ctx.workspace), &id)
+            // Iteration #6: honor the model's `path` scope (fenced; honest
+            // warning when missing) instead of silently searching everything.
+            super::text::text_search_scoped(
+                query,
+                std::path::Path::new(ctx.workspace),
+                args["path"].as_str(),
+                &id,
+            )
         }
         "find_references" => {
             let symbol = args["symbol"].as_str().unwrap_or("").trim();
