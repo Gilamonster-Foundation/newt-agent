@@ -396,16 +396,21 @@ impl PromptIntake {
                 "harness_action: answer without mutation; bounded read/recovery tools only"
             }
             PromptDisposition::Research => {
-                "harness_action: gather bounded read-only evidence with the advertised tools \
-                 (for top-N CODE file line/size rankings: find with code=true + sort=lines|size \
-                 + show_lines|show_size; present as a GFM Markdown table); do not mutate or \
-                 request capability grants"
+                "harness_action: gather bounded read-only evidence; do not mutate or request capability grants"
             }
             PromptDisposition::Plan => {
                 "harness_action: read evidence and maintain the harness plan ledger only; do not mutate the workspace, execute commands, or request capability grants"
             }
         };
-        format!(
+        let prompt = self
+            .manifest
+            .atomic_asks
+            .iter()
+            .map(AtomicAsk::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let refinement = request_refinement_model_card(&prompt);
+        let mut card = format!(
             "{PROMPT_COMPREHENSION_MODEL_CARD_PREFIX}\n\
              disposition: {}\n\
              atomic_ask_count: {}\n\
@@ -416,7 +421,12 @@ impl PromptIntake {
             self.disposition.as_str(),
             self.manifest.atomic_asks.len(),
             self.manifest.decisions.len(),
-        )
+        );
+        if !refinement.is_empty() {
+            card.push('\n');
+            card.push_str(&refinement);
+        }
+        card
     }
 
     /// Exact persistence projection for a bodyless `Decision` artifact. The
@@ -558,6 +568,55 @@ fn strip_list_marker(line: &str) -> &str {
         }
     }
     line
+}
+
+/// Prompt-specific refinements layered over the standing response/repository
+/// policy in the protected active-prompt card. Keep this narrow: general
+/// Markdown shape and source-first evidence belong to the harness policy, not
+/// an incident-derived prompt lexicon.
+fn request_refinement_model_card(prompt: &str) -> String {
+    let lower = prompt.to_ascii_lowercase();
+    let packs = crate::api_surface::builtin_packs();
+    let language = crate::api_surface::detect_source_language(prompt, &packs);
+    let contains = |needle| crate::api_surface::contains_bounded_ascii(&lower, needle);
+    let names_source_files = ["code file", "code files", "source file", "source files"]
+        .iter()
+        .any(|needle| contains(needle));
+    let names_language_files = language.is_some()
+        && ["file", "files", "script", "scripts"]
+            .iter()
+            .any(|needle| contains(needle));
+    let source_files = names_source_files || names_language_files;
+
+    let mut lines = Vec::new();
+    if contains("table") {
+        lines.push("response_shape: table".to_string());
+    }
+
+    if source_files {
+        lines.push("evidence_scope: source_files".to_string());
+        match language {
+            Some(pack) => {
+                if let Ok(extensions) =
+                    crate::api_surface::source_extensions_for(&packs, Some(&pack.name))
+                {
+                    lines.push(format!("source_extensions: {}", extensions.join(",")));
+                }
+                lines.push(format!(
+                    "source_filter: category=source language={}",
+                    pack.name
+                ));
+            }
+            None => lines.push("source_filter: category=source".to_string()),
+        }
+        lines.push(
+            "scope_instruction: code/source means registered language source files only; \
+             exclude documentation, manifests, lockfiles, and other repository metadata \
+             from the primary evidence set"
+                .to_string(),
+        );
+    }
+    lines.join("\n")
 }
 
 /// The pure-data needle table driving [`infer_disposition`] (#1260, three-Cs):
@@ -851,22 +910,6 @@ mod tests {
     }
 
     #[test]
-    fn research_model_card_steers_code_rankings_and_gfm_tables() {
-        let card = PromptIntake::analyze(
-            "show me the 10 code files with the highest line counts in this repository?",
-        )
-        .model_card();
-        assert!(
-            card.contains("disposition: research"),
-            "line-count code question → Research: {card}"
-        );
-        assert!(
-            card.contains("code=true") && card.contains("Markdown table"),
-            "Research card must teach find code=true + GFM table: {card}"
-        );
-    }
-
-    #[test]
     fn empty_headless_input_is_a_bounded_ask_not_act() {
         let empty = PromptIntake::analyze("   \n");
         assert_eq!(empty.disposition(), PromptDisposition::Ask);
@@ -1151,6 +1194,75 @@ mod tests {
                 "line-count evidence phrasing → Research: {prompt:?}"
             );
         }
+    }
+
+    #[test]
+    fn code_file_prompt_adds_source_scope_without_incident_specific_shape_guessing() {
+        let intake = PromptIntake::analyze(
+            "show me the 10 code files with the highest line counts in this repository?",
+        );
+        let card = intake.model_card();
+
+        assert!(
+            !card.contains("response_shape:"),
+            "line-count/ranking keywords must not own presentation policy: {card}"
+        );
+        assert!(
+            card.contains("evidence_scope: source_files"),
+            "`code files` means language source, not every repository file: {card}"
+        );
+        assert!(
+            card.contains("source_filter: category=source"),
+            "an unqualified code-file request must use the harness-owned source category: {card}"
+        );
+        assert!(
+            card.contains("exclude documentation, manifests, lockfiles"),
+            "the steering must name the observed false-positive classes: {card}"
+        );
+        assert!(
+            !card.contains("highest")
+                && !card.contains("longest")
+                && !card.contains("most lines")
+                && !card.contains("line/size rankings")
+                && !card.contains("code=true"),
+            "the model card must carry a general source refinement, not an incident lexicon: {card}"
+        );
+    }
+
+    #[test]
+    fn explicit_rust_table_prompt_steers_rs_filter_and_gfm_table() {
+        let intake = PromptIntake::analyze(
+            "can you give me a table of the rust files with the longest line counts instead?",
+        );
+        let card = intake.model_card();
+
+        assert!(card.contains("response_shape: table"), "{card}");
+        assert!(card.contains("evidence_scope: source_files"), "{card}");
+        assert!(
+            card.contains("source_extensions: rs"),
+            "Rust must resolve through the language-pack data to its source extension: {card}"
+        );
+        assert!(
+            card.contains("source_filter: category=source language=rust"),
+            "the model needs the concrete harness filter, not just a language label: {card}"
+        );
+    }
+
+    #[test]
+    fn ordinary_prompt_gets_no_incident_specific_refinement() {
+        let card = PromptIntake::analyze("explain ownership briefly").model_card();
+
+        assert!(!card.contains("response_format:"), "{card}");
+        assert!(!card.contains("response_shape:"), "{card}");
+        assert!(!card.contains("evidence_scope:"), "{card}");
+        assert!(!card.contains("source_filter:"), "{card}");
+
+        let comfortable =
+            PromptIntake::analyze("make this interface more comfortable").model_card();
+        assert!(
+            !comfortable.contains("response_shape:"),
+            "presentation inference must not match `table` inside another word: {comfortable}"
+        );
     }
 
     #[test]

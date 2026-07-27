@@ -5,7 +5,8 @@
 //! extensions, entry-point file globs, and regex symbol-extraction rules with
 //! free-form kind labels. So adding a language is *config, not code*.
 //!
-//! - **Built-in packs** (first-class): Rust, Python, Bash, C/C++, Go, Java —
+//! - **Built-in packs** (first-class): common source languages, including Rust,
+//!   Python, Bash, C/C++, C#, Go, Java, Ruby, and TypeScript —
 //!   see [`builtin_packs`]. They double as the canonical examples.
 //! - **External packs**: drop a `<name>.toml` into `~/.newt/language-packs/`
 //!   (global) or `.newt/language-packs/` (project-local), or inline under
@@ -51,6 +52,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
     vec![
         LanguagePack {
             name: "rust".into(),
+            aliases: vec!["rust".into(), "rs".into()],
             extensions: vec!["rs".into()],
             entry_points: vec!["lib.rs".into(), "mod.rs".into(), "main.rs".into()],
             symbols: vec![
@@ -66,6 +68,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
         },
         LanguagePack {
             name: "python".into(),
+            aliases: vec!["python".into(), "python3".into(), "py".into()],
             extensions: vec!["py".into()],
             entry_points: vec!["__init__.py".into(), "__main__.py".into()],
             // Module-level (column 0), public (non-`_`) names.
@@ -76,6 +79,12 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
         },
         LanguagePack {
             name: "bash".into(),
+            aliases: vec![
+                "bash".into(),
+                "shell".into(),
+                "shell script".into(),
+                "sh".into(),
+            ],
             extensions: vec!["sh".into(), "bash".into()],
             entry_points: vec![],
             symbols: vec![
@@ -85,6 +94,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
         },
         LanguagePack {
             name: "c_cpp".into(),
+            aliases: vec!["c".into(), "c++".into(), "c/c++".into(), "cpp".into()],
             extensions: vec![
                 "c".into(),
                 "cc".into(),
@@ -106,7 +116,32 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            name: "csharp".into(),
+            aliases: vec![
+                "c#".into(),
+                "csharp".into(),
+                "c sharp".into(),
+                "dotnet".into(),
+                ".net".into(),
+            ],
+            extensions: vec!["cs".into()],
+            entry_points: vec![],
+            symbols: vec![
+                rule(
+                    r"^\s*public\s+(?:abstract\s+|sealed\s+|static\s+|partial\s+)*class\s+(\w+)",
+                    "class",
+                ),
+                rule(
+                    r"^\s*public\s+(?:partial\s+)?interface\s+(\w+)",
+                    "interface",
+                ),
+                rule(r"^\s*public\s+(?:readonly\s+)?struct\s+(\w+)", "struct"),
+                rule(r"^\s*public\s+(?:class\s+)?enum\s+(\w+)", "enum"),
+            ],
+        },
+        LanguagePack {
             name: "go".into(),
+            aliases: vec!["go".into(), "golang".into()],
             extensions: vec!["go".into()],
             entry_points: vec!["doc.go".into()],
             // Go exports = capitalized identifiers.
@@ -119,6 +154,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
         },
         LanguagePack {
             name: "java".into(),
+            aliases: vec!["java".into()],
             extensions: vec!["java".into()],
             entry_points: vec!["package-info.java".into()],
             symbols: vec![
@@ -137,10 +173,22 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
                 ),
             ],
         },
+        LanguagePack {
+            name: "ruby".into(),
+            aliases: vec!["ruby".into(), "rb".into()],
+            extensions: vec!["rb".into()],
+            entry_points: vec!["*.rb".into()],
+            symbols: vec![
+                rule(r"^\s*def\s+([a-z_]\w*[!?]?)", "method"),
+                rule(r"^\s*class\s+(\w+)", "class"),
+                rule(r"^\s*module\s+(\w+)", "module"),
+            ],
+        },
         // Dart + TypeScript: the symbol side of the project packs the "IDE for
         // LLMs" ships out of the box (#1288). Regex is the bootstrap (AST later).
         LanguagePack {
             name: "dart".into(),
+            aliases: vec!["dart".into()],
             extensions: vec!["dart".into()],
             entry_points: vec!["lib.dart".into()],
             // Top-level (column 0) public (non-`_`) declarations.
@@ -153,6 +201,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
         },
         LanguagePack {
             name: "typescript".into(),
+            aliases: vec!["typescript".into(), "type script".into(), "ts".into()],
             extensions: vec!["ts".into(), "tsx".into()],
             entry_points: vec!["index.ts".into(), "*.d.ts".into()],
             // Exported declarations are the public surface.
@@ -198,11 +247,9 @@ pub fn load_packs_from_dir(dir: &Path) -> Vec<LanguagePack> {
 
 /// Sorted unique file extensions from language packs (no leading dots).
 ///
-/// Shared allowlist for "what counts as code":
-/// - [`gather_code_files`] / nav session build (`ensure_nav_indexes`)
-/// - `find` with `code: true` (top-N line/size rankings of *code* files)
-/// - a future warm-up inventory can reuse the same list without inventing a
-///   second definition of "code"
+/// Compatibility projection of the language-pack registry for callers that
+/// need the complete extension set. Repository evidence tools should prefer
+/// [`source_extensions_for`] so they can also honor language names and aliases.
 #[must_use]
 pub fn code_file_extensions(packs: &[LanguagePack]) -> Vec<String> {
     let mut exts: Vec<String> = packs
@@ -251,6 +298,111 @@ pub fn merge_packs(layers: Vec<Vec<LanguagePack>>) -> Vec<LanguagePack> {
         .into_iter()
         .filter_map(|n| by_name.remove(&n))
         .collect()
+}
+
+/// Resolve the canonical language-pack registry for `workspace`.
+///
+/// This is the harness-owned definition of a source/code file: built-ins,
+/// global drop-ins, project drop-ins, then inline config, merged by pack name.
+/// Inventory tools and semantic/API surfaces use this same registry so "code"
+/// cannot drift into a separate hardcoded extension list.
+#[must_use]
+pub fn resolve_language_packs(workspace: &Path, cfg: &ApiSurfaceConfig) -> Vec<LanguagePack> {
+    let global = crate::Config::user_config_path()
+        .map(|path| path.with_file_name("language-packs"))
+        .map(|dir| load_packs_from_dir(&dir))
+        .unwrap_or_default();
+    let project = load_packs_from_dir(&workspace.join(".newt").join("language-packs"));
+    merge_packs(vec![
+        builtin_packs(),
+        global,
+        project,
+        cfg.language_packs.clone(),
+    ])
+}
+
+fn language_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn language_pack_matches(pack: &LanguagePack, language: &str) -> bool {
+    let wanted = language_key(language);
+    language_key(&pack.name) == wanted
+        || pack
+            .aliases
+            .iter()
+            .any(|alias| language_key(alias) == wanted)
+}
+
+/// Return the registered source extensions, optionally narrowed to a language
+/// name or human alias. Order follows pack/extension data and duplicates are
+/// removed, making the result stable and suitable for both tool filtering and
+/// model steering.
+pub fn source_extensions_for(
+    packs: &[LanguagePack],
+    language: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let matching = packs
+        .iter()
+        .filter(|pack| language.is_none_or(|value| language_pack_matches(pack, value)))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Err(format!(
+            "unknown source language {:?}; configure a language pack alias or use category=source",
+            language.unwrap_or("")
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut extensions = Vec::new();
+    for extension in matching.into_iter().flat_map(|pack| pack.extensions.iter()) {
+        let extension = extension
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if !extension.is_empty() && seen.insert(extension.clone()) {
+            extensions.push(extension);
+        }
+    }
+    Ok(extensions)
+}
+
+pub(crate) fn contains_bounded_ascii(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.match_indices(needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before = haystack[..start].bytes().next_back();
+        let after = haystack[end..].bytes().next();
+        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        before.is_none_or(|byte| !word(byte)) && after.is_none_or(|byte| !word(byte))
+    })
+}
+
+/// Detect a language named in operator prose using only registered pack data.
+///
+/// Longest alias wins, so `C++` and `C#` beat the shorter `C` alias. Matching
+/// is bounded at ASCII word edges to keep short aliases such as `go` and `rs`
+/// from firing inside unrelated words.
+#[must_use]
+pub fn detect_source_language<'a>(
+    prompt: &str,
+    packs: &'a [LanguagePack],
+) -> Option<&'a LanguagePack> {
+    let prompt = prompt.to_ascii_lowercase();
+    let mut candidates = packs
+        .iter()
+        .flat_map(|pack| {
+            std::iter::once(pack.name.as_str())
+                .chain(pack.aliases.iter().map(String::as_str))
+                .map(move |alias| (alias, pack))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(alias, _)| std::cmp::Reverse(alias.len()));
+    candidates.into_iter().find_map(|(alias, pack)| {
+        contains_bounded_ascii(&prompt, &language_key(alias)).then_some(pack)
+    })
 }
 
 /// A [`LanguagePack`] with its symbol rules compiled. Invalid regexes are dropped
@@ -519,7 +671,17 @@ mod tests {
     #[test]
     fn builtins_cover_the_first_class_languages() {
         let names: Vec<String> = builtin_packs().into_iter().map(|p| p.name).collect();
-        for lang in ["rust", "python", "bash", "c_cpp", "go", "java"] {
+        for lang in [
+            "rust",
+            "python",
+            "bash",
+            "c_cpp",
+            "csharp",
+            "go",
+            "java",
+            "ruby",
+            "typescript",
+        ] {
             assert!(
                 names.contains(&lang.to_string()),
                 "missing built-in: {lang}"
@@ -528,19 +690,93 @@ mod tests {
     }
 
     #[test]
-    fn code_file_extensions_are_sorted_unique_pack_allowlist() {
-        let exts = code_file_extensions(&builtin_packs());
-        assert!(exts.contains(&"rs".into()));
-        assert!(exts.contains(&"py".into()));
-        assert!(exts.windows(2).all(|w| w[0] <= w[1]), "sorted: {exts:?}");
-        // Docs / lockfiles are NOT code — no extension match for them.
-        assert!(!path_is_code_file("AGENTS.md", &exts));
-        assert!(!path_is_code_file("CHANGELOG.md", &exts));
-        assert!(!path_is_code_file("Cargo.lock", &exts));
-        assert!(!path_is_code_file("LICENSE", &exts));
-        assert!(!path_is_code_file("README.md", &exts));
-        assert!(path_is_code_file("newt-core/src/lib.rs", &exts));
-        assert!(path_is_code_file("tools/Foo.RS", &exts), "case-insensitive");
+    fn source_language_registry_resolves_names_and_human_aliases() {
+        let packs = builtin_packs();
+        for (language, expected) in [
+            ("Rust", vec!["rs"]),
+            ("Python", vec!["py"]),
+            ("TypeScript", vec!["ts", "tsx"]),
+            ("Java", vec!["java"]),
+            (
+                "C++",
+                vec!["c", "cc", "cpp", "cxx", "h", "hpp", "hh", "hxx"],
+            ),
+            ("C#", vec!["cs"]),
+            ("Ruby", vec!["rb"]),
+            ("shell", vec!["sh", "bash"]),
+        ] {
+            assert_eq!(
+                source_extensions_for(&packs, Some(language)).unwrap(),
+                expected,
+                "language alias {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_source_registry_unions_every_pack_extension() {
+        let packs = builtin_packs();
+        let extensions = source_extensions_for(&packs, None).unwrap();
+
+        for extension in ["rs", "py", "ts", "java", "cpp", "cs", "rb", "sh"] {
+            assert!(
+                extensions.contains(&extension.to_string()),
+                "generic source category omitted .{extension}: {extensions:?}"
+            );
+        }
+        for non_source in ["md", "toml", "lock"] {
+            assert!(
+                !extensions.contains(&non_source.to_string()),
+                "repository metadata is not source code: {extensions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_language_detection_uses_pack_aliases_not_a_rust_special_case() {
+        let packs = builtin_packs();
+        for (prompt, expected) in [
+            ("the Rust files", "rust"),
+            ("Python source files", "python"),
+            ("a table of TypeScript files", "typescript"),
+            ("longest C++ files", "c_cpp"),
+            ("largest C# source files", "csharp"),
+            ("Ruby code files", "ruby"),
+            ("bash scripts", "bash"),
+        ] {
+            assert_eq!(
+                detect_source_language(prompt, &packs).map(|pack| pack.name.as_str()),
+                Some(expected),
+                "prompt={prompt:?}"
+            );
+        }
+        assert_eq!(detect_source_language("repository files", &packs), None);
+    }
+
+    /// Grounds the pure merge/alias tests above in a real project drop-in: the
+    /// harness source registry must learn a new code extension without a binary
+    /// change or a parallel hardcoded list.
+    #[test]
+    fn project_dropin_extends_harness_source_category() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let pack_dir = workspace.path().join(".newt/language-packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("zig.toml"),
+            "name = \"zig\"\n\
+             aliases = [\"zig\", \"ziglang\"]\n\
+             extensions = [\"zig\"]\n\
+             [[symbols]]\n\
+             pattern = '^pub fn (\\\\w+)'\n\
+             kind = \"fn\"\n",
+        )
+        .unwrap();
+
+        let packs = resolve_language_packs(workspace.path(), &ApiSurfaceConfig::default());
+        assert_eq!(
+            source_extensions_for(&packs, Some("ziglang")).unwrap(),
+            vec!["zig"]
+        );
     }
 
     #[test]
@@ -590,6 +826,7 @@ mod tests {
         // Simulate ingesting an external Ruby pack (what a drop-in file would do).
         let ruby = LanguagePack {
             name: "ruby".into(),
+            aliases: vec!["ruby".into(), "rb".into()],
             extensions: vec!["rb".into()],
             entry_points: vec!["*.rb".into()],
             symbols: vec![
@@ -608,6 +845,7 @@ mod tests {
         // A pack named "rust" replaces the built-in (here: also surface `fn` privates).
         let custom_rust = LanguagePack {
             name: "rust".into(),
+            aliases: vec!["rust".into()],
             extensions: vec!["rs".into()],
             entry_points: vec![],
             symbols: vec![rule(r"^\s*fn\s+(\w+)", "fn")],
@@ -724,6 +962,7 @@ mod tests {
     fn invalid_regex_in_a_rule_is_skipped_not_fatal() {
         let bad = LanguagePack {
             name: "bad".into(),
+            aliases: vec![],
             extensions: vec!["zz".into()],
             entry_points: vec![],
             symbols: vec![rule(r"(unclosed", "x"), rule(r"^ok\s+(\w+)", "fn")],

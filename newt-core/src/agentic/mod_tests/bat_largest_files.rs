@@ -43,6 +43,17 @@ const PROMPT: &str = "What are the 10 largest Rust files in this workspace?";
 const LINE_COUNT_PROMPT: &str =
     "show me the 10 code files with the highest line counts in this repository?";
 
+/// The operator's immediate follow-up, verbatim: explicit language + explicit
+/// table presentation. This is a new prompt, not a retry, so the protected
+/// comprehension card must independently preserve both constraints.
+const RUST_TABLE_PROMPT: &str =
+    "can you give me a table of the rust files with the longest line counts instead?";
+
+/// A repository-understanding request with no inventory metric, ranking word,
+/// file extension, or requested presentation shape. It proves the policy is a
+/// standing harness default rather than a repair for the observed prompts.
+const GENERAL_REPOSITORY_PROMPT: &str = "analyze how authentication works in this repository";
+
 fn msgs_for(prompt: &str) -> Vec<MemMessage> {
     vec![
         MemMessage::system("you are a test"),
@@ -178,7 +189,7 @@ async fn run_scenario_for(
         narration_nudge_cap: 1,
         action_nudges: true,
         prompt_disposition: intake.disposition(),
-        prompt_intake: None,
+        prompt_intake: Some(&intake),
         workflow_grace_rounds: 0,
         tool_output_lines: 20,
         debug: false,
@@ -316,11 +327,11 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
                 "tool_calls": [{
                     "id": "c1", "type": "function",
                     "function": { "name": "find",
-                        "arguments": "{\"path\":\".\",\"type\":\"f\",\"code\":true,\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
+                        "arguments": "{\"path\":\".\",\"category\":\"source\",\"type\":\"f\",\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
                 }]
             }),
             serde_json::json!({ "content":
-                "| Path | Lines |\n| --- | ---: |\n| tall.rs | 120 |\n| mid.rs | 40 |\n| fat.rs | 2 |" }),
+                "| File | line count |\n|---|---:|\n| `tall.rs` | 120 |\n| `mid.rs` | 40 |\n| `fat.rs` | 2 |" }),
         ],
     )
     .await;
@@ -337,12 +348,17 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
         "Research-advertised find schema must teach show_lines + sort=lines: {wire}"
     );
     assert!(
-        wire.contains("\"code\"")
-            && (wire.contains("code: true")
-                || wire.contains("`code: true`")
-                || wire.contains("code=true")
-                || wire.contains("language-pack")),
-        "Research-advertised find schema must teach code:true for source files: {wire}"
+        wire.contains("\\\"category\\\":\\\"source\\\"")
+            || wire.contains("\"category\":\"source\""),
+        "`code files` must use the harness source category, not an unfiltered walk: {wire}"
+    );
+    assert!(
+        wire.contains("response_format: gfm_markdown")
+            && wire.contains("response_structure: adaptive")
+            && wire.contains("repository_evidence: source_first")
+            && wire.contains("evidence_scope: source_files"),
+        "the protected card must combine general Markdown/source-first policy with the \
+         request's explicit code-file scope: {wire}"
     );
     // The evidence turn ANSWERED the line-count question through `find` — line
     // counts, descending — no shell, no `wc -l`, no bytesize substitute.
@@ -380,6 +396,95 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
             || wire.contains(&format!("{fat_bytes}\tfat.rs"))),
         "must NOT answer with fat.rs's byte size ({fat_bytes}) — that is the \
          bytesize-fallback failure: {wire}"
+    );
+    assert_clean_footer(hallucinations, end_reason);
+}
+
+/// The broad contract behind the incident regressions: ordinary repository
+/// understanding starts from registered source files and returns structured
+/// Markdown even when the prompt says nothing about lines, ranking, tables, or
+/// a particular language.
+#[tokio::test]
+async fn general_repository_explanation_is_markdown_and_source_first() {
+    let ws = simulated_workspace();
+    let (reply, hallucinations, end_reason, wire) = run_scenario_for(
+        GENERAL_REPOSITORY_PROMPT,
+        ws.path(),
+        vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "find",
+                        "arguments": "{\"path\":\".\",\"category\":\"source\",\"type\":\"f\",\"max_results\":20}" }
+                }]
+            }),
+            serde_json::json!({ "content":
+                "## Authentication implementation\n\n- Source evidence lives in `large.rs`.\n- No repository metadata was substituted for code." }),
+        ],
+    )
+    .await;
+
+    assert!(
+        reply.starts_with("## Authentication implementation\n\n- "),
+        "general repository findings must remain renderable GFM: {reply}"
+    );
+    assert!(
+        wire.contains("response_format: gfm_markdown")
+            && wire.contains("response_structure: adaptive")
+            && wire.contains("repository_evidence: source_first")
+            && wire.contains("source_definition: resolved_language_packs"),
+        "standing response/repository policy must reach the model without incident keywords: \
+         {wire}"
+    );
+    assert!(
+        wire.contains("\\\"category\\\":\\\"source\\\"")
+            || wire.contains("\"category\":\"source\""),
+        "the general repository investigation must use the harness source category: {wire}"
+    );
+    assert_clean_footer(hallucinations, end_reason);
+}
+
+/// Flow 1c — the exact follow-up that regressed to an empty response. The
+/// protected card resolves Rust through language-pack data, the tool call uses
+/// the harness source category + language alias, and the final answer is a
+/// syntactically complete GFM pipe table for the TUI renderer.
+#[tokio::test]
+async fn rust_followup_answers_with_source_filtered_markdown_table() {
+    let ws = simulated_line_workspace();
+    let (reply, hallucinations, end_reason, wire) = run_scenario_for(
+        RUST_TABLE_PROMPT,
+        ws.path(),
+        vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "find",
+                        "arguments": "{\"path\":\".\",\"category\":\"source\",\"language\":\"rust\",\"type\":\"f\",\"sort\":\"lines\",\"show_lines\":true,\"max_results\":10}" }
+                }]
+            }),
+            serde_json::json!({ "content":
+                "| Rust file | Lines |\n|---|---:|\n| `tall.rs` | 120 |\n| `mid.rs` | 40 |\n| `fat.rs` | 2 |" }),
+        ],
+    )
+    .await;
+
+    assert!(
+        reply.starts_with("| Rust file | Lines |\n|---|---:|"),
+        "final answer must be a complete GFM table: {reply}"
+    );
+    assert!(
+        wire.contains("source_extensions: rs")
+            && wire.contains("source_filter: category=source language=rust"),
+        "the protected card must resolve Rust through language-pack data: {wire}"
+    );
+    assert!(
+        (wire.contains("\\\"category\\\":\\\"source\\\"")
+            || wire.contains("\"category\":\"source\""))
+            && (wire.contains("\\\"language\\\":\\\"rust\\\"")
+                || wire.contains("\"language\":\"rust\"")),
+        "the concrete find call must preserve source category + language: {wire}"
     );
     assert_clean_footer(hallucinations, end_reason);
 }

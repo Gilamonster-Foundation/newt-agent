@@ -1787,6 +1787,15 @@ enum FindType {
     Any,
 }
 
+/// Harness-owned semantic category for repository entries. `Source` is backed
+/// by the resolved language-pack registry; it is not a prompt-specific
+/// extension list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FindCategory {
+    Any,
+    Source,
+}
+
 /// Result ordering for the embedded `find` tool (#1258). `Name` is the historical
 /// default (paths ascending); `Size` orders by byte size descending, `Lines` by
 /// newline count descending — so an evidence-only turn can answer "the N largest
@@ -1804,6 +1813,10 @@ struct FindOpts<'a> {
     /// Glob matched against each basename; `None` matches everything.
     name: Option<&'a str>,
     type_filter: FindType,
+    /// Semantic file category. A named language implies `Source`.
+    category: FindCategory,
+    /// Optional language-pack name or human alias.
+    language: Option<&'a str>,
     /// Max depth below the search root (1 = immediate children); `None` =
     /// unlimited.
     max_depth: Option<usize>,
@@ -1817,9 +1830,6 @@ struct FindOpts<'a> {
     /// Prefix each line with the entry's line (newline) count + a tab. When set
     /// (or `sort=lines`) the metric column is line count, not bytes.
     show_lines: bool,
-    /// Restrict to language-pack source extensions ("code files", not docs /
-    /// lockfiles). When true, directories are also skipped.
-    code: bool,
     /// Result ordering (#1258): [`FindSort::Name`] (default), byte-size- or
     /// line-count-descending.
     sort: FindSort,
@@ -1838,6 +1848,12 @@ fn find_detail(path: &str, opts: &FindOpts) -> String {
         FindType::Files => parts.push("type=f".to_string()),
         FindType::Dirs => parts.push("type=d".to_string()),
         FindType::Any => {}
+    }
+    if opts.category == FindCategory::Source {
+        parts.push("category=source".to_string());
+    }
+    if let Some(language) = opts.language {
+        parts.push(format!("language={language}"));
     }
     if let Some(d) = opts.max_depth {
         parts.push(format!("depth={d}"));
@@ -1863,9 +1879,6 @@ fn find_detail(path: &str, opts: &FindOpts) -> String {
     if opts.show_lines {
         parts.push("lines".to_string());
     }
-    if opts.code {
-        parts.push("code".to_string());
-    }
     if parts.is_empty() {
         path.to_string()
     } else {
@@ -1881,6 +1894,18 @@ fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
             Some("d") => FindType::Dirs,
             _ => FindType::Any,
         },
+        // `code: true` is the backward-compatible alias for the source category
+        // (#1405 shipped it; #1406 makes `category`/`language` canonical). A
+        // named language also implies source.
+        category: if args["category"].as_str() == Some("source")
+            || args["language"].as_str().is_some()
+            || args["code"].as_bool() == Some(true)
+        {
+            FindCategory::Source
+        } else {
+            FindCategory::Any
+        },
+        language: args["language"].as_str(),
         max_depth: args["max_depth"].as_u64().map(|d| d as usize),
         max_results: args["max_results"]
             .as_u64()
@@ -1890,13 +1915,27 @@ fn find_opts_from_args(args: &serde_json::Value) -> FindOpts<'_> {
         case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
         show_size: args["show_size"].as_bool().unwrap_or(false),
         show_lines: args["show_lines"].as_bool().unwrap_or(false),
-        code: args["code"].as_bool().unwrap_or(false),
         sort: match args["sort"].as_str() {
             Some("size") => FindSort::Size,
             Some("lines") => FindSort::Lines,
             _ => FindSort::Name,
         },
     }
+}
+
+fn find_source_extensions(
+    workspace: &std::path::Path,
+    opts: &FindOpts<'_>,
+) -> Result<Option<Vec<String>>, String> {
+    if opts.category == FindCategory::Any {
+        return Ok(None);
+    }
+    let api_cfg = crate::Config::resolve()
+        .ok()
+        .and_then(|cfg| cfg.context.map(|context| context.api_surface))
+        .unwrap_or_default();
+    let packs = crate::api_surface::resolve_language_packs(workspace, &api_cfg);
+    crate::api_surface::source_extensions_for(&packs, opts.language).map(Some)
 }
 
 /// Pure: order, de-duplicate, truncate, and format the collected `(size, path)`
@@ -2097,7 +2136,7 @@ fn find_walk(
     root: &std::path::Path,
     workspace_root: &std::path::Path,
     opts: &FindOpts<'_>,
-    code_extensions: Option<&[String]>,
+    source_extensions: Option<&[String]>,
     mut on_hit: impl FnMut(&str),
 ) -> Result<(Vec<String>, bool), String> {
     let pattern = match opts.name {
@@ -2153,9 +2192,20 @@ fn find_walk(
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        // `code: true` implies source files only (never directories).
-        if opts.code && is_dir {
-            continue;
+        if let Some(extensions) = source_extensions {
+            if is_dir
+                || !entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extensions
+                            .iter()
+                            .any(|known| known.eq_ignore_ascii_case(extension))
+                    })
+            {
+                continue;
+            }
         }
         match opts.type_filter {
             FindType::Files if is_dir => continue,
@@ -2173,11 +2223,6 @@ fn find_walk(
             .strip_prefix(workspace_root)
             .unwrap_or_else(|_| entry.path());
         let rel_display = rel.to_string_lossy().replace('\\', "/");
-        if let Some(exts) = code_extensions {
-            if !crate::api_surface::path_is_code_file(&rel_display, exts) {
-                continue;
-            }
-        }
         // The metric is read only when it will be used (shown or sorted on). Line
         // mode (show_lines / sort=lines) wins over byte mode when both are set:
         // reads the file and counts newlines (dirs → 0); byte mode reads cheap
@@ -2199,19 +2244,6 @@ fn find_walk(
         entries.push((metric, rel_display));
     }
     Ok(finalize_find(entries, opts))
-}
-
-/// Resolve the language-pack extension allowlist for `find` `code: true`.
-/// Same seam as nav gather (`ensure_nav_indexes`) / a future warm-up inventory:
-/// built-in packs plus any inline `[context.api_surface.language_packs]`.
-fn active_code_extensions() -> Vec<String> {
-    let inline = crate::Config::resolve()
-        .ok()
-        .and_then(|cfg| cfg.context)
-        .map(|ctx| ctx.api_surface.language_packs)
-        .unwrap_or_default();
-    let packs = crate::api_surface::merge_packs(vec![crate::api_surface::builtin_packs(), inline]);
-    crate::api_surface::code_file_extensions(&packs)
 }
 
 /// Count newlines in a file, matching `wc -l` semantics (a trailing line without
@@ -4047,6 +4079,11 @@ async fn execute_tool_inner(
                 );
             }
             let opts = find_opts_from_args(args);
+            let source_extensions =
+                match find_source_extensions(std::path::Path::new(workspace), &opts) {
+                    Ok(extensions) => extensions,
+                    Err(error) => return format!("error: {error}"),
+                };
             if !full.exists() {
                 return format!("error: no such path '{path}'");
             }
@@ -4076,12 +4113,11 @@ async fn execute_tool_inner(
                     relay.write(crate::agentic::ToolOutputStream::Stdout, &chunk);
                 }
             };
-            let code_exts = opts.code.then(active_code_extensions);
             let walked = find_walk(
                 &full,
                 std::path::Path::new(workspace),
                 &opts,
-                code_exts.as_deref(),
+                source_extensions.as_deref(),
                 on_hit,
             );
             if let Some(live) = live.as_mut() {
@@ -4229,13 +4265,14 @@ mod tests {
         FindOpts {
             name: None,
             type_filter: FindType::Any,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results,
             respect_gitignore: true,
             case_sensitive: true,
             show_size,
             show_lines: false,
-            code: false,
             sort,
         }
     }
@@ -4270,13 +4307,16 @@ mod tests {
     }
 
     #[test]
-    fn find_opts_parses_code_filter() {
-        let coded = serde_json::json!({ "code": true, "sort": "lines", "show_lines": true });
-        let opts = find_opts_from_args(&coded);
-        assert!(opts.code);
-        assert!(opts.show_lines);
-        assert_eq!(opts.sort, FindSort::Lines);
-        assert!(!find_opts_from_args(&serde_json::json!({})).code);
+    fn find_opts_parse_harness_source_category_and_language() {
+        let source = serde_json::json!({ "category": "source", "language": "C++" });
+        let opts = find_opts_from_args(&source);
+
+        assert_eq!(opts.category, FindCategory::Source);
+        assert_eq!(opts.language, Some("C++"));
+        let empty = serde_json::json!({});
+        let defaults = find_opts_from_args(&empty);
+        assert_eq!(defaults.category, FindCategory::Any);
+        assert_eq!(defaults.language, None);
     }
 
     #[test]
@@ -5014,13 +5054,14 @@ mod tests {
         let opts = FindOpts {
             name: None,
             type_filter: FindType::Any,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results: 1000,
             respect_gitignore: true,
             case_sensitive: true,
             show_size: false,
             show_lines: false,
-            code: false,
             sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ".");
@@ -5031,13 +5072,14 @@ mod tests {
         let opts = FindOpts {
             name: Some("*.rs"),
             type_filter: FindType::Files,
+            category: FindCategory::Any,
+            language: None,
             max_depth: Some(2),
             max_results: 50,
             respect_gitignore: false,
             case_sensitive: false,
             show_size: false,
             show_lines: false,
-            code: false,
             sort: FindSort::Name,
         };
         assert_eq!(
@@ -5051,13 +5093,14 @@ mod tests {
         let opts = FindOpts {
             name: None,
             type_filter: FindType::Dirs,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results: 1000,
             respect_gitignore: true,
             case_sensitive: true,
             show_size: false,
             show_lines: false,
-            code: false,
             sort: FindSort::Name,
         };
         assert_eq!(find_detail(".", &opts), ". (type=d)");
@@ -5068,13 +5111,14 @@ mod tests {
         let opts = FindOpts {
             name: Some("*.rs"),
             type_filter: FindType::Files,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results: 10,
             respect_gitignore: true,
             case_sensitive: true,
             show_size: true,
             show_lines: false,
-            code: false,
             sort: FindSort::Size,
         };
         assert_eq!(
@@ -5088,13 +5132,14 @@ mod tests {
         let opts = FindOpts {
             name: Some("*.rs"),
             type_filter: FindType::Files,
+            category: FindCategory::Any,
+            language: None,
             max_depth: None,
             max_results: 10,
             respect_gitignore: true,
             case_sensitive: true,
             show_size: false,
             show_lines: true,
-            code: false,
             sort: FindSort::Lines,
         };
         assert_eq!(
@@ -5104,7 +5149,9 @@ mod tests {
     }
 
     #[test]
-    fn find_detail_notes_the_code_filter() {
+    fn find_detail_notes_the_source_category_filter() {
+        // #1406: the `code:true` boolean was replaced by the language-pack
+        // `category=source` filter; find_detail now surfaces that instead.
         let opts = FindOpts {
             name: None,
             type_filter: FindType::Files,
@@ -5114,12 +5161,13 @@ mod tests {
             case_sensitive: true,
             show_size: false,
             show_lines: true,
-            code: true,
+            category: FindCategory::Source,
+            language: None,
             sort: FindSort::Lines,
         };
         assert_eq!(
             find_detail(".", &opts),
-            ". (type=f, max=10, sort=lines, lines, code)"
+            ". (type=f, category=source, max=10, sort=lines, lines)"
         );
     }
 
@@ -5389,19 +5437,33 @@ mod tests {
         );
         let desc = find_def["function"]["description"].as_str().unwrap_or("");
         assert!(
-            desc.contains("code: true") || desc.contains("`code: true`"),
-            "find description must teach code:true for source rankings: {desc}"
+            desc.contains("category") && desc.contains("source"),
+            "find description must teach category=source for source rankings: {desc}"
         );
-        assert!(
-            desc.contains("Markdown table") || desc.contains("GFM Markdown table"),
-            "find description must coax a GFM table the TUI renders: {desc}"
-        );
+        // #1406: GFM-table response steering moved out of the tool description
+        // into the prompt-intake layer (see prompt_intake.rs
+        // `*_steers_*_markdown_table` tests); the description no longer carries it.
         let sort_enum = props["sort"]["enum"]
             .as_array()
             .expect("sort must be an enum");
         assert!(
             sort_enum.iter().any(|v| v.as_str() == Some("lines")),
             "Research find sort enum must include 'lines': {sort_enum:?}"
+        );
+        assert!(
+            props.get("category").is_some() && props.get("language").is_some(),
+            "Research find schema must teach the harness source category + language filter: \
+             {find_def}"
+        );
+        assert!(
+            find_def["function"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("repository code investigation")
+                        && description.contains("source by default")
+                }),
+            "the tool catalog must reinforce the standing source-first repository policy: \
+             {find_def}"
         );
         // #1259: the formal ask-the-human escalation IS admitted in evidence
         // turns — a boxed-in model ends as a question, not penalized narration…
@@ -7751,6 +7813,73 @@ mod execute_tool_branch_tests {
         // Pre-sorted, exactly the two in-depth .py files, no dir, no .md, no
         // depth-3 file — and no shell `| sort` needed.
         assert_eq!(out, "examples/a.py\nexamples/sub/b.py", "got: {out}");
+    }
+
+    /// `code` is a harness-owned semantic category: it includes source files
+    /// from every registered language pack and excludes docs/manifests/locks.
+    /// This real-filesystem test grounds the pure language-registry classifier.
+    #[tokio::test]
+    async fn find_source_category_filters_repository_metadata_across_languages() {
+        let ws = tempfile::TempDir::new().unwrap();
+        for file in [
+            "src/main.rs",
+            "src/app.py",
+            "web/app.ts",
+            "java/App.java",
+            "native/app.cpp",
+            "dotnet/App.cs",
+            "ruby/app.rb",
+            "scripts/build.sh",
+            "AGENTS.md",
+            "Cargo.toml",
+            "Cargo.lock",
+        ] {
+            touch(ws.path(), file);
+        }
+
+        let out = run_find(
+            serde_json::json!({ "category": "source", "type": "f" }),
+            ws.path(),
+        )
+        .await;
+
+        for source in [
+            "src/main.rs",
+            "src/app.py",
+            "web/app.ts",
+            "java/App.java",
+            "native/app.cpp",
+            "dotnet/App.cs",
+            "ruby/app.rb",
+            "scripts/build.sh",
+        ] {
+            assert!(
+                out.lines().any(|line| line == source),
+                "missing {source}: {out}"
+            );
+        }
+        for metadata in ["AGENTS.md", "Cargo.toml", "Cargo.lock"] {
+            assert!(
+                !out.lines().any(|line| line == metadata),
+                "metadata is not source code ({metadata}): {out}"
+            );
+        }
+    }
+
+    /// A named language narrows the generic source category through pack
+    /// aliases. The mocked tool schema and pure registry tests sit underneath;
+    /// this real walk proves the filter reaches filesystem behavior.
+    #[tokio::test]
+    async fn find_language_alias_narrows_source_files() {
+        let ws = tempfile::TempDir::new().unwrap();
+        for file in ["native/a.c", "native/b.cpp", "dotnet/App.cs", "src/main.rs"] {
+            touch(ws.path(), file);
+        }
+
+        let cpp = run_find(serde_json::json!({ "language": "C++" }), ws.path()).await;
+        assert_eq!(cpp, "native/a.c\nnative/b.cpp");
+        let csharp = run_find(serde_json::json!({ "language": "C#" }), ws.path()).await;
+        assert_eq!(csharp, "dotnet/App.cs");
     }
 
     /// Output is sorted ascending regardless of filesystem/creation order.

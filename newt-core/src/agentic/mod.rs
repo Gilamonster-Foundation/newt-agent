@@ -174,6 +174,8 @@ pub use prompt_intake::{
     AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
     PromptComprehensionManifest, PromptDisposition, PromptIntake,
 };
+#[cfg(test)]
+pub(crate) use prompt_read::response_repository_policy_tokens;
 pub use prompt_read::{
     prompt_read_tool_definition, PromptReadContext, PromptSource, SessionPromptSource,
     SessionPromptStore, StorePromptSource,
@@ -10258,7 +10260,11 @@ mod compression_loop_tests {
         // summarizing pass; catalog growth shifts the threshold with it. The
         // >40% reclaim assertion below still measures actual dispatched
         // requests.
-        c.mid_loop_trim_tokens = Some(builtin_catalog_tokens(PromptDisposition::Act) + 5_600);
+        c.mid_loop_trim_tokens = Some(
+            builtin_catalog_tokens(PromptDisposition::Act)
+                + prompt_read::response_repository_policy_tokens()
+                + 5_600,
+        );
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _streamed, _usage, hallu) = chat_complete(c, &mut NoMcp)
@@ -10302,9 +10308,13 @@ mod compression_loop_tests {
             .map(|&(_, t, _)| t)
             .expect("a compressed request was dispatched");
         println!("e2e reclaim: ~{before} -> ~{after} est. message tokens");
+        let fixed = prompt_read::response_repository_policy_tokens();
+        let reclaimable_before = before.saturating_sub(fixed);
+        let reclaimable_after = after.saturating_sub(fixed);
         assert!(
-            after < before * 6 / 10,
-            "compression must reclaim >40% here (got {before} -> {after})"
+            reclaimable_after < reclaimable_before * 6 / 10,
+            "compression must reclaim >40% of the non-policy messages here \
+             (got {before} -> {after}, fixed policy ~{fixed})"
         );
     }
 
@@ -10373,7 +10383,9 @@ mod compression_loop_tests {
         // full request through compression before its first dispatch. (At
         // today's catalog this reproduces the historical 6,144 num_ctx /
         // 4,915-token ceiling.)
-        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act) + 1_130;
+        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act)
+            + prompt_read::response_repository_policy_tokens()
+            + 1_130;
         let num_ctx = (input_ceiling * 100).div_ceil(c.input_ceiling_pct as usize) as u32;
         // The actual ceiling the loop derives (`num_ctx_input_ceiling`), reused
         // by the fit assertion below so budget and check stay in lockstep.
@@ -10487,7 +10499,11 @@ mod compression_loop_tests {
         // summarizer failure rather than tipping into an irreducible-window
         // refusal as the catalog grows. (Reproduces the historical 5,600 at
         // today's catalog size.)
-        c.mid_loop_trim_tokens = Some(builtin_catalog_tokens(PromptDisposition::Act) + 1_815);
+        c.mid_loop_trim_tokens = Some(
+            builtin_catalog_tokens(PromptDisposition::Act)
+                + prompt_read::response_repository_policy_tokens()
+                + 1_815,
+        );
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -10961,7 +10977,11 @@ mod compression_loop_tests {
         // Derive the trigger from the live Always-on catalog (#1387 grew it)
         // plus a catalog-independent headroom for one complete fresh result
         // group — same shape as the other compression-loop fixtures.
-        c.mid_loop_trim_tokens = Some(builtin_catalog_tokens(PromptDisposition::Act) + 4_600);
+        c.mid_loop_trim_tokens = Some(
+            builtin_catalog_tokens(PromptDisposition::Act)
+                + prompt_read::response_repository_policy_tokens()
+                + 4_600,
+        );
         c.summarizer = Some(&*summarizer);
         c.compress_state = Some(&mut compress_state);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
@@ -11086,7 +11106,7 @@ mod compression_loop_tests {
         let catalog = builtin_catalog_tokens(PromptDisposition::Act);
         // ~3.2k tokens of message/result headroom after reclaim (matches the
         // pre-#1387 6,553 − ~3.4k catalog gap).
-        let input_ceiling = catalog + 3_200;
+        let input_ceiling = catalog + prompt_read::response_repository_policy_tokens() + 3_200;
         let num_ctx = ((input_ceiling as f64) / 0.8).ceil() as u32;
         let ws = tempfile::TempDir::new().unwrap();
         std::fs::write(
@@ -11701,7 +11721,9 @@ mod observation_hook_tests {
         // (Reproduces the historical 5,120 num_ctx / 4,096 ceiling / ~5,000
         // report at today's catalog size.)
         const INPUT_CEILING_PCT: usize = 80; // matches ctx() default below
-        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act) + 311;
+        let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act)
+            + prompt_read::response_repository_policy_tokens()
+            + 311;
         let num_ctx = (input_ceiling * 100).div_ceil(INPUT_CEILING_PCT) as u32;
         let suspect_prompt = num_ctx * 98 / 100; // ≥95% of num_ctx → suspect
         let tools_rounds = Arc::new(AtomicUsize::new(0));
@@ -11866,7 +11888,11 @@ mod observation_hook_tests {
         // the catalog grows. The reported 8_734-token prompt stays far above
         // 85% of this window, so the silent-overflow gate still fires.
         // (Reproduces the historical 4_000 at today's catalog size.)
-        c.safe_context = Some((builtin_catalog_tokens(PromptDisposition::Act) + 215) as u32);
+        c.safe_context = Some(
+            (builtin_catalog_tokens(PromptDisposition::Act)
+                + prompt_read::response_repository_policy_tokens()
+                + 215) as u32,
+        );
         c.on_round_usage = Some(&mut hook);
         let (_reply, streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
             .await
