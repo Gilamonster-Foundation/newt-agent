@@ -480,6 +480,27 @@ fn catalog_write_target(project: bool) -> anyhow::Result<PathBuf> {
 
 /// Entry point for `newt mcp probe`.
 pub async fn run(args: ProbeArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    // #1432 — under `--json`, stdout is a PAYLOAD channel, not a human one.
+    //
+    // This command has always honoured that by hand: every status line is an
+    // `eprintln!` and only the report is a `println!`. Hand-discipline holds
+    // exactly as long as everyone remembers, and it is about to stop holding —
+    // #1312 routes prompts through `PromptWindow::ask`, which hardcodes
+    // `io::stdout()`, so the confirm question would land inside the JSON.
+    //
+    // Take fd 1 away instead. After this, EVERY write to stdout — ours, the
+    // arbiter's, anything in the dep tree — goes to stderr, and the report is
+    // written through the private handle that is now the only route to the real
+    // stdout. That is the same move pi makes (`output-guard.ts` `takeOverStdout`
+    // + `writeRawStdout`) and the law codex compiles in (`exec/src/lib.rs`).
+    //
+    // Only under `--json`: the text path's `println!` IS the human output.
+    let payload_stdout = if args.json {
+        crate::stdio_guard::redirect_stdout_to_stderr().ok()
+    } else {
+        None
+    };
+
     let env = crate::mcp_cmd::parse_env_pairs(&args.env)?;
     let cfg = match config_path {
         Some(p) => Config::load(p)?,
@@ -497,10 +518,19 @@ pub async fn run(args: ProbeArgs, config_path: Option<&Path>) -> anyhow::Result<
     };
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&render_json_report(&outcome)?)?
-        );
+        let report = serde_json::to_string_pretty(&render_json_report(&outcome)?)?;
+        match payload_stdout {
+            // The guard is installed: fd 1 is stderr now, so the report must go
+            // through the private handle or it would join the status stream.
+            Some(mut out) => {
+                use std::io::Write as _;
+                writeln!(out, "{report}").context("writing the --json report")?;
+                out.flush().context("flushing the --json report")?;
+            }
+            // Guard unavailable (non-unix, or dup2 refused): fall back to the
+            // hand-discipline that was correct before this change.
+            None => println!("{report}"),
+        }
     } else {
         println!("{}", render_text_report(&outcome)?);
     }

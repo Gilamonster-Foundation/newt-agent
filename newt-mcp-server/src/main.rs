@@ -1,3 +1,15 @@
+// #1432 — the compiled half of the stdout law.
+//
+// stdout on this binary is a JSON-RPC wire: one stray `println!` corrupts a
+// frame. `stdio_guard::redirect_stdout_to_stderr` (dup2) already catches this
+// at runtime for anything that reaches fd 1, including the dep tree. This lint
+// catches OUR OWN violations at compile time instead, so the runtime guard is
+// the backstop rather than the only line of defence — the belt-and-suspenders
+// posture codex ships (`codex-rs/exec/src/lib.rs:5`).
+//
+// Deliberate writes go through the private handle the guard hands back.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use anyhow::Result;
 
 #[tokio::main]

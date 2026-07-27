@@ -1,3 +1,9 @@
+// #1432 — the compiled half of the stdout law (see newt-mcp-server/src/main.rs).
+// `newt worker` speaks JSON-RPC on stdout; a stray `println!` corrupts a frame.
+// The dup2 guard in `newt-cli` catches it at runtime for the whole dep tree;
+// this catches our own at compile time.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 //! Newt-Agent ACP worker.
 //!
 //! Speaks the Agent Client Protocol (agentclientprotocol.com) over stdio so
