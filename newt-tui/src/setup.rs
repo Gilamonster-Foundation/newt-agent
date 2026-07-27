@@ -518,6 +518,24 @@ async fn pick_cloud_model(
 /// Build a cloud backend config and, when an API key is provided, write it to
 /// `backends/<name>.token` beside the config file and store the absolute path
 /// in `api_key_file`.
+/// Render `path` as `~/…` when it sits under the home directory, else as an
+/// absolute path.
+///
+/// Checks `USERPROFILE` as well as `HOME` so Windows collapses too, and always
+/// returns *something*: a portable-looking path is a nicety, and must never be
+/// the reason a configured credential goes unrecorded.
+fn collapse_home(path: &Path) -> String {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(home) = home {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
+}
+
 fn build_cloud_config(
     config_path: &Path,
     name: &str,
@@ -531,13 +549,12 @@ fn build_cloud_config(
         std::fs::create_dir_all(&backends_dir).ok()?;
         let token_path = backends_dir.join(format!("{name}.token"));
         std::fs::write(&token_path, key).ok()?;
-        // Store the tilde-collapsed path so it's portable across home dirs.
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
-        token_path
-            .strip_prefix(&home)
-            .ok()
-            .map(|rel| format!("~/{}", rel.display()))
-            .or_else(|| Some(token_path.display().to_string()))
+        // Tilde-collapse when we can, but NEVER let that decide whether the key
+        // is referenced at all. This previously read `var_os("HOME")?`, and on
+        // Windows — where the variable is USERPROFILE — the `?` bailed out of
+        // the whole closure: the token file landed on disk and `api_key_file`
+        // stayed None, so the backend silently authenticated with nothing.
+        Some(collapse_home(&token_path))
     });
 
     let backend = BackendConfig {
@@ -2662,6 +2679,55 @@ mod tests {
         assert!(
             dropin.api_key_file.is_none(),
             "no key given, so no token file may be written"
+        );
+    }
+
+    /// Regression: the token path used `var_os("HOME")?`, so on Windows — where
+    /// the variable is `USERPROFILE` — the `?` bailed out of the whole closure.
+    /// The token file was written and `api_key_file` stayed `None`, leaving the
+    /// backend silently unauthenticated. Caught by the Windows CI job; this
+    /// pins it without needing one.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn a_token_path_is_recorded_even_when_home_is_unset() {
+        let saved = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
+        // SAFETY: guarded by the `real_fs` serial lane, and restored below.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (_cfg, backend) = build_cloud_config(
+            &path,
+            "example.com",
+            "http://example.com:8080",
+            "model-a",
+            Some("a-secret"),
+        );
+
+        // SAFETY: same lane; restore before asserting so a failure cannot leak.
+        unsafe {
+            if let Some(v) = saved.0 {
+                std::env::set_var("HOME", v);
+            }
+            if let Some(v) = saved.1 {
+                std::env::set_var("USERPROFILE", v);
+            }
+        }
+
+        let recorded = backend
+            .api_key_file
+            .expect("a supplied key must always be recorded, home dir or not");
+        assert!(
+            !recorded.starts_with('~'),
+            "with no home to collapse against, the path stays absolute: {recorded}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&recorded).unwrap(),
+            "a-secret",
+            "the recorded path must point at the token actually written"
         );
     }
 
