@@ -36,9 +36,18 @@ pub struct EnrollmentCandidate {
     pub cose_alg: i64,
     /// Fingerprint of the mesh agent that ran the ceremony.
     pub mesh_agent_fingerprint: String,
-    /// Hex transcript id from the commit-reveal ceremony — the value whose
-    /// word string the human compared across both screens.
+    /// Hex transcript id the staging surface *claims*.
+    ///
+    /// Never displayed and never trusted: the terminal rebuilds the transcript
+    /// from the inputs below and refuses the candidate if the two disagree. It
+    /// is carried only so that disagreement is detectable.
     pub transcript_id: String,
+    /// Relying-party id the ceremony ran under.
+    pub rp_id: String,
+    /// Hex commitment the browser published before the nonce was revealed.
+    pub commitment: String,
+    /// The server's single-use enrollment nonce, base64.
+    pub enroll_nonce: String,
 }
 
 impl EnrollmentCandidate {
