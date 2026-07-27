@@ -662,7 +662,13 @@ pub(crate) fn run_chat(
     let mut markdown_override: Option<bool> = None;
     // #1235: per-session live spill height. `None` follows `[tui].spill_lines`;
     // `Some(0)` keeps completed output unbounded and disables the live frame.
-    let mut spill_lines_override: Option<usize> = None;
+    //
+    // #1434: `--trace` / `[tui] trace` SEEDS this, rather than being consulted
+    // separately at the point of use. One variable, so the launch flag and the
+    // runtime control cannot disagree — see `initial_spill_override`, and pi's
+    // `options.verbose || toolOutputExpanded` phase bug that motivated it.
+    let mut spill_lines_override: Option<usize> =
+        crate::initial_spill_override(crate::prompt::trace_mode(&cfg));
     // Human-only per-session override for the agentic loop's tool-call round
     // safety valve. `None` preserves config/model-tuning behavior exactly.
     let mut max_tool_rounds_override: Option<usize> = None;
@@ -2010,6 +2016,34 @@ pub(crate) fn run_chat(
                                 verbose,
                             );
                         }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // #1434: `/detail` flips the session detail level between the
+                    // configured height and unbounded. It shares
+                    // `spill_lines_override` with `/spill`, so the two controls
+                    // cannot disagree — there is no second detail state.
+                    //
+                    // A slash command, not only a chord, because the chord path
+                    // is terminal-dependent: on macOS Option is a compose key by
+                    // default, so `Alt+t` needs a per-terminal setting. This
+                    // always works. (The chord itself waits on #294's action
+                    // table — binding it inline here is exactly the sprawl that
+                    // issue exists to prevent.)
+                    if slash_md == "detail" {
+                        let configured = spill_lines(&cfg);
+                        spill_lines_override =
+                            crate::toggle_spill_detail(spill_lines_override, configured);
+                        print_newt(
+                            &spill_status(
+                                configured,
+                                spill_lines_override,
+                                live_spill_eligibility(),
+                            ),
+                            color,
+                            verbose,
+                        );
                         surface.save_history();
                         println!();
                         continue;

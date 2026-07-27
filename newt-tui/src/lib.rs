@@ -6831,6 +6831,39 @@ fn effective_spill_lines(configured: usize, session_override: Option<usize>) -> 
     session_override.unwrap_or(configured)
 }
 
+/// #1434: `--trace` SEEDS the session detail knob instead of sitting beside it.
+///
+/// newt already has a session-wide detail level — `SPILL_LINES`, config-seeded
+/// per turn and runtime-mutable via `/spill N`, with `0` meaning unbounded. What
+/// it lacked was a connection to the launch flag, which is exactly the bug pi
+/// shipped: `getStartupExpansionState()` is `options.verbose || toolOutputExpanded`
+/// and nothing initializes the latter from the former, so **after `pi --verbose`
+/// the first toggle press expands instead of collapsing**.
+///
+/// A launch flag that sits *beside* a runtime toggle has two sources of truth
+/// and therefore a phase. Seeding gives one variable and no phase.
+fn initial_spill_override(trace: bool) -> Option<usize> {
+    // `--trace` means "show me everything"; 0 is this knob's unbounded.
+    trace.then_some(0)
+}
+
+/// #1434: flip the session detail level between unbounded and the configured
+/// height. The single action behind `/detail` (and, once #294's action table
+/// exists, behind a chord).
+///
+/// Returns the new override. Deliberately expressed over the SAME
+/// `Option<usize>` the `/spill` command already mutates, so there is no second
+/// piece of detail state to drift — see `initial_spill_override`.
+fn toggle_spill_detail(current: Option<usize>, configured: usize) -> Option<usize> {
+    if effective_spill_lines(configured, current) == 0 {
+        // Unbounded → back to the configured height. `max(1)` so a configured
+        // 0 cannot make the toggle a no-op that looks broken.
+        Some(configured.max(1))
+    } else {
+        Some(0)
+    }
+}
+
 /// Why the live spill viewport is, or is not, available right now (#1412).
 ///
 /// The predicate used to be a bare `bool`, so `/spill` could say only
