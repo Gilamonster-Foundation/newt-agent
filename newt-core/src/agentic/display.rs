@@ -391,31 +391,95 @@ pub(crate) fn spill_lines() -> usize {
     SPILL_LINES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub(crate) fn spill_view_lines(output: &str, view: usize) -> Vec<String> {
+/// The one place that names the recovery path out of a truncated view (#1433).
+///
+/// Every truncation marker interpolates THIS, so a third one cannot silently
+/// ship without it — which is exactly how `:{HIDDEN_TAIL}` below drifted from
+/// the boundary marker and left the operator stuck. codex solves it the same
+/// way with a single `TRANSCRIPT_HINT` constant; pi derives the text from its
+/// live binding table so a rebind can never desync a hint.
+pub(crate) const SPILL_RECOVERY_HINT: &str = "/spill N raises this view";
+
+pub(crate) fn spill_view_lines(output: &str, view: usize, columns: usize) -> Vec<String> {
+    // #1433: the budget is spent in RENDERED rows, not logical lines — counting
+    // lines let one 4000-char diagnostic consume an unbounded number of them.
+    //
+    // But the emitted text stays UNWRAPPED. This excerpt is the canonical
+    // committed block, and `plain_scroller_tui.md` names scrollback as
+    // "searchable, copy-pasteable, and capturable with script/asciinema".
+    // Hard-wrapping would insert a newline and a gutter mid-sentence: visually
+    // identical to the terminal's own soft-wrap, but it breaks copy-paste and
+    // breaks search across the wrap point. So we MEASURE with the wrapper and
+    // EMIT the original.
+    //
+    // The gutter glyph costs two columns ("▒ "), so content wraps at
+    // `columns - 2`.
+    let content_width = columns.saturating_sub(2).max(1);
+    let rows_of = |l: &str| wrap_to_width(l, content_width).len().max(1);
+
     let lines: Vec<&str> = output.lines().collect();
     if lines.is_empty() {
         return Vec::new();
     }
     if view == 0 {
-        return lines.iter().map(|l| l.to_string()).collect();
+        return lines.iter().map(|l| (*l).to_string()).collect();
     }
+
+    // Walk from the tail (where errors and hits live) taking whole lines while
+    // their rendered rows fit the budget.
+    let mut kept = 0usize;
+    let mut used = 0usize;
+    for l in lines.iter().rev() {
+        let r = rows_of(l);
+        if kept > 0 && used + r > view {
+            break;
+        }
+        kept += 1;
+        used += r;
+        if used >= view {
+            break;
+        }
+    }
+    let start = lines.len() - kept;
+    let tail = &lines[start..];
+
+    // A single line wider than the whole budget is the pathological case the
+    // issue is about. It is the ONLY case where the text is altered, and it is
+    // altered the same way the rest of this function already works: keep the
+    // TAIL, which is where the error is, and say so.
+    if used > view && tail.len() == 1 {
+        let wrapped = wrap_to_width(tail[0], content_width);
+        let dropped = wrapped.len() - view;
+        let mut out = vec![format!(
+            "▲ {dropped} more wrapped rows above · {SPILL_RECOVERY_HINT}"
+        )];
+        for (i, row) in wrapped[dropped..].iter().enumerate() {
+            let glyph = if i + 1 == view { '▓' } else { '▒' };
+            out.push(format!("{glyph} {row}"));
+        }
+        out.push("…".to_string());
+        return out;
+    }
+
+    let lines: Vec<String> = tail.iter().map(|l| (*l).to_string()).collect();
+    let hidden_logical = start;
     let mut out = Vec::new();
-    if lines.len() <= view {
+    if hidden_logical == 0 {
         for l in &lines {
             out.push(format!("▒ {l}"));
         }
         out.push("…".to_string());
         return out;
     }
-    let hidden = lines.len() - view;
+    let hidden = hidden_logical;
     // #1263: this excerpt is PLAIN PRINTED TEXT — it deliberately shares the
     // ▲/▒/▓ glyphs with the live viewport, so without this hint it masqueraded
     // as the interactive scroller (the diagnosed operator tried to expand it in
     // scrollback). Name the real recovery path at the point of use.
     out.push(format!(
-        "▲ {hidden} more lines above · /spill N raises this view"
+        "▲ {hidden} more lines above · {SPILL_RECOVERY_HINT}"
     ));
-    let tail = &lines[hidden..];
+    let tail = &lines[..];
     for (i, l) in tail.iter().enumerate() {
         let glyph = if i + 1 == tail.len() { '▓' } else { '▒' };
         out.push(format!("{glyph} {l}"));
@@ -489,7 +553,7 @@ impl<W: Write> ToolDisplay<W> {
         } else {
             output
         };
-        let rendered = spill_view_lines(output, self.spill_lines).join("\n");
+        let rendered = spill_view_lines(output, self.spill_lines, self.cols).join("\n");
         if self.color {
             execute!(
                 &mut self.writer,
@@ -533,7 +597,9 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
             if !rendered.is_empty() {
                 rendered.push('\n');
             }
-            rendered.push_str(&format!("  … ({hidden} more lines hidden)"));
+            rendered.push_str(&format!(
+                "  … ({hidden} more lines hidden · {SPILL_RECOVERY_HINT})"
+            ));
         }
         if rendered.is_empty() {
             return;
@@ -580,8 +646,93 @@ pub(crate) fn print_tool_output(output: &str, _tool_output_lines: usize, color: 
 mod tests {
     use super::{
         fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_view_lines,
-        tool_call_lines,
+        tool_call_lines, wrap_to_width, SPILL_RECOVERY_HINT,
     };
+
+    /// #1433: the excerpt is capped by LOGICAL lines, so its "N rows" promise
+    /// only holds when the output happens to be narrow. One long line — a
+    /// compiler diagnostic, a minified JSON blob, a base64 payload — autowraps
+    /// past the budget and floods the scrollback.
+    ///
+    /// codex names this rule explicitly (`exec_cell/render.rs`): "Wrap first so
+    /// that truncation is applied to on-screen lines rather than logical lines.
+    /// This ensures that a small number of very long lines cannot flood the
+    /// viewport."
+    ///
+    /// Note the asymmetry this closes: the LIVE viewport already clips to width
+    /// (`docs/decisions/live_spill_viewport.md` §3). Only the committed excerpt
+    /// did not — so the same output was bounded while running and unbounded
+    /// once finished, which is backwards from what an operator expects.
+    #[test]
+    fn one_long_line_cannot_flood_the_row_budget() {
+        const COLS: usize = 80;
+        let long = "x".repeat(400);
+        let out = spill_view_lines(&long, 3, COLS);
+
+        let rendered_rows: usize = out.iter().map(|l| wrap_to_width(l, COLS).len()).sum();
+        // header + 3 body rows + the trailing ellipsis
+        assert!(
+            rendered_rows <= 5,
+            "a single {}-char line rendered {rendered_rows} rows at {COLS} columns \
+             against a 3-row budget:\n{out:#?}",
+            long.len()
+        );
+    }
+
+    /// #1433: the budget is measured in rendered rows, but the TEXT is not
+    /// rewrapped. This excerpt is the canonical committed block, and
+    /// `plain_scroller_tui.md` names scrollback as "searchable, copy-pasteable,
+    /// and capturable with script/asciinema" — hard-wrapping would insert a
+    /// newline and a gutter mid-sentence, which looks identical to the
+    /// terminal's own soft-wrap but breaks copy-paste and breaks search across
+    /// the wrap point.
+    ///
+    /// This is the regression that first showed up as
+    /// `artifact_read_central_display_never_echoes_recovered_body` failing: a
+    /// 103-character line split "…44 of 44 body / characters…" and a `contains`
+    /// assertion stopped matching. The assertion was right and the wrap was
+    /// wrong.
+    #[test]
+    fn a_line_wider_than_the_terminal_is_measured_but_not_rewrapped() {
+        const COLS: usize = 40;
+        let wide = "artifact:abc: returned 44 of 44 body characters at offset 0 (complete)";
+        assert!(wide.len() > COLS, "the fixture must exceed the width");
+
+        let out = spill_view_lines(&format!("first\n{wide}"), 3, COLS);
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("returned 44 of 44 body characters"),
+            "the phrase was split across a wrap — copy-paste and search are \
+             broken by rewrapping the canonical block:\n{joined}"
+        );
+    }
+
+    /// #1433: measuring in rows must still SPEND the budget in rows — a wide
+    /// line costs what it actually occupies, so fewer lines are shown, not more
+    /// rows than asked for.
+    #[test]
+    fn a_wide_line_spends_the_row_budget_it_actually_occupies() {
+        const COLS: usize = 20;
+        // ~3 rows at width 18 (20 minus the "▒ " gutter).
+        let wide = "w".repeat(50);
+        let out = spill_view_lines(&format!("a\nb\nc\n{wide}"), 3, COLS);
+
+        let body: Vec<&String> = out
+            .iter()
+            .filter(|l| l.starts_with('▒') || l.starts_with('▓'))
+            .collect();
+        assert_eq!(
+            body.len(),
+            1,
+            "the wide line alone should consume the 3-row budget, leaving no \
+             room for a/b/c:\n{out:#?}"
+        );
+        assert!(out[0].contains("more lines above"), "{out:#?}");
+        assert!(
+            out[0].contains(SPILL_RECOVERY_HINT),
+            "every truncation marker names the way out:\n{out:#?}"
+        );
+    }
 
     /// #1235: the spill view is TAIL-biased with the issue's gutter glyphs —
     /// small outputs show whole (▒ gutter + … end marker), overflow shows the
@@ -590,12 +741,12 @@ mod tests {
     #[test]
     fn spill_view_is_tail_biased_with_gutter_glyphs() {
         // Fits: whole output, ▒ gutter, end marker.
-        let small = spill_view_lines("a\nb\nc", 3);
+        let small = spill_view_lines("a\nb\nc", 3, 80);
         assert_eq!(small, vec!["▒ a", "▒ b", "▒ c", "…"]);
 
         // Overflows: LAST view lines (tail is where errors/hits live),
         // ▲ carries the hidden count, ▓ thumbs the tail.
-        let big = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3);
+        let big = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3, 80);
         assert_eq!(
             big,
             vec![
@@ -608,9 +759,9 @@ mod tests {
         );
 
         // Unbounded: raw lines, no gutter.
-        assert_eq!(spill_view_lines("x\ny", 0), vec!["x", "y"]);
+        assert_eq!(spill_view_lines("x\ny", 0, 80), vec!["x", "y"]);
         // Empty: nothing.
-        assert!(spill_view_lines("", 3).is_empty());
+        assert!(spill_view_lines("", 3, 80).is_empty());
     }
 
     #[test]
@@ -618,7 +769,7 @@ mod tests {
         let output = "l1\nl2\nl3\nl4\nl5";
 
         assert_eq!(
-            spill_view_lines(output, 3),
+            spill_view_lines(output, 3, 80),
             vec![
                 "▲ 2 more lines above · /spill N raises this view",
                 "▒ l3",
@@ -628,7 +779,7 @@ mod tests {
             ]
         );
         let raw: Vec<String> = output.lines().map(str::to_string).collect();
-        assert_eq!(spill_view_lines(output, 0), raw);
+        assert_eq!(spill_view_lines(output, 0, 80), raw);
     }
 
     /// #1263: the COMPLETED excerpt names its real recovery path at the point
@@ -637,7 +788,7 @@ mod tests {
     /// diagnosed operator tried to expand it in scrollback and could not).
     #[test]
     fn completed_excerpt_names_its_recovery_path() {
-        let lines = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3);
+        let lines = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3, 80);
         assert!(
             lines[0].contains("/spill N raises this view"),
             "the ▲ boundary must carry the recovery hint: {:?}",
@@ -648,7 +799,7 @@ mod tests {
         // frame's ⧉/▣ boundary.
         assert_eq!(lines.last().map(String::as_str), Some("…"));
         // The fits-entirely form is inert-terminated too.
-        let small = spill_view_lines("a\nb", 3);
+        let small = spill_view_lines("a\nb", 3, 80);
         assert_eq!(small.last().map(String::as_str), Some("…"));
     }
 
