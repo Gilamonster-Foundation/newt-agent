@@ -1062,7 +1062,7 @@ impl ContextFeatureSet {
     /// offload, the `<state>`/`<plan>` scratchpad ledger, semantic retrieval,
     /// experiential memory, and the scheduled per-step view — the default on
     /// EVERY backend rather than only local (`Ollama`) ones. Cloud endpoints
-    /// (NVIDIA `inference.nvidia.com` and other `Openai`-protocol hosts) can't
+    /// (hosted `Openai`-protocol endpoints generally) can't
     /// auto-discover a context window, so they benefit most from the ledger and
     /// retrieval being on by default. Explicit overrides still win — they layer
     /// on top via [`ContextFeatures::apply_to`], so a user can turn any feature

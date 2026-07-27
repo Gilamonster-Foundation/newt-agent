@@ -62,16 +62,16 @@ def test_local_vllm_backend_construct() -> None:
 
 
 def test_local_vllm_backend_accepts_api_key() -> None:
-    # Hosted OpenAI-compatible endpoints (e.g. NVIDIA in-house inference)
+    # Hosted OpenAI-compatible endpoints (any vendor or self-hosted gateway)
     # require a bearer token; the constructor must accept it as an optional
     # kwarg. Wire-level header behavior is covered by the Rust
     # `openai_auth_tests`; here we only assert the binding threads it through.
     backend = inference.LocalVllmBackend(
-        "https://inference-api.nvidia.com/v1",
-        "nvidia/nemotron-3-super-120b-a12b",
+        "https://inference.example.com/v1",
+        "example/model-a",
         api_key="secret-abc",
     )
-    assert backend.endpoint() == "https://inference-api.nvidia.com/v1"
+    assert backend.endpoint() == "https://inference.example.com/v1"
     assert backend.name() == "vllm-local"
 
 
