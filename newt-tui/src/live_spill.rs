@@ -81,9 +81,20 @@ impl TerminalWriter {
 ///
 /// Width-shrink cleanup follows the primary-screen reflow used by mainstream
 /// terminal emulators: a painted logical line is rewrapped at the new column
-/// count. ANSI exposes no portable reflow capability query; an emulator that
-/// deliberately keeps old rows un-reflowed may therefore over-rewind only on
-/// a width shrink. Normal painting and same-width cleanup use exact row counts.
+/// count. ANSI exposes no portable reflow capability query, so this is an
+/// assumption, not a probe. Normal painting and same-width cleanup use exact
+/// row counts.
+///
+/// **Reflow is a REQUIREMENT of the rich tier, not a caveat** (#1426, decided
+/// 2026-07-27 — see `docs/decisions/lean_rich_tui_morphologies.md`). An emulator
+/// that keeps old rows un-reflowed is a lean-tier terminal and should run
+/// `--lean`, which has no redraw region and therefore no rewind to get wrong.
+/// Assuming no-reflow instead would leave stale rows on *every* shrink in the
+/// common case in order to be safe in the rare one.
+///
+/// No height clamp is needed here: `MoveUp` already saturates at row 0, so
+/// bounding the count changes the emitted bytes without changing where the
+/// cursor lands.
 pub(crate) struct LiveSpillRenderer {
     state: Arc<Mutex<RenderState>>,
     output: Arc<Mutex<OutputState>>,
