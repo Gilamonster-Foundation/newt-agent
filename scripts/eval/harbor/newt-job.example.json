@@ -1,0 +1,9 @@
+{
+  "jobs_dir": "/var/tmp/tbench-harbor",
+  "datasets": [
+    {"path": "/var/tmp/tbench-tasks/terminal-bench", "task_names": ["regex-log"]}
+  ],
+  "agents": [
+    {"import_path": "newt_agent:NewtAgent", "model_name": "newt/qwen3-coder_30b"}
+  ]
+}
