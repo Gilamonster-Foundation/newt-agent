@@ -535,6 +535,69 @@ fn search_commands_parse_expected_forms() {
     assert!(parse_search_command("/search pin").is_err());
 }
 
+/// #1434: `--trace` seeds the detail knob, so there is ONE source of truth and
+/// no launch-vs-runtime phase.
+///
+/// This is the bug pi shipped, written down so newt cannot ship it.
+/// `modes/interactive/interactive-mode.ts` computes
+/// `options.verbose || toolOutputExpanded` at one call site, and nothing ever
+/// initializes `toolOutputExpanded` from `options.verbose`. So after
+/// `pi --verbose` the state is "expanded" for display purposes but `false` in
+/// the variable, and **the first toggle press expands again instead of
+/// collapsing** — the control moves the wrong way on its first use, which is
+/// the worst possible first impression for a toggle.
+///
+/// Seeding removes the second variable, so the phase cannot exist.
+#[test]
+fn trace_seeds_the_detail_knob_so_the_first_toggle_collapses() {
+    const CONFIGURED: usize = 3;
+
+    // Without --trace the knob simply follows config.
+    assert_eq!(initial_spill_override(false), None);
+    assert_eq!(
+        effective_spill_lines(CONFIGURED, initial_spill_override(false)),
+        CONFIGURED
+    );
+
+    // With --trace the session STARTS unbounded …
+    let seeded = initial_spill_override(true);
+    assert_eq!(seeded, Some(0), "--trace means show me everything");
+    assert_eq!(effective_spill_lines(CONFIGURED, seeded), 0);
+
+    // … and the first toggle press must COLLAPSE, not expand again.
+    let after_first_press = toggle_spill_detail(seeded, CONFIGURED);
+    assert_eq!(
+        effective_spill_lines(CONFIGURED, after_first_press),
+        CONFIGURED,
+        "the first toggle after --trace went the wrong way — this is pi's phase \
+         bug, and seeding exists precisely to make it unrepresentable"
+    );
+
+    // And it flips back.
+    let after_second_press = toggle_spill_detail(after_first_press, CONFIGURED);
+    assert_eq!(effective_spill_lines(CONFIGURED, after_second_press), 0);
+}
+
+/// #1434: the toggle is defined over the same `Option<usize>` `/spill` mutates,
+/// so a `/spill N` mid-session and a toggle cannot disagree.
+#[test]
+fn detail_toggle_shares_state_with_the_spill_command() {
+    // Operator sets an explicit height, then toggles.
+    let explicit = Some(7);
+    let expanded = toggle_spill_detail(explicit, 3);
+    assert_eq!(effective_spill_lines(3, expanded), 0, "toggle expands");
+
+    // Toggling back returns to the CONFIGURED height, not the explicit 7 —
+    // the toggle is a two-state control, and `/spill 7` is how you get 7 back.
+    let collapsed = toggle_spill_detail(expanded, 3);
+    assert_eq!(effective_spill_lines(3, collapsed), 3);
+
+    // A configured height of 0 must not make the toggle a no-op that reads as
+    // a broken control.
+    let from_zero_config = toggle_spill_detail(Some(0), 0);
+    assert!(effective_spill_lines(0, from_zero_config) > 0);
+}
+
 #[test]
 fn spill_override_resolves_and_reports_live_capability() {
     assert_eq!(effective_spill_lines(3, None), 3);
