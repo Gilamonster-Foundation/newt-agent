@@ -154,9 +154,89 @@ pub(crate) fn dispatch(
             _ => print_newt("usage: /thinking <on|off>", color, verbose),
         },
 
+        // #tenacity / #12: how hard the harness pushes the model from reading to
+        // acting. `/tenacity` shows the active level; `/tenacity <level>` sets an
+        // explicit override that wins over `[tenacity]` config + the CLI flag.
+        "tenacity" => print_newt(&tenacity_command(arg1), color, verbose),
+
         other => {
             unreachable!("commands::settings::dispatch routed a non-setting command: {other:?}")
         }
     }
     Ok(true)
+}
+
+/// Build the `/tenacity` response and, when `arg` names a level, install it as an
+/// explicit override (the highest-priority input in
+/// [`newt_core::tenacity::effective_tenacity`]). Pure for the show/list/error
+/// paths; the set path mutates the process-global via `set_cli_tenacity`.
+fn tenacity_command(arg: &str) -> String {
+    use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+    match arg.trim() {
+        "" | "status" | "show" => {
+            let t = effective_tenacity();
+            format!(
+                "tenacity: {} — {}  (/tenacity <relaxed|standard|insistent|relentless>|list)",
+                t.label(),
+                t.describe()
+            )
+        }
+        "list" => {
+            let mut out = String::from("tenacity levels (patient → forcing):");
+            for t in Tenacity::all() {
+                let active = if t == effective_tenacity() {
+                    " ← active"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("\n  {:<10} {}{active}", t.label(), t.describe()));
+            }
+            out
+        }
+        other => match other.parse::<Tenacity>() {
+            Ok(level) => {
+                set_cli_tenacity(level);
+                format!("tenacity → {} — {}", level.label(), level.describe())
+            }
+            Err(e) => {
+                format!("{e}  (/tenacity <level>|list|status)")
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tenacity_command;
+
+    #[test]
+    fn tenacity_status_and_list_and_error_are_informative() {
+        // Status names the active level and the usage hint (no mutation).
+        let status = tenacity_command("");
+        assert!(status.starts_with("tenacity: "), "{status}");
+        assert!(status.contains("/tenacity"), "{status}");
+        // List enumerates every level, patient → forcing, marking the active one.
+        let list = tenacity_command("list");
+        for label in ["relaxed", "standard", "insistent", "relentless"] {
+            assert!(list.contains(label), "list missing {label}: {list}");
+        }
+        assert!(
+            list.contains("← active"),
+            "list marks the active level: {list}"
+        );
+        // An unknown level explains itself rather than silently doing nothing.
+        let err = tenacity_command("banana");
+        assert!(err.contains("unknown tenacity"), "{err}");
+    }
+
+    #[test]
+    fn tenacity_command_sets_the_level_live() {
+        use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        let restore = effective_tenacity();
+        let msg = tenacity_command("relentless");
+        assert!(msg.contains("relentless"), "{msg}");
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
+        // Restore so the process-global doesn't leak into sibling tests.
+        set_cli_tenacity(restore);
+    }
 }
