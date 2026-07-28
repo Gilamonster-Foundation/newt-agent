@@ -1488,8 +1488,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // stop exploring and call edit_file or write_file.  This breaks the
         // "endless exploration → empty response" failure mode seen with some
         // local models (e.g. nemotron3:33b).
-        const READ_ONLY_NUDGE_AFTER: usize = 3;
-        if action_nudges && read_only_rounds >= READ_ONLY_NUDGE_AFTER {
+        // The action-forcing threshold is now a `Tenacity` level rather than a
+        // magic constant (#tenacity). `Standard` preserves the historical value
+        // of 3; config + per-family wiring that lets an operator raise it lands
+        // in a follow-up, plugging into exactly this seam.
+        let read_only_nudge_after = crate::tenacity::Tenacity::Standard.read_only_nudge_after();
+        if action_nudges && read_only_rounds >= read_only_nudge_after {
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             // Sustained read-only exploration on a task that classifies as a
             // diagnose/fix workflow is exactly the shape `crew`/`team`
