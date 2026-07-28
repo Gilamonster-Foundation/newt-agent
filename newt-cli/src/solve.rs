@@ -104,30 +104,31 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // 6. Emit the trace record (one JSONL line), including the per-tool-call
     //    trajectory (name/args-digest/ok/duration) the TurnDriver now lends —
     //    the material for the failure taxonomy.
-    let (status, reply_chars, usage, halluc, error) = match &outcome {
-        Ok(o) => (
-            "completed",
-            o.reply.len(),
-            o.usage.as_ref().map(|u| u.total()),
-            o.hallucinations,
-            None,
-        ),
-        Err(e) => ("failed", 0, None, 0, Some(e.clone())),
+    // A part-way inference failure now arrives as `Ok(o)` with `o.error` set —
+    // so its PARTIAL trajectory is preserved (an infra failure must not report
+    // the agent as having done nothing). `Err` is only a spawn/thread failure
+    // with no trajectory at all.
+    let o_opt = outcome.as_ref().ok();
+    let (status, error) = match &outcome {
+        Ok(o) if o.error.is_none() => ("completed", None),
+        Ok(o) => ("failed", o.error.clone()),
+        Err(e) => ("failed", Some(e.clone())),
     };
+    let reply_chars = o_opt.map(|o| o.reply.len()).unwrap_or(0);
+    let usage = o_opt.and_then(|o| o.usage.as_ref().map(|u| u.total()));
+    let halluc = o_opt.map(|o| o.hallucinations).unwrap_or(0);
     // The per-tool trajectory — the material for the failure taxonomy. The
     // single highest-signal field is `write_calls`: a failed task with 0 writes
-    // never ACTED (the tenacity target); with writes it acted but wrong.
-    let (tool_calls, write_calls, end_reason, trajectory) = match &outcome {
-        Ok(o) => {
+    // never ACTED (the tenacity target); with writes it acted but wrong. Only
+    // newt's real workspace-write tools count — `write_file`/`edit_file` (the
+    // `is_workspace_write_call` set); aliases like `create_file`/`str_replace`/
+    // `apply_patch` get a coaching reply and never modify the tree.
+    let (tool_calls, write_calls, end_reason, trajectory) = match o_opt {
+        Some(o) => {
             let names: Vec<&str> = o.tool_events.iter().map(|e| e.tool.as_str()).collect();
             let writes = names
                 .iter()
-                .filter(|n| {
-                    matches!(
-                        **n,
-                        "write_file" | "edit_file" | "create_file" | "str_replace" | "apply_patch"
-                    )
-                })
+                .filter(|n| matches!(**n, "write_file" | "edit_file"))
                 .count();
             (
                 names.len(),
@@ -136,7 +137,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 serde_json::to_value(&o.tool_events).unwrap_or(serde_json::Value::Null),
             )
         }
-        Err(_) => (0, 0, "None".to_string(), serde_json::Value::Null),
+        None => (0, 0, "None".to_string(), serde_json::Value::Null),
     };
     let record = serde_json::json!({
         "kind": "solve_result",
@@ -167,7 +168,10 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // Always echo the record to stdout too, so a manual bootstrap run is legible.
     println!("{record}");
 
-    Ok(if outcome.is_ok() { 0 } else { 1 })
+    // Clean completion → 0; any failure (inference error carried on the outcome,
+    // or a spawn/thread Err) → 1.
+    let clean = matches!(&outcome, Ok(o) if o.error.is_none());
+    Ok(if clean { 0 } else { 1 })
 }
 
 /// Pick the backend to drive: `NEWT_PROVIDER` by name if set and present, else

@@ -229,6 +229,11 @@ pub struct TurnOutcome {
     /// Why the turn ended (genuine completion vs round-cap vs empty), when the
     /// loop set it.
     pub end_reason: Option<crate::TurnEndReason>,
+    /// The inference/loop error, when the turn failed part-way. `Some` means the
+    /// turn did NOT complete cleanly — but `reply`/`usage` may be empty while
+    /// `tool_events` still holds whatever the agent did *before* the error (an
+    /// infrastructure failure must not erase the partial trajectory).
+    pub error: Option<String>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -547,6 +552,11 @@ async fn run_one_turn(
     } else {
         chat_complete(ctx, &mut mcp).await
     };
+    // Both arms move `tool_events`/`end_reason` out (only one arm runs). On a
+    // failed turn we still return `Ok` carrying the PARTIAL trajectory + the
+    // error, rather than `Err` that discards what the agent already did — an
+    // infrastructure failure (e.g. a context-window 500) must not misreport the
+    // agent as having done nothing.
     match dispatch {
         Ok((reply, was_streamed, usage, hallucinations)) => Ok(TurnOutcome {
             reply,
@@ -555,8 +565,17 @@ async fn run_one_turn(
             hallucinations,
             tool_events,
             end_reason,
+            error: None,
         }),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Ok(TurnOutcome {
+            reply: String::new(),
+            was_streamed: false,
+            usage: None,
+            hallucinations: 0,
+            tool_events,
+            end_reason,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
