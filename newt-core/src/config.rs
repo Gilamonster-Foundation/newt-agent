@@ -130,6 +130,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsConfig>,
 
+    /// `[tenacity]` — how hard the harness pushes the model from reading to
+    /// acting: a baseline level plus per-model-family overrides. `None` → the
+    /// behaviour-preserving `Standard`. An explicit `--tenacity` supersedes it.
+    /// See [`crate::tenacity::TenacityConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenacity: Option<crate::tenacity::TenacityConfig>,
+
     /// `[tool_exposure]` — the progressive tool-schema controller (Pass 1).
     /// `None` → [`ExposureProfile::Full`] (identity; advertise the full
     /// authorized catalog). See [`ToolExposureConfig`].
@@ -3287,6 +3294,7 @@ impl Default for Config {
             intake: None,
             context: None,
             tools: None,
+            tenacity: None,
             tool_exposure: None,
             pricing: None,
             memory: None,
@@ -3453,6 +3461,10 @@ impl Config {
         crate::agentic::set_max_output_tokens(cfg.max_output_tokens());
         crate::agentic::set_output_head_tokens(cfg.output_head_tokens());
         crate::agentic::set_output_cap_chars_per_token(cfg.output_cap_chars_per_token());
+        // #tenacity: publish the resolved `[tenacity]` config so `effective_tenacity`
+        // can pick the per-family default for the active model. An explicit
+        // `--tenacity` still supersedes it (resolved in `effective_tenacity`).
+        crate::tenacity::set_tenacity_config(cfg.tenacity.clone().unwrap_or_default());
         // #880: publish the repo `[lifecycle]` overrides the same way — the single
         // canonical config-application entry — so the crew's normalize (and future
         // phase consumers) honor `.newt/config.toml`.
