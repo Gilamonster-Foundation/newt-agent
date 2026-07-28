@@ -55,6 +55,13 @@ exclude = ["newt-mesh", "newt-web"]
 # landed since 0.7.3 but the version never moved, so a stale pre-verbs build
 # was indistinguishable from a current one at `newt --version`. 0.8.0 is
 # deliberately reserved for a larger release.
+# 0.7.5: bug-fix bump so the fixed build is distinguishable from the 0.7.4 that
+# shipped two now-fixed defects — #1466 (working-set protection: pin the
+# most-recent read compaction-immune so a refactor target survives to the edit)
+# and #1467 (a probe drop-in no longer clears config-declared backend tiers,
+# which had silently rerouted sessions to a local ollama model; adds `--backend-*`
+# CLI flags to pin any backend setting). A stale 0.7.4 mistaken for a current one
+# wasted a live-drive measurement — this bump removes that ambiguity.
 version = "0.7.5"
 edition = "2021"
 # MSRV 1.75 -> 1.88. The old "1.75" was already STALE: the current lock needs
