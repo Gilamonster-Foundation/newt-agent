@@ -53,9 +53,17 @@ pub fn is_context_overflow(msg: &str) -> bool {
 ///
 /// When a budget IS known, shrink to [`SHRINK_PCT`]% of the smallest known
 /// ceiling (`send_budget` = the current input budget; `num_ctx_ceiling` = the
-/// per-request `num_ctx` ceiling on wires that send one), floored at
-/// [`MIN_DERIVED_CAP`]. Repeated overflows tighten monotonically because the
-/// caller stores the returned cap back into `send_budget`.
+/// per-request `num_ctx` ceiling on wires that send one), but never below
+/// [`MIN_DERIVED_CAP`] (a request can't be made viably smaller than the
+/// irreducible system/card head).
+///
+/// The returned cap is ALWAYS strictly smaller than the budget that just
+/// overflowed — so the caller, which stores it back into `send_budget`, tightens
+/// monotonically. When even the floored value can't stay below `base` (i.e.
+/// `base <= MIN_DERIVED_CAP`), there is no smaller viable budget to retry with,
+/// so return `None` and let the error surface — rather than RAISE the budget to
+/// the floor (which would enlarge the prompt after an overflow) or stall at a
+/// no-progress fixed point.
 pub fn core_recover_overflow(
     msg: &str,
     send_budget: Option<usize>,
@@ -69,10 +77,16 @@ pub fn core_recover_overflow(
         (Some(a), None) | (None, Some(a)) => a,
         (None, None) => return None,
     };
-    // u64 math avoids overflow on a large budget; the result is a token count
-    // that always fits u32 (backend windows are millions at most).
-    let derived = (base as u64 * SHRINK_PCT / 100).min(u32::MAX as u64) as u32;
-    Some(derived.max(MIN_DERIVED_CAP))
+    // Shrink to SHRINK_PCT% of the overflowed budget, but not below the floor.
+    // saturating_mul guards the (unreachable) u64 overflow on a huge budget.
+    let derived = ((base as u64).saturating_mul(SHRINK_PCT) / 100).max(MIN_DERIVED_CAP as u64);
+    // The cap must STRICTLY tighten; if flooring pushed it up to/over `base`
+    // there is nothing smaller to try — give up instead of raising the budget.
+    if derived >= base as u64 {
+        return None;
+    }
+    // Saturate rather than wrap for the (unreachable) multi-billion-token budget.
+    Some(derived.min(u32::MAX as u64) as u32)
 }
 
 #[cfg(test)]
@@ -136,10 +150,41 @@ mod tests {
     }
 
     #[test]
-    fn recovery_floors_at_min_cap() {
+    fn recovery_pins_to_floor_just_above_it_then_gives_up() {
         let msg = "Context size has been exceeded";
-        // 100 * 80% = 80, floored to MIN_DERIVED_CAP.
-        assert_eq!(core_recover_overflow(msg, Some(100), None), Some(1024));
+        // Just above the floor band: 80% would dip under MIN_DERIVED_CAP, so the
+        // cap is pinned to the floor — still a STRICT tighten (1024 < base),
+        // never a raise. (Regression guard: the earlier `.max()` form and the
+        // first "return None below the floor" form both got this band wrong.)
+        assert_eq!(core_recover_overflow(msg, Some(1_279), None), Some(1_024));
+        assert_eq!(core_recover_overflow(msg, Some(1_280), None), Some(1_024));
+        assert_eq!(core_recover_overflow(msg, Some(1_025), None), Some(1_024));
+        // At/below the floor there is no smaller viable budget → give up (None),
+        // NEVER raise to 1024 (the cursor-bugbot case) or stall at a fixed point.
+        assert_eq!(core_recover_overflow(msg, Some(1_024), None), None);
+        assert_eq!(core_recover_overflow(msg, Some(100), None), None);
+        assert_eq!(core_recover_overflow(msg, Some(0), None), None);
+    }
+
+    #[test]
+    fn recovery_never_raises_the_budget() {
+        // Invariant: every returned cap is STRICTLY less than the overflowed
+        // budget and at least the floor — a recovery may only tighten.
+        let msg = "Context size has been exceeded";
+        for base in [
+            1_025usize,
+            1_280,
+            2_000,
+            8_000,
+            24_000,
+            100_000,
+            u32::MAX as usize,
+        ] {
+            if let Some(cap) = core_recover_overflow(msg, Some(base), None) {
+                assert!((cap as usize) < base, "cap {cap} !< base {base}");
+                assert!(cap >= 1_024, "cap {cap} below floor for base {base}");
+            }
+        }
     }
 
     #[test]
