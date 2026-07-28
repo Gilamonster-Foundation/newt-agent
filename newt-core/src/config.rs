@@ -3403,6 +3403,17 @@ impl Config {
                             if backend.api_key_file.is_none() {
                                 backend.api_key_file = existing.api_key_file.clone();
                             }
+                            // Same contract for tier assignment: probing records
+                            // reality (endpoint / model / api / serving) but never
+                            // tiers — tiers are an operator choice, so the adopt
+                            // writeback always emits `tiers = []`. An empty
+                            // drop-in `tiers` must not CLEAR the tiers the config
+                            // declared, or the backend serves no tier after the
+                            // first writeback and newt silently falls back to an
+                            // auto-discovered local backend.
+                            if backend.tiers.is_empty() {
+                                backend.tiers = existing.tiers.clone();
+                            }
                             *existing = backend;
                         }
                         None => self.backends.push(backend),
@@ -5421,6 +5432,44 @@ mod tests {
             b.api_key_file.as_deref(),
             Some("/vault/openai"),
             "config-declared api_key_file must survive a keyless probe drop-in"
+        );
+    }
+
+    #[test]
+    fn dropin_probe_cache_preserves_config_declared_tiers() {
+        // Regression (2026-07-27, steering-regressions): the adopt writeback
+        // records probed endpoint/model/api/serving but NOT tiers — tier
+        // assignment is an operator choice, never a probed property — so the
+        // drop-in carries `tiers = []`. The load-merge must PRESERVE the
+        // config's tiers, not clear them. Otherwise the backend serves NO tier
+        // after the first adopt writeback, and newt silently falls back to an
+        // auto-discovered local backend: a live eval drive configured for a 30B
+        // model on the remote router instead ran a 9B model on local ollama,
+        // grinding the local GPU while the remote box sat idle.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("eval.toml"),
+            "endpoint = \"http://router:8080\"\nmodel = \"big-30b\"\nkind = \"openai\"\ntiers = []\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "eval".into(),
+                endpoint: "http://router:8080".into(),
+                model: Some("big-30b".into()),
+                kind: Some(BackendKind::Openai),
+                tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg.merge_backends_from_dir(dir.path());
+        let b = cfg.backends.iter().find(|b| b.name == "eval").unwrap();
+        assert_eq!(b.model.as_deref(), Some("big-30b"), "probed model applied");
+        assert_eq!(
+            b.tiers,
+            vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+            "config-declared tiers must survive a probe drop-in that omits them (tiers=[])"
         );
     }
 
