@@ -27,6 +27,16 @@ pub struct ToolsConfig {
     /// `max_output_tokens` are clamped to pure-head.
     #[serde(default = "default_output_head_tokens")]
     pub output_head_tokens: usize,
+
+    /// Conservative chars/token used to SIZE the output cap — distinct from the
+    /// 4 c/t context estimate. Dense tool output (hex, base64, minified JSON,
+    /// columnar data) tokenizes denser than prose, so a cap sized at 4 c/t
+    /// admits more real tokens than its budget and can overrun a served window
+    /// on its own. Default 3 keeps a capped result at/under its token budget for
+    /// dense content. Lower it (e.g. 2) for very dense workloads; 4 matches the
+    /// estimate (no conservatism). Clamped to a minimum of 1.
+    #[serde(default = "default_output_cap_chars_per_token")]
+    pub output_cap_chars_per_token: usize,
 }
 
 impl Default for ToolsConfig {
@@ -34,6 +44,7 @@ impl Default for ToolsConfig {
         Self {
             max_output_tokens: default_max_output_tokens(),
             output_head_tokens: default_output_head_tokens(),
+            output_cap_chars_per_token: default_output_cap_chars_per_token(),
         }
     }
 }
@@ -44,4 +55,8 @@ pub(crate) fn default_max_output_tokens() -> usize {
 
 pub(crate) fn default_output_head_tokens() -> usize {
     1_500
+}
+
+pub(crate) fn default_output_cap_chars_per_token() -> usize {
+    3
 }

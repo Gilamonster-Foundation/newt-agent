@@ -263,8 +263,8 @@ pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
     filter_tools_for_disposition, full_access_requested, ocap_disabled, persona_tool_allowed,
-    plan_phase_clamp, set_max_output_tokens, set_output_head_tokens, tool_allowed,
-    tool_definitions, venv_cmd_prefix, ExposureSettings,
+    plan_phase_clamp, set_max_output_tokens, set_output_cap_chars_per_token,
+    set_output_head_tokens, tool_allowed, tool_definitions, venv_cmd_prefix, ExposureSettings,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
