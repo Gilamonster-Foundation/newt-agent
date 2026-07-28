@@ -28,6 +28,7 @@ mod models_cmd;
 mod new_project;
 mod ocap_cmd;
 mod skills;
+mod solve;
 pub mod stack;
 pub mod stdio_guard;
 mod summarizer_cmd;
@@ -597,6 +598,28 @@ pub enum Command {
     Ocap {
         #[command(subcommand)]
         cmd: ocap_cmd::OcapCmd,
+    },
+    /// Solve one task HEADLESS and emit a trace (Terminal-Bench / #1419). Drives
+    /// the same agentic loop the TUI runs, non-interactively, and exits. Reads
+    /// the task from `--instruction-file`, runs in `--cwd`, and appends a JSONL
+    /// trace to `--events`. `--non-interactive` (the default here) runs OCAP-off
+    /// + full-access with no prompts — the benchmark bootstrap lane.
+    Solve {
+        /// Workspace directory the agent runs against (default: current dir).
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+        /// File whose contents are the task instruction.
+        #[arg(long, value_name = "FILE")]
+        instruction_file: PathBuf,
+        /// Run OCAP-off + full-access with no prompts (default true).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        non_interactive: bool,
+        /// Append a JSONL trace record here.
+        #[arg(long, value_name = "FILE")]
+        events: Option<PathBuf>,
+        /// Override the max tool-call rounds for this solve.
+        #[arg(long, value_name = "N")]
+        max_rounds: Option<usize>,
     },
     /// Print resolved config.
     Config,
@@ -1288,6 +1311,28 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Ocap { cmd } => {
             let code = ocap_cmd::run(cmd, cli.config.as_deref())?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Solve {
+            cwd,
+            instruction_file,
+            non_interactive,
+            events,
+            max_rounds,
+        } => {
+            let code = solve::run(solve::SolveArgs {
+                cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
+                instruction_file,
+                // The pinned benchmark profile is the global `--config <FILE>`.
+                profile: cli.config.clone(),
+                non_interactive,
+                events,
+                max_rounds,
+            })
+            .await?;
             if code != 0 {
                 std::process::exit(code);
             }
