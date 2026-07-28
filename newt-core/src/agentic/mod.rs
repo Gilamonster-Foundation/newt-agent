@@ -1397,7 +1397,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // "I'm genuinely finished" defense loop (#1158) gets seeded.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
     let workflow_steerer = crate::WorkflowSteerer::load_default();
-    let mut workflow_runtime = WorkflowRuntimeState::default();
+    let mut workflow_runtime = WorkflowRuntimeState {
+        tenacity: crate::tenacity::effective_tenacity(),
+        ..Default::default()
+    };
     // The matching workflow's round-cap grace horizon override, resolved once
     // from the turn's opening context (diagnostic workflows need more
     // read-only rounds between checkpoints than routine edits — see
@@ -1488,8 +1491,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // stop exploring and call edit_file or write_file.  This breaks the
         // "endless exploration → empty response" failure mode seen with some
         // local models (e.g. nemotron3:33b).
-        const READ_ONLY_NUDGE_AFTER: usize = 3;
-        if action_nudges && read_only_rounds >= READ_ONLY_NUDGE_AFTER {
+        // The action-forcing threshold is now a `Tenacity` level rather than a
+        // magic constant (#tenacity). `Standard` preserves the historical value
+        // of 3; config + per-family wiring that lets an operator raise it lands
+        // in a follow-up, plugging into exactly this seam.
+        let read_only_nudge_after = crate::tenacity::Tenacity::Standard.read_only_nudge_after();
+        if action_nudges && read_only_rounds >= read_only_nudge_after {
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             // Sustained read-only exploration on a task that classifies as a
             // diagnose/fix workflow is exactly the shape `crew`/`team`
@@ -3050,6 +3057,14 @@ struct WorkflowRuntimeState {
     progress_horizon_rounds: Option<usize>,
     step_lock_nudges: usize,
     rediscovery_nudges: usize,
+    /// How hard to push the model from reading to acting (#tenacity). Set once
+    /// per turn from [`crate::tenacity::effective_tenacity`]; `Default` is
+    /// `Standard`, the behaviour-preserving level.
+    tenacity: crate::tenacity::Tenacity,
+    /// Consecutive tool rounds this turn that modified nothing in the workspace.
+    /// Reset on any workspace-write round; drives the tenacity action-forcing
+    /// nudge.
+    consecutive_read_only_rounds: usize,
 }
 
 impl WorkflowRuntimeState {
@@ -3091,6 +3106,15 @@ impl WorkflowRuntimeState {
     }
 
     fn record_round_outcome(&mut self, round_wrote: bool, round_progress: bool) {
+        // Tenacity counter (#tenacity): consecutive rounds that changed nothing
+        // in the workspace. Unconditional — independent of the error-evidence
+        // workflow below — so it drives action-forcing on ANY task, not only
+        // diagnosed failures.
+        if round_wrote {
+            self.consecutive_read_only_rounds = 0;
+        } else {
+            self.consecutive_read_only_rounds = self.consecutive_read_only_rounds.saturating_add(1);
+        }
         if round_progress {
             self.rounds_since_progress = Some(0);
         } else if let Some(rounds) = self.rounds_since_progress.as_mut() {
@@ -3125,6 +3149,32 @@ impl WorkflowRuntimeState {
             evidence.observations,
             active_step_description(step_ledger).as_deref(),
         ))
+    }
+
+    /// Tenacity action-forcing nudge (#tenacity): once the model has spent the
+    /// tenacity level's budget of consecutive read-only rounds without touching
+    /// the workspace, inject the standard "stop exploring, make the change" nudge
+    /// and reset the counter so it re-accumulates before firing again. This is
+    /// the answer to the measured ceiling where a capable model reads/plans for
+    /// its whole budget and never edits. `Standard` (budget 3) reproduces the
+    /// historical Ollama-loop threshold; higher tenacity forces sooner.
+    fn action_forcing_nudge(
+        &mut self,
+        remaining_rounds: usize,
+        step_ledger: Option<&dyn scheduled::StepLedger>,
+        delegate_hint: Option<&str>,
+    ) -> Option<String> {
+        if self.consecutive_read_only_rounds < self.tenacity.read_only_nudge_after() {
+            return None;
+        }
+        let nudge = read_only_action_nudge(
+            self.consecutive_read_only_rounds,
+            remaining_rounds,
+            step_ledger,
+            delegate_hint,
+        );
+        self.consecutive_read_only_rounds = 0;
+        Some(nudge)
     }
 
     fn rediscovery_nudge(
@@ -4673,7 +4723,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // #1152/#1162: same intent gate as the primary loop — see the comment there.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
     let workflow_steerer = crate::WorkflowSteerer::load_default();
-    let mut workflow_runtime = WorkflowRuntimeState::default();
+    let mut workflow_runtime = WorkflowRuntimeState {
+        tenacity: crate::tenacity::effective_tenacity(),
+        ..Default::default()
+    };
     // See the Ollama path: a matching workflow's grace-horizon override.
     workflow_runtime.set_progress_horizon(
         workflow_steerer.progress_horizon(&workflow_classifier_text(&messages, "")),
@@ -4733,6 +4786,24 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
+                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+            }
+            // Tenacity action-forcing (#tenacity): the OpenAI-chat loop had no
+            // read-only action nudge (only the Ollama loop did), so a model
+            // driven here could read/plan its whole budget without ever editing.
+            // Fire the tenacity nudge once the read-only budget is spent.
+            let remaining = current_tool_round_limit.saturating_sub(round + 1);
+            if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
+            {
+                if debug {
+                    print_debug(
+                        &format!(
+                            "tenacity[{}]: forcing action, read-only budget spent (round {round})",
+                            workflow_runtime.tenacity
+                        ),
+                        color,
+                    );
+                }
                 messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
         }
@@ -6651,6 +6722,48 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
         assert!(fp.contains("newt-tui/src/help_sections.rs:523:22"), "{fp}");
         assert!(fp.contains("error[E0425]"), "{fp}");
         assert!(fp.contains("SECTION_PROMPT_TOKENS"), "{fp}");
+    }
+
+    #[test]
+    fn tenacity_action_forcing_nudge_fires_at_the_budget_and_resets_on_a_write() {
+        // #tenacity: the action-forcing nudge fires once the model has spent the
+        // tenacity level's budget of consecutive read-only rounds, and a
+        // workspace write resets the counter. This is what gives the OpenAI-chat
+        // loop (which had no read-only nudge) a push from reading to acting.
+        let mut state = WorkflowRuntimeState {
+            tenacity: crate::tenacity::Tenacity::Relentless, // budget 1
+            ..Default::default()
+        };
+        // Nothing spent yet → no nudge.
+        assert!(state.action_forcing_nudge(5, None, None).is_none());
+        // One read-only round → at the Relentless budget → fires.
+        state.record_round_outcome(false, false);
+        let nudge = state
+            .action_forcing_nudge(5, None, None)
+            .expect("relentless tenacity must force action after one read-only round");
+        assert!(nudge.contains("edit_file or write_file"), "{nudge}");
+        // Firing resets the counter; a follow-up read-only round re-accumulates.
+        assert!(state.action_forcing_nudge(5, None, None).is_none());
+        state.record_round_outcome(false, false);
+        assert!(state.action_forcing_nudge(5, None, None).is_some());
+        // A workspace-write round clears the counter entirely.
+        state.record_round_outcome(true, true);
+        assert!(
+            state.action_forcing_nudge(5, None, None).is_none(),
+            "a write must reset the read-only streak"
+        );
+
+        // Standard tenacity preserves the historical budget of 3.
+        let mut standard = WorkflowRuntimeState::default();
+        for _ in 0..2 {
+            standard.record_round_outcome(false, false);
+        }
+        assert!(
+            standard.action_forcing_nudge(5, None, None).is_none(),
+            "standard must not fire before 3 read-only rounds"
+        );
+        standard.record_round_outcome(false, false);
+        assert!(standard.action_forcing_nudge(5, None, None).is_some());
     }
 
     #[test]

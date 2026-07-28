@@ -149,6 +149,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "LEVEL", value_parser = ["doer", "coach", "advise"])]
     pub altitude: Option<String>,
 
+    /// Tenacity (#tenacity): how hard the harness pushes the model from reading
+    /// to ACTING — `relaxed` | `standard` | `insistent` | `relentless`. Higher
+    /// forces an edit sooner (nudge after 6/3/2/1 read-only rounds) and makes
+    /// plan-mode exit hand off to a mandatory edit. Default `standard`
+    /// (behaviour-preserving). Small models that over-explore benefit from
+    /// `insistent`/`relentless`.
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
+    pub tenacity: Option<newt_core::Tenacity>,
+
     /// Run with NO conversation persistence: nothing is auto-resumed, no
     /// conversation row is created, and no turn is saved. Equivalent to
     /// setting `NEWT_EPHEMERAL=1`. Takes precedence over
@@ -413,6 +422,10 @@ fn parse_tier(s: &str) -> Result<newt_core::Tier, String> {
         "REVIEW" => Ok(Tier::Review),
         _ => Err(format!("unknown tier '{s}' (FAST|STANDARD|COMPLEX|REVIEW)")),
     }
+}
+
+fn parse_tenacity(s: &str) -> Result<newt_core::Tenacity, String> {
+    s.parse()
 }
 
 fn parse_backend_kind(s: &str) -> Result<newt_core::config::BackendKind, String> {
@@ -911,6 +924,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 unsafe { std::env::set_var("NEWT_PROVIDER", provider) };
             }
         }
+    }
+
+    // CLI `--tenacity`: install the process-global action-forcing level the
+    // agentic loop reads when it builds each turn's WorkflowRuntimeState.
+    if let Some(level) = cli.tenacity {
+        newt_core::tenacity::set_cli_tenacity(level);
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
