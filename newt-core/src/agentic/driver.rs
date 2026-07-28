@@ -221,6 +221,19 @@ pub struct TurnOutcome {
     pub usage: Option<TokenUsage>,
     /// Count of hallucinated (non-existent) tool calls the loop saw.
     pub hallucinations: u32,
+    /// Per-tool-call trace of the turn (name, args-digest, ok, duration) — the
+    /// trajectory a headless consumer (`newt solve` / Terminal-Bench) serializes
+    /// to reason about what the agent actually did. Empty when the loop produced
+    /// no tool calls.
+    pub tool_events: Vec<crate::ToolEvent>,
+    /// Why the turn ended (genuine completion vs round-cap vs empty), when the
+    /// loop set it.
+    pub end_reason: Option<crate::TurnEndReason>,
+    /// The inference/loop error, when the turn failed part-way. `Some` means the
+    /// turn did NOT complete cleanly — but `reply`/`usage` may be empty while
+    /// `tool_events` still holds whatever the agent did *before* the error (an
+    /// infrastructure failure must not erase the partial trajectory).
+    pub error: Option<String>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -423,6 +436,11 @@ async fn run_one_turn(
     messages: &[MemMessage],
     task: &str,
 ) -> Result<TurnOutcome, String> {
+    // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
+    // borrows these mutably; the borrows release when `ctx` is consumed by the
+    // await below, after which they move into the TurnOutcome.
+    let mut tool_events: Vec<crate::ToolEvent> = Vec::new();
+    let mut end_reason: Option<crate::TurnEndReason> = None;
     let ctx = ChatCtx {
         url: &config.url,
         model: &config.model,
@@ -501,9 +519,9 @@ async fn run_one_turn(
         memory_source: None,
         summarizer: None,
         compress_state: None,
-        tool_events: None,
+        tool_events: Some(&mut tool_events),
         phantom_reaches: None,
-        end_reason: None,
+        end_reason: Some(&mut end_reason),
         permission_gate: None,
         // Phase 20 (spec §5): headless surfaces neither read nor write the
         // capability cache — the hook stays absent and no calibration is
@@ -534,14 +552,30 @@ async fn run_one_turn(
     } else {
         chat_complete(ctx, &mut mcp).await
     };
+    // Both arms move `tool_events`/`end_reason` out (only one arm runs). On a
+    // failed turn we still return `Ok` carrying the PARTIAL trajectory + the
+    // error, rather than `Err` that discards what the agent already did — an
+    // infrastructure failure (e.g. a context-window 500) must not misreport the
+    // agent as having done nothing.
     match dispatch {
         Ok((reply, was_streamed, usage, hallucinations)) => Ok(TurnOutcome {
             reply,
             was_streamed,
             usage,
             hallucinations,
+            tool_events,
+            end_reason,
+            error: None,
         }),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Ok(TurnOutcome {
+            reply: String::new(),
+            was_streamed: false,
+            usage: None,
+            hallucinations: 0,
+            tool_events,
+            end_reason,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
