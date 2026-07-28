@@ -2881,6 +2881,150 @@ impl BackendConfig {
     }
 }
 
+/// CLI-supplied backend override (`newt --backend-*` flags). Each field mirrors
+/// an operator-settable [`BackendConfig`] field; `None` means "not set on the
+/// command line". Applied LAST in [`Config::resolve`] so it wins over disk
+/// drop-ins and localhost discovery — the explicit, per-invocation escape hatch
+/// for "use EXACTLY this backend", which no probe write-back or auto-discovery
+/// can then override. Set once from the CLI via [`set_cli_backend_override`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BackendOverride {
+    /// Backend name (default `"cli"`). Names the exclusive backend, or selects
+    /// which existing backend a field-only override targets.
+    pub name: Option<String>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub model_path: Option<String>,
+    pub tiers: Option<Vec<Tier>>,
+    pub kind: Option<BackendKind>,
+    pub api: Option<OpenAiApi>,
+    pub api_key_env: Option<String>,
+    pub api_key_file: Option<String>,
+    pub serving: Option<Serving>,
+    pub host: Option<String>,
+    pub coexist: Option<bool>,
+    pub ram_gib: Option<f64>,
+    pub card: Option<String>,
+}
+
+impl BackendOverride {
+    /// True when no `--backend-*` flag was set (the common case) — [`apply`] is
+    /// then a no-op.
+    ///
+    /// [`apply`]: Self::apply
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Apply to a resolved config.
+    ///
+    /// When a destination is given (`endpoint` or `model_path`), the override
+    /// defines an **exclusive** backend that REPLACES all others — so CLI intent
+    /// beats disk drop-ins and localhost discovery, and no later probe write-back
+    /// can misroute the session. Tiers default to all four when unset so the
+    /// backend actually serves. Without a destination the provided fields
+    /// **override in place** the backend named by `name` (else the first
+    /// backend), e.g. `--backend-model` to swap only the model.
+    pub fn apply(&self, cfg: &mut Config) {
+        if self.is_empty() {
+            return;
+        }
+        let name = self.name.clone().unwrap_or_else(|| "cli".to_string());
+        let has_destination = self.endpoint.is_some() || self.model_path.is_some();
+
+        if has_destination {
+            let mut backend = cfg
+                .backends
+                .iter()
+                .find(|b| b.name == name)
+                .cloned()
+                .unwrap_or_else(|| BackendConfig {
+                    name: name.clone(),
+                    ..Default::default()
+                });
+            backend.name = name;
+            self.overlay(&mut backend);
+            if backend.tiers.is_empty() {
+                backend.tiers = vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review];
+            }
+            cfg.backends = vec![backend];
+            return;
+        }
+
+        // Field-only override: mutate the named backend (else the first) in place.
+        let idx = match self.name.as_deref() {
+            Some(n) => cfg.backends.iter().position(|b| b.name == n),
+            None => (!cfg.backends.is_empty()).then_some(0),
+        };
+        if let Some(i) = idx {
+            self.overlay(&mut cfg.backends[i]);
+        }
+    }
+
+    /// Copy every set field onto `backend` (leaving unset fields untouched).
+    fn overlay(&self, backend: &mut BackendConfig) {
+        if let Some(v) = &self.endpoint {
+            backend.endpoint = v.clone();
+        }
+        if let Some(v) = &self.model {
+            backend.model = Some(v.clone());
+        }
+        if let Some(v) = &self.model_path {
+            backend.model_path = Some(v.clone());
+        }
+        if let Some(v) = &self.tiers {
+            backend.tiers = v.clone();
+        }
+        if let Some(v) = self.kind {
+            backend.kind = Some(v);
+        }
+        if let Some(v) = self.api {
+            backend.api = Some(v);
+        }
+        if let Some(v) = &self.api_key_env {
+            backend.api_key_env = Some(v.clone());
+        }
+        if let Some(v) = &self.api_key_file {
+            backend.api_key_file = Some(v.clone());
+        }
+        if let Some(v) = self.serving {
+            backend.serving = Some(v);
+        }
+        if let Some(v) = &self.host {
+            backend.host = Some(v.clone());
+        }
+        if let Some(v) = self.coexist {
+            backend.coexist = Some(v);
+        }
+        if let Some(v) = self.ram_gib {
+            backend.ram_gib = Some(v);
+        }
+        if let Some(v) = &self.card {
+            backend.card = Some(v.clone());
+        }
+    }
+}
+
+/// Process-global CLI backend override, set once from the CLI before any config
+/// resolution. Mirrors the other single-canonical-entry publishes in
+/// [`Config::resolve`] (max_output_tokens, scratch dir): the CLI can't thread a
+/// value through every `Config::resolve()` call site, so it stashes it here and
+/// `resolve` applies it.
+static CLI_BACKEND_OVERRIDE: std::sync::Mutex<Option<BackendOverride>> =
+    std::sync::Mutex::new(None);
+
+/// Install the CLI backend override (see [`BackendOverride`]). Call once, before
+/// the first [`Config::resolve`].
+pub fn set_cli_backend_override(over: BackendOverride) {
+    if let Ok(mut slot) = CLI_BACKEND_OVERRIDE.lock() {
+        *slot = Some(over);
+    }
+}
+
+fn cli_backend_override() -> Option<BackendOverride> {
+    CLI_BACKEND_OVERRIDE.lock().ok().and_then(|s| s.clone())
+}
+
 /// Dedicated configuration for the compression summarizer, loaded from
 /// `~/.newt/summarizer.toml` (Step 24.10, #559). An absent file means
 /// `SummarizerConfig::default()` — every field falls back to the session
@@ -3274,6 +3418,15 @@ impl Config {
         if cfg.backends.is_empty() {
             cfg.backends.push(fallback_localhost_backend());
         }
+        // CLI `--backend-*` flags win over disk drop-ins and localhost
+        // discovery: apply the process-global override LAST so an operator who
+        // pins a backend on the command line gets exactly it, and no probe
+        // write-back can silently reroute the session (the ollama-fallback
+        // incident). Applied here — the single canonical config-application
+        // entry — so every consumer (TUI, cowork, eval) honors it.
+        if let Some(over) = cli_backend_override() {
+            over.apply(&mut cfg);
+        }
         // Per-file bundles (the model-support-kit control surface): drop a
         // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
         cfg.merge_disk_bundles();
@@ -3402,6 +3555,17 @@ impl Config {
                             }
                             if backend.api_key_file.is_none() {
                                 backend.api_key_file = existing.api_key_file.clone();
+                            }
+                            // Same contract for tier assignment: probing records
+                            // reality (endpoint / model / api / serving) but never
+                            // tiers — tiers are an operator choice, so the adopt
+                            // writeback always emits `tiers = []`. An empty
+                            // drop-in `tiers` must not CLEAR the tiers the config
+                            // declared, or the backend serves no tier after the
+                            // first writeback and newt silently falls back to an
+                            // auto-discovered local backend.
+                            if backend.tiers.is_empty() {
+                                backend.tiers = existing.tiers.clone();
                             }
                             *existing = backend;
                         }
@@ -5422,6 +5586,128 @@ mod tests {
             Some("/vault/openai"),
             "config-declared api_key_file must survive a keyless probe drop-in"
         );
+    }
+
+    #[test]
+    fn dropin_probe_cache_preserves_config_declared_tiers() {
+        // Regression (2026-07-27, steering-regressions): the adopt writeback
+        // records probed endpoint/model/api/serving but NOT tiers — tier
+        // assignment is an operator choice, never a probed property — so the
+        // drop-in carries `tiers = []`. The load-merge must PRESERVE the
+        // config's tiers, not clear them. Otherwise the backend serves NO tier
+        // after the first adopt writeback, and newt silently falls back to an
+        // auto-discovered local backend: a live eval drive configured for a 30B
+        // model on the remote router instead ran a 9B model on local ollama,
+        // grinding the local GPU while the remote box sat idle.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("eval.toml"),
+            "endpoint = \"http://router:8080\"\nmodel = \"big-30b\"\nkind = \"openai\"\ntiers = []\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "eval".into(),
+                endpoint: "http://router:8080".into(),
+                model: Some("big-30b".into()),
+                kind: Some(BackendKind::Openai),
+                tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg.merge_backends_from_dir(dir.path());
+        let b = cfg.backends.iter().find(|b| b.name == "eval").unwrap();
+        assert_eq!(b.model.as_deref(), Some("big-30b"), "probed model applied");
+        assert_eq!(
+            b.tiers,
+            vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+            "config-declared tiers must survive a probe drop-in that omits them (tiers=[])"
+        );
+    }
+
+    #[test]
+    fn cli_backend_override_with_endpoint_is_exclusive_and_defaults_tiers() {
+        // A CLI-pinned endpoint defines the ONLY backend, discarding whatever
+        // discovery/drop-ins produced (the ollama-fallback escape hatch), and
+        // its tiers default to all four so it actually serves.
+        let mut cfg = Config {
+            backends: vec![
+                BackendConfig {
+                    name: "discovered-ollama".into(),
+                    endpoint: "http://localhost:11434".into(),
+                    kind: Some(BackendKind::Ollama),
+                    tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+                    ..Default::default()
+                },
+                fallback_localhost_backend(),
+            ],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            endpoint: Some("http://router:8080".into()),
+            model: Some("big-30b".into()),
+            kind: Some(BackendKind::Openai),
+            ..Default::default()
+        };
+        over.apply(&mut cfg);
+        assert_eq!(cfg.backends.len(), 1, "CLI endpoint is exclusive");
+        let b = &cfg.backends[0];
+        assert_eq!(b.name, "cli");
+        assert_eq!(b.endpoint, "http://router:8080");
+        assert_eq!(b.model.as_deref(), Some("big-30b"));
+        assert_eq!(b.kind, Some(BackendKind::Openai));
+        assert_eq!(
+            b.tiers,
+            vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+            "an exclusive CLI backend defaults to all tiers so it serves"
+        );
+    }
+
+    #[test]
+    fn cli_backend_override_field_only_edits_first_backend_in_place() {
+        // With no endpoint/model_path the override is a field edit, not a new
+        // backend: `--backend-model` swaps only the model of the primary backend.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "eval".into(),
+                endpoint: "http://router:8080".into(),
+                model: Some("old".into()),
+                kind: Some(BackendKind::Openai),
+                tiers: vec![Tier::Fast],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            model: Some("new-model".into()),
+            ..Default::default()
+        };
+        over.apply(&mut cfg);
+        assert_eq!(cfg.backends.len(), 1, "no new backend added");
+        assert_eq!(cfg.backends[0].name, "eval", "existing backend kept");
+        assert_eq!(cfg.backends[0].endpoint, "http://router:8080");
+        assert_eq!(cfg.backends[0].model.as_deref(), Some("new-model"));
+    }
+
+    #[test]
+    fn cli_backend_override_empty_is_a_noop() {
+        let mut cfg = Config {
+            backends: vec![fallback_localhost_backend()],
+            ..Default::default()
+        };
+        let before: Vec<(String, String)> = cfg
+            .backends
+            .iter()
+            .map(|b| (b.name.clone(), b.endpoint.clone()))
+            .collect();
+        BackendOverride::default().apply(&mut cfg);
+        let after: Vec<(String, String)> = cfg
+            .backends
+            .iter()
+            .map(|b| (b.name.clone(), b.endpoint.clone()))
+            .collect();
+        assert_eq!(after, before, "an empty override changes nothing");
     }
 
     #[test]
