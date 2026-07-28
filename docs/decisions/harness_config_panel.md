@@ -1,7 +1,7 @@
 # Decision: a footer-launched harness config panel (severable, TTY-only)
 
-**Status:** **Proposed** (awaiting decision by Shawn Hartsock) — an amendment to
-`docs/decisions/plain_scroller_tui.md`.
+**Status:** **Accepted** (decided by Shawn Hartsock, 2026-07-28) — an amendment
+to `docs/decisions/plain_scroller_tui.md`. Unblocks #14 (the panel itself).
 **Date:** 2026-07-28
 **Related:** `docs/decisions/plain_scroller_tui.md` (the plain-scroller doctrine
 this amends), `#416` (the rich inline input carve-out — the precedent),
@@ -78,7 +78,7 @@ command, the flag, or the config file.
 
 ## Decision requested
 
-Accept this carve-out so #14 (the harness panel itself) can be built against a
-documented seam, or reject/reshape it. Until accepted, the panel is not built;
-the tenacity dial remains fully usable via `--tenacity`, `[tenacity]` config, and
-`/tenacity` (shipped), and the footer shows the static indicator (#1480).
+**Accepted 2026-07-28 (Shawn Hartsock).** #14 (the harness panel itself) may be
+built against this documented seam. The tenacity dial is already usable via
+`--tenacity`, `[tenacity]` config, and `/tenacity`, with the static footer
+indicator (#1480); the panel makes it (and model-profile selection) navigable.

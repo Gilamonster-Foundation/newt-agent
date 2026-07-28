@@ -17,8 +17,8 @@ shows), #416 (two-mode rich inline input — the amendment), PR #419 (the
 `InputSurface` seam that makes it severable), `docs/decisions/mesh_integration.md`
 (newt as a mesh worker), `docs/decisions/live_spill_viewport.md` (the narrow
 active-tool live-output exception), `docs/decisions/harness_config_panel.md`
-(**PROPOSED** — a severable, TTY-only footer-launched config panel for operator
-dials; awaiting decision).
+(**Accepted 2026-07-28** — a severable, TTY-only footer-launched config panel for
+operator dials).
 
 ---
 
