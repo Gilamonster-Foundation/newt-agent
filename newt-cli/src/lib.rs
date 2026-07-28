@@ -292,9 +292,156 @@ pub struct Cli {
     #[arg(long = "write", global = true, value_name = "PATH")]
     pub write_paths: Vec<PathBuf>,
 
+    /// Backend override flags (`--backend-*`): pin the model backend from the
+    /// command line, bypassing discovery and probe drop-ins.
+    #[command(flatten)]
+    pub backend: BackendArgs,
+
     /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+/// `--backend-*` flags — set any backend field from the command line. Each
+/// mirrors an operator-settable [`newt_core::config::BackendConfig`] field. When
+/// an endpoint (or `--backend-model-path`) is given the flags define the sole,
+/// exclusive backend for the invocation, so no discovery or probe drop-in can
+/// reroute the session; otherwise the set fields override the selected backend
+/// in place (e.g. just `--backend-model`). Built into a
+/// [`newt_core::config::BackendOverride`] by [`Cli::backend_override`].
+#[derive(clap::Args, Debug, Default, Clone)]
+pub struct BackendArgs {
+    /// Backend endpoint URL. Setting this makes the CLI backend EXCLUSIVE:
+    /// discovery and probe drop-ins are bypassed for the session.
+    #[arg(long = "backend-endpoint", global = true, value_name = "URL")]
+    pub endpoint: Option<String>,
+
+    /// Model this backend serves (e.g. `qwen3-coder_30b`).
+    #[arg(long = "backend-model", global = true, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// For `--backend-kind embedded`: local GGUF model file path.
+    #[arg(long = "backend-model-path", global = true, value_name = "PATH")]
+    pub model_path: Option<String>,
+
+    /// Tiers this backend serves, comma-separated: FAST,STANDARD,COMPLEX,REVIEW
+    /// (case-insensitive). Default when creating an exclusive backend: all four.
+    #[arg(
+        long = "backend-tiers",
+        global = true,
+        value_name = "TIERS",
+        value_delimiter = ',',
+        value_parser = parse_tier
+    )]
+    pub tiers: Vec<newt_core::Tier>,
+
+    /// Wire protocol: `ollama`, `openai` (alias `vllm`), or `embedded`.
+    #[arg(long = "backend-kind", global = true, value_name = "KIND", value_parser = parse_backend_kind)]
+    pub kind: Option<newt_core::config::BackendKind>,
+
+    /// OpenAI HTTP surface: `chat_completions` or `responses`.
+    #[arg(long = "backend-api", global = true, value_name = "API", value_parser = parse_openai_api)]
+    pub api: Option<newt_core::config::OpenAiApi>,
+
+    /// Env var holding the bearer token (takes precedence over the file).
+    #[arg(long = "backend-api-key-env", global = true, value_name = "VAR")]
+    pub api_key_env: Option<String>,
+
+    /// File whose first non-empty line is the bearer token.
+    #[arg(long = "backend-api-key-file", global = true, value_name = "PATH")]
+    pub api_key_file: Option<String>,
+
+    /// Serving axis: `multiplexer` or `instance`.
+    #[arg(long = "backend-serving", global = true, value_name = "AXIS", value_parser = parse_serving)]
+    pub serving: Option<newt_core::config::Serving>,
+
+    /// Physical host of the endpoint, for same-host reasoning.
+    #[arg(long = "backend-host", global = true, value_name = "HOST")]
+    pub host: Option<String>,
+
+    /// Assert this host can run this backend alongside others (suppress the
+    /// same-host starvation rule).
+    #[arg(long = "backend-coexist", global = true, value_name = "BOOL")]
+    pub coexist: Option<bool>,
+
+    /// Host memory available for serving (GiB), for the crew fit-gate.
+    #[arg(long = "backend-ram-gib", global = true, value_name = "GIB")]
+    pub ram_gib: Option<f64>,
+
+    /// Model-card pointer for this backend.
+    #[arg(long = "backend-card", global = true, value_name = "CARD")]
+    pub card: Option<String>,
+
+    /// Backend name (default `cli`). Names the exclusive backend, or selects
+    /// which existing backend a field-only override targets.
+    #[arg(long = "backend-name", global = true, value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl BackendArgs {
+    /// Build the [`newt_core::config::BackendOverride`] these flags describe.
+    /// Unset flags stay `None`; an empty `--backend-tiers` stays `None` (not an
+    /// empty tier list), so a field-only override never accidentally clears
+    /// tiers.
+    pub fn to_override(&self) -> newt_core::config::BackendOverride {
+        newt_core::config::BackendOverride {
+            name: self.name.clone(),
+            endpoint: self.endpoint.clone(),
+            model: self.model.clone(),
+            model_path: self.model_path.clone(),
+            tiers: (!self.tiers.is_empty()).then(|| self.tiers.clone()),
+            kind: self.kind,
+            api: self.api,
+            api_key_env: self.api_key_env.clone(),
+            api_key_file: self.api_key_file.clone(),
+            serving: self.serving,
+            host: self.host.clone(),
+            coexist: self.coexist,
+            ram_gib: self.ram_gib,
+            card: self.card.clone(),
+        }
+    }
+}
+
+fn parse_tier(s: &str) -> Result<newt_core::Tier, String> {
+    use newt_core::Tier;
+    match s.trim().to_ascii_uppercase().as_str() {
+        "FAST" => Ok(Tier::Fast),
+        "STANDARD" => Ok(Tier::Standard),
+        "COMPLEX" => Ok(Tier::Complex),
+        "REVIEW" => Ok(Tier::Review),
+        _ => Err(format!("unknown tier '{s}' (FAST|STANDARD|COMPLEX|REVIEW)")),
+    }
+}
+
+fn parse_backend_kind(s: &str) -> Result<newt_core::config::BackendKind, String> {
+    use newt_core::config::BackendKind;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "ollama" => Ok(BackendKind::Ollama),
+        "openai" | "vllm" | "openai-compatible" => Ok(BackendKind::Openai),
+        "embedded" => Ok(BackendKind::Embedded),
+        _ => Err(format!(
+            "unknown backend kind '{s}' (ollama|openai|embedded)"
+        )),
+    }
+}
+
+fn parse_openai_api(s: &str) -> Result<newt_core::config::OpenAiApi, String> {
+    use newt_core::config::OpenAiApi;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "chat_completions" | "chat-completions" | "chat" => Ok(OpenAiApi::ChatCompletions),
+        "responses" => Ok(OpenAiApi::Responses),
+        _ => Err(format!("unknown api '{s}' (chat_completions|responses)")),
+    }
+}
+
+fn parse_serving(s: &str) -> Result<newt_core::config::Serving, String> {
+    use newt_core::config::Serving;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "multiplexer" | "mux" => Ok(Serving::Multiplexer),
+        "instance" => Ok(Serving::Instance),
+        _ => Err(format!("unknown serving '{s}' (multiplexer|instance)")),
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -721,6 +868,24 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         if v.eq_ignore_ascii_case("off") || v == "0" {
             unsafe {
                 std::env::remove_var(newt_core::denial_journal::DENIAL_JOURNAL_PATH_ENV);
+            }
+        }
+    }
+
+    // CLI `--backend-*` flags: install the process-global override so every
+    // Config::resolve honors it, and — when a destination is pinned — set
+    // NEWT_PROVIDER to the backend so the tier→backend selector picks exactly
+    // it. This is the explicit escape hatch against discovery/probe drop-ins
+    // silently rerouting the session (the local-ollama-fallback incident).
+    {
+        let over = cli.backend.to_override();
+        if !over.is_empty() {
+            let has_destination = over.endpoint.is_some() || over.model_path.is_some();
+            let provider = over.name.clone().unwrap_or_else(|| "cli".to_string());
+            newt_core::config::set_cli_backend_override(over);
+            if has_destination {
+                // SAFETY: single-threaded before the TUI starts any async work.
+                unsafe { std::env::set_var("NEWT_PROVIDER", provider) };
             }
         }
     }
@@ -1372,6 +1537,70 @@ async fn run_mcp(persona: Option<&str>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn backend_flags_parse_and_build_an_exclusive_override() {
+        let cli = Cli::try_parse_from([
+            "newt",
+            "--backend-endpoint",
+            "http://router:8080",
+            "--backend-model",
+            "qwen3-coder_30b",
+            "--backend-kind",
+            "openai",
+            "--backend-api",
+            "chat_completions",
+            "--backend-tiers",
+            "FAST,STANDARD,COMPLEX,REVIEW",
+            "--backend-api-key-file",
+            "/vault/token",
+        ])
+        .unwrap();
+        let over = cli.backend.to_override();
+        assert!(!over.is_empty());
+        assert_eq!(over.endpoint.as_deref(), Some("http://router:8080"));
+        assert_eq!(over.model.as_deref(), Some("qwen3-coder_30b"));
+        assert_eq!(over.kind, Some(newt_core::config::BackendKind::Openai));
+        assert_eq!(
+            over.api,
+            Some(newt_core::config::OpenAiApi::ChatCompletions)
+        );
+        assert_eq!(over.api_key_file.as_deref(), Some("/vault/token"));
+        assert_eq!(
+            over.tiers,
+            Some(vec![
+                newt_core::Tier::Fast,
+                newt_core::Tier::Standard,
+                newt_core::Tier::Complex,
+                newt_core::Tier::Review,
+            ])
+        );
+
+        // The override is exclusive and replaces discovered backends.
+        let mut cfg = newt_core::Config {
+            backends: vec![newt_core::config::BackendConfig {
+                name: "discovered".into(),
+                endpoint: "http://localhost:11434".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        over.apply(&mut cfg);
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.backends[0].name, "cli");
+        assert_eq!(cfg.backends[0].endpoint, "http://router:8080");
+    }
+
+    #[test]
+    fn no_backend_flags_yields_an_empty_override() {
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert!(cli.backend.to_override().is_empty());
+    }
+
+    #[test]
+    fn backend_kind_rejects_garbage() {
+        assert!(Cli::try_parse_from(["newt", "--backend-kind", "banana"]).is_err());
+    }
 
     #[test]
     fn parses_global_persona_for_default_code_command() {
