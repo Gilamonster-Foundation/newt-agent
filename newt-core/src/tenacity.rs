@@ -121,6 +121,32 @@ impl FromStr for Tenacity {
     }
 }
 
+/// Process-global tenacity, set once from the CLI (`--tenacity`) before the
+/// agentic loop runs. Mirrors the CLI backend-override pattern: the operator
+/// dial can't be threaded through every loop construction site, so it is stashed
+/// here and read where a `WorkflowRuntimeState` is built. Absent ⇒ [`Tenacity`]'s
+/// `Default` (`Standard`). Config + per-family resolution supersede this in a
+/// later slice.
+static CLI_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
+
+/// Install the process-global tenacity (see [`effective_tenacity`]). Call once,
+/// before the agentic loop starts.
+pub fn set_cli_tenacity(level: Tenacity) {
+    if let Ok(mut slot) = CLI_TENACITY.lock() {
+        *slot = Some(level);
+    }
+}
+
+/// The tenacity in effect: the CLI override if set, else the [`Default`]
+/// (`Standard`).
+pub fn effective_tenacity() -> Tenacity {
+    CLI_TENACITY
+        .lock()
+        .ok()
+        .and_then(|s| *s)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
