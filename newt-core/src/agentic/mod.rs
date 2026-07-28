@@ -20,6 +20,7 @@ mod claim_check;
 pub(crate) mod compress;
 mod crew_attest;
 mod crew_tool;
+pub(crate) mod cw_overflow;
 mod display;
 mod git_tool;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
@@ -1818,11 +1819,23 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     }));
                     continue 'round_loop;
                 }
-                // Graceful context-window 400 recovery: parse the model's real
-                // limit, tighten the budget, compress, and retry once (#223;
-                // compress-not-trim since Step 18.4).
+                // Graceful context-window overflow recovery: parse the model's
+                // real limit, tighten the budget, compress, and retry once (#223;
+                // compress-not-trim since Step 18.4). A numberless overflow with
+                // no parseable limit (llama.cpp served over the Ollama-compat
+                // `/api/chat`) falls back to a cap derived from the current send
+                // budget / the `num_ctx` ceiling, so the turn self-heals.
                 if cw_retries < 2 {
-                    if let Some(new_cap) = recover_cw_400.and_then(|f| f(&e, model, &today)) {
+                    if let Some(new_cap) = recover_cw_400
+                        .and_then(|f| f(&e, model, &today))
+                        .or_else(|| {
+                            cw_overflow::core_recover_overflow(
+                                &e.to_string(),
+                                send_budget,
+                                num_ctx_ceiling,
+                            )
+                        })
+                    {
                         emit_overflow_notice(
                             color,
                             accumulated_usage.as_ref(),
@@ -5026,11 +5039,23 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     }
                     continue 'round_loop;
                 }
-                // Graceful context-window 400 recovery: parse the model's real
-                // limit, tighten the budget, compress, and retry once (#223;
-                // compress-not-trim since Step 18.4).
+                // Graceful context-window overflow recovery: parse the model's
+                // real limit, tighten the budget, compress, and retry once (#223;
+                // compress-not-trim since Step 18.4). When the endpoint carries
+                // NO parseable limit — llama.cpp's numberless `500 "Context size
+                // has been exceeded"`, which `recover_cw_400` (litellm-numbered)
+                // can't read, and which headless has no `recover_cw_400` for at
+                // all — fall back to deriving a tightened cap from the current
+                // send budget so the turn self-heals instead of dying on a blind
+                // resend of the same oversized prompt. No `num_ctx` ceiling on
+                // this wire (limits are server-side), so derive from send_budget.
                 if cw_retries < 2 {
-                    if let Some(new_cap) = recover_cw_400.and_then(|f| f(&e, model, &today)) {
+                    if let Some(new_cap) = recover_cw_400
+                        .and_then(|f| f(&e, model, &today))
+                        .or_else(|| {
+                            cw_overflow::core_recover_overflow(&e.to_string(), send_budget, None)
+                        })
+                    {
                         emit_overflow_notice(
                             color,
                             accumulated_usage.as_ref(),
