@@ -633,6 +633,11 @@ pub enum Command {
         /// Override the max tool-call rounds for this solve.
         #[arg(long, value_name = "N")]
         max_rounds: Option<usize>,
+        /// The served model's context window (input-token ceiling), so
+        /// compaction keeps each request under the backend's `--ctx-size` (e.g.
+        /// 32768) instead of overrunning it.
+        #[arg(long, value_name = "N")]
+        context_window: Option<usize>,
     },
     /// Print resolved config.
     Config,
@@ -1341,6 +1346,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             non_interactive,
             events,
             max_rounds,
+            context_window,
         } => {
             let code = solve::run(solve::SolveArgs {
                 cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
@@ -1350,6 +1356,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 non_interactive,
                 events,
                 max_rounds,
+                context_window,
             })
             .await?;
             if code != 0 {

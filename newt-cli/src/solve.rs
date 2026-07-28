@@ -25,6 +25,10 @@ pub struct SolveArgs {
     pub non_interactive: bool,
     pub events: Option<PathBuf>,
     pub max_rounds: Option<usize>,
+    /// Context window (input-token ceiling) of the served model, so compaction
+    /// bounds the request under the backend's `--ctx-size` instead of overrunning
+    /// it (the "Context size has been exceeded" 500s). None keeps newt's default.
+    pub context_window: Option<usize>,
 }
 
 /// Run one task headless and emit its trace. Returns the process exit code:
@@ -83,6 +87,16 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     dc.api_key = api_key;
     if let Some(r) = args.max_rounds {
         dc.max_tool_rounds = r;
+    }
+    // Pin the model's served context window so the loop's pre-send guard +
+    // compaction keep each request under the backend's `--ctx-size` (e.g. dgx1
+    // llama.cpp serves qwen3-coder at 32768). Without this newt overruns it and
+    // the server returns "Context size has been exceeded" (a dirty-trace failure).
+    if let Some(cw) = args.context_window {
+        let cw = cw as u32;
+        dc.safe_context = Some(cw);
+        dc.max_ok_input = Some(cw);
+        dc.num_ctx = Some(cw);
     }
     let mut driver = TurnDriver::new(dc);
     let started = Instant::now();

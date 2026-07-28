@@ -41,6 +41,10 @@ _NEWT_PROFILE = os.environ.get("NEWT_BENCH_PROFILE", "")
 # Optional tenacity dial (relaxed|standard|insistent|relentless) and round cap.
 _TENACITY = os.environ.get("NEWT_BENCH_TENACITY", "")
 _MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "40")
+# The served model's context window (input ceiling) so compaction keeps requests
+# under the backend's --ctx-size (dgx1 serves qwen3-coder at 32768; leave output
+# headroom). Overrideable; empty disables the pin.
+_CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "30000")
 
 
 class NewtAgent(BaseInstalledAgent):
@@ -92,6 +96,7 @@ class NewtAgent(BaseInstalledAgent):
             os.unlink(local_instr)
 
         tenacity = f" --tenacity {shlex.quote(_TENACITY)}" if _TENACITY else ""
+        ctx = f" --context-window {shlex.quote(_CONTEXT_WINDOW)}" if _CONTEXT_WINDOW else ""
         # --non-interactive defaults true in `newt solve`, so it's omitted here
         # (passing it bare requires a value under the current arg definition).
         command = (
@@ -100,6 +105,6 @@ class NewtAgent(BaseInstalledAgent):
             "--instruction-file /tmp/newt-task.md "
             "--config /etc/newt/bench.toml "
             "--events /logs/agent/newt-events.jsonl "
-            f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}"
+            f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}{ctx}"
         )
         await self.exec_as_agent(environment, command=command)
