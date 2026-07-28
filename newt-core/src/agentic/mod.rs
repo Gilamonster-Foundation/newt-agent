@@ -4795,6 +4795,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
             {
+                if debug {
+                    print_debug(
+                        &format!(
+                            "tenacity[{}]: forcing action, read-only budget spent (round {round})",
+                            workflow_runtime.tenacity
+                        ),
+                        color,
+                    );
+                }
                 messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
         }
