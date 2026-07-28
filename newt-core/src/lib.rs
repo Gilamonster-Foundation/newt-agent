@@ -67,6 +67,7 @@ pub mod ssh_caveats;
 pub mod store;
 pub mod symbols;
 pub mod templates;
+pub mod tenacity;
 pub mod tokens;
 pub mod tooling;
 /// Terminal-line ownership: the process-wide arbiter every ephemeral writer
@@ -160,6 +161,7 @@ pub use navigator::{
     RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
 };
 pub use project_map::ProjectMapProvider;
+pub use tenacity::Tenacity;
 pub use where_is::{
     build_where_is_index, build_where_is_index_from_workspace, execute_where_is,
     where_is_tool_definition, LookupVerdict, WhereIsIndex, Witness,
