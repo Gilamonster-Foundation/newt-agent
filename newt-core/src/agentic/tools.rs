@@ -1372,12 +1372,22 @@ fn shell_envelope_output(
         // budget using head+tail. When tool_offload is on, spill the FULL
         // redacted output before capping so the true tail and elided middle stay
         // recoverable via memory_fetch("spill:<id>") and grep.
+        //
+        // The spill decision sizes with the SAME conservative estimator the cap
+        // uses (via `should_spill_full_output` → `cap_estimator`, not the 4 c/t
+        // context default) — otherwise output between the conservative cap
+        // (3 c/t) and the looser default (4 c/t) gets head/tail-truncated by the
+        // cap yet judged "under budget" by the spill gate, so its elided middle
+        // is never spilled and becomes unrecoverable. One shared owner keeps
+        // "will the cap truncate?" and "should we spill?" from ever diverging.
         let max_tokens = max_output_tokens();
-        let est = crate::tokens::TokenEstimation::default();
-        let over_model_budget = max_tokens != 0 && est.tokens_for_chars(out.len()) > max_tokens;
-        let over_spill_budget = out.chars().count() > spill::TOOL_RESULT_SPILL_CAP;
-        let should_spill =
-            max_tokens != 0 && tool_offload && (over_model_budget || over_spill_budget);
+        let est = output_budget::cap_estimator();
+        let should_spill = output_budget::should_spill_full_output(
+            out.len(),
+            out.chars().count(),
+            max_tokens,
+            tool_offload,
+        );
         let capped = if should_spill {
             match spill_store {
                 Some(store) => {

@@ -79,10 +79,37 @@ pub(super) fn output_cap_chars_per_token() -> usize {
 }
 
 /// The [`crate::tokens::TokenEstimation`] used to SIZE the cap — the conservative
-/// [`output_cap_chars_per_token`] ratio, NOT the 4 c/t context estimate. A
-/// single place so `cap_model_output` and `paginate_read` size identically.
-fn cap_estimator() -> crate::tokens::TokenEstimation {
+/// [`output_cap_chars_per_token`] ratio, NOT the 4 c/t context estimate. The
+/// single owner of the cap ratio: `cap_model_output`, `paginate_read`, AND the
+/// `run_command` spill gate all size from this, so the spill decision ("will the
+/// cap truncate this?") can never diverge from what the cap actually does.
+pub(super) fn cap_estimator() -> crate::tokens::TokenEstimation {
     crate::tokens::TokenEstimation::new(output_cap_chars_per_token())
+}
+
+/// Should a `run_command` result's FULL output be spilled (redacted → recoverable
+/// via `memory_fetch("spill:<id>")`) before the model-facing head/tail cap?
+///
+/// Pure so it can be unit-tested with an explicit `max_tokens` (the caller reads
+/// the process-global). Spilling is only meaningful when `tool_offload` is on and
+/// there is a budget (`max_tokens != 0`). Two independent triggers:
+/// - **over model budget** — sized with [`cap_estimator`], the SAME conservative
+///   ratio the cap uses, so anything the cap will truncate is spilled first (they
+///   can never diverge and silently drop the elided middle).
+/// - **over spill budget** — the raw output already exceeds
+///   [`crate::agentic::spill::TOOL_RESULT_SPILL_CAP`] chars.
+pub(super) fn should_spill_full_output(
+    out_bytes: usize,
+    out_chars: usize,
+    max_tokens: usize,
+    tool_offload: bool,
+) -> bool {
+    if max_tokens == 0 || !tool_offload {
+        return false;
+    }
+    let over_model_budget = cap_estimator().tokens_for_chars(out_bytes) > max_tokens;
+    let over_spill_budget = out_chars > crate::agentic::spill::TOOL_RESULT_SPILL_CAP;
+    over_model_budget || over_spill_budget
 }
 
 /// #726/#945: cap a tool's **model-facing** output to `max_tokens`' worth of
@@ -209,5 +236,48 @@ pub(super) fn paginate_read(
     match footer {
         Some(f) => format!("{body}\n\n[{f}]"),
         None => body,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spill_gate_uses_the_conservative_cap_ratio_not_the_estimate() {
+        // Regression (cursor[bot] #1476): the spill gate must size with the SAME
+        // conservative estimator as the cap. Output of 3_500 bytes at a
+        // 1_000-token budget: the cap TRUNCATES it (3 c/t ⇒ ~1_167 > 1_000), so
+        // it MUST be spilled. The old 4 c/t default under-counted (875 ≤ 1_000)
+        // and skipped the spill, silently dropping the elided middle.
+        let out_bytes = 3_500;
+        let out_chars = 3_500; // ASCII ⇒ bytes == chars, and < TOOL_RESULT_SPILL_CAP
+        assert!(
+            out_chars < crate::agentic::spill::TOOL_RESULT_SPILL_CAP,
+            "isolate over_model_budget: stay under the raw spill cap"
+        );
+        // The fix: conservative gate spills (over model budget).
+        assert!(should_spill_full_output(out_bytes, out_chars, 1_000, true));
+        // Guard the exact defect: the 4 c/t default would NOT have (the bug).
+        assert!(crate::tokens::TokenEstimation::default().tokens_for_chars(out_bytes) <= 1_000);
+        // And the conservative cap ratio DOES exceed the budget (so the cap cuts).
+        assert!(cap_estimator().tokens_for_chars(out_bytes) > 1_000);
+    }
+
+    #[test]
+    fn spill_gate_off_when_no_offload_or_no_budget() {
+        // Even a huge output does not spill when offload is off or budget is 0.
+        assert!(!should_spill_full_output(
+            1_000_000, 1_000_000, 10_000, false
+        ));
+        assert!(!should_spill_full_output(1_000_000, 1_000_000, 0, true));
+    }
+
+    #[test]
+    fn spill_gate_fires_on_raw_size_even_when_under_token_budget() {
+        // The raw-size trigger is independent of the token budget: output past
+        // TOOL_RESULT_SPILL_CAP spills even with a generous budget.
+        let big = crate::agentic::spill::TOOL_RESULT_SPILL_CAP + 1;
+        assert!(should_spill_full_output(big, big, usize::MAX, true));
     }
 }
