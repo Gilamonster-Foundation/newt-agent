@@ -18,11 +18,15 @@ use super::spill::{self, SpillStore};
 use crate::caveats::CaveatsExt as _;
 #[cfg(test)]
 use output_budget::DEFAULT_MAX_OUTPUT_TOKENS;
+#[cfg(test)]
+use output_budget::DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN;
 use output_budget::{
     cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
     paginate_read,
 };
-pub use output_budget::{set_max_output_tokens, set_output_head_tokens};
+pub use output_budget::{
+    set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
+};
 
 mod catalog;
 pub(crate) mod exposure;
@@ -5043,10 +5047,49 @@ mod tests {
 
     #[test]
     fn token_to_char_math_uses_the_default_four_chars_per_token() {
-        // The budget→char conversion is the default 4 chars/token (the shared
-        // estimator constant), so a 10k-token budget is a 40k-char backstop.
+        // The context ESTIMATOR is the default 4 chars/token. NOTE: the output
+        // CAP no longer sizes at this ratio — it uses the conservative
+        // `output_cap_chars_per_token` (default 3, ~30k chars for a 10k budget)
+        // so dense output can't overrun its token budget. See
+        // `output_cap_sizes_at_the_conservative_ratio_not_the_estimate`.
         let est = crate::tokens::TokenEstimation::default();
         assert_eq!(est.chars_for_tokens(DEFAULT_MAX_OUTPUT_TOKENS), 40_000);
+    }
+
+    #[test]
+    fn output_cap_sizes_at_the_conservative_ratio_not_the_estimate() {
+        // The conservative cap ratio (default 3) sizes the char backstop, so a
+        // 10k-token budget caps at ~30k chars — not the estimator's 40k. This is
+        // what keeps dense output (which tokenizes denser than 4 c/t) at/under
+        // its real token budget.
+        let cap = crate::tokens::TokenEstimation::new(DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN);
+        assert_eq!(cap.chars_for_tokens(DEFAULT_MAX_OUTPUT_TOKENS), 30_000);
+        assert!(
+            cap.chars_for_tokens(DEFAULT_MAX_OUTPUT_TOKENS)
+                < crate::tokens::TokenEstimation::default()
+                    .chars_for_tokens(DEFAULT_MAX_OUTPUT_TOKENS),
+            "cap must be tighter than the estimate"
+        );
+    }
+
+    #[test]
+    fn cap_model_output_caps_dense_body_the_estimate_would_pass() {
+        // A body sized between the conservative cap (30k) and the estimator
+        // backstop (40k): the old 4-c/t sizing would pass it VERBATIM; the
+        // conservative 3-c/t sizing caps it. Relies on the default cap ratio (3)
+        // — no global mutation (matches the max_output_tokens test convention).
+        let body = "x".repeat(35_000);
+        let out = cap_model_output(&body, DEFAULT_MAX_OUTPUT_TOKENS);
+        assert!(
+            out.len() < body.len(),
+            "conservative cap must truncate a 35k-char body at a 10k-token budget \
+             (old 4-c/t backstop of 40k would have passed it); got {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("head+tail shown"),
+            "cap marker present: {out:?}"
+        );
     }
 
     #[test]

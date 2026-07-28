@@ -16,6 +16,18 @@ const DEFAULT_READ_LIMIT: usize = 2_000;
 pub(super) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 const DEFAULT_OUTPUT_HEAD_TOKENS: usize = 1_500;
 
+/// Conservative chars/token used to SIZE the output cap (distinct from the 4
+/// chars/token *estimate*). Dense tool output — hex dumps, base64, minified
+/// JSON, columnar data — tokenizes far denser than the prose-derived 4 c/t
+/// heuristic (observed ~3.3 c/t on Terminal-Bench `run_command` output), so a
+/// "10k-token" cap sized at 4 c/t (40k chars) really admits ~12k+ real tokens
+/// and can overrun a served window on its own. Sizing the cap at a conservative
+/// 3 c/t (30k chars for a 10k budget) keeps a single capped result at/under its
+/// token budget even for dense content — making a single-oversized-result
+/// context overflow unrepresentable rather than something the loop must recover
+/// from after the fact. Overridable by `[tools] output_cap_chars_per_token`.
+pub(super) const DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN: usize = 3;
+
 /// Process-wide model-facing output budget, in tokens. Defaults to
 /// [`DEFAULT_MAX_OUTPUT_TOKENS`]; the resolved `[tools] max_output_tokens`
 /// config value is pushed here once at the config-resolution entry
@@ -26,6 +38,8 @@ const DEFAULT_OUTPUT_HEAD_TOKENS: usize = 1_500;
 /// thread it per-session like `tool_output_lines` once warranted.
 static MAX_OUTPUT_TOKENS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_OUTPUT_TOKENS);
 static OUTPUT_HEAD_TOKENS: AtomicUsize = AtomicUsize::new(DEFAULT_OUTPUT_HEAD_TOKENS);
+static OUTPUT_CAP_CHARS_PER_TOKEN: AtomicUsize =
+    AtomicUsize::new(DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN);
 
 /// Set the process-wide model-facing output budget (tokens). Called once from
 /// `Config::resolve` with the resolved `[tools] max_output_tokens`. `0` means
@@ -51,6 +65,26 @@ pub(super) fn output_head_tokens() -> usize {
     OUTPUT_HEAD_TOKENS.load(Ordering::Relaxed)
 }
 
+/// Set the conservative chars/token used to size the output cap. Called once
+/// from `Config::resolve` with `[tools] output_cap_chars_per_token`. Clamped to
+/// a minimum of 1 by [`crate::tokens::TokenEstimation::new`] at the use site.
+pub fn set_output_cap_chars_per_token(chars_per_token: usize) {
+    OUTPUT_CAP_CHARS_PER_TOKEN.store(chars_per_token, Ordering::Relaxed);
+}
+
+/// The active conservative chars/token for cap sizing.
+/// [`DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN`] until overridden.
+pub(super) fn output_cap_chars_per_token() -> usize {
+    OUTPUT_CAP_CHARS_PER_TOKEN.load(Ordering::Relaxed)
+}
+
+/// The [`crate::tokens::TokenEstimation`] used to SIZE the cap — the conservative
+/// [`output_cap_chars_per_token`] ratio, NOT the 4 c/t context estimate. A
+/// single place so `cap_model_output` and `paginate_read` size identically.
+fn cap_estimator() -> crate::tokens::TokenEstimation {
+    crate::tokens::TokenEstimation::new(output_cap_chars_per_token())
+}
+
 /// #726/#945: cap a tool's **model-facing** output to `max_tokens`' worth of
 /// chars, estimated with the default chars/token heuristic
 /// ([`crate::tokens::TokenEstimation`], 4 chars/token — the same constant the
@@ -71,7 +105,11 @@ pub(super) fn cap_model_output_with_handle(
     if max_tokens == 0 {
         return text.to_string();
     }
-    let est = crate::tokens::TokenEstimation::default();
+    // Size the cap with the CONSERVATIVE ratio, not the 4 c/t context estimate:
+    // dense output tokenizes denser, so a cap sized at 4 c/t admits more real
+    // tokens than its budget. Using the conservative ratio for BOTH the
+    // over-budget test and the char budget caps dense content sooner and tighter.
+    let est = cap_estimator();
     if est.tokens_for_chars(text.len()) <= max_tokens {
         return text.to_string();
     }
@@ -126,7 +164,11 @@ pub(super) fn paginate_read(
     let max_chars = if max_output_tokens == 0 {
         usize::MAX
     } else {
-        crate::tokens::TokenEstimation::default().chars_for_tokens(max_output_tokens)
+        // Conservative cap sizing (see `cap_estimator`): dense files (data,
+        // base64, minified) tokenize denser than 4 c/t, so the char backstop
+        // uses the conservative ratio to keep the model-facing payload under
+        // its token budget.
+        cap_estimator().chars_for_tokens(max_output_tokens)
     };
     let total = contents.lines().count();
     let start = offset.filter(|&o| o > 0).unwrap_or(1); // 1-based

@@ -28,7 +28,9 @@ pub use shell::{
     ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
     shell_env_passthrough_default, IntakeConfig, ShellConfig, ShellEngine,
 };
-use tools::{default_max_output_tokens, default_output_head_tokens};
+use tools::{
+    default_max_output_tokens, default_output_cap_chars_per_token, default_output_head_tokens,
+};
 
 /// Process-scoped user config root override, set by the CLI's `--config-dir`.
 pub const NEWT_CONFIG_DIR_ENV: &str = "NEWT_CONFIG_DIR";
@@ -3450,6 +3452,7 @@ impl Config {
         // `usize` through `ChatCtx` + `execute_tool` + every call site. Idempotent.
         crate::agentic::set_max_output_tokens(cfg.max_output_tokens());
         crate::agentic::set_output_head_tokens(cfg.output_head_tokens());
+        crate::agentic::set_output_cap_chars_per_token(cfg.output_cap_chars_per_token());
         // #880: publish the repo `[lifecycle]` overrides the same way — the single
         // canonical config-application entry — so the crew's normalize (and future
         // phase consumers) honor `.newt/config.toml`.
@@ -3487,6 +3490,16 @@ impl Config {
             .as_ref()
             .map(|t| t.output_head_tokens)
             .unwrap_or_else(default_output_head_tokens)
+    }
+
+    /// The resolved `[tools] output_cap_chars_per_token` — the conservative
+    /// chars/token used to size the model-facing output cap — or the built-in
+    /// default (3) when `[tools]` is absent. See [`ToolsConfig`].
+    pub fn output_cap_chars_per_token(&self) -> usize {
+        self.tools
+            .as_ref()
+            .map(|t| t.output_cap_chars_per_token)
+            .unwrap_or_else(default_output_cap_chars_per_token)
     }
 
     /// Merge per-file backends from the `backends/` dirs next to the config:
@@ -7562,6 +7575,21 @@ net = [\"already.example.com\"]
         assert_eq!(cfg.output_head_tokens(), 1_500);
         assert_eq!(Config::default().max_output_tokens(), 10_000);
         assert_eq!(Config::default().output_head_tokens(), 1_500);
+    }
+
+    #[test]
+    fn tools_output_cap_chars_per_token_defaults_to_3_and_parses_an_override() {
+        // Absent ⇒ the conservative default (3, tighter than the 4 c/t estimate).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.output_cap_chars_per_token(), 3);
+        assert_eq!(Config::default().output_cap_chars_per_token(), 3);
+        // A `[tools]` table that omits the key still falls back to 3.
+        let cfg: Config = toml::from_str("[tools]\n").unwrap();
+        assert_eq!(cfg.output_cap_chars_per_token(), 3);
+        // Explicit override (e.g. 2 for very dense workloads) is honored.
+        let cfg: Config = toml::from_str("[tools]\noutput_cap_chars_per_token = 2\n").unwrap();
+        assert_eq!(cfg.tools.as_ref().unwrap().output_cap_chars_per_token, 2);
+        assert_eq!(cfg.output_cap_chars_per_token(), 2);
     }
 
     #[test]
