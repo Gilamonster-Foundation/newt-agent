@@ -764,7 +764,7 @@ pub(crate) async fn compress(
     // (1) Structural prune — zero LLM cost (Step 18.3's passes).
     let pruned = prune(req.messages, &PruneConfig::default());
     let prune_changed = pruned.chars_reclaimed > 0;
-    let pruned = pruned.messages;
+    let mut pruned = pruned.messages;
     let after_prune = estimate_tokens(&pruned, req.est);
     if !over(after_prune, pruned.len()) {
         if tokens_over_entry {
@@ -783,6 +783,50 @@ pub(crate) async fn compress(
     // (2) Boundary: head + token-budgeted (and, for the count trigger,
     // count-capped) tail, last-user anchored, tool-pair aligned.
     let boundary = compute_boundary(&pruned, req.budget, req.max_messages, req.est);
+
+    // (2.5) Working-set protection: pin the single most-recent read that the
+    // boundary leaves in the summarizable middle, so a refactor target survives
+    // to the edit instead of looping read → summarize → re-read. The pin is a
+    // compaction-immune head card carrying the file's VERBATIM contents
+    // (captured from the pre-prune history, since prune one-lines aged reads).
+    // It is skipped when that read's verbatim body is already in the protected
+    // TAIL — a still-fresh read needs no pin. De-dupe any prior card first (one
+    // per round, so a newer read supersedes it), and insert just before the
+    // active-prompt card so that card stays the LAST leading system message
+    // (preserving its user-message head-immunity); then recompute the boundary
+    // over the shifted indices.
+    pruned.retain(|m| {
+        !(m["role"].as_str() == Some("system")
+            && m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with(WORKING_SET_PREFIX)))
+    });
+    let in_protected_tail = |content: &str| {
+        pruned[boundary.tail_start.min(pruned.len())..]
+            .iter()
+            .any(|m| m["content"].as_str() == Some(content))
+    };
+    let pinned_path = match working_set_from_history(req.messages, req.budget, req.est) {
+        Some((path, content)) if !in_protected_tail(&content) => {
+            let at = pruned
+                .iter()
+                .position(|m| {
+                    m["role"].as_str() == Some("system")
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|c| c.starts_with(ACTIVE_PROMPT_PREFIX))
+                })
+                .unwrap_or(0);
+            pruned.insert(at, working_set_card(&path, &content));
+            Some(path)
+        }
+        _ => None,
+    };
+    let boundary = if pinned_path.is_some() {
+        compute_boundary(&pruned, req.budget, req.max_messages, req.est)
+    } else {
+        boundary
+    };
     let middle = &pruned[boundary.head..boundary.tail_start];
 
     let (mut assembled, mut action) = if middle.is_empty() {
@@ -827,7 +871,7 @@ pub(crate) async fn compress(
         // summary will hallucinate it. Name the files read in the compacted
         // span with an explicit re-read directive so the model treats its
         // memory of them as stale and re-reads instead of inventing.
-        if let Some(crumb) = reread_breadcrumb(middle) {
+        if let Some(crumb) = reread_breadcrumb(middle, pinned_path.as_deref()) {
             body.push_str("\n\n");
             body.push_str(&crumb);
         }
@@ -1326,14 +1370,96 @@ fn middle_shape(middle: &[Value]) -> ConvShape {
     }
 }
 
+/// Prefix marking the harness-owned working-set card — the compaction-immune
+/// pin for the file the model most recently read (analogous to
+/// [`ACTIVE_PROMPT_PREFIX`] for the task). Exactly one card is kept, de-duped
+/// every compaction round.
+pub(crate) const WORKING_SET_PREFIX: &str = "[NEWT WORKING SET v1]";
+
+/// Extract the `path` argument of a `read_file` tool call, tolerating both the
+/// object-args dialect (Ollama) and the JSON-string-args dialect (OpenAI).
+/// Returns `None` for any other tool.
+fn read_file_call_path(call: &Value) -> Option<String> {
+    if call["function"]["name"].as_str() != Some("read_file") {
+        return None;
+    }
+    let args = &call["function"]["arguments"];
+    args["path"].as_str().map(str::to_string).or_else(|| {
+        args.as_str()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|v| v["path"].as_str().map(str::to_string))
+    })
+}
+
+/// The compaction-immune working-set card: the verbatim contents of the file
+/// the model most recently read, pinned into the protected head so a refactor
+/// target survives summarization and the model can edit from it directly.
+fn working_set_card(path: &str, content: &str) -> Value {
+    serde_json::json!({
+        "role": "system",
+        "content": format!(
+            "{WORKING_SET_PREFIX}\npath: {path}\n\
+             CURRENT contents of {path} as you last read them, pinned here so \
+             they are NOT summarized away. Edit from THIS text directly; do not \
+             re-read {path} unless you need a different line range.\n\
+             --- BEGIN {path} ---\n{content}\n--- END {path} ---"
+        )
+    })
+}
+
+/// The working set to pin: the VERBATIM contents of the file the model most
+/// recently read, taken from the PRE-prune history. Structural prune one-lines
+/// aged `read_file` results (`[read_file] read '…' -> ok, N lines`), so the
+/// verbatim body must be captured before prune runs, or the pin preserves the
+/// one-liner instead of the code. Returns `(path, content)`, or `None` when
+/// there is no read, its result is empty, or it is too large to pin without
+/// threatening the irreducible-head invariant (then it is left to the
+/// breadcrumb).
+fn working_set_from_history(
+    messages: &[Value],
+    budget: usize,
+    est: TokenEstimation,
+) -> Option<(String, String)> {
+    let cap_chars = est.chars_for_tokens(budget / 2).max(1);
+    let mut idx = messages.len();
+    while idx > 0 {
+        idx -= 1;
+        let m = &messages[idx];
+        if m["role"].as_str() != Some("assistant") {
+            continue;
+        }
+        let Some(calls) = m["tool_calls"].as_array() else {
+            continue;
+        };
+        let Some(path) = calls.iter().find_map(read_file_call_path) else {
+            continue;
+        };
+        // The result is the immediately following tool message.
+        let content = messages
+            .get(idx + 1)
+            .filter(|r| r["role"].as_str() == Some("tool"))
+            .and_then(|r| r["content"].as_str())
+            .unwrap_or("");
+        if content.is_empty() || content.len() > cap_chars {
+            // Nothing to pin, or too big for the head — leave it to the
+            // breadcrumb rather than risk an irreducible protected head.
+            return None;
+        }
+        return Some((path, content.to_string()));
+    }
+    None
+}
+
 /// #319: list the files read or edited in the summarized span, with a re-read
 /// directive. The middle is replaced by a PROSE summary that does not preserve
 /// verbatim signatures/types/lines; a coding model recalling an API from that
 /// prose hallucinates it (the nemotron-3 incident). Naming the touched files
 /// and instructing a re-read turns a confident hallucination into a re-read and
 /// keeps the harness honest about what it dropped. Deterministic — independent
-/// of whatever the summarizer LLM chose to mention.
-fn reread_breadcrumb(middle: &[Value]) -> Option<String> {
+/// of whatever the summarizer LLM chose to mention. `pinned` names the one file
+/// whose verbatim contents ARE preserved (the working-set card) so it is not
+/// contradictorily told to re-read what it can already see.
+fn reread_breadcrumb(middle: &[Value], pinned: Option<&str>) -> Option<String> {
     let mut paths: Vec<String> = Vec::new();
     for m in middle {
         if m["role"].as_str() != Some("assistant") {
@@ -1359,6 +1485,11 @@ fn reread_breadcrumb(middle: &[Value]) -> Option<String> {
                     .and_then(|v| v["path"].as_str().map(str::to_string))
             });
             if let Some(p) = path {
+                // The pinned working-set file is preserved verbatim in its own
+                // head card; do not also tell the model to re-read it.
+                if pinned == Some(p.as_str()) {
+                    continue;
+                }
                 if !paths.contains(&p) {
                     paths.push(p);
                 }
@@ -2217,6 +2348,154 @@ mod tests {
         assert!(
             assembled.contains("RE-READ") && assembled.contains("do NOT recall"),
             "the breadcrumb must carry the re-read / don't-recall directive"
+        );
+    }
+
+    /// Working-set protection: the single MOST-RECENT `read_file` result is the
+    /// file the model is about to act on. If it lands in the summarized middle
+    /// it degrades to a "RE-READ" breadcrumb — and for a refactor target that
+    /// loops forever (read → summarized → re-read → summarized), which is the
+    /// steering-regressions ceiling the gauge surfaced 2026-07-27: a live drive
+    /// made 9 reads and ZERO edits because every target read was compacted away
+    /// before an edit could be emitted. The most-recent read must instead be
+    /// PINNED verbatim into the protected head so the model can edit from it.
+    #[tokio::test]
+    async fn most_recent_target_read_is_pinned_and_survives_compaction() {
+        let target = "newt-core/src/agentic/mod.rs";
+        let marker = "fn WORKING_SET_MARKER_edit_me()";
+        let body = format!("{marker} {{\n{}}}\n", "    // body line\n".repeat(120));
+        let mut msgs = vec![
+            sys("you are newt"),
+            active_prompt_card(),
+            user("ACTIVE TASK: reduce mod.rs below 5000 lines by pure code motion"),
+        ];
+        // Older reads of OTHER files — legitimately breadcrumbed, not the
+        // working set.
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({ "path": format!("src/other_{i}.rs") }),
+            ));
+            msgs.push(tool_result(&format!(
+                "// other file {i}\n{}",
+                "filler line\n".repeat(120)
+            )));
+        }
+        // The TARGET read — the working set the next edit depends on.
+        msgs.push(assistant_call("read_file", json!({ "path": target })));
+        msgs.push(tool_result(&body));
+        // NON-read bookkeeping AFTER it (plan/git/status): pushes the target
+        // read out of the freshest trailing group WITHOUT superseding it as the
+        // working set, so on current code it falls into the summarized middle.
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "run_command",
+                json!({ "cmd": format!("git status {i}") }),
+            ));
+            msgs.push(tool_result(&format!(
+                "bookkeeping {i}\n{}",
+                "status line\n".repeat(120)
+            )));
+        }
+
+        let before = estimate_tokens(&msgs, EST);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        // The real summarizer returns PROSE, never the file body.
+        let s = recording_summarizer(
+            prompts.clone(),
+            "## Active Task\nReduce mod.rs by code motion. The agent read several files.",
+        );
+        let mut state = CompressState::new();
+        let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
+
+        let assembled: String = out
+            .messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            out.fired && out.action == CompressAction::Summarized,
+            "summary must fire for this to test protection (action={:?})",
+            out.action
+        );
+        assert!(
+            assembled.contains(marker),
+            "the most-recent target read must be PINNED and survive compaction so \
+             the model can edit from it instead of looping on re-reads; assembled:\n{}",
+            &assembled[..assembled.len().min(1600)]
+        );
+    }
+
+    /// The pin tracks the LATEST read: when the model moves on to a second
+    /// file, that file becomes the working set and the earlier one reverts to a
+    /// re-read breadcrumb. One card per round — a stale pin must not stick.
+    #[tokio::test]
+    async fn working_set_pin_tracks_the_latest_read_not_the_first() {
+        let first = "src/first.rs";
+        let second = "src/second.rs";
+        let first_marker = "fn FIRST_FILE_MARKER()";
+        let second_marker = "fn SECOND_FILE_MARKER()";
+        let mut msgs = vec![
+            sys("you are newt"),
+            active_prompt_card(),
+            user("ACTIVE TASK: refactor two files"),
+        ];
+        // Read the FIRST file, then bury it under bookkeeping.
+        msgs.push(assistant_call("read_file", json!({ "path": first })));
+        msgs.push(tool_result(&format!(
+            "{first_marker} {{\n{}}}\n",
+            "    // a\n".repeat(60)
+        )));
+        for i in 0..4 {
+            msgs.push(assistant_call(
+                "run_command",
+                json!({ "cmd": format!("git a{i}") }),
+            ));
+            msgs.push(tool_result(&format!("bk {i}\n{}", "x\n".repeat(120))));
+        }
+        // Then read the SECOND file — the new working set — and bury it too.
+        msgs.push(assistant_call("read_file", json!({ "path": second })));
+        msgs.push(tool_result(&format!(
+            "{second_marker} {{\n{}}}\n",
+            "    // b\n".repeat(60)
+        )));
+        for i in 0..4 {
+            msgs.push(assistant_call(
+                "run_command",
+                json!({ "cmd": format!("git b{i}") }),
+            ));
+            msgs.push(tool_result(&format!("bk2 {i}\n{}", "y\n".repeat(120))));
+        }
+
+        let before = estimate_tokens(&msgs, EST);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "## Active Task\nrefactor two files.");
+        let mut state = CompressState::new();
+        let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
+
+        let assembled: String = out
+            .messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.fired && out.action == CompressAction::Summarized);
+        // The latest read is pinned verbatim…
+        assert!(
+            assembled.contains(second_marker),
+            "the latest read (second.rs) must be the pinned working set"
+        );
+        // …and its file must not also be told to re-read itself.
+        assert!(
+            !assembled.contains(&format!("- {second}")),
+            "the pinned file must be excluded from the re-read breadcrumb"
+        );
+        // The earlier file is no longer the working set: its body is gone and it
+        // is named in the breadcrumb to re-read instead.
+        assert!(
+            !assembled.contains(first_marker),
+            "the superseded file's body must not linger as a second pin"
         );
     }
 
