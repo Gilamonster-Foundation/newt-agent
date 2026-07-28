@@ -42,10 +42,12 @@ _NEWT_PROFILE = os.environ.get("NEWT_BENCH_PROFILE", "")
 _TENACITY = os.environ.get("NEWT_BENCH_TENACITY", "")
 _MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "40")
 # The served model's FULL context window (dgx1 serves qwen3-coder at
-# --ctx-size 32768). newt reserves ~20% of this for the reply, so the input
-# budget becomes 0.8x — leaving KV headroom so generation doesn't overrun the
-# window. Overrideable; empty disables the pin.
-_CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "32768")
+# --ctx-size 65536 as of 2026-07-28; the router's global `-c` is the ctx knob —
+# per-model preset `ctx-size` is ignored in that build). newt reserves ~20% of
+# this for the reply, so the input budget becomes 0.8x — leaving KV headroom so
+# generation doesn't overrun the window. Set this to match whatever `--ctx-size`
+# the endpoint actually serves. Overrideable; empty disables the pin.
+_CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "65536")
 
 
 class NewtAgent(BaseInstalledAgent):
