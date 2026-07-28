@@ -221,6 +221,14 @@ pub struct TurnOutcome {
     pub usage: Option<TokenUsage>,
     /// Count of hallucinated (non-existent) tool calls the loop saw.
     pub hallucinations: u32,
+    /// Per-tool-call trace of the turn (name, args-digest, ok, duration) — the
+    /// trajectory a headless consumer (`newt solve` / Terminal-Bench) serializes
+    /// to reason about what the agent actually did. Empty when the loop produced
+    /// no tool calls.
+    pub tool_events: Vec<crate::ToolEvent>,
+    /// Why the turn ended (genuine completion vs round-cap vs empty), when the
+    /// loop set it.
+    pub end_reason: Option<crate::TurnEndReason>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -423,6 +431,11 @@ async fn run_one_turn(
     messages: &[MemMessage],
     task: &str,
 ) -> Result<TurnOutcome, String> {
+    // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
+    // borrows these mutably; the borrows release when `ctx` is consumed by the
+    // await below, after which they move into the TurnOutcome.
+    let mut tool_events: Vec<crate::ToolEvent> = Vec::new();
+    let mut end_reason: Option<crate::TurnEndReason> = None;
     let ctx = ChatCtx {
         url: &config.url,
         model: &config.model,
@@ -501,9 +514,9 @@ async fn run_one_turn(
         memory_source: None,
         summarizer: None,
         compress_state: None,
-        tool_events: None,
+        tool_events: Some(&mut tool_events),
         phantom_reaches: None,
-        end_reason: None,
+        end_reason: Some(&mut end_reason),
         permission_gate: None,
         // Phase 20 (spec §5): headless surfaces neither read nor write the
         // capability cache — the hook stays absent and no calibration is
@@ -540,6 +553,8 @@ async fn run_one_turn(
             was_streamed,
             usage,
             hallucinations,
+            tool_events,
+            end_reason,
         }),
         Err(e) => Err(e.to_string()),
     }
