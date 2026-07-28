@@ -25,9 +25,11 @@ pub struct SolveArgs {
     pub non_interactive: bool,
     pub events: Option<PathBuf>,
     pub max_rounds: Option<usize>,
-    /// Context window (input-token ceiling) of the served model, so compaction
-    /// bounds the request under the backend's `--ctx-size` instead of overrunning
-    /// it (the "Context size has been exceeded" 500s). None keeps newt's default.
+    /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`).
+    /// newt reserves ~20% for the reply and gates input at 80% of it, so a
+    /// long turn compacts under the window instead of overrunning it during
+    /// generation (the "Context size has been exceeded" 500s). None keeps
+    /// newt's default.
     pub context_window: Option<usize>,
 }
 
@@ -90,12 +92,18 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     }
     // Pin the model's served context window so the loop's pre-send guard +
     // compaction keep each request under the backend's `--ctx-size` (e.g. dgx1
-    // llama.cpp serves qwen3-coder at 32768). Without this newt overruns it and
-    // the server returns "Context size has been exceeded" (a dirty-trace failure).
+    // llama.cpp serves qwen3-coder at 32768). `--context-window` is the FULL
+    // served window; the input budget is 80% of it, RESERVING ~20% for the
+    // reply — the server's KV window is shared by input+output, so gating on the
+    // full window (no headroom) overruns it during generation and 500s (that was
+    // the leak). This matches the workspace convention that `safe_context` is
+    // the 80%-discounted window (mirrors the Ollama input-ceiling path). num_ctx
+    // is inert on the OpenAI wire but kept for the Ollama path.
     if let Some(cw) = args.context_window {
         let cw = cw as u32;
-        dc.safe_context = Some(cw);
-        dc.max_ok_input = Some(cw);
+        let input_budget = (u64::from(cw) * 80 / 100) as u32;
+        dc.safe_context = Some(input_budget);
+        dc.max_ok_input = Some(input_budget);
         dc.num_ctx = Some(cw);
     }
     let mut driver = TurnDriver::new(dc);

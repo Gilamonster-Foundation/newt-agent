@@ -41,10 +41,11 @@ _NEWT_PROFILE = os.environ.get("NEWT_BENCH_PROFILE", "")
 # Optional tenacity dial (relaxed|standard|insistent|relentless) and round cap.
 _TENACITY = os.environ.get("NEWT_BENCH_TENACITY", "")
 _MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "40")
-# The served model's context window (input ceiling) so compaction keeps requests
-# under the backend's --ctx-size (dgx1 serves qwen3-coder at 32768; leave output
-# headroom). Overrideable; empty disables the pin.
-_CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "30000")
+# The served model's FULL context window (dgx1 serves qwen3-coder at
+# --ctx-size 32768). newt reserves ~20% of this for the reply, so the input
+# budget becomes 0.8x — leaving KV headroom so generation doesn't overrun the
+# window. Overrideable; empty disables the pin.
+_CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "32768")
 
 
 class NewtAgent(BaseInstalledAgent):

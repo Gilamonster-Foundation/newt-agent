@@ -633,9 +633,10 @@ pub enum Command {
         /// Override the max tool-call rounds for this solve.
         #[arg(long, value_name = "N")]
         max_rounds: Option<usize>,
-        /// The served model's context window (input-token ceiling), so
-        /// compaction keeps each request under the backend's `--ctx-size` (e.g.
-        /// 32768) instead of overrunning it.
+        /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`,
+        /// 32768). newt gates input at 80% of it, reserving ~20% for the reply,
+        /// so a long turn compacts under the window instead of overrunning it
+        /// during generation.
         #[arg(long, value_name = "N")]
         context_window: Option<usize>,
     },
