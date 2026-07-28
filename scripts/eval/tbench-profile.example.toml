@@ -1,0 +1,8 @@
+# Example --profile for tbench-bootstrap.sh. Copy to a LOCAL, uncommitted file
+# and set the real endpoint there (RATCHET.md: no host in committed files).
+[[backends]]
+name = "bench"
+endpoint = "http://REPLACE-WITH-YOUR-INFERENCE-HOST:PORT"
+model = "qwen3-coder_30b"   # llama.cpp/openai; or an ollama model with kind="ollama"
+kind = "openai"
+tiers = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
