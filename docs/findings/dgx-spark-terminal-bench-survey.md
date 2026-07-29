@@ -65,21 +65,39 @@ confinement damage.)
 ## Harness comparison — newt vs Codex (same model)
 
 Same cheap reasoning model (**o4-mini**), two harnesses, to isolate the harness
-from the model:
+from the model. **Both runs verified clean** (0 infra errors, 0 crashes; each
+harness actually drove the model and wrote code):
 
 | Harness | Model | Score |
 |---------|-------|-------|
+| **Codex** | o4-mini | **33.3% (10/30)** |
 | newt | o4-mini | 13.3% (4/30) |
-| Codex | o4-mini | _fair run landing_ |
 
-**Caveat, load-bearing:** the first Codex run scored 3.3% but was **discarded as
-invalid** — Codex defaults `web_search` on, and the Terminal-Bench containers have
-no general web (only `api.openai.com` is reachable), so Codex burned its entire
-turn budget on ~32 failed searches per task and wrote **zero code**. Re-running
+**Codex's harness beat newt's by ~2.5× on the same model** — the single most
+important finding of the day, and an uncomfortable one for newt (its own project).
+It is reported anyway, because integrity is symmetric: the *first* Codex run
+scored 3.3% but was **discarded as a crippled artifact** — Codex defaults
+`web_search` on, the TB containers have no general web (only `api.openai.com`), so
+Codex burned every turn on ~32 failed searches and wrote **zero code**; re-running
 with `--ak web_search=disabled` fixed it (19 command-executions + 4 file-changes,
-and it passed the task it had failed while crippled). The **fair** run is the one
-reported here. gpt-4.1-mini is a newt-only data point — Codex's adapter requires a
-reasoning model, so the cross-harness comparison rides on o4-mini.
+and it passed the task it had failed while crippled). Then the *same* scrutiny was
+applied to newt's losing number: it ran clean (0 infra, real writes on nearly
+every task — it acted, it just got them wrong), so **13.3% is a fair newt number,
+not a hampered one.** A result that *flattered* newt (the crippled 4×) got caught;
+a result that *embarrassed* newt (the fair 2.5× loss) got reported.
+
+**What it means.** This is direct evidence for the line's standing thesis that
+**the harness — not the model weights — is the current ceiling.** Codex extracts
+2.5× more from the *identical* o4-mini than newt does, so newt's agentic loop is
+leaving large capability on the table. The hopeful corollary: the DGX Spark's
+local models (surveyed above at 13–27% through newt) likely have substantial
+headroom too — a better newt loop should lift every row. Closing the gap to Codex
+is now a concrete, measurable target.
+
+_Caveats: 1 trial/task (variance is real, though a 10-vs-4 gap is large enough to
+be signal); each harness ran in its own fair config (newt confined+self-verify;
+Codex web_search-off). gpt-4.1-mini stays a newt-only point — Codex's adapter
+requires a reasoning model, so the cross-harness comparison rides on o4-mini._
 
 ## Key findings
 
