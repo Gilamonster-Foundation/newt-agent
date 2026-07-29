@@ -25,8 +25,14 @@ Run it:
     NEWT_BENCH_PROFILE=/path/to/bench.toml \\
     NEWT_BENCH_TENACITY=insistent \\
     NEWT_BENCH_OCAP=on \\        # omit / off for the --yolo lane
+    NEWT_BENCH_SELF_VERIFY=1 \\  # run the workspace's own checks before RTB (#1 lever)
     PYTHONPATH=scripts/eval/harbor \\
     harbor run -a newt_agent:NewtAgent -m newt/qwen3-coder_30b <task-or-dataset...>
+
+Robustness/capability knobs injected INTO the container (the harbor process's env
+does not cross the container boundary): NEWT_BENCH_HTTP_RETRIES (default 10 — a
+more patient retry window so a transient router drop doesn't zero a task on a
+pure infra fault) and NEWT_BENCH_SELF_VERIFY (opt-in self-verify gate).
 
 The backend (endpoint + model) is pinned by NEWT_BENCH_PROFILE (host-secret,
 local); ``-m`` is required by Harbor but the profile is authoritative here.
@@ -63,6 +69,33 @@ _CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "65536")
 # flips: the SAME suite is run once per model with NEWT_BENCH_OCAP unset (off)
 # and once with ``on``, and the two scores must match before 0.7.6 tags.
 _OCAP = os.environ.get("NEWT_BENCH_OCAP", "")
+# Inference-robustness knob. The local llama.cpp router drops connections under
+# memory pressure (co-hosted vLLM near the 121G ceiling), and a task that
+# exhausts newt's retry window scores 0 on a pure infra fault — not the agent.
+# Bench runs get a MORE patient retry budget than the interactive default so a
+# brief router restart doesn't zero a task. `newt`'s `RetryPolicy::from_env`
+# reads these; overridable, empty keeps newt's own default.
+_HTTP_RETRIES = os.environ.get("NEWT_BENCH_HTTP_RETRIES", "10")
+# Self-verify gate (the measured #1 capability lever): make the agent RUN the
+# workspace's own checks before declaring done. Opt-in per run — set
+# NEWT_BENCH_SELF_VERIFY=1 to inject NEWT_SELF_VERIFY=1 into the container.
+_SELF_VERIFY = os.environ.get("NEWT_BENCH_SELF_VERIFY", "")
+
+
+def _container_env_prefix() -> str:
+    """Env vars exported INSIDE the task container ahead of `newt solve` — the
+    harbor process's own env does NOT cross into the container, so anything newt
+    must read (retry budget, self-verify) is injected here as a `K=V ` prefix."""
+    parts = []
+    if _HTTP_RETRIES.strip():
+        # More patient retry window: 10 retries over the 2s→30s backoff rides a
+        # ~5 min router blip instead of the default ~90s.
+        parts.append(f"NEWT_HTTP_MAX_RETRIES={shlex.quote(_HTTP_RETRIES)}")
+        parts.append("NEWT_HTTP_BACKOFF_BASE_MS=2000")
+        parts.append("NEWT_HTTP_BACKOFF_MAX_MS=30000")
+    if _SELF_VERIFY.strip().lower() in ("1", "true", "on", "yes"):
+        parts.append("NEWT_SELF_VERIFY=1")
+    return (" ".join(parts) + " ") if parts else ""
 
 
 class NewtAgent(BaseInstalledAgent):
@@ -123,7 +156,7 @@ class NewtAgent(BaseInstalledAgent):
         # (passing it bare requires a value under the current arg definition).
         command = (
             "mkdir -p /logs/agent; "
-            "newt solve --cwd /app "
+            f"{_container_env_prefix()}newt solve --cwd /app "
             "--instruction-file /tmp/newt-task.md "
             "--config /etc/newt/bench.toml "
             "--events /logs/agent/newt-events.jsonl "
