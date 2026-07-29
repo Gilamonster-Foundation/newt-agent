@@ -142,6 +142,27 @@ impl MatrixConfig {
                 bail!("unknown OCAP lane `{lane}` (must be `off` or `on`)");
             }
         }
+        // A run needs a real suite: an empty task list or dataset would launch the
+        // harness against nothing and silently record a 0/0 row.
+        if self.suite.tasks.is_empty() {
+            bail!("[suite] has no tasks — the matrix would run against an empty suite");
+        }
+        if self.suite.dataset.trim().is_empty() {
+            bail!("[suite] dataset is empty — set the Terminal-Bench dataset path");
+        }
+        // Only `harbor` is wired today; a typo or a not-yet-built executor must
+        // fail loudly rather than silently fall through to harbor.
+        if self.harness.executor != "harbor" {
+            bail!(
+                "unknown [harness] executor `{}` (only `harbor` is available)",
+                self.harness.executor
+            );
+        }
+        // The harbor executor injects this binary into every task container; an
+        // empty path would shadow the adapter's fallback and break injection.
+        if self.harness.binary.trim().is_empty() {
+            bail!("[harness] binary is empty — set the container-portable newt binary path");
+        }
         Ok(())
     }
 
@@ -162,8 +183,7 @@ impl MatrixConfig {
         match only {
             None => Ok(self.models.iter().collect()),
             Some(name) => {
-                let hit: Vec<&ModelEntry> =
-                    self.models.iter().filter(|m| m.name == name).collect();
+                let hit: Vec<&ModelEntry> = self.models.iter().filter(|m| m.name == name).collect();
                 if hit.is_empty() {
                     bail!("model `{name}` is not in the roster");
                 }
@@ -225,7 +245,10 @@ mod tests {
 
     #[test]
     fn harness_defaults_apply_when_section_omitted() {
-        let m = MatrixConfig::parse("[suite]\nname = \"tb-30\"\n").unwrap();
+        // Deserialization defaults are separate from runnability: a suite-only doc
+        // deserializes with the [harness] defaults but is NOT a valid matrix
+        // (validate() requires tasks/dataset/binary — see the rejection test).
+        let m: MatrixConfig = toml::from_str("[suite]\nname = \"tb-30\"\n").unwrap();
         assert_eq!(m.harness.executor, "harbor");
         assert_eq!(m.harness.concurrent, 2);
         assert_eq!(m.harness.lanes, vec!["off"]);
@@ -239,6 +262,10 @@ mod tests {
         let ok = r#"
             [suite]
             name = "tb-30"
+            dataset = "/d"
+            tasks = ["t"]
+            [harness]
+            binary = "/newt"
             [[model]]
             name = "nemotron-3-nano_30b"
             [[model]]
@@ -256,6 +283,34 @@ mod tests {
         "#;
         let err = MatrixConfig::parse(dup).unwrap_err().to_string();
         assert!(err.contains("duplicate model id"), "{err}");
+    }
+
+    #[test]
+    fn empty_suite_unknown_executor_and_missing_binary_are_rejected() {
+        // no tasks
+        let e =
+            MatrixConfig::parse("[suite]\nname=\"s\"\ndataset=\"/d\"\n[harness]\nbinary=\"/b\"\n")
+                .unwrap_err()
+                .to_string();
+        assert!(e.contains("no tasks"), "{e}");
+        // empty dataset
+        let e =
+            MatrixConfig::parse("[suite]\nname=\"s\"\ntasks=[\"t\"]\n[harness]\nbinary=\"/b\"\n")
+                .unwrap_err()
+                .to_string();
+        assert!(e.contains("dataset is empty"), "{e}");
+        // unknown executor
+        let e = MatrixConfig::parse(
+            "[suite]\nname=\"s\"\ntasks=[\"t\"]\ndataset=\"/d\"\n[harness]\nexecutor=\"native\"\nbinary=\"/b\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("unknown [harness] executor"), "{e}");
+        // empty binary (harness defaults binary to "")
+        let e = MatrixConfig::parse("[suite]\nname=\"s\"\ntasks=[\"t\"]\ndataset=\"/d\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("binary is empty"), "{e}");
     }
 
     #[test]
