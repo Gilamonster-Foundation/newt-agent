@@ -118,7 +118,7 @@ class NewtAgent(BaseInstalledAgent):
         # OCAP-on lane: append --confined. Off (empty/anything else) keeps the
         # default --yolo full-access lane. The flag flips OCAP on AND seeds the
         # workspace-fenced caveat inside `newt solve`.
-        confined = " --confined" if _OCAP.lower() == "on" else ""
+        confined = " --confined" if _OCAP.strip().lower() == "on" else ""
         # --non-interactive defaults true in `newt solve`, so it's omitted here
         # (passing it bare requires a value under the current arg definition).
         command = (

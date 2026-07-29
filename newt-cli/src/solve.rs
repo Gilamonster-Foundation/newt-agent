@@ -20,8 +20,19 @@
 //!   fs_write, never `Scope::All`). A `Scope::Only` write auto-consents at the
 //!   tool gate (the preset IS the operator's consent — see
 //!   `tools::confirm_unrestricted_fs_mutation`), so in-fence writes run with no
-//!   prompt while out-of-fence writes fail closed. This is the lane the 0.7.6
-//!   OCAP-parity gate measures against the `--yolo` scores.
+//!   prompt. This is the lane the 0.7.6 OCAP-parity gate measures against the
+//!   `--yolo` scores.
+//!
+//! **Scope of the write fence (be honest about it).** The fence enforces newt's
+//! own `write_file`/`edit_file` tool gate (`tools::tui_permits_path`), where an
+//! out-of-fence write is denied. It does NOT confine writes performed by
+//! programs the agent *spawns* (`exec` is `Scope::All`): confining those needs
+//! the kernel L3 fence (Landlock), and this lane forces the brush engine even
+//! when Landlock is absent, so a spawned command's writes are then advisory, not
+//! kernel-enforced. Combined with `fs_read = All` + `net = All`, this lane is a
+//! **bench isolation control for disposable containers, not a security sandbox**
+//! against a hostile agent. The fence is also deliberately broad on this first
+//! cut (workspace + standard mutable roots); tightening it is a later ratchet.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -53,6 +64,38 @@ pub struct SolveArgs {
     pub context_window: Option<usize>,
 }
 
+/// Which headless lane `newt solve` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadlessLane {
+    /// OCAP on, workspace-fenced tool writes (`--confined` / `NEWT_BENCH_OCAP=on`).
+    Confined,
+    /// OCAP off, full host access (`--non-interactive`, the default).
+    Yolo,
+    /// Neither — OCAP on with no gate; out-of-grant writes deny silently.
+    Neither,
+}
+
+/// Resolve the headless lane purely from the flags + the `NEWT_BENCH_OCAP` env
+/// twin, so precedence is unit-tested without a live run. `--confined` (or a
+/// trimmed, case-insensitive `NEWT_BENCH_OCAP=on`) wins over the `--yolo`
+/// default — the parity run flips the env from the adapter without also
+/// unsetting `--non-interactive`. The `.trim()` keeps a `"on "` from a shell or
+/// YAML value from silently missing the lane.
+fn resolve_lane(
+    confined_flag: bool,
+    ocap_env: Option<&str>,
+    non_interactive: bool,
+) -> HeadlessLane {
+    let confined = confined_flag || ocap_env.is_some_and(|v| v.trim().eq_ignore_ascii_case("on"));
+    if confined {
+        HeadlessLane::Confined
+    } else if non_interactive {
+        HeadlessLane::Yolo
+    } else {
+        HeadlessLane::Neither
+    }
+}
+
 /// Run one task headless and emit its trace. Returns the process exit code:
 /// `0` when the turn completed, `1` on an infrastructure/turn failure. (Task
 /// pass/fail is Terminal-Bench's job via the task's own verification — this exit
@@ -67,31 +110,46 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         None => Config::resolve().context("resolving config")?,
     };
 
-    // 2. Choose the headless lane. `--confined` / `NEWT_BENCH_OCAP=on` wins over
-    //    the `--yolo` default so the OCAP-parity run can flip the variable from
-    //    the adapter without also unsetting `--non-interactive`.
+    // 2. Choose the headless lane (pure resolution → unit-tested precedence),
+    //    then apply its process-env setup.
     //    SAFETY: single-threaded before the driver spawns its turn thread.
-    let confined = args.confined
-        || std::env::var("NEWT_BENCH_OCAP")
-            .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("on"));
-    if confined {
-        // OCAP-ON lane: do NOT disable OCAP or grant full access. Pin the brush
-        // shell engine so compound commands (pipes / `&&` / `$()`) run even when
-        // the Landlock L3 fence is unavailable in the container — the SafeSubset
-        // fallback engine structurally refuses that grammar. The workspace-fenced
-        // caveat is seeded onto `dc` below (needs the canonical workspace).
-        unsafe {
-            std::env::set_var("NEWT_SHELL_ENGINE", "brush");
+    let ocap_env = std::env::var("NEWT_BENCH_OCAP").ok();
+    let lane = resolve_lane(args.confined, ocap_env.as_deref(), args.non_interactive);
+    match lane {
+        HeadlessLane::Confined => {
+            // Keep OCAP enabled. DEFENSIVELY clear any inherited
+            // `NEWT_DISABLE_OCAP` / `NEWT_FULL_ACCESS` — `ocap_disabled()` reads
+            // those straight from the process env, so an inherited `=1` (a
+            // wrapper/pod that also runs the `--yolo` lane) would silently route
+            // every command to the host shell and void this lane's confinement
+            // contract. Then pin the brush shell engine so compound commands run
+            // even when the Landlock L3 fence is unavailable in the container (the
+            // SafeSubset fallback refuses that grammar). Caveat seeded on `dc`.
+            unsafe {
+                std::env::remove_var("NEWT_DISABLE_OCAP");
+                std::env::remove_var("NEWT_FULL_ACCESS");
+                std::env::set_var("NEWT_SHELL_ENGINE", "brush");
+            }
         }
-    } else if args.non_interactive {
-        // The `--yolo --full-access` bootstrap lane: full access (Caveats::top)
-        // AND OCAP disabled, so an UNRESTRICTED fs write auto-accepts instead of
-        // waiting on a (nonexistent) prompt gate and silently denying — the write
-        // path the benchmark depends on.
-        unsafe {
-            std::env::set_var("NEWT_FULL_ACCESS", "1");
-            std::env::set_var("NEWT_DISABLE_OCAP", "1");
+        HeadlessLane::Yolo => {
+            // The `--yolo --full-access` bootstrap lane: full access
+            // (Caveats::top) AND OCAP disabled, so an UNRESTRICTED fs write
+            // auto-accepts instead of waiting on a (nonexistent) prompt gate and
+            // silently denying — the write path the benchmark depends on.
+            unsafe {
+                std::env::set_var("NEWT_FULL_ACCESS", "1");
+                std::env::set_var("NEWT_DISABLE_OCAP", "1");
+            }
+        }
+        HeadlessLane::Neither => {
+            // OCAP on with no headless prompt gate, so out-of-grant writes deny
+            // silently (the WS1 trap). Only reachable via `--non-interactive
+            // false` without `--confined`; warn rather than fail mysteriously.
+            tracing::warn!(
+                "newt solve: neither --confined nor --non-interactive is set; OCAP \
+                 is on with no prompt gate, so writes outside the default grant \
+                 will be denied silently. Pass --confined for the fenced lane."
+            );
         }
     }
 
@@ -140,12 +198,12 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     if let Some(r) = args.max_rounds {
         dc.max_tool_rounds = r;
     }
-    // OCAP-ON confined lane: replace the default unconfined `Caveats::top()` with
-    // a workspace-fenced authority. The tool gate consults `dc.caveats` and the
-    // permission_gate stays `None` — an in-fence write auto-consents, an
-    // out-of-fence one fails closed (never hangs). This is the only seam the
-    // confined lane touches; the driver + tool layer are unchanged.
-    if confined {
+    // OCAP-ON confined lane: replace the default unconfined caveat with a
+    // workspace-fenced authority. The tool gate consults `dc.caveats` and the
+    // permission_gate stays `None` — an in-fence write auto-consents; an
+    // out-of-fence tool write is denied. This is the only seam the confined lane
+    // touches; the driver + tool layer are unchanged.
+    if lane == HeadlessLane::Confined {
         dc.caveats = confined_bench_caveats(&workspace);
     }
     // Pin the model's served context window so the loop's pre-send guard +
@@ -375,6 +433,26 @@ mod tests {
             ..Default::default()
         };
         assert!(pick_backend(&cfg).is_none());
+    }
+
+    #[test]
+    fn resolve_lane_precedence_and_trim() {
+        use HeadlessLane::*;
+        // --confined flag wins regardless of the others.
+        assert_eq!(resolve_lane(true, None, true), Confined);
+        assert_eq!(resolve_lane(true, Some("off"), false), Confined);
+        // NEWT_BENCH_OCAP=on (trimmed, case-insensitive) selects the confined lane.
+        assert_eq!(resolve_lane(false, Some("on"), true), Confined);
+        assert_eq!(resolve_lane(false, Some(" ON "), true), Confined);
+        assert_eq!(resolve_lane(false, Some("On"), false), Confined);
+        // Any non-`on` env value is NOT confined — it does not silently confine,
+        // and (with --non-interactive) it is the yolo lane.
+        assert_eq!(resolve_lane(false, Some("1"), true), Yolo);
+        assert_eq!(resolve_lane(false, Some("true"), true), Yolo);
+        assert_eq!(resolve_lane(false, None, true), Yolo);
+        // Neither flag nor env → the warn lane.
+        assert_eq!(resolve_lane(false, None, false), Neither);
+        assert_eq!(resolve_lane(false, Some("off"), false), Neither);
     }
 
     use newt_core::caveats::CaveatsExt;
