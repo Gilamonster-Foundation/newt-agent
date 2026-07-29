@@ -5,16 +5,30 @@
 //! It is a THIN wrapper over the same [`TurnDriver`] / `chat_complete` loop the
 //! interactive TUI runs — no second loop. Headless contract:
 //! `permission_gate: None` (a capability denial fails the call, never hangs) and
-//! caveats default to [`Caveats::top`] (unconfined). `--non-interactive` sets
-//! `NEWT_FULL_ACCESS=1` so the host shell is used and no prompt can appear — the
-//! `--yolo --full-access` bootstrap lane. (The flight-recorder-derived-Caveats
-//! confined lane is the later OCAP arc.)
+//! caveats default to [`Caveats::top`] (unconfined).
+//!
+//! Two headless lanes, selected up front:
+//!
+//! - **`--non-interactive` (the `--yolo` lane, default):** sets
+//!   `NEWT_FULL_ACCESS=1` + `NEWT_DISABLE_OCAP=1` so the host shell runs and no
+//!   prompt can appear — the bootstrap lane that isolated the agentic variable
+//!   from the confinement variable while the bench floor was established.
+//! - **`--confined` / `NEWT_BENCH_OCAP=on` (the OCAP-on lane):** OCAP stays ON.
+//!   Instead of full access, [`confined_bench_caveats`] seeds a workspace-fenced
+//!   authority — reads/exec/net stay open, but writes are confined to the
+//!   workspace and the container's mutable system roots (a `Scope::Only`
+//!   fs_write, never `Scope::All`). A `Scope::Only` write auto-consents at the
+//!   tool gate (the preset IS the operator's consent — see
+//!   `tools::confirm_unrestricted_fs_mutation`), so in-fence writes run with no
+//!   prompt while out-of-fence writes fail closed. This is the lane the 0.7.6
+//!   OCAP-parity gate measures against the `--yolo` scores.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use newt_core::caveats::{Caveats, Scope};
 use newt_core::{BackendKind, Config, TurnDriver, TurnDriverConfig, TurnStatus};
 
 /// Parsed `newt solve` arguments (mirrors the `Command::Solve` fields).
@@ -23,6 +37,12 @@ pub struct SolveArgs {
     pub instruction_file: PathBuf,
     pub profile: Option<PathBuf>,
     pub non_interactive: bool,
+    /// OCAP-ON confined bench lane: keep OCAP enabled and seed a workspace-fenced
+    /// caveat (see [`confined_bench_caveats`]) instead of the `--yolo` full-access
+    /// lane. Also enabled by the `NEWT_BENCH_OCAP=on` env twin (so the Harbor
+    /// adapter can flip it without a flag). Supersedes `non_interactive`'s
+    /// OCAP-off behaviour when set.
+    pub confined: bool,
     pub events: Option<PathBuf>,
     pub max_rounds: Option<usize>,
     /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`).
@@ -47,12 +67,28 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         None => Config::resolve().context("resolving config")?,
     };
 
-    // 2. Non-interactive ⇒ the `--yolo --full-access` bootstrap lane: full
-    //    access (Caveats::top) AND OCAP disabled, so an UNRESTRICTED fs write
-    //    auto-accepts instead of waiting on a (nonexistent) prompt gate and
-    //    silently denying — the write path the benchmark depends on. SAFETY:
-    //    single-threaded before the driver spawns its turn thread.
-    if args.non_interactive {
+    // 2. Choose the headless lane. `--confined` / `NEWT_BENCH_OCAP=on` wins over
+    //    the `--yolo` default so the OCAP-parity run can flip the variable from
+    //    the adapter without also unsetting `--non-interactive`.
+    //    SAFETY: single-threaded before the driver spawns its turn thread.
+    let confined = args.confined
+        || std::env::var("NEWT_BENCH_OCAP")
+            .ok()
+            .is_some_and(|v| v.eq_ignore_ascii_case("on"));
+    if confined {
+        // OCAP-ON lane: do NOT disable OCAP or grant full access. Pin the brush
+        // shell engine so compound commands (pipes / `&&` / `$()`) run even when
+        // the Landlock L3 fence is unavailable in the container — the SafeSubset
+        // fallback engine structurally refuses that grammar. The workspace-fenced
+        // caveat is seeded onto `dc` below (needs the canonical workspace).
+        unsafe {
+            std::env::set_var("NEWT_SHELL_ENGINE", "brush");
+        }
+    } else if args.non_interactive {
+        // The `--yolo --full-access` bootstrap lane: full access (Caveats::top)
+        // AND OCAP disabled, so an UNRESTRICTED fs write auto-accepts instead of
+        // waiting on a (nonexistent) prompt gate and silently denying — the write
+        // path the benchmark depends on.
         unsafe {
             std::env::set_var("NEWT_FULL_ACCESS", "1");
             std::env::set_var("NEWT_DISABLE_OCAP", "1");
@@ -103,6 +139,14 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     dc.api_key = api_key;
     if let Some(r) = args.max_rounds {
         dc.max_tool_rounds = r;
+    }
+    // OCAP-ON confined lane: replace the default unconfined `Caveats::top()` with
+    // a workspace-fenced authority. The tool gate consults `dc.caveats` and the
+    // permission_gate stays `None` — an in-fence write auto-consents, an
+    // out-of-fence one fails closed (never hangs). This is the only seam the
+    // confined lane touches; the driver + tool layer are unchanged.
+    if confined {
+        dc.caveats = confined_bench_caveats(&workspace);
     }
     // Pin the model's served context window so the loop's pre-send guard +
     // compaction keep each request under the backend's `--ctx-size` (e.g. dgx1
@@ -221,6 +265,68 @@ fn pick_backend(cfg: &Config) -> Option<&newt_core::config::BackendConfig> {
     cfg.backends.iter().find(|b| !b.endpoint.is_empty())
 }
 
+/// The workspace-fenced authority for the OCAP-ON bench lane.
+///
+/// Reads / exec / net stay fully open (a bench task legitimately reads the
+/// whole tree, runs arbitrary toolchains, and installs packages over the
+/// network), but **writes are fenced** to the workspace plus the mutable system
+/// roots a container's package managers and toolchains need (`/tmp`, `/usr`,
+/// `/usr/local`, `/var`, `/etc`, `/opt`, `/root`, `/home`) — plus any per-task
+/// `NEWT_WRITE_PATHS` grant. The fence is a `Scope::Only`, **never**
+/// `Scope::All`: that is the whole point of the lane (a `Scope::Only` write
+/// auto-consents at the tool gate, so in-fence writes run promptless while a
+/// write to an un-granted absolute path fails closed), and it is what the 0.7.6
+/// OCAP-parity gate measures. The fence is deliberately broad on this first cut
+/// so parity isolates *"does routing every op through the caveat lattice + the
+/// bridled shell break tasks?"* from *"is the fence too tight?"*; tightening
+/// per-task is a later ratchet.
+///
+/// Matching at the enforcement site (`tools::tui_permits_path`) is by
+/// lexically-normalized path **prefix**, so a root entry covers everything
+/// beneath it (`/usr` grants `/usr/lib/python3/...`).
+fn confined_bench_caveats(workspace: &str) -> Caveats {
+    // The per-task extra write grants the harness may pass (same env the
+    // interactive `--write` grants flow through). `split_paths` keeps a Windows
+    // drive-letter grant intact rather than shattering it on `:`. Read here so
+    // the pure core below stays env-free (and unit-testable without racing the
+    // process-global environment).
+    let extra: Vec<String> = std::env::var_os("NEWT_WRITE_PATHS")
+        .map(|v| {
+            std::env::split_paths(&v)
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    confined_bench_caveats_with_grants(workspace, &extra)
+}
+
+/// Pure core of [`confined_bench_caveats`]: the workspace fence plus explicit
+/// extra write roots, with no environment access (so it is deterministic and
+/// parallel-safe to test).
+fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[String]) -> Caveats {
+    // `top()` opens every axis; we then narrow ONLY fs_write. Reads/exec/net and
+    // the unlimited call budget are intentionally left wide.
+    let mut cv = Caveats::top();
+    let mut write_roots: Vec<String> = [
+        workspace,
+        "/tmp",
+        "/usr",
+        "/usr/local",
+        "/var",
+        "/etc",
+        "/opt",
+        "/root",
+        "/home",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    write_roots.extend(extra_write_roots.iter().cloned());
+    cv.fs_write = Scope::only(write_roots);
+    cv
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +368,54 @@ mod tests {
             ..Default::default()
         };
         assert!(pick_backend(&cfg).is_none());
+    }
+
+    use newt_core::caveats::CaveatsExt;
+
+    /// The load-bearing invariant of the OCAP-on lane: writes are FENCED, never
+    /// unrestricted. A `Scope::All` fs_write would (a) drop us back to the
+    /// unconfined `--yolo` behaviour and (b) route through the y/N-gated
+    /// `confirm_unrestricted_fs_mutation` path (which, with `permission_gate:
+    /// None`, silently DENIES) — the exact WS1 trap the lane exists to avoid.
+    #[test]
+    fn confined_caveats_fence_writes_never_all() {
+        let cv = confined_bench_caveats_with_grants("/app/task", &[]);
+        assert!(
+            !matches!(cv.fs_write, Scope::All),
+            "confined lane must NEVER grant fs_write = Scope::All"
+        );
+        assert!(
+            matches!(cv.fs_write, Scope::Only(_)),
+            "confined fs_write must be an explicit Scope::Only fence"
+        );
+        // Reads / exec / net stay wide so the bench isn't crippled — parity
+        // isolates the enforcement PATH, not fence tightness.
+        assert!(matches!(cv.fs_read, Scope::All), "reads stay open");
+        assert!(matches!(cv.exec, Scope::All), "exec stays open");
+        assert!(matches!(cv.net, Scope::All), "net stays open");
+    }
+
+    #[test]
+    fn confined_caveats_permit_workspace_and_scratch_writes() {
+        let cv = confined_bench_caveats_with_grants("/app/task", &[]);
+        // The workspace root and the standard mutable roots are writable
+        // (exact-match here; the enforcement site adds prefix coverage).
+        assert!(cv.permits_fs_write("/app/task"), "workspace root writable");
+        assert!(cv.permits_fs_write("/tmp"), "scratch writable");
+        assert!(cv.permits_fs_write("/usr"), "package-manager root writable");
+        // An un-granted absolute path outside every root is NOT writable.
+        assert!(
+            !cv.permits_fs_write("/boot/vmlinuz"),
+            "a path outside every granted root fails closed"
+        );
+    }
+
+    #[test]
+    fn confined_caveats_honor_write_paths_grant() {
+        let cv = confined_bench_caveats_with_grants("/app/task", &["/data/scratch".to_string()]);
+        assert!(
+            cv.permits_fs_write("/data/scratch"),
+            "a per-task NEWT_WRITE_PATHS grant joins the fence"
+        );
     }
 }

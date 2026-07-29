@@ -4,8 +4,16 @@ The bridge that lets Terminal-Bench (Harbor) drive newt on real, containerized
 tasks — the entry to the release-champion ceremony's reproducible lane.
 
 It injects the locally-built ``newt`` binary + a pinned backend profile into each
-task container, then drives ``newt solve`` headless (``--non-interactive`` =
---yolo --full-access) in ``/app`` and writes the trace to ``/logs/agent``.
+task container, then drives ``newt solve`` headless in ``/app`` and writes the
+trace to ``/logs/agent``. Two lanes, chosen by ``NEWT_BENCH_OCAP``:
+
+- unset / off — the default ``--non-interactive`` (``--yolo --full-access``)
+  lane: OCAP off, host shell, no prompts. The lane the published floor was set
+  on (deliberate variable isolation).
+- ``on`` — the ``--confined`` lane: OCAP stays ON, writes fenced to the
+  workspace + the container's mutable roots, reads/exec/net open. The 0.7.6
+  parity gate runs the SAME suite once per lane and requires the scores match.
+
 Inference reaches the pinned endpoint from *inside* the container (verified
 reachable). The binary is *injected* rather than package-installed because newt
 has no public crates/npm release yet — that is the only reason this isn't a
@@ -16,6 +24,7 @@ Run it:
     NEWT_BENCH_BIN=~/bin/newt \\
     NEWT_BENCH_PROFILE=/path/to/bench.toml \\
     NEWT_BENCH_TENACITY=insistent \\
+    NEWT_BENCH_OCAP=on \\        # omit / off for the --yolo lane
     PYTHONPATH=scripts/eval/harbor \\
     harbor run -a newt_agent:NewtAgent -m newt/qwen3-coder_30b <task-or-dataset...>
 
@@ -48,6 +57,12 @@ _MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "40")
 # generation doesn't overrun the window. Set this to match whatever `--ctx-size`
 # the endpoint actually serves. Overrideable; empty disables the pin.
 _CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "65536")
+# OCAP lane: ``on`` runs the confined lane (OCAP enabled, writes fenced to the
+# workspace + the container's mutable roots, reads/exec/net open) instead of the
+# default ``--yolo`` full-access lane. This is the variable the 0.7.6 parity gate
+# flips: the SAME suite is run once per model with NEWT_BENCH_OCAP unset (off)
+# and once with ``on``, and the two scores must match before 0.7.6 tags.
+_OCAP = os.environ.get("NEWT_BENCH_OCAP", "")
 
 
 class NewtAgent(BaseInstalledAgent):
@@ -100,6 +115,10 @@ class NewtAgent(BaseInstalledAgent):
 
         tenacity = f" --tenacity {shlex.quote(_TENACITY)}" if _TENACITY else ""
         ctx = f" --context-window {shlex.quote(_CONTEXT_WINDOW)}" if _CONTEXT_WINDOW else ""
+        # OCAP-on lane: append --confined. Off (empty/anything else) keeps the
+        # default --yolo full-access lane. The flag flips OCAP on AND seeds the
+        # workspace-fenced caveat inside `newt solve`.
+        confined = " --confined" if _OCAP.lower() == "on" else ""
         # --non-interactive defaults true in `newt solve`, so it's omitted here
         # (passing it bare requires a value under the current arg definition).
         command = (
@@ -108,6 +127,6 @@ class NewtAgent(BaseInstalledAgent):
             "--instruction-file /tmp/newt-task.md "
             "--config /etc/newt/bench.toml "
             "--events /logs/agent/newt-events.jsonl "
-            f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}{ctx}"
+            f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}{ctx}{confined}"
         )
         await self.exec_as_agent(environment, command=command)
