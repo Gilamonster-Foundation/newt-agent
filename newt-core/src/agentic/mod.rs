@@ -5388,10 +5388,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // hand it one more round to run it before we accept the finish — the
             // measured #1 capability lever (models declare done on broken
             // solutions). Gated by the action-nudge switch (`/nudge off`) and
-            // capped so a model that won't verify still ends the turn.
+            // capped so a model that won't verify still ends the turn. The
+            // `round + 1 < current_tool_round_limit` guard (cursor[bot], #1483)
+            // mirrors the narration/stale-file nudges: on the FINAL round a
+            // verify nudge would burn the pending answer into a cap-exit with
+            // zero rounds left to actually run anything — step aside and accept.
             if self_verify::enabled()
                 && action_nudges
                 && self_verify_nudges < SELF_VERIFY_CAP
+                && round + 1 < current_tool_round_limit
                 && !content.is_empty()
             {
                 let entries = self_verify::workspace_entries(std::path::Path::new(workspace));
