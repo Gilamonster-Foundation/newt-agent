@@ -9,6 +9,7 @@ mod brand;
 mod chat;
 mod color;
 mod crew_form;
+pub mod harness_panel;
 mod navigator_cmds;
 // Danger-tiering for permission grants (facade P1b, §7-F3/F4): pure-data
 // classification of a `(capability, target)` grant into a `DangerTier`, read by
