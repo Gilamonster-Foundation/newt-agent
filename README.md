@@ -112,13 +112,13 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 
 | Model | Family | OCAP off | OCAP on | Parity Δ | Suite | Window | Version | Date |
 |-------|--------|----------|---------|----------|-------|--------|---------|------|
-| `qwen3.6_35b` | qwen | 20.0% (6/30) | _pending_ | — | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
+| `qwen3.6_35b` | qwen | 20.0% (6/30) | 26.7% (8/30) | +6.7 pp | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
 | `qwen3-coder_30b` | qwen | 10.0% (3/30) | _pending_ | — | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
+| `nemotron-3-nano_30b` | nemotron | 6.7% (2/30) | _pending_ | — | tb-30 | 65536 | 0.7.5 | 2026-07-29 |
 | `deepseek-coder-v2_16b` | deepseek | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `gemma4_31b` | gemma | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `glm-4.7-flash` | glm | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `kimi-dev_72b` | kimi | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `nemotron-3-nano_30b` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `ornith_35b` | ornith | _queued_ | _queued_ | — | tb-30 | — | — | — |
 
 <!-- BENCH-SCOREBOARD:END -->
