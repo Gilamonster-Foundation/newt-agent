@@ -59,6 +59,14 @@
   {
    "model": "kimi-dev_72b",
    "family": "kimi"
+  },
+  {
+   "model": "gpt-4.1-mini",
+   "family": "openai"
+  },
+  {
+   "model": "o4-mini",
+   "family": "openai"
   }
  ]
 }
