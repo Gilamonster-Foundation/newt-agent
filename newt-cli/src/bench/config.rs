@@ -4,7 +4,7 @@
 //! tasks), the harness (how to run them), and the roster (which models). A new
 //! model is one `[[model]]` entry — config, never code (the three Cs).
 //!
-//! Two invariants this file enforces at parse time:
+//! Invariants this file enforces at parse time (`validate`):
 //!
 //! - **Each model id is its own identity.** Model names must be UNIQUE; the
 //!   roster never lumps variants together (the router alone serves six distinct
@@ -13,6 +13,9 @@
 //!   is an independent row with its own ratchet and parity verdict; `family` is
 //!   a display label ONLY, never the key.
 //! - **Lanes are `off` and/or `on`.** Any other lane name is a config error.
+//! - **The matrix is runnable:** a non-empty suite (tasks + dataset), a known
+//!   `executor`, and a non-empty `binary` — so a half-filled config fails loudly
+//!   at load instead of launching the harness against nothing.
 //!
 //! The "one model at a time" rule is an *orchestration* invariant (the run loop,
 //! not this file): dgx1's shared unified-memory pool holds a single model, so
