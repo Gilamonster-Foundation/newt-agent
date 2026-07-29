@@ -1,0 +1,58 @@
+# newt bench matrix — the roster as manifest (#1490).
+#
+# Copy to ~/.newt/bench/matrix.toml and point each model's `profile` at a LOCAL
+# backend toml (endpoint stays host-secret there, never in this file). Then:
+#
+#   newt bench run                       # whole roster, configured lanes
+#   newt bench run --model qwen3.6_35b   # one model
+#   newt bench run --lane on             # OCAP-on lane only
+#
+# HARD RULE: one model at a time. The model loop is strictly sequential — dgx1's
+# shared unified-memory pool holds ONE model; `concurrent` below is
+# n_concurrent_trials WITHIN a single already-loaded model's suite, never a
+# license to load two.
+
+[suite]
+name = "tb-30"
+dataset = "/var/tmp/tbench-tasks/terminal-bench"
+# The fixed 30-task cross-model instrument.
+tasks = [
+  "adaptive-rejection-sampler", "chess-best-move", "cobol-modernization",
+  "code-from-image", "constraints-scheduling", "count-dataset-tokens",
+  "crack-7z-hash", "dna-insert", "fix-git", "overfull-hbox",
+  "prove-plus-comm", "regex-log", "break-filter-js-from-html",
+  "build-cython-ext", "cancel-async-tasks", "configure-git-webserver",
+  "db-wal-recovery", "extract-elf", "feal-differential-cryptanalysis",
+  "git-leak-recovery", "kv-store-grpc", "log-summary-date-ranges",
+  "nginx-request-logging", "openssl-selfsigned-cert", "password-recovery",
+  "path-tracing", "pypi-server", "regex-chess", "sqlite-db-truncate",
+  "train-fasttext",
+]
+
+[harness]
+executor = "harbor"          # the pluggable backend; harbor today
+concurrent = 2               # trials in flight WITHIN one loaded model
+timeout_multiplier = 1.5
+max_rounds = 40
+binary = "/var/tmp/newt-bench-build/target/release/newt"  # container-portable
+lanes = ["off", "on"]        # both OCAP lanes → parity
+context_window = 65536       # per-model `window` overrides this
+
+# Each [[model]] is an INDEPENDENT identity — its own off/on ratchets and its own
+# parity verdict. Never lump variants: the router alone serves six distinct
+# nemotrons. `family` is a display label only; the exact `name` is the key.
+
+[[model]]
+name = "qwen3.6_35b"
+profile = "scratch/solve-qwen36.toml"
+family = "qwen"
+
+[[model]]
+name = "qwen3-coder_30b"
+profile = "scratch/solve-qwen3-coder.toml"
+family = "qwen"
+
+[[model]]
+name = "nemotron-3-nano_30b"
+profile = "scratch/solve-nemotron-3-nano_30b.toml"
+family = "nemotron"

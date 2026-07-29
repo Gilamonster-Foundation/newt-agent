@@ -722,6 +722,12 @@ pub enum Command {
         #[command(subcommand)]
         cmd: dgx::DgxCmd,
     },
+    /// Terminal-Bench matrix orchestration — run the roster one model at a
+    /// time, both OCAP lanes, feeding the scoreboard (#1490).
+    Bench {
+        #[command(subcommand)]
+        cmd: bench::BenchCmd,
+    },
     /// Authenticate an HTTP MCP server via the OAuth 2.1 PKCE browser flow.
     ///
     /// Without arguments: lists all discovered HTTP MCP servers and their token
@@ -1397,6 +1403,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         } => new_project::run(ecosystem, name, dir, force),
         Command::Skills { cmd } => skills::run(cmd, cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
+        Command::Bench { cmd } => bench::run(cmd).await,
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),
         Command::Models { cmd } => models_cmd::run(cmd).await,
         Command::Summarizer { cmd } => summarizer_cmd::run(cmd).await,
