@@ -31,6 +31,7 @@ import os
 import sys
 
 MANIFEST_DEFAULT = os.path.join(os.path.dirname(__file__), "bench-results.jsonl")
+ROSTER_DEFAULT = os.path.join(os.path.dirname(__file__), "bench-roster.json")
 START_MARKER = "<!-- BENCH-SCOREBOARD:START -->"
 END_MARKER = "<!-- BENCH-SCOREBOARD:END -->"
 
@@ -151,7 +152,16 @@ def _pct(x: float) -> str:
     return f"{x * 100:.1f}%"
 
 
-def render_table(records: list[dict]) -> str:
+def load_roster(path: str) -> list[dict]:
+    """The model matrix the scoreboard tracks. Missing/invalid file → empty
+    (roster rows are additive; the champions always render)."""
+    try:
+        return json.load(open(path)).get("roster", [])
+    except (OSError, ValueError):
+        return []
+
+
+def render_table(records: list[dict], roster: list[dict] | None = None) -> str:
     champs = champions(records)
     rows = sorted(champs.values(), key=lambda r: (-score_of(r), r.get("model", "")))
     header = (
@@ -160,7 +170,7 @@ def render_table(records: list[dict]) -> str:
         "| Model | Family | Score | Passed | Suite | Window | Version | Date |\n"
         "|-------|--------|-------|--------|-------|--------|---------|------|\n"
     )
-    if not rows:
+    if not rows and not roster:
         return header + "| _(no runs recorded yet)_ | | | | | | | |\n"
     body = ""
     for r in rows:
@@ -169,6 +179,16 @@ def render_table(records: list[dict]) -> str:
             f"{_pct(score_of(r))} | {r.get('passed','?')}/{r.get('total','?')} | "
             f"{r.get('suite','?')} | {r.get('window','?')} | "
             f"{r.get('version','?')} | {r.get('date','?')} |\n"
+        )
+    # Roster models with no measured run yet render as queued rows — the table
+    # doubles as the parity-tracking instrument for the whole matrix.
+    measured = {r.get("model") for r in rows}
+    for m in roster or []:
+        if m.get("model") in measured:
+            continue
+        body += (
+            f"| `{m.get('model','?')}` | {m.get('family','?')} | "
+            f"_queued_ | — | tb-30 | — | — | — |\n"
         )
     return header + body
 
@@ -230,7 +250,7 @@ def _cmd_gate(a: argparse.Namespace) -> int:
 
 def _cmd_render(a: argparse.Namespace) -> int:
     records = load_manifest(a.manifest)
-    table = render_table(records)
+    table = render_table(records, load_roster(a.roster))
     text = open(a.readme).read()
     new = inject(text, table)
     if new != text:
@@ -268,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     pr = sub.add_parser("render", help="rewrite the README scoreboard table")
     pr.add_argument("--readme", default="README.md")
     pr.add_argument("--manifest", default=MANIFEST_DEFAULT)
+    pr.add_argument("--roster", default=ROSTER_DEFAULT)
     pr.set_defaults(fn=_cmd_render)
 
     args = p.parse_args(argv)
@@ -321,6 +342,20 @@ def _self_test() -> int:
         assert False, "expected ValueError on missing markers"
     except ValueError:
         pass
+
+    # roster: unmeasured models render as queued rows, measured ones don't duplicate.
+    roster = [
+        {"model": "qwen", "family": "qwen"},          # measured → no extra row
+        {"model": "nemotron", "family": "nemotron"},  # unmeasured → queued row
+    ]
+    rt = render_table(recs, roster)
+    assert rt.count("| `qwen` |") == 1, "measured roster model must not duplicate"
+    assert "`nemotron` | nemotron | _queued_" in rt, rt
+    # roster-only (no runs at all) still renders rows, not the empty placeholder.
+    only = render_table([], [{"model": "m1", "family": "f"}])
+    assert "_queued_" in only and "no runs recorded" not in only
+    # missing roster file → empty list, never a crash.
+    assert load_roster("/nonexistent/roster.json") == []
 
     # tie on score → later date wins.
     tie = [
