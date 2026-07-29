@@ -70,6 +70,20 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     let kind = backend.kind.unwrap_or(BackendKind::Openai);
     let api_key = backend.resolve_api_key();
 
+    // #tenacity: attribute the model's family so a per-family `[tenacity]` config
+    // default applies to this run (an explicit `--tenacity` still supersedes it).
+    // The card's `family` if a built-in card names one, else a family inferred
+    // from the model NAME against the configured `[tenacity.families]` keys — so
+    // the model matrix (qwen3/gemma/nemotron/…) works from config without a card
+    // per model.
+    let card_family = newt_core::model_card::builtin_card(&model).and_then(|c| c.family);
+    let family = cfg
+        .tenacity
+        .as_ref()
+        .and_then(|t| t.family_for(&model, card_family.as_deref()))
+        .or(card_family);
+    newt_core::tenacity::set_active_model_family(family);
+
     // 4. The task instruction.
     let instruction = std::fs::read_to_string(&args.instruction_file).with_context(|| {
         format!(

@@ -121,15 +121,93 @@ impl FromStr for Tenacity {
     }
 }
 
-/// Process-global tenacity, set once from the CLI (`--tenacity`) before the
-/// agentic loop runs. Mirrors the CLI backend-override pattern: the operator
-/// dial can't be threaded through every loop construction site, so it is stashed
-/// here and read where a `WorkflowRuntimeState` is built. Absent ⇒ [`Tenacity`]'s
-/// `Default` (`Standard`). Config + per-family resolution supersede this in a
-/// later slice.
-static CLI_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
+/// The `[tenacity]` config section: a baseline level plus per-model-family
+/// overrides. Pure data (the three-Cs "knowledge in data" rule) — a new family's
+/// default is one map entry, not a new branch, mirroring the model-card
+/// [`crate::model_card::family_defaults`] pattern.
+///
+/// ```toml
+/// [tenacity]
+/// default = "standard"
+/// [tenacity.families]
+/// nemotron = "relentless"   # small/over-exploring family → force sooner
+/// qwen3    = "standard"
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TenacityConfig {
+    /// Baseline level when no per-family override matches. `None` ⇒ [`Tenacity`]'s
+    /// `Default` (`Standard`), so an empty `[tenacity]` changes nothing.
+    pub default: Option<Tenacity>,
+    /// Per-model-family overrides, keyed by the card's `family` label (e.g.
+    /// `"qwen3"`, `"nemotron"`). Matched case-insensitively. Supersedes
+    /// [`default`](Self::default); an explicit CLI `--tenacity` supersedes this.
+    pub families: std::collections::BTreeMap<String, Tenacity>,
+}
 
-/// Install the process-global tenacity (see [`effective_tenacity`]). Call once,
+impl TenacityConfig {
+    /// The configured level for a model `family` (case-insensitive): a per-family
+    /// override if one matches, else [`default`](Self::default), else `Standard`.
+    /// `family == None` (unknown/unresolved) skips straight to the default.
+    pub fn resolve(&self, family: Option<&str>) -> Tenacity {
+        family
+            .and_then(|f| {
+                self.families
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(f.trim()))
+                    .map(|(_, v)| *v)
+            })
+            .or(self.default)
+            .unwrap_or_default()
+    }
+
+    /// Attribute a family to a model for per-family resolution, without requiring
+    /// a model card per model. The card's `family` wins when it names a configured
+    /// family; otherwise infer it by matching a configured family KEY as a
+    /// case-insensitive substring of the model NAME — so `"qwen3-coder_30b"` picks
+    /// up a `[tenacity.families] qwen3` default, and the whole matrix (gemma,
+    /// nemotron, deepseek, kimi, glm…) works from config alone. The match set is
+    /// the operator's own `families` keys (data, not a hardcoded list). `None`
+    /// when nothing matches ⇒ [`resolve`](Self::resolve) uses the default.
+    pub fn family_for(&self, model: &str, card_family: Option<&str>) -> Option<String> {
+        if let Some(fam) = card_family {
+            let fam = fam.trim();
+            if self.families.keys().any(|k| k.eq_ignore_ascii_case(fam)) {
+                return Some(fam.to_string());
+            }
+        }
+        let lname = model.to_ascii_lowercase();
+        self.families
+            .keys()
+            .find(|k| lname.contains(&k.to_ascii_lowercase()))
+            .cloned()
+    }
+}
+
+/// Full resolution order, most-specific first: an explicit operator choice
+/// (`--tenacity`) wins over any config; config per-family wins over config
+/// default; `Standard` is the floor. `config == None` ⇒ CLI-or-`Standard`.
+pub fn resolve_tenacity(
+    cli: Option<Tenacity>,
+    config: Option<&TenacityConfig>,
+    family: Option<&str>,
+) -> Tenacity {
+    cli.unwrap_or_else(|| config.map(|c| c.resolve(family)).unwrap_or_default())
+}
+
+// The three tenacity inputs, each stashed by the one site that knows it — the
+// operator dial can't be threaded through every loop construction site. They are
+// combined lazily by [`effective_tenacity`] via [`resolve_tenacity`], so each
+// setter is independent and order-free:
+//   - CLI `--tenacity` flag (highest), set in the CLI dispatch,
+//   - the `[tenacity]` config, stashed at `Config::resolve`,
+//   - the active model's family, set at model selection.
+// All absent ⇒ [`Tenacity`]'s `Default` (`Standard`) — behaviour-preserving.
+static CLI_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
+static TENACITY_CONFIG: std::sync::Mutex<Option<TenacityConfig>> = std::sync::Mutex::new(None);
+static ACTIVE_FAMILY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Install the explicit CLI `--tenacity` override (highest priority). Call once,
 /// before the agentic loop starts.
 pub fn set_cli_tenacity(level: Tenacity) {
     if let Ok(mut slot) = CLI_TENACITY.lock() {
@@ -137,14 +215,30 @@ pub fn set_cli_tenacity(level: Tenacity) {
     }
 }
 
-/// The tenacity in effect: the CLI override if set, else the [`Default`]
-/// (`Standard`).
+/// Install the resolved `[tenacity]` config (per-family + default). Called from
+/// `Config::resolve`, the single canonical config-application entry.
+pub fn set_tenacity_config(config: TenacityConfig) {
+    if let Ok(mut slot) = TENACITY_CONFIG.lock() {
+        *slot = Some(config);
+    }
+}
+
+/// Install the active model's family (from its model card) so per-family config
+/// defaults apply. Called at model selection. `None` clears it.
+pub fn set_active_model_family(family: Option<String>) {
+    if let Ok(mut slot) = ACTIVE_FAMILY.lock() {
+        *slot = family;
+    }
+}
+
+/// The tenacity in effect, resolved from the three inputs (most-specific first):
+/// the CLI `--tenacity` flag, then the `[tenacity]` config's per-family override
+/// for the active family, then the config default, then `Standard`.
 pub fn effective_tenacity() -> Tenacity {
-    CLI_TENACITY
-        .lock()
-        .ok()
-        .and_then(|s| *s)
-        .unwrap_or_default()
+    let cli = CLI_TENACITY.lock().ok().and_then(|s| *s);
+    let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
+    let family = ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone());
+    resolve_tenacity(cli, config.as_ref(), family.as_deref())
 }
 
 #[cfg(test)]
@@ -208,5 +302,118 @@ mod tests {
         assert_eq!(json, "\"insistent\"");
         let back: Tenacity = serde_json::from_str("\"relentless\"").unwrap();
         assert_eq!(back, Tenacity::Relentless);
+    }
+
+    fn cfg(default: Option<Tenacity>, fams: &[(&str, Tenacity)]) -> TenacityConfig {
+        TenacityConfig {
+            default,
+            families: fams.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        }
+    }
+
+    #[test]
+    fn config_resolve_prefers_family_then_default_then_standard() {
+        let c = cfg(
+            Some(Tenacity::Relaxed),
+            &[("nemotron", Tenacity::Relentless)],
+        );
+        // Known family → its override.
+        assert_eq!(c.resolve(Some("nemotron")), Tenacity::Relentless);
+        // Case-insensitive + trimmed.
+        assert_eq!(c.resolve(Some("  NEMOTRON ")), Tenacity::Relentless);
+        // Unknown family → the config default.
+        assert_eq!(c.resolve(Some("qwen3")), Tenacity::Relaxed);
+        // No family → the config default.
+        assert_eq!(c.resolve(None), Tenacity::Relaxed);
+        // Empty config → Standard.
+        assert_eq!(
+            TenacityConfig::default().resolve(Some("qwen3")),
+            Tenacity::Standard
+        );
+        assert_eq!(cfg(None, &[]).resolve(None), Tenacity::Standard);
+    }
+
+    #[test]
+    fn resolve_tenacity_lets_the_cli_flag_win_over_config() {
+        let c = cfg(
+            Some(Tenacity::Relaxed),
+            &[("nemotron", Tenacity::Relentless)],
+        );
+        // CLI override beats even a matching per-family default.
+        assert_eq!(
+            resolve_tenacity(Some(Tenacity::Standard), Some(&c), Some("nemotron")),
+            Tenacity::Standard
+        );
+        // No CLI → config per-family.
+        assert_eq!(
+            resolve_tenacity(None, Some(&c), Some("nemotron")),
+            Tenacity::Relentless
+        );
+        // No CLI, unknown family → config default.
+        assert_eq!(
+            resolve_tenacity(None, Some(&c), Some("kimi")),
+            Tenacity::Relaxed
+        );
+        // No config at all → CLI-or-Standard.
+        assert_eq!(
+            resolve_tenacity(None, None, Some("nemotron")),
+            Tenacity::Standard
+        );
+        assert_eq!(
+            resolve_tenacity(Some(Tenacity::Insistent), None, None),
+            Tenacity::Insistent
+        );
+    }
+
+    #[test]
+    fn family_for_prefers_card_then_infers_from_the_model_name() {
+        let c = cfg(
+            None,
+            &[
+                ("qwen3", Tenacity::Standard),
+                ("nemotron", Tenacity::Relentless),
+            ],
+        );
+        // Card family that names a configured family wins.
+        assert_eq!(
+            c.family_for("whatever", Some("qwen3")).as_deref(),
+            Some("qwen3")
+        );
+        // No card → infer from the model name (the matrix case).
+        assert_eq!(
+            c.family_for("qwen3-coder_30b", None).as_deref(),
+            Some("qwen3")
+        );
+        assert_eq!(
+            c.family_for("NVIDIA-Nemotron-3-Nano", None).as_deref(),
+            Some("nemotron")
+        );
+        // No configured family matches the name → None (→ default level).
+        assert_eq!(c.family_for("gemma-2-9b", None), None);
+        // A card family NOT in the map falls through to name inference.
+        assert_eq!(
+            c.family_for("qwen3-coder_30b", Some("unlisted")).as_deref(),
+            Some("qwen3")
+        );
+        // Resolving that inferred family gives the per-family level.
+        let fam = c.family_for("qwen3-coder_30b", None);
+        assert_eq!(c.resolve(fam.as_deref()), Tenacity::Standard);
+    }
+
+    #[test]
+    fn tenacity_config_parses_from_toml() {
+        let c: TenacityConfig = toml::from_str(
+            r#"
+            default = "insistent"
+            [families]
+            nemotron = "relentless"
+            qwen3 = "standard"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.default, Some(Tenacity::Insistent));
+        assert_eq!(c.resolve(Some("nemotron")), Tenacity::Relentless);
+        assert_eq!(c.resolve(Some("qwen3")), Tenacity::Standard);
+        assert_eq!(c.resolve(Some("gemma")), Tenacity::Insistent);
     }
 }
