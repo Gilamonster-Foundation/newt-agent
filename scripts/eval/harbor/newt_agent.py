@@ -53,6 +53,11 @@ from harbor.models.agent.context import AgentContext
 # the endpoint lives only in the profile toml (RATCHET.md invariant).
 _NEWT_BIN = os.environ.get("NEWT_BENCH_BIN", os.path.expanduser("~/bin/newt"))
 _NEWT_PROFILE = os.environ.get("NEWT_BENCH_PROFILE", "")
+# Optional API-key file to inject for hosted backends (e.g. OpenAI). Uploaded
+# into the container at /etc/newt/api-key; a profile then reads it via
+# `api_key_file = "/etc/newt/api-key"`. Host-secret: the key stays in a local
+# file (never an env value or a committed literal). Empty = local endpoint, no key.
+_API_KEY_FILE = os.environ.get("NEWT_BENCH_API_KEY_FILE", "")
 # Optional tenacity dial (relaxed|standard|insistent|relentless) and round cap.
 _TENACITY = os.environ.get("NEWT_BENCH_TENACITY", "")
 _MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "40")
@@ -128,6 +133,10 @@ class NewtAgent(BaseInstalledAgent):
         await self.exec_as_root(environment, command="chmod 0755 /usr/local/bin/newt")
         await self.exec_as_root(environment, command="mkdir -p /etc/newt")
         await environment.upload_file(_NEWT_PROFILE, "/etc/newt/bench.toml")
+        # Hosted backends: inject the API key as a file (never an env literal).
+        if _API_KEY_FILE:
+            await environment.upload_file(_API_KEY_FILE, "/etc/newt/api-key")
+            await self.exec_as_root(environment, command="chmod 0600 /etc/newt/api-key")
 
     @override
     @with_prompt_template
