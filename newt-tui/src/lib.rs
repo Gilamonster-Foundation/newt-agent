@@ -3175,9 +3175,22 @@ pub(crate) struct BackendChoice {
 /// testing.
 fn ready_line(version: &str, model: &str, url: &str, kind: newt_core::BackendKind) -> String {
     format!(
-        "v{version} ready — {model} @ {url} ({})  (Ctrl-D or /exit to quit)",
-        kind.label()
+        "v{version} ready — {model} @ {url} ({}){}  (Ctrl-D or /exit to quit)",
+        kind.label(),
+        tenacity_indicator(newt_core::tenacity::effective_tenacity())
     )
+}
+
+/// The preamble tenacity indicator (#12): shown only when tenacity is ELEVATED
+/// above the behaviour-preserving `Standard`, so an operator sees at a glance
+/// that action-forcing is dialled up (`· tenacity: relentless`). Empty at
+/// `Standard` to keep the default line clean. Pure — unit-tested directly.
+fn tenacity_indicator(t: newt_core::Tenacity) -> String {
+    if t == newt_core::Tenacity::Standard {
+        String::new()
+    } else {
+        format!(" · tenacity: {}", t.label())
+    }
 }
 
 /// Resolve where the semantic embedder sends requests: `(url, protocol, key)`.
@@ -9075,6 +9088,18 @@ optional field. Same form as `newt crew --edit`.
 On (default on a TTY): chain-of-thought streams dimmed above the answer while
 the model works. Off: just the answer. Persist with [tui] thinking in config."
         }
+        "tenacity" => {
+            "\
+/tenacity [level|list] — how hard the harness pushes the model from reading to acting
+
+  /tenacity              show the active level and what it does
+  /tenacity list         list every level, patient → forcing
+  /tenacity <level>      set relaxed | standard | insistent | relentless
+
+Higher tenacity forces an edit after fewer read-only rounds and makes
+exit_plan_mode require a concrete edit. This session-scoped override wins over
+[tenacity] config and the --tenacity flag. Persist per-family in [tenacity]."
+        }
         "probe" => {
             "\
 /probe [model|all] · /probe window <model> · /probe reset
@@ -9578,6 +9603,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /docs                    - quick pointers to newt docs and issue tracker",
         "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
+        "  /tenacity [level|list]   - how hard to push from reading to acting (relaxed→relentless)",
         "  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)",
         "  /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
@@ -9627,7 +9653,7 @@ fn dispatch_slash(
         "exit" | "quit" | "help" | "version" | "workspace" | "config" => {
             commands::meta::dispatch(cmd, arg1, workspace, color, verbose)
         }
-        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" => {
+        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" | "tenacity" => {
             commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose)
         }
         "models" | "probe" | "model" | "backend" | "backends" | "summarizer" | "dgx" => {
@@ -12254,6 +12280,31 @@ mod helper_fn_tests;
 // ---------------------------------------------------------------------------
 // Persona helper tests — store edge cases + command plumbing
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tenacity_indicator_tests {
+    use super::tenacity_indicator;
+    use newt_core::Tenacity;
+
+    #[test]
+    fn shows_only_when_elevated_above_standard() {
+        // Behaviour-preserving default: no clutter on the ready line.
+        assert_eq!(tenacity_indicator(Tenacity::Standard), "");
+        // Every elevated level (either direction from Standard) is announced.
+        assert_eq!(
+            tenacity_indicator(Tenacity::Relentless),
+            " · tenacity: relentless"
+        );
+        assert_eq!(
+            tenacity_indicator(Tenacity::Insistent),
+            " · tenacity: insistent"
+        );
+        assert_eq!(
+            tenacity_indicator(Tenacity::Relaxed),
+            " · tenacity: relaxed"
+        );
+    }
+}
 
 #[cfg(test)]
 mod persona_helper_tests {
