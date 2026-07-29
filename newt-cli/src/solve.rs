@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use newt_core::caveats::{Caveats, Scope};
+use newt_core::caveats::{Caveats, CountBound, Scope};
 use newt_core::{BackendKind, Config, TurnDriver, TurnDriverConfig, TurnStatus};
 
 /// Parsed `newt solve` arguments (mirrors the `Command::Solve` fields).
@@ -305,9 +305,6 @@ fn confined_bench_caveats(workspace: &str) -> Caveats {
 /// extra write roots, with no environment access (so it is deterministic and
 /// parallel-safe to test).
 fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[String]) -> Caveats {
-    // `top()` opens every axis; we then narrow ONLY fs_write. Reads/exec/net and
-    // the unlimited call budget are intentionally left wide.
-    let mut cv = Caveats::top();
     let mut write_roots: Vec<String> = [
         workspace,
         "/tmp",
@@ -323,8 +320,18 @@ fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[Stri
     .map(|s| s.to_string())
     .collect();
     write_roots.extend(extra_write_roots.iter().cloned());
-    cv.fs_write = Scope::only(write_roots);
-    cv
+    // Built axis-by-axis rather than narrowing `Caveats::top()`: a headless
+    // dispatch path must not even MENTION `Caveats::top()` (the `#94` no-top-leak
+    // guard, `newt-acp-worker/tests/no_top_leak.rs`). Reads/exec/net and the call
+    // budget are the open top of their axes; ONLY fs_write is fenced.
+    Caveats {
+        fs_read: Scope::All,
+        fs_write: Scope::only(write_roots),
+        exec: Scope::All,
+        net: Scope::All,
+        max_calls: CountBound::Unlimited,
+        valid_for_generation: Scope::All,
+    }
 }
 
 #[cfg(test)]
