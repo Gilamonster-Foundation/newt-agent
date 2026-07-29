@@ -112,6 +112,7 @@ _Per-model **champion** scores — the release gate is a monotonic ratchet: a mo
 
 | Model | Family | Score | Passed | Suite | Window | Version | Date |
 |-------|--------|-------|--------|-------|--------|---------|------|
+| `qwen3.6_35b` | qwen | 20.0% | 6/30 | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
 | `qwen3-coder_30b` | qwen | 10.0% | 3/30 | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
 
 <!-- BENCH-SCOREBOARD:END -->
