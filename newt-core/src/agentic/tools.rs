@@ -2503,6 +2503,27 @@ fn record_governed_file_change(
     }
 }
 
+/// The `exit_plan_mode` tool result. Under a tenacity level that
+/// [`requires an edit`](crate::tenacity::Tenacity::exit_plan_requires_edit) on
+/// plan exit (Insistent / Relentless), it appends a MANDATORY-EDIT directive so
+/// the model executes the first step instead of sliding back into more reading
+/// (#tenacity / #11). Lower levels leave plan exit advisory. The tenacity
+/// action-forcing loop (#10) then enforces it: a subsequent read-only round
+/// trips the forcing nudge within the level's (small) budget.
+fn exit_plan_mode_result(tenacity: crate::tenacity::Tenacity) -> String {
+    let base = "exited the model-entered PLAN PHASE. Subsequent tool calls return to this turn's validated disposition and underlying session permissions; the next outer turn returns to the human-selected operating mode. `/mode plan` and other clamps still remain read-only.";
+    if tenacity.exit_plan_requires_edit() {
+        format!(
+            "{base}\n\nThe plan is set — now EXECUTE it. Your NEXT action must be a concrete \
+             change (edit_file or write_file) that begins the first step — not another \
+             read, search, or plan. If a prerequisite is missing, make the smallest edit \
+             that unblocks it."
+        )
+    } else {
+        base.to_string()
+    }
+}
+
 fn artifact_postcondition_warning(
     path: &str,
     detail: &str,
@@ -3284,7 +3305,7 @@ async fn execute_tool_inner(
         },
         "exit_plan_mode" => match plan_mode_control {
             Some(control) => match control.set_plan_mode(false) {
-                Ok(()) => "exited the model-entered PLAN PHASE. Subsequent tool calls return to this turn's validated disposition and underlying session permissions; the next outer turn returns to the human-selected operating mode. `/mode plan` and other clamps still remain read-only.".to_string(),
+                Ok(()) => exit_plan_mode_result(crate::tenacity::effective_tenacity()),
                 Err(error) => format!("error: exit_plan_mode: {error}"),
             },
             None => {
@@ -4270,6 +4291,34 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
 mod tests {
     use super::*;
     use crate::agentic::NoMcp;
+
+    #[test]
+    fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it() {
+        use crate::tenacity::Tenacity;
+        // Advisory levels: plain result, no forcing directive.
+        for t in [Tenacity::Relaxed, Tenacity::Standard] {
+            let out = exit_plan_mode_result(t);
+            assert!(out.starts_with("exited the model-entered PLAN PHASE"));
+            assert!(
+                !out.contains("must be a concrete"),
+                "{t} must not force an edit: {out}"
+            );
+        }
+        // Forcing levels: the mandatory-edit directive is appended.
+        for t in [Tenacity::Insistent, Tenacity::Relentless] {
+            let out = exit_plan_mode_result(t);
+            assert!(out.contains("now EXECUTE it"), "{t}: {out}");
+            assert!(out.contains("must be a concrete"), "{t}: {out}");
+            assert!(out.contains("edit_file or write_file"), "{t}: {out}");
+        }
+        // The two sets agree with the level's own predicate.
+        for t in Tenacity::all() {
+            assert_eq!(
+                exit_plan_mode_result(t).contains("now EXECUTE it"),
+                t.exit_plan_requires_edit()
+            );
+        }
+    }
 
     // ── #1258: the embedded `find` size column (pure, fs-free) ──────────────
 
