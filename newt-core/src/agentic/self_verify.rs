@@ -8,9 +8,9 @@
 //! violating a stated hard rule a checker would catch; many tasks include a
 //! `test_*.py` (and say "you can run it to verify") the agent ignores.
 //!
-//! This module is the PURE decision core: given the workspace's top-level entries
-//! + the instruction + the shell commands the model ran this turn, it detects the
-//! verifications on offer and returns a nudge naming the ones NOT run — so the
+//! This module is the PURE decision core: given the workspace's top-level
+//! entries, the instruction, and the shell commands the model ran this turn, it
+//! detects the verifications on offer and returns a nudge naming the ones NOT run — so the
 //! loop can hand the model one more round to verify instead of accepting a
 //! finish. It renders no output and touches no filesystem; the loop supplies the
 //! entries (one cheap scan) and the accumulated commands.
@@ -76,7 +76,14 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
             seen_pytest = true;
             checks.push(VerifyCheck::new(
                 "the Python tests (`pytest` / running the test file)",
-                &["pytest", "unittest", "py.test", "python -m test", "test_", "_test.py"],
+                &[
+                    "pytest",
+                    "unittest",
+                    "py.test",
+                    "python -m test",
+                    "test_",
+                    "_test.py",
+                ],
             ));
         }
         match el.as_str() {
@@ -90,10 +97,19 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
             )),
             "package.json" => checks.push(VerifyCheck::new(
                 "`npm test` (package.json)",
-                &["npm test", "npm run test", "yarn test", "pnpm test", "npm run check"],
+                &[
+                    "npm test",
+                    "npm run test",
+                    "yarn test",
+                    "pnpm test",
+                    "npm run check",
+                ],
             )),
             "cargo.toml" => {
-                checks.push(VerifyCheck::new("`cargo test`", &["cargo test", "cargo check"]))
+                checks.push(VerifyCheck::new(
+                    "`cargo test`",
+                    &["cargo test", "cargo check"],
+                ));
             }
             "go.mod" => checks.push(VerifyCheck::new("`go test ./...`", &["go test"])),
             _ => {}
@@ -194,7 +210,9 @@ pub fn commands_from_messages(messages: &[serde_json::Value]) -> Vec<String> {
                     .ok()
                     .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
             } else {
-                args.get("command").and_then(|c| c.as_str()).map(String::from)
+                args.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(String::from)
             };
             if let Some(c) = cmd {
                 out.push(c);
@@ -202,6 +220,15 @@ pub fn commands_from_messages(messages: &[serde_json::Value]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Is the self-verify gate enabled? OFF by default (behaviour-preserving — the
+/// gate changes when a turn is allowed to conclude, so it must be opt-in), turned
+/// on with `NEWT_SELF_VERIFY=1` (the headless bench lane sets it). Kept an env
+/// toggle to match the session-scoped `NEWT_NUDGE` / `NEWT_FULL_ACCESS` pattern.
+pub fn enabled() -> bool {
+    std::env::var("NEWT_SELF_VERIFY")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
 }
 
 /// The workspace's top-level entry names for [`detect_checks`]. A thin fs wrapper
@@ -227,7 +254,10 @@ mod tests {
 
     #[test]
     fn detects_a_python_test_file_once() {
-        let c = detect_checks(&entries(&["solution.py", "test_outputs.py", "README.md"]), "");
+        let c = detect_checks(
+            &entries(&["solution.py", "test_outputs.py", "README.md"]),
+            "",
+        );
         assert_eq!(c.len(), 1);
         assert!(c[0].label.contains("Python tests"));
         // A second test file does not add a duplicate pytest check.
@@ -238,7 +268,13 @@ mod tests {
     #[test]
     fn detects_build_tool_test_entrypoints() {
         let labels: Vec<String> = detect_checks(
-            &entries(&["Makefile", "package.json", "Cargo.toml", "justfile", "go.mod"]),
+            &entries(&[
+                "Makefile",
+                "package.json",
+                "Cargo.toml",
+                "justfile",
+                "go.mod",
+            ]),
             "",
         )
         .into_iter()

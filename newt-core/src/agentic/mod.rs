@@ -21,9 +21,9 @@ pub(crate) mod compress;
 mod crew_attest;
 mod crew_tool;
 pub(crate) mod cw_overflow;
-pub(crate) mod self_verify;
 mod display;
 mod git_tool;
+pub(crate) mod self_verify;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
 pub(crate) mod scratchpad;
 // Step 26.5 (#582): semantic repo-evidence retrieval (embedding RAG-for-code).
@@ -5389,9 +5389,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // measured #1 capability lever (models declare done on broken
             // solutions). Gated by the action-nudge switch (`/nudge off`) and
             // capped so a model that won't verify still ends the turn.
-            if action_nudges && self_verify_nudges < SELF_VERIFY_CAP && !content.is_empty() {
-                let entries =
-                    self_verify::workspace_entries(std::path::Path::new(workspace));
+            if self_verify::enabled()
+                && action_nudges
+                && self_verify_nudges < SELF_VERIFY_CAP
+                && !content.is_empty()
+            {
+                let entries = self_verify::workspace_entries(std::path::Path::new(workspace));
                 let checks = self_verify::detect_checks(&entries, active_task);
                 let cmds = self_verify::commands_from_messages(&messages);
                 if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
@@ -5402,8 +5405,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         );
                     }
                     strip_trailing_nudge_exchange(&mut messages);
-                    messages
-                        .push(serde_json::json!({ "role": "assistant", "content": content }));
+                    messages.push(serde_json::json!({ "role": "assistant", "content": content }));
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge),
