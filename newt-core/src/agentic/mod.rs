@@ -21,6 +21,7 @@ pub(crate) mod compress;
 mod crew_attest;
 mod crew_tool;
 pub(crate) mod cw_overflow;
+pub(crate) mod self_verify;
 mod display;
 mod git_tool;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
@@ -4728,6 +4729,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
     // Narrate-then-stop rescue counter (mirror of the Ollama path).
     let mut narration_nudges: usize = 0;
+    // Self-verify gate (#23): times we've handed the model a round to run the
+    // verification the workspace ships before letting it conclude. Capped so a
+    // model that refuses to verify still ends the turn.
+    let mut self_verify_nudges: usize = 0;
+    const SELF_VERIFY_CAP: usize = 2;
     // Pending-plan final-answer gate counter (mirror of the Ollama path).
     let mut pending_plan_nudges: usize = 0;
     // Unverified stale-file blocker rescue counter (mirror of the Ollama path).
@@ -5375,6 +5381,36 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 }));
                 narration_nudges += 1;
                 continue 'round_loop;
+            }
+            // Self-verify gate (#23): the model is concluding with usable content.
+            // If the workspace ships a verification (tests / a make·just·npm·cargo
+            // target / a command the instruction names) it NEVER ran this turn,
+            // hand it one more round to run it before we accept the finish — the
+            // measured #1 capability lever (models declare done on broken
+            // solutions). Gated by the action-nudge switch (`/nudge off`) and
+            // capped so a model that won't verify still ends the turn.
+            if action_nudges && self_verify_nudges < SELF_VERIFY_CAP && !content.is_empty() {
+                let entries =
+                    self_verify::workspace_entries(std::path::Path::new(workspace));
+                let checks = self_verify::detect_checks(&entries, active_task);
+                let cmds = self_verify::commands_from_messages(&messages);
+                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
+                    if debug {
+                        print_debug(
+                            "concluding with unrun verification — self-verify nudge",
+                            color,
+                        );
+                    }
+                    strip_trailing_nudge_exchange(&mut messages);
+                    messages
+                        .push(serde_json::json!({ "role": "assistant", "content": content }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge),
+                    }));
+                    self_verify_nudges += 1;
+                    continue 'round_loop;
+                }
             }
             // Phase 20 §2.2: non-empty final content is usable output —
             // report the accepted prompt before returning.
