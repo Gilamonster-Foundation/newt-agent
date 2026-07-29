@@ -108,18 +108,18 @@ published from `scripts/eval/bench-results.jsonl` every release
 (`scripts/eval/bench_scoreboard.py render`).
 
 <!-- BENCH-SCOREBOARD:START -->
-_Per-model **champion** scores — the release gate is a monotonic ratchet: a model's score never goes down. Auto-generated; do not edit by hand._
+_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down); the 0.7.6 gate is per-model **parity** — OCAP-on within reach of OCAP-off (Δ ≥ 0). Auto-generated; do not edit by hand._
 
-| Model | Family | Score | Passed | Suite | Window | Version | Date |
-|-------|--------|-------|--------|-------|--------|---------|------|
-| `qwen3.6_35b` | qwen | 20.0% | 6/30 | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
-| `qwen3-coder_30b` | qwen | 10.0% | 3/30 | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
-| `ornith_35b` | ornith | _queued_ | — | tb-30 | — | — | — |
-| `glm-4.7-flash` | glm | _queued_ | — | tb-30 | — | — | — |
-| `deepseek-coder-v2_16b` | deepseek | _queued_ | — | tb-30 | — | — | — |
-| `gemma4_31b` | gemma | _queued_ | — | tb-30 | — | — | — |
-| `kimi-dev_72b` | kimi | _queued_ | — | tb-30 | — | — | — |
-| `nemotron-3-nano_30b` | nemotron | _queued_ | — | tb-30 | — | — | — |
+| Model | Family | OCAP off | OCAP on | Parity Δ | Suite | Window | Version | Date |
+|-------|--------|----------|---------|----------|-------|--------|---------|------|
+| `qwen3.6_35b` | qwen | 20.0% (6/30) | _pending_ | — | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
+| `qwen3-coder_30b` | qwen | 10.0% (3/30) | _pending_ | — | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
+| `deepseek-coder-v2_16b` | deepseek | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `gemma4_31b` | gemma | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `glm-4.7-flash` | glm | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `kimi-dev_72b` | kimi | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `nemotron-3-nano_30b` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `ornith_35b` | ornith | _queued_ | _queued_ | — | tb-30 | — | — | — |
 
 <!-- BENCH-SCOREBOARD:END -->
 
