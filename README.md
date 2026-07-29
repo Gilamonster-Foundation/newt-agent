@@ -107,6 +107,11 @@ releases; we establish a starting number and keep beating it. The table below is
 published from `scripts/eval/bench-results.jsonl` every release
 (`scripts/eval/bench_scoreboard.py render`).
 
+For the full DGX Spark capability survey — the model ladder, the hosted-model and
+newt-vs-Codex comparisons, and the integrity log for how the numbers were kept
+honest — see
+[docs/findings/dgx-spark-terminal-bench-survey.md](docs/findings/dgx-spark-terminal-bench-survey.md).
+
 <!-- BENCH-SCOREBOARD:START -->
 _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down); the 0.7.6 gate is per-model **parity** — OCAP-on within reach of OCAP-off (Δ ≥ 0). Auto-generated; do not edit by hand._
 
