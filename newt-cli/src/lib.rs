@@ -9,6 +9,7 @@
 //! kept out of the default workspace.
 
 mod auth_cmd;
+pub mod bench;
 mod compaction_cmd;
 mod config_cmd;
 pub mod crew;
