@@ -36,7 +36,13 @@ impl RunSpec<'_> {
             .model
             .name
             .chars()
-            .map(|c| if c == '/' || c == std::path::MAIN_SEPARATOR { '_' } else { c })
+            .map(|c| {
+                if c == '/' || c == std::path::MAIN_SEPARATOR {
+                    '_'
+                } else {
+                    c
+                }
+            })
             .collect();
         format!("{}/tbench-{}-{}", self.jobs_root, safe, self.lane)
     }
@@ -99,7 +105,10 @@ impl HarborExecutor {
         let mut env = vec![
             ("NEWT_BENCH_BIN".into(), spec.harness.binary.clone()),
             ("NEWT_BENCH_PROFILE".into(), spec.model.profile.clone()),
-            ("NEWT_BENCH_MAX_ROUNDS".into(), spec.harness.max_rounds.to_string()),
+            (
+                "NEWT_BENCH_MAX_ROUNDS".into(),
+                spec.harness.max_rounds.to_string(),
+            ),
             ("PYTHONPATH".into(), self.pythonpath.clone()),
         ];
         // The lane is the whole point: `on` flips the confined `newt solve` lane;
@@ -173,8 +182,8 @@ fn endpoint_from_profile(profile: &str) -> Result<String> {
     if profile.is_empty() {
         bail!("model has no `profile` (needed to resolve its endpoint)");
     }
-    let text = std::fs::read_to_string(profile)
-        .with_context(|| format!("reading profile {profile}"))?;
+    let text =
+        std::fs::read_to_string(profile).with_context(|| format!("reading profile {profile}"))?;
     let val: toml::Value = toml::from_str(&text).context("parsing profile toml")?;
     val.get("backends")
         .and_then(|b| b.as_array())
@@ -224,8 +233,14 @@ mod tests {
     #[test]
     fn jobs_dir_is_per_model_and_per_lane() {
         let m = MatrixConfig::parse(SAMPLE).unwrap();
-        assert_eq!(spec(&m, 0, "off").jobs_dir(), "/var/tmp/tbench-qwen3.6_35b-off");
-        assert_eq!(spec(&m, 0, "on").jobs_dir(), "/var/tmp/tbench-qwen3.6_35b-on");
+        assert_eq!(
+            spec(&m, 0, "off").jobs_dir(),
+            "/var/tmp/tbench-qwen3.6_35b-off"
+        );
+        assert_eq!(
+            spec(&m, 0, "on").jobs_dir(),
+            "/var/tmp/tbench-qwen3.6_35b-on"
+        );
         // off and on never share a dir → no clobber.
         assert_ne!(spec(&m, 0, "off").jobs_dir(), spec(&m, 0, "on").jobs_dir());
     }
@@ -246,8 +261,11 @@ mod tests {
     #[test]
     fn run_env_maps_lane_to_ocap_and_window() {
         let m = MatrixConfig::parse(SAMPLE).unwrap();
-        let ex = HarborExecutor { pythonpath: "scripts/eval/harbor".into() };
-        let on: std::collections::HashMap<_, _> = ex.run_env(&spec(&m, 0, "on")).into_iter().collect();
+        let ex = HarborExecutor {
+            pythonpath: "scripts/eval/harbor".into(),
+        };
+        let on: std::collections::HashMap<_, _> =
+            ex.run_env(&spec(&m, 0, "on")).into_iter().collect();
         assert_eq!(on["NEWT_BENCH_OCAP"], "on");
         assert_eq!(on["NEWT_BENCH_BIN"], "/opt/newt");
         assert_eq!(on["NEWT_BENCH_PROFILE"], "solve-qwen36.toml");
@@ -255,15 +273,19 @@ mod tests {
         assert_eq!(on["NEWT_BENCH_MAX_ROUNDS"], "40");
         assert!(!on.contains_key("NEWT_BENCH_TENACITY")); // none set for qwen
 
-        let off: std::collections::HashMap<_, _> = ex.run_env(&spec(&m, 0, "off")).into_iter().collect();
+        let off: std::collections::HashMap<_, _> =
+            ex.run_env(&spec(&m, 0, "off")).into_iter().collect();
         assert_eq!(off["NEWT_BENCH_OCAP"], "off");
     }
 
     #[test]
     fn run_env_honors_per_model_window_and_tenacity() {
         let m = MatrixConfig::parse(SAMPLE).unwrap();
-        let ex = HarborExecutor { pythonpath: "p".into() };
-        let e: std::collections::HashMap<_, _> = ex.run_env(&spec(&m, 1, "on")).into_iter().collect();
+        let ex = HarborExecutor {
+            pythonpath: "p".into(),
+        };
+        let e: std::collections::HashMap<_, _> =
+            ex.run_env(&spec(&m, 1, "on")).into_iter().collect();
         assert_eq!(e["NEWT_BENCH_CONTEXT_WINDOW"], "32768"); // nemotron override
         assert_eq!(e["NEWT_BENCH_TENACITY"], "relentless");
     }
@@ -274,7 +296,10 @@ mod tests {
         // touch; instead exercise the parser via a string round-trip helper.
         let text = "[[backends]]\nendpoint = \"http://h:8080/\"\nmodel = \"m\"\n";
         let val: toml::Value = toml::from_str(text).unwrap();
-        let ep = val["backends"][0]["endpoint"].as_str().unwrap().trim_end_matches('/');
+        let ep = val["backends"][0]["endpoint"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches('/');
         assert_eq!(ep, "http://h:8080");
     }
 }

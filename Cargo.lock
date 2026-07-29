@@ -3777,6 +3777,7 @@ dependencies = [
  "predicates",
  "regex",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
