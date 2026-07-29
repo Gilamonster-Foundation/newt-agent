@@ -1,0 +1,1 @@
+{"date": "2026-07-28", "family": "qwen", "mean_reward": 0.1, "model": "qwen3-coder_30b", "passed": 3, "passed_tasks": ["cancel-async-tasks", "extract-elf", "pypi-server"], "suite": "tb-30", "total": 30, "version": "0.7.5", "window": 65536}

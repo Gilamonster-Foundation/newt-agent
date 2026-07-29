@@ -98,6 +98,24 @@ the binary is the authority on its own surface, this file is not. Python
 bindings live in [`newt-agent-py/`](./newt-agent-py/) (`pip install
 newt-agent-py`, import path `newt_agent`).
 
+## Terminal-Bench scoreboard
+
+newt is measured on [Terminal-Bench](https://github.com/harbor-framework/terminal-bench)
+via `newt solve` (headless) + the Harbor adapter. The release gate is a
+**per-model monotonic ratchet** — a model's score never goes down across
+releases; we establish a starting number and keep beating it. The table below is
+published from `scripts/eval/bench-results.jsonl` every release
+(`scripts/eval/bench_scoreboard.py render`).
+
+<!-- BENCH-SCOREBOARD:START -->
+_Per-model **champion** scores — the release gate is a monotonic ratchet: a model's score never goes down. Auto-generated; do not edit by hand._
+
+| Model | Family | Score | Passed | Suite | Window | Version | Date |
+|-------|--------|-------|--------|-------|--------|---------|------|
+| `qwen3-coder_30b` | qwen | 10.0% | 3/30 | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
+
+<!-- BENCH-SCOREBOARD:END -->
+
 ## Design laws
 
 The invariants. Each links to the decision record that argues it.

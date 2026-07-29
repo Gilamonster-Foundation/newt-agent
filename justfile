@@ -187,6 +187,25 @@ readme-check:
     done < <(grep -oE '\]\(\./[^)#]+' README.md | sed 's/](\.\///')
     exit $rc
 
+# Terminal-Bench scoreboard (release process). `bench-ingest` appends a Harbor
+# run's per-task rewards to the manifest; `bench-gate` enforces the per-model
+# no-regression ratchet (exit 3 on a drop); `bench-publish` rewrites the README
+# scoreboard table. Every release: ingest → gate → publish. See
+# scripts/eval/bench_scoreboard.py (--self-test for its unit tests).
+bench-ingest RUN_DIR MODEL FAMILY VERSION WINDOW DATE:
+    python3 scripts/eval/bench_scoreboard.py ingest {{RUN_DIR}} \
+        --model {{MODEL}} --family {{FAMILY}} --version {{VERSION}} \
+        --window {{WINDOW}} --date {{DATE}}
+
+bench-gate MODEL SCORE:
+    python3 scripts/eval/bench_scoreboard.py gate --model {{MODEL}} --score {{SCORE}}
+
+bench-publish:
+    python3 scripts/eval/bench_scoreboard.py render --readme README.md
+
+bench-selftest:
+    python3 scripts/eval/bench_scoreboard.py --self-test
+
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
 # CI — see docs/decisions/mesh_integration.md.
