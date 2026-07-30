@@ -69,15 +69,11 @@ pub fn resolve_cognition(persona: Option<Cognition>) -> Option<Cognition> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // These tests mutate a process-global; the `serial` guard keeps them from
-    // racing each other (and any other test that reads the override).
-    use std::sync::Mutex as StdMutex;
-    static SERIAL: StdMutex<()> = StdMutex::new(());
+    use crate::test_guard::GlobalSettingsGuard;
 
     #[test]
     fn unset_override_follows_the_persona() {
-        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Unset);
         // No persona → no field; persona level → that level.
         assert_eq!(resolve_cognition(None), None);
@@ -89,7 +85,7 @@ mod tests {
 
     #[test]
     fn set_override_wins_over_the_persona() {
-        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Set(Cognition::Glancing));
         assert_eq!(
             resolve_cognition(Some(Cognition::Contemplating)),
@@ -101,7 +97,7 @@ mod tests {
 
     #[test]
     fn off_override_forces_no_field_even_with_a_persona() {
-        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Off);
         assert_eq!(
             resolve_cognition(Some(Cognition::Contemplating)),
@@ -117,7 +113,7 @@ mod tests {
         // `resolve_cognition(None)`. A `--cognition` / `--obsessive` override
         // installed via `set_cli_cognition` must therefore reach the wire headless
         // (default `Unset` → `None`, unchanged).
-        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Unset);
         assert_eq!(
             resolve_cognition(None),

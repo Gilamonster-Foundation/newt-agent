@@ -215,6 +215,24 @@ pub fn set_cli_tenacity(level: Tenacity) {
     }
 }
 
+/// Clear the explicit CLI `--tenacity` override, so tenacity resolves from config
+/// / family again. The complement of [`set_cli_tenacity`]: it lets a surface
+/// express "inherit" (no override) rather than pinning the currently-resolved
+/// value — e.g. the config panel must not persist an untouched dial.
+pub fn clear_cli_tenacity() {
+    if let Ok(mut slot) = CLI_TENACITY.lock() {
+        *slot = None;
+    }
+}
+
+/// The raw CLI `--tenacity` override, if one is installed (`None` = inherit from
+/// config / family). Distinct from [`effective_tenacity`], which resolves the
+/// full precedence ladder to a concrete level.
+#[must_use]
+pub fn cli_tenacity() -> Option<Tenacity> {
+    CLI_TENACITY.lock().ok().and_then(|s| *s)
+}
+
 /// Install the resolved `[tenacity]` config (per-family + default). Called from
 /// `Config::resolve`, the single canonical config-application entry.
 pub fn set_tenacity_config(config: TenacityConfig) {

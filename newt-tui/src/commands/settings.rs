@@ -334,7 +334,8 @@ mod tests {
     fn cognition_status_list_set_off_auto_and_error_are_informative() {
         use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
         use newt_core::role_profile::Cognition;
-        // Start clean; restore afterward so the process-global doesn't leak.
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // Start clean; the guard restores the process-global on drop.
         let restore = cli_cognition();
         set_cli_cognition(CognitionOverride::Unset);
 
@@ -390,6 +391,7 @@ mod tests {
         use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
         use newt_core::role_profile::Cognition;
         use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
         // Reset to a non-obsessive baseline so the assertions are meaningful.
         set_cli_cognition(CognitionOverride::Unset);
         set_cli_tenacity(Tenacity::Standard);
@@ -432,6 +434,7 @@ mod tests {
     #[test]
     fn tenacity_command_sets_the_level_live() {
         use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
         let restore = effective_tenacity();
         let msg = tenacity_command("relentless");
         assert!(msg.contains("relentless"), "{msg}");
