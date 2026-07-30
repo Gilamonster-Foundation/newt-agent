@@ -147,8 +147,10 @@ pub enum Cognition {
 
 impl Cognition {
     /// The OpenAI `reasoning.effort` value this level maps to on the Responses
-    /// wire (emitted by `agentic::responses_reasoning_field`). Chat-shape emit is
-    /// a follow-up; the value mapping is the same.
+    /// wire (emitted by `agentic::responses_reasoning_field`). Cognition applies
+    /// to Responses backends only — the Chat-Completions path does not send
+    /// `reasoning_effort` (it is model-specific and rejected by non-reasoning
+    /// models), so cognition is ignored there.
     #[must_use]
     pub fn reasoning_effort(self) -> &'static str {
         match self {
