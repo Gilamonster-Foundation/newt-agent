@@ -107,19 +107,33 @@ releases; we establish a starting number and keep beating it. The table below is
 published from `scripts/eval/bench-results.jsonl` every release
 (`scripts/eval/bench_scoreboard.py render`).
 
-<!-- BENCH-SCOREBOARD:START -->
-_Per-model **champion** scores — the release gate is a monotonic ratchet: a model's score never goes down. Auto-generated; do not edit by hand._
+For the full DGX Spark capability survey — the model ladder, the hosted-model and
+newt-vs-Codex comparisons, and the integrity log for how the numbers were kept
+honest — see
+[docs/findings/dgx-spark-terminal-bench-survey.md](docs/findings/dgx-spark-terminal-bench-survey.md).
 
-| Model | Family | Score | Passed | Suite | Window | Version | Date |
-|-------|--------|-------|--------|-------|--------|---------|------|
-| `qwen3.6_35b` | qwen | 20.0% | 6/30 | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
-| `qwen3-coder_30b` | qwen | 10.0% | 3/30 | tb-30 | 65536 | 0.7.5 | 2026-07-28 |
-| `ornith_35b` | ornith | _queued_ | — | tb-30 | — | — | — |
-| `glm-4.7-flash` | glm | _queued_ | — | tb-30 | — | — | — |
-| `deepseek-coder-v2_16b` | deepseek | _queued_ | — | tb-30 | — | — | — |
-| `gemma4_31b` | gemma | _queued_ | — | tb-30 | — | — | — |
-| `kimi-dev_72b` | kimi | _queued_ | — | tb-30 | — | — | — |
-| `nemotron-3-nano_30b` | nemotron | _queued_ | — | tb-30 | — | — | — |
+<!-- BENCH-SCOREBOARD:START -->
+_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down); the 0.7.6 gate is per-model **parity** — OCAP-on within reach of OCAP-off (Δ ≥ 0). Auto-generated; do not edit by hand._
+
+| Model | Family | OCAP off | OCAP on | Parity Δ | Suite | Window | Version | Date |
+|-------|--------|----------|---------|----------|-------|--------|---------|------|
+| `ornith-1.0-35b-q8` | ornith | _pending_ | 36.7% (11/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
+| `qwen3.6_35b` | qwen | 20.0% (6/30) | 26.7% (8/30) | +6.7 pp | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
+| `o4-mini` | openai | _pending_ | 13.3% (4/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
+| `qwen3-coder_30b` | qwen | 10.0% (3/30) | 13.3% (4/30) | +3.3 pp | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
+| `nemotron-3-nano_30b` | nemotron | 6.7% (2/30) | _pending_ | — | tb-30 | 65536 | 0.7.5 | 2026-07-29 |
+| `gpt-4.1-mini` | openai | _pending_ | 3.3% (1/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
+| `deepseek-coder-v2_16b` | deepseek | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `deepseek-r1_32b` | deepseek | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `gemma4_31b` | gemma | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `glm-4.7-flash` | glm | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `kimi-dev_72b` | kimi | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `nemotron-3-super_120b` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `nemotron-mini_4b` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `nemotron_70b-instruct-q8_0` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `ornith-1.0-397b-iq1_m` | ornith | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `qwen2.5-coder_32b` | qwen | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| `qwen3-coder-next_latest` | qwen | _queued_ | _queued_ | — | tb-30 | — | — | — |
 
 <!-- BENCH-SCOREBOARD:END -->
 

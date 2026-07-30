@@ -1,13 +1,72 @@
 {
-  "comment": "The model matrix the scoreboard tracks (Shawn 2026-07-28): every roster model gets a row — measured champions first, then queued. Model ids are the served names on the bench endpoint; family keys match [tenacity.families].",
-  "roster": [
-    { "model": "qwen3-coder_30b", "family": "qwen" },
-    { "model": "qwen3.6_35b", "family": "qwen" },
-    { "model": "ornith_35b", "family": "ornith" },
-    { "model": "glm-4.7-flash", "family": "glm" },
-    { "model": "deepseek-coder-v2_16b", "family": "deepseek" },
-    { "model": "gemma4_31b", "family": "gemma" },
-    { "model": "kimi-dev_72b", "family": "kimi" },
-    { "model": "nemotron-3-nano_30b", "family": "nemotron" }
-  ]
+ "roster": [
+  {
+   "model": "nemotron-mini_4b",
+   "family": "nemotron"
+  },
+  {
+   "model": "nemotron-3-nano_30b",
+   "family": "nemotron"
+  },
+  {
+   "model": "nemotron_70b-instruct-q8_0",
+   "family": "nemotron"
+  },
+  {
+   "model": "nemotron-3-super_120b",
+   "family": "nemotron"
+  },
+  {
+   "model": "ornith-1.0-35b-q8",
+   "family": "ornith"
+  },
+  {
+   "model": "ornith-1.0-397b-iq1_m",
+   "family": "ornith"
+  },
+  {
+   "model": "qwen3.6_35b",
+   "family": "qwen"
+  },
+  {
+   "model": "qwen3-coder_30b",
+   "family": "qwen"
+  },
+  {
+   "model": "qwen3-coder-next_latest",
+   "family": "qwen"
+  },
+  {
+   "model": "qwen2.5-coder_32b",
+   "family": "qwen"
+  },
+  {
+   "model": "glm-4.7-flash",
+   "family": "glm"
+  },
+  {
+   "model": "deepseek-coder-v2_16b",
+   "family": "deepseek"
+  },
+  {
+   "model": "deepseek-r1_32b",
+   "family": "deepseek"
+  },
+  {
+   "model": "gemma4_31b",
+   "family": "gemma"
+  },
+  {
+   "model": "kimi-dev_72b",
+   "family": "kimi"
+  },
+  {
+   "model": "gpt-4.1-mini",
+   "family": "openai"
+  },
+  {
+   "model": "o4-mini",
+   "family": "openai"
+  }
+ ]
 }
