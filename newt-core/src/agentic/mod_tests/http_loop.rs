@@ -37,6 +37,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         step_ledger: None,
         caveats,
         persona_tools: None,
+        cognition: None,
         max_tool_rounds: 8,
         narration_nudge_cap: 1,
         action_nudges: true,

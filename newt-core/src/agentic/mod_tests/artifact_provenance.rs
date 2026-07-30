@@ -44,6 +44,7 @@ fn ctx<'a>(
         step_ledger: None,
         caveats,
         persona_tools: None,
+        cognition: None,
         max_tool_rounds: 5,
         narration_nudge_cap: 0,
         action_nudges: false,
