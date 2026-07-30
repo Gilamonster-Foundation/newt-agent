@@ -322,6 +322,7 @@ fn psyche_command(arg: &str) -> String {
         "\n              how many minds work the task                   (NEWT_TEAM / newt crew)",
     );
     out.push_str("\nobsessive = the max-everything posture: contemplating + relentless + crew on.");
+    out.push_str("\n/psyche edit — open the config panel to adjust these dials (TTY).");
     out
 }
 

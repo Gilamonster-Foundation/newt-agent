@@ -39,6 +39,10 @@ mod workspace_state;
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]
 mod rich_input;
+// The harness config panel (#14) — a severable, TTY-only overlay for the psyche
+// operator dials. Gated with the other rich TTY surfaces so wyvern/lean strip it.
+#[cfg(feature = "rich-tui")]
+mod config_panel;
 #[cfg(feature = "rich-tui")]
 mod vi;
 // The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
@@ -124,6 +128,30 @@ pub async fn run_setup_target(
 /// ratatui surface — `docs/decisions/plain_scroller_tui.md`).
 pub fn run_crew_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
     crew_form::run_edit(name, color)
+}
+
+/// Open the harness config panel (#14) for the psyche operator dials (cognition +
+/// tenacity), or — when the rich TTY surface is unavailable (piped / headless /
+/// lean / `--no-default-features`) — print a short note pointing at the text
+/// `/psyche` view and the per-dial commands. The panel writes through the same
+/// setters (`set_cli_cognition` / `set_cli_tenacity`) as the flags and slash
+/// commands, so there is no panel-only state. See
+/// `docs/decisions/harness_config_panel.md`.
+pub(crate) fn run_psyche_panel(color: bool, verbose: bool) {
+    #[cfg(feature = "rich-tui")]
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        match config_panel::run() {
+            Ok(summary) => print_newt(&summary, color, verbose),
+            Err(e) => print_newt(&format!("psyche panel error: {e}"), color, verbose),
+        }
+        return;
+    }
+    print_newt(
+        "the psyche panel needs an interactive rich terminal — use /psyche for the \
+         text view, or /cognition / /tenacity to change the dials.",
+        color,
+        verbose,
+    );
 }
 
 /// Report auth status for every discovered HTTP MCP server, and optionally run
@@ -9357,9 +9385,10 @@ active persona's cognition; a persona sets its own default via `cognition:`."
         }
         "psyche" => {
             "\
-/psyche [obsessive] — the agent's effort posture: cognition, tenacity, crew
+/psyche [edit|obsessive] — the agent's effort posture: cognition, tenacity, crew
 
   /psyche                show the three dials and how to change each
+  /psyche edit           open the config panel to adjust the dials (TTY)
   /psyche obsessive      engage the max-everything posture's live dials
 
 The three orthogonal psyche dials:

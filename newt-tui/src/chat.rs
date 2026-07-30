@@ -3367,6 +3367,16 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
+                    if slash_body == "psyche edit" {
+                        // The harness config panel (#14): a transient overlay for
+                        // the psyche operator dials. It writes the same globals the
+                        // slash commands do, so the next turn (and the footer
+                        // indicator) pick the changes up with no re-resolve.
+                        run_psyche_panel(color, verbose);
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
                     let cont = dispatch_slash(&task, workspace, color, verbose)?;
                     surface.save_history();
                     // Skip config reload and terminal reinit when exiting — unnecessary
