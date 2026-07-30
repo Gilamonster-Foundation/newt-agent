@@ -3374,10 +3374,56 @@ pub(crate) fn run_chat(
                     }
                     if slash_body == "psyche edit" {
                         // The harness config panel (#14): a transient overlay for
-                        // the psyche operator dials. It writes the same globals the
-                        // slash commands do, so the next turn (and the footer
-                        // indicator) pick the changes up with no re-resolve.
-                        run_psyche_panel(color, verbose);
+                        // the psyche operator dials. It applies dials through the
+                        // same globals the slash commands do (picked up next turn,
+                        // no re-resolve); persona select + save come back for us to
+                        // act on, since the session owns that state.
+                        let persona_names: Vec<String> = persona_store
+                            .list()
+                            .map(|v| v.into_iter().map(|s| s.name).collect())
+                            .unwrap_or_default();
+                        let backend = active_backend_name(&cfg);
+                        let result = run_psyche_panel(persona_names, backend, color, verbose);
+                        if let Some((name, content)) = result.saved {
+                            match persona_store.save(&name, &content) {
+                                Ok(_) => {
+                                    print_newt(&format!("saved persona '{name}'"), color, verbose);
+                                }
+                                Err(e) => print_newt(&format!("save failed: {e}"), color, verbose),
+                            }
+                        }
+                        if let Some(name) = result.select_persona {
+                            let mut reset_ctx = ConversationResetContext {
+                                memory: &mut memory,
+                                system: &mut system,
+                                conversation_id: &mut active_conversation_id,
+                                mode_states: &conversation_mode_states,
+                            };
+                            match handle_persona_command(
+                                &format!("persona set {name} --keep-context"),
+                                workspace,
+                                &persona_store,
+                                &mut active_persona,
+                                &mut reset_ctx,
+                            ) {
+                                Ok(msg) => print_newt(&msg, color, verbose),
+                                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                            }
+                            let _ = apply_persona_backend(
+                                active_persona.as_ref(),
+                                &base_provider,
+                                &base_model,
+                                &cfg,
+                                &mut choice,
+                                &mut inf_url,
+                                &mut inf_model,
+                                &mut inf_kind,
+                                &mut inf_key,
+                                &mut inf_context_window,
+                                color,
+                                verbose,
+                            );
+                        }
                         surface.save_history();
                         println!();
                         continue;
