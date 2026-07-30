@@ -58,8 +58,8 @@ use std::sync::Arc;
 
 use super::observation::ShellObservation;
 use super::{
-    chat_complete, openai_chat_complete, ChatCtx, CodeSearch, Embedder, NoMcp, PromptDisposition,
-    SemanticIndex,
+    chat_complete, openai_chat_complete, openai_responses_complete, responses_api_selected,
+    ChatCtx, CodeSearch, Embedder, NoMcp, PromptDisposition, SemanticIndex,
 };
 use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, Role, TokenUsage};
 
@@ -563,8 +563,18 @@ async fn run_one_turn(
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.
     let mut mcp = NoMcp;
+    // Mirror `chat_complete_with_prompt_and_artifacts`'s dispatch: an OpenAI
+    // backend with `api = "responses"` (surfaced via NEWT_OPENAI_API) speaks the
+    // Responses API. Without this the headless driver (`newt solve` / worker)
+    // always hit /v1/chat/completions, so a responses-only model like
+    // gpt-5.6-sol 400s on function tools — the interactive path already routed
+    // correctly, this closes the headless gap.
     let dispatch = if config.kind == BackendKind::Openai {
-        openai_chat_complete(ctx, &mut mcp).await
+        if responses_api_selected() {
+            openai_responses_complete(ctx, &mut mcp).await
+        } else {
+            openai_chat_complete(ctx, &mut mcp).await
+        }
     } else {
         chat_complete(ctx, &mut mcp).await
     };
