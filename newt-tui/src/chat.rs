@@ -588,13 +588,14 @@ pub(crate) fn run_chat(
     // turn (`ensure_context_window` only early-outs on success).
     let mut ctx_window_probed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Snapshot the pre-persona backend baseline (whatever `--backend` / loadout /
-    // sticky settings established) BEFORE any persona routing, so a `/persona
-    // clear` — or a switch to a persona that declares no backend — reverts to it
-    // rather than staying pinned to the last persona's (possibly cost-bearing)
-    // backend. May be unset (`None` ⇒ the configured default).
-    let base_provider = std::env::var("NEWT_PROVIDER").ok();
-    let base_model = std::env::var("NEWT_DGX_MODEL").ok();
+    // The OPERATOR's backend baseline: what a `/persona clear` (or a switch to a
+    // persona that declares no backend) reverts to — the operator's own latest
+    // explicit choice, NOT the last persona's route. Seeded from startup
+    // (`--backend` / loadout / sticky), then updated below whenever an operator
+    // backend command (`/backends` / `/model` / `/backend`) runs — a persona's own
+    // routing never touches it (review P1#2). `None` ⇒ the configured default.
+    let mut base_provider = std::env::var("NEWT_PROVIDER").ok();
+    let mut base_model = std::env::var("NEWT_DGX_MODEL").ok();
 
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
@@ -3476,6 +3477,15 @@ pub(crate) fn run_chat(
                         } else {
                             None
                         };
+                    }
+                    // Review P1#2: an operator backend command (/backends, /model,
+                    // /backend) just wrote its explicit choice to the env — capture
+                    // it as the baseline a later `/persona clear` reverts to. A
+                    // persona's own routing runs in a separate branch that never
+                    // reaches here, so it can never pollute the operator baseline.
+                    if is_operator_backend_command(slash_body) {
+                        base_provider = std::env::var("NEWT_PROVIDER").ok();
+                        base_model = std::env::var("NEWT_DGX_MODEL").ok();
                     }
                     if cap.reapply(resolve_tui(&cfg), workspace) {
                         print_newt(
