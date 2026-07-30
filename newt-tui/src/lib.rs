@@ -130,28 +130,55 @@ pub fn run_crew_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
     crew_form::run_edit(name, color)
 }
 
-/// Open the harness config panel (#14) for the psyche operator dials (cognition +
-/// tenacity), or — when the rich TTY surface is unavailable (piped / headless /
-/// lean / `--no-default-features`) — print a short note pointing at the text
-/// `/psyche` view and the per-dial commands. The panel writes through the same
+/// What the config panel asked the caller (the session loop) to do, beyond the
+/// dials it applied itself. Ungated so the non-rich fallback returns an empty one.
+#[derive(Debug, Default)]
+pub(crate) struct PsychePanelResult {
+    /// A persona the operator chose to activate (caller switches to it).
+    pub select_persona: Option<String>,
+    /// A persona to save: `(name, file_content)` (caller writes it via `PersonaStore`).
+    pub saved: Option<(String, String)>,
+}
+
+/// Open the harness config panel (#14) for the psyche operator dials, or — when
+/// the rich TTY surface is unavailable (piped / headless / lean /
+/// `--no-default-features`) — print a short note pointing at the text `/psyche`
+/// view and the per-dial commands. The panel applies dials through the same
 /// setters (`set_cli_cognition` / `set_cli_tenacity`) as the flags and slash
-/// commands, so there is no panel-only state. See
+/// commands (only the ones the operator changed), so there is no panel-only
+/// state; persona select + save are returned for the caller to act on. See
 /// `docs/decisions/harness_config_panel.md`.
-pub(crate) fn run_psyche_panel(color: bool, verbose: bool) {
+pub(crate) fn run_psyche_panel(
+    persona_names: Vec<String>,
+    backend: Option<String>,
+    color: bool,
+    verbose: bool,
+) -> PsychePanelResult {
     #[cfg(feature = "rich-tui")]
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        match config_panel::run() {
-            Ok(summary) => print_newt(&summary, color, verbose),
-            Err(e) => print_newt(&format!("psyche panel error: {e}"), color, verbose),
+        match config_panel::run(persona_names, backend) {
+            Ok(o) => {
+                print_newt(&o.summary, color, verbose);
+                return PsychePanelResult {
+                    select_persona: o.select_persona,
+                    saved: o.saved,
+                };
+            }
+            Err(e) => {
+                print_newt(&format!("psyche panel error: {e}"), color, verbose);
+                return PsychePanelResult::default();
+            }
         }
-        return;
     }
+    #[cfg(not(feature = "rich-tui"))]
+    let _ = (persona_names, backend);
     print_newt(
         "the psyche panel needs an interactive rich terminal — use /psyche for the \
          text view, or /cognition / /tenacity to change the dials.",
         color,
         verbose,
     );
+    PsychePanelResult::default()
 }
 
 /// Report auth status for every discovered HTTP MCP server, and optionally run
@@ -4160,6 +4187,17 @@ impl PersonaStore {
 
     fn default() -> Self {
         Self::new(Self::default_dir())
+    }
+
+    /// Write a persona file `<name>.md` with `content`, creating the personas
+    /// directory if needed. The name is normalized to a file stem; returns the
+    /// written path. Used by the config panel's save action.
+    fn save(&self, name: &str, content: &str) -> anyhow::Result<std::path::PathBuf> {
+        let name = normalize_persona_name(name)?;
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.dir.join(format!("{name}.md"));
+        std::fs::write(&path, content)?;
+        Ok(path)
     }
 
     fn load(&self, name: &str) -> anyhow::Result<Persona> {
