@@ -2,10 +2,10 @@
 name: tmux-drive
 description: Drive an interactive TTY/TUI program hands-free from a non-interactive agent by launching it on a DEDICATED tmux server (a separate socket, never your own) and using send-keys + capture-pane. Isolation makes killing your own session structurally impossible.
 when_to_use: When you must operate a program that requires a real terminal — a full-screen TUI, a REPL, an interactive installer/prompt, or anything that refuses to run under a pipe or redirect (e.g. errors like "No such device or address" / "not a tty"). Also when you want to observe and type into a long-lived interactive session a human is watching.
-version: 2.0.0
+version: 2.1.0
 license: Apache-2.0
 caveats:
-  exec: { only: ["tmux", "bash", "cat", "mkdir", "grep", "tail", "sleep", "printf", "seq", "chmod"] }
+  exec: { only: ["tmux", "bash", "cat", "mkdir", "grep", "tail", "sleep", "printf", "seq", "chmod", "python", "winpty"] }
   fs_read: all
   net: { only: [] }
   max_calls: unlimited
@@ -170,3 +170,52 @@ TDRIVE_SOCK=newt bash "$TD" stop                      # releases the session cla
 The same pattern drives any REPL, `ssh` prompt, `top`, `vi`, an interactive
 `gh`/`git rebase -i`, or a language shell — anything that needs a terminal.
 Always on its own `-L` server.
+
+## Windows addendum — the pseudoconsole is the tmux equivalent
+
+There is no tmux on native Windows (Git Bash), and WSL — the usual way to get
+one — needs a reboot you may not be able to take. But everything above still
+applies conceptually: a program that demands a TTY needs a real pseudo-terminal,
+and Windows has one — **ConPTY**, exposed to Python by `pywinpty` (a pipe still
+won't do). Spawn the TUI inside a pseudoconsole and you `send`-keys / read-screen
+exactly as with a tmux pane.
+
+**The one structural difference:** a tmux pane lives on a *server*, so `tdrive.sh`
+can be one-subcommand-per-tool-call (state persists on the socket). A
+pseudoconsole is an **in-process object** — it dies when the Python process
+exits. So on Windows you write a short **driver script** (one persistent process
+that spawns the TUI and drives it), rather than separate CLI calls. There is no
+"kill yourself" hazard to guard against — the PTY is a child of your own script,
+not a shared server.
+
+Use the helper `scripts/wdrive.py` (the Windows sibling of `tdrive.sh`; needs
+`pywinpty` + Git Bash's bundled `winpty`, both no-admin/no-reboot):
+
+```python
+from wdrive import Tui   # scripts/wdrive.py
+
+# env= sets vars for the child (see gotcha 2). A pseudoconsole is a REAL tty.
+t = Tui([r"C:\path\to\newt.exe", "-n", "--no-splash"],
+        env={"NEWT_NO_MODEL_PULL": "1"})
+t.wait(r"❯|ready")            # poll for the live prompt (never fixed-sleep)
+t.send("/persona switch bob") # types text + Enter
+t.wait(r"persona .bob.")
+t.send("/persona")            # show status
+t.wait(r"role: researcher")
+print(t.screen())             # ANSI-stripped screen for asserts
+t.quit("/quit")
+```
+
+**Two Windows gotchas the helper handles / you must know:**
+
+1. **cp1252 print crash.** A TUI emits unicode (spinner glyphs, `❯`); Python's
+   default Windows stdout is cp1252 and *crashes on `print`*. `wdrive` reconfigures
+   stdout to utf-8 — or run under `PYTHONUTF8=1`.
+2. **A pseudoconsole presents as a REAL tty**, so any program that gates
+   expensive first-run work on `isatty()` will fire it here where a pipe would
+   not. For `newt` specifically, that's the 468 MB on-host summarizer pull —
+   pass `NEWT_NO_MODEL_PULL=1` in `env` or the prompt never comes ready. (General
+   rule: find the program's headless/no-provision opt-out and set it.)
+
+Same pattern drives any Windows console REPL, installer prompt, or full-screen
+TUI — anything that refuses to run under a pipe.
