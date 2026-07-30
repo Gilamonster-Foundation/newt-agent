@@ -627,6 +627,12 @@ pub enum Command {
         /// Run OCAP-off + full-access with no prompts (default true).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         non_interactive: bool,
+        /// OCAP-ON confined lane: keep OCAP enabled and fence writes to the
+        /// workspace + the container's mutable roots (reads/exec/net stay open)
+        /// instead of the `--yolo` full-access lane. Also enabled by
+        /// `NEWT_BENCH_OCAP=on`. This is the lane the OCAP-parity gate measures.
+        #[arg(long, default_value_t = false)]
+        confined: bool,
         /// Append a JSONL trace record here.
         #[arg(long, value_name = "FILE")]
         events: Option<PathBuf>,
@@ -1345,6 +1351,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             cwd,
             instruction_file,
             non_interactive,
+            confined,
             events,
             max_rounds,
             context_window,
@@ -1355,6 +1362,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 // The pinned benchmark profile is the global `--config <FILE>`.
                 profile: cli.config.clone(),
                 non_interactive,
+                confined,
                 events,
                 max_rounds,
                 context_window,
