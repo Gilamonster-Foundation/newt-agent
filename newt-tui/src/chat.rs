@@ -3397,7 +3397,21 @@ pub(crate) fn run_chat(
                             .map(|v| v.into_iter().map(|s| s.name).collect())
                             .unwrap_or_default();
                         let backend = active_backend_name(&cfg);
-                        let result = run_psyche_panel(persona_names, backend, color, verbose);
+                        // review-2 #1/#4: hand the panel the EFFECTIVE resolved
+                        // posture + the active persona, so it displays/saves the
+                        // real values and can tell Keep from Switch/Clear.
+                        let current_persona = active_persona.as_ref().map(|p| p.name.clone());
+                        let eff_cognition = newt_core::cognition::effective_cognition();
+                        let eff_tenacity = newt_core::tenacity::effective_tenacity();
+                        let result = run_psyche_panel(
+                            persona_names,
+                            current_persona,
+                            backend,
+                            eff_cognition,
+                            eff_tenacity,
+                            color,
+                            verbose,
+                        );
                         if let Some((name, content)) = result.saved {
                             match persona_store.save(&name, &content) {
                                 Ok(_) => {
@@ -3406,7 +3420,18 @@ pub(crate) fn run_chat(
                                 Err(e) => print_newt(&format!("save failed: {e}"), color, verbose),
                             }
                         }
-                        if let Some(name) = result.select_persona {
+                        // review-2 #4: apply the persona action the panel returned —
+                        // Keep does nothing, Clear drops the persona, Switch activates
+                        // one. Clear/Switch both re-route the backend to the new
+                        // baseline afterward.
+                        let persona_command = match result.persona {
+                            PsychePersonaAction::Keep => None,
+                            PsychePersonaAction::Clear => Some("persona clear".to_string()),
+                            PsychePersonaAction::Switch(name) => {
+                                Some(format!("persona set {name} --keep-context"))
+                            }
+                        };
+                        if let Some(cmd) = persona_command {
                             let mut reset_ctx = ConversationResetContext {
                                 memory: &mut memory,
                                 system: &mut system,
@@ -3414,7 +3439,7 @@ pub(crate) fn run_chat(
                                 mode_states: &conversation_mode_states,
                             };
                             match handle_persona_command(
-                                &format!("persona set {name} --keep-context"),
+                                &cmd,
                                 workspace,
                                 &persona_store,
                                 &mut active_persona,
