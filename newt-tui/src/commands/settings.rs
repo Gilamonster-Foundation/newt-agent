@@ -159,6 +159,11 @@ pub(crate) fn dispatch(
         // explicit override that wins over `[tenacity]` config + the CLI flag.
         "tenacity" => print_newt(&tenacity_command(arg1), color, verbose),
 
+        // Psyche cognition: the per-call reasoning depth (→ `reasoning.effort`).
+        // `/cognition` shows the session override; `/cognition <level>` forces it,
+        // `/cognition off` suppresses the field, `/cognition auto` follows persona.
+        "cognition" => print_newt(&cognition_command(arg1), color, verbose),
+
         other => {
             unreachable!("commands::settings::dispatch routed a non-setting command: {other:?}")
         }
@@ -205,9 +210,110 @@ fn tenacity_command(arg: &str) -> String {
     }
 }
 
+/// Build the `/cognition` response and, when `arg` names a level (or `off`/`auto`),
+/// install the session override — the highest-priority input in
+/// [`newt_core::cognition::resolve_cognition`], layered over the active persona's
+/// `cognition:`. Pure for the show/list/error paths; the set paths mutate the
+/// process-global via `set_cli_cognition`.
+fn cognition_command(arg: &str) -> String {
+    use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+    use newt_core::role_profile::Cognition;
+    let usage = "(/cognition <glancing|pondering|deliberating|contemplating>|off|auto|list)";
+    match arg.trim() {
+        "" | "status" | "show" => {
+            match cli_cognition() {
+                CognitionOverride::Unset => {
+                    format!("cognition: auto — follows the active persona's `cognition:` (or off)  {usage}")
+                }
+                CognitionOverride::Off => {
+                    format!("cognition: off — no reasoning.effort sent, overriding any persona  {usage}")
+                }
+                CognitionOverride::Set(c) => format!(
+                    "cognition: {} — {}  (session override, beats the persona)  {usage}",
+                    c.label(),
+                    c.describe()
+                ),
+            }
+        }
+        "list" => {
+            let active = cli_cognition();
+            let mut out = String::from("cognition levels (light → deep):");
+            for c in Cognition::all() {
+                let mark = if matches!(active, CognitionOverride::Set(a) if a == c) {
+                    " ← override"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("\n  {:<14} {}{mark}", c.label(), c.describe()));
+            }
+            out.push_str("\n  off            no reasoning.effort (overrides the persona)");
+            out.push_str("\n  auto           follow the active persona (default)");
+            out
+        }
+        "off" | "none" => {
+            set_cli_cognition(CognitionOverride::Off);
+            "cognition → off — no reasoning.effort will be sent".to_string()
+        }
+        "auto" | "reset" | "persona" => {
+            set_cli_cognition(CognitionOverride::Unset);
+            "cognition → auto — following the active persona".to_string()
+        }
+        other => match other.parse::<Cognition>() {
+            Ok(level) => {
+                set_cli_cognition(CognitionOverride::Set(level));
+                format!("cognition → {} — {}", level.label(), level.describe())
+            }
+            Err(e) => format!("{e}  {usage}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tenacity_command;
+    use super::{cognition_command, tenacity_command};
+
+    #[test]
+    fn cognition_status_list_set_off_auto_and_error_are_informative() {
+        use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+        use newt_core::role_profile::Cognition;
+        // Start clean; restore afterward so the process-global doesn't leak.
+        let restore = cli_cognition();
+        set_cli_cognition(CognitionOverride::Unset);
+
+        // Status (unset) explains it follows the persona and shows usage.
+        let status = cognition_command("");
+        assert!(status.starts_with("cognition: auto"), "{status}");
+        assert!(status.contains("/cognition"), "{status}");
+        // List enumerates every level plus off/auto.
+        let list = cognition_command("list");
+        for label in [
+            "glancing",
+            "pondering",
+            "deliberating",
+            "contemplating",
+            "off",
+            "auto",
+        ] {
+            assert!(list.contains(label), "list missing {label}: {list}");
+        }
+        // Setting a level installs the override live.
+        let msg = cognition_command("contemplating");
+        assert!(msg.contains("contemplating"), "{msg}");
+        assert_eq!(
+            cli_cognition(),
+            CognitionOverride::Set(Cognition::Contemplating)
+        );
+        // `off` forces the off state; `auto` returns to following the persona.
+        cognition_command("off");
+        assert_eq!(cli_cognition(), CognitionOverride::Off);
+        cognition_command("auto");
+        assert_eq!(cli_cognition(), CognitionOverride::Unset);
+        // An unknown level explains itself rather than silently doing nothing.
+        let err = cognition_command("banana");
+        assert!(err.contains("unknown cognition"), "{err}");
+
+        set_cli_cognition(restore);
+    }
 
     #[test]
     fn tenacity_status_and_list_and_error_are_informative() {

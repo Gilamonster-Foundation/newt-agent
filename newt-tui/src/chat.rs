@@ -4038,10 +4038,13 @@ pub(crate) fn run_chat(
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());
-                    // Psyche: the active persona's `cognition:` dial → the turn's
-                    // `reasoning.effort` (via ChatCtx.cognition). `None` (no persona,
-                    // or a persona that sets no cognition) omits the wire field.
-                    let cognition = active_persona.as_ref().and_then(|p| p.profile.cognition);
+                    // Psyche: resolve the turn's cognition → `reasoning.effort`
+                    // (via ChatCtx.cognition). Precedence: a live `/cognition`
+                    // session override wins; else the active persona's `cognition:`;
+                    // else `None` (no wire field — request unchanged for non-opt-in).
+                    let cognition = newt_core::cognition::resolve_cognition(
+                        active_persona.as_ref().and_then(|p| p.profile.cognition),
+                    );
                     // The active posture's optional clamp is threaded to the
                     // gate (re-clamps any session grant). A skill/framing-only
                     // compatibility binding is genuinely `None` here.

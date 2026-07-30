@@ -9118,6 +9118,20 @@ Higher tenacity forces an edit after fewer read-only rounds and makes
 exit_plan_mode require a concrete edit. This session-scoped override wins over
 [tenacity] config and the --tenacity flag. Persist per-family in [tenacity]."
         }
+        "cognition" => {
+            "\
+/cognition [level|off|auto|list] — how much reasoning the model spends per call
+
+  /cognition             show the session setting
+  /cognition list        list every level, light → deep
+  /cognition <level>     set glancing | pondering | deliberating | contemplating
+  /cognition off         send no reasoning.effort (override any persona)
+  /cognition auto        follow the active persona's cognition (default)
+
+The level maps to the OpenAI reasoning.effort wire field (glancing=minimal …
+contemplating=high) on the Responses API. This session override beats the
+active persona's cognition; a persona sets its own default via `cognition:`."
+        }
         "probe" => {
             "\
 /probe [model|all] · /probe window <model> · /probe reset
@@ -9671,9 +9685,8 @@ fn dispatch_slash(
         "exit" | "quit" | "help" | "version" | "workspace" | "config" => {
             commands::meta::dispatch(cmd, arg1, workspace, color, verbose)
         }
-        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" | "tenacity" => {
-            commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose)
-        }
+        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" | "tenacity"
+        | "cognition" => commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose),
         "models" | "probe" | "model" | "backend" | "backends" | "summarizer" | "dgx" => {
             commands::model::dispatch(cmd, arg1, arg2, color, verbose)
         }
