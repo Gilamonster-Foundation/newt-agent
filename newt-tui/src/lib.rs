@@ -536,10 +536,11 @@ fn render_inline_header(workspace: &str, color: bool) -> String {
     let mid = n / 2;
     let header = format!("{}  ·  {}", brand_name(), brand_tagline());
     let plugins = brand_plugins();
+    let version = format!("v{VERSION}");
     let text: &[(&str, bool)] = &[
         (header.as_str(), false),
-        (std::concat!("v", env!("CARGO_PKG_VERSION")), true), // dim
-        (plugins.as_deref().unwrap_or(""), true),             // dim; empty row hides itself
+        (version.as_str(), true),                 // dim
+        (plugins.as_deref().unwrap_or(""), true), // dim; empty row hides itself
         (
             "ready — type a task, /help for commands, /exit to quit",
             true,

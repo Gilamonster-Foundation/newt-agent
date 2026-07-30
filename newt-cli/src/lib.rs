@@ -59,7 +59,11 @@ pub fn parse_with_help() -> anyhow::Result<Cli> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "newt", version, about = "Free, friendly, local agentic coder")]
+#[command(
+    name = "newt",
+    version = newt_core::build_info::VERSION_WITH_COMMIT,
+    about = "Free, friendly, local agentic coder"
+)]
 // `newt help [command]` renders newt's INTERACTIVE `/help` command catalog
 // startup-free (no session, no backend) via the `Help` subcommand below —
 // deliberately taking over the name from clap's auto-generated `help`

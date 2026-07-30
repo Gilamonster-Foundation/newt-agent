@@ -4,6 +4,39 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::io::Write;
 
+/// Ground-truth build provenance: the real binary must report the package
+/// version and the commit checked out in the real repository. This guards the
+/// shared build-info value against drifting back to Cargo's version alone.
+#[test]
+fn version_reports_package_and_source_commit() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let git = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(git.status.success(), "git rev-parse failed: {git:?}");
+    let commit = String::from_utf8(git.stdout).unwrap();
+    let commit = commit.trim();
+
+    assert!(
+        newt_core::build_info::VERSION_WITH_COMMIT.contains(commit),
+        "build version {:?} does not identify checked-out commit {commit}",
+        newt_core::build_info::VERSION_WITH_COMMIT
+    );
+    Command::cargo_bin("newt")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(format!(
+            "newt {}\n",
+            newt_core::build_info::VERSION_WITH_COMMIT
+        ));
+}
+
 #[test]
 fn binary_help_surfaces_start_on_the_guarded_cli_stack() {
     // Regression for PR #746 / issue #747: on Windows, the expanded clap tree
