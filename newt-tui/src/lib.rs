@@ -9132,6 +9132,17 @@ The level maps to the OpenAI reasoning.effort wire field (glancing=minimal …
 contemplating=high) on the Responses API. This session override beats the
 active persona's cognition; a persona sets its own default via `cognition:`."
         }
+        "psyche" => {
+            "\
+/psyche — the agent's effort posture: cognition, tenacity, and crew at a glance
+
+Shows the three orthogonal psyche dials and how to change each:
+  cognition   reasoning depth per call → reasoning.effort   (/cognition)
+  tenacity    how hard the loop pushes read → act            (/tenacity)
+  crew        how many minds work the task                   (NEWT_TEAM / newt crew)
+
+obsessive is the max-everything posture (contemplating + relentless + crew on)."
+        }
         "probe" => {
             "\
 /probe [model|all] · /probe window <model> · /probe reset
@@ -9686,7 +9697,9 @@ fn dispatch_slash(
             commands::meta::dispatch(cmd, arg1, workspace, color, verbose)
         }
         "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" | "tenacity"
-        | "cognition" => commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose),
+        | "cognition" | "psyche" => {
+            commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose)
+        }
         "models" | "probe" | "model" | "backend" | "backends" | "summarizer" | "dgx" => {
             commands::model::dispatch(cmd, arg1, arg2, color, verbose)
         }
