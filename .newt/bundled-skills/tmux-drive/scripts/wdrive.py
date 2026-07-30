@@ -81,14 +81,27 @@ class Tui:
             raw = "".join(self._buf)
         return _ANSI_CSI.sub("", _ANSI_OSC.sub("", raw))
 
-    def wait(self, pattern, timeout=12.0):
-        """Poll (0.2s) until `pattern` (regex, case-insensitive) appears."""
+    def wait(self, pattern, timeout=12.0, raise_on_timeout=True):
+        """Poll (0.2s) until `pattern` (regex, case-insensitive) appears.
+
+        RAISES `TimeoutError` on timeout by default — for an automation driver a
+        timeout should be LOUD: a script that silently continued past a missing
+        expectation would then inspect or act on stale terminal contents. Pass
+        `raise_on_timeout=False` (or use `try_wait`) for boolean polling when a
+        match is genuinely optional.
+        """
         end = time.time() + timeout
         while time.time() < end:
             if re.search(pattern, self.screen(), re.I):
                 return True
             time.sleep(0.2)
+        if raise_on_timeout:
+            raise TimeoutError(f"wdrive.wait timed out after {timeout}s for {pattern!r}")
         return False
+
+    def try_wait(self, pattern, timeout=12.0):
+        """Boolean poll that never raises — for optional / branching expectations."""
+        return self.wait(pattern, timeout, raise_on_timeout=False)
 
     def send(self, text, enter=True):
         """Type `text` (and Enter). Use send_key for named keys."""
