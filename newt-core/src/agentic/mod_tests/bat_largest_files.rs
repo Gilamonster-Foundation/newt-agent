@@ -185,6 +185,7 @@ async fn run_scenario_for(
         step_ledger: None,
         caveats: &caveats,
         persona_tools: None,
+        cognition: None,
         max_tool_rounds: 8,
         narration_nudge_cap: 1,
         action_nudges: true,
