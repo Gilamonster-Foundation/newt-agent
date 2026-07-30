@@ -297,10 +297,17 @@ fn psyche_command(arg: &str) -> String {
             ten.label()
         );
     }
+    // Show the EFFECTIVE cognition + where it resolves from (review-2 #6): a
+    // status view, not just an override inspector.
     let cog = match cli_cognition() {
-        CognitionOverride::Unset => "auto — follows the active persona".to_string(),
-        CognitionOverride::Off => "off — no reasoning.effort".to_string(),
-        CognitionOverride::Set(c) => format!("{} — {}", c.label(), c.describe()),
+        CognitionOverride::Off => "off — no reasoning.effort (session override)".to_string(),
+        CognitionOverride::Set(c) => {
+            format!("{} — {} (session override)", c.label(), c.describe())
+        }
+        CognitionOverride::Unset => match newt_core::cognition::persona_cognition() {
+            Some(c) => format!("{} — {} (from the active persona)", c.label(), c.describe()),
+            None => "auto — no reasoning.effort (no persona sets it)".to_string(),
+        },
     };
     let ten = effective_tenacity();
     // Mirror newt-cli's startup gate: the crew runner is built iff NEWT_TEAM is set.
@@ -311,7 +318,9 @@ fn psyche_command(arg: &str) -> String {
     };
     let mut out = String::from("psyche — how hard the agent works (three orthogonal dials):");
     out.push_str(&format!("\n  cognition   {cog}"));
-    out.push_str("\n              reasoning depth per call → reasoning.effort   (/cognition)");
+    out.push_str(
+        "\n              reasoning depth → reasoning.effort (Responses only)   (/cognition)",
+    );
     out.push_str(&format!(
         "\n  tenacity    {} — {}",
         ten.label(),

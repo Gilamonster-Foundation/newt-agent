@@ -6985,8 +6985,9 @@ fn handle_persona_command(
         PersonaCommand::Show => Ok(persona_status(active_persona.as_ref())),
         PersonaCommand::Clear => {
             *active_persona = None;
-            // P1#3: no persona → no persona-declared tenacity layer.
+            // P1#3: no persona → no persona-declared tenacity / cognition layer.
             newt_core::tenacity::set_persona_tenacity(None);
+            newt_core::cognition::set_persona_cognition(None);
             // Clearing the persona starts a new conversation → fresh id + plan.
             *ctx.conversation_id = newt_core::new_conversation_id();
             reset_conversation(workspace, active_persona.as_ref(), ctx);
@@ -6994,9 +6995,11 @@ fn handle_persona_command(
         }
         PersonaCommand::Set { name, keep_context } => {
             let persona = store.load(&name)?;
-            // P1#3: apply the persona's declared `tenacity:` as a real resolution
-            // layer, so `/persona show` and `/psyche` agree and the loop obeys it.
+            // P1#3 / review-2: install the persona's declared tenacity + cognition
+            // as real resolution layers, so `/persona show`, `/psyche`, and the
+            // panel all agree and the loop obeys them.
             newt_core::tenacity::set_persona_tenacity(persona.profile.tenacity);
+            newt_core::cognition::set_persona_cognition(persona.profile.cognition);
             *active_persona = Some(persona);
             if keep_context {
                 // Persistent-actor swap: rebuild the system prompt for the new

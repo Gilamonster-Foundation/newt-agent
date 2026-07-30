@@ -508,7 +508,7 @@ async fn run_one_turn(
         // (and `--obsessive`) set the reasoning effort on the headless wire too —
         // the same single resolver the TUI uses, with no persona to layer over.
         persona_tools: None,
-        cognition: crate::cognition::resolve_cognition(None),
+        cognition: crate::cognition::effective_cognition(),
         max_tool_rounds: config.max_tool_rounds,
         narration_nudge_cap: config.narration_nudge_cap,
         workflow_grace_rounds: config.workflow_grace_rounds,
