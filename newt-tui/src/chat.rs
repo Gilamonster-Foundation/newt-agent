@@ -588,6 +588,14 @@ pub(crate) fn run_chat(
     // turn (`ensure_context_window` only early-outs on success).
     let mut ctx_window_probed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Snapshot the pre-persona backend baseline (whatever `--backend` / loadout /
+    // sticky settings established) BEFORE any persona routing, so a `/persona
+    // clear` — or a switch to a persona that declares no backend — reverts to it
+    // rather than staying pinned to the last persona's (possibly cost-bearing)
+    // backend. May be unset (`None` ⇒ the configured default).
+    let base_provider = std::env::var("NEWT_PROVIDER").ok();
+    let base_model = std::env::var("NEWT_DGX_MODEL").ok();
+
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
     let mut choice = resolve_backend_choice(&cfg);
@@ -936,6 +944,32 @@ pub(crate) fn run_chat(
                 active_persona = Some(synthetic_altitude_persona(alt));
             }
             None => {}
+        }
+    }
+
+    // Persona backend auto-route (startup): if `--persona` named a persona that
+    // declares a `backend:`, repoint the session to it now — before the memory /
+    // budget setup below reads inf_model. Follow-ups (both minor, cloud backends
+    // like sol unaffected): the active_profile pick above used the pre-persona
+    // model and is not recomputed; and this re-resolve re-probes the endpoint a
+    // second time (the first was the default at session start).
+    if active_persona.is_some() {
+        let url_changed = apply_persona_backend(
+            active_persona.as_ref(),
+            &base_provider,
+            &base_model,
+            &cfg,
+            &mut choice,
+            &mut inf_url,
+            &mut inf_model,
+            &mut inf_kind,
+            &mut inf_key,
+            &mut inf_context_window,
+            color,
+            verbose,
+        );
+        if url_changed && verbose {
+            dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url).map(|d| d.into_sampler(2));
         }
     }
 
@@ -3265,6 +3299,28 @@ pub(crate) fn run_chat(
                                 color,
                                 verbose,
                             );
+                            // Persona backend auto-route: repoint the session's
+                            // wire target to the new persona's `backend:` (if any),
+                            // exactly as `/backends <name>` would; a persona with no
+                            // backend (or a cleared one) reverts to the baseline.
+                            let url_changed = apply_persona_backend(
+                                active_persona.as_ref(),
+                                &base_provider,
+                                &base_model,
+                                &cfg,
+                                &mut choice,
+                                &mut inf_url,
+                                &mut inf_model,
+                                &mut inf_kind,
+                                &mut inf_key,
+                                &mut inf_context_window,
+                                color,
+                                verbose,
+                            );
+                            if url_changed && verbose {
+                                dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                    .map(|d| d.into_sampler(2));
+                            }
                         }
                         surface.save_history();
                         println!();
@@ -3330,29 +3386,23 @@ pub(crate) fn run_chat(
                     if !ephemeral_session {
                         conversation_store = Some(conversation_store_for(workspace, &cfg)?);
                     }
-                    let prev_inf_url = inf_url.clone();
-                    choice = resolve_backend_choice(&cfg);
-                    // #1126 C1b: adopt served reality on a backend/model
-                    // switch too — but only when the endpoint or session
-                    // override actually changed (a plain slash command must
-                    // not re-probe every time).
-                    if choice.url != prev_inf_url || choice.model != inf_model {
-                        for line in adopt_backend_choice(&mut choice) {
-                            print_newt(&line, color, verbose);
-                        }
-                    }
-                    inf_url = choice.url.clone();
-                    inf_model = choice.model.clone();
-                    inf_kind = choice.kind;
-                    inf_key = choice.api_key.clone();
-                    inf_context_window = choice.context_window;
-                    apply_openai_api_env(choice.api);
+                    let url_changed = refresh_backend(
+                        &cfg,
+                        &mut choice,
+                        &mut inf_url,
+                        &mut inf_model,
+                        &mut inf_kind,
+                        &mut inf_key,
+                        &mut inf_context_window,
+                        color,
+                        verbose,
+                    );
                     // Re-probe DCGM ONLY when the backend URL actually changed
                     // (and only in verbose mode, where the snapshot is shown).
                     // `try_connect` is a blocking ~3s network call (issue #412);
                     // a `/vi`/`/emacs` toggle never changes the URL. Dropping the
                     // old receiver stops the previous background sampler (#414).
-                    if inf_url != prev_inf_url {
+                    if url_changed {
                         dgx_rx = if verbose {
                             dgx_probe::DgxTelemetry::try_connect(&inf_url)
                                 .map(|d| d.into_sampler(2))
