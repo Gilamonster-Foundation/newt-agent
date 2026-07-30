@@ -13,6 +13,9 @@ pub mod artifact;
 pub mod backend_probe;
 pub mod caveats;
 pub mod classifiers;
+/// The cognition session dial — the `/cognition` override resolved over a
+/// persona's `cognition:` (psyche sibling of [`tenacity`]).
+pub mod cognition;
 pub mod config;
 pub mod conversation;
 pub mod credential_registry;
