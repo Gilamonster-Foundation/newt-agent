@@ -1447,11 +1447,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),
         Command::Models { cmd } => models_cmd::run(cmd).await,
         Command::Summarizer { cmd } => summarizer_cmd::run(cmd).await,
-        // Startup-free help: no session, no backend connect. Renders the SAME
-        // bytes the interactive `/help` prints (both route through
-        // `newt_tui::render_help`), so `newt help` is a hosted-CI-safe way to
-        // inspect the command catalog. A leading `/` on the topic is tolerated
-        // so `newt help /dgx` and `newt help dgx` behave alike.
+        // Startup-free help: no session, no backend connect. Uses the same
+        // command corpus as interactive `/help`, in its stable plain format,
+        // so `newt help` is a hosted-CI-safe way to inspect the catalog. A
+        // leading `/` on the topic is tolerated so `newt help /dgx` and
+        // `newt help dgx` behave alike.
         Command::Help { command } => {
             let topic = command.as_deref().map(|c| c.trim_start_matches('/'));
             print!(

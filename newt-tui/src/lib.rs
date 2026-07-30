@@ -9706,9 +9706,9 @@ Add --help (or -h) to any command for its page."
 /// page exists. Unknown topics render a one-line miss (so a typo doesn't fall
 /// through to the wrong handler) and return `false`.
 ///
-/// This is the single byte-source for a per-command page. Both the interactive
-/// REPL ([`print_command_help`]) and the startup-free CLI ([`render_help`])
-/// route through it, so the two surfaces cannot silently diverge.
+/// This is the single byte-source for a plain per-command page. The interactive
+/// TUI derives its Markdown document from the same [`command_help_page`]
+/// corpus, while the startup-free CLI routes through [`render_help`].
 fn command_help_output(cmd: &str, color: bool, verbose: bool) -> (String, bool) {
     match command_help_page(cmd) {
         Some(page) => {
@@ -9738,10 +9738,10 @@ fn command_help_output(cmd: &str, color: bool, verbose: bool) -> (String, bool) 
 
 /// Render the bare-`/help` command list to a `String`.
 ///
-/// The single byte-source for the top-level list: the `Available commands:`
-/// narrator line followed by every [`help_lines`] entry. Both the interactive
-/// REPL (`commands::meta::dispatch`) and the startup-free CLI ([`render_help`])
-/// route through it, so `/help` and `newt help` cannot diverge.
+/// The plain top-level list: the `Available commands:` narrator line followed
+/// by every [`help_lines`] entry. The interactive TUI derives its Markdown
+/// document from that same corpus; plain mode and the startup-free CLI
+/// ([`render_help`]) route through this function.
 fn help_list_output(color: bool, verbose: bool) -> String {
     let mut out = newt_line("Available commands:", color, verbose);
     out.push('\n');
@@ -9752,11 +9752,82 @@ fn help_list_output(color: bool, verbose: bool) -> String {
     out
 }
 
-/// Print one command's `--help` page; `true` when a page exists. Thin wrapper
-/// over [`command_help_output`] — the byte-identical REPL side of [`render_help`].
-fn print_command_help(cmd: &str, color: bool, verbose: bool) -> bool {
-    let (out, found) = command_help_output(cmd, color, verbose);
-    print!("{out}");
+/// Markdown source for RichTUI's bare command catalog. The long-standing
+/// [`help_lines`] corpus remains the single source of truth; this only gives
+/// each row Markdown structure so the renderer preserves command boundaries
+/// instead of folding their soft line breaks into one paragraph.
+fn help_list_markdown() -> String {
+    let mut out = String::from("## Available commands\n\n");
+    for line in help_lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            out.push('\n');
+        } else if let Some((usage, description)) = line.split_once(" - ") {
+            out.push_str(&format!("- `{usage}` — {description}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Markdown source for one command's detail page.
+fn command_help_markdown(cmd: &str) -> Option<String> {
+    let page = command_help_page(cmd)?;
+    let mut out = format!("## /{} help\n\n", canonical_help_topic(cmd));
+    for line in page.lines() {
+        if line.starts_with("  ") {
+            out.push_str("- ");
+            out.push_str(line.trim());
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Render help for the interactive TUI. Markdown mode is deliberately a
+/// presentation layer over the existing corpus: disabling it returns the
+/// byte-identical plain/startup-free output from [`render_help`].
+fn render_help_for_tui(
+    topic: Option<&str>,
+    color: bool,
+    verbose: bool,
+    markdown: bool,
+    cols: usize,
+) -> String {
+    if !markdown {
+        return render_help(topic, color, verbose);
+    }
+    let source = match topic {
+        None => help_list_markdown(),
+        Some(cmd) => match command_help_markdown(cmd) {
+            Some(source) => source,
+            None => return render_help(topic, color, verbose),
+        },
+    };
+    let rendered = newt_core::agentic::render_markdown(
+        &source,
+        newt_core::agentic::RenderOpts { color, cols },
+    );
+    format!("{}{rendered}\n", newt_line("", color, verbose))
+}
+
+/// Print one command's `--help` page; `true` when a page exists.
+fn print_command_help(cmd: &str, color: bool, verbose: bool, markdown: bool) -> bool {
+    let found = command_help_page(cmd).is_some();
+    print!(
+        "{}",
+        render_help_for_tui(
+            Some(cmd),
+            color,
+            verbose,
+            markdown,
+            newt_core::tty::term_cols(),
+        )
+    );
     found
 }
 
@@ -9764,12 +9835,11 @@ fn print_command_help(cmd: &str, color: bool, verbose: bool) -> bool {
 /// backend. `topic == None` is the bare-`/help` command list; `Some(cmd)` is
 /// that command's detail page (an unknown topic renders the one-line miss).
 ///
-/// This is the startup-free entry point behind `newt help [command]`. It emits
-/// bytes IDENTICAL to the interactive REPL's `/help` / `/<cmd> --help` output
-/// because both sides share [`help_list_output`] / [`command_help_output`];
-/// `help_lines` / `command_help_page` remain the single source of truth for
-/// WHAT help says (issue #548 measures that content). This path only changes
-/// WHEN and HOW it can be rendered — it never forks the corpus.
+/// This is the startup-free entry point behind `newt help [command]` and the
+/// interactive TUI's plain-render fallback. [`help_lines`] and
+/// [`command_help_page`] remain the single source of truth for WHAT help says
+/// (issue #548 measures that content); RichTUI only adds a Markdown
+/// presentation over those corpora.
 pub fn render_help(topic: Option<&str>, color: bool, verbose: bool) -> String {
     match topic {
         None => help_list_output(color, verbose),
@@ -9912,6 +9982,7 @@ fn dispatch_slash(
     workspace: &str,
     color: bool,
     verbose: bool,
+    markdown: bool,
 ) -> anyhow::Result<bool> {
     // Strip leading slash and split into at most 3 tokens.
     let body = input.trim_start_matches('/');
@@ -9922,7 +9993,7 @@ fn dispatch_slash(
 
     match cmd {
         "exit" | "quit" | "help" | "version" | "workspace" | "config" => {
-            commands::meta::dispatch(cmd, arg1, workspace, color, verbose)
+            commands::meta::dispatch(cmd, arg1, workspace, color, verbose, markdown)
         }
         "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" | "tenacity"
         | "cognition" | "psyche" => {

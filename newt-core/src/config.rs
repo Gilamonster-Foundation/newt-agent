@@ -784,9 +784,11 @@ impl ColorMode {
 }
 
 /// Markdown rendering mode — the `[tui] markdown` key and the `/markdown`
-/// command (Step 25.4, #568). `Auto` renders Markdown whenever color is active;
-/// `On`/`Off` force the choice (`On` still needs color to emit ANSI). The
-/// effective decision is `mode.forced().unwrap_or(color_on) && color_on`.
+/// command (Step 25.4, #568). This controls RichTUI text output, including
+/// assistant replies and built-in Markdown documents such as `/help`. `Auto`
+/// renders Markdown whenever color is active; `On`/`Off` force the choice
+/// (`On` still needs color to emit ANSI). The effective decision is
+/// `mode.forced().unwrap_or(color_on) && color_on`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MarkdownMode {
@@ -1697,7 +1699,8 @@ pub struct TuiConfig {
     // (#559), so the summarizer can run on its own backend. Old `[tui]` keys
     // (`summarizer_timeout_secs` / `summarizer_retries` / `summarizer_model`)
     // are no longer read — `#[serde(default)]` ignores them in stale configs.
-    /// Markdown rendering of assistant output (Step 25.4, #568). `auto`
+    /// Markdown rendering of RichTUI text output (Step 25.4, #568), including
+    /// assistant replies and built-in documents such as `/help`. `auto`
     /// (default) renders whenever color is active; `on`/`off` force it. The
     /// `/markdown [on|off]` command overrides this for the session.
     #[serde(default)]
