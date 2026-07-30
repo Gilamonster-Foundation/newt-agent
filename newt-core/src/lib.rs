@@ -74,6 +74,9 @@ pub mod store;
 pub mod symbols;
 pub mod templates;
 pub mod tenacity;
+/// A shared RAII guard for tests that touch the process-global operator settings
+/// (cognition / tenacity / `NEWT_*`) — one lock + Drop-restored snapshot.
+pub mod test_guard;
 pub mod tokens;
 pub mod tooling;
 /// Terminal-line ownership: the process-wide arbiter every ephemeral writer

@@ -41,6 +41,7 @@ mod tests {
 
     #[test]
     fn obsessive_sets_max_cognition_and_max_tenacity() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
         // Start from a non-obsessive state so the assertions mean something.
         set_cli_cognition(CognitionOverride::Unset);
         set_cli_tenacity(Tenacity::Standard);
