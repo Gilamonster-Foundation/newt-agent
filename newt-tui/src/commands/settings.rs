@@ -286,7 +286,8 @@ fn psyche_command(arg: &str) -> String {
     // `/psyche obsessive` — engage the max-everything posture's two LIVE dials.
     // Crew is a startup gate (crew_runner is built once at launch), so it can't
     // be turned on mid-session; say so honestly and point at the launch flag.
-    if arg.trim().eq_ignore_ascii_case("obsessive") {
+    let a = arg.trim();
+    if a.eq_ignore_ascii_case("obsessive") || a.eq_ignore_ascii_case("obsessive-relentless") {
         let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
         return format!(
             "obsessive engaged (live): cognition → {}, tenacity → {}.\n\

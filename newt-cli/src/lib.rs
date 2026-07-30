@@ -175,8 +175,14 @@ pub struct Cli {
     /// `contemplating` (deepest reasoning.effort), tenacity to `relentless` (most
     /// forcing), and the crew ON (as if `NEWT_TEAM` were set). An explicit
     /// `--tenacity` alongside still wins. In-session, `/psyche obsessive` engages
-    /// the two live dials; crew needs a launch with this flag.
-    #[arg(long, global = true, default_value_t = false)]
+    /// the two live dials; crew needs a launch with this flag. Alias
+    /// `--obsessive-relentless` names the tenacity axis explicitly.
+    #[arg(
+        long,
+        visible_alias = "obsessive-relentless",
+        global = true,
+        default_value_t = false
+    )]
     pub obsessive: bool,
 
     /// Run with NO conversation persistence: nothing is auto-resumed, no
