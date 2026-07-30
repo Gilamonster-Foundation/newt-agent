@@ -52,6 +52,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::router::Tier;
+use crate::Tenacity;
 use crate::{Caveats, CountBound, Scope};
 
 /// A parsed role profile: a system-prompt overlay plus the optional toolset /
@@ -88,6 +89,20 @@ pub struct RoleProfile {
     /// REPLACES `DEFAULT_SOUL` with `COACH_SOUL` so a coaching persona doesn't
     /// ship two contradictory identities (doer soul + advise overlay).
     pub altitude: Option<Altitude>,
+    /// BACKEND — names a `[[backends]]` entry this persona runs on (e.g.
+    /// `"sol"` → gpt-5.6-sol). `None` = the session's configured backend.
+    /// Auto-selection (overriding `default_backend` while this persona is
+    /// active) is a follow-up; declaring it is wired here first.
+    pub backend: Option<String>,
+    /// COGNITION — per-call reasoning depth (the psyche dial). `None` = backend
+    /// default. Maps onto `reasoning.effort`; the emit site is a follow-up.
+    pub cognition: Option<Cognition>,
+    /// TENACITY — how hard the harness pushes the read→act loop for this
+    /// persona. `None` = the session/global tenacity (`/tenacity`).
+    pub tenacity: Option<Tenacity>,
+    /// CREW — when `true`, this persona runs with the multi-agent crew (`/team`)
+    /// on by default. `None`/`false` = single-agent. Enforcement is a follow-up.
+    pub crew: Option<bool>,
 }
 
 /// The persona's operating altitude (FR-5, #999). Decides whether the base
@@ -104,6 +119,55 @@ pub enum Altitude {
     /// synonym `"advise"` in front-matter.
     #[serde(alias = "advise")]
     Coach,
+}
+
+/// COGNITION — the psyche's reasoning-depth dial: how hard the model thinks
+/// per call. Declared in front-matter as `cognition = "deliberating"`; an
+/// absent field leaves the backend default. Maps onto the wire
+/// `reasoning.effort` field (Responses / Chat-Completions); the emit site is a
+/// follow-up — declaring it is wired here first, matching how `tools`/`model`
+/// shipped (declared, then enforced).
+///
+/// The ladder is deliberately a personality arc, not a clinical scale — light
+/// and careful through to compulsive at the top (paired with [`Tenacity`] and
+/// crew under the `obsessive` persona).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Cognition {
+    /// Snap judgement — barely deliberate. Wire: `reasoning.effort = minimal`.
+    Glancing,
+    /// Think it through before answering. Wire: `low`.
+    Pondering,
+    /// Weigh the options carefully — the default. Wire: `medium`.
+    #[default]
+    Deliberating,
+    /// Long, deep, quiet consideration. Wire: `high`.
+    Contemplating,
+}
+
+impl Cognition {
+    /// The OpenAI `reasoning.effort` value this level maps to on the Responses /
+    /// Chat wire. The emit site is a follow-up; this is the mapping it will use.
+    #[must_use]
+    pub fn reasoning_effort(self) -> &'static str {
+        match self {
+            Self::Glancing => "minimal",
+            Self::Pondering => "low",
+            Self::Deliberating => "medium",
+            Self::Contemplating => "high",
+        }
+    }
+
+    /// Stable lowercase label — the front-matter / `/cognition` spelling.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Glancing => "glancing",
+            Self::Pondering => "pondering",
+            Self::Deliberating => "deliberating",
+            Self::Contemplating => "contemplating",
+        }
+    }
 }
 
 /// The TOML front-matter shape. Kept separate from [`RoleProfile`] so the
@@ -124,6 +188,14 @@ struct FrontMatter {
     tier: Option<Tier>,
     #[serde(default)]
     altitude: Option<Altitude>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    cognition: Option<Cognition>,
+    #[serde(default)]
+    tenacity: Option<Tenacity>,
+    #[serde(default)]
+    crew: Option<bool>,
 }
 
 /// A small, human-friendly serde shape for an agent-bridle capability profile.
@@ -467,12 +539,16 @@ impl RoleProfile {
             model: fm.model,
             tier: fm.tier,
             altitude: fm.altitude,
+            backend: fm.backend,
+            cognition: fm.cognition,
+            tenacity: fm.tenacity,
+            crew: fm.crew,
         })
     }
 
     /// `true` when this profile declares more than a prompt (i.e. front-matter
-    /// bound a role, tools, skills, caveats, model, or tier). A prompt-only
-    /// persona returns `false`.
+    /// bound a role, tools, skills, caveats, model, tier, altitude, or any
+    /// psyche dial). A prompt-only persona returns `false`.
     #[must_use]
     pub fn is_role_bound(&self) -> bool {
         self.role.is_some()
@@ -482,6 +558,10 @@ impl RoleProfile {
             || self.model.is_some()
             || self.tier.is_some()
             || self.altitude.is_some()
+            || self.backend.is_some()
+            || self.cognition.is_some()
+            || self.tenacity.is_some()
+            || self.crew.is_some()
     }
 
     /// Load a named persona `.md` file from `dir` (#1021 PR 5.2 — the
@@ -646,6 +726,45 @@ You edit files and run builds.
         assert_eq!(caveats.exec, Scope::only(["cargo".to_string()]));
         assert_eq!(caveats.net, Scope::none());
         assert_eq!(caveats.max_calls, CountBound::AtMost(40));
+    }
+
+    #[test]
+    fn parses_psyche_fields() {
+        // A persona (Bob the researcher) that names its backend and pegs the
+        // psyche dials — the shape the `obsessive`/`bob` shipped personas use.
+        let text = "\
++++
+role = \"researcher\"
+backend = \"sol\"
+cognition = \"contemplating\"
+tenacity = \"relentless\"
+crew = true
++++
+
+# Bob
+
+You are Bob, a researcher.
+";
+        let rp = RoleProfile::parse(text).unwrap();
+        assert_eq!(rp.role.as_deref(), Some("researcher"));
+        assert_eq!(rp.backend.as_deref(), Some("sol"));
+        assert_eq!(rp.cognition, Some(Cognition::Contemplating));
+        assert_eq!(rp.tenacity, Some(Tenacity::Relentless));
+        assert_eq!(rp.crew, Some(true));
+        assert!(rp.is_role_bound());
+        // The dial maps onto the OpenAI reasoning-effort wire value.
+        assert_eq!(rp.cognition.unwrap().reasoning_effort(), "high");
+        assert_eq!(rp.cognition.unwrap().label(), "contemplating");
+    }
+
+    #[test]
+    fn cognition_alone_is_role_bound() {
+        // Even a single psyche dial promotes a persona past prompt-only.
+        let text = "+++\ncognition = \"pondering\"\n+++\n\n# Thinker\n";
+        let rp = RoleProfile::parse(text).unwrap();
+        assert_eq!(rp.cognition, Some(Cognition::Pondering));
+        assert!(rp.is_role_bound());
+        assert_eq!(Cognition::default(), Cognition::Deliberating);
     }
 
     #[test]

@@ -4576,6 +4576,19 @@ fn persona_status(active: Option<&Persona>) -> String {
         (None, Some(t)) => out.push_str(&format!("\n  router: tier={t:?}")),
         (None, None) => {}
     }
+    // The psyche dials (backend + cognition/tenacity/crew), shown only when set.
+    if let Some(b) = &profile.backend {
+        out.push_str(&format!("\n  backend: {b}"));
+    }
+    if let Some(c) = profile.cognition {
+        out.push_str(&format!("\n  cognition: {}", c.label()));
+    }
+    if let Some(t) = profile.tenacity {
+        out.push_str(&format!("\n  tenacity: {}", t.label()));
+    }
+    if profile.crew == Some(true) {
+        out.push_str("\n  crew: on");
+    }
     if !profile.is_role_bound() {
         out.push_str("\n  (prompt-only persona — no role bindings)");
     }
