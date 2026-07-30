@@ -1,7 +1,9 @@
-//! `/prompt` · `/vi` · `/emacs` · `/nano` · `/edit-mode` · `/thinking` · `/nudge` — the
-//! session-setting commands, each of which sets an `NEWT_*` env var that a
-//! later step in `run_chat` picks up. Moved verbatim from the `dispatch_slash`
-//! match in `lib.rs`.
+//! `/prompt` · `/vi` · `/emacs` · `/nano` · `/edit-mode` · `/thinking` · `/nudge` ·
+//! `/tenacity` · `/cognition` · `/psyche` — the session-setting commands. The
+//! editor-family ones set an `NEWT_*` env var a later step in `run_chat` picks
+//! up; the psyche dials (`/tenacity`, `/cognition`) mutate a process-global and
+//! `/psyche` renders all three effort dials read-only. Moved from the
+//! `dispatch_slash` match in `lib.rs`.
 
 use newt_core::agentic::print_newt;
 
@@ -164,6 +166,10 @@ pub(crate) fn dispatch(
         // `/cognition off` suppresses the field, `/cognition auto` follows persona.
         "cognition" => print_newt(&cognition_command(arg1), color, verbose),
 
+        // The psyche panel: all three effort dials (cognition/tenacity/crew) at a
+        // glance, with how to change each. Read-only status view.
+        "psyche" => print_newt(&psyche_command(), color, verbose),
+
         other => {
             unreachable!("commands::settings::dispatch routed a non-setting command: {other:?}")
         }
@@ -268,6 +274,44 @@ fn cognition_command(arg: &str) -> String {
     }
 }
 
+/// Build the `/psyche` panel — the agent's effort posture at a glance: the three
+/// orthogonal dials (cognition / tenacity / crew) and how to change each. Reads
+/// the live session state — the cognition + tenacity process-globals and the
+/// crew `NEWT_TEAM` startup gate (the same gate newt-cli reads to build the crew
+/// runner). The three are kept factored on purpose: cognition rides the wire
+/// request, tenacity steers the harness loop, crew sets how many minds work.
+fn psyche_command() -> String {
+    use newt_core::cognition::{cli_cognition, CognitionOverride};
+    use newt_core::tenacity::effective_tenacity;
+    let cog = match cli_cognition() {
+        CognitionOverride::Unset => "auto — follows the active persona".to_string(),
+        CognitionOverride::Off => "off — no reasoning.effort".to_string(),
+        CognitionOverride::Set(c) => format!("{} — {}", c.label(), c.describe()),
+    };
+    let ten = effective_tenacity();
+    // Mirror newt-cli's startup gate: the crew runner is built iff NEWT_TEAM is set.
+    let crew = if std::env::var("NEWT_TEAM").is_ok() {
+        "on"
+    } else {
+        "off"
+    };
+    let mut out = String::from("psyche — how hard the agent works (three orthogonal dials):");
+    out.push_str(&format!("\n  cognition   {cog}"));
+    out.push_str("\n              reasoning depth per call → reasoning.effort   (/cognition)");
+    out.push_str(&format!(
+        "\n  tenacity    {} — {}",
+        ten.label(),
+        ten.describe()
+    ));
+    out.push_str("\n              how hard the loop pushes read → act            (/tenacity)");
+    out.push_str(&format!("\n  crew        {crew}"));
+    out.push_str(
+        "\n              how many minds work the task                   (NEWT_TEAM / newt crew)",
+    );
+    out.push_str("\nobsessive = the max-everything posture: contemplating + relentless + crew on.");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{cognition_command, tenacity_command};
@@ -313,6 +357,18 @@ mod tests {
         assert!(err.contains("unknown cognition"), "{err}");
 
         set_cli_cognition(restore);
+    }
+
+    #[test]
+    fn psyche_panel_shows_all_three_dials_and_how_to_change_them() {
+        let out = super::psyche_command();
+        for k in ["cognition", "tenacity", "crew", "obsessive"] {
+            assert!(out.contains(k), "psyche panel missing '{k}': {out}");
+        }
+        assert!(
+            out.contains("/cognition") && out.contains("/tenacity"),
+            "panel should point at how to change each dial: {out}"
+        );
     }
 
     #[test]
