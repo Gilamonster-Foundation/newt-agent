@@ -9134,14 +9134,19 @@ active persona's cognition; a persona sets its own default via `cognition:`."
         }
         "psyche" => {
             "\
-/psyche — the agent's effort posture: cognition, tenacity, and crew at a glance
+/psyche [obsessive] — the agent's effort posture: cognition, tenacity, crew
 
-Shows the three orthogonal psyche dials and how to change each:
+  /psyche                show the three dials and how to change each
+  /psyche obsessive      engage the max-everything posture's live dials
+
+The three orthogonal psyche dials:
   cognition   reasoning depth per call → reasoning.effort   (/cognition)
   tenacity    how hard the loop pushes read → act            (/tenacity)
   crew        how many minds work the task                   (NEWT_TEAM / newt crew)
 
-obsessive is the max-everything posture (contemplating + relentless + crew on)."
+obsessive = contemplating + relentless + crew on — newt's 'ultra'. In-session
+/psyche obsessive sets cognition + tenacity live; crew is a launch gate, so
+start with `newt --obsessive` to include the crew this session."
         }
         "probe" => {
             "\
