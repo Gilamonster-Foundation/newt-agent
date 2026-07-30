@@ -58,8 +58,7 @@ use std::sync::Arc;
 
 use super::observation::ShellObservation;
 use super::{
-    chat_complete, openai_chat_complete, openai_responses_complete, responses_api_selected,
-    ChatCtx, CodeSearch, Embedder, NoMcp, PromptDisposition, SemanticIndex,
+    chat_complete, ChatCtx, CodeSearch, Embedder, NoMcp, PromptDisposition, SemanticIndex,
 };
 use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, Role, TokenUsage};
 
@@ -563,21 +562,15 @@ async fn run_one_turn(
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.
     let mut mcp = NoMcp;
-    // Mirror `chat_complete_with_prompt_and_artifacts`'s dispatch: an OpenAI
-    // backend with `api = "responses"` (surfaced via NEWT_OPENAI_API) speaks the
-    // Responses API. Without this the headless driver (`newt solve` / worker)
-    // always hit /v1/chat/completions, so a responses-only model like
-    // gpt-5.6-sol 400s on function tools — the interactive path already routed
-    // correctly, this closes the headless gap.
-    let dispatch = if config.kind == BackendKind::Openai {
-        if responses_api_selected() {
-            openai_responses_complete(ctx, &mut mcp).await
-        } else {
-            openai_chat_complete(ctx, &mut mcp).await
-        }
-    } else {
-        chat_complete(ctx, &mut mcp).await
-    };
+    // ONE dispatch owner. `chat_complete` routes openai-vs-ollama AND, for an
+    // openai backend, responses-vs-chat (`api = "responses"`, surfaced via
+    // NEWT_OPENAI_API). The headless driver goes through the SAME entry the
+    // interactive TUI does, so the wire-format decision lives in exactly one
+    // place and cannot drift. (This path used to fork its own `if kind==Openai`
+    // branch that called `openai_chat_complete` directly, bypassing the
+    // responses check — which is exactly why a responses-only model like
+    // gpt-5.6-sol was mis-routed to /v1/chat/completions.)
+    let dispatch = chat_complete(ctx, &mut mcp).await;
     // Both arms move `tool_events`/`end_reason` out (only one arm runs). On a
     // failed turn we still return `Ok` carrying the PARTIAL trajectory + the
     // error, rather than `Err` that discards what the agent already did — an
