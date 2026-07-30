@@ -69,6 +69,10 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         .to_string();
     let kind = backend.kind.unwrap_or(BackendKind::Openai);
     let api_key = backend.resolve_api_key();
+    // Surface the backend's wire API (`api = "responses"`) to the agentic loop,
+    // exactly as the chat path does — without this, a responses-only model like
+    // gpt-5.6-sol is driven over /v1/chat/completions and 400s on function tools.
+    newt_tui::apply_openai_api_env(backend.api.unwrap_or_default());
 
     // #tenacity: attribute the model's family so a per-family `[tenacity]` config
     // default applies to this run (an explicit `--tenacity` still supersedes it).

@@ -3829,10 +3829,15 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
 }
 
 /// Surface the resolved OpenAI API surface to the agent loop via
-/// `NEWT_OPENAI_API` (read by `chat_complete` to route to the Responses path).
+/// `NEWT_OPENAI_API` (read by the agent loop to route to the Responses path).
 /// Called whenever the session (re)resolves its backend, so a `/backends`
 /// switch to a `responses` backend takes effect on the next message.
-fn apply_openai_api_env(api: newt_core::OpenAiApi) {
+///
+/// Public so the headless surfaces (`newt solve` / worker) that reuse the same
+/// loop surface `api = "responses"` too — otherwise a responses-only model
+/// (gpt-5.6-sol, gpt-5-codex) is driven over `/v1/chat/completions` and 400s on
+/// function tools.
+pub fn apply_openai_api_env(api: newt_core::OpenAiApi) {
     // SAFETY: single-threaded session setup; the agent loop reads this between
     // turns, never concurrently.
     unsafe {
