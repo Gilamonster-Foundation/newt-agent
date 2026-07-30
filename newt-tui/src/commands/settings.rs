@@ -182,18 +182,19 @@ pub(crate) fn dispatch(
 /// [`newt_core::tenacity::effective_tenacity`]). Pure for the show/list/error
 /// paths; the set path mutates the process-global via `set_cli_tenacity`.
 fn tenacity_command(arg: &str) -> String {
-    use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+    use newt_core::tenacity::{clear_cli_tenacity, effective_tenacity, set_cli_tenacity, Tenacity};
     match arg.trim() {
         "" | "status" | "show" => {
             let t = effective_tenacity();
             format!(
-                "tenacity: {} — {}  (/tenacity <relaxed|standard|insistent|relentless>|list)",
+                "tenacity: {} — {}  (/tenacity <auto|relaxed|standard|insistent|relentless>|list)",
                 t.label(),
                 t.describe()
             )
         }
         "list" => {
             let mut out = String::from("tenacity levels (patient → forcing):");
+            out.push_str("\n  auto       inherit from the persona / config / model family");
             for t in Tenacity::all() {
                 let active = if t == effective_tenacity() {
                     " ← active"
@@ -204,13 +205,23 @@ fn tenacity_command(arg: &str) -> String {
             }
             out
         }
+        // review-2 #2: clear the `--tenacity`/`/tenacity` override so tenacity
+        // resolves from the persona / config / family again — the undo `/tenacity`
+        // previously lacked (a session override could not be released).
+        "auto" | "inherit" | "reset" => {
+            clear_cli_tenacity();
+            format!(
+                "tenacity → auto (override cleared) — now {} (from persona / config / family)",
+                effective_tenacity().label()
+            )
+        }
         other => match other.parse::<Tenacity>() {
             Ok(level) => {
                 set_cli_tenacity(level);
                 format!("tenacity → {} — {}", level.label(), level.describe())
             }
             Err(e) => {
-                format!("{e}  (/tenacity <level>|list|status)")
+                format!("{e}  (/tenacity <auto|level>|list|status)")
             }
         },
     }
@@ -449,6 +460,18 @@ mod tests {
         let msg = tenacity_command("relentless");
         assert!(msg.contains("relentless"), "{msg}");
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
+        // review-2 #2: `/tenacity auto` releases the override (was un-undoable).
+        let msg = tenacity_command("auto");
+        assert!(msg.contains("cleared"), "{msg}");
+        assert_eq!(
+            newt_core::tenacity::cli_tenacity(),
+            None,
+            "/tenacity auto clears the session override"
+        );
+        // `inherit` / `reset` are aliases for the same clear.
+        set_cli_tenacity(Tenacity::Insistent);
+        tenacity_command("reset");
+        assert_eq!(newt_core::tenacity::cli_tenacity(), None);
         // Restore so the process-global doesn't leak into sibling tests.
         set_cli_tenacity(restore);
     }
