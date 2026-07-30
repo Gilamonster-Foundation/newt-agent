@@ -1495,7 +1495,12 @@ pub(crate) fn run_chat(
                     // <cmd>`) uniformly — even the ones handled inline below.
                     // A bare `/help` falls through to the full command list.
                     if let Some(topic) = help_request(&task) {
-                        print_command_help(&topic, color, verbose);
+                        print_command_help(
+                            &topic,
+                            color,
+                            verbose,
+                            markdown_enabled(&cfg, color, markdown_override),
+                        );
                         println!();
                         continue;
                     }
@@ -3377,7 +3382,13 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
-                    let cont = dispatch_slash(&task, workspace, color, verbose)?;
+                    let cont = dispatch_slash(
+                        &task,
+                        workspace,
+                        color,
+                        verbose,
+                        markdown_enabled(&cfg, color, markdown_override),
+                    )?;
                     surface.save_history();
                     // Skip config reload and terminal reinit when exiting — unnecessary
                     // work that can hang if the terminal is in a degraded state.
