@@ -158,6 +158,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
     pub tenacity: Option<newt_core::Tenacity>,
 
+    /// Obsessive (#psyche): the max-everything posture — newt's "ultra". A named
+    /// launch act that moves three orthogonal dials at once: cognition to
+    /// `contemplating` (deepest reasoning.effort), tenacity to `relentless` (most
+    /// forcing), and the crew ON (as if `NEWT_TEAM` were set). An explicit
+    /// `--tenacity` alongside still wins. In-session, `/psyche obsessive` engages
+    /// the two live dials; crew needs a launch with this flag.
+    #[arg(long, global = true, default_value_t = false)]
+    pub obsessive: bool,
+
     /// Run with NO conversation persistence: nothing is auto-resumed, no
     /// conversation row is created, and no turn is saved. Equivalent to
     /// setting `NEWT_EPHEMERAL=1`. Takes precedence over
@@ -930,6 +939,22 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 unsafe { std::env::set_var("NEWT_PROVIDER", provider) };
             }
         }
+    }
+
+    // #psyche `--obsessive`: the max-everything launch posture (newt's "ultra").
+    // Applied BEFORE the explicit `--tenacity` below so a simultaneous
+    // `--tenacity <level>` still wins. Engages the two LIVE dials via the single
+    // posture owner; crew is a startup gate, so we also set `NEWT_TEAM` here —
+    // the same var the crew-runner build below reads — for full effect.
+    if cli.obsessive {
+        let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
+        // SAFETY: single-threaded before the TUI starts any async work.
+        unsafe { std::env::set_var("NEWT_TEAM", "1") };
+        eprintln!(
+            "obsessive engaged — cognition={}, tenacity={}, crew=on",
+            cog.label(),
+            ten.label()
+        );
     }
 
     // CLI `--tenacity`: install the process-global action-forcing level the

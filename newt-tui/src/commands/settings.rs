@@ -167,8 +167,8 @@ pub(crate) fn dispatch(
         "cognition" => print_newt(&cognition_command(arg1), color, verbose),
 
         // The psyche panel: all three effort dials (cognition/tenacity/crew) at a
-        // glance, with how to change each. Read-only status view.
-        "psyche" => print_newt(&psyche_command(), color, verbose),
+        // glance. `/psyche obsessive` engages the max-everything live dials.
+        "psyche" => print_newt(&psyche_command(arg1), color, verbose),
 
         other => {
             unreachable!("commands::settings::dispatch routed a non-setting command: {other:?}")
@@ -280,9 +280,22 @@ fn cognition_command(arg: &str) -> String {
 /// crew `NEWT_TEAM` startup gate (the same gate newt-cli reads to build the crew
 /// runner). The three are kept factored on purpose: cognition rides the wire
 /// request, tenacity steers the harness loop, crew sets how many minds work.
-fn psyche_command() -> String {
+fn psyche_command(arg: &str) -> String {
     use newt_core::cognition::{cli_cognition, CognitionOverride};
     use newt_core::tenacity::effective_tenacity;
+    // `/psyche obsessive` — engage the max-everything posture's two LIVE dials.
+    // Crew is a startup gate (crew_runner is built once at launch), so it can't
+    // be turned on mid-session; say so honestly and point at the launch flag.
+    if arg.trim().eq_ignore_ascii_case("obsessive") {
+        let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
+        return format!(
+            "obsessive engaged (live): cognition → {}, tenacity → {}.\n\
+             crew is a launch gate — relaunch with `newt --obsessive` (or set \
+             NEWT_TEAM) to add the crew this session.",
+            cog.label(),
+            ten.label()
+        );
+    }
     let cog = match cli_cognition() {
         CognitionOverride::Unset => "auto — follows the active persona".to_string(),
         CognitionOverride::Off => "off — no reasoning.effort".to_string(),
@@ -361,7 +374,7 @@ mod tests {
 
     #[test]
     fn psyche_panel_shows_all_three_dials_and_how_to_change_them() {
-        let out = super::psyche_command();
+        let out = super::psyche_command("");
         for k in ["cognition", "tenacity", "crew", "obsessive"] {
             assert!(out.contains(k), "psyche panel missing '{k}': {out}");
         }
@@ -369,6 +382,30 @@ mod tests {
             out.contains("/cognition") && out.contains("/tenacity"),
             "panel should point at how to change each dial: {out}"
         );
+    }
+
+    #[test]
+    fn psyche_obsessive_engages_the_max_live_dials_and_notes_crew() {
+        use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+        use newt_core::role_profile::Cognition;
+        use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        // Reset to a non-obsessive baseline so the assertions are meaningful.
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
+
+        let out = super::psyche_command("obsessive");
+        // The two live dials are actually maxed.
+        assert_eq!(
+            cli_cognition(),
+            CognitionOverride::Set(Cognition::Contemplating)
+        );
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
+        // The message is honest about crew being a launch gate.
+        assert!(out.to_lowercase().contains("crew"), "{out}");
+        assert!(out.contains("--obsessive"), "{out}");
+
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
     }
 
     #[test]

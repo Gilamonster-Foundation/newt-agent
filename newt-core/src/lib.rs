@@ -51,6 +51,9 @@ pub mod project_map;
 pub mod project_model;
 pub mod prompt;
 pub mod prune;
+/// Psyche posture macros (e.g. `obsessive`) — named acts that move several
+/// psyche dials ([`cognition`] + [`tenacity`], + crew at the caller) at once.
+pub mod psyche;
 pub mod reasoning;
 pub mod retry;
 /// #1030 node evaluators: Task/Plan done-ness from objective git state.
