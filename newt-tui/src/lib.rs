@@ -9457,10 +9457,12 @@ the model works. Off: just the answer. Persist with [tui] thinking in config."
   /tenacity              show the active level and what it does
   /tenacity list         list every level, patient → forcing
   /tenacity <level>      set relaxed | standard | insistent | relentless
+  /tenacity auto         clear the override; inherit from persona / config / family
 
 Higher tenacity forces an edit after fewer read-only rounds and makes
 exit_plan_mode require a concrete edit. This session-scoped override wins over
-[tenacity] config and the --tenacity flag. Persist per-family in [tenacity]."
+the persona declaration and [tenacity] config; `/tenacity auto` (aliases
+`inherit` / `reset`) releases it. Persist per-family in [tenacity]."
         }
         "cognition" => {
             "\
