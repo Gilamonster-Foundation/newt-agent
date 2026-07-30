@@ -146,8 +146,9 @@ pub enum Cognition {
 }
 
 impl Cognition {
-    /// The OpenAI `reasoning.effort` value this level maps to on the Responses /
-    /// Chat wire. The emit site is a follow-up; this is the mapping it will use.
+    /// The OpenAI `reasoning.effort` value this level maps to on the Responses
+    /// wire (emitted by `agentic::responses_reasoning_field`). Chat-shape emit is
+    /// a follow-up; the value mapping is the same.
     #[must_use]
     pub fn reasoning_effort(self) -> &'static str {
         match self {
@@ -166,6 +167,45 @@ impl Cognition {
             Self::Pondering => "pondering",
             Self::Deliberating => "deliberating",
             Self::Contemplating => "contemplating",
+        }
+    }
+
+    /// One-line description — the effort it requests, for `/cognition` listings.
+    #[must_use]
+    pub fn describe(self) -> String {
+        format!("reasoning.effort = {}", self.reasoning_effort())
+    }
+
+    /// All levels, light → deep (for `/cognition list` and menus).
+    #[must_use]
+    pub fn all() -> [Self; 4] {
+        [
+            Self::Glancing,
+            Self::Pondering,
+            Self::Deliberating,
+            Self::Contemplating,
+        ]
+    }
+}
+
+impl std::fmt::Display for Cognition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl std::str::FromStr for Cognition {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "glancing" => Ok(Self::Glancing),
+            "pondering" => Ok(Self::Pondering),
+            "deliberating" | "default" => Ok(Self::Deliberating),
+            "contemplating" => Ok(Self::Contemplating),
+            other => Err(format!(
+                "unknown cognition '{other}' (glancing|pondering|deliberating|contemplating)"
+            )),
         }
     }
 }
