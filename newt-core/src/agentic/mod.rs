@@ -596,6 +596,13 @@ pub struct ChatCtx<'a> {
     /// axis-scoped `caveats` (which part 1, #1002, already meets in). Headless
     /// / driver / eval callers pass `None` (no persona surface).
     pub persona_tools: Option<&'a [String]>,
+    /// The psyche **cognition** dial for this turn — how much reasoning effort to
+    /// request. `Some(level)` emits `reasoning.effort` (Responses) / `reasoning_effort`
+    /// (Chat) on the wire via [`Cognition::reasoning_effort`]; `None` omits the field
+    /// entirely (bit-for-bit unchanged for callers that don't opt in). The TUI
+    /// resolves it from the active persona's `cognition:` front-matter alongside
+    /// `persona_tools`; headless / eval callers pass `None`.
+    pub cognition: Option<crate::role_profile::Cognition>,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 40).
     pub max_tool_rounds: usize,
@@ -1167,6 +1174,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        // Psyche cognition: the chat-shape `reasoning_effort` emit is a follow-up
+        // (the chat request has ~7 body-literal sites that must be consolidated to
+        // one owner first — see `responses_reasoning_field`, the Responses emit).
+        // Bound `_` so the field is explicitly accounted for, never silently lost.
+        cognition: _,
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
@@ -4607,6 +4619,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        // Psyche cognition: the chat-shape `reasoning_effort` emit is a follow-up
+        // (the chat request has ~7 body-literal sites that must be consolidated to
+        // one owner first — see `responses_reasoning_field`, the Responses emit).
+        // Bound `_` so the field is explicitly accounted for, never silently lost.
+        cognition: _,
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
@@ -5849,6 +5866,19 @@ fn responses_api_selected() -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("responses"))
 }
 
+/// The Responses-wire `reasoning` object for a cognition level, or `None` to omit
+/// it. The **single owner** of how the psyche `cognition` dial becomes a wire
+/// field: the value mapping lives in [`Cognition::reasoning_effort`], the Responses
+/// *shape* (`{"effort": …}`) lives here, so the chat-shape projection
+/// (`reasoning_effort: …`, a follow-up once the chat bodies are consolidated)
+/// reuses the same value without duplicating the ladder. `None` → the field is
+/// never added, leaving the request bit-for-bit unchanged for non-opt-in callers.
+fn responses_reasoning_field(
+    cognition: Option<crate::role_profile::Cognition>,
+) -> Option<serde_json::Value> {
+    cognition.map(|c| serde_json::json!({ "effort": c.reasoning_effort() }))
+}
+
 /// Split chat-style messages into the Responses API's `(instructions, input)`:
 /// `system`/`developer` messages concatenate into top-level `instructions`;
 /// `user`/`assistant` become `input` message items (plain string content). Any
@@ -6007,6 +6037,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        cognition,
         max_tool_rounds,
         workflow_grace_rounds: _,
         narration_nudge_cap: _,
@@ -6167,10 +6198,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
 
+    let reasoning = responses_reasoning_field(cognition);
     let build_body = |input: &[serde_json::Value], with_tools: bool| {
         let mut body = serde_json::json!({ "model": model, "input": input, "stream": false });
         if let Some(ins) = &instructions {
             body["instructions"] = serde_json::json!(ins);
+        }
+        // Psyche cognition → `reasoning.effort` (omitted entirely when unset).
+        if let Some(reasoning) = &reasoning {
+            body["reasoning"] = reasoning.clone();
         }
         if with_tools && !tools.is_empty() {
             body["tools"] = serde_json::json!(tools);
@@ -7718,6 +7754,7 @@ mod tool_round_cap_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
             max_tool_rounds: 1,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -7893,6 +7930,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8198,6 +8236,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8294,6 +8333,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8409,6 +8449,26 @@ mod tool_round_cap_tests {
         );
         assert_eq!(out[0]["description"], "run git");
         assert!(out[0]["function"].is_null(), "no nested function wrapper");
+    }
+
+    #[test]
+    fn cognition_maps_to_the_responses_reasoning_field_or_is_omitted() {
+        use crate::role_profile::Cognition;
+        // Opt-in: each level projects to the Responses `reasoning.effort` value.
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Contemplating)),
+            Some(serde_json::json!({ "effort": "high" }))
+        );
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Glancing)),
+            Some(serde_json::json!({ "effort": "minimal" }))
+        );
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Deliberating)),
+            Some(serde_json::json!({ "effort": "medium" }))
+        );
+        // Not opted in → the field is omitted entirely (request unchanged).
+        assert_eq!(responses_reasoning_field(None), None);
     }
 
     #[test]
@@ -8657,6 +8717,53 @@ mod tool_round_cap_tests {
             body.get("num_ctx").is_none(),
             "Responses must not send the ChatCtx num_ctx display hint"
         );
+        assert!(
+            body.get("reasoning").is_none(),
+            "no cognition set → no reasoning.effort on the wire (request unchanged)"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_emits_cognition_as_reasoning_effort_on_the_wire() {
+        // The psyche cognition dial must reach the real /v1/responses request as
+        // `reasoning.effort` — grounds the pure mapping test against the full loop.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "considered"}]
+                }],
+                "usage": {"input_tokens": 20, "output_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "think hard about this";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("the request should dispatch");
+        assert_eq!(reply, "considered");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["reasoning"]["effort"], "high",
+            "cognition=contemplating must ride the wire as reasoning.effort=high"
+        );
     }
 
     struct GiantPromptReadResponder {
@@ -8899,6 +9006,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9007,6 +9115,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9124,6 +9233,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9253,6 +9363,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9374,6 +9485,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9537,6 +9649,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9709,6 +9822,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9847,6 +9961,7 @@ mod save_note_loop_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -10348,6 +10463,7 @@ mod compression_loop_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -11638,6 +11754,7 @@ mod observation_hook_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
             action_nudges: true,

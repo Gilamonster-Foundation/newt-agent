@@ -503,8 +503,11 @@ async fn run_one_turn(
         experience_store: None,
         step_ledger: None,
         caveats: &config.caveats,
-        // Headless cowork driver carries no persona surface (FR-1 part 2, #997).
+        // Headless cowork driver carries no persona surface (FR-1 part 2, #997),
+        // so no cognition dial rides this turn (a `--cognition` / config surface
+        // for the headless path is a follow-up).
         persona_tools: None,
+        cognition: None,
         max_tool_rounds: config.max_tool_rounds,
         narration_nudge_cap: config.narration_nudge_cap,
         workflow_grace_rounds: config.workflow_grace_rounds,
