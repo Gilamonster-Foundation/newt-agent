@@ -948,6 +948,13 @@ pub(crate) fn run_chat(
         }
     }
 
+    // P1#3: apply a `--persona`'s declared `tenacity:` as a real resolution layer
+    // at startup too (below any `--tenacity`, above config/family), so the loop
+    // obeys it and the status surfaces agree.
+    newt_core::tenacity::set_persona_tenacity(
+        active_persona.as_ref().and_then(|p| p.profile.tenacity),
+    );
+
     // Persona backend auto-route (startup): if `--persona` named a persona that
     // declares a `backend:`, repoint the session to it now — before the memory /
     // budget setup below reads inf_model. Follow-ups (both minor, cloud backends

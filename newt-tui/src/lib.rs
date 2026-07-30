@@ -4915,10 +4915,20 @@ fn persona_status(active: Option<&Persona>) -> String {
         out.push_str(&format!("\n  cognition: {}", c.label()));
     }
     if let Some(t) = profile.tenacity {
+        // P1#3: this is now an APPLIED resolution layer (set_persona_tenacity),
+        // not just rendered — it agrees with /psyche's effective_tenacity.
         out.push_str(&format!("\n  tenacity: {}", t.label()));
     }
     if profile.crew == Some(true) {
-        out.push_str("\n  crew: on");
+        // P1#3: crew is a startup gate (NEWT_TEAM builds the crew runner once at
+        // launch), so a declaration can't engage it live. Label it honestly so
+        // this status can't claim a control is active while the engine ignores it.
+        let runtime = if std::env::var("NEWT_TEAM").is_ok() {
+            "on"
+        } else {
+            "off — a launch gate; start with `newt --obsessive` / NEWT_TEAM to engage"
+        };
+        out.push_str(&format!("\n  crew: declared on · runtime {runtime}"));
     }
     if !profile.is_role_bound() {
         out.push_str("\n  (prompt-only persona — no role bindings)");
@@ -6975,6 +6985,8 @@ fn handle_persona_command(
         PersonaCommand::Show => Ok(persona_status(active_persona.as_ref())),
         PersonaCommand::Clear => {
             *active_persona = None;
+            // P1#3: no persona → no persona-declared tenacity layer.
+            newt_core::tenacity::set_persona_tenacity(None);
             // Clearing the persona starts a new conversation → fresh id + plan.
             *ctx.conversation_id = newt_core::new_conversation_id();
             reset_conversation(workspace, active_persona.as_ref(), ctx);
@@ -6982,6 +6994,9 @@ fn handle_persona_command(
         }
         PersonaCommand::Set { name, keep_context } => {
             let persona = store.load(&name)?;
+            // P1#3: apply the persona's declared `tenacity:` as a real resolution
+            // layer, so `/persona show` and `/psyche` agree and the loop obeys it.
+            newt_core::tenacity::set_persona_tenacity(persona.profile.tenacity);
             *active_persona = Some(persona);
             if keep_context {
                 // Persistent-actor swap: rebuild the system prompt for the new

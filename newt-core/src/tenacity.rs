@@ -185,14 +185,17 @@ impl TenacityConfig {
 }
 
 /// Full resolution order, most-specific first: an explicit operator choice
-/// (`--tenacity`) wins over any config; config per-family wins over config
-/// default; `Standard` is the floor. `config == None` ⇒ CLI-or-`Standard`.
+/// (`--tenacity`) wins over the active `persona` declaration, which wins over
+/// config per-family, which wins over the config default; `Standard` is the
+/// floor. `config == None` ⇒ CLI-or-persona-or-`Standard`.
 pub fn resolve_tenacity(
     cli: Option<Tenacity>,
+    persona: Option<Tenacity>,
     config: Option<&TenacityConfig>,
     family: Option<&str>,
 ) -> Tenacity {
-    cli.unwrap_or_else(|| config.map(|c| c.resolve(family)).unwrap_or_default())
+    cli.or(persona)
+        .unwrap_or_else(|| config.map(|c| c.resolve(family)).unwrap_or_default())
 }
 
 // The three tenacity inputs, each stashed by the one site that knows it — the
@@ -206,6 +209,11 @@ pub fn resolve_tenacity(
 static CLI_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
 static TENACITY_CONFIG: std::sync::Mutex<Option<TenacityConfig>> = std::sync::Mutex::new(None);
 static ACTIVE_FAMILY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+// The active persona's declared `tenacity:` — a resolution layer BELOW the CLI
+// override and ABOVE the config/family default, set when a persona activates
+// (review P1#3: a declared persona tenacity is now actually applied, not just
+// rendered). `None` when no persona / the persona declares none.
+static PERSONA_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
 
 /// Install the explicit CLI `--tenacity` override (highest priority). Call once,
 /// before the agentic loop starts.
@@ -249,14 +257,31 @@ pub fn set_active_model_family(family: Option<String>) {
     }
 }
 
-/// The tenacity in effect, resolved from the three inputs (most-specific first):
-/// the CLI `--tenacity` flag, then the `[tenacity]` config's per-family override
-/// for the active family, then the config default, then `Standard`.
+/// Install the active persona's declared `tenacity:` (review P1#3). Called when a
+/// persona activates (its declared level) or clears (`None`), so the declaration
+/// is actually applied — below the CLI override, above the config/family default.
+pub fn set_persona_tenacity(level: Option<Tenacity>) {
+    if let Ok(mut slot) = PERSONA_TENACITY.lock() {
+        *slot = level;
+    }
+}
+
+/// The active persona's declared tenacity, if any (for status rendering).
+#[must_use]
+pub fn persona_tenacity() -> Option<Tenacity> {
+    PERSONA_TENACITY.lock().ok().and_then(|s| *s)
+}
+
+/// The tenacity in effect, resolved most-specific first: the CLI `--tenacity`
+/// flag, then the active persona's declared `tenacity:`, then the `[tenacity]`
+/// config's per-family override for the active family, then the config default,
+/// then `Standard`.
 pub fn effective_tenacity() -> Tenacity {
     let cli = CLI_TENACITY.lock().ok().and_then(|s| *s);
+    let persona = PERSONA_TENACITY.lock().ok().and_then(|s| *s);
     let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
     let family = ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone());
-    resolve_tenacity(cli, config.as_ref(), family.as_deref())
+    resolve_tenacity(cli, persona, config.as_ref(), family.as_deref())
 }
 
 #[cfg(test)]
@@ -352,33 +377,48 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tenacity_lets_the_cli_flag_win_over_config() {
+    fn resolve_tenacity_precedence_cli_over_persona_over_config() {
         let c = cfg(
             Some(Tenacity::Relaxed),
             &[("nemotron", Tenacity::Relentless)],
         );
-        // CLI override beats even a matching per-family default.
+        // CLI override beats even a matching per-family default AND a persona.
         assert_eq!(
-            resolve_tenacity(Some(Tenacity::Standard), Some(&c), Some("nemotron")),
+            resolve_tenacity(
+                Some(Tenacity::Standard),
+                Some(Tenacity::Insistent),
+                Some(&c),
+                Some("nemotron")
+            ),
             Tenacity::Standard
         );
-        // No CLI → config per-family.
+        // No CLI → the persona declaration wins over config per-family (P1#3).
         assert_eq!(
-            resolve_tenacity(None, Some(&c), Some("nemotron")),
+            resolve_tenacity(None, Some(Tenacity::Insistent), Some(&c), Some("nemotron")),
+            Tenacity::Insistent,
+            "an active persona's declared tenacity is applied, not just rendered"
+        );
+        // No CLI, no persona → config per-family.
+        assert_eq!(
+            resolve_tenacity(None, None, Some(&c), Some("nemotron")),
             Tenacity::Relentless
         );
-        // No CLI, unknown family → config default.
+        // No CLI, no persona, unknown family → config default.
         assert_eq!(
-            resolve_tenacity(None, Some(&c), Some("kimi")),
+            resolve_tenacity(None, None, Some(&c), Some("kimi")),
             Tenacity::Relaxed
         );
-        // No config at all → CLI-or-Standard.
+        // No config at all → CLI-or-persona-or-Standard.
         assert_eq!(
-            resolve_tenacity(None, None, Some("nemotron")),
+            resolve_tenacity(None, None, None, Some("nemotron")),
             Tenacity::Standard
         );
         assert_eq!(
-            resolve_tenacity(Some(Tenacity::Insistent), None, None),
+            resolve_tenacity(None, Some(Tenacity::Insistent), None, None),
+            Tenacity::Insistent
+        );
+        assert_eq!(
+            resolve_tenacity(Some(Tenacity::Insistent), None, None, None),
             Tenacity::Insistent
         );
     }
