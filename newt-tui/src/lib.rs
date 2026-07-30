@@ -130,12 +130,22 @@ pub fn run_crew_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
     crew_form::run_edit(name, color)
 }
 
+/// The persona action the config panel returned (ungated mirror of the panel's
+/// own enum, so the non-rich fallback and the caller don't need the feature).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) enum PsychePersonaAction {
+    #[default]
+    Keep,
+    Clear,
+    Switch(String),
+}
+
 /// What the config panel asked the caller (the session loop) to do, beyond the
 /// dials it applied itself. Ungated so the non-rich fallback returns an empty one.
 #[derive(Debug, Default)]
 pub(crate) struct PsychePanelResult {
-    /// A persona the operator chose to activate (caller switches to it).
-    pub select_persona: Option<String>,
+    /// What to do with the active persona (keep / clear / switch).
+    pub persona: PsychePersonaAction,
     /// A persona to save: `(name, file_content)` (caller writes it via `PersonaStore`).
     pub saved: Option<(String, String)>,
 }
@@ -143,24 +153,39 @@ pub(crate) struct PsychePanelResult {
 /// Open the harness config panel (#14) for the psyche operator dials, or — when
 /// the rich TTY surface is unavailable (piped / headless / lean /
 /// `--no-default-features`) — print a short note pointing at the text `/psyche`
-/// view and the per-dial commands. The panel applies dials through the same
-/// setters (`set_cli_cognition` / `set_cli_tenacity`) as the flags and slash
-/// commands (only the ones the operator changed), so there is no panel-only
-/// state; persona select + save are returned for the caller to act on. See
-/// `docs/decisions/harness_config_panel.md`.
+/// view and the per-dial commands. The panel applies (only the changed) dials
+/// through the same setters the flags / slash commands use, so there is no
+/// panel-only state; the persona action + any save are returned for the caller to
+/// act on. Takes the EFFECTIVE resolved cognition/tenacity + the active persona so
+/// the panel can show/save the real posture. See `harness_config_panel.md`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_psyche_panel(
     persona_names: Vec<String>,
+    current_persona: Option<String>,
     backend: Option<String>,
+    eff_cognition: Option<newt_core::role_profile::Cognition>,
+    eff_tenacity: newt_core::Tenacity,
     color: bool,
     verbose: bool,
 ) -> PsychePanelResult {
     #[cfg(feature = "rich-tui")]
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        match config_panel::run(persona_names, backend) {
+        match config_panel::run(
+            persona_names,
+            current_persona,
+            backend,
+            eff_cognition,
+            eff_tenacity,
+        ) {
             Ok(o) => {
                 print_newt(&o.summary, color, verbose);
+                let persona = match o.persona {
+                    config_panel::PersonaAction::Keep => PsychePersonaAction::Keep,
+                    config_panel::PersonaAction::Clear => PsychePersonaAction::Clear,
+                    config_panel::PersonaAction::Switch(n) => PsychePersonaAction::Switch(n),
+                };
                 return PsychePanelResult {
-                    select_persona: o.select_persona,
+                    persona,
                     saved: o.saved,
                 };
             }
@@ -171,7 +196,13 @@ pub(crate) fn run_psyche_panel(
         }
     }
     #[cfg(not(feature = "rich-tui"))]
-    let _ = (persona_names, backend);
+    let _ = (
+        persona_names,
+        current_persona,
+        backend,
+        eff_cognition,
+        eff_tenacity,
+    );
     print_newt(
         "the psyche panel needs an interactive rich terminal — use /psyche for the \
          text view, or /cognition / /tenacity to change the dials.",
