@@ -951,11 +951,14 @@ pub(crate) fn run_chat(
         }
     }
 
-    // P1#3: apply a `--persona`'s declared `tenacity:` as a real resolution layer
-    // at startup too (below any `--tenacity`, above config/family), so the loop
-    // obeys it and the status surfaces agree.
+    // P1#3 / review-2: install a `--persona`'s declared tenacity + cognition as
+    // real resolution layers at startup too (below any `--tenacity` / `--cognition`,
+    // above config/family), so the loop obeys them and status surfaces agree.
     newt_core::tenacity::set_persona_tenacity(
         active_persona.as_ref().and_then(|p| p.profile.tenacity),
+    );
+    newt_core::cognition::set_persona_cognition(
+        active_persona.as_ref().and_then(|p| p.profile.cognition),
     );
 
     // Persona backend auto-route (startup): if `--persona` named a persona that
@@ -4175,13 +4178,11 @@ pub(crate) fn run_chat(
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());
-                    // Psyche: resolve the turn's cognition → `reasoning.effort`
-                    // (via ChatCtx.cognition). Precedence: a live `/cognition`
-                    // session override wins; else the active persona's `cognition:`;
-                    // else `None` (no wire field — request unchanged for non-opt-in).
-                    let cognition = newt_core::cognition::resolve_cognition(
-                        active_persona.as_ref().and_then(|p| p.profile.cognition),
-                    );
+                    // Psyche: the turn's cognition → `reasoning.effort` (via
+                    // ChatCtx.cognition). Effective precedence: a live `/cognition`
+                    // override wins; else the active persona's declared cognition
+                    // (installed as PERSONA_COGNITION on activation); else `None`.
+                    let cognition = newt_core::cognition::effective_cognition();
                     // P2#4: cognition rides the Responses wire only. If it is set
                     // but the active backend is Chat-Completions / Ollama, say so
                     // ONCE — never silently accept-and-ignore a dial.

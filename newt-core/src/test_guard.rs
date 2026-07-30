@@ -17,15 +17,27 @@
 //! Exposed (not `#[cfg(test)]`) so tests in dependent crates (`newt-tui`) share
 //! the SAME lock — a module-local mutex cannot serialize tests in other crates.
 
-use crate::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
-use crate::tenacity::{clear_cli_tenacity, cli_tenacity, set_cli_tenacity, Tenacity};
+use crate::cognition::{
+    cli_cognition, persona_cognition, set_cli_cognition, set_persona_cognition, CognitionOverride,
+};
+use crate::role_profile::Cognition;
+use crate::tenacity::{
+    clear_cli_tenacity, cli_tenacity, persona_tenacity, set_cli_tenacity, set_persona_tenacity,
+    Tenacity,
+};
 use std::sync::{Mutex, MutexGuard};
 
 /// The one lock that serializes every test touching the operator globals.
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
 /// The env vars the psyche + backend-routing paths read (and tests mutate).
-const ENV_KEYS: &[&str] = &["NEWT_TEAM", "NEWT_PROVIDER", "NEWT_DGX_MODEL"];
+/// `NEWT_OPENAI_API` gates the cognition wire scope, so it belongs here too.
+const ENV_KEYS: &[&str] = &[
+    "NEWT_TEAM",
+    "NEWT_PROVIDER",
+    "NEWT_DGX_MODEL",
+    "NEWT_OPENAI_API",
+];
 
 /// Exclusive access to the process-global operator settings for the duration of a
 /// test. Snapshots cognition + tenacity + the relevant env on `acquire`, restores
@@ -36,7 +48,9 @@ pub struct GlobalSettingsGuard {
     // that panicked mid-mutation shouldn't wedge the whole suite).
     _lock: MutexGuard<'static, ()>,
     cognition: CognitionOverride,
+    persona_cognition: Option<Cognition>,
     tenacity: Option<Tenacity>,
+    persona_tenacity: Option<Tenacity>,
     env: Vec<(&'static str, Option<String>)>,
 }
 
@@ -52,7 +66,9 @@ impl GlobalSettingsGuard {
         Self {
             _lock: lock,
             cognition: cli_cognition(),
+            persona_cognition: persona_cognition(),
             tenacity: cli_tenacity(),
+            persona_tenacity: persona_tenacity(),
             env,
         }
     }
@@ -61,6 +77,8 @@ impl GlobalSettingsGuard {
 impl Drop for GlobalSettingsGuard {
     fn drop(&mut self) {
         set_cli_cognition(self.cognition);
+        set_persona_cognition(self.persona_cognition);
+        set_persona_tenacity(self.persona_tenacity);
         match self.tenacity {
             Some(t) => set_cli_tenacity(t),
             None => clear_cli_tenacity(),
