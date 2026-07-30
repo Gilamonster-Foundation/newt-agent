@@ -158,6 +158,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
     pub tenacity: Option<newt_core::Tenacity>,
 
+    /// Cognition (#psyche): how much reasoning to spend per call —
+    /// `glancing` | `pondering` | `deliberating` | `contemplating`, mapping to the
+    /// OpenAI `reasoning.effort` wire field (minimal … high) on the Responses API.
+    /// A session-wide override that beats a persona's `cognition:`; applies to the
+    /// interactive TUI AND the headless `solve` / worker path. Unset ⇒ no
+    /// `reasoning.effort` is sent (unless a persona sets one).
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_cognition)]
+    pub cognition: Option<newt_core::role_profile::Cognition>,
+
     /// Obsessive (#psyche): the max-everything posture — newt's "ultra". A named
     /// launch act that moves three orthogonal dials at once: cognition to
     /// `contemplating` (deepest reasoning.effort), tenacity to `relentless` (most
@@ -434,6 +443,10 @@ fn parse_tier(s: &str) -> Result<newt_core::Tier, String> {
 }
 
 fn parse_tenacity(s: &str) -> Result<newt_core::Tenacity, String> {
+    s.parse()
+}
+
+fn parse_cognition(s: &str) -> Result<newt_core::role_profile::Cognition, String> {
     s.parse()
 }
 
@@ -961,6 +974,16 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // agentic loop reads when it builds each turn's WorkflowRuntimeState.
     if let Some(level) = cli.tenacity {
         newt_core::tenacity::set_cli_tenacity(level);
+    }
+
+    // CLI `--cognition`: install the session cognition override (→ the
+    // `reasoning.effort` wire field), read by both the TUI's `resolve_cognition`
+    // and the headless driver. Applied AFTER `--obsessive` so an explicit
+    // `--cognition` supersedes the macro's contemplating.
+    if let Some(level) = cli.cognition {
+        newt_core::cognition::set_cli_cognition(newt_core::cognition::CognitionOverride::Set(
+            level,
+        ));
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {

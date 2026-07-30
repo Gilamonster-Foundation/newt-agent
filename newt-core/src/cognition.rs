@@ -110,4 +110,26 @@ mod tests {
         );
         set_cli_cognition(CognitionOverride::Unset); // restore
     }
+
+    #[test]
+    fn override_reaches_the_headless_path_with_no_persona() {
+        // The headless driver (solve / worker) has no persona, so it resolves
+        // `resolve_cognition(None)`. A `--cognition` / `--obsessive` override
+        // installed via `set_cli_cognition` must therefore reach the wire headless
+        // (default `Unset` → `None`, unchanged).
+        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        set_cli_cognition(CognitionOverride::Unset);
+        assert_eq!(
+            resolve_cognition(None),
+            None,
+            "no override ⇒ no effort headless"
+        );
+        set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+        assert_eq!(
+            resolve_cognition(None),
+            Some(Cognition::Contemplating),
+            "--cognition must reach the persona-less headless driver"
+        );
+        set_cli_cognition(CognitionOverride::Unset); // restore
+    }
 }
