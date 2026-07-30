@@ -4064,9 +4064,46 @@ pub(crate) fn apply_persona_backend(
     url_changed
 }
 
+/// Whether `slash_body` is an operator command that explicitly sets the session
+/// backend (`/backends`, `/model`, `/backend`) — so a later `/persona clear`
+/// reverts to it, not the startup backend (review P1#2). A persona's own routing
+/// is a separate path that never updates this operator baseline.
+pub(crate) fn is_operator_backend_command(slash_body: &str) -> bool {
+    matches!(
+        slash_body.split_whitespace().next().unwrap_or(""),
+        "backends" | "model" | "backend"
+    )
+}
+
 #[cfg(test)]
 mod persona_backend_tests {
     use super::*;
+
+    #[test]
+    fn operator_backend_commands_update_the_baseline_but_persona_paths_do_not() {
+        for cmd in [
+            "backends sol",
+            "backends",
+            "model gpt-5.6-sol",
+            "backend openai",
+        ] {
+            assert!(is_operator_backend_command(cmd), "operator cmd: {cmd:?}");
+        }
+        // Persona / non-backend commands must NOT be treated as an operator
+        // backend choice (so persona routing can't pollute the revert baseline).
+        for cmd in [
+            "persona set bob",
+            "psyche edit",
+            "tenacity relentless",
+            "vi",
+            "",
+        ] {
+            assert!(
+                !is_operator_backend_command(cmd),
+                "non-operator cmd: {cmd:?}"
+            );
+        }
+    }
 
     #[test]
     fn persona_provider_env_maps_backend_and_optional_model() {
