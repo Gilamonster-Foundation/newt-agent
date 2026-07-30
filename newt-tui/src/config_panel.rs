@@ -13,7 +13,7 @@
 //! NOT yet reuse newt's shared vi/emacs editor core (`rich_input` / `vi`). That
 //! is deliberate for this first cut; unifying the two onto a shared
 //! semantic-command layer (arrow + vi `hjkl`/`gg`/`G` + emacs `C-p/n/b/f`) is
-//! tracked as a follow-up. Until then this panel is an **interim overlay**.
+//! tracked as #1495. Until then this panel is an **interim overlay**.
 //!
 //! ## Provenance discipline (review P1#1 / review-2 #1, #2)
 //! Dials are seeded from the LIVE override + the EFFECTIVE resolved value, and a
