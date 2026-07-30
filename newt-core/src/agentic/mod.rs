@@ -5932,15 +5932,22 @@ fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// Extract `(assistant_text, function_call_items)` from a Responses reply's
-/// `output[]`: text is the concatenation of `output_text` parts inside
-/// `message` items; `function_call` items are returned verbatim (they carry
-/// `call_id` / `name` / `arguments` and are echoed back into the next request).
-/// Falls back to a flattened top-level `output_text` if the structured walk
-/// found no text.
-fn parse_responses_output(json: &serde_json::Value) -> (String, Vec<serde_json::Value>) {
+/// Extract `(assistant_text, function_call_items, echo_items)` from a Responses
+/// reply's `output[]`. `text` is the concatenation of `output_text` parts inside
+/// `message` items. `function_call_items` are the calls the loop executes.
+/// `echo_items` is the ordered subsequence of `reasoning` AND `function_call`
+/// items that must be echoed VERBATIM into the next request's `input`: a
+/// reasoning model (gpt-5.6-sol, gpt-5-codex) pairs each `function_call` with a
+/// preceding `reasoning` item (`rs_…`) and 400s ("function_call … without its
+/// required 'reasoning' item") if the call is sent back without it. Preserving
+/// original order keeps each reasoning item adjacent to its call. Falls back to a
+/// flattened top-level `output_text` if the structured walk found no text.
+fn parse_responses_output(
+    json: &serde_json::Value,
+) -> (String, Vec<serde_json::Value>, Vec<serde_json::Value>) {
     let mut text = String::new();
     let mut calls = Vec::new();
+    let mut echo = Vec::new();
     if let Some(items) = json["output"].as_array() {
         for item in items {
             match item["type"].as_str() {
@@ -5953,7 +5960,14 @@ fn parse_responses_output(json: &serde_json::Value) -> (String, Vec<serde_json::
                         }
                     }
                 }
-                Some("function_call") => calls.push(item.clone()),
+                Some("function_call") => {
+                    calls.push(item.clone());
+                    echo.push(item.clone());
+                }
+                // Reasoning items (`rs_…`) carry the chain that produced the
+                // following function_call; the Responses API requires them echoed
+                // back alongside the call, so preserve them in output order.
+                Some("reasoning") => echo.push(item.clone()),
                 _ => {}
             }
         }
@@ -5963,7 +5977,7 @@ fn parse_responses_output(json: &serde_json::Value) -> (String, Vec<serde_json::
             text.push_str(t);
         }
     }
-    (text, calls)
+    (text, calls, echo)
 }
 
 /// Responses API usage → `TokenUsage` (`input_tokens`/`output_tokens`, distinct
@@ -6282,7 +6296,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 
         let round_usage = responses_usage(&json["usage"]);
         accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
-        let (text, calls) = parse_responses_output(&json);
+        let (text, calls, echo) = parse_responses_output(&json);
 
         if debug {
             let excerpt: String = text.chars().take(80).collect();
@@ -6304,10 +6318,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             return Ok((out, false, accumulated_usage, hallucination_count));
         }
 
-        // Echo the model's function_call items back into the running input,
-        // then run each and append its function_call_output.
-        for call in &calls {
-            input.push(call.clone());
+        // Echo the model's reasoning + function_call items back into the running
+        // input (in output order, so each call keeps its required reasoning item),
+        // then run each call and append its function_call_output.
+        for item in &echo {
+            input.push(item.clone());
         }
         for call in &calls {
             let call_id = call["call_id"]
@@ -6492,7 +6507,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     }
     let json: serde_json::Value = resp.json().await?;
     accumulated_usage = merge_round_usage(accumulated_usage, responses_usage(&json["usage"]));
-    let (text, _) = parse_responses_output(&json);
+    let (text, _, _) = parse_responses_output(&json);
     Ok((text, false, accumulated_usage, hallucination_count))
 }
 
@@ -8483,10 +8498,17 @@ mod tool_round_cap_tests {
             ],
             "usage": {"input_tokens": 100, "output_tokens": 20}
         });
-        let (text, calls) = parse_responses_output(&json);
+        let (text, calls, echo) = parse_responses_output(&json);
         assert_eq!(text, "the answer");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["call_id"], "call_1");
+        // The echo re-sends the reasoning item AND the function_call in output
+        // order, so a reasoning model (gpt-5.6-sol) does not 400 on the follow-up
+        // turn for a function_call missing its required reasoning item.
+        assert_eq!(echo.len(), 2, "reasoning + function_call are echoed");
+        assert_eq!(echo[0]["type"], "reasoning");
+        assert_eq!(echo[1]["type"], "function_call");
+        assert_eq!(echo[1]["call_id"], "call_1");
         let usage = responses_usage(&json["usage"]).unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 20);
