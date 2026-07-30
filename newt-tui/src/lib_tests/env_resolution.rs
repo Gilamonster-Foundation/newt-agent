@@ -492,9 +492,9 @@ fn slash_backends_list_and_switch_keep_session_alive() {
     let _ = cfg; // dispatch_slash re-resolves real config; this just documents intent.
                  // Listing returns true (session continues) regardless of configured set.
     with_env_vars(&[], &["NEWT_PROVIDER", "NEWT_DGX_MODEL"], || {
-        assert!(dispatch_slash("/backends", "/ws", false, false).unwrap());
+        assert!(dispatch_slash("/backends", "/ws", false, false, false).unwrap());
         // An unknown name reports the miss but still keeps the session alive.
-        assert!(dispatch_slash("/backends nope-xyz", "/ws", false, false).unwrap());
+        assert!(dispatch_slash("/backends nope-xyz", "/ws", false, false, false).unwrap());
     });
 }
 
@@ -509,8 +509,8 @@ fn slash_crew_usage_and_unknown_keep_session_alive() {
     // (`/crew edit` is exercised by crew_form's own tests — invoking it here
     // would read real stdin and write to ~/.newt, so it's deliberately not
     // dispatched in a unit test.)
-    assert!(dispatch_slash("/crew", "/ws", false, false).unwrap());
-    assert!(dispatch_slash("/crew bogus", "/ws", false, false).unwrap());
+    assert!(dispatch_slash("/crew", "/ws", false, false, false).unwrap());
+    assert!(dispatch_slash("/crew bogus", "/ws", false, false, false).unwrap());
 }
 
 #[test]
