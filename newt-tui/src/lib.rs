@@ -9470,7 +9470,9 @@ exit_plan_mode require a concrete edit. This session-scoped override wins over
   /cognition auto        follow the active persona's cognition (default)
 
 The level maps to the OpenAI reasoning.effort wire field (glancing=minimal …
-contemplating=high) on the Responses API. This session override beats the
+contemplating=high) on the Responses API. It applies to Responses backends only
+— a Chat-Completions backend does not send reasoning_effort (model-specific
+there), so cognition is ignored on that path. This session override beats the
 active persona's cognition; a persona sets its own default via `cognition:`."
         }
         "psyche" => {

@@ -597,9 +597,12 @@ pub struct ChatCtx<'a> {
     /// / driver / eval callers pass `None` (no persona surface).
     pub persona_tools: Option<&'a [String]>,
     /// The psyche **cognition** dial for this turn — how much reasoning effort to
-    /// request. `Some(level)` emits `reasoning.effort` (Responses) / `reasoning_effort`
-    /// (Chat) on the wire via [`Cognition::reasoning_effort`]; `None` omits the field
-    /// entirely (bit-for-bit unchanged for callers that don't opt in). The TUI
+    /// request. `Some(level)` emits the OpenAI **Responses** `reasoning.effort`
+    /// field (via [`Cognition::reasoning_effort`]); `None` omits it (bit-for-bit
+    /// unchanged for callers that don't opt in). SCOPE: cognition applies to
+    /// Responses backends only — the Chat-Completions path does NOT send
+    /// `reasoning_effort` (it is model-specific there and rejected by
+    /// non-reasoning models), so this field is ignored on that path. The TUI
     /// resolves it from the active persona's `cognition:` front-matter alongside
     /// `persona_tools`; headless / eval callers pass `None`.
     pub cognition: Option<crate::role_profile::Cognition>,
@@ -1174,10 +1177,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
-        // Psyche cognition: the chat-shape `reasoning_effort` emit is a follow-up
-        // (the chat request has ~7 body-literal sites that must be consolidated to
-        // one owner first — see `responses_reasoning_field`, the Responses emit).
-        // Bound `_` so the field is explicitly accounted for, never silently lost.
+        // Psyche cognition is SCOPED to Responses backends: it maps to
+        // `reasoning.effort`, sent only on the Responses wire (responses_reasoning_field).
+        // The Chat-Completions path deliberately does NOT send `reasoning_effort` — it
+        // is model-specific there and rejected by non-reasoning models — so cognition
+        // is ignored on this path. Bound `_` to make that explicit.
         cognition: _,
         max_tool_rounds,
         workflow_grace_rounds,
@@ -4619,10 +4623,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
-        // Psyche cognition: the chat-shape `reasoning_effort` emit is a follow-up
-        // (the chat request has ~7 body-literal sites that must be consolidated to
-        // one owner first — see `responses_reasoning_field`, the Responses emit).
-        // Bound `_` so the field is explicitly accounted for, never silently lost.
+        // Psyche cognition is SCOPED to Responses backends: it maps to
+        // `reasoning.effort`, sent only on the Responses wire (responses_reasoning_field).
+        // The Chat-Completions path deliberately does NOT send `reasoning_effort` — it
+        // is model-specific there and rejected by non-reasoning models — so cognition
+        // is ignored on this path. Bound `_` to make that explicit.
         cognition: _,
         max_tool_rounds,
         workflow_grace_rounds,

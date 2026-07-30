@@ -596,6 +596,9 @@ pub(crate) fn run_chat(
     // routing never touches it (review P1#2). `None` ⇒ the configured default.
     let mut base_provider = std::env::var("NEWT_PROVIDER").ok();
     let mut base_model = std::env::var("NEWT_DGX_MODEL").ok();
+    // P2#4 visibility: warn ONCE if cognition is set on a backend that ignores it
+    // (Responses-only) so the dial isn't silently dropped.
+    let mut cognition_scope_noted = false;
 
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
@@ -4179,6 +4182,21 @@ pub(crate) fn run_chat(
                     let cognition = newt_core::cognition::resolve_cognition(
                         active_persona.as_ref().and_then(|p| p.profile.cognition),
                     );
+                    // P2#4: cognition rides the Responses wire only. If it is set
+                    // but the active backend is Chat-Completions / Ollama, say so
+                    // ONCE — never silently accept-and-ignore a dial.
+                    if cognition.is_some() && !cognition_scope_noted {
+                        let responses = std::env::var("NEWT_OPENAI_API")
+                            .is_ok_and(|v| v.eq_ignore_ascii_case("responses"));
+                        if !responses {
+                            print_newt(
+                                "note: cognition (reasoning.effort) applies to Responses backends only — the active backend ignores it.",
+                                color,
+                                verbose,
+                            );
+                            cognition_scope_noted = true;
+                        }
+                    }
                     // The active posture's optional clamp is threaded to the
                     // gate (re-clamps any session grant). A skill/framing-only
                     // compatibility binding is genuinely `None` here.
