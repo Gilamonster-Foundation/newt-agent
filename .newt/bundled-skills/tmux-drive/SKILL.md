@@ -199,12 +199,17 @@ t = Tui([r"C:\path\to\newt.exe", "-n", "--no-splash"],
         env={"NEWT_NO_MODEL_PULL": "1"})
 t.wait(r"❯|ready")            # poll for the live prompt (never fixed-sleep)
 t.send("/persona switch bob") # types text + Enter
-t.wait(r"persona .bob.")
+t.wait(r"persona .bob.")      # RAISES TimeoutError if it never appears (loud)
 t.send("/persona")            # show status
 t.wait(r"role: researcher")
 print(t.screen())             # ANSI-stripped screen for asserts
 t.quit("/quit")
 ```
+
+`wait()` **raises `TimeoutError` on timeout by default** — a driver must never
+silently sail past a missing expectation and then assert on stale screen bytes.
+For a genuinely optional/branching match, use `try_wait()` (or
+`wait(..., raise_on_timeout=False)`), which returns a bool instead.
 
 **Two Windows gotchas the helper handles / you must know:**
 
