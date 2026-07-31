@@ -31,6 +31,30 @@ fn binary_help_surfaces_start_on_the_guarded_cli_stack() {
         .stdout(predicate::str::contains("--config-dir"));
 }
 
+/// Regression for #1513 (the #1491 re-scope): the `newt bench` subcommand was
+/// removed — matrix orchestration lives in the `scripts/eval/` tooling, not the
+/// CLI surface. `bench` must parse as an unrecognized subcommand and must not
+/// appear in the top-level help. Fully mocked / no backend — PR tier.
+#[test]
+fn bench_subcommand_is_removed() {
+    Command::cargo_bin("newt")
+        .unwrap()
+        .args(["bench"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
+
+    // The subcommand catalog lists each command name on its own indented line;
+    // no such line may be `bench`. (The word "benchmark" legitimately appears
+    // in `solve`'s description — the lane the eval tooling drives.)
+    Command::cargo_bin("newt")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r"(?m)^\s+bench\b").unwrap().not());
+}
+
 /// `newt help` renders the interactive command catalog WITHOUT starting a
 /// session or connecting to a backend. This is the property that lets
 /// `scripts/eval/grade-548.sh` run on a hosted CI runner (no live Ollama): the
