@@ -3831,6 +3831,45 @@ impl Config {
         Self::user_config_dir().map(|dir| dir.join("config.toml"))
     }
 
+    /// The shared config-based backend-selection precedence (#1320, PR-3) — the
+    /// single definition used by chat's `resolve_backend_choice` config rungs, by
+    /// `solve`, and by the ACP worker, so every entry point agrees on which
+    /// configured backend the operator named. Most-specific first: `$NEWT_PROVIDER`
+    /// names a backend > `default_backend` (usable) > a sole backend > prefer an
+    /// OpenAI-kind entry, else the first endpoint-bearing one. `None` only when no
+    /// backend has an endpoint. Env-synthesized fallbacks (codex, legacy dgx,
+    /// localhost) stay in chat's `resolve_backend_choice`, layered around this.
+    #[must_use]
+    pub fn select_configured_backend(&self) -> Option<&BackendConfig> {
+        // 1. Operator / live override: $NEWT_PROVIDER names a backend.
+        if let Ok(name) = std::env::var("NEWT_PROVIDER") {
+            if !name.is_empty() {
+                if let Some(b) = self.backends.iter().find(|b| b.name == name) {
+                    return Some(b);
+                }
+            }
+        }
+        // 2. The configured default (usable — skip an endpointless one).
+        if let Some(name) = &self.default_backend {
+            if let Some(b) = self
+                .backends
+                .iter()
+                .find(|b| b.name == *name && !b.endpoint.is_empty())
+            {
+                return Some(b);
+            }
+        }
+        // 3. A sole backend is the obvious choice.
+        if self.backends.len() == 1 {
+            return self.backends.first().filter(|b| !b.endpoint.is_empty());
+        }
+        // 4. Prefer an OpenAI-kind entry, else the first endpoint-bearing one.
+        self.backends
+            .iter()
+            .find(|b| b.kind == Some(BackendKind::Openai) && !b.endpoint.is_empty())
+            .or_else(|| self.backends.iter().find(|b| !b.endpoint.is_empty()))
+    }
+
     /// Serialize the config to pretty TOML for **audit**, with inline secret
     /// material redacted. Every `[[mcp_servers]]` `env` / `headers` **literal**
     /// value is replaced with [`Self::REDACTED`] — a literal is the only place
