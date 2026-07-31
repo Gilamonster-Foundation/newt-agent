@@ -135,9 +135,17 @@ fn select_openai_backend(
     if ollama_override {
         return None;
     }
-    cfg.backends
-        .iter()
-        .find(|b| b.kind == Some(newt_core::BackendKind::Openai))
+    // #1320 (PR-3): honor the shared config precedence (NEWT_PROVIDER /
+    // default_backend / …) so the worker agrees with chat + solve — but the
+    // worker's vLLM path needs an OpenAI-kind backend, so use the precedence pick
+    // only when it IS OpenAI; otherwise fall back to the first OpenAI entry.
+    match cfg.select_configured_backend() {
+        Some(b) if b.kind == Some(newt_core::BackendKind::Openai) => Some(b),
+        _ => cfg
+            .backends
+            .iter()
+            .find(|b| b.kind == Some(newt_core::BackendKind::Openai)),
+    }
 }
 
 fn select_provider_config(

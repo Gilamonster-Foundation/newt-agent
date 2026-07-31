@@ -411,31 +411,11 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     Ok(if clean { 0 } else { 1 })
 }
 
-/// Pick the backend to drive: `NEWT_PROVIDER` by name if set and present, else
-/// the first configured backend that has an endpoint.
+/// Pick the backend to drive. Delegates to the **shared** config precedence
+/// (#1320, PR-3) so `solve` selects exactly as chat + the worker do:
+/// `NEWT_PROVIDER` > `default_backend` > sole > prefer-OpenAI, else first usable.
 fn pick_backend(cfg: &Config) -> Option<&newt_core::config::BackendConfig> {
-    // 1) Operator / live override: `NEWT_PROVIDER` names a backend.
-    if let Ok(name) = std::env::var("NEWT_PROVIDER") {
-        if let Some(b) = cfg.backends.iter().find(|b| b.name == name) {
-            return Some(b);
-        }
-    }
-    // 2) #1320: honor the config's `default_backend` — the same rung chat's
-    //    `resolve_backend_choice` uses — so `newt --config X solve` routes to X's
-    //    declared default, not merely the first endpoint-bearing entry. Without
-    //    this, solve matched chat only by the coincidence of file layout (sol being
-    //    listed first). Skip an unusable (endpointless) default and fall through.
-    if let Some(name) = &cfg.default_backend {
-        if let Some(b) = cfg
-            .backends
-            .iter()
-            .find(|b| b.name == *name && !b.endpoint.is_empty())
-        {
-            return Some(b);
-        }
-    }
-    // 3) Fallback: the first usable (endpoint-bearing) backend.
-    cfg.backends.iter().find(|b| !b.endpoint.is_empty())
+    cfg.select_configured_backend()
 }
 
 /// The workspace-fenced authority for the OCAP-ON bench lane.
