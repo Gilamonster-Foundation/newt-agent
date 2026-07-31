@@ -934,7 +934,9 @@ mod tests {
         let TurnStatus::Completed(o) = status else {
             panic!("expected Completed-with-error, got {status:?}");
         };
-        let err = o.error.expect("the failed dispatch is carried on the outcome");
+        let err = o
+            .error
+            .expect("the failed dispatch is carried on the outcome");
         assert!(err.contains("Ollama 404"), "historical wording kept: {err}");
         assert_eq!(o.error_class, Some(ErrorClass::Model));
     }
