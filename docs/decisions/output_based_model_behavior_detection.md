@@ -1,6 +1,6 @@
 # Output-based model-behavior detection and adaptation
 
-**Status:** PROPOSED (design-first — no implementation until this ADR is agreed). Epic: #1506.
+**Status:** ACCEPTED (operator-approved 2026-07-31). Epic: #1506 — gates the 0.7.6 release.
 **Drivers:** the 0.7.6 bench cycle's quarantines, #1500, and the operator ruling:
 *"Rather than trusting a configuration I'd like the system to auto detect the
 model's behavior NOT by name but by outputs — and to adjust to switching models
