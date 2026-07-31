@@ -247,25 +247,31 @@ def render_table(records: list[dict], roster: list[dict] | None = None) -> str:
         "_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a "
         "monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do "
         "not edit by hand._\n\n"
-        "| Model | Family | OCAP off | OCAP on | Parity Δ | Suite | Window | Version | Date |\n"
-        "|-------|--------|----------|---------|----------|-------|--------|---------|------|\n"
+        "| Model | OCAP off | OCAP on |\n"
+        "|-------|----------|---------|\n"
     )
     if not families:
-        return header + "| _(no runs recorded yet)_ | | | | | | | | |\n"
+        return header + "| _(no runs recorded yet)_ | | |\n"
     body = ""
     for m in sorted(families, key=sort_key):
         off, on = champs.get((m, "off")), champs.get((m, "on"))
-        p = parity(records, m)
         # Prefer the OCAP-on run's metadata for the row (the 0.7.6 focus); fall
         # back to OCAP-off, then to nothing.
         meta = on or off or {}
+        # Metadata folds onto a second line under the model name; parity Δ is
+        # dropped (it is just on − off), leaving three columns instead of nine.
+        if meta:
+            sub = (
+                f"{families[m]} · {meta.get('suite', 'tb-30')} · "
+                f"ctx {meta.get('window', '—')} · v{meta.get('version', '—')} · "
+                f"{meta.get('date', '—')}"
+            )
+        else:
+            sub = f"{families[m]} · queued"
         body += (
-            f"| `{m}` | {families[m]} | "
+            f"| `{m}`<br><sub>{sub}</sub> | "
             f"{_lane_cell(off, pending=on is not None)} | "
-            f"{_lane_cell(on, pending=off is not None)} | "
-            f"{_pp(p['delta'])} | "
-            f"{meta.get('suite', 'tb-30')} | {meta.get('window', '—')} | "
-            f"{meta.get('version', '—')} | {meta.get('date', '—')} |\n"
+            f"{_lane_cell(on, pending=off is not None)} |\n"
         )
     return header + body
 
@@ -508,7 +514,6 @@ def _self_test() -> int:
     table = render_table(recs)
     assert "glm" in table and "qwen" in table
     assert table.index("glm") < table.index("qwen"), "higher off-score first"
-    assert "0.0 pp" in table, table  # qwen parity delta
     assert "_pending_" in table, "glm on-lane owed"
     qrow = [ln for ln in table.splitlines() if "`qwen`" in ln][0]
     assert qrow.count("13.0%") == 2, f"both qwen lanes at 13%: {qrow}"
@@ -533,8 +538,10 @@ def _self_test() -> int:
         {"model": "nemotron", "family": "nemotron"},  # unmeasured → queued row
     ]
     rt = render_table(recs, roster)
-    assert rt.count("| `qwen` |") == 1, "measured roster model must not duplicate"
-    assert "`nemotron` | nemotron | _queued_ | _queued_" in rt, rt
+    assert rt.count("`qwen`<br>") == 1, "measured roster model must not duplicate"
+    assert (
+        "`nemotron`<br><sub>nemotron · queued</sub> | _queued_ | _queued_" in rt
+    ), rt
     # roster-only (no runs at all) still renders rows, not the empty placeholder.
     only = render_table([], [{"model": "m1", "family": "f"}])
     assert "_queued_" in only and "no runs recorded" not in only

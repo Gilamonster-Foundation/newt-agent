@@ -115,26 +115,26 @@ honest — see
 <!-- BENCH-SCOREBOARD:START -->
 _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do not edit by hand._
 
-| Model | Family | OCAP off | OCAP on | Parity Δ | Suite | Window | Version | Date |
-|-------|--------|----------|---------|----------|-------|--------|---------|------|
-| `ornith-1.0-35b-q8` | ornith | _pending_ | 36.7% (11/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
-| `qwen3.6_35b` | qwen | 20.0% (6/30) | 26.7% (8/30) | +6.7 pp | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
-| `o4-mini` | openai | _pending_ | 13.3% (4/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
-| `qwen3-coder_30b` | qwen | 10.0% (3/30) | 13.3% (4/30) | +3.3 pp | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
-| `kimi-linear_48b` | kimi | _pending_ | 10.0% (3/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-31 |
-| `nemotron-3-nano_30b` | nemotron | 6.7% (2/30) | _pending_ | — | tb-30 | 65536 | 0.7.5 | 2026-07-29 |
-| `glm-4.7-flash` | glm | _pending_ | 3.3% (1/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-31 |
-| `gpt-4.1-mini` | openai | _pending_ | 3.3% (1/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
-| `deepseek-coder-v2_16b` | deepseek | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `deepseek-r1_32b` | deepseek | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `gemma4_31b` | gemma | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `kimi-dev_72b` | kimi | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `nemotron-3-super_120b` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `nemotron-mini_4b` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `nemotron_70b-instruct-q8_0` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `ornith-1.0-397b-iq1_m` | ornith | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `qwen2.5-coder_32b` | qwen | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `qwen3-coder-next_latest` | qwen | _queued_ | _queued_ | — | tb-30 | — | — | — |
+| Model | OCAP off | OCAP on |
+|-------|----------|---------|
+| `ornith-1.0-35b-q8`<br><sub>ornith · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | _pending_ | 36.7% (11/30) |
+| `qwen3.6_35b`<br><sub>qwen · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | 20.0% (6/30) | 26.7% (8/30) |
+| `o4-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | _pending_ | 13.3% (4/30) |
+| `qwen3-coder_30b`<br><sub>qwen · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | 10.0% (3/30) | 13.3% (4/30) |
+| `kimi-linear_48b`<br><sub>kimi · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 10.0% (3/30) |
+| `nemotron-3-nano_30b`<br><sub>nemotron · tb-30 · ctx 65536 · v0.7.5 · 2026-07-29</sub> | 6.7% (2/30) | _pending_ |
+| `glm-4.7-flash`<br><sub>glm · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 3.3% (1/30) |
+| `gpt-4.1-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | _pending_ | 3.3% (1/30) |
+| `deepseek-coder-v2_16b`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
+| `deepseek-r1_32b`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
+| `gemma4_31b`<br><sub>gemma · queued</sub> | _queued_ | _queued_ |
+| `kimi-dev_72b`<br><sub>kimi · queued</sub> | _queued_ | _queued_ |
+| `nemotron-3-super_120b`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
+| `nemotron-mini_4b`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
+| `nemotron_70b-instruct-q8_0`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
+| `ornith-1.0-397b-iq1_m`<br><sub>ornith · queued</sub> | _queued_ | _queued_ |
+| `qwen2.5-coder_32b`<br><sub>qwen · queued</sub> | _queued_ | _queued_ |
+| `qwen3-coder-next_latest`<br><sub>qwen · queued</sub> | _queued_ | _queued_ |
 
 <!-- BENCH-SCOREBOARD:END -->
 
