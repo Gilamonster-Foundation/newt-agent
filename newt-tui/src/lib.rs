@@ -3927,6 +3927,12 @@ pub(crate) fn refresh_backend(
     *inf_key = choice.api_key.clone();
     *inf_context_window = choice.context_window;
     apply_openai_api_env(choice.api);
+    // #1139: this is the ONE seam every mid-session model change flows through —
+    // `/backends`, `/model`, and persona routing (`apply_persona_backend`) all land
+    // here — so re-attribute the model's family in one place. Per-family `[tenacity]`
+    // defaults then track a live backend/persona switch, instead of going stale on
+    // the model the session happened to start with.
+    newt_core::tenacity::attribute_active_family(cfg.tenacity.as_ref(), inf_model.as_str());
     *inf_url != prev_url
 }
 
