@@ -3255,7 +3255,7 @@ pub fn writeback_probed_backend(
     merged.provenance = Some(BackendProvenance {
         source: Some(format!(
             "newt adopt v{} (probed; delete this file to reset)",
-            env!("CARGO_PKG_VERSION")
+            crate::build_info::VERSION_WITH_COMMIT
         )),
         probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
         derived_serving: patch

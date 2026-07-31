@@ -81,7 +81,7 @@ pub(crate) fn offer_interactive(color: bool, budget: Duration) -> anyhow::Result
     println!();
     println!(
         "{dim}newt v{} — no configuration yet.{reset}",
-        env!("CARGO_PKG_VERSION")
+        crate::VERSION
     );
 
     if crossterm::terminal::enable_raw_mode().is_err() {
@@ -142,10 +142,7 @@ fn run_setup(color: bool, config_path: &std::path::Path) -> anyhow::Result<()> {
     let reset = if color { "\x1b[0m" } else { "" };
 
     println!();
-    println!(
-        "{accent}newt v{} — first-run setup{reset}",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("{accent}newt v{} — first-run setup{reset}", crate::VERSION);
     println!("{dim}Probing common Ollama endpoints…{reset}");
 
     let candidates = probe_candidates();
@@ -196,7 +193,7 @@ fn save_config(path: &std::path::Path, url: &str, model: &str) -> anyhow::Result
         kind: Some(newt_core::BackendKind::Ollama),
         serving: Some(newt_core::Serving::Multiplexer),
         provenance: Some(newt_core::config::BackendProvenance {
-            source: Some(format!("newt init v{}", env!("CARGO_PKG_VERSION"))),
+            source: Some(format!("newt init v{}", crate::VERSION)),
             probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
             derived_serving: Some(true),
         }),

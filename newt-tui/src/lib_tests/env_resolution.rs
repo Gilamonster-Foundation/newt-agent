@@ -792,8 +792,8 @@ fn prompt_str_expands_newt_prompt_template() {
     // it, and the model/rich args don't interfere with an explicit template.
     with_env_vars(&[("NEWT_PROMPT", "\\w \\M \\v> ")], &[], || {
         let vi = prompt_str("/tmp/proj", true, "gpt-4.1", true);
-        assert_eq!(vi, format!("proj vi {}> ", env!("CARGO_PKG_VERSION")));
+        assert_eq!(vi, format!("proj vi {VERSION}> "));
         let em = prompt_str("/tmp/proj", false, "gpt-4.1", false);
-        assert_eq!(em, format!("proj emacs {}> ", env!("CARGO_PKG_VERSION")));
+        assert_eq!(em, format!("proj emacs {VERSION}> "));
     });
 }
