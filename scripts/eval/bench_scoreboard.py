@@ -247,20 +247,19 @@ def render_table(records: list[dict], roster: list[dict] | None = None) -> str:
         "_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a "
         "monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do "
         "not edit by hand._\n\n"
-        "| Model | OCAP off | OCAP on | Parity Δ |\n"
-        "|-------|----------|---------|----------|\n"
+        "| Model | OCAP off | OCAP on |\n"
+        "|-------|----------|---------|\n"
     )
     if not families:
-        return header + "| _(no runs recorded yet)_ | | | |\n"
+        return header + "| _(no runs recorded yet)_ | | |\n"
     body = ""
     for m in sorted(families, key=sort_key):
         off, on = champs.get((m, "off")), champs.get((m, "on"))
-        p = parity(records, m)
         # Prefer the OCAP-on run's metadata for the row (the 0.7.6 focus); fall
         # back to OCAP-off, then to nothing.
         meta = on or off or {}
-        # Metadata folds onto a second line under the model name, so the table
-        # stays four columns wide instead of nine.
+        # Metadata folds onto a second line under the model name; parity Δ is
+        # dropped (it is just on − off), leaving three columns instead of nine.
         if meta:
             sub = (
                 f"{families[m]} · {meta.get('suite', 'tb-30')} · "
@@ -272,8 +271,7 @@ def render_table(records: list[dict], roster: list[dict] | None = None) -> str:
         body += (
             f"| `{m}`<br><sub>{sub}</sub> | "
             f"{_lane_cell(off, pending=on is not None)} | "
-            f"{_lane_cell(on, pending=off is not None)} | "
-            f"{_pp(p['delta'])} |\n"
+            f"{_lane_cell(on, pending=off is not None)} |\n"
         )
     return header + body
 
@@ -516,7 +514,6 @@ def _self_test() -> int:
     table = render_table(recs)
     assert "glm" in table and "qwen" in table
     assert table.index("glm") < table.index("qwen"), "higher off-score first"
-    assert "0.0 pp" in table, table  # qwen parity delta
     assert "_pending_" in table, "glm on-lane owed"
     qrow = [ln for ln in table.splitlines() if "`qwen`" in ln][0]
     assert qrow.count("13.0%") == 2, f"both qwen lanes at 13%: {qrow}"
