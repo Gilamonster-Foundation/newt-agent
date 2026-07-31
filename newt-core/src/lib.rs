@@ -121,8 +121,9 @@ pub use agentic::{
     SemanticIndex, SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex,
     SessionSpillStore, SessionStepLedger, ShellObservation, SpillStore, Step, StepLedger,
     StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
-    ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
-    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
+    ErrorClass, ParseSignal, SolveObservation, ToolCallDialect, ToolOutputStream, TranscriptLine,
+    TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome,
+    TurnStatus, EXPERIENCE_TOP_K,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::{resolve_surface_budget, ApiSurfaceProvider};

@@ -36,6 +36,10 @@ pub(crate) mod scheduled;
 /// Drive an overseer-authored plan through a `CrewRunner` (#628 P2 execute side).
 pub(crate) mod plan_exec;
 pub(crate) mod spill;
+// W0 (#1511, epic #1506): typed dispatch-error classification + per-round
+// tool-call parse signals — the structural inputs of the observability
+// contract `newt solve` emits for the external evaluator.
+pub(crate) mod observability;
 /// Recover tool calls a weak model emitted in CONTENT instead of the native
 /// `tool_calls` field (the #1 weak-model failure — see the module docs).
 pub(crate) mod tool_recovery;
@@ -171,6 +175,10 @@ pub use experiential::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
+pub use observability::{
+    classify_reqwest, error_class, round_parse_signal, DispatchError, ErrorClass, ParseSignal,
+    SolveObservation, ToolCallDialect,
+};
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
     AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
