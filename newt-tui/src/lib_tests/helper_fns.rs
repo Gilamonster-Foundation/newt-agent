@@ -628,10 +628,7 @@ fn resolve_workspace_none_uses_current_dir() {
 #[test]
 fn expand_prompt_tokens_replaces_all_tokens() {
     let out = expand_prompt_tokens("\\w|\\W|\\v|\\m|\\M", "/tmp/proj", "gpt-4.1", true);
-    assert_eq!(
-        out,
-        format!("proj|/tmp/proj|{}|gpt-4.1|vi", env!("CARGO_PKG_VERSION"))
-    );
+    assert_eq!(out, format!("proj|/tmp/proj|{VERSION}|gpt-4.1|vi"));
     // \h expands to *some* hostname — the token itself must be gone.
     let host = expand_prompt_tokens("on \\h!", "/tmp/proj", "m", false);
     assert!(!host.contains("\\h"), "got: {host}");

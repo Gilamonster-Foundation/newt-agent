@@ -11,6 +11,7 @@ pub mod answer_authz;
 pub mod api_surface;
 pub mod artifact;
 pub mod backend_probe;
+pub mod build_info;
 pub mod caveats;
 pub mod classifiers;
 /// The cognition session dial — the `/cognition` override resolved over a

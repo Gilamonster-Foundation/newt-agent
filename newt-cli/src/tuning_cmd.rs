@@ -222,7 +222,7 @@ fn cmd_show(model: Option<&str>) -> anyhow::Result<()> {
 
 fn cmd_export(output: Option<&std::path::Path>) -> anyhow::Result<()> {
     let caps = load_caps_raw();
-    let version = env!("CARGO_PKG_VERSION");
+    let version = newt_core::build_info::VERSION_WITH_COMMIT;
 
     let mut ct = CommunityTunings::default();
     ct.format.generated_by = Some(format!("newt/{version}"));
