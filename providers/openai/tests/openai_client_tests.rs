@@ -98,3 +98,151 @@ async fn non_success_status_includes_bounded_body_excerpt() {
     assert!(text.contains("429"));
     assert!(text.len() < 700, "error body should be bounded: {text}");
 }
+
+// Regression tests for #1497: the provider had no retry/backoff (a transient
+// 429/5xx or connect hiccup failed the request outright) and a hard-coded
+// 120s timeout. Fully mocked per the unit-tier rules; retry delays are
+// Duration::ZERO so no wall-clock is spent.
+
+use std::time::Duration;
+
+#[tokio::test]
+async fn complete_retries_transient_5xx_then_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "recovered"}}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::new(server.uri(), Some("test-key".to_string()))
+        .with_retries(2, Duration::ZERO);
+    let reply = client.complete(complete_request()).await.unwrap();
+
+    assert_eq!(reply.content, "recovered");
+}
+
+#[tokio::test]
+async fn complete_retries_429_honoring_retry_after_seconds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "after backoff"}}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::new(server.uri(), Some("test-key".to_string()))
+        .with_retries(1, Duration::ZERO);
+    let reply = client.complete(complete_request()).await.unwrap();
+
+    assert_eq!(reply.content, "after backoff");
+}
+
+#[tokio::test]
+async fn complete_does_not_retry_non_transient_4xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::new(server.uri(), Some("test-key".to_string()))
+        .with_retries(2, Duration::ZERO);
+    let err = client.complete(complete_request()).await.unwrap_err();
+
+    assert!(err.to_string().contains("400"));
+}
+
+#[tokio::test]
+async fn complete_gives_up_after_max_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::new(server.uri(), Some("test-key".to_string()))
+        .with_retries(1, Duration::ZERO);
+    let err = client.complete(complete_request()).await.unwrap_err();
+
+    assert!(err.to_string().contains("503"));
+}
+
+#[tokio::test]
+async fn list_models_retries_transient_5xx_then_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(502))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "gpt-test", "object": "model"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::new(server.uri(), Some("test-key".to_string()))
+        .with_retries(1, Duration::ZERO);
+    let models = client.list_models().await.unwrap();
+
+    assert_eq!(models.models, vec!["gpt-test"]);
+}
+
+#[test]
+fn timeout_env_parsing_defaults_and_overrides() {
+    use newt_provider_openai::parse_timeout_secs;
+
+    assert_eq!(parse_timeout_secs(None), Duration::from_secs(120));
+    assert_eq!(
+        parse_timeout_secs(Some("300".to_string())),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        parse_timeout_secs(Some("not-a-number".to_string())),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        parse_timeout_secs(Some("0".to_string())),
+        Duration::from_secs(120)
+    );
+}
+
+#[test]
+fn max_retries_env_parsing_defaults_and_overrides() {
+    use newt_provider_openai::parse_max_retries;
+
+    assert_eq!(parse_max_retries(None), 2);
+    assert_eq!(parse_max_retries(Some("5".to_string())), 5);
+    assert_eq!(parse_max_retries(Some("0".to_string())), 0);
+    assert_eq!(parse_max_retries(Some("nope".to_string())), 2);
+}
