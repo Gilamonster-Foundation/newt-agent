@@ -113,7 +113,7 @@ honest — see
 [docs/findings/dgx-spark-terminal-bench-survey.md](docs/findings/dgx-spark-terminal-bench-survey.md).
 
 <!-- BENCH-SCOREBOARD:START -->
-_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down); the 0.7.6 gate is per-model **parity** — OCAP-on within reach of OCAP-off (Δ ≥ 0). Auto-generated; do not edit by hand._
+_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do not edit by hand._
 
 | Model | Family | OCAP off | OCAP on | Parity Δ | Suite | Window | Version | Date |
 |-------|--------|----------|---------|----------|-------|--------|---------|------|
@@ -121,12 +121,13 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 | `qwen3.6_35b` | qwen | 20.0% (6/30) | 26.7% (8/30) | +6.7 pp | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
 | `o4-mini` | openai | _pending_ | 13.3% (4/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
 | `qwen3-coder_30b` | qwen | 10.0% (3/30) | 13.3% (4/30) | +3.3 pp | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
+| `kimi-linear_48b` | kimi | _pending_ | 10.0% (3/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-31 |
 | `nemotron-3-nano_30b` | nemotron | 6.7% (2/30) | _pending_ | — | tb-30 | 65536 | 0.7.5 | 2026-07-29 |
+| `glm-4.7-flash` | glm | _pending_ | 3.3% (1/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-31 |
 | `gpt-4.1-mini` | openai | _pending_ | 3.3% (1/30) | — | tb-30 | 65536 | 0.7.6 | 2026-07-29 |
 | `deepseek-coder-v2_16b` | deepseek | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `deepseek-r1_32b` | deepseek | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `gemma4_31b` | gemma | _queued_ | _queued_ | — | tb-30 | — | — | — |
-| `glm-4.7-flash` | glm | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `kimi-dev_72b` | kimi | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `nemotron-3-super_120b` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |
 | `nemotron-mini_4b` | nemotron | _queued_ | _queued_ | — | tb-30 | — | — | — |

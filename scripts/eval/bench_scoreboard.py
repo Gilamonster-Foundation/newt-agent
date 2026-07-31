@@ -245,8 +245,7 @@ def render_table(records: list[dict], roster: list[dict] | None = None) -> str:
 
     header = (
         "_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a "
-        "monotonic ratchet (a score never goes down); the 0.7.6 gate is per-model "
-        "**parity** — OCAP-on within reach of OCAP-off (Δ ≥ 0). Auto-generated; do "
+        "monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do "
         "not edit by hand._\n\n"
         "| Model | Family | OCAP off | OCAP on | Parity Δ | Suite | Window | Version | Date |\n"
         "|-------|--------|----------|---------|----------|-------|--------|---------|------|\n"
