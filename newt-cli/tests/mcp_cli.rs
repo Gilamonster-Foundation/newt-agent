@@ -21,7 +21,15 @@ fn sandbox() -> Sandbox {
     let root = tempfile::tempdir().unwrap();
     let config_dir = root.path().join("cfg");
     let home = root.path().join("home");
-    let cwd = root.path().join("ws");
+    // The workspace MUST live UNDER the sandbox home (#1494). The project-config
+    // walk-up (`find_project_config_from`) stops at `home_dir()`; if `cwd` and
+    // `home` were siblings, the boundary is never an ancestor of `cwd`, so on
+    // Windows — where the temp dir lives under `C:\Users\<user>` — the walk-up
+    // sails up past the real home and writes fixtures into the developer's real
+    // `~/.newt/config.toml`. Nesting `cwd` under `home` makes the boundary a true
+    // ancestor, so the search is contained on every OS (production is already
+    // safe: there the real home genuinely is an ancestor of `cwd`).
+    let cwd = home.join("ws");
     for dir in [&config_dir, &home, &cwd] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -38,6 +46,9 @@ fn newt(sb: &Sandbox) -> Command {
     let mut cmd = Command::cargo_bin("newt").unwrap();
     cmd.env("NEWT_CONFIG_DIR", &sb.config_dir)
         .env("HOME", &sb.home)
+        // `home_dir()` reads HOME then USERPROFILE; set both so home resolution is
+        // contained on Windows too, not just Unix (#1494).
+        .env("USERPROFILE", &sb.home)
         .env_remove("NEWT_CONFIG")
         .current_dir(&sb.cwd);
     cmd
