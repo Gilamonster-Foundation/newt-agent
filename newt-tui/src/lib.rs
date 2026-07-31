@@ -12887,6 +12887,18 @@ mod persona_helper_tests {
 
     #[cfg(feature = "rich-tui")]
     #[test]
+    fn persona_save_returns_the_normalized_on_disk_name() {
+        // review-3 follow-up: the caller reports the returned path stem, which is
+        // the NORMALIZED (lowercased) on-disk name — so the "saved persona 'x'"
+        // confirmation matches the file, not the raw typed name.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonaStore::new(tmp.path().join("personas"));
+        let path = store.save("MixedCase", "body", false).unwrap();
+        assert_eq!(path.file_stem().unwrap().to_string_lossy(), "mixedcase");
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
     fn persona_overwrite_failure_preserves_the_original() {
         // review-3 §1: a failed replacement write leaves the original persona intact
         // (temp+rename never truncates in place). Failure injected via save_with.

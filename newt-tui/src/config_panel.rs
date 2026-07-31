@@ -206,7 +206,8 @@ pub(crate) struct PanelState {
     /// The crew launch gate at open (`NEWT_TEAM`) — the base a persona's `crew:`
     /// declaration projects over.
     base_crew: bool,
-    /// The backend active at open — the projection fallback + save default.
+    /// The operator BASELINE backend (what a no-backend persona reverts to on
+    /// apply) — the projection fallback + save default.
     backend: Option<String>,
     mode: Mode,
     /// Transient status / error line (visible feedback for saves + bad commands).
@@ -218,13 +219,29 @@ pub(crate) struct PanelState {
 
 impl PanelState {
     /// Seed from the live overrides, the selectable personas + the active one, the
-    /// current backend, and the config/family tenacity base (for projection).
+    /// operator baseline backend, and the config/family tenacity base (for
+    /// projection).
     pub(crate) fn new(
-        personas: Vec<PersonaChoice>,
+        mut personas: Vec<PersonaChoice>,
         current_persona: Option<String>,
         backend: Option<String>,
         base_tenacity: Tenacity,
     ) -> Self {
+        // Guarantee the active persona is selectable. If it isn't in the list
+        // (e.g. its file failed to load), append it so it renders "(active)" and
+        // Enter maps to Keep — never a silent Clear (review-3 follow-up). Its
+        // declarations are unknown, so it projects the base (Keep changes nothing).
+        if let Some(cur) = &current_persona {
+            if !personas.iter().any(|p| &p.name == cur) {
+                personas.push(PersonaChoice {
+                    name: cur.clone(),
+                    cognition: None,
+                    tenacity: None,
+                    backend: None,
+                    crew: None,
+                });
+            }
+        }
         let mut persona_opts = Vec::with_capacity(personas.len() + 1);
         persona_opts.push(NONE.to_string());
         persona_opts.extend(personas.iter().map(|p| p.name.clone()));
@@ -353,7 +370,7 @@ impl PanelState {
     }
 
     /// The backend that WILL be in effect: the selected persona's declared backend,
-    /// else the current one.
+    /// else the operator baseline (what a no-backend persona reverts to on apply).
     fn projected_backend(&self) -> Option<String> {
         self.selected_persona()
             .and_then(|p| p.backend.clone())
@@ -593,7 +610,9 @@ impl PanelState {
     fn backend_provenance(&self) -> String {
         match self.selected_persona() {
             Some(p) if p.backend.is_some() => format!("persona: {}", p.name),
-            _ => "current".to_string(),
+            // No declared backend → the selection reverts to the operator baseline
+            // on apply (NOT the outgoing persona's backend).
+            _ => "base".to_string(),
         }
     }
     fn crew_provenance(&self) -> String {
@@ -949,6 +968,40 @@ mod tests {
         let rp = newt_core::RoleProfile::parse(&content).unwrap();
         assert_eq!(rp.cognition, Some(Cognition::Contemplating));
         assert_eq!(rp.tenacity, Some(Tenacity::Relentless));
+    }
+
+    #[test]
+    fn active_persona_absent_from_the_list_is_kept_not_silently_cleared() {
+        // review-3 follow-up: if the active persona isn't in the projected list
+        // (e.g. its file failed to load), it must still show "(active)" and Enter
+        // must map to Keep — never a silent Clear at index 0.
+        let _g = GlobalSettingsGuard::acquire();
+        let s = panel(Some("ghost"), two_personas(), Tenacity::Standard);
+        assert!(s.persona_label().contains("ghost"));
+        assert!(s.persona_label().contains("(active)"));
+        assert_eq!(s.persona_action(), PersonaAction::Keep);
+    }
+
+    #[test]
+    fn no_backend_persona_projects_the_operator_baseline() {
+        // review-3 §3: a persona that declares no backend projects the operator
+        // BASELINE (the revert target), not the outgoing persona's backend.
+        let _g = GlobalSettingsGuard::acquire();
+        let personas = vec![PersonaChoice {
+            name: "alice".to_string(),
+            cognition: None,
+            tenacity: None,
+            backend: None,
+            crew: None,
+        }];
+        let mut s = PanelState::new(personas, None, Some("sol".to_string()), Tenacity::Standard);
+        s.cycle(1); // none → alice
+        assert_eq!(
+            s.projected_backend().as_deref(),
+            Some("sol"),
+            "no-backend persona reverts to the baseline"
+        );
+        assert_eq!(s.backend_provenance(), "base");
     }
 
     #[test]
