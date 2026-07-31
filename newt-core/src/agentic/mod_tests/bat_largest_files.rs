@@ -215,6 +215,7 @@ async fn run_scenario_for(
         tool_events: None,
         phantom_reaches: None,
         end_reason: None,
+        solve_obs: None,
         permission_gate: None,
         on_round_usage: None,
         estimate_ratio: None,

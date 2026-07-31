@@ -4321,6 +4321,10 @@ pub(crate) fn run_chat(
                                         tool_events: Some(&mut turn_tool_events),
                                         phantom_reaches: Some(&mut turn_phantom_reaches),
                                         end_reason: Some(&mut turn_end_reason),
+                                        // W0 (#1511): the solve contract is a
+                                        // headless-lane artifact — the TUI
+                                        // session records nothing here.
+                                        solve_obs: None,
                                         // #263: present only when prompting is on —
                                         // the loop blocks on the prompt like a long
                                         // tool call; None keeps denials verbatim.

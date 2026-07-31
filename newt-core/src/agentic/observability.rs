@@ -180,13 +180,17 @@ impl std::fmt::Display for DispatchError {
 impl std::error::Error for DispatchError {}
 
 /// Recover the structural class from an anyhow chain at the driver boundary.
-/// `None` means no [`DispatchError`] anywhere in the chain — the failure
+/// A [`DispatchError`] wins; a raw [`reqwest::Error`] still in the chain (the
+/// body-decode paths propagate it via `anyhow::Error::from`) is classified
+/// typed as a fallback. `None` means neither is present — the failure
 /// happened outside a dispatch (the caller files it as `harness_error`,
 /// fail-closed: an unattributed error must never masquerade as a model one).
 pub fn error_class(e: &anyhow::Error) -> Option<ErrorClass> {
-    e.chain()
-        .find_map(|c| c.downcast_ref::<DispatchError>())
-        .map(|d| d.class)
+    e.chain().find_map(|c| {
+        c.downcast_ref::<DispatchError>()
+            .map(|d| d.class)
+            .or_else(|| c.downcast_ref::<reqwest::Error>().map(classify_reqwest))
+    })
 }
 
 #[cfg(test)]
@@ -253,6 +257,11 @@ mod tests {
         let err = reqwest::Client::new().get("").send().await.unwrap_err();
         assert!(err.is_builder());
         assert_eq!(classify_reqwest(&err), ErrorClass::Harness);
+        // A RAW reqwest error in an anyhow chain classifies typed too — the
+        // `resp.json()` decode paths propagate it via `anyhow::Error::from`
+        // without a DispatchError wrapper.
+        let chained = anyhow::Error::from(err).context("decoding response body");
+        assert_eq!(error_class(&chained), Some(ErrorClass::Harness));
     }
 
     /// The boundary recovery: the class survives an anyhow chain (with
