@@ -50,8 +50,15 @@ if [ -z "${PY:-}" ]; then
 fi
 [ -n "${PY:-}" ] || { echo "FATAL: need a working python3/python on PATH for metric parsing" >&2; exit 2; }
 
-ORNITH_ENDPOINT="${ORNITH_ENDPOINT:-http://100.113.207.102:8080}"
-ORNITH_MODEL="${ORNITH_MODEL:-ornith-1.0-35b-q8}"
+# Backend under test — defaults to ornith on dgx1 (chat_completions). Set these
+# for a Responses/cognition leg (e.g. sol): MODEL_ENDPOINT=https://api.openai.com
+# MODEL_ID=gpt-5.6-sol MODEL_API=responses MODEL_KEY_FILE=~/.newt/keys/openai
+# BACKEND_NAME=sol. (ORNITH_* are kept as aliases for the default leg.)
+MODEL_ENDPOINT="${MODEL_ENDPOINT:-${ORNITH_ENDPOINT:-http://100.113.207.102:8080}}"
+MODEL_ID="${MODEL_ID:-${ORNITH_MODEL:-ornith-1.0-35b-q8}}"
+MODEL_API="${MODEL_API:-chat_completions}"     # or: responses (cognition wires through)
+MODEL_KEY_FILE="${MODEL_KEY_FILE:-}"           # e.g. ~/.newt/keys/openai for sol
+BACKEND_NAME="${BACKEND_NAME:-ornith}"
 TASKS_DIR="${TASKS_DIR:-$HERE/tasks}"
 MAX_ROUNDS="${MAX_ROUNDS:-15}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-600}"
@@ -66,16 +73,17 @@ MD="$OUT/matrix.md"
 CFG="$OUT/ornith.toml"
 
 # Render the backend config from the endpoint/model (portable — no ~/.newt needed).
-cat > "$CFG" <<EOF
-default_backend = "ornith"
-[[backends]]
-name = "ornith"
-endpoint = "$ORNITH_ENDPOINT"
-model = "$ORNITH_MODEL"
-kind = "openai"
-api = "chat_completions"
-tiers = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
-EOF
+{
+  echo "default_backend = \"$BACKEND_NAME\""
+  echo "[[backends]]"
+  echo "name = \"$BACKEND_NAME\""
+  echo "endpoint = \"$MODEL_ENDPOINT\""
+  echo "model = \"$MODEL_ID\""
+  echo "kind = \"openai\""
+  echo "api = \"$MODEL_API\""
+  [ -n "$MODEL_KEY_FILE" ] && echo "api_key_file = \"$MODEL_KEY_FILE\""
+  echo 'tiers = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]'
+} > "$CFG"
 
 echo "posture,ocap,task,verify,status,tool_calls,write_calls,total_tokens,wall_secs,solve_rc" > "$CSV"
 
@@ -97,14 +105,18 @@ posture_env() {  # extra env exports for a posture (crew gate)
 }
 
 # Reachability pre-check — fail fast rather than burn a whole matrix on a dead endpoint.
-if ! curl -s --max-time 10 -o /dev/null -w '%{http_code}' "$ORNITH_ENDPOINT/v1/models" | grep -q 200; then
-  echo "FATAL: $ORNITH_ENDPOINT/v1/models did not return 200 — is dgx1/ornith up + reachable from here?" >&2
-  exit 3
+if [ -z "$MODEL_KEY_FILE" ]; then
+  if ! curl -s --max-time 10 -o /dev/null -w '%{http_code}' "$MODEL_ENDPOINT/v1/models" | grep -q 200; then
+    echo "FATAL: $MODEL_ENDPOINT/v1/models did not return 200 — is the backend up + reachable from here?" >&2
+    exit 3
+  fi
+else
+  echo "note: auth-gated endpoint ($MODEL_KEY_FILE) — skipping unauthenticated reachability probe."
 fi
 
 echo "== psyche A/B matrix =="
 echo "newt:      $NEWT"
-echo "endpoint:  $ORNITH_ENDPOINT   model: $ORNITH_MODEL"
+echo "endpoint:  $MODEL_ENDPOINT   model: $MODEL_ID   api: $MODEL_API"
 echo "postures:  $POSTURES"
 echo "ocap:      $OCAP_MODES"
 echo "tasks:     $(ls "$TASKS_DIR" 2>/dev/null | tr '\n' ' ')"
@@ -157,7 +169,7 @@ PY
 done
 
 # Render matrix.md (pass-rate grid + per-cell rollup) from the CSV.
-"$PY" - "$CSV" "$MD" "$ORNITH_MODEL" "$ORNITH_ENDPOINT" <<'PY'
+"$PY" - "$CSV" "$MD" "$MODEL_ID" "$MODEL_ENDPOINT" <<'PY'
 import sys, csv, collections
 csvp, mdp, model, endpoint = sys.argv[1:5]
 rows = list(csv.DictReader(open(csvp, encoding="utf-8")))

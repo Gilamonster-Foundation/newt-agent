@@ -45,23 +45,34 @@ matrix report.
 ```bash
 cd bench/psyche-ab-matrix
 cargo build --release -p newt-agent --bin newt        # if not already built
-# LAN endpoint is lower-latency from gnuc; Tailscale is the default and also works:
-ORNITH_ENDPOINT=http://192.168.0.103:8080 ./run-matrix.sh
+```
+
+**ornith leg (local, dgx1 — the long one):**
+```bash
+MODEL_ENDPOINT=http://192.168.0.103:8080 ./run-matrix.sh   # LAN, lower latency from gnuc
+```
+
+**sol / cognition leg (OpenAI Responses — the only leg where cognition wires through):**
+```bash
+MODEL_ENDPOINT=https://api.openai.com MODEL_ID=gpt-5.6-sol \
+  MODEL_API=responses MODEL_KEY_FILE=~/.newt/keys/openai BACKEND_NAME=sol \
+  ./run-matrix.sh
 ```
 
 Everything is env-overridable (defaults in `run-matrix.sh`):
 
-```bash
-NEWT=/path/to/newt \
-ORNITH_ENDPOINT=http://100.113.207.102:8080 \
-ORNITH_MODEL=ornith-1.0-35b-q8 \
-TASKS_DIR=./tasks \
-POSTURES="baseline tenacity crew obsessive" \
-OCAP_MODES="off on" \
-MAX_ROUNDS=15 TASK_TIMEOUT=600 \
-OUT=./runs/mystamp \
-./run-matrix.sh
-```
+| env | default | meaning |
+|---|---|---|
+| `NEWT` | repo `target/release/newt`, then `$PATH` | the binary |
+| `MODEL_ENDPOINT` | `http://100.113.207.102:8080` (dgx1 tailnet) | OpenAI-compatible base URL (`ORNITH_ENDPOINT` alias) |
+| `MODEL_ID` | `ornith-1.0-35b-q8` | served model id (`ORNITH_MODEL` alias) |
+| `MODEL_API` | `chat_completions` | or `responses` (cognition wires through) |
+| `MODEL_KEY_FILE` | (none) | e.g. `~/.newt/keys/openai` for sol |
+| `BACKEND_NAME` | `ornith` | backend name written into the config |
+| `POSTURES` | `baseline tenacity crew obsessive` | subset of postures |
+| `OCAP_MODES` | `off on` | subset of OCAP lanes |
+| `MAX_ROUNDS` / `TASK_TIMEOUT` | `15` / `600` | solve caps (size for the model) |
+| `OUT` | `./runs/<stamp>` | output dir |
 
 The runner fails fast if the endpoint isn't reachable (a `/v1/models` 200 check)
 so a whole matrix never burns on a dead backend.
