@@ -3415,17 +3415,26 @@ pub(crate) fn run_chat(
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            let backend = active_backend_name(&cfg);
+                            // review-3 §3: the projection fallback for a persona that
+                            // declares no backend is the operator BASELINE — what
+                            // apply_persona_backend reverts to — NOT the outgoing
+                            // persona's current backend.
+                            let backend = base_provider.clone();
                             let current_persona = active_persona.as_ref().map(|p| p.name.clone());
                             let base_tenacity = newt_core::tenacity::base_tenacity();
-                            // review-3 §1: the ONLY filesystem I/O, injected so a
-                            // failed write keeps the panel open and mutates nothing.
+                            // review-3 §1: the ONLY filesystem I/O, injected so a failed
+                            // write keeps the panel open and mutates nothing. Report the
+                            // store's NORMALIZED (on-disk) name so the confirmation
+                            // matches the written file.
                             let persist =
                                 |name: &str, content: &str, overwrite: bool| match persona_store
                                     .save(name, content, overwrite)
                                 {
-                                    Ok(_) => config_panel::SaveResult::Saved {
-                                        name: name.to_string(),
+                                    Ok(path) => config_panel::SaveResult::Saved {
+                                        name: path
+                                            .file_stem()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| name.to_string()),
                                     },
                                     Err(PersonaSaveError::Exists) => {
                                         config_panel::SaveResult::Exists {
