@@ -85,6 +85,34 @@ pub fn effective_cognition() -> Option<Cognition> {
     }
 }
 
+/// A complete snapshot of both mutable globals that feed [`effective_cognition`]
+/// — the `/cognition` override and the active persona's declared `cognition:`.
+/// The test guard snapshots + restores this as one unit (symmetric with
+/// [`crate::tenacity::TenacityRuntimeSnapshot`]) instead of reaching into each
+/// global piecemeal.
+#[doc(hidden)]
+pub struct CognitionRuntimeSnapshot {
+    cli: CognitionOverride,
+    persona: Option<Cognition>,
+}
+
+/// Snapshot both cognition-resolution globals (see [`CognitionRuntimeSnapshot`]).
+#[doc(hidden)]
+#[must_use]
+pub fn snapshot_runtime_state() -> CognitionRuntimeSnapshot {
+    CognitionRuntimeSnapshot {
+        cli: cli_cognition(),
+        persona: persona_cognition(),
+    }
+}
+
+/// Restore both cognition-resolution globals from a snapshot.
+#[doc(hidden)]
+pub fn restore_runtime_state(snapshot: CognitionRuntimeSnapshot) {
+    set_cli_cognition(snapshot.cli);
+    set_persona_cognition(snapshot.persona);
+}
+
 /// The cognition in effect given an EXPLICIT persona level (rather than the
 /// process-global). Retained for headless / eval callers that pass the persona
 /// directly; the interactive path uses [`effective_cognition`].

@@ -130,86 +130,45 @@ pub fn run_crew_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
     crew_form::run_edit(name, color)
 }
 
-/// The persona action the config panel returned (a mirror of the panel's own
-/// enum so the caller doesn't need the `config_panel` types). **Rich-tui only:**
-/// the lean (`--no-default-features`) build has no panel, so the `/psyche edit`
-/// handler prints a fallback and never constructs `Clear` / `Switch` — gating
-/// the whole panel path here (rather than an `allow(dead_code)`) keeps the lean
-/// tier honestly warning-clean.
+/// Open the harness config panel (#14) for the psyche operator dials and return
+/// its [`config_panel::PanelOutcome`], or — when stdout is not a TTY (piped /
+/// headless) — print a short note pointing at the text `/psyche` view and return
+/// `Cancelled`. The panel applies (only the changed) dials through the same
+/// setters the flags / slash commands use; `persist` (the caller's closure, which
+/// owns the `PersonaStore`) is the ONLY filesystem I/O, so a failed save keeps the
+/// panel open without mutating the runtime (review-3 §1). The caller acts on the
+/// returned outcome — applying the persona action, rerouting, and reporting from
+/// fresh runtime state. **Rich-tui only** — the lean build has no ratatui surface,
+/// so the `/psyche edit` handler prints the fallback directly. See
+/// `harness_config_panel.md`.
 #[cfg(feature = "rich-tui")]
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) enum PsychePersonaAction {
-    #[default]
-    Keep,
-    Clear,
-    Switch(String),
-}
-
-/// What the config panel asked the caller (the session loop) to do, beyond the
-/// dials it applied itself. Rich-tui only (see [`PsychePersonaAction`]).
-#[cfg(feature = "rich-tui")]
-#[derive(Debug, Default)]
-pub(crate) struct PsychePanelResult {
-    /// What to do with the active persona (keep / clear / switch).
-    pub persona: PsychePersonaAction,
-    /// A persona to save: `(name, file_content)` (caller writes it via `PersonaStore`).
-    pub saved: Option<(String, String)>,
-}
-
-/// Open the harness config panel (#14) for the psyche operator dials, or — when
-/// stdout is not a TTY (piped / headless) — print a short note pointing at the
-/// text `/psyche` view and the per-dial commands. The panel applies (only the
-/// changed) dials through the same setters the flags / slash commands use, so
-/// there is no panel-only state; the persona action + any save are returned for
-/// the caller to act on. Takes the EFFECTIVE resolved cognition/tenacity + the
-/// active persona so the panel can show/save the real posture. **Rich-tui only**
-/// — the lean build has no ratatui surface, so the `/psyche edit` handler prints
-/// the fallback directly. See `harness_config_panel.md`.
-#[cfg(feature = "rich-tui")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_psyche_panel(
-    persona_names: Vec<String>,
+    personas: Vec<config_panel::PersonaChoice>,
     current_persona: Option<String>,
     backend: Option<String>,
-    eff_cognition: Option<newt_core::role_profile::Cognition>,
-    eff_tenacity: newt_core::Tenacity,
+    base_tenacity: newt_core::Tenacity,
+    persist: impl FnMut(&str, &str, bool) -> config_panel::SaveResult,
     color: bool,
     verbose: bool,
-) -> PsychePanelResult {
+) -> config_panel::PanelOutcome {
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        match config_panel::run(
-            persona_names,
-            current_persona,
-            backend,
-            eff_cognition,
-            eff_tenacity,
-        ) {
-            Ok(o) => {
-                print_newt(&o.summary, color, verbose);
-                let persona = match o.persona {
-                    config_panel::PersonaAction::Keep => PsychePersonaAction::Keep,
-                    config_panel::PersonaAction::Clear => PsychePersonaAction::Clear,
-                    config_panel::PersonaAction::Switch(n) => PsychePersonaAction::Switch(n),
-                };
-                return PsychePanelResult {
-                    persona,
-                    saved: o.saved,
-                };
-            }
+        match config_panel::run(personas, current_persona, backend, base_tenacity, persist) {
+            Ok(outcome) => outcome,
             Err(e) => {
                 print_newt(&format!("psyche panel error: {e}"), color, verbose);
-                return PsychePanelResult::default();
+                config_panel::PanelOutcome::Cancelled
             }
         }
+    } else {
+        // rich-tui compiled but stdout is not a TTY (piped / headless): no overlay.
+        print_newt(
+            "the psyche panel needs an interactive rich terminal — use /psyche for the \
+             text view, or /cognition / /tenacity to change the dials.",
+            color,
+            verbose,
+        );
+        config_panel::PanelOutcome::Cancelled
     }
-    // rich-tui compiled but stdout is not a TTY (piped / headless): no overlay.
-    print_newt(
-        "the psyche panel needs an interactive rich terminal — use /psyche for the \
-         text view, or /cognition / /tenacity to change the dials.",
-        color,
-        verbose,
-    );
-    PsychePanelResult::default()
 }
 
 /// Report auth status for every discovered HTTP MCP server, and optionally run
@@ -4240,6 +4199,20 @@ struct PersonaStore {
     dir: std::path::PathBuf,
 }
 
+/// Why a [`PersonaStore::save`] did not write — mapped by the config-panel caller
+/// to `config_panel::SaveResult` for a visible status line. Rich-tui only (the
+/// panel is its only caller).
+#[cfg(feature = "rich-tui")]
+#[derive(Debug)]
+enum PersonaSaveError {
+    /// A persona with this name already exists and overwrite was not requested.
+    Exists,
+    /// The name is not a valid persona file stem.
+    InvalidName(String),
+    /// The filesystem write failed.
+    Io(String),
+}
+
 impl PersonaStore {
     const DEFAULT_NAME: &'static str = "coder";
 
@@ -4257,17 +4230,60 @@ impl PersonaStore {
         Self::new(Self::default_dir())
     }
 
-    /// Write a persona file `<name>.md` with `content`, creating the personas
-    /// directory if needed. The name is normalized to a file stem; returns the
-    /// written path. Used only by the config panel's save action, so it is
-    /// rich-tui-gated alongside the panel (dead in the lean build otherwise).
+    /// Atomically write persona `<name>.md`. With `overwrite == false`, refuses an
+    /// existing persona ([`PersonaSaveError::Exists`]); with `true`, replaces it
+    /// atomically — writes to a temp file in the destination directory then renames
+    /// it over the target, so a failed or partial write never truncates or corrupts
+    /// the existing persona (review-3 §1). Used only by the config panel's save
+    /// action, so it is rich-tui-gated alongside the panel.
     #[cfg(feature = "rich-tui")]
-    fn save(&self, name: &str, content: &str) -> anyhow::Result<std::path::PathBuf> {
-        let name = normalize_persona_name(name)?;
-        std::fs::create_dir_all(&self.dir)?;
+    fn save(
+        &self,
+        name: &str,
+        content: &str,
+        overwrite: bool,
+    ) -> Result<std::path::PathBuf, PersonaSaveError> {
+        self.save_with(name, content, overwrite, |p, c| std::fs::write(p, c))
+    }
+
+    /// [`Self::save`] with an injectable byte-writer, so the atomicity guarantee
+    /// (a failed write preserves the original) is unit-testable without needing to
+    /// provoke a real I/O error.
+    #[cfg(feature = "rich-tui")]
+    fn save_with<W>(
+        &self,
+        name: &str,
+        content: &str,
+        overwrite: bool,
+        write_bytes: W,
+    ) -> Result<std::path::PathBuf, PersonaSaveError>
+    where
+        W: Fn(&std::path::Path, &str) -> std::io::Result<()>,
+    {
+        let name = normalize_persona_name(name)
+            .map_err(|e| PersonaSaveError::InvalidName(e.to_string()))?;
         let path = self.dir.join(format!("{name}.md"));
-        std::fs::write(&path, content)?;
-        Ok(path)
+        if !overwrite && path.exists() {
+            return Err(PersonaSaveError::Exists);
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| PersonaSaveError::Io(e.to_string()))?;
+        // Atomic replace: write a temp file in the SAME dir, then rename over the
+        // target. If either step fails we remove the temp and leave the original
+        // untouched — never a truncating in-place write.
+        let tmp = self
+            .dir
+            .join(format!(".{name}.md.tmp.{}", std::process::id()));
+        if let Err(e) = write_bytes(&tmp, content) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(PersonaSaveError::Io(e.to_string()));
+        }
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => Ok(path),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(PersonaSaveError::Io(e.to_string()))
+            }
+        }
     }
 
     fn load(&self, name: &str) -> anyhow::Result<Persona> {
@@ -12836,6 +12852,60 @@ mod persona_helper_tests {
         assert!(normalize_persona_name("").is_err());
         assert!(normalize_persona_name("bad name").is_err());
         assert!(normalize_persona_name("näme").is_err());
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn persona_save_is_atomic_and_refuses_existing_without_overwrite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonaStore::new(tmp.path().join("personas"));
+        // First write creates the file.
+        let path = store
+            .save("bob", "+++\nrole = \"bob\"\n+++\n\nbody\n", false)
+            .unwrap();
+        assert!(path.exists());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("role = \"bob\""));
+        // Second write WITHOUT overwrite → Exists, original untouched.
+        assert!(matches!(
+            store.save("bob", "NEW", false),
+            Err(PersonaSaveError::Exists)
+        ));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("role = \"bob\""));
+        // WITH overwrite → replaces atomically, no stray temp files.
+        store.save("bob", "REPLACED", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "REPLACED");
+        let stray = std::fs::read_dir(tmp.path().join("personas"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!stray, "no temp files remain after saves");
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn persona_overwrite_failure_preserves_the_original() {
+        // review-3 §1: a failed replacement write leaves the original persona intact
+        // (temp+rename never truncates in place). Failure injected via save_with.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonaStore::new(tmp.path().join("personas"));
+        let path = store.save("bob", "ORIGINAL", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ORIGINAL");
+        let r = store.save_with("bob", "NEW", true, |_p, _c| {
+            Err(std::io::Error::other("boom"))
+        });
+        assert!(
+            matches!(r, Err(PersonaSaveError::Io(_))),
+            "the write failure surfaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ORIGINAL",
+            "original persona intact after a failed overwrite"
+        );
     }
 
     #[test]
