@@ -36,6 +36,10 @@ pub(crate) mod scheduled;
 /// Drive an overseer-authored plan through a `CrewRunner` (#628 P2 execute side).
 pub(crate) mod plan_exec;
 pub(crate) mod spill;
+// W0 (#1511, epic #1506): typed dispatch-error classification + per-round
+// tool-call parse signals — the structural inputs of the observability
+// contract `newt solve` emits for the external evaluator.
+pub(crate) mod observability;
 /// Recover tool calls a weak model emitted in CONTENT instead of the native
 /// `tool_calls` field (the #1 weak-model failure — see the module docs).
 pub(crate) mod tool_recovery;
@@ -171,6 +175,10 @@ pub use experiential::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
+pub use observability::{
+    classify_reqwest, error_class, round_parse_signal, DispatchError, ErrorClass, ParseSignal,
+    SolveObservation, ToolCallDialect,
+};
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
     AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
@@ -729,6 +737,13 @@ pub struct ChatCtx<'a> {
     /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. The
     /// Responses-API loop does not report it.
     pub end_reason: Option<&'a mut Option<crate::TurnEndReason>>,
+    /// Out-param: per-turn observability for the solve contract (W0 #1511) —
+    /// the backend-reported served `model` plus per-round tool-call parse
+    /// signals ([`observability::ParseSignal`]). Lent fresh per turn like
+    /// `tool_events`; the headless driver folds it into the `TurnOutcome` and
+    /// `newt solve` serializes it. `None` (TUI / eval) ⇒ nothing recorded.
+    /// The Responses-API loop does not report it (same as `end_reason`).
+    pub solve_obs: Option<&'a mut observability::SolveObservation>,
     /// Prompted ocap grants (issue #263): when present, a capability denial
     /// inside `execute_tool` consults the human — allow once / session allow
     /// / deny — instead of failing outright; the loop blocks like a long
@@ -1180,6 +1195,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -1756,16 +1772,27 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 with_backoff_notify(
                     &retry,
                     || async {
+                        // W0 (#1511): classify while the error is TYPED — the
+                        // DispatchError keeps the historical message text and
+                        // carries the structural class to the driver boundary.
                         let resp = client
                             .post(&chat_url)
                             .json(&body_no_stream)
                             .send()
                             .await
-                            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                            .map_err(|e| {
+                                anyhow::Error::new(observability::DispatchError::from_reqwest(
+                                    "request failed",
+                                    e,
+                                ))
+                            })?;
                         if !resp.status().is_success() {
                             let status = resp.status();
                             let text = resp.text().await.unwrap_or_default();
-                            anyhow::bail!("Ollama {status}: {text}");
+                            return Err(observability::DispatchError::http_status(format!(
+                                "Ollama {status}: {text}"
+                            ))
+                            .into());
                         }
                         resp.json::<serde_json::Value>()
                             .await
@@ -1975,6 +2002,25 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             _ => None,
         };
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        // W0 (#1511): record what the backend SAYS it served plus this
+        // round's parse status for the solve contract. `json["model"]` is the
+        // served reality (the contract's `effective_model` source, never an
+        // echo of our request); the signal is the ADR §5
+        // recovered_tool_call{dialect} / no_parseable_tool_call trace event.
+        if let Some(obs) = solve_obs.as_deref_mut() {
+            if let Some(m) = json["model"].as_str().filter(|m| !m.is_empty()) {
+                obs.served_model = Some(m.to_string());
+            }
+            let native = native_calls.is_some_and(|t| !t.is_empty());
+            if let Some(sig) = observability::round_parse_signal(
+                round,
+                !probe_content.is_empty(),
+                native,
+                recovered.dialect,
+            ) {
+                obs.parse_signals.push(sig);
+            }
+        }
         if debug && !recovered.calls.is_empty() {
             print_debug(
                 &format!(
@@ -2260,7 +2306,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             .json(&body_stream)
                             .send()
                             .await
-                            .map_err(|e| anyhow::anyhow!("stream request failed: {e}"))
+                            .map_err(|e| {
+                                // Typed classification at the source (W0 #1511).
+                                anyhow::Error::new(observability::DispatchError::from_reqwest(
+                                    "stream request failed",
+                                    e,
+                                ))
+                            })
                     },
                     |attempt, delay| print_retry_indicator(attempt, delay, color),
                 ),
@@ -4239,11 +4291,20 @@ async fn final_summary_ollama(
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                .map_err(|e| {
+                    // Typed classification at the source (W0 #1511).
+                    anyhow::Error::new(observability::DispatchError::from_reqwest(
+                        "request failed",
+                        e,
+                    ))
+                })?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Ollama {status}: {text}");
+                return Err(observability::DispatchError::http_status(format!(
+                    "Ollama {status}: {text}"
+                ))
+                .into());
             }
             resp.json::<serde_json::Value>()
                 .await
@@ -4412,14 +4473,20 @@ async fn final_summary_openai(
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+            let resp = req.send().await.map_err(|e| {
+                // Typed classification at the source (W0 #1511).
+                anyhow::Error::new(observability::DispatchError::from_reqwest(
+                    "request failed",
+                    e,
+                ))
+            })?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                anyhow::bail!("inference endpoint {status}: {text}");
+                return Err(observability::DispatchError::http_status(format!(
+                    "inference endpoint {status}: {text}"
+                ))
+                .into());
             }
             resp.json::<serde_json::Value>()
                 .await
@@ -4568,6 +4635,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -5008,14 +5076,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 if let Some(key) = api_key {
                     req = req.bearer_auth(key);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                // W0 (#1511): classify while the error is TYPED — the
+                // DispatchError keeps the historical message text and carries
+                // the structural class to the driver boundary.
+                let resp = req.send().await.map_err(|e| {
+                    anyhow::Error::new(observability::DispatchError::from_reqwest(
+                        "request failed",
+                        e,
+                    ))
+                })?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("inference endpoint {status}: {text}");
+                    return Err(observability::DispatchError::http_status(format!(
+                        "inference endpoint {status}: {text}"
+                    ))
+                    .into());
                 }
                 resp.json::<serde_json::Value>()
                     .await
@@ -5208,6 +5284,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             _ => None,
         };
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        // W0 (#1511): served-model + parse-status observation for the solve
+        // contract — mirror of the Ollama loop above.
+        if let Some(obs) = solve_obs.as_deref_mut() {
+            if let Some(m) = json["model"].as_str().filter(|m| !m.is_empty()) {
+                obs.served_model = Some(m.to_string());
+            }
+            let native = native_calls.is_some_and(|t| !t.is_empty());
+            if let Some(sig) = observability::round_parse_signal(
+                round,
+                !oa_content.is_empty(),
+                native,
+                recovered.dialect,
+            ) {
+                obs.parse_signals.push(sig);
+            }
+        }
         if debug && !recovered.calls.is_empty() {
             print_debug(
                 &format!(
@@ -5946,6 +6038,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         end_reason: _,
+        solve_obs: _,
         mut permission_gate,
         on_round_usage: _,
         estimate_ratio,
@@ -6107,14 +6200,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 if let Some(key) = api_key {
                     req = req.bearer_auth(key);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                // Typed classification at the source (W0 #1511).
+                let resp = req.send().await.map_err(|e| {
+                    anyhow::Error::new(observability::DispatchError::from_reqwest(
+                        "request failed",
+                        e,
+                    ))
+                })?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("inference endpoint {status}: {text}");
+                    return Err(observability::DispatchError::http_status(format!(
+                        "inference endpoint {status}: {text}"
+                    ))
+                    .into());
                 }
                 resp.json::<serde_json::Value>()
                     .await
@@ -6344,11 +6443,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
+    // Bare `?` keeps the raw typed reqwest error in the chain (the boundary's
+    // `error_class` classifies it as a fallback); the status bail is typed.
     let resp = req.send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("inference endpoint {status}: {text}");
+        return Err(observability::DispatchError::http_status(format!(
+            "inference endpoint {status}: {text}"
+        ))
+        .into());
     }
     let json: serde_json::Value = resp.json().await?;
     accumulated_usage = merge_round_usage(accumulated_usage, responses_usage(&json["usage"]));
@@ -7644,6 +7748,7 @@ mod tool_round_cap_tests {
             tool_events: None,
             phantom_reaches: None,
             end_reason: None,
+            solve_obs: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -7818,6 +7923,7 @@ mod tool_round_cap_tests {
                 tool_events: None,
                 phantom_reaches: None,
                 end_reason: Some(&mut end_reason),
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -8122,6 +8228,7 @@ mod tool_round_cap_tests {
                 tool_events: None,
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -8217,6 +8324,7 @@ mod tool_round_cap_tests {
                 tool_events: None,
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -8821,6 +8929,7 @@ mod tool_round_cap_tests {
                 tool_events: None,
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -8928,6 +9037,7 @@ mod tool_round_cap_tests {
                 tool_events: None,
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -9044,6 +9154,7 @@ mod tool_round_cap_tests {
                 tool_events: Some(&mut events),
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -9172,6 +9283,7 @@ mod tool_round_cap_tests {
                 tool_events: Some(&mut events),
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -9292,6 +9404,7 @@ mod tool_round_cap_tests {
                 tool_events: None,
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -9454,6 +9567,7 @@ mod tool_round_cap_tests {
                 tool_events: None,
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -9625,6 +9739,7 @@ mod tool_round_cap_tests {
                 tool_events: None,
                 phantom_reaches: None,
                 end_reason: None,
+                solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -9762,6 +9877,7 @@ mod save_note_loop_tests {
             tool_events: None,
             phantom_reaches: None,
             end_reason: None,
+            solve_obs: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -10264,6 +10380,7 @@ mod compression_loop_tests {
             tool_events: None,
             phantom_reaches: None,
             end_reason: None,
+            solve_obs: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -11551,6 +11668,7 @@ mod observation_hook_tests {
             tool_events: None,
             phantom_reaches: None,
             end_reason: None,
+            solve_obs: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,

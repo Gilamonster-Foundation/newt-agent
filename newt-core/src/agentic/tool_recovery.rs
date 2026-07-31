@@ -23,6 +23,8 @@
 
 use serde_json::{json, Value};
 
+use super::observability::ToolCallDialect;
+
 /// Outcome of attempting to recover tool calls from model content.
 #[derive(Debug, Default, PartialEq)]
 pub struct Recovery {
@@ -34,6 +36,9 @@ pub struct Recovery {
     /// not fully parse — a format-hallucination signal the caller counts and
     /// steers on.
     pub tool_shaped: bool,
+    /// Which dialect produced `calls` (W0 #1511: `recovered_tool_call{dialect}`
+    /// provenance for the trace). `None` when nothing was recovered.
+    pub dialect: Option<ToolCallDialect>,
 }
 
 /// Charset-validate a recovered tool name (downstream still validates authority).
@@ -233,20 +238,25 @@ fn recover_json(content: &str, out: &mut Vec<Value>) -> bool {
 
 /// Recover tool calls from model content. Tries the `<function=>` tag form first
 /// (it embeds JSON params), then the JSON-object form. Returns native-shaped
-/// calls + whether the content looked tool-shaped at all.
+/// calls + whether the content looked tool-shaped at all + which dialect the
+/// calls came from (trace provenance, W0 #1511).
 #[must_use]
 pub fn recover_tool_calls(content: &str) -> Recovery {
     let mut calls = Vec::new();
     let mut shaped = recover_function_tag(content, &mut calls);
+    let mut dialect = (!calls.is_empty()).then_some(ToolCallDialect::FunctionTag);
     if calls.is_empty() {
         shaped |= recover_root_tool_tag(content, &mut calls);
+        dialect = (!calls.is_empty()).then_some(ToolCallDialect::RootTag);
     }
     if calls.is_empty() {
         shaped |= recover_json(content, &mut calls);
+        dialect = (!calls.is_empty()).then_some(ToolCallDialect::BareJson);
     }
     Recovery {
         calls,
         tool_shaped: shaped,
+        dialect,
     }
 }
 
@@ -266,6 +276,7 @@ mod tests {
             r.calls[0]["function"]["arguments"]["steps"],
             json!(["a", "b"])
         );
+        assert_eq!(r.dialect, Some(ToolCallDialect::FunctionTag));
     }
 
     #[test]
@@ -276,6 +287,7 @@ mod tests {
         assert_eq!(r.calls.len(), 1);
         assert_eq!(r.calls[0]["function"]["name"], "edit_file");
         assert_eq!(r.calls[0]["function"]["arguments"]["path"], "service.py");
+        assert_eq!(r.dialect, Some(ToolCallDialect::BareJson));
     }
 
     #[test]
@@ -315,6 +327,7 @@ mod tests {
             r.calls[0]["function"]["arguments"]["path"],
             "/Users/shawnhartsock/workspaces/newt-agent/newt-tui/src/help_sections.rs"
         );
+        assert_eq!(r.dialect, Some(ToolCallDialect::RootTag));
     }
 
     #[test]
@@ -341,6 +354,7 @@ mod tests {
         let r = recover_tool_calls("I have finished editing the file and the tests pass.");
         assert!(r.calls.is_empty());
         assert!(!r.tool_shaped);
+        assert_eq!(r.dialect, None, "no recovery → no dialect provenance");
     }
 
     #[test]
@@ -384,6 +398,7 @@ mod tests {
         let r = recover_tool_calls("<function=not a valid name!>oops");
         assert!(r.tool_shaped);
         assert!(r.calls.is_empty());
+        assert_eq!(r.dialect, None, "an unrecovered attempt names no dialect");
     }
 
     #[test]

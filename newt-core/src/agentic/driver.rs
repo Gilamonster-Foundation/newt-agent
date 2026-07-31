@@ -234,6 +234,18 @@ pub struct TurnOutcome {
     /// `tool_events` still holds whatever the agent did *before* the error (an
     /// infrastructure failure must not erase the partial trajectory).
     pub error: Option<String>,
+    /// Structural class of `error` (W0 #1511), read from the TYPED dispatch
+    /// error chain — never from the message text. `Some(Harness)` when an
+    /// error carried no dispatch classification at all (fail-closed: an
+    /// unattributed failure is ours, not the model's). `None` iff `error` is.
+    pub error_class: Option<crate::agentic::observability::ErrorClass>,
+    /// The `model` field the backend reported in its response body, when it
+    /// did — what was ACTUALLY served (the solve contract's `effective_model`
+    /// source), as opposed to what we asked for.
+    pub served_model: Option<String>,
+    /// Per-round tool-call parse signals (ADR #1506 §5): recovered dialects
+    /// and content-with-no-parseable-call rounds, in round order.
+    pub parse_signals: Vec<crate::agentic::observability::ParseSignal>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -441,6 +453,9 @@ async fn run_one_turn(
     // await below, after which they move into the TurnOutcome.
     let mut tool_events: Vec<crate::ToolEvent> = Vec::new();
     let mut end_reason: Option<crate::TurnEndReason> = None;
+    // W0 (#1511): served-model + parse-signal observation for the solve
+    // contract — same lend-per-turn pattern as `tool_events`.
+    let mut solve_obs = crate::agentic::observability::SolveObservation::default();
     let ctx = ChatCtx {
         url: &config.url,
         model: &config.model,
@@ -522,6 +537,7 @@ async fn run_one_turn(
         tool_events: Some(&mut tool_events),
         phantom_reaches: None,
         end_reason: Some(&mut end_reason),
+        solve_obs: Some(&mut solve_obs),
         permission_gate: None,
         // Phase 20 (spec §5): headless surfaces neither read nor write the
         // capability cache — the hook stays absent and no calibration is
@@ -566,6 +582,9 @@ async fn run_one_turn(
             tool_events,
             end_reason,
             error: None,
+            error_class: None,
+            served_model: solve_obs.served_model,
+            parse_signals: solve_obs.parse_signals,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
@@ -574,7 +593,16 @@ async fn run_one_turn(
             hallucinations: 0,
             tool_events,
             end_reason,
+            // W0 (#1511): the class is read from the TYPED chain; an error
+            // with no dispatch classification is OURS — harness_error,
+            // fail-closed, never a guess from the message text.
+            error_class: Some(
+                crate::agentic::observability::error_class(&e)
+                    .unwrap_or(crate::agentic::observability::ErrorClass::Harness),
+            ),
             error: Some(e.to_string()),
+            served_model: solve_obs.served_model,
+            parse_signals: solve_obs.parse_signals,
         }),
     }
 }
@@ -846,6 +874,71 @@ mod tests {
         assert!(matches!(err, TurnDriverError::Busy));
         // Let it finish so the test doesn't leak the task.
         let _ = pump_to_done(&mut driver).await;
+    }
+
+    /// W0 (#1511): the served model + parse signals flow from the loop to the
+    /// `TurnOutcome`. The backend body carries `model` (what it actually
+    /// served); the reply is content with no tool call, so round 0 records a
+    /// `no_parseable_tool_call` signal. Clean turn ⇒ no error class.
+    #[tokio::test]
+    async fn outcome_carries_served_model_and_parse_signals() {
+        use crate::agentic::observability::ParseSignal;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "served-by-backend",
+                "message": { "content": "plain prose, no tool call" }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut driver = TurnDriver::new(cfg(&server.uri()));
+        driver.submit("do a thing").expect("submit");
+        let status = pump_to_done(&mut driver).await;
+        let TurnStatus::Completed(o) = status else {
+            panic!("expected Completed, got {status:?}");
+        };
+        assert_eq!(o.error, None);
+        assert_eq!(o.error_class, None, "clean turn carries no error class");
+        assert_eq!(
+            o.served_model.as_deref(),
+            Some("served-by-backend"),
+            "effective model comes from the response body, not our request"
+        );
+        assert!(
+            o.parse_signals
+                .contains(&ParseSignal::NoParseableToolCall { round: 0 }),
+            "content with no parseable call is signalled: {:?}",
+            o.parse_signals
+        );
+    }
+
+    /// W0 (#1511): a non-success HTTP status is a `model_error` STRUCTURALLY —
+    /// the class rides the typed `DispatchError` through the anyhow chain to
+    /// the outcome; nothing string-matches the message. (404 is non-retryable,
+    /// so the test does not sit through the backoff schedule.)
+    #[tokio::test]
+    async fn http_error_status_classifies_as_model_error() {
+        use crate::agentic::observability::ErrorClass;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such model"))
+            .mount(&server)
+            .await;
+
+        let mut driver = TurnDriver::new(cfg(&server.uri()));
+        driver.submit("do a thing").expect("submit");
+        let status = pump_to_done(&mut driver).await;
+        let TurnStatus::Completed(o) = status else {
+            panic!("expected Completed-with-error, got {status:?}");
+        };
+        let err = o
+            .error
+            .expect("the failed dispatch is carried on the outcome");
+        assert!(err.contains("Ollama 404"), "historical wording kept: {err}");
+        assert_eq!(o.error_class, Some(ErrorClass::Model));
     }
 
     /// Cancel aborts the in-flight turn and returns the driver to idle.

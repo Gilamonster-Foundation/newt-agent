@@ -42,6 +42,8 @@ use anyhow::{Context, Result};
 use newt_core::caveats::{Caveats, CountBound, Scope};
 use newt_core::{BackendKind, Config, TurnDriver, TurnDriverConfig, TurnStatus};
 
+use crate::solve_contract;
+
 /// Parsed `newt solve` arguments (mirrors the `Command::Solve` fields).
 pub struct SolveArgs {
     pub cwd: PathBuf,
@@ -62,6 +64,14 @@ pub struct SolveArgs {
     /// generation (the "Context size has been exceeded" 500s). None keeps
     /// newt's default.
     pub context_window: Option<usize>,
+    /// Operator-supplied sha256 of the weights actually served, for the
+    /// contract record's `model_digest` (W0 #1511). Also settable via the
+    /// `NEWT_MODEL_DIGEST` env twin. `None` ⇒ the field is OMITTED from the
+    /// record — never fabricated (a name is not an identity, and a made-up
+    /// digest would defeat the silent-re-upload detection the field exists
+    /// for). Local-weights derivation would only apply to the embedded
+    /// backend, which `solve` cannot drive (it needs an HTTP endpoint).
+    pub model_digest: Option<String>,
 }
 
 /// Which headless lane `newt solve` runs.
@@ -94,6 +104,19 @@ fn resolve_lane(
     } else {
         HeadlessLane::Neither
     }
+}
+
+/// Resolve the operator-supplied model digest: the `--model-digest` flag wins
+/// over the `NEWT_MODEL_DIGEST` env twin (the same flag/env pattern as the
+/// lane); blank values fall through. Pure so precedence is unit-tested
+/// without racing the process environment. NEVER derives or invents a digest.
+fn resolve_model_digest(flag: Option<&str>, env: Option<&str>) -> Option<String> {
+    [flag, env]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|d| !d.is_empty())
+        .map(str::to_string)
 }
 
 /// Run one task headless and emit its trace. Returns the process exit code:
@@ -176,6 +199,15 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         .as_ref()
         .and_then(|t| t.family_for(&model, card_family.as_deref()))
         .or(card_family);
+    // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
+    // contract's effective_config — the bench never re-derives it from a
+    // profile (contract requirement 5).
+    let tenacity_level = cfg
+        .tenacity
+        .clone()
+        .unwrap_or_default()
+        .resolve(family.as_deref())
+        .to_string();
     newt_core::tenacity::set_active_model_family(family);
 
     // 4. The task instruction.
@@ -222,6 +254,9 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         dc.max_ok_input = Some(input_budget);
         dc.num_ctx = Some(cw);
     }
+    // Captured before `dc` moves into the driver: the cap the run ACTUALLY
+    // uses (post `--max-rounds`), for the contract's effective_config.
+    let max_rounds = dc.max_tool_rounds as u32;
     let mut driver = TurnDriver::new(dc);
     let started = Instant::now();
     driver
@@ -237,7 +272,10 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             }
         }
     };
-    let wall_secs = started.elapsed().as_secs_f64();
+    let elapsed = started.elapsed();
+    let wall_secs = elapsed.as_secs_f64();
+    // Contract timing is integral milliseconds.
+    let wall_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
     // 6. Emit the trace record (one JSONL line), including the per-tool-call
     //    trajectory (name/args-digest/ok/duration) the TurnDriver now lends —
@@ -247,6 +285,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // the agent as having done nothing). `Err` is only a spawn/thread failure
     // with no trajectory at all.
     let o_opt = outcome.as_ref().ok();
+    let clean = matches!(&outcome, Ok(o) if o.error.is_none());
     let (status, error) = match &outcome {
         Ok(o) if o.error.is_none() => ("completed", None),
         Ok(o) => ("failed", o.error.clone()),
@@ -295,20 +334,76 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         "trajectory": trajectory,
         "error": error,
     });
+    // 7. W0 (#1511): the per-round parse-signal trace events plus EXACTLY ONE
+    //    contract record (the `contract_version` key marks it — the external
+    //    evaluator rejects a trace with zero or several), appended alongside
+    //    the solve_result line above, never replacing it.
+    let mut trace_lines: Vec<serde_json::Value> = vec![record];
+    if let Some(o) = o_opt {
+        trace_lines.extend(
+            o.parse_signals
+                .iter()
+                .map(solve_contract::parse_signal_line),
+        );
+    }
+    // Outcome: structural, from the TYPED class the driver carried over. A
+    // spawn/thread `Err` never reached a dispatch → no class → harness_error.
+    let outcome_label = solve_contract::outcome_label(
+        clean,
+        match &outcome {
+            Ok(o) => o.error_class,
+            Err(_) => None,
+        },
+    );
+    // effective_model: the response body's `model` field when the backend
+    // reported one (the served reality), else the request model — a turn
+    // that never got a response body has nothing truer to report.
+    let effective_model = o_opt
+        .and_then(|o| o.served_model.clone())
+        .unwrap_or_else(|| model.clone());
+    // Digest: operator-supplied only (flag > NEWT_MODEL_DIGEST env twin);
+    // absent ⇒ the field is omitted — never fabricated.
+    let digest_env = std::env::var("NEWT_MODEL_DIGEST").ok();
+    let model_digest = resolve_model_digest(args.model_digest.as_deref(), digest_env.as_deref());
+    trace_lines.push(solve_contract::contract_record(
+        &solve_contract::ContractInputs {
+            requested_model: &model,
+            effective_model: &effective_model,
+            model_digest: model_digest.as_deref(),
+            backend_name: &backend.name,
+            backend_kind: kind.label(),
+            outcome: outcome_label,
+            context_window: args.context_window.map(|c| c as u32),
+            tenacity: &tenacity_level,
+            ocap: if lane == HeadlessLane::Yolo {
+                "off"
+            } else {
+                "on"
+            },
+            max_rounds,
+            wall_ms,
+            gen_tokens: o_opt
+                .and_then(|o| o.usage.as_ref())
+                .map(|u| u64::from(u.output_tokens)),
+        },
+    ));
     if let Some(path) = &args.events {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .with_context(|| format!("opening --events {}", path.display()))?;
-        writeln!(f, "{record}").context("writing events line")?;
+        for line in &trace_lines {
+            writeln!(f, "{line}").context("writing events line")?;
+        }
     }
-    // Always echo the record to stdout too, so a manual bootstrap run is legible.
-    println!("{record}");
+    // Always echo the trace to stdout too, so a manual bootstrap run is legible.
+    for line in &trace_lines {
+        println!("{line}");
+    }
 
     // Clean completion → 0; any failure (inference error carried on the outcome,
     // or a spawn/thread Err) → 1.
-    let clean = matches!(&outcome, Ok(o) if o.error.is_none());
     Ok(if clean { 0 } else { 1 })
 }
 
@@ -433,6 +528,28 @@ mod tests {
             ..Default::default()
         };
         assert!(pick_backend(&cfg).is_none());
+    }
+
+    /// W0 (#1511): digest resolution is flag > env twin, blank falls through,
+    /// and NOTHING is ever derived — no value in ⇒ no digest out.
+    #[test]
+    fn resolve_model_digest_flag_beats_env_and_never_invents() {
+        assert_eq!(
+            resolve_model_digest(Some("sha-flag"), Some("sha-env")).as_deref(),
+            Some("sha-flag")
+        );
+        assert_eq!(
+            resolve_model_digest(None, Some(" sha-env ")).as_deref(),
+            Some("sha-env"),
+            "env twin used when no flag; whitespace trimmed"
+        );
+        assert_eq!(
+            resolve_model_digest(Some("  "), Some("sha-env")).as_deref(),
+            Some("sha-env"),
+            "a blank flag falls through to the env twin"
+        );
+        assert_eq!(resolve_model_digest(None, None), None);
+        assert_eq!(resolve_model_digest(Some(""), Some("")), None);
     }
 
     #[test]

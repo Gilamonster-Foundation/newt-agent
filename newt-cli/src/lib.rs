@@ -30,6 +30,9 @@ mod new_project;
 mod ocap_cmd;
 mod skills;
 mod solve;
+// W0 (#1511): the pure emitter-side declaration of the observability
+// contract (`contract_version: "1"`) `newt solve` appends to `--events`.
+mod solve_contract;
 pub mod stack;
 pub mod stdio_guard;
 mod summarizer_cmd;
@@ -646,6 +649,12 @@ pub enum Command {
         /// during generation.
         #[arg(long, value_name = "N")]
         context_window: Option<usize>,
+        /// Operator-supplied sha256 of the weights actually served (GGUF file
+        /// hash / HF revision SHA) for the contract record's `model_digest`
+        /// (W0 #1511). Env twin: `NEWT_MODEL_DIGEST`. Omitted from the record
+        /// when absent — never fabricated.
+        #[arg(long, value_name = "SHA256")]
+        model_digest: Option<String>,
     },
     /// Print resolved config.
     Config,
@@ -1362,6 +1371,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             events,
             max_rounds,
             context_window,
+            model_digest,
         } => {
             let code = solve::run(solve::SolveArgs {
                 cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
@@ -1373,6 +1383,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 events,
                 max_rounds,
                 context_window,
+                model_digest,
             })
             .await?;
             if code != 0 {
