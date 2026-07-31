@@ -5,6 +5,8 @@ Notable changes to the newt-agent workspace. Format follows
 (`0.MINOR.PATCH`, pre-1.0). The workspace version in the top-level `Cargo.toml`
 is inherited by all internal crates.
 
+Each release also leaves a **witnessed benchmark record** under [`docs/releases/`](docs/releases/) (template: [`docs/releases/TEMPLATE.md`](docs/releases/TEMPLATE.md)) — the reproducible, digest-pinned scoreboard for that version.
+
 ## [Unreleased]
 
 ## [0.7.6] — 2026-07-31
