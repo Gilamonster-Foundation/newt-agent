@@ -311,6 +311,20 @@ pub fn base_tenacity() -> Tenacity {
     resolve_tenacity(None, None, config.as_ref(), family.as_deref())
 }
 
+/// Attribute the active model's family for per-family `[tenacity]` resolution and
+/// install it (`ACTIVE_FAMILY`). The card's `family` wins when a built-in card
+/// names one; else the family is inferred from the model NAME against the
+/// configured `[tenacity.families]` keys. Call at every point a session settles on
+/// a model — solve AND chat (#1139: chat previously never did this, so per-family
+/// defaults silently did not apply there). `config == None` ⇒ only a card family.
+pub fn attribute_active_family(config: Option<&TenacityConfig>, model: &str) {
+    let card_family = crate::model_card::builtin_card(model).and_then(|c| c.family);
+    let family = config
+        .and_then(|t| t.family_for(model, card_family.as_deref()))
+        .or(card_family);
+    set_active_model_family(family);
+}
+
 /// A complete snapshot of **every** mutable global that feeds
 /// [`effective_tenacity`] — the CLI override, the persona layer, the `[tenacity]`
 /// config, and the active model family. The test guard snapshots and restores
@@ -446,6 +460,44 @@ mod tests {
             Tenacity::Standard
         );
         assert_eq!(cfg(None, &[]).resolve(None), Tenacity::Standard);
+    }
+
+    #[test]
+    fn attribute_active_family_installs_card_then_substring_then_clears() {
+        use crate::test_guard::GlobalSettingsGuard;
+        let _g = GlobalSettingsGuard::acquire();
+
+        // Card path: with no config at all (`config == None` ⇒ only a card family),
+        // a built-in card that names a family installs it. ornith-1.0-35b → qwen3.
+        set_active_model_family(None);
+        attribute_active_family(None, "ornith-1.0-35b");
+        assert_eq!(
+            active_model_family().as_deref(),
+            Some("qwen3"),
+            "the built-in card's declared family is installed"
+        );
+
+        // Substring path: no card for this name, but the model NAME contains a
+        // configured `[tenacity.families]` key → that family is inferred + installed.
+        // This is the #1139 chat fix — chat now attributes family exactly as solve does.
+        let c = cfg(None, &[("qwen3", Tenacity::Relentless)]);
+        set_active_model_family(None);
+        attribute_active_family(Some(&c), "Qwen3-Coder-30B");
+        assert_eq!(
+            active_model_family().as_deref(),
+            Some("qwen3"),
+            "a family is inferred from the model name against the config families"
+        );
+
+        // No card + no matching family → ACTIVE_FAMILY is CLEARED (not left stale),
+        // so effective_tenacity falls back to the config default / Standard.
+        set_active_model_family(Some("stale".to_string()));
+        attribute_active_family(Some(&c), "mystery-model-7b");
+        assert_eq!(
+            active_model_family(),
+            None,
+            "an unrecognized model clears the family rather than leaving a stale one"
+        );
     }
 
     #[test]

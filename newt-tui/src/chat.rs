@@ -609,6 +609,12 @@ pub(crate) fn run_chat(
         print_newt(&line, color, verbose);
     }
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+    // #1139: attribute the resolved model's family so per-family `[tenacity]`
+    // config defaults apply in CHAT, exactly as they do in solve. This was the
+    // ACTIVE_FAMILY gap — `set_active_model_family` was called ONLY in solve, so
+    // chat left the family None and a `[tenacity.families]` default silently never
+    // applied to an interactive session.
+    newt_core::tenacity::attribute_active_family(cfg.tenacity.as_ref(), &inf_model);
     // #1199: the server-declared window from adopt, fresh per session — feeds
     // the budget without the persisted cache.
     let mut inf_context_window: Option<u32> = choice.context_window;
@@ -3521,25 +3527,17 @@ pub(crate) fn run_chat(
                                     }
                                 }
                                 // Recompute + report from FRESH runtime state (§2).
-                                let cognition = newt_core::cognition::effective_cognition();
-                                let tenacity = newt_core::tenacity::effective_tenacity();
-                                let persona_name =
-                                    active_persona.as_ref().map_or("none", |p| p.name.as_str());
-                                let crew = if std::env::var("NEWT_TEAM").is_ok() {
-                                    "on"
-                                } else {
-                                    "off"
-                                };
-                                print_newt(
-                                    &format!(
-                                        "psyche · persona {persona_name} · cognition {} · \
-                                         tenacity {} · crew {crew}",
-                                        cognition.map_or("off", |c| c.label()),
-                                        tenacity.label(),
-                                    ),
-                                    color,
-                                    verbose,
+                                // #1139: one resolved snapshot is the single source
+                                // for this apply line — the same render `/psyche` and
+                                // `solve` read, not a re-derivation of each dial here.
+                                let snap = newt_core::RuntimeSettingsSnapshot::resolve(
+                                    &cfg,
+                                    active_persona.as_ref().map(|p| p.name.as_str()),
+                                    active_persona
+                                        .as_ref()
+                                        .and_then(|p| p.profile.backend.as_deref()),
                                 );
+                                print_newt(&snap.summary(), color, verbose);
                             }
                         }
                         #[cfg(not(feature = "rich-tui"))]

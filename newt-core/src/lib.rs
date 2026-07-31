@@ -63,6 +63,7 @@ pub mod roadmap_eval;
 pub mod roadmap_file;
 pub mod role_profile;
 pub mod router;
+pub mod runtime;
 pub mod sas_confirm;
 pub mod sas_transcript;
 pub mod scope_grounding;
@@ -171,6 +172,7 @@ pub use navigator::{
     RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
 };
 pub use project_map::ProjectMapProvider;
+pub use runtime::{BackendState, RuntimeSettingsSnapshot};
 pub use tenacity::Tenacity;
 pub use where_is::{
     build_where_is_index, build_where_is_index_from_workspace, execute_where_is,
