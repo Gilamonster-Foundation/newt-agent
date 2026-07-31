@@ -284,6 +284,78 @@ pub fn effective_tenacity() -> Tenacity {
     resolve_tenacity(cli, persona, config.as_ref(), family.as_deref())
 }
 
+/// The installed `[tenacity]` config, if any (for status rendering + the snapshot
+/// used by the test guard). Read accessor for the otherwise write-only
+/// [`TENACITY_CONFIG`].
+#[must_use]
+pub fn tenacity_config() -> Option<TenacityConfig> {
+    TENACITY_CONFIG.lock().ok().and_then(|s| s.clone())
+}
+
+/// The active model family, if any (for the config-panel projection + the test
+/// guard snapshot). Read accessor for the otherwise write-only [`ACTIVE_FAMILY`].
+#[must_use]
+pub fn active_model_family() -> Option<String> {
+    ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone())
+}
+
+/// Tenacity with **no CLI override and no persona layer** — just the config
+/// per-family override for the active family, the config default, then `Standard`.
+/// This is the value a persona that declares no `tenacity:` inherits, so the
+/// config panel projects a selected persona's effective tenacity as
+/// `persona.tenacity.unwrap_or(base_tenacity())`.
+#[must_use]
+pub fn base_tenacity() -> Tenacity {
+    let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
+    let family = ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone());
+    resolve_tenacity(None, None, config.as_ref(), family.as_deref())
+}
+
+/// A complete snapshot of **every** mutable global that feeds
+/// [`effective_tenacity`] — the CLI override, the persona layer, the `[tenacity]`
+/// config, and the active model family. The test guard snapshots and restores
+/// this as one unit so no tenacity-resolution input can leak between tests (the
+/// earlier piecemeal guard missed `TENACITY_CONFIG` + `ACTIVE_FAMILY`, which
+/// `Config::resolve` and the `solve` model-selection path mutate process-wide).
+#[doc(hidden)]
+pub struct TenacityRuntimeSnapshot {
+    cli: Option<Tenacity>,
+    persona: Option<Tenacity>,
+    config: Option<TenacityConfig>,
+    active_family: Option<String>,
+}
+
+/// Snapshot all four tenacity-resolution globals (see [`TenacityRuntimeSnapshot`]).
+#[doc(hidden)]
+#[must_use]
+pub fn snapshot_runtime_state() -> TenacityRuntimeSnapshot {
+    TenacityRuntimeSnapshot {
+        cli: CLI_TENACITY.lock().ok().and_then(|s| *s),
+        persona: PERSONA_TENACITY.lock().ok().and_then(|s| *s),
+        config: TENACITY_CONFIG.lock().ok().and_then(|s| s.clone()),
+        active_family: ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone()),
+    }
+}
+
+/// Restore all four tenacity-resolution globals from a snapshot (see
+/// [`TenacityRuntimeSnapshot`]). Total: every input is overwritten, so a test
+/// that installed a config / family / override is fully undone.
+#[doc(hidden)]
+pub fn restore_runtime_state(snapshot: TenacityRuntimeSnapshot) {
+    if let Ok(mut s) = CLI_TENACITY.lock() {
+        *s = snapshot.cli;
+    }
+    if let Ok(mut s) = PERSONA_TENACITY.lock() {
+        *s = snapshot.persona;
+    }
+    if let Ok(mut s) = TENACITY_CONFIG.lock() {
+        *s = snapshot.config;
+    }
+    if let Ok(mut s) = ACTIVE_FAMILY.lock() {
+        *s = snapshot.active_family;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +528,93 @@ mod tests {
         // Resolving that inferred family gives the per-family level.
         let fam = c.family_for("qwen3-coder_30b", None);
         assert_eq!(c.resolve(fam.as_deref()), Tenacity::Standard);
+    }
+
+    #[test]
+    fn snapshot_restore_round_trips_every_tenacity_resolution_global() {
+        // CR3 area 4: the guard must isolate ALL FOUR inputs to effective_tenacity
+        // — CLI override, persona layer, TENACITY_CONFIG, ACTIVE_FAMILY. Exercise
+        // the exact snapshot/restore the guard's Drop runs.
+        use crate::test_guard::GlobalSettingsGuard;
+        let _g = GlobalSettingsGuard::acquire(); // serialize + final cleanup
+
+        // Known-empty baseline → snapshot it.
+        clear_cli_tenacity();
+        set_persona_tenacity(None);
+        set_tenacity_config(TenacityConfig::default());
+        set_active_model_family(None);
+        let snap = snapshot_runtime_state();
+
+        // Mutate every axis.
+        set_cli_tenacity(Tenacity::Relentless);
+        set_persona_tenacity(Some(Tenacity::Insistent));
+        set_tenacity_config(cfg(
+            Some(Tenacity::Relaxed),
+            &[("nemotron", Tenacity::Relentless)],
+        ));
+        set_active_model_family(Some("nemotron".to_string()));
+        assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
+        assert_eq!(persona_tenacity(), Some(Tenacity::Insistent));
+        assert!(tenacity_config().is_some_and(|c| !c.families.is_empty()));
+        assert_eq!(active_model_family().as_deref(), Some("nemotron"));
+
+        // Restore — exactly what GlobalSettingsGuard::drop does — undoes all four.
+        restore_runtime_state(snap);
+        assert_eq!(cli_tenacity(), None, "CLI tenacity restored");
+        assert_eq!(persona_tenacity(), None, "persona tenacity restored");
+        assert_eq!(
+            tenacity_config(),
+            Some(TenacityConfig::default()),
+            "TENACITY_CONFIG restored (the gap the piecemeal guard missed)"
+        );
+        assert_eq!(active_model_family(), None, "ACTIVE_FAMILY restored");
+    }
+
+    #[test]
+    fn base_tenacity_ignores_cli_and_persona_overrides() {
+        // The config-panel projection uses base_tenacity() as the value a persona
+        // inherits when it declares none: it must strip the CLI + persona layers.
+        use crate::test_guard::GlobalSettingsGuard;
+        let _g = GlobalSettingsGuard::acquire();
+        set_tenacity_config(cfg(
+            Some(Tenacity::Relaxed),
+            &[("nemotron", Tenacity::Relentless)],
+        ));
+        set_active_model_family(Some("nemotron".to_string()));
+        set_cli_tenacity(Tenacity::Standard); // present…
+        set_persona_tenacity(Some(Tenacity::Insistent)); // …present…
+        assert_eq!(
+            base_tenacity(),
+            Tenacity::Relentless,
+            "base strips CLI + persona, leaving the per-family override"
+        );
+        set_active_model_family(None);
+        assert_eq!(
+            base_tenacity(),
+            Tenacity::Relaxed,
+            "no family → the config default"
+        );
+    }
+
+    #[test]
+    fn guarded_state_is_restored_even_when_a_test_panics() {
+        // CR3 area 4: restoration must survive a panic (Drop runs during unwind).
+        use crate::test_guard::GlobalSettingsGuard;
+        let sentinel = "panic-family-sentinel";
+        let result = std::panic::catch_unwind(|| {
+            let _g = GlobalSettingsGuard::acquire();
+            set_active_model_family(Some(sentinel.to_string()));
+            set_cli_tenacity(Tenacity::Relentless);
+            assert_eq!(active_model_family().as_deref(), Some(sentinel));
+            panic!("intentional panic inside a guarded test");
+        });
+        assert!(result.is_err(), "the guarded closure panicked as intended");
+        let _g = GlobalSettingsGuard::acquire();
+        assert_ne!(
+            active_model_family().as_deref(),
+            Some(sentinel),
+            "GlobalSettingsGuard::drop restored ACTIVE_FAMILY during unwind"
+        );
     }
 
     #[test]

@@ -3396,72 +3396,138 @@ pub(crate) fn run_chat(
                         // text /psyche + per-dial commands instead.
                         #[cfg(feature = "rich-tui")]
                         {
-                            let persona_names: Vec<String> = persona_store
+                            use config_panel::{PanelOutcome, PersonaAction, PersonaChoice};
+                            // review-3 §3: hand the panel each persona's declarations
+                            // so it can PROJECT the selected persona's effective
+                            // posture, plus the config/family tenacity base.
+                            let personas: Vec<PersonaChoice> = persona_store
                                 .list()
-                                .map(|v| v.into_iter().map(|s| s.name).collect())
+                                .map(|v| {
+                                    v.into_iter()
+                                        .filter_map(|s| persona_store.load(&s.name).ok())
+                                        .map(|p| PersonaChoice {
+                                            name: p.name.clone(),
+                                            cognition: p.profile.cognition,
+                                            tenacity: p.profile.tenacity,
+                                            backend: p.profile.backend.clone(),
+                                            crew: p.profile.crew,
+                                        })
+                                        .collect()
+                                })
                                 .unwrap_or_default();
                             let backend = active_backend_name(&cfg);
-                            // review-2 #1/#4: hand the panel the EFFECTIVE resolved
-                            // posture + the active persona, so it displays/saves the
-                            // real values and can tell Keep from Switch/Clear.
                             let current_persona = active_persona.as_ref().map(|p| p.name.clone());
-                            let eff_cognition = newt_core::cognition::effective_cognition();
-                            let eff_tenacity = newt_core::tenacity::effective_tenacity();
-                            let result = run_psyche_panel(
-                                persona_names,
+                            let base_tenacity = newt_core::tenacity::base_tenacity();
+                            // review-3 §1: the ONLY filesystem I/O, injected so a
+                            // failed write keeps the panel open and mutates nothing.
+                            let persist =
+                                |name: &str, content: &str, overwrite: bool| match persona_store
+                                    .save(name, content, overwrite)
+                                {
+                                    Ok(_) => config_panel::SaveResult::Saved {
+                                        name: name.to_string(),
+                                    },
+                                    Err(PersonaSaveError::Exists) => {
+                                        config_panel::SaveResult::Exists {
+                                            name: name.to_string(),
+                                        }
+                                    }
+                                    Err(PersonaSaveError::InvalidName(m)) => {
+                                        config_panel::SaveResult::InvalidName(m)
+                                    }
+                                    Err(PersonaSaveError::Io(e)) => {
+                                        config_panel::SaveResult::Failed(e)
+                                    }
+                                };
+                            let outcome = run_psyche_panel(
+                                personas,
                                 current_persona,
                                 backend,
-                                eff_cognition,
-                                eff_tenacity,
+                                base_tenacity,
+                                persist,
                                 color,
                                 verbose,
                             );
-                            if let Some((name, content)) = result.saved {
-                                let msg = match persona_store.save(&name, &content) {
-                                    Ok(_) => format!("saved persona '{name}'"),
-                                    Err(e) => format!("save failed: {e}"),
-                                };
-                                print_newt(&msg, color, verbose);
-                            }
-                            // review-2 #4: apply the persona action the panel
-                            // returned — Keep does nothing, Clear drops the persona,
-                            // Switch activates one. Clear/Switch both re-route the
-                            // backend to the new baseline afterward.
-                            let persona_command = match result.persona {
-                                PsychePersonaAction::Keep => None,
-                                PsychePersonaAction::Clear => Some("persona clear".to_string()),
-                                PsychePersonaAction::Switch(name) => {
-                                    Some(format!("persona set {name} --keep-context"))
+                            // Commit (review-3 §1/§2): the file (if any) was persisted
+                            // inside the panel; dials were applied inside run() on an
+                            // explicit apply. Here we report the save, apply the persona
+                            // action, reroute the backend, then report the committed
+                            // posture from FRESH runtime state (never the working copy).
+                            let (persona_action, saved_name, applied) = match outcome {
+                                PanelOutcome::Cancelled => (None, None, false),
+                                PanelOutcome::Saved { name } => (None, Some(name), false),
+                                PanelOutcome::Applied { persona } => (Some(persona), None, true),
+                                PanelOutcome::SavedAndApplied { name, persona } => {
+                                    (Some(persona), Some(name), true)
                                 }
                             };
-                            if let Some(cmd) = persona_command {
-                                let mut reset_ctx = ConversationResetContext {
-                                    memory: &mut memory,
-                                    system: &mut system,
-                                    conversation_id: &mut active_conversation_id,
-                                    mode_states: &conversation_mode_states,
-                                };
-                                match handle_persona_command(
-                                    &cmd,
-                                    workspace,
-                                    &persona_store,
-                                    &mut active_persona,
-                                    &mut reset_ctx,
-                                ) {
-                                    Ok(msg) => print_newt(&msg, color, verbose),
-                                    Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                            if let Some(name) = &saved_name {
+                                print_newt(&format!("saved persona '{name}'"), color, verbose);
+                            }
+                            if !applied {
+                                if saved_name.is_none() {
+                                    print_newt("psyche edit cancelled", color, verbose);
                                 }
-                                let _ = apply_persona_backend(
-                                    active_persona.as_ref(),
-                                    &base_provider,
-                                    &base_model,
-                                    &cfg,
-                                    &mut choice,
-                                    &mut inf_url,
-                                    &mut inf_model,
-                                    &mut inf_kind,
-                                    &mut inf_key,
-                                    &mut inf_context_window,
+                            } else {
+                                if let Some(action) = persona_action {
+                                    let persona_command = match action {
+                                        PersonaAction::Keep => None,
+                                        PersonaAction::Clear => Some("persona clear".to_string()),
+                                        PersonaAction::Switch(name) => {
+                                            Some(format!("persona set {name} --keep-context"))
+                                        }
+                                    };
+                                    if let Some(cmd) = persona_command {
+                                        let mut reset_ctx = ConversationResetContext {
+                                            memory: &mut memory,
+                                            system: &mut system,
+                                            conversation_id: &mut active_conversation_id,
+                                            mode_states: &conversation_mode_states,
+                                        };
+                                        let msg = match handle_persona_command(
+                                            &cmd,
+                                            workspace,
+                                            &persona_store,
+                                            &mut active_persona,
+                                            &mut reset_ctx,
+                                        ) {
+                                            Ok(msg) => msg,
+                                            Err(e) => format!("error: {e}"),
+                                        };
+                                        print_newt(&msg, color, verbose);
+                                        let _ = apply_persona_backend(
+                                            active_persona.as_ref(),
+                                            &base_provider,
+                                            &base_model,
+                                            &cfg,
+                                            &mut choice,
+                                            &mut inf_url,
+                                            &mut inf_model,
+                                            &mut inf_kind,
+                                            &mut inf_key,
+                                            &mut inf_context_window,
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                // Recompute + report from FRESH runtime state (§2).
+                                let cognition = newt_core::cognition::effective_cognition();
+                                let tenacity = newt_core::tenacity::effective_tenacity();
+                                let persona_name =
+                                    active_persona.as_ref().map_or("none", |p| p.name.as_str());
+                                let crew = if std::env::var("NEWT_TEAM").is_ok() {
+                                    "on"
+                                } else {
+                                    "off"
+                                };
+                                print_newt(
+                                    &format!(
+                                        "psyche · persona {persona_name} · cognition {} · \
+                                         tenacity {} · crew {crew}",
+                                        cognition.map_or("off", |c| c.label()),
+                                        tenacity.label(),
+                                    ),
                                     color,
                                     verbose,
                                 );
