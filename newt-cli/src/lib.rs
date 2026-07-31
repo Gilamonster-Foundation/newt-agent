@@ -840,6 +840,19 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // SAFETY: single-threaded before any async work or config resolution.
         unsafe { std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir) };
     }
+    // #1320: `--config <file>` is otherwise only forwarded to the path-taking
+    // subcommands (solve/config/mcp/doctor/…) via `Config::load`; it never reaches
+    // the arg-free `Config::resolve()` that chat/plan/worker use, so `newt --config
+    // X` silently kept resolving `~/.newt` for the interactive session. Promote it
+    // to the process-global `$NEWT_CONFIG` pin (`candidate_paths[0]`) — the same
+    // normalization `--config-dir` gets above — so every entry point resolves the
+    // operator's file identically. `$NEWT_CONFIG` is already the operator-explicit
+    // "Trusted" base in `resolve()`.
+    if let Some(file) = cli.config.as_deref() {
+        let file = abs_grant_path(file);
+        // SAFETY: single-threaded before any async work or config resolution.
+        unsafe { std::env::set_var("NEWT_CONFIG", file) };
+    }
 
     // Resolve the venv: --venv flag wins, then fall back to an already-activated $VIRTUAL_ENV.
     // Set NEWT_VENV so the TUI can inject it into the agent-bridle confined shell (which does

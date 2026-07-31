@@ -410,11 +410,27 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
 /// Pick the backend to drive: `NEWT_PROVIDER` by name if set and present, else
 /// the first configured backend that has an endpoint.
 fn pick_backend(cfg: &Config) -> Option<&newt_core::config::BackendConfig> {
+    // 1) Operator / live override: `NEWT_PROVIDER` names a backend.
     if let Ok(name) = std::env::var("NEWT_PROVIDER") {
         if let Some(b) = cfg.backends.iter().find(|b| b.name == name) {
             return Some(b);
         }
     }
+    // 2) #1320: honor the config's `default_backend` — the same rung chat's
+    //    `resolve_backend_choice` uses — so `newt --config X solve` routes to X's
+    //    declared default, not merely the first endpoint-bearing entry. Without
+    //    this, solve matched chat only by the coincidence of file layout (sol being
+    //    listed first). Skip an unusable (endpointless) default and fall through.
+    if let Some(name) = &cfg.default_backend {
+        if let Some(b) = cfg
+            .backends
+            .iter()
+            .find(|b| b.name == *name && !b.endpoint.is_empty())
+        {
+            return Some(b);
+        }
+    }
+    // 3) Fallback: the first usable (endpoint-bearing) backend.
     cfg.backends.iter().find(|b| !b.endpoint.is_empty())
 }
 
@@ -550,6 +566,39 @@ mod tests {
         );
         assert_eq!(resolve_model_digest(None, None), None);
         assert_eq!(resolve_model_digest(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn pick_backend_honors_default_backend_over_first_endpoint() {
+        // #1320: `--config X` sets `default_backend`; solve must route to it, not to
+        // the first endpoint-bearing entry (the coincidence that masked the bug).
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let cfg = Config {
+            default_backend: Some("sol".to_string()),
+            backends: vec![
+                backend("other", "https://other:9000"), // first + endpoint-bearing
+                backend("sol", "https://api.openai.com"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            pick_backend(&cfg).expect("a backend").name,
+            "sol",
+            "default_backend wins over the first endpoint-bearing entry"
+        );
+    }
+
+    #[test]
+    fn pick_backend_default_backend_falls_through_when_unusable() {
+        // A `default_backend` naming an endpointless entry is skipped for the first
+        // usable one, rather than returning an unreachable backend.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let cfg = Config {
+            default_backend: Some("ghost".to_string()),
+            backends: vec![backend("ghost", ""), backend("real", "http://r:1")],
+            ..Default::default()
+        };
+        assert_eq!(pick_backend(&cfg).expect("a backend").name, "real");
     }
 
     #[test]
