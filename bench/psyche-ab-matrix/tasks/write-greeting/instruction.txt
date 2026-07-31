@@ -1,0 +1,1 @@
+Create a file named greeting.txt in the current directory containing a friendly one-line greeting. Then stop.

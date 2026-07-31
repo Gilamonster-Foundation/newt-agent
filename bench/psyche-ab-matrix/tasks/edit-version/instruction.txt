@@ -1,0 +1,1 @@
+Edit the file config.txt in the current directory: change the line "version = 1" to "version = 2". Use your editing tools to make the change, then stop.
