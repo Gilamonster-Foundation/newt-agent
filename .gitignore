@@ -88,3 +88,4 @@ wip/
 
 # Cursor agent test target (local)
 target-cursor-tests/
+.worktrees/
