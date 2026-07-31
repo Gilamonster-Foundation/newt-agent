@@ -3391,78 +3391,90 @@ pub(crate) fn run_chat(
                         // the psyche operator dials. It applies dials through the
                         // same globals the slash commands do (picked up next turn,
                         // no re-resolve); persona select + save come back for us to
-                        // act on, since the session owns that state.
-                        let persona_names: Vec<String> = persona_store
-                            .list()
-                            .map(|v| v.into_iter().map(|s| s.name).collect())
-                            .unwrap_or_default();
-                        let backend = active_backend_name(&cfg);
-                        // review-2 #1/#4: hand the panel the EFFECTIVE resolved
-                        // posture + the active persona, so it displays/saves the
-                        // real values and can tell Keep from Switch/Clear.
-                        let current_persona = active_persona.as_ref().map(|p| p.name.clone());
-                        let eff_cognition = newt_core::cognition::effective_cognition();
-                        let eff_tenacity = newt_core::tenacity::effective_tenacity();
-                        let result = run_psyche_panel(
-                            persona_names,
-                            current_persona,
-                            backend,
-                            eff_cognition,
-                            eff_tenacity,
-                            color,
-                            verbose,
-                        );
-                        if let Some((name, content)) = result.saved {
-                            match persona_store.save(&name, &content) {
-                                Ok(_) => {
-                                    print_newt(&format!("saved persona '{name}'"), color, verbose);
-                                }
-                                Err(e) => print_newt(&format!("save failed: {e}"), color, verbose),
-                            }
-                        }
-                        // review-2 #4: apply the persona action the panel returned —
-                        // Keep does nothing, Clear drops the persona, Switch activates
-                        // one. Clear/Switch both re-route the backend to the new
-                        // baseline afterward.
-                        let persona_command = match result.persona {
-                            PsychePersonaAction::Keep => None,
-                            PsychePersonaAction::Clear => Some("persona clear".to_string()),
-                            PsychePersonaAction::Switch(name) => {
-                                Some(format!("persona set {name} --keep-context"))
-                            }
-                        };
-                        if let Some(cmd) = persona_command {
-                            let mut reset_ctx = ConversationResetContext {
-                                memory: &mut memory,
-                                system: &mut system,
-                                conversation_id: &mut active_conversation_id,
-                                mode_states: &conversation_mode_states,
-                            };
-                            match handle_persona_command(
-                                &cmd,
-                                workspace,
-                                &persona_store,
-                                &mut active_persona,
-                                &mut reset_ctx,
-                            ) {
-                                Ok(msg) => print_newt(&msg, color, verbose),
-                                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
-                            }
-                            let _ = apply_persona_backend(
-                                active_persona.as_ref(),
-                                &base_provider,
-                                &base_model,
-                                &cfg,
-                                &mut choice,
-                                &mut inf_url,
-                                &mut inf_model,
-                                &mut inf_kind,
-                                &mut inf_key,
-                                &mut inf_context_window,
+                        // act on, since the session owns that state. Rich-tui only —
+                        // the lean build has no ratatui surface, so it points at the
+                        // text /psyche + per-dial commands instead.
+                        #[cfg(feature = "rich-tui")]
+                        {
+                            let persona_names: Vec<String> = persona_store
+                                .list()
+                                .map(|v| v.into_iter().map(|s| s.name).collect())
+                                .unwrap_or_default();
+                            let backend = active_backend_name(&cfg);
+                            // review-2 #1/#4: hand the panel the EFFECTIVE resolved
+                            // posture + the active persona, so it displays/saves the
+                            // real values and can tell Keep from Switch/Clear.
+                            let current_persona = active_persona.as_ref().map(|p| p.name.clone());
+                            let eff_cognition = newt_core::cognition::effective_cognition();
+                            let eff_tenacity = newt_core::tenacity::effective_tenacity();
+                            let result = run_psyche_panel(
+                                persona_names,
+                                current_persona,
+                                backend,
+                                eff_cognition,
+                                eff_tenacity,
                                 color,
                                 verbose,
                             );
+                            if let Some((name, content)) = result.saved {
+                                let msg = match persona_store.save(&name, &content) {
+                                    Ok(_) => format!("saved persona '{name}'"),
+                                    Err(e) => format!("save failed: {e}"),
+                                };
+                                print_newt(&msg, color, verbose);
+                            }
+                            // review-2 #4: apply the persona action the panel
+                            // returned — Keep does nothing, Clear drops the persona,
+                            // Switch activates one. Clear/Switch both re-route the
+                            // backend to the new baseline afterward.
+                            let persona_command = match result.persona {
+                                PsychePersonaAction::Keep => None,
+                                PsychePersonaAction::Clear => Some("persona clear".to_string()),
+                                PsychePersonaAction::Switch(name) => {
+                                    Some(format!("persona set {name} --keep-context"))
+                                }
+                            };
+                            if let Some(cmd) = persona_command {
+                                let mut reset_ctx = ConversationResetContext {
+                                    memory: &mut memory,
+                                    system: &mut system,
+                                    conversation_id: &mut active_conversation_id,
+                                    mode_states: &conversation_mode_states,
+                                };
+                                match handle_persona_command(
+                                    &cmd,
+                                    workspace,
+                                    &persona_store,
+                                    &mut active_persona,
+                                    &mut reset_ctx,
+                                ) {
+                                    Ok(msg) => print_newt(&msg, color, verbose),
+                                    Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                                }
+                                let _ = apply_persona_backend(
+                                    active_persona.as_ref(),
+                                    &base_provider,
+                                    &base_model,
+                                    &cfg,
+                                    &mut choice,
+                                    &mut inf_url,
+                                    &mut inf_model,
+                                    &mut inf_kind,
+                                    &mut inf_key,
+                                    &mut inf_context_window,
+                                    color,
+                                    verbose,
+                                );
+                            }
                         }
+                        #[cfg(not(feature = "rich-tui"))]
+                        print_newt(
+                            "the psyche panel needs an interactive rich terminal — use \
+                             /psyche for the text view, or /cognition / /tenacity to \
+                             change the dials.",
+                            color,
+                            verbose,
+                        );
                         surface.save_history();
                         println!();
                         continue;

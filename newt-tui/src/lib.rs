@@ -130,8 +130,13 @@ pub fn run_crew_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
     crew_form::run_edit(name, color)
 }
 
-/// The persona action the config panel returned (ungated mirror of the panel's
-/// own enum, so the non-rich fallback and the caller don't need the feature).
+/// The persona action the config panel returned (a mirror of the panel's own
+/// enum so the caller doesn't need the `config_panel` types). **Rich-tui only:**
+/// the lean (`--no-default-features`) build has no panel, so the `/psyche edit`
+/// handler prints a fallback and never constructs `Clear` / `Switch` — gating
+/// the whole panel path here (rather than an `allow(dead_code)`) keeps the lean
+/// tier honestly warning-clean.
+#[cfg(feature = "rich-tui")]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) enum PsychePersonaAction {
     #[default]
@@ -141,7 +146,8 @@ pub(crate) enum PsychePersonaAction {
 }
 
 /// What the config panel asked the caller (the session loop) to do, beyond the
-/// dials it applied itself. Ungated so the non-rich fallback returns an empty one.
+/// dials it applied itself. Rich-tui only (see [`PsychePersonaAction`]).
+#[cfg(feature = "rich-tui")]
 #[derive(Debug, Default)]
 pub(crate) struct PsychePanelResult {
     /// What to do with the active persona (keep / clear / switch).
@@ -151,13 +157,15 @@ pub(crate) struct PsychePanelResult {
 }
 
 /// Open the harness config panel (#14) for the psyche operator dials, or — when
-/// the rich TTY surface is unavailable (piped / headless / lean /
-/// `--no-default-features`) — print a short note pointing at the text `/psyche`
-/// view and the per-dial commands. The panel applies (only the changed) dials
-/// through the same setters the flags / slash commands use, so there is no
-/// panel-only state; the persona action + any save are returned for the caller to
-/// act on. Takes the EFFECTIVE resolved cognition/tenacity + the active persona so
-/// the panel can show/save the real posture. See `harness_config_panel.md`.
+/// stdout is not a TTY (piped / headless) — print a short note pointing at the
+/// text `/psyche` view and the per-dial commands. The panel applies (only the
+/// changed) dials through the same setters the flags / slash commands use, so
+/// there is no panel-only state; the persona action + any save are returned for
+/// the caller to act on. Takes the EFFECTIVE resolved cognition/tenacity + the
+/// active persona so the panel can show/save the real posture. **Rich-tui only**
+/// — the lean build has no ratatui surface, so the `/psyche edit` handler prints
+/// the fallback directly. See `harness_config_panel.md`.
+#[cfg(feature = "rich-tui")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_psyche_panel(
     persona_names: Vec<String>,
@@ -168,7 +176,6 @@ pub(crate) fn run_psyche_panel(
     color: bool,
     verbose: bool,
 ) -> PsychePanelResult {
-    #[cfg(feature = "rich-tui")]
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         match config_panel::run(
             persona_names,
@@ -195,14 +202,7 @@ pub(crate) fn run_psyche_panel(
             }
         }
     }
-    #[cfg(not(feature = "rich-tui"))]
-    let _ = (
-        persona_names,
-        current_persona,
-        backend,
-        eff_cognition,
-        eff_tenacity,
-    );
+    // rich-tui compiled but stdout is not a TTY (piped / headless): no overlay.
     print_newt(
         "the psyche panel needs an interactive rich terminal — use /psyche for the \
          text view, or /cognition / /tenacity to change the dials.",
@@ -4259,7 +4259,9 @@ impl PersonaStore {
 
     /// Write a persona file `<name>.md` with `content`, creating the personas
     /// directory if needed. The name is normalized to a file stem; returns the
-    /// written path. Used by the config panel's save action.
+    /// written path. Used only by the config panel's save action, so it is
+    /// rich-tui-gated alongside the panel (dead in the lean build otherwise).
+    #[cfg(feature = "rich-tui")]
     fn save(&self, name: &str, content: &str) -> anyhow::Result<std::path::PathBuf> {
         let name = normalize_persona_name(name)?;
         std::fs::create_dir_all(&self.dir)?;
