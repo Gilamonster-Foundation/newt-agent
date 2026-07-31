@@ -7,6 +7,22 @@ is inherited by all internal crates.
 
 ## [Unreleased]
 
+## [0.7.6] — 2026-07-31
+
+### Benchmarks
+
+- **Confined (OCAP-on) tb-30 baseline, digest-pinned.** Establishes the per-model
+  confined scoreboard under a stricter, *honesty-classified* methodology: a run is
+  scored only if the model made a real tool-call attempt on >=25/30 tasks
+  (otherwise **quarantined**, not recorded), and each local score is pinned to the
+  served GGUF sha256. Confined champions: ornith 36.7%, qwen3.6 26.7%,
+  qwen3-coder 13.3%, kimi-linear 10.0%, glm-4.7-flash 3.3%. Three models
+  (granite4.1, nemotron-3-nano canonical + bare) were quarantined for
+  under-engagement (tracked in #1500). This is a *re-baseline under stricter
+  measurement*, not a raw champion-defeat; tb-30 is a 30-task sample, so per-model
+  numbers carry ~+/-10pp run-to-run variance.
+
+
 ### Security
 
 - **Trust boundary on MCP secret resolution (#1301 review).** `${…}`
