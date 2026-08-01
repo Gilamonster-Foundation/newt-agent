@@ -3202,6 +3202,7 @@ pub(crate) struct BackendChoice {
     /// instead of trusting a placeholder wire protocol.
     pub(crate) kind_needs_probe: bool,
     pub(crate) api_key: Option<String>,
+    pub(crate) chat_completions_capability: newt_core::model_card::ChatCompletionsCapability,
     pub(crate) reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope,
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
@@ -3651,6 +3652,7 @@ fn codex_env_backend(
         kind: newt_core::BackendKind::Openai,
         kind_needs_probe: false,
         api_key: api_key.map(str::to_string),
+        chat_completions_capability: Default::default(),
         reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: true,
@@ -3735,6 +3737,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: b.kind.unwrap_or(newt_core::BackendKind::Ollama),
         kind_needs_probe: b.needs_kind_probe(),
         api_key: b.resolve_api_key(),
+        chat_completions_capability: b.chat_completions_capability(),
         reasoning_replay_scope: b.reasoning_replay_scope(),
         api: b.api.unwrap_or_default(),
         api_needs_probe: b.api.is_none(),
@@ -3802,6 +3805,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             kind_needs_probe: false,
             api_key: None,
+            chat_completions_capability: Default::default(),
             reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
             api: newt_core::OpenAiApi::default(),
             api_needs_probe: false,
@@ -3847,6 +3851,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             kind_needs_probe: false,
             api_key: None,
+            chat_completions_capability: Default::default(),
             reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
             api: newt_core::OpenAiApi::default(),
             api_needs_probe: false,
@@ -3873,6 +3878,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: false,
         api_key: None,
+        chat_completions_capability: Default::default(),
         reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
@@ -9533,14 +9539,14 @@ the persona declaration and [tenacity] config; `/tenacity auto` (aliases
   /cognition             show the session setting
   /cognition list        list every level, light → deep
   /cognition <level>     set glancing | pondering | deliberating | contemplating
-  /cognition off         send no reasoning.effort (override any persona)
+  /cognition off         send no reasoning controls (override any persona)
   /cognition auto        follow the active persona's cognition (default)
 
-The level maps to the OpenAI reasoning.effort wire field (glancing=minimal …
-contemplating=high) on the Responses API. It applies to Responses backends only
-— a Chat-Completions backend does not send reasoning_effort (model-specific
-there), so cognition is ignored on that path. This session override beats the
-active persona's cognition; a persona sets its own default via `cognition:`."
+Responses maps the level to OpenAI reasoning.effort (glancing=minimal …
+contemplating=high). Chat Completions maps it to local generation controls only
+when the endpoint explicitly advertises that capability; unknown endpoints are
+unchanged. This session override beats the active persona's cognition; a
+persona sets its own default via `cognition:`."
         }
         "psyche" => {
             "\
@@ -9551,7 +9557,7 @@ active persona's cognition; a persona sets its own default via `cognition:`."
   /psyche obsessive      engage the max-everything posture's live dials
 
 The three orthogonal psyche dials:
-  cognition   reasoning depth per call → reasoning.effort   (/cognition)
+  cognition   backend-specific reasoning depth per call      (/cognition)
   tenacity    how hard the loop pushes read → act            (/tenacity)
   crew        how many minds work the task                   (NEWT_TEAM / newt crew)
 
@@ -12623,6 +12629,7 @@ mod tool_round_cap_tests {
                     caveats: &caveats,
                     persona_tools: None,
                     cognition: None,
+                    chat_completions_capability: Default::default(),
                     reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
                     max_tool_rounds: 5,
                     narration_nudge_cap: 1,

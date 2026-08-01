@@ -40,6 +40,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         caveats,
         persona_tools: None,
         cognition: None,
+        chat_completions_capability: Default::default(),
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         max_tool_rounds: 4,
         narration_nudge_cap: 0,

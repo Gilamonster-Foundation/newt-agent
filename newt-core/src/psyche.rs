@@ -17,7 +17,7 @@ use crate::cognition::{set_cli_cognition, CognitionOverride};
 use crate::role_profile::Cognition;
 use crate::tenacity::{set_cli_tenacity, Tenacity};
 
-/// The obsessive posture's cognition: the deepest level (→ `reasoning.effort=high`).
+/// The obsessive posture's cognition: the deepest backend-specific reasoning level.
 pub const OBSESSIVE_COGNITION: Cognition = Cognition::Contemplating;
 /// The obsessive posture's tenacity: the most forcing level.
 pub const OBSESSIVE_TENACITY: Tenacity = Tenacity::Relentless;

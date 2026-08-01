@@ -4293,15 +4293,18 @@ pub(crate) fn run_chat(
                     // override wins; else the active persona's declared cognition
                     // (installed as PERSONA_COGNITION on activation); else `None`.
                     let cognition = newt_core::cognition::effective_cognition();
-                    // P2#4: cognition rides the Responses wire only. If it is set
-                    // but the active backend is Chat-Completions / Ollama, say so
-                    // ONCE — never silently accept-and-ignore a dial.
+                    // Cognition always rides the Responses wire and may also
+                    // project to Chat Completions when the endpoint explicitly
+                    // advertises that extension. Otherwise say so once — never
+                    // silently accept and ignore a live dial.
                     if cognition.is_some() && !cognition_scope_noted {
                         let responses = std::env::var("NEWT_OPENAI_API")
                             .is_ok_and(|v| v.eq_ignore_ascii_case("responses"));
-                        if !responses {
+                        let capable_chat = choice.kind == newt_core::BackendKind::Openai
+                            && choice.chat_completions_capability.cognition == Some(true);
+                        if !responses && !capable_chat {
                             print_newt(
-                                "note: cognition (reasoning.effort) applies to Responses backends only — the active backend ignores it.",
+                                "note: the active backend does not advertise a cognition generation policy — cognition is ignored.",
                                 color,
                                 verbose,
                             );
@@ -4549,6 +4552,8 @@ pub(crate) fn run_chat(
                                         caveats: &turn_caveats,
                                         persona_tools,
                                         cognition,
+                                        chat_completions_capability: choice
+                                            .chat_completions_capability,
                                         reasoning_replay_scope: choice.reasoning_replay_scope,
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,

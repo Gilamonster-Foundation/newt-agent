@@ -95,7 +95,8 @@ pub struct RoleProfile {
     /// active) is a follow-up; declaring it is wired here first.
     pub backend: Option<String>,
     /// COGNITION — per-call reasoning depth (the psyche dial). `None` = backend
-    /// default. Maps onto `reasoning.effort`; the emit site is a follow-up.
+    /// default. The backend projects this semantic level onto its own request
+    /// controls.
     pub cognition: Option<Cognition>,
     /// TENACITY — how hard the harness pushes the read→act loop for this
     /// persona. `None` = the session/global tenacity (`/tenacity`).
@@ -123,10 +124,9 @@ pub enum Altitude {
 
 /// COGNITION — the psyche's reasoning-depth dial: how hard the model thinks
 /// per call. Declared in front-matter as `cognition = "deliberating"`; an
-/// absent field leaves the backend default. Maps onto the wire
-/// `reasoning.effort` field (Responses / Chat-Completions); the emit site is a
-/// follow-up — declaring it is wired here first, matching how `tools`/`model`
-/// shipped (declared, then enforced).
+/// absent field leaves the backend default. Responses projects it onto
+/// `reasoning.effort`; an explicitly capable Chat Completions endpoint projects
+/// it onto a local generation policy.
 ///
 /// The ladder is deliberately a personality arc, not a clinical scale — light
 /// and careful through to compulsive at the top (paired with [`Tenacity`] and
@@ -147,10 +147,9 @@ pub enum Cognition {
 
 impl Cognition {
     /// The OpenAI `reasoning.effort` value this level maps to on the Responses
-    /// wire (emitted by `agentic::responses_reasoning_field`). Cognition applies
-    /// to Responses backends only — the Chat-Completions path does not send
-    /// `reasoning_effort` (it is model-specific and rejected by non-reasoning
-    /// models), so cognition is ignored there.
+    /// wire (emitted by `agentic::responses_reasoning_field`). Chat Completions
+    /// uses the backend-neutral generation policy instead and only when the
+    /// endpoint explicitly advertises support.
     #[must_use]
     pub fn reasoning_effort(self) -> &'static str {
         match self {
@@ -172,10 +171,15 @@ impl Cognition {
         }
     }
 
-    /// One-line description — the effort it requests, for `/cognition` listings.
+    /// One-line backend-neutral description for `/cognition` listings.
     #[must_use]
-    pub fn describe(self) -> String {
-        format!("reasoning.effort = {}", self.reasoning_effort())
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Glancing => "minimal reasoning",
+            Self::Pondering => "low reasoning",
+            Self::Deliberating => "medium reasoning",
+            Self::Contemplating => "high reasoning",
+        }
     }
 
     /// All levels, light → deep (for `/cognition list` and menus).
