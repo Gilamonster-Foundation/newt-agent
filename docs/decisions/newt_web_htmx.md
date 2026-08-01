@@ -73,6 +73,22 @@ axum + HTMX + SSE. Server-rendered fragments; tabs = agents; per-agent SSE
 stream of transcript deltas; a prompt box POSTs to the agent's drive seam.
 HTMX means no JS toolchain — the whole front end is the server's templates.
 
+**Canonical presentation contract (operator ruling, 2026-07-31).** Harness,
+store, and transport output is GFM Markdown by default. A surface projects that
+same source into its native medium: `newt-core` renders ANSI for a capable TTY,
+while newt-web renders sanitized HTML and progressively enhances recognized
+fenced blocks. Mermaid is the first enrichment (<code>```mermaid</code>); the browser
+runtime is pinned and served locally, with strict security mode. Genuine Rich
+TUI interactions may remain native widgets, but they need a Markdown
+representation/fallback so the same workflow stays usable through headless,
+web, and mobile adapters. HTMX controls are an input adapter, not a second
+conversation format.
+
+The browser acceptance seam follows the same split: deterministic headless BAT
+runs on pull requests/main; phone-sized, user-driven UAT gates `release/**` and
+can be dispatched manually. Both run against a local simulated backend. Live
+model BAT/UAT remains the separate `eval-live.yml` tier.
+
 Two agent sources, one tab model:
 - **Owned agents** — spawned by newt-web, driven in-process via `TurnDriver`.
 - **Followed sessions** — any conversation in the shared `ConversationStore`

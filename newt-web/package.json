@@ -1,0 +1,12 @@
+{
+  "name": "newt-web-acceptance",
+  "private": true,
+  "scripts": {
+    "test:acceptance": "playwright test",
+    "test:bat": "playwright test --grep @bat",
+    "test:uat": "playwright test --grep @uat"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

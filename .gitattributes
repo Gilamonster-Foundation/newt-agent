@@ -11,3 +11,7 @@
 #
 # `text=auto` still auto-detects binary files (NUL bytes) and leaves them alone.
 * text=auto eol=lf
+
+# Preserve the audited upstream Mermaid distribution byte-for-byte. The
+# minified bundle contains intentional trailing spaces inside template text.
+newt-web/assets/mermaid.min.js binary

@@ -79,6 +79,24 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
                 )
             }),
         )
+        .route(
+            "/assets/mermaid.min.js",
+            get(|| async {
+                (
+                    [("content-type", "text/javascript")],
+                    include_str!("../assets/mermaid.min.js"),
+                )
+            }),
+        )
+        .route(
+            "/assets/markdown.js",
+            get(|| async {
+                (
+                    [("content-type", "text/javascript")],
+                    include_str!("../assets/markdown.js"),
+                )
+            }),
+        )
         .route("/agents", post(spawn_agent))
         .route("/follow", post(follow_session))
         .route("/agents/:id/panel", get(agent_panel_route))
@@ -567,6 +585,25 @@ mod tests {
         let (status, body) = req(&app(), "GET", "/assets/htmx.min.js", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("htmx"), "vendored htmx served");
+    }
+
+    #[tokio::test]
+    async fn markdown_enrichment_assets_are_served_locally() {
+        let app = app();
+        let (status, mermaid) = req(&app, "GET", "/assets/mermaid.min.js", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(mermaid.contains("mermaid"), "vendored Mermaid served");
+
+        let (status, enhancer) = req(&app, "GET", "/assets/markdown.js", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            enhancer.contains("newtEnhanceMarkdown"),
+            "generic Markdown enhancement hook served"
+        );
+        assert!(
+            enhancer.contains(r#"securityLevel: "strict""#),
+            "untrusted diagrams must use Mermaid strict mode"
+        );
     }
 
     /// The W2 acceptance: spawn → prompt → a full mocked turn lands in the
