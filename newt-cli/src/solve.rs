@@ -119,6 +119,17 @@ fn resolve_model_digest(flag: Option<&str>, env: Option<&str>) -> Option<String>
         .map(str::to_string)
 }
 
+fn apply_context_config(driver: &mut TurnDriverConfig, context: Option<&newt_core::ContextConfig>) {
+    let Some(context) = context else {
+        return;
+    };
+    driver.compaction_trigger_policy = context.compaction_trigger_policy;
+    driver.input_ceiling_pct = context.input_ceiling_pct;
+    driver.low_budget_pct = context.low_budget_pct;
+    driver.estimation = context.estimation;
+    driver.summary_input_cap_floor_chars = context.summary_input_cap_floor_chars;
+}
+
 /// Run one task headless and emit its trace. Returns the process exit code:
 /// `0` when the turn completed, `1` on an infrastructure/turn failure. (Task
 /// pass/fail is Terminal-Bench's job via the task's own verification — this exit
@@ -230,6 +241,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
 
     // 5. Drive one full turn (== a complete multi-round agentic solve).
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
+    apply_context_config(&mut dc, cfg.context.as_ref());
     dc.api_key = api_key;
     dc.chat_completions_capability = backend.chat_completions_capability();
     dc.reasoning_replay_scope = backend.reasoning_replay_scope();
@@ -590,6 +602,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pick_backend(&cfg).expect("a backend").name, "real");
+    }
+
+    #[test]
+    fn headless_solve_applies_context_config_to_turn_driver() {
+        let mut driver = TurnDriverConfig::new(
+            "http://example.invalid",
+            "model",
+            BackendKind::Openai,
+            "/workspace",
+        );
+        let context = newt_core::ContextConfig {
+            estimation: newt_core::tokens::TokenEstimation::new(3),
+            summary_input_cap_floor_chars: 4_096,
+            input_ceiling_pct: 70,
+            low_budget_pct: 20,
+            compaction_trigger_policy: newt_core::CompactionTriggerPolicy::MessageCount,
+            ..Default::default()
+        };
+
+        apply_context_config(&mut driver, Some(&context));
+
+        assert_eq!(driver.estimation.chars_per_token, 3);
+        assert_eq!(driver.summary_input_cap_floor_chars, 4_096);
+        assert_eq!(driver.input_ceiling_pct, 70);
+        assert_eq!(driver.low_budget_pct, 20);
+        assert_eq!(
+            driver.compaction_trigger_policy,
+            newt_core::CompactionTriggerPolicy::MessageCount
+        );
     }
 
     #[test]

@@ -148,6 +148,10 @@ pub struct TurnDriverConfig {
     pub input_ceiling_pct: u32,
     /// #727: remaining-budget percent below which the loop nudges (default 15).
     pub low_budget_pct: usize,
+    /// Cheap request-token estimator configured under `[context.estimation]`.
+    pub estimation: crate::tokens::TokenEstimation,
+    /// Minimum summarizer input cap configured under `[context]`.
+    pub summary_input_cap_floor_chars: usize,
     /// #1280: optional semantic retrieval for the headless turn. `Some` ⇒ the
     /// `code_search` tool is advertised and executable against the supplied
     /// index; `None` (the default) ⇒ absent, preserving today's behavior.
@@ -189,6 +193,8 @@ impl TurnDriverConfig {
             safe_context: None,
             input_ceiling_pct: 80,
             low_budget_pct: 15,
+            estimation: crate::tokens::TokenEstimation::default(),
+            summary_input_cap_floor_chars: 8_192,
             code_search: None,
         }
     }
@@ -557,8 +563,8 @@ async fn run_one_turn(
         // applied, preserving today's behavior exactly.
         on_round_usage: None,
         estimate_ratio: None,
-        estimation: crate::tokens::TokenEstimation::default(),
-        summary_input_cap_floor_chars: 8_192,
+        estimation: config.estimation,
+        summary_input_cap_floor_chars: config.summary_input_cap_floor_chars,
         // #307: the headless driver carries no preset clamp — exec authority is
         // whatever `config.caveats` already grants, exactly like the ACP worker
         // / newt-eval callers. A consumer enforcing a mode clamps `caveats` itself.
