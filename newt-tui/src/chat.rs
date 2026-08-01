@@ -4549,6 +4549,7 @@ pub(crate) fn run_chat(
                                         caveats: &turn_caveats,
                                         persona_tools,
                                         cognition,
+                                        reasoning_replay_scope: choice.reasoning_replay_scope,
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,
                                         // #1162: the /nudge dial — env set by the

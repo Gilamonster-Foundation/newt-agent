@@ -976,6 +976,7 @@ async fn adopt_detects_openai_when_kind_absent() {
         kind: newt_core::BackendKind::Ollama, // placeholder
         kind_needs_probe: true,
         api_key: None,
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -1012,6 +1013,7 @@ async fn adopt_detects_ollama_when_kind_absent() {
         kind: newt_core::BackendKind::Openai, // wrong placeholder — probe must win
         kind_needs_probe: true,
         api_key: None,
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -1044,6 +1046,7 @@ async fn adopt_respects_explicit_kind_without_detect() {
         kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: false,
         api_key: None,
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -1083,6 +1086,7 @@ async fn adopt_detects_authenticated_openai_with_bearer() {
         kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: true,
         api_key: Some("secret-token".into()),
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,

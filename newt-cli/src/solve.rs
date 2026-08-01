@@ -231,6 +231,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // 5. Drive one full turn (== a complete multi-round agentic solve).
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     dc.api_key = api_key;
+    dc.reasoning_replay_scope = backend.reasoning_replay_scope();
     if let Some(r) = args.max_rounds {
         dc.max_tool_rounds = r;
     }

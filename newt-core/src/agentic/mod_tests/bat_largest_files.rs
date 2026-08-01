@@ -186,6 +186,7 @@ async fn run_scenario_for(
         caveats: &caveats,
         persona_tools: None,
         cognition: None,
+        reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         max_tool_rounds: 8,
         narration_nudge_cap: 1,
         action_nudges: true,

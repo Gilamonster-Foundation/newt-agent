@@ -181,6 +181,19 @@ impl Tuning {
     }
 }
 
+/// How assistant reasoning is replayed into later completion requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplayScope {
+    /// Never send model reasoning back to the endpoint.
+    #[default]
+    Never,
+    /// Preserve reasoning only while continuing the current human turn.
+    CurrentUserTurn,
+    /// Preserve reasoning across the complete conversation history.
+    FullHistory,
+}
+
 /// Reasoning capability bits the harness reads (retires the `reasoning.rs`
 /// name-match in a later issue).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -197,6 +210,9 @@ pub struct Capability {
     /// `reasoning_content`); `None` = inline `<think>` inside `content`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content_field: Option<String>,
+    /// Scope in which assistant reasoning may be replayed to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay_scope: Option<ReasoningReplayScope>,
 }
 
 impl Capability {
@@ -206,6 +222,7 @@ impl Capability {
             emits_leading_reasoning: o.emits_leading_reasoning.or(self.emits_leading_reasoning),
             thinking_default: o.thinking_default.or(self.thinking_default),
             reasoning_content_field: o.reasoning_content_field.or(self.reasoning_content_field),
+            reasoning_replay_scope: o.reasoning_replay_scope.or(self.reasoning_replay_scope),
         }
     }
 }
@@ -555,6 +572,24 @@ capability:
         // And a TOML round-trip is stable.
         let reparsed = parse_card(&from_toml.to_toml().unwrap(), "toml").unwrap();
         assert_eq!(reparsed, from_toml);
+    }
+
+    #[test]
+    fn capability_parses_turn_scoped_reasoning_replay() {
+        let card = parse_card(
+            r#"
+name = "reasoning-model"
+
+[capability]
+reasoning_replay_scope = "current_user_turn"
+"#,
+            "toml",
+        )
+        .expect("reasoning replay scope is a supported capability");
+
+        let capability = serde_json::to_value(card.capability.expect("capability present"))
+            .expect("capability serializes");
+        assert_eq!(capability["reasoning_replay_scope"], "current_user_turn");
     }
 
     #[test]

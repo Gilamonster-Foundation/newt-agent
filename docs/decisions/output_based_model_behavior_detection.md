@@ -170,6 +170,35 @@ against the existing round limits.
   dialect set.
 - **Rung 3 — non-action spiral** ⇒ the existing tenacity machinery, unchanged.
 
+### 2a. Turn-scoped reasoning replay is an endpoint contract
+
+Some reasoning-capable Chat Completions endpoints require an assistant tool
+call's reasoning to be replayed during later tool rounds in the same human
+turn, while strict endpoints reject that field. Newt therefore treats replay
+scope as an explicit endpoint capability, not a model-name behavior gate:
+
+```toml
+[[backends]]
+name = "nemotron-local"
+endpoint = "http://127.0.0.1:8000"
+model = "nemotron-3-nano"
+kind = "openai"
+
+[backends.capability]
+reasoning_replay_scope = "current_user_turn"
+```
+
+Unknown and legacy endpoints default to `never`. `current_user_turn` preserves
+both split `reasoning_content` and inline reasoning only while a tool loop is
+continuing the active human turn; reasoning from completed turns remains
+excluded from outbound history and from user-visible answers. While replay is
+active, count-only compaction treats the reasoning-bearing suffix as one atomic
+item; hard token pressure may compact older tool results but does not discard
+the assistant plans. The tools-disabled round-cap completion preserves that
+same suffix. The configured scope is backend behavior data: it can
+later be populated by a successful contract probe without changing the
+message-replay implementation.
+
 ### 3. Kill the name gate — in the right order
 
 `emits_leading_reasoning` (the list) is deleted and the splitter becomes

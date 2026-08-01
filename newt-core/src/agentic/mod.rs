@@ -606,6 +606,10 @@ pub struct ChatCtx<'a> {
     /// resolves it from the active persona's `cognition:` front-matter alongside
     /// `persona_tools`; headless / eval callers pass `None`.
     pub cognition: Option<crate::role_profile::Cognition>,
+    /// Whether assistant reasoning may be replayed to the active backend.
+    /// Unknown endpoints default to `Never`; local reasoning backends opt in via
+    /// their explicit capability profile.
+    pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 40).
     pub max_tool_rounds: usize,
@@ -1183,6 +1187,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // is model-specific there and rejected by non-reasoning models — so cognition
         // is ignored on this path. Bound `_` to make that explicit.
         cognition: _,
+        reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
@@ -1622,6 +1627,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 messages: &messages,
                                 budget: pipeline_budget,
                                 max_messages: trigger.max_messages,
+                                replay_protected_tail_len: 0,
                                 task: active_task,
                                 hard_budget: trigger.hard_budget,
                                 authoritative: token_fired || send_budget_authoritative,
@@ -1906,6 +1912,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     cal,
                                 ),
                                 max_messages: None,
+                                replay_protected_tail_len: 0,
                                 task: active_task,
                                 hard_budget: true,
                                 authoritative: true,
@@ -2518,6 +2525,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 messages: &messages,
                                 budget: target,
                                 max_messages: None,
+                                replay_protected_tail_len: 0,
                                 task: active_task,
                                 hard_budget: true,
                                 // A suspected silent overflow is a real failure
@@ -4426,6 +4434,29 @@ fn openai_chat_wire_messages(
     Ok(wire)
 }
 
+fn prepare_openai_assistant_replay(
+    message: &serde_json::Value,
+    clean_content: &str,
+    replay_scope: crate::model_card::ReasoningReplayScope,
+    current_user_turn: bool,
+) -> serde_json::Value {
+    let mut assistant = message.clone();
+    if assistant["role"].as_str().is_none() {
+        assistant["role"] = serde_json::Value::String("assistant".into());
+    }
+
+    let keep_reasoning = replay_scope == crate::model_card::ReasoningReplayScope::FullHistory
+        || (replay_scope == crate::model_card::ReasoningReplayScope::CurrentUserTurn
+            && current_user_turn);
+    if !keep_reasoning {
+        assistant["content"] = serde_json::Value::String(clean_content.to_string());
+        if let Some(object) = assistant.as_object_mut() {
+            object.remove("reasoning_content");
+        }
+    }
+    assistant
+}
+
 /// Final tools-disabled completion for the OpenAI (`/v1/chat/completions`) path.
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
@@ -4629,6 +4660,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // is model-specific there and rejected by non-reasoning models — so cognition
         // is ignored on this path. Bound `_` to make that explicit.
         cognition: _,
+        reasoning_replay_scope,
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
@@ -4713,7 +4745,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
-        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .map(|m| {
+            let content = if m.role == crate::Role::Assistant
+                && reasoning_replay_scope != crate::model_card::ReasoningReplayScope::FullHistory
+            {
+                crate::reasoning::split_reasoning(&m.content).0
+            } else {
+                m.content.clone()
+            };
+            serde_json::json!({"role": m.role.as_str(), "content": content})
+        })
         .collect();
     let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
         crate::TurnPromptContext::ephemeral_operator(
@@ -4933,8 +4974,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 mid_loop_trim_tokens,
             )
             .is_some();
+            let reasoning_tail_len = compress::reasoning_replay_tail_len(&messages);
             if let Some(trigger) = compression_trigger(
-                messages.len(),
+                compress::compression_message_count(&messages, reasoning_tail_len),
                 current,
                 message_tokens,
                 CompressionTriggerLimits {
@@ -4961,7 +5003,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     CompressRequest {
                         messages: &messages,
                         budget: pipeline_budget,
-                        max_messages: trigger.max_messages,
+                        // A current-turn reasoning transcript is one atomic
+                        // logical item for count pressure. Token pressure still
+                        // applies to its real size, but a physical count cap
+                        // must not split away the plan the endpoint requires.
+                        max_messages: if reasoning_tail_len > 0 {
+                            None
+                        } else {
+                            trigger.max_messages
+                        },
+                        replay_protected_tail_len: reasoning_tail_len,
                         task: active_task,
                         hard_budget: trigger.hard_budget,
                         authoritative: token_fired || send_budget_authoritative,
@@ -5182,6 +5233,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     cal,
                                 ),
                                 max_messages: None,
+                                replay_protected_tail_len: compress::reasoning_replay_tail_len(
+                                    &messages,
+                                ),
                                 task: active_task,
                                 hard_budget: true,
                                 authoritative: true,
@@ -5589,21 +5643,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             truncation_suspect,
             round_est_raw,
         );
-        // #857: re-send a CLEAN assistant turn — stripped content (no inline
-        // <think>) and no prior-turn `reasoning_content` (the model must not be fed
-        // its own CoT back). The `tool_calls` are preserved.
-        let mut assistant_turn = message.clone();
-        // OpenAI-compatible proxies are not perfectly uniform: some omit the
-        // otherwise-required `role` field from a tool-calling response. Keep
-        // the transcript canonical before compression/repair so its matched
-        // `role="tool"` results are not mistaken for orphans and discarded.
-        if assistant_turn["role"].as_str().is_none() {
-            assistant_turn["role"] = serde_json::Value::String("assistant".into());
-        }
-        assistant_turn["content"] = serde_json::Value::String(oa_content.clone());
-        if let Some(obj) = assistant_turn.as_object_mut() {
-            obj.remove("reasoning_content");
-        }
+        // #857: unknown endpoints keep the historical clean replay (no inline
+        // <think> or reasoning_content). A capability-profiled reasoning backend
+        // may instead retain the assistant's current-turn plan across tool rounds.
+        // Some proxies omit the otherwise-required role; preparation also
+        // canonicalizes that field before compression can inspect tool pairs.
+        let assistant_turn =
+            prepare_openai_assistant_replay(message, &oa_content, reasoning_replay_scope, true);
         messages.push(assistant_turn);
         let mut round_modified_workspace = false;
         let mut round_progress = false;
@@ -5811,7 +5857,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Reached the round cap. Trim the message list and make ONE final
     // tools-disabled completion (matches the Ollama path).
     let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
-    let trimmed = trim_for_summary(&messages, protected_head, 6);
+    let replay_protected_tail_len = compress::reasoning_replay_tail_len(&messages);
+    let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     let (text, streamed, usage) = final_summary_openai(
@@ -6057,6 +6104,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         caveats,
         persona_tools,
         cognition,
+        reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,
         narration_nudge_cap: _,
@@ -7737,6 +7785,45 @@ mod tool_round_cap_tests {
         }
     }
 
+    struct OpenAiReasoningCapResponder {
+        round: AtomicUsize,
+        first_plan_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Respond for OpenAiReasoningCapResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if request_has_tools(req) {
+                let round = self.round.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {
+                        "content": null,
+                        "reasoning_content": format!("persistent plan round {round}"),
+                        "tool_calls": [{
+                            "id": "call_cap",
+                            "type": "function",
+                            "function": {
+                                "name": "definitely_not_a_real_tool",
+                                "arguments": "{}"
+                            }
+                        }]
+                    }}]
+                }));
+            }
+
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let first_plan_seen = body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["reasoning_content"].as_str() == Some("persistent plan round 0")
+                })
+            });
+            self.first_plan_seen_on_final
+                .store(first_plan_seen, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "cap summary"}}]
+            }))
+        }
+    }
+
     fn msgs() -> Vec<MemMessage> {
         vec![
             MemMessage::system("you are a test"),
@@ -7775,6 +7862,7 @@ mod tool_round_cap_tests {
             caveats,
             persona_tools: None,
             cognition: None,
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 1,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -7910,6 +7998,37 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
+    async fn openai_cap_exit_preserves_the_full_current_turn_reasoning_tail() {
+        let server = MockServer::start().await;
+        let first_plan_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiReasoningCapResponder {
+                round: AtomicUsize::new(0),
+                first_plan_seen_on_final: first_plan_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+        let task = "keep the active plan through cap exit";
+        let messages = vec![MemMessage::system("base"), MemMessage::user(task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        context.safe_context = None;
+        context.max_tool_rounds = 4;
+        context.reasoning_replay_scope = crate::model_card::ReasoningReplayScope::CurrentUserTurn;
+
+        let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
+            .await
+            .expect("cap exit succeeds");
+        assert_eq!(reply, "cap summary");
+        assert!(
+            first_plan_seen.load(Ordering::SeqCst),
+            "the tools-disabled cap-exit request must retain the first current-turn plan"
+        );
+    }
+
+    #[tokio::test]
     async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
         let server = MockServer::start().await;
         let served = Arc::new(AtomicUsize::new(0));
@@ -7951,6 +8070,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8257,6 +8377,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8354,6 +8475,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9034,6 +9156,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9143,6 +9266,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9261,6 +9385,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9391,6 +9516,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9513,6 +9639,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9677,6 +9804,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9850,6 +9978,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9989,6 +10118,7 @@ mod save_note_loop_tests {
             caveats,
             persona_tools: None,
             cognition: None,
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -10491,6 +10621,7 @@ mod compression_loop_tests {
             caveats,
             persona_tools: None,
             cognition: None,
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -11782,6 +11913,7 @@ mod observation_hook_tests {
             caveats,
             persona_tools: None,
             cognition: None,
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
             action_nudges: true,

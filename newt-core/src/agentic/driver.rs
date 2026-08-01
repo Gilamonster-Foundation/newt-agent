@@ -105,6 +105,8 @@ pub struct TurnDriverConfig {
     pub kind: BackendKind,
     /// Bearer token for authenticated OpenAI-compatible endpoints.
     pub api_key: Option<String>,
+    /// Whether the active backend accepts replayed assistant reasoning.
+    pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
     /// Absolute workspace path the tool loop runs against.
     pub workspace: String,
     /// Permission caveats enforced for this turn's tool calls.
@@ -166,6 +168,7 @@ impl TurnDriverConfig {
             model: model.into(),
             kind,
             api_key: None,
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             workspace: workspace.into(),
             caveats: crate::caveats::Caveats::top(),
             max_tool_rounds: 40,
@@ -509,6 +512,7 @@ async fn run_one_turn(
         // the same single resolver the TUI uses, with no persona to layer over.
         persona_tools: None,
         cognition: crate::cognition::effective_cognition(),
+        reasoning_replay_scope: config.reasoning_replay_scope,
         max_tool_rounds: config.max_tool_rounds,
         narration_nudge_cap: config.narration_nudge_cap,
         workflow_grace_rounds: config.workflow_grace_rounds,
