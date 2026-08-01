@@ -19,8 +19,10 @@
 //!   (#1500) — `recovered_tool_call{dialect}` when `tool_recovery` fired
 //!   (and which dialect matched), `no_parseable_tool_call` when a round
 //!   produced content but neither native `tool_calls` nor a recovery hit.
-//!   `reasoning_overflow` is deliberately ABSENT — that detection is W3
-//!   (#1508), not W0.
+//!
+//! - **Reasoning-overflow recovery** ([`BehaviorSignal`] /
+//!   [`reasoning_overflow_signature`]): the exact reasoning-only length-stop
+//!   signature and the result of its one bounded continuation.
 //!
 //! [`SolveObservation`] is the per-turn out-param bundle the loops fill (the
 //! `tool_events` lending pattern): the parse signals plus the `model` field
@@ -80,6 +82,56 @@ pub fn round_parse_signal(
     None
 }
 
+/// Whether one Chat Completions response exhausted its output allowance inside
+/// reasoning without producing visible content or an executable tool call.
+/// This remains structural: ordinary empty/stop responses and parser failures
+/// are different outcomes and must not acquire a retry.
+#[must_use]
+pub fn reasoning_overflow_signature(
+    finish_reason: Option<&str>,
+    content_empty: bool,
+    reasoning_nonempty: bool,
+    has_calls: bool,
+) -> bool {
+    finish_reason == Some("length") && content_empty && reasoning_nonempty && !has_calls
+}
+
+/// Output-behavior trace events emitted alongside parse-status signals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BehaviorSignal {
+    /// The backend's finish reason for every parsed Chat Completions response.
+    /// `None` is retained rather than invented when a compatible server omits
+    /// the field.
+    ChatCompletionFinish {
+        round: usize,
+        finish_reason: Option<String>,
+    },
+    /// Generation stopped at the exact reasoning-only length signature. The
+    /// booleans distinguish detection, recovery eligibility, and recovery
+    /// outcome without reinterpreting an empty reply downstream.
+    ReasoningOverflow {
+        round: usize,
+        reasoning_overflow_detected: bool,
+        continuation_attempted: bool,
+        continuation_succeeded: bool,
+        finish_reason: String,
+        reasoning_tokens_estimate: usize,
+    },
+}
+
+impl BehaviorSignal {
+    pub(crate) fn mark_continuation_succeeded(&mut self) {
+        if let Self::ReasoningOverflow {
+            continuation_succeeded,
+            ..
+        } = self
+        {
+            *continuation_succeeded = true;
+        }
+    }
+}
+
 /// Per-turn observability out-params (#1511), lent by the headless driver the
 /// way `tool_events` is: the loop fills it, the driver folds it into the
 /// [`TurnOutcome`](super::TurnOutcome), `newt solve` serializes it.
@@ -91,6 +143,8 @@ pub struct SolveObservation {
     pub served_model: Option<String>,
     /// Per-round parse-status signals, in round order.
     pub parse_signals: Vec<ParseSignal>,
+    /// Output-behavior signals, in detection order.
+    pub behavior_signals: Vec<BehaviorSignal>,
 }
 
 /// Structural classification of a failed turn — the contract `outcome`
@@ -315,6 +369,74 @@ mod tests {
         // Empty content with no calls is the suspicious-empty case, not a
         // parse status (W3 territory) — no signal here either.
         assert_eq!(round_parse_signal(0, false, false, None), None);
+    }
+
+    #[test]
+    fn reasoning_overflow_requires_the_exact_structural_signature() {
+        assert!(reasoning_overflow_signature(
+            Some("length"),
+            true,
+            true,
+            false
+        ));
+        for (finish_reason, content_empty, reasoning_nonempty, has_calls) in [
+            (Some("stop"), true, true, false),
+            (Some("length"), false, true, false),
+            (Some("length"), true, false, false),
+            (Some("length"), true, true, true),
+            (None, true, true, false),
+        ] {
+            assert!(
+                !reasoning_overflow_signature(
+                    finish_reason,
+                    content_empty,
+                    reasoning_nonempty,
+                    has_calls
+                ),
+                "non-matching signature must not trigger: {finish_reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_overflow_signal_serializes_recovery_outcome() {
+        let signal = BehaviorSignal::ReasoningOverflow {
+            round: 2,
+            reasoning_overflow_detected: true,
+            continuation_attempted: true,
+            continuation_succeeded: false,
+            finish_reason: "length".into(),
+            reasoning_tokens_estimate: 37,
+        };
+
+        assert_eq!(
+            serde_json::to_value(signal).unwrap(),
+            serde_json::json!({
+                "kind": "reasoning_overflow",
+                "round": 2,
+                "reasoning_overflow_detected": true,
+                "continuation_attempted": true,
+                "continuation_succeeded": false,
+                "finish_reason": "length",
+                "reasoning_tokens_estimate": 37,
+            })
+        );
+    }
+
+    #[test]
+    fn chat_completion_finish_signal_records_each_finish_reason() {
+        assert_eq!(
+            serde_json::to_value(BehaviorSignal::ChatCompletionFinish {
+                round: 4,
+                finish_reason: Some("tool_calls".into()),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "kind": "chat_completion_finish",
+                "round": 4,
+                "finish_reason": "tool_calls",
+            })
+        );
     }
 
     /// The trace-line shape: `kind` carries the ADR §5 event name; a signal

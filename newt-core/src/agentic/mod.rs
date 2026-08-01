@@ -177,8 +177,8 @@ pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use observability::{
-    classify_reqwest, error_class, round_parse_signal, DispatchError, ErrorClass, ParseSignal,
-    SolveObservation, ToolCallDialect,
+    classify_reqwest, error_class, round_parse_signal, BehaviorSignal, DispatchError, ErrorClass,
+    ParseSignal, SolveObservation, ToolCallDialect,
 };
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
@@ -4793,6 +4793,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // At most one reasoning-only length-stop continuation per user turn. The
+    // signal index lets the next response record whether that bounded recovery
+    // produced visible content or an executable call.
+    let mut reasoning_continuation_attempted = false;
+    let mut reasoning_overflow_signal_index: Option<usize> = None;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
     // No-tools recovery (mirrors the Ollama path): a model that rejects the
@@ -5368,6 +5373,98 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             _ => None,
         };
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        let finish_reason = json["choices"][0]["finish_reason"].as_str();
+        if let Some(obs) = solve_obs.as_deref_mut() {
+            obs.behavior_signals
+                .push(observability::BehaviorSignal::ChatCompletionFinish {
+                    round,
+                    finish_reason: finish_reason.map(str::to_string),
+                });
+        }
+        let reasoning_text = separate_reasoning.or(inline_reasoning.as_deref());
+        let reasoning_overflow = observability::reasoning_overflow_signature(
+            finish_reason,
+            oa_content.is_empty(),
+            reasoning_text.is_some(),
+            has_tools,
+        );
+
+        // Resolve the pending telemetry record on the first response after a
+        // continuation. A tool call or visible answer is a successful recovery;
+        // another reasoning-only/empty response remains an honest failure.
+        if reasoning_continuation_attempted && !reasoning_overflow {
+            if has_tools || !oa_content.is_empty() {
+                if let (Some(obs), Some(index)) =
+                    (solve_obs.as_deref_mut(), reasoning_overflow_signal_index)
+                {
+                    if let Some(signal) = obs.behavior_signals.get_mut(index) {
+                        signal.mark_continuation_succeeded();
+                    }
+                }
+            }
+            reasoning_overflow_signal_index = None;
+        }
+
+        if reasoning_overflow {
+            let has_round_budget = round + 1 < current_tool_round_limit;
+            let can_continue = generation_policy
+                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget);
+
+            let resolving_existing_continuation =
+                reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
+            if !resolving_existing_continuation {
+                if let Some(obs) = solve_obs.as_deref_mut() {
+                    let index = obs.behavior_signals.len();
+                    obs.behavior_signals
+                        .push(observability::BehaviorSignal::ReasoningOverflow {
+                            round,
+                            reasoning_overflow_detected: true,
+                            continuation_attempted: can_continue,
+                            continuation_succeeded: false,
+                            finish_reason: "length".into(),
+                            reasoning_tokens_estimate: estimation.tokens_for_chars(
+                                reasoning_text
+                                    .map(|reasoning| reasoning.chars().count())
+                                    .unwrap_or(0),
+                            ),
+                        });
+                    reasoning_overflow_signal_index = Some(index);
+                }
+            }
+
+            if can_continue {
+                print_newt(
+                    "reasoning reached the output limit before an answer — continuing once",
+                    color,
+                    false,
+                );
+                messages.push(prepare_openai_assistant_replay(
+                    message,
+                    &oa_content,
+                    reasoning_replay_scope,
+                    true,
+                ));
+                reasoning_continuation_attempted = true;
+                continue 'round_loop;
+            }
+
+            let reason = if resolving_existing_continuation {
+                "the bounded continuation also reached the output limit"
+            } else if reasoning_continuation_attempted {
+                "the turn already used its bounded continuation"
+            } else if !generation_policy.one_bounded_reasoning_continuation {
+                "the endpoint does not advertise bounded continuation"
+            } else if reasoning_replay_scope == crate::model_card::ReasoningReplayScope::Never {
+                "the endpoint does not allow current-turn reasoning replay"
+            } else {
+                "the turn has no remaining round budget"
+            };
+            print_newt(
+                &format!("reasoning overflow detected — {reason}"),
+                color,
+                false,
+            );
+        }
         // W0 (#1511): served-model + parse-status observation for the solve
         // contract — mirror of the Ollama loop above.
         if let Some(obs) = solve_obs.as_deref_mut() {

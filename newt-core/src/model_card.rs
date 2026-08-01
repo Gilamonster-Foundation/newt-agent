@@ -210,6 +210,7 @@ pub struct ChatCompletionsCapability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     /// Allows one bounded continuation after a reasoning-only length stop.
+    /// The runtime also requires a non-`never` reasoning replay scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounded_reasoning_continuation: Option<bool>,
 }

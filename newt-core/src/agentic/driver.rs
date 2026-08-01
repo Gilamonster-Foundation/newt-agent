@@ -251,6 +251,8 @@ pub struct TurnOutcome {
     /// Per-round tool-call parse signals (ADR #1506 §5): recovered dialects
     /// and content-with-no-parseable-call rounds, in round order.
     pub parse_signals: Vec<crate::agentic::observability::ParseSignal>,
+    /// Output-behavior signals, including bounded reasoning-overflow recovery.
+    pub behavior_signals: Vec<crate::agentic::observability::BehaviorSignal>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -600,6 +602,7 @@ async fn run_one_turn(
             error_class: None,
             served_model: solve_obs.served_model,
             parse_signals: solve_obs.parse_signals,
+            behavior_signals: solve_obs.behavior_signals,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
@@ -618,6 +621,7 @@ async fn run_one_turn(
             error: Some(e.to_string()),
             served_model: solve_obs.served_model,
             parse_signals: solve_obs.parse_signals,
+            behavior_signals: solve_obs.behavior_signals,
         }),
     }
 }

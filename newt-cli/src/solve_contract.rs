@@ -13,7 +13,7 @@
 //! per solve — the bench keys on the presence of `contract_version` and
 //! rejects ambiguous traces.
 
-use newt_core::{ErrorClass, ParseSignal};
+use newt_core::{BehaviorSignal, ErrorClass, ParseSignal};
 
 /// The contract version this emitter declares. Bumped only on a breaking
 /// change to field names/semantics; adding an optional field is not breaking.
@@ -79,6 +79,12 @@ pub fn parse_signal_line(signal: &ParseSignal) -> serde_json::Value {
     serde_json::to_value(signal).expect("ParseSignal serializes infallibly")
 }
 
+/// One JSONL trace line per output-behavior signal. Like parse signals, these
+/// carry no `contract_version`, so they cannot be mistaken for contract rows.
+pub fn behavior_signal_line(signal: &BehaviorSignal) -> serde_json::Value {
+    serde_json::to_value(signal).expect("BehaviorSignal serializes infallibly")
+}
+
 /// Build THE contract record — exactly the `contract_version: "1"` fields.
 /// Optional fields (`model_digest`, `effective_config.context_window`,
 /// `timing.gen_tokens`/`tok_s`) are OMITTED when unknown, never nulled-in
@@ -120,7 +126,7 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newt_core::ToolCallDialect;
+    use newt_core::{BehaviorSignal, ToolCallDialect};
 
     fn inputs() -> ContractInputs<'static> {
         ContractInputs {
@@ -194,6 +200,46 @@ mod tests {
             }),
             serde_json::json!({
                 "kind": "recovered_tool_call", "round": 1, "dialect": "function_tag"
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_overflow_line_carries_the_bounded_recovery_result() {
+        let signal = BehaviorSignal::ReasoningOverflow {
+            round: 0,
+            reasoning_overflow_detected: true,
+            continuation_attempted: true,
+            continuation_succeeded: true,
+            finish_reason: "length".into(),
+            reasoning_tokens_estimate: 2500,
+        };
+        assert_eq!(
+            behavior_signal_line(&signal),
+            serde_json::json!({
+                "kind": "reasoning_overflow",
+                "round": 0,
+                "reasoning_overflow_detected": true,
+                "continuation_attempted": true,
+                "continuation_succeeded": true,
+                "finish_reason": "length",
+                "reasoning_tokens_estimate": 2500,
+            })
+        );
+    }
+
+    #[test]
+    fn chat_completion_finish_line_records_backend_reason() {
+        let signal = BehaviorSignal::ChatCompletionFinish {
+            round: 3,
+            finish_reason: Some("length".into()),
+        };
+        assert_eq!(
+            behavior_signal_line(&signal),
+            serde_json::json!({
+                "kind": "chat_completion_finish",
+                "round": 3,
+                "finish_reason": "length",
             })
         );
     }
