@@ -2847,6 +2847,16 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// Resolve the backend's reasoning replay contract. Unknown or legacy
+    /// endpoints remain conservative and never receive replayed reasoning.
+    #[must_use]
+    pub fn reasoning_replay_scope(&self) -> crate::model_card::ReasoningReplayScope {
+        self.capability
+            .as_ref()
+            .and_then(|capability| capability.reasoning_replay_scope)
+            .unwrap_or_default()
+    }
+
     /// The declared model, if any — empty strings count as unset. This is the
     /// ONLY sanctioned way to read `model`; when it returns `None` the backend
     /// expects the served model to be adopted from the endpoint (Phase B).
@@ -5497,6 +5507,26 @@ mod tests {
         let out = toml::to_string(&legacy).unwrap();
         assert!(!out.contains("serving"), "unset fields are skipped: {out}");
         assert!(!out.contains("provenance"));
+    }
+
+    #[test]
+    fn backend_reasoning_replay_scope_is_explicit_and_defaults_never() {
+        let default_backend: BackendConfig =
+            toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\n").unwrap();
+        assert_eq!(
+            default_backend.reasoning_replay_scope(),
+            crate::model_card::ReasoningReplayScope::Never
+        );
+
+        let replay_backend: BackendConfig = toml::from_str(
+            "endpoint=\"http://h:1\"\nmodel=\"m\"\n\
+             [capability]\nreasoning_replay_scope=\"current_user_turn\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            replay_backend.reasoning_replay_scope(),
+            crate::model_card::ReasoningReplayScope::CurrentUserTurn
+        );
     }
 
     #[test]

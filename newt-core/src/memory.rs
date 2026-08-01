@@ -1154,6 +1154,7 @@ impl Summarizing {
                 messages: &protected,
                 budget: self.budget() as usize,
                 max_messages: None,
+                replay_protected_tail_len: 0,
                 task: active_task,
                 hard_budget: true,
                 // The memory budget is config-derived — authoritative, so

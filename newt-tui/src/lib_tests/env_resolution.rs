@@ -282,6 +282,35 @@ fn backend(
 }
 
 #[test]
+fn backend_choice_carries_reasoning_replay_capability() {
+    let mut configured = backend(
+        "nemotron",
+        "http://local:8000",
+        "nemotron-3-nano",
+        newt_core::BackendKind::Openai,
+    );
+    configured.capability = Some(newt_core::model_card::Capability {
+        reasoning_replay_scope: Some(newt_core::model_card::ReasoningReplayScope::CurrentUserTurn),
+        ..Default::default()
+    });
+    let cfg = newt_core::Config {
+        backends: vec![configured],
+        ..Default::default()
+    };
+
+    with_env_vars(
+        &[],
+        &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
+        || {
+            assert_eq!(
+                resolve_backend_choice(&cfg).reasoning_replay_scope,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn
+            );
+        },
+    );
+}
+
+#[test]
 fn resolve_backend_choice_honors_named_provider() {
     let cfg = newt_core::Config {
         backends: vec![
