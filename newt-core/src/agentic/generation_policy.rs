@@ -13,6 +13,7 @@ pub(crate) struct GenerationPolicy {
     pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) reasoning_replay_scope: ReasoningReplayScope,
     pub(crate) chat_template_kwargs: bool,
+    pub(crate) one_bounded_reasoning_continuation: bool,
 }
 
 impl GenerationPolicy {
@@ -29,6 +30,8 @@ impl GenerationPolicy {
             parallel_tool_calls: capability.parallel_tool_calls,
             reasoning_replay_scope,
             chat_template_kwargs: capability.chat_template_kwargs == Some(true),
+            one_bounded_reasoning_continuation: capability.bounded_reasoning_continuation
+                == Some(true),
             ..Self::default()
         };
 
@@ -87,6 +90,21 @@ impl GenerationPolicy {
             }
         }
     }
+
+    /// One automatic reasoning continuation is safe only when the endpoint
+    /// opted in, current-turn reasoning can be replayed, and the ordinary
+    /// round budget can pay for the extra request.
+    #[must_use]
+    pub(crate) fn allows_reasoning_continuation(
+        self,
+        already_attempted: bool,
+        has_round_budget: bool,
+    ) -> bool {
+        !already_attempted
+            && self.one_bounded_reasoning_continuation
+            && self.reasoning_replay_scope != ReasoningReplayScope::Never
+            && has_round_budget
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +154,7 @@ mod tests {
             assert_eq!(policy.top_p, Some(top_p), "{cognition}");
             assert_eq!(policy.parallel_tool_calls, Some(false), "{cognition}");
             assert!(policy.chat_template_kwargs, "{cognition}");
+            assert!(policy.one_bounded_reasoning_continuation, "{cognition}");
             assert_eq!(
                 policy.reasoning_replay_scope,
                 ReasoningReplayScope::CurrentUserTurn,
@@ -163,6 +182,7 @@ mod tests {
         assert_eq!(policy.top_p, None);
         assert_eq!(policy.parallel_tool_calls, Some(false));
         assert!(policy.chat_template_kwargs);
+        assert!(policy.one_bounded_reasoning_continuation);
     }
 
     #[test]
@@ -225,5 +245,28 @@ mod tests {
         assert!(body.get("parallel_tool_calls").is_none());
         assert_eq!(body["max_tokens"], 4_096);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn bounded_reasoning_continuation_requires_capability_replay_and_round_budget() {
+        let enabled = GenerationPolicy::resolve(
+            None,
+            local_capability(),
+            ReasoningReplayScope::CurrentUserTurn,
+        );
+        assert!(enabled.allows_reasoning_continuation(false, true));
+        assert!(!enabled.allows_reasoning_continuation(true, true));
+        assert!(!enabled.allows_reasoning_continuation(false, false));
+
+        let no_replay =
+            GenerationPolicy::resolve(None, local_capability(), ReasoningReplayScope::Never);
+        assert!(!no_replay.allows_reasoning_continuation(false, true));
+
+        let no_capability = GenerationPolicy::resolve(
+            None,
+            ChatCompletionsCapability::default(),
+            ReasoningReplayScope::CurrentUserTurn,
+        );
+        assert!(!no_capability.allows_reasoning_continuation(false, true));
     }
 }

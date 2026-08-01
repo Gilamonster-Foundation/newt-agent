@@ -222,6 +222,17 @@ Newt never infers these extensions from the model display name. With
 strict OpenAI-compatible endpoints receive none of these additional fields,
 even when the active persona sets cognition.
 
+`bounded_reasoning_continuation = true` is effective only with a non-`never`
+reasoning replay scope. On the exact `finish_reason = length`, empty visible
+content, non-empty reasoning, and no-call signature, Newt appends the assistant
+partial without exposing its reasoning, spends one more ordinary tool round,
+and grants one fresh policy-bounded output allowance. It never retries a
+`finish_reason = stop` reply, parser failure, tool call, or ordinary empty
+response. Every parsed Chat Completions response emits a
+`chat_completion_finish` trace event; an incident also emits
+`reasoning_overflow` with attempted/succeeded status and an estimated reasoning
+token count.
+
 ### 3. Kill the name gate — in the right order
 
 `emits_leading_reasoning` (the list) is deleted and the splitter becomes

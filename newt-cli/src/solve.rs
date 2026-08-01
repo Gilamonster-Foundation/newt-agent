@@ -351,6 +351,11 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 .iter()
                 .map(solve_contract::parse_signal_line),
         );
+        trace_lines.extend(
+            o.behavior_signals
+                .iter()
+                .map(solve_contract::behavior_signal_line),
+        );
     }
     // Outcome: structural, from the TYPED class the driver carried over. A
     // spawn/thread `Err` never reached a dispatch → no class → harness_error.
