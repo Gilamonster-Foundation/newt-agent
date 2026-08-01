@@ -1,6 +1,6 @@
 //! Server-rendered HTML — the whole front end (vendored HTMX + one inline
-//! EventSource hook per agent; no JS toolchain). Every piece of user/model
-//! text passes through [`escape`] before it reaches a page.
+//! EventSource hook per agent; no JS build toolchain). User/model text is
+//! either escaped directly or rendered from Markdown through the sanitizer.
 
 use crate::agents::{Registry, Snapshot};
 use axum::extract::State;
@@ -26,14 +26,37 @@ pub(crate) fn escape(s: &str) -> String {
 /// smuggle script into the cockpit. Soft line breaks become hard breaks so
 /// chat text keeps its newlines instead of Markdown-collapsing them.
 pub(crate) fn render_markdown(src: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser};
+    use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
+    let mut in_mermaid = false;
     let parser = Parser::new_ext(src, Options::all()).map(|ev| match ev {
+        Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+            let is_mermaid = info
+                .split_whitespace()
+                .next()
+                .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"));
+            if is_mermaid {
+                in_mermaid = true;
+                Event::Html(CowStr::Borrowed(
+                    r#"<pre class="mermaid" data-markdown-extension="mermaid">"#,
+                ))
+            } else {
+                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+            }
+        }
+        Event::End(TagEnd::CodeBlock) if in_mermaid => {
+            in_mermaid = false;
+            Event::Html(CowStr::Borrowed("</pre>"))
+        }
         Event::SoftBreak => Event::HardBreak,
         other => other,
     });
     let mut raw = String::new();
     html::push_html(&mut raw, parser);
-    ammonia::clean(&raw)
+    ammonia::Builder::default()
+        .add_tag_attributes("pre", &["class", "data-markdown-extension"])
+        .add_tag_attributes("code", &["class"])
+        .clean(&raw)
+        .to_string()
 }
 
 const STYLE: &str = r#"
@@ -71,6 +94,9 @@ const STYLE: &str = r#"
   .md code { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
   .md pre { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.6rem; border-radius: 6px; overflow-x: auto; }
   .md pre code { background: none; padding: 0; }
+  .md .mermaid { box-sizing: border-box; max-width: 100%; text-align: center; }
+  .md .mermaid svg { display: block; height: auto; max-width: 100%; margin-inline: auto; }
+  .md .mermaid-error { text-align: left; border: 1px solid #d9534f; white-space: pre-wrap; }
   .md blockquote { margin: 0.3rem 0; padding-left: 0.75rem; border-left: 3px solid color-mix(in srgb, currentColor 25%, transparent); opacity: 0.85; }
   .md table { border-collapse: collapse; display: block; overflow-x: auto; }
   .md th, .md td { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); padding: 0.2rem 0.5rem; }
@@ -168,7 +194,11 @@ pub(crate) fn agent_panel(
   var es = new EventSource("/agents/{id}/events");
   es.onmessage = function (e) {{
     var t = document.getElementById("transcript-{id}");
-    if (t) {{ t.innerHTML = e.data; t.scrollTop = t.scrollHeight; }}
+    if (t) {{
+      t.innerHTML = e.data;
+      if (window.newtEnhanceMarkdown) {{ window.newtEnhanceMarkdown(t); }}
+      t.scrollTop = t.scrollHeight;
+    }}
     else {{ es.close(); }}
   }};
 }})();
@@ -274,6 +304,8 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>newt-web</title>
 <script src="/assets/htmx.min.js"></script>
+<script defer src="/assets/mermaid.min.js"></script>
+<script defer src="/assets/markdown.js"></script>
 <style>{STYLE}</style>
 </head>
 <body>
@@ -326,6 +358,52 @@ mod tests {
         assert!(
             out.contains("<br"),
             "soft break becomes a hard break: {out}"
+        );
+    }
+
+    #[test]
+    fn markdown_marks_mermaid_fences_for_progressive_enhancement() {
+        let out = render_markdown(
+            "before\n\n```mermaid\ngraph TD\n  A[Markdown] --> B[Web or TUI]\n```\n\nafter",
+        );
+        assert!(
+            out.contains(r#"<pre class="mermaid" data-markdown-extension="mermaid">graph TD"#),
+            "Mermaid fence becomes an enrichment hook: {out}"
+        );
+        assert!(
+            !out.contains(r#"class="language-mermaid""#),
+            "Mermaid must not remain an ordinary code fence: {out}"
+        );
+        assert!(out.contains("<p>before</p>"), "surrounding Markdown: {out}");
+        assert!(out.contains("<p>after</p>"), "surrounding Markdown: {out}");
+    }
+
+    #[test]
+    fn markdown_keeps_non_mermaid_fences_as_code() {
+        let out = render_markdown("```rust\nfn main() {}\n```");
+        assert!(
+            out.contains(r#"<code class="language-rust">"#),
+            "ordinary fences keep their language: {out}"
+        );
+        assert!(!out.contains(r#"class="mermaid""#), "not Mermaid: {out}");
+    }
+
+    #[test]
+    fn mermaid_source_is_still_untrusted_text() {
+        let out = render_markdown("```mermaid\ngraph TD\n  A[<script>alert(1)</script>]\n```");
+        assert!(!out.contains("<script"), "script tag escaped: {out}");
+        assert!(
+            out.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "diagram source remains inert text: {out}"
+        );
+    }
+
+    #[test]
+    fn live_panel_reenhances_markdown_after_sse_updates() {
+        let panel = agent_panel(7, "a", "m", false, &Snapshot::default());
+        assert!(
+            panel.contains("window.newtEnhanceMarkdown(t)"),
+            "SSE replacement must rerun generic Markdown enhancements: {panel}"
         );
     }
 

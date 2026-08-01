@@ -1,5 +1,8 @@
 # newt-web CI — the excluded-crate lane (decision D1, docs/decisions/newt_web_htmx.md).
 # Runs only when newt-web/ or its path-dep surface changes.
+# HOOK PARITY EXCEPTION: the root pre-push hook mirrors ci.yml, not this
+# excluded-crate lane. Browser installation is CI-only; the exact local BAT/UAT
+# commands are pinned in newt-web/README.md.
 name: newt-web
 on:
   pull_request:
@@ -8,20 +11,32 @@ on:
       - "newt-core/**"
       - ".github/workflows/newt-web.yml"
   push:
-    branches: [main]
+    branches: [main, "release/**"]
     paths:
       - "newt-web/**"
       - "newt-core/**"
       - ".github/workflows/newt-web.yml"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Headless acceptance tier"
+        type: choice
+        default: all
+        options: [bat, uat, all]
 jobs:
   newt-web:
-    name: newt-web (fmt + clippy + test)
+    name: newt-web (Rust + headless acceptance)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: newt-web/package-lock.json
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: newt-web
@@ -31,3 +46,30 @@ jobs:
         run: cargo clippy --manifest-path newt-web/Cargo.toml --all-targets -- -D warnings
       - name: test
         run: cargo test --manifest-path newt-web/Cargo.toml
+      - name: Install headless-harness dependencies
+        working-directory: newt-web
+        run: npm ci
+      - name: Install headless Chromium
+        working-directory: newt-web
+        run: npx playwright install chromium --with-deps
+      # BAT is the deterministic browser smoke gate on PRs and main. A manual
+      # UAT-only dispatch skips it; release/** runs both tiers below.
+      - name: Headless BAT
+        if: github.event_name != 'workflow_dispatch' || inputs.tier != 'uat'
+        working-directory: newt-web
+        run: npm run test:bat
+      # UAT uses the same simulated Ollama boundary but drives user-visible
+      # phone-sized behavior. It gates release branches and is opt-in manually,
+      # matching docs/testing/bat-uat.md's CI/CD tier split.
+      - name: Headless UAT
+        if: startsWith(github.ref, 'refs/heads/release/') || (github.event_name == 'workflow_dispatch' && inputs.tier != 'bat')
+        working-directory: newt-web
+        run: npm run test:uat
+      - name: Upload headless acceptance report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: newt-web-playwright-report
+          path: newt-web/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>newt-web</title>
 <script src="/assets/htmx.min.js"></script>
+<script defer src="/assets/mermaid.min.js"></script>
+<script defer src="/assets/markdown.js"></script>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: ui-monospace, monospace; margin: 0; }
@@ -40,6 +42,9 @@
   .md code { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
   .md pre { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.6rem; border-radius: 6px; overflow-x: auto; }
   .md pre code { background: none; padding: 0; }
+  .md .mermaid { box-sizing: border-box; max-width: 100%; text-align: center; }
+  .md .mermaid svg { display: block; height: auto; max-width: 100%; margin-inline: auto; }
+  .md .mermaid-error { text-align: left; border: 1px solid #d9534f; white-space: pre-wrap; }
   .md blockquote { margin: 0.3rem 0; padding-left: 0.75rem; border-left: 3px solid color-mix(in srgb, currentColor 25%, transparent); opacity: 0.85; }
   .md table { border-collapse: collapse; display: block; overflow-x: auto; }
   .md th, .md td { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); padding: 0.2rem 0.5rem; }

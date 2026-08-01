@@ -55,6 +55,15 @@ package-lock.json
 # them and hashes them for SRI, so an ignored asset silently breaks the build
 # for everyone but the author (#1372).
 !newt-web/assets/*.js
+# newt-web has no browser build step, but its headless BAT/UAT harness is
+# committed JavaScript with a pinned Playwright test-only dependency.
+!newt-web/package.json
+!newt-web/package-lock.json
+!newt-web/playwright.config.mjs
+!newt-web/tests/headless/
+!newt-web/tests/headless/*.mjs
+/newt-web/playwright-report/
+/newt-web/test-results/
 
 # ...but the reconstituted Claude Code commands are GENERATED artifacts:
 # scripts/eval/workflows/install.sh recreates them on any fresh machine.

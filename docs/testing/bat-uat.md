@@ -32,9 +32,17 @@ externals) on every PR, and against **real test LLMs** on a schedule.
   that thrashes (a distinct failing tool call every round + a failing summary)
   and asserts the cap-exit is honest. These are the durable regression guard for
   the loop hardening and gate every PR.
+- **newt-web browser acceptance** — a Playwright/Chromium harness starts the
+  real web binary and a simulated Ollama boundary. BAT verifies the canonical
+  Markdown/progressive-enhancement contract on every newt-web PR and `main`;
+  phone-sized UAT drives a complete prompt/reply/Mermaid flow on `release/**`
+  and manual dispatch. Run it with `npm run test:bat` or `npm run test:uat` from
+  `newt-web/`.
 
-These are fast, deterministic, and parallel-safe — no real network, fs,
-subprocess, or wall-clock.
+The Rust/mock tiers are fast, deterministic, and parallel-safe — no real
+network, fs, subprocess, or wall-clock. The browser BAT/UAT is the deliberate
+grounding add-on: it is still deterministic and uses no external network, but
+runs serially against real loopback processes, a temporary store, and Chromium.
 
 ### 2. Live (real LLMs on gnuc) — weekly + release, in `eval-live.yml`
 
