@@ -343,6 +343,13 @@ fn authoritative_request_budget(
     }
 }
 
+fn capped_accepted_prompt_tokens(
+    accepted_prompt_tokens: u32,
+    declared_ceiling: Option<usize>,
+) -> usize {
+    (accepted_prompt_tokens as usize).min(declared_ceiling.unwrap_or(usize::MAX))
+}
+
 /// Refuse before inference when the compression-immune system/card/exact-user
 /// head, newest live user presentation, and advertised schemas cannot fit an
 /// authoritative model budget. The live presentation intentionally remains at
@@ -4805,17 +4812,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
     // Pre-send token budget gate; tightened mid-turn by a recovered 400
-    // (#223). Phase 20 §2.1 max(proven, believed) semantics — no `num_ctx`
-    // ceiling on this wire (limits are server-side, e.g. vLLM
-    // --max-model-len), so the ceiling leg is `None`.
+    // (#223). `num_ctx` is not sent on this wire, but an operator-declared
+    // local endpoint window still provides an authoritative input ceiling.
+    // Cloud endpoints leave it unset and continue to fail open on proven-good
+    // evidence alone.
+    let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct);
     let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
-    // Step 20.3: on this wire there is no `num_ctx` ceiling, so the send
-    // budget is authoritative only when a believed window (`safe_context`)
-    // seeds it. Cloud OpenAI-compatible models have no `/api/show` to seed
-    // one, so their budget rests on the proven-good HWM alone — the guard
-    // fails open rather than refusing. A cw-400 flips this true mid-turn.
-    let mut send_budget_authoritative = safe_context.is_some();
+        initial_send_budget(max_ok_input, safe_context, num_ctx, input_ceiling_pct);
+    let mut send_budget_authoritative = safe_context.is_some() || num_ctx_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     let tools = merged_tool_definitions(
         mcp,
@@ -5149,12 +5153,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 o.remove("tool_choice");
             }
         }
-        // No `num_ctx` is sent here, so #282's per-request input ceiling has
-        // no value to key on either — the pre-send guard stays on the cached
-        // `max_ok_input` ∥ `safe_context` numbers and the cw-400 recovery
-        // (these endpoints DO reject oversize requests with a parseable 400,
-        // unlike Ollama's silent truncation).
-        let _ = num_ctx; // not applicable for OpenAI-compatible endpoints
+        // OpenAI-compatible endpoints do not accept a `num_ctx` request field,
+        // but the operator-declared local window still bounds Newt's pre-send
+        // budget. These endpoints reject oversize requests rather than silently
+        // truncating them, so no wire field is needed to enforce the local cap.
         let dispatch = with_backoff_notify(
             &retry,
             || async {
@@ -5215,8 +5217,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // can't read, and which headless has no `recover_cw_400` for at
                 // all — fall back to deriving a tightened cap from the current
                 // send budget so the turn self-heals instead of dying on a blind
-                // resend of the same oversized prompt. No `num_ctx` ceiling on
-                // this wire (limits are server-side), so derive from send_budget.
+                // resend of the same oversized prompt. The fallback derives from
+                // send_budget and remains capped by the operator-declared local
+                // window even though no `num_ctx` field rides on this wire.
                 if cw_retries < 2 {
                     if let Some(new_cap) = recover_cw_400
                         .and_then(|f| f(&e, model, &today))
@@ -5231,7 +5234,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             model,
                             cw_retries + 1,
                         );
-                        send_budget = Some(new_cap as usize);
+                        let new_budget =
+                            num_ctx_ceiling.map_or(new_cap as usize, |c| (new_cap as usize).min(c));
+                        send_budget = Some(new_budget);
                         // The endpoint's parsed hard limit is authoritative
                         // from here on (Step 20.3; mirrors the Ollama path).
                         send_budget_authoritative = true;
@@ -5242,7 +5247,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 // (Phase 20 §2.3; mirrors the Ollama path).
                                 messages: &messages,
                                 budget: calibrate_down(
-                                    (new_cap as usize).saturating_sub(tool_tokens_real),
+                                    new_budget.saturating_sub(tool_tokens_real),
                                     cal,
                                 ),
                                 max_messages: None,
@@ -5286,10 +5291,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 outcome.action,
                                 outcome.tokens_before,
                                 outcome.tokens_after,
-                                calibrate_down(
-                                    (new_cap as usize).saturating_sub(tool_tokens_real),
-                                    cal,
-                                ),
+                                calibrate_down(new_budget.saturating_sub(tool_tokens_real), cal),
                                 round,
                                 "context_window_400",
                                 None,
@@ -5314,10 +5316,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
         // Phase 20 §2.2: no `num_ctx` on this wire, so there is no silent
         // head-truncation mode to suspect (oversize requests get a parseable
-        // 400 instead) and no per-request ceiling on the mid-turn raise.
+        // 400 instead). The declared local `num_ctx` still caps Newt's input
+        // budget even though that field is not sent on this wire: accepting a
+        // prompt with a short reply does not prove the same prompt leaves room
+        // for the configured maximum output.
         let truncation_suspect = false;
         if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
-            let raised = u.input_tokens as usize;
+            let raised = capped_accepted_prompt_tokens(u.input_tokens, num_ctx_ceiling);
             if raised > budget {
                 send_budget = Some(raised);
                 if debug {
@@ -5838,9 +5843,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             // #727: intercept the read-only budget self-read (see the Ollama path).
-            // num_ctx is not applicable on OpenAI-compatible endpoints (so the
-            // ceiling is usually None → an honest "no ceiling configured"), but the
-            // used-token figure is still reported.
+            // OpenAI-compatible endpoints do not receive `num_ctx`, but a local
+            // endpoint's operator-declared window still provides the displayed
+            // input ceiling. Cloud endpoints normally leave it unset.
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
@@ -8783,6 +8788,12 @@ mod tool_round_cap_tests {
         format!("{label} {}", "x".repeat(6_000))
     }
 
+    #[test]
+    fn accepted_prompt_cannot_raise_budget_past_declared_ceiling() {
+        assert_eq!(capped_accepted_prompt_tokens(61_221, Some(54_394)), 54_394);
+        assert_eq!(capped_accepted_prompt_tokens(8_734, None), 8_734);
+    }
+
     /// Prove the regression fixture isolates the live-tail duplicate — the
     /// protected recovery copy and schemas fit, but the irreducible complete
     /// request (recovery copy + newest user presentation) does not — and
@@ -8940,6 +8951,26 @@ mod tool_round_cap_tests {
         let error = openai_chat_complete(ctx, &mut NoMcp)
             .await
             .expect_err("the two irreducible prompt presentations exceed the window");
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn openai_chat_declared_num_ctx_is_a_local_refusal_budget() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("OPENAI-CHAT-NUM-CTX");
+        let budget = mid_sized_pair_budget(&task, false);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.num_ctx = Some(((budget * 100).div_ceil(80)) as u32);
+
+        let error = openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the declared local window must refuse the irreducible request");
+
         assert_irreducible_refusal(&error);
         assert_no_requests(&server).await;
     }
