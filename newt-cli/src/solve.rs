@@ -59,10 +59,10 @@ pub struct SolveArgs {
     pub events: Option<PathBuf>,
     pub max_rounds: Option<usize>,
     /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`).
-    /// newt reserves ~20% for the reply and gates input at 80% of it, so a
-    /// long turn compacts under the window instead of overrunning it during
-    /// generation (the "Context size has been exceeded" 500s). None keeps
-    /// newt's default.
+    /// newt reserves the configured reply headroom and gates input at
+    /// `[context].input_ceiling_pct`, so a long turn compacts under the window
+    /// instead of overrunning it during generation (the "Context size has been
+    /// exceeded" 500s). None keeps newt's default.
     pub context_window: Option<usize>,
     /// Operator-supplied sha256 of the weights actually served, for the
     /// contract record's `model_digest` (W0 #1511). Also settable via the
@@ -128,6 +128,15 @@ fn apply_context_config(driver: &mut TurnDriverConfig, context: Option<&newt_cor
     driver.low_budget_pct = context.low_budget_pct;
     driver.estimation = context.estimation;
     driver.summary_input_cap_floor_chars = context.summary_input_cap_floor_chars;
+}
+
+fn apply_context_window(driver: &mut TurnDriverConfig, context_window: usize) {
+    let context_window = context_window as u32;
+    let input_budget =
+        (u64::from(context_window) * u64::from(driver.input_ceiling_pct) / 100) as u32;
+    driver.safe_context = Some(input_budget);
+    driver.max_ok_input = Some(input_budget);
+    driver.num_ctx = Some(context_window);
 }
 
 /// Run one task headless and emit its trace. Returns the process exit code:
@@ -259,18 +268,15 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // Pin the model's served context window so the loop's pre-send guard +
     // compaction keep each request under the backend's `--ctx-size` (e.g. dgx1
     // llama.cpp serves qwen3-coder at 32768). `--context-window` is the FULL
-    // served window; the input budget is 80% of it, RESERVING ~20% for the
-    // reply — the server's KV window is shared by input+output, so gating on the
-    // full window (no headroom) overruns it during generation and 500s (that was
-    // the leak). This matches the workspace convention that `safe_context` is
-    // the 80%-discounted window (mirrors the Ollama input-ceiling path). num_ctx
-    // is inert on the OpenAI wire but kept for the Ollama path.
+    // served window; the input budget uses `[context].input_ceiling_pct`,
+    // reserving the remainder for the reply. The server's KV window is shared
+    // by input+output, so gating on the full window (no headroom) overruns it
+    // during generation and 500s (that was the leak). This matches the workspace
+    // convention that `safe_context` is discounted by the configured input
+    // ceiling (mirrors the Ollama path). num_ctx is inert on the OpenAI wire but
+    // kept for the Ollama path.
     if let Some(cw) = args.context_window {
-        let cw = cw as u32;
-        let input_budget = (u64::from(cw) * 80 / 100) as u32;
-        dc.safe_context = Some(input_budget);
-        dc.max_ok_input = Some(input_budget);
-        dc.num_ctx = Some(cw);
+        apply_context_window(&mut dc, cw);
     }
     // Captured before `dc` moves into the driver: the cap the run ACTUALLY
     // uses (post `--max-rounds`), for the contract's effective_config.
@@ -631,6 +637,23 @@ mod tests {
             driver.compaction_trigger_policy,
             newt_core::CompactionTriggerPolicy::MessageCount
         );
+    }
+
+    #[test]
+    fn context_window_uses_configured_input_ceiling() {
+        let mut driver = TurnDriverConfig::new(
+            "http://example.invalid",
+            "model",
+            BackendKind::Openai,
+            "/workspace",
+        );
+        driver.input_ceiling_pct = 83;
+
+        apply_context_window(&mut driver, 65_536);
+
+        assert_eq!(driver.num_ctx, Some(65_536));
+        assert_eq!(driver.safe_context, Some(54_394));
+        assert_eq!(driver.max_ok_input, Some(54_394));
     }
 
     #[test]
