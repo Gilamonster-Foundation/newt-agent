@@ -186,6 +186,12 @@ kind = "openai"
 
 [backends.capability]
 reasoning_replay_scope = "current_user_turn"
+
+[backends.capability.chat_completions]
+cognition = true
+chat_template_kwargs = true
+parallel_tool_calls = false
+bounded_reasoning_continuation = true
 ```
 
 Unknown and legacy endpoints default to `never`. `current_user_turn` preserves
@@ -198,6 +204,23 @@ the assistant plans. The tools-disabled round-cap completion preserves that
 same suffix. The configured scope is backend behavior data: it can
 later be populated by a successful contract probe without changing the
 message-replay implementation.
+
+The nested `chat_completions` table is also explicit endpoint behavior data.
+Newt never infers these extensions from the model display name. With
+`cognition = true`, the psyche dial resolves to this initial local policy:
+
+| Cognition | Thinking | `max_tokens` | Temperature | `top_p` |
+|---|---:|---:|---:|---:|
+| `glancing` | off | 2,048 | 0.0 | 1.0 |
+| `pondering` | on | 4,096 | 0.6 | 0.95 |
+| `deliberating` | on | 10,000 | 0.6 | 0.95 |
+| `contemplating` | on | 16,000 | 0.6 | 0.95 |
+
+`chat_template_kwargs = true` permits Newt to project thinking as
+`enable_thinking` plus `truncate_history_thinking = true`.
+`parallel_tool_calls` is sent only on requests that include tools. Unknown
+strict OpenAI-compatible endpoints receive none of these additional fields,
+even when the active persona sets cognition.
 
 ### 3. Kill the name gate — in the right order
 

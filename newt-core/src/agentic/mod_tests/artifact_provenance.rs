@@ -45,6 +45,7 @@ fn ctx<'a>(
         caveats,
         persona_tools: None,
         cognition: None,
+        chat_completions_capability: Default::default(),
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         max_tool_rounds: 5,
         narration_nudge_cap: 0,

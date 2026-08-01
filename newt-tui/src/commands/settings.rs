@@ -161,7 +161,7 @@ pub(crate) fn dispatch(
         // explicit override that wins over `[tenacity]` config + the CLI flag.
         "tenacity" => print_newt(&tenacity_command(arg1), color, verbose),
 
-        // Psyche cognition: the per-call reasoning depth (→ `reasoning.effort`).
+        // Psyche cognition: the backend-neutral per-call reasoning depth.
         // `/cognition` shows the session override; `/cognition <level>` forces it,
         // `/cognition off` suppresses the field, `/cognition auto` follows persona.
         "cognition" => print_newt(&cognition_command(arg1), color, verbose),
@@ -243,7 +243,7 @@ fn cognition_command(arg: &str) -> String {
                     format!("cognition: auto — follows the active persona's `cognition:` (or off)  {usage}")
                 }
                 CognitionOverride::Off => {
-                    format!("cognition: off — no reasoning.effort sent, overriding any persona  {usage}")
+                    format!("cognition: off — no reasoning controls sent, overriding any persona  {usage}")
                 }
                 CognitionOverride::Set(c) => format!(
                     "cognition: {} — {}  (session override, beats the persona)  {usage}",
@@ -263,13 +263,13 @@ fn cognition_command(arg: &str) -> String {
                 };
                 out.push_str(&format!("\n  {:<14} {}{mark}", c.label(), c.describe()));
             }
-            out.push_str("\n  off            no reasoning.effort (overrides the persona)");
+            out.push_str("\n  off            no reasoning controls (overrides the persona)");
             out.push_str("\n  auto           follow the active persona (default)");
             out
         }
         "off" | "none" => {
             set_cli_cognition(CognitionOverride::Off);
-            "cognition → off — no reasoning.effort will be sent".to_string()
+            "cognition → off — no reasoning controls will be sent".to_string()
         }
         "auto" | "reset" | "persona" => {
             set_cli_cognition(CognitionOverride::Unset);
@@ -311,13 +311,13 @@ fn psyche_command(arg: &str) -> String {
     // Show the EFFECTIVE cognition + where it resolves from (review-2 #6): a
     // status view, not just an override inspector.
     let cog = match cli_cognition() {
-        CognitionOverride::Off => "off — no reasoning.effort (session override)".to_string(),
+        CognitionOverride::Off => "off — no reasoning controls (session override)".to_string(),
         CognitionOverride::Set(c) => {
             format!("{} — {} (session override)", c.label(), c.describe())
         }
         CognitionOverride::Unset => match newt_core::cognition::persona_cognition() {
             Some(c) => format!("{} — {} (from the active persona)", c.label(), c.describe()),
-            None => "auto — no reasoning.effort (no persona sets it)".to_string(),
+            None => "auto — no reasoning controls (no persona sets it)".to_string(),
         },
     };
     let ten = effective_tenacity();
@@ -330,7 +330,7 @@ fn psyche_command(arg: &str) -> String {
     let mut out = String::from("psyche — how hard the agent works (three orthogonal dials):");
     out.push_str(&format!("\n  cognition   {cog}"));
     out.push_str(
-        "\n              reasoning depth → reasoning.effort (Responses only)   (/cognition)",
+        "\n              backend-specific reasoning depth                    (/cognition)",
     );
     out.push_str(&format!(
         "\n  tenacity    {} — {}",

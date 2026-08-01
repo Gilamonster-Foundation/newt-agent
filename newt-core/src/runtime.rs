@@ -40,7 +40,8 @@ pub struct BackendState {
 /// `Config`. The single query for "what is active".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSettingsSnapshot {
-    /// Effective cognition (override > persona > off). `None` ⇒ no reasoning.effort.
+    /// Effective cognition (override > persona > off). `None` means no
+    /// backend-specific reasoning controls are requested.
     pub cognition: Option<Cognition>,
     /// Effective tenacity (CLI > persona > config/family > Standard).
     pub tenacity: Tenacity,

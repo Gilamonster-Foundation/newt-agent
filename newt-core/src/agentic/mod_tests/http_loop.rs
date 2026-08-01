@@ -38,6 +38,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         caveats,
         persona_tools: None,
         cognition: None,
+        chat_completions_capability: Default::default(),
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         max_tool_rounds: 8,
         narration_nudge_cap: 1,
@@ -1578,6 +1579,93 @@ async fn openai_current_turn_scope_redacts_inline_reasoning_from_restored_histor
         .expect("restored assistant message present");
     assert_eq!(old_assistant["content"], "visible old answer");
     assert!(!request.to_string().contains("private old plan"));
+}
+
+#[tokio::test]
+async fn openai_chat_projects_cognition_only_for_an_explicitly_capable_endpoint() {
+    let server = MockServer::start().await;
+    let request = Arc::new(Mutex::new(None));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureOpenAiRequestResponder {
+            request: request.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.cognition = Some(crate::role_profile::Cognition::Deliberating);
+    c.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+        cognition: Some(true),
+        chat_template_kwargs: Some(true),
+        parallel_tool_calls: Some(false),
+        bounded_reasoning_continuation: Some(true),
+    };
+
+    chat_complete(c, &mut NoMcp)
+        .await
+        .expect("capable OpenAI-compatible dispatch succeeds");
+
+    let request = request
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("request captured");
+    assert_eq!(request["max_tokens"], 10_000);
+    assert_eq!(request["temperature"], 0.6);
+    assert_eq!(request["top_p"], 0.95);
+    assert_eq!(request["parallel_tool_calls"], false);
+    assert_eq!(request["chat_template_kwargs"]["enable_thinking"], true);
+    assert_eq!(
+        request["chat_template_kwargs"]["truncate_history_thinking"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn openai_chat_omits_local_cognition_fields_for_an_unknown_endpoint() {
+    let server = MockServer::start().await;
+    let request = Arc::new(Mutex::new(None));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureOpenAiRequestResponder {
+            request: request.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.cognition = Some(crate::role_profile::Cognition::Contemplating);
+
+    chat_complete(c, &mut NoMcp)
+        .await
+        .expect("strict-compatible dispatch succeeds");
+
+    let request = request
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("request captured");
+    for field in [
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "parallel_tool_calls",
+        "chat_template_kwargs",
+    ] {
+        assert!(
+            request.get(field).is_none(),
+            "unknown endpoints must not receive `{field}`"
+        );
+    }
 }
 
 #[test]

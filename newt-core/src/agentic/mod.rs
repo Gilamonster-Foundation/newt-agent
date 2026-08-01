@@ -22,6 +22,7 @@ mod crew_attest;
 mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
+mod generation_policy;
 mod git_tool;
 pub(crate) mod self_verify;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
@@ -597,15 +598,16 @@ pub struct ChatCtx<'a> {
     /// / driver / eval callers pass `None` (no persona surface).
     pub persona_tools: Option<&'a [String]>,
     /// The psyche **cognition** dial for this turn — how much reasoning effort to
-    /// request. `Some(level)` emits the OpenAI **Responses** `reasoning.effort`
-    /// field (via [`Cognition::reasoning_effort`]); `None` omits it (bit-for-bit
-    /// unchanged for callers that don't opt in). SCOPE: cognition applies to
-    /// Responses backends only — the Chat-Completions path does NOT send
-    /// `reasoning_effort` (it is model-specific there and rejected by
-    /// non-reasoning models), so this field is ignored on that path. The TUI
-    /// resolves it from the active persona's `cognition:` front-matter alongside
-    /// `persona_tools`; headless / eval callers pass `None`.
+    /// request. `Some(level)` emits OpenAI **Responses** `reasoning.effort` or,
+    /// for an explicitly capable Chat Completions endpoint, resolves a local
+    /// generation policy. `None` omits cognition-derived fields. The TUI
+    /// resolves this from the active persona's `cognition:` front-matter
+    /// alongside `persona_tools`; headless / eval callers pass `None`.
     pub cognition: Option<crate::role_profile::Cognition>,
+    /// Chat Completions extensions explicitly accepted by this endpoint.
+    /// Unknown endpoints use the all-unset default and retain the historical
+    /// request body even when cognition is active.
+    pub chat_completions_capability: crate::model_card::ChatCompletionsCapability,
     /// Whether assistant reasoning may be replayed to the active backend.
     /// Unknown endpoints default to `Never`; local reasoning backends opt in via
     /// their explicit capability profile.
@@ -1181,12 +1183,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
-        // Psyche cognition is SCOPED to Responses backends: it maps to
-        // `reasoning.effort`, sent only on the Responses wire (responses_reasoning_field).
-        // The Chat-Completions path deliberately does NOT send `reasoning_effort` — it
-        // is model-specific there and rejected by non-reasoning models — so cognition
-        // is ignored on this path. Bound `_` to make that explicit.
+        // Ollama has no Chat Completions capability projection. Bound these
+        // fields to `_` so its request body remains unchanged.
         cognition: _,
+        chat_completions_capability: _,
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds,
@@ -4467,6 +4467,7 @@ async fn final_summary_openai(
     model: &str,
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
+    generation_policy: generation_policy::GenerationPolicy,
     cap: CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     let CapExit {
@@ -4507,11 +4508,12 @@ async fn final_summary_openai(
         ));
     }
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": &messages,
         "stream": false,
     });
+    generation_policy.apply_to_chat_completions_body(&mut body);
     let retry = tui_retry_policy();
     let result = with_backoff_notify(
         &retry,
@@ -4654,12 +4656,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
-        // Psyche cognition is SCOPED to Responses backends: it maps to
-        // `reasoning.effort`, sent only on the Responses wire (responses_reasoning_field).
-        // The Chat-Completions path deliberately does NOT send `reasoning_effort` — it
-        // is model-specific there and rejected by non-reasoning models — so cognition
-        // is ignored on this path. Bound `_` to make that explicit.
-        cognition: _,
+        // Chat Completions does not use the Responses-only `reasoning_effort`
+        // field. Explicit endpoint capability data may instead project cognition
+        // into a local generation policy.
+        cognition,
+        chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
         workflow_grace_rounds,
@@ -4710,6 +4711,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // execution-pressure nudges.
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
+    let generation_policy = generation_policy::GenerationPolicy::resolve(
+        cognition,
+        chat_completions_capability,
+        reasoning_replay_scope,
+    );
+    let reasoning_replay_scope = generation_policy.reasoning_replay_scope;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
     let compress_state = match compress_state {
@@ -5128,6 +5135,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             "tool_choice": "auto",
             "stream": false,
         });
+        generation_policy.apply_to_chat_completions_body(&mut body);
         // Drop tools (and the now-meaningless tool_choice) for a model that
         // rejected them on a prior "does not support tools" 400.
         if !tools_supported {
@@ -5867,6 +5875,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         model,
         api_key,
         trimmed,
+        generation_policy,
         CapExit {
             max_tool_rounds,
             accumulated: accumulated_usage,
@@ -6104,6 +6113,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         caveats,
         persona_tools,
         cognition,
+        chat_completions_capability: _,
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,
@@ -7788,6 +7798,7 @@ mod tool_round_cap_tests {
     struct OpenAiReasoningCapResponder {
         round: AtomicUsize,
         first_plan_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
+        policy_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Respond for OpenAiReasoningCapResponder {
@@ -7818,6 +7829,14 @@ mod tool_round_cap_tests {
             });
             self.first_plan_seen_on_final
                 .store(first_plan_seen, Ordering::SeqCst);
+            self.policy_seen_on_final.store(
+                body["max_tokens"] == 10_000
+                    && body["temperature"] == 0.6
+                    && body["top_p"] == 0.95
+                    && body["chat_template_kwargs"]["enable_thinking"] == true
+                    && body.get("parallel_tool_calls").is_none(),
+                Ordering::SeqCst,
+            );
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": {"content": "cap summary"}}]
             }))
@@ -7862,6 +7881,7 @@ mod tool_round_cap_tests {
             caveats,
             persona_tools: None,
             cognition: None,
+            chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 1,
             narration_nudge_cap: 1,
@@ -8001,11 +8021,13 @@ mod tool_round_cap_tests {
     async fn openai_cap_exit_preserves_the_full_current_turn_reasoning_tail() {
         let server = MockServer::start().await;
         let first_plan_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let policy_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(OpenAiReasoningCapResponder {
                 round: AtomicUsize::new(0),
                 first_plan_seen_on_final: first_plan_seen.clone(),
+                policy_seen_on_final: policy_seen.clone(),
             })
             .mount(&server)
             .await;
@@ -8017,6 +8039,13 @@ mod tool_round_cap_tests {
         context.safe_context = None;
         context.max_tool_rounds = 4;
         context.reasoning_replay_scope = crate::model_card::ReasoningReplayScope::CurrentUserTurn;
+        context.cognition = Some(crate::role_profile::Cognition::Deliberating);
+        context.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            chat_template_kwargs: Some(true),
+            parallel_tool_calls: Some(false),
+            bounded_reasoning_continuation: Some(true),
+        };
 
         let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
             .await
@@ -8025,6 +8054,10 @@ mod tool_round_cap_tests {
         assert!(
             first_plan_seen.load(Ordering::SeqCst),
             "the tools-disabled cap-exit request must retain the first current-turn plan"
+        );
+        assert!(
+            policy_seen.load(Ordering::SeqCst),
+            "the cap-exit request must retain cognition policy and omit tool-only fields"
         );
     }
 
@@ -8070,6 +8103,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
@@ -8280,6 +8314,7 @@ mod tool_round_cap_tests {
             "tiny-model",
             None,
             messages,
+            generation_policy::GenerationPolicy::default(),
             CapExit {
                 max_tool_rounds: 1,
                 accumulated: None,
@@ -8377,6 +8412,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
@@ -8475,6 +8511,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
@@ -9156,6 +9193,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
@@ -9266,6 +9304,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
@@ -9385,6 +9424,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
@@ -9516,6 +9556,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
@@ -9639,6 +9680,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
@@ -9804,6 +9846,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
@@ -9978,6 +10021,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 cognition: None,
+                chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
@@ -10118,6 +10162,7 @@ mod save_note_loop_tests {
             caveats,
             persona_tools: None,
             cognition: None,
+            chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
@@ -10621,6 +10666,7 @@ mod compression_loop_tests {
             caveats,
             persona_tools: None,
             cognition: None,
+            chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
@@ -11913,6 +11959,7 @@ mod observation_hook_tests {
             caveats,
             persona_tools: None,
             cognition: None,
+            chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 8,
             narration_nudge_cap: 1,

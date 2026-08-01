@@ -282,7 +282,7 @@ fn backend(
 }
 
 #[test]
-fn backend_choice_carries_reasoning_replay_capability() {
+fn backend_choice_carries_chat_generation_capabilities() {
     let mut configured = backend(
         "nemotron",
         "http://local:8000",
@@ -291,6 +291,12 @@ fn backend_choice_carries_reasoning_replay_capability() {
     );
     configured.capability = Some(newt_core::model_card::Capability {
         reasoning_replay_scope: Some(newt_core::model_card::ReasoningReplayScope::CurrentUserTurn),
+        chat_completions: Some(newt_core::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            chat_template_kwargs: Some(true),
+            parallel_tool_calls: Some(false),
+            bounded_reasoning_continuation: Some(true),
+        }),
         ..Default::default()
     });
     let cfg = newt_core::Config {
@@ -302,9 +308,15 @@ fn backend_choice_carries_reasoning_replay_capability() {
         &[],
         &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
         || {
+            let choice = resolve_backend_choice(&cfg);
             assert_eq!(
-                resolve_backend_choice(&cfg).reasoning_replay_scope,
+                choice.reasoning_replay_scope,
                 newt_core::model_card::ReasoningReplayScope::CurrentUserTurn
+            );
+            assert_eq!(choice.chat_completions_capability.cognition, Some(true));
+            assert_eq!(
+                choice.chat_completions_capability.parallel_tool_calls,
+                Some(false)
             );
         },
     );

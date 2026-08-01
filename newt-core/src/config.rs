@@ -2847,6 +2847,15 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// Resolve explicitly accepted Chat Completions request extensions.
+    #[must_use]
+    pub fn chat_completions_capability(&self) -> crate::model_card::ChatCompletionsCapability {
+        self.capability
+            .as_ref()
+            .and_then(|capability| capability.chat_completions)
+            .unwrap_or_default()
+    }
+
     /// Resolve the backend's reasoning replay contract. Unknown or legacy
     /// endpoints remain conservative and never receive replayed reasoning.
     #[must_use]
@@ -5526,6 +5535,27 @@ mod tests {
         assert_eq!(
             replay_backend.reasoning_replay_scope(),
             crate::model_card::ReasoningReplayScope::CurrentUserTurn
+        );
+    }
+
+    #[test]
+    fn backend_chat_completions_generation_policy_is_explicit_capability_data() {
+        let backend: BackendConfig = toml::from_str(
+            "endpoint=\"http://h:1\"\nmodel=\"m\"\nkind=\"openai\"\n\
+             [capability.chat_completions]\ncognition=true\n\
+             chat_template_kwargs=true\nparallel_tool_calls=false\n\
+             bounded_reasoning_continuation=true\n",
+        )
+        .expect("chat-completions policy is valid capability data");
+
+        let capability = serde_json::to_value(backend.capability.expect("capability present"))
+            .expect("capability serializes");
+        assert_eq!(capability["chat_completions"]["cognition"], true);
+        assert_eq!(capability["chat_completions"]["chat_template_kwargs"], true);
+        assert_eq!(capability["chat_completions"]["parallel_tool_calls"], false);
+        assert_eq!(
+            capability["chat_completions"]["bounded_reasoning_continuation"],
+            true
         );
     }
 
