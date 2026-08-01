@@ -139,6 +139,14 @@ fn apply_context_window(driver: &mut TurnDriverConfig, context_window: usize) {
     driver.num_ctx = Some(context_window);
 }
 
+fn resolved_tenacity_for_contract(
+    config: Option<&newt_core::tenacity::TenacityConfig>,
+    model: &str,
+) -> String {
+    newt_core::tenacity::attribute_active_family(config, model);
+    newt_core::tenacity::effective_tenacity().to_string()
+}
+
 /// Run one task headless and emit its trace. Returns the process exit code:
 /// `0` when the turn completed, `1` on an infrastructure/turn failure. (Task
 /// pass/fail is Terminal-Bench's job via the task's own verification — this exit
@@ -217,22 +225,10 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // from the model NAME against the configured `[tenacity.families]` keys — so
     // the model matrix (qwen3/gemma/nemotron/…) works from config without a card
     // per model.
-    let card_family = newt_core::model_card::builtin_card(&model).and_then(|c| c.family);
-    let family = cfg
-        .tenacity
-        .as_ref()
-        .and_then(|t| t.family_for(&model, card_family.as_deref()))
-        .or(card_family);
     // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
     // contract's effective_config — the bench never re-derives it from a
     // profile (contract requirement 5).
-    let tenacity_level = cfg
-        .tenacity
-        .clone()
-        .unwrap_or_default()
-        .resolve(family.as_deref())
-        .to_string();
-    newt_core::tenacity::set_active_model_family(family);
+    let tenacity_level = resolved_tenacity_for_contract(cfg.tenacity.as_ref(), &model);
 
     // 4. The task instruction.
     let instruction = std::fs::read_to_string(&args.instruction_file).with_context(|| {
@@ -654,6 +650,15 @@ mod tests {
         assert_eq!(driver.num_ctx, Some(65_536));
         assert_eq!(driver.safe_context, Some(54_394));
         assert_eq!(driver.max_ok_input, Some(54_394));
+    }
+
+    #[test]
+    fn contract_tenacity_records_the_effective_cli_override() {
+        let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        newt_core::tenacity::set_tenacity_config(Default::default());
+        newt_core::tenacity::set_cli_tenacity(newt_core::Tenacity::Insistent);
+
+        assert_eq!(resolved_tenacity_for_contract(None, "model"), "insistent");
     }
 
     #[test]
