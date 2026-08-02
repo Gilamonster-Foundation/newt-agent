@@ -162,6 +162,7 @@ pub use compress::{
 };
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
+pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, newt_line, print_harness_notice,
     print_list_item, print_newt, set_spill_lines, GaugeLevel, NEWT_ORANGE_CT,
@@ -269,6 +270,7 @@ pub use permissions::{
 pub use plan_mode::PlanModeControl;
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
+pub use send_budget::initial_context_input_budget;
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
@@ -296,8 +298,8 @@ use display::{
     emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator, print_trace,
 };
 use send_budget::{
-    calibrate_down, calibrate_up, emit_accepted, initial_send_budget, num_ctx_input_ceiling,
-    sanitize_estimate_ratio,
+    calibrate_down, calibrate_up, emit_accepted, emit_context_window_400, initial_send_budget,
+    num_ctx_input_ceiling, recovered_input_budget, sanitize_estimate_ratio,
 };
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
@@ -333,10 +335,7 @@ fn authoritative_request_budget(
     send_budget_authoritative: bool,
     token_threshold: Option<usize>,
 ) -> Option<usize> {
-    let send = send_budget_authoritative
-        .then_some(send_budget)
-        .flatten()
-        .filter(|budget| *budget > 0);
+    let send = send_budget_authoritative.then_some(send_budget).flatten();
     match (send, token_threshold.filter(|budget| *budget > 0)) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -458,7 +457,10 @@ fn preflight_responses_request(
 }
 
 /// Hook recovering a hard context-window 400:
-/// `(error, model, today) → new input-token cap`. See [`ChatCtx::recover_cw_400`].
+/// `(error, model, today) → parsed full context window`. The loop composes the
+/// returned window with its percentage ceiling and generation output reserve;
+/// callbacks must not pre-discount it into an input cap. See
+/// [`ChatCtx::recover_cw_400`].
 pub type RecoverCw400 = fn(&anyhow::Error, &str, &str) -> Option<u32>;
 
 /// One per-round capability observation, reported through
@@ -482,6 +484,10 @@ pub enum RoundObservation {
     /// Persistent empty responses at `prompt_tokens` after retries (the
     /// 85%-of-safe-context silent-overflow exit).
     SuspectedOverflow { prompt_tokens: u32 },
+    /// A hard HTTP error reported the endpoint's full context window. The TUI
+    /// applies this through the same in-memory capability entry as subsequent
+    /// accepted-round evidence, avoiding stale whole-cache overwrites.
+    ContextWindow400 { context_window: u32 },
     /// Response carried only non-content fields (thinking/reasoning) with
     /// empty content.
     ThinkingOnly,
@@ -662,7 +668,9 @@ pub struct ChatCtx<'a> {
     /// Also feeds the pre-send budget as a hard input ceiling for this turn's
     /// requests (issue #282): Ollama silently evaluates only the window's
     /// tail, so anything newt sends must already fit inside the `num_ctx` it
-    /// sends it with. Ignored on the OpenAI path (no such request field).
+    /// sends it with. OpenAI requests do not serialize `num_ctx`, but local
+    /// compatible endpoints still use it as an authoritative declared window
+    /// for preflight, compaction, reporting, and 400 recovery.
     pub num_ctx: Option<u32>,
     /// TCP connect timeout. Short (5 s default) so a down endpoint fails fast
     /// rather than blocking the full `inference_timeout_secs`.
@@ -698,11 +706,12 @@ pub struct ChatCtx<'a> {
     /// `None` disables overflow detection.
     pub safe_context: Option<u32>,
     /// Hook invoked when a dispatch fails, to recover a hard context-window
-    /// 400: `(error, model, today) → new input-token cap`. The TUI wires its
-    /// `recover_context_window_400` (which parses the endpoint's real limit
-    /// and persists it to `model-capabilities.json` — that cache stays
-    /// TUI-side with the probe module). `None` disables recovery: the error
-    /// propagates exactly as it did when no limit could be parsed. See #223.
+    /// 400: `(error, model, today) → parsed full context window`. The loop
+    /// derives the effective input cap after reserving its configured maximum
+    /// output; callbacks must not return a pre-discounted input budget. The
+    /// loop emits [`RoundObservation::ContextWindow400`] so the TUI's existing
+    /// observation owner can persist the discovery. `None` disables numbered
+    /// recovery.
     pub recover_cw_400: Option<RecoverCw400>,
     /// Model-writable note store behind the `save_note` tool (Step 19.3,
     /// #248). `None` ⇒ the tool is not advertised and the loop never writes
@@ -798,10 +807,11 @@ pub struct ChatCtx<'a> {
     /// `[context] summary_input_cap_floor_chars` — floor for the summarizer
     /// input cap so a tight budget never starves the summarizer of material.
     pub summary_input_cap_floor_chars: usize,
-    /// `[context] input_ceiling_pct` — percent of `num_ctx` usable as input
-    /// before the reply reserve. Historically hardcoded at 80 (20% headroom);
-    /// large-window models (e.g. Opus) can safely raise this to pack more
-    /// context per turn. Applied by `num_ctx_input_ceiling`.
+    /// `[context] input_ceiling_pct` — percentage-based input limit inside the
+    /// declared context window. The effective ceiling is the tighter of this
+    /// limit and the space left after the generation policy's maximum output.
+    /// Historically hardcoded at 80 (20% headroom). Applied by
+    /// `num_ctx_input_ceiling`.
     pub input_ceiling_pct: u32,
     /// `[context] low_budget_pct` — remaining-budget percent below which the
     /// loop treats the turn as "low budget" and nudges toward wrapping up.
@@ -1347,16 +1357,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // so without the ceiling the first turn dispatched 10× over the real
     // window with zero events — B6). Mutable because a recovered 400 tightens
     // it mid-turn. See #223.
-    let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct);
+    let mut effective_input_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None);
     let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, num_ctx, input_ceiling_pct);
+        initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
     // does it rest on the proven-good high-water mark (`max_ok_input`) alone?
     // `safe_context` (a believed/declared window) and the per-request
     // `num_ctx` ceiling are authoritative; a cw-400 recovery flips this true
     // mid-turn. Cloud endpoints with no `/api/show` seed neither, so their
     // guard is non-authoritative and fails open instead of refusing.
-    let mut send_budget_authoritative = safe_context.is_some() || num_ctx_ceiling.is_some();
+    let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
@@ -1883,28 +1893,44 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 // `/api/chat`) falls back to a cap derived from the current send
                 // budget / the `num_ctx` ceiling, so the turn self-heals.
                 if cw_retries < 2 {
-                    if let Some(new_cap) = recover_cw_400
-                        .and_then(|f| f(&e, model, &today))
+                    let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                    if let Some(recovered_budget) = recovered_window
+                        .map(|context_window| {
+                            recovered_input_budget(
+                                context_window,
+                                input_ceiling_pct,
+                                None,
+                                effective_input_ceiling,
+                            )
+                        })
                         .or_else(|| {
                             cw_overflow::core_recover_overflow(
                                 &e.to_string(),
                                 send_budget,
-                                num_ctx_ceiling,
+                                effective_input_ceiling,
                             )
+                            .map(|cap| cap as usize)
                         })
                     {
+                        if let Some(context_window) = recovered_window {
+                            emit_context_window_400(&mut on_round_usage, context_window);
+                        }
+                        // A recovered full window is composed through the same
+                        // effective-ceiling operation as the declared window;
+                        // numberless recovery already derives an input cap.
+                        let new_budget = effective_input_ceiling
+                            .map_or(recovered_budget, |c| recovered_budget.min(c));
                         emit_overflow_notice(
                             color,
                             accumulated_usage.as_ref(),
-                            Some(new_cap),
+                            Some(new_budget.min(u32::MAX as usize) as u32),
                             model,
                             cw_retries + 1,
                         );
                         // A recovered cap can only tighten — the request still
                         // carries the same `num_ctx`, so its ceiling holds (#282).
-                        let new_budget =
-                            num_ctx_ceiling.map_or(new_cap as usize, |c| (new_cap as usize).min(c));
                         send_budget = Some(new_budget);
+                        effective_input_ceiling = Some(new_budget);
                         // The endpoint's parsed hard limit is authoritative —
                         // a refuse on it is correct from here on (Step 20.3).
                         send_budget_authoritative = true;
@@ -1994,7 +2020,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // within the same turn (Phase 20 §2.2). Never lowers; stays under the
         // per-request input ceiling.
         if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
-            let raised = (u.input_tokens as usize).min(num_ctx_ceiling.unwrap_or(usize::MAX));
+            let raised =
+                (u.input_tokens as usize).min(effective_input_ceiling.unwrap_or(usize::MAX));
             if raised > budget {
                 send_budget = Some(raised);
                 if debug {
@@ -2762,9 +2789,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
+                    effective_input_ceiling,
                     num_ctx,
-                    input_ceiling_pct as usize,
+                    input_ceiling_pct,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -4816,10 +4843,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // local endpoint window still provides an authoritative input ceiling.
     // Cloud endpoints leave it unset and continue to fail open on proven-good
     // evidence alone.
-    let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct);
+    let mut effective_input_ceiling = num_ctx_input_ceiling(
+        num_ctx,
+        input_ceiling_pct,
+        generation_policy.max_output_tokens,
+    );
     let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, num_ctx, input_ceiling_pct);
-    let mut send_budget_authoritative = safe_context.is_some() || num_ctx_ceiling.is_some();
+        initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
+    let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     let tools = merged_tool_definitions(
         mcp,
@@ -5213,30 +5244,46 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // real limit, tighten the budget, compress, and retry once (#223;
                 // compress-not-trim since Step 18.4). When the endpoint carries
                 // NO parseable limit — llama.cpp's numberless `500 "Context size
-                // has been exceeded"`, which `recover_cw_400` (litellm-numbered)
-                // can't read, and which headless has no `recover_cw_400` for at
-                // all — fall back to deriving a tightened cap from the current
-                // send budget so the turn self-heals instead of dying on a blind
-                // resend of the same oversized prompt. The fallback derives from
-                // send_budget and remains capped by the operator-declared local
-                // window even though no `num_ctx` field rides on this wire.
+                // has been exceeded"` — fall back to deriving a tightened cap
+                // from the current send budget. The shared parse-only hook reads
+                // both LiteLLM and vLLM numbered forms in interactive and
+                // headless drivers; this fallback is only for numberless errors.
+                // It remains capped by the operator-declared local window even
+                // though no `num_ctx` field rides on this wire.
                 if cw_retries < 2 {
-                    if let Some(new_cap) = recover_cw_400
-                        .and_then(|f| f(&e, model, &today))
+                    let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                    if let Some(recovered_budget) = recovered_window
+                        .map(|context_window| {
+                            recovered_input_budget(
+                                context_window,
+                                input_ceiling_pct,
+                                generation_policy.max_output_tokens,
+                                effective_input_ceiling,
+                            )
+                        })
                         .or_else(|| {
                             cw_overflow::core_recover_overflow(&e.to_string(), send_budget, None)
+                                .map(|cap| cap as usize)
                         })
                     {
+                        if let Some(context_window) = recovered_window {
+                            emit_context_window_400(&mut on_round_usage, context_window);
+                        }
+                        // The callback returns the endpoint's full hard window,
+                        // not an already-discounted input cap. Reserve this
+                        // request's maximum output against the actual window,
+                        // then retain any tighter declared-window ceiling.
+                        let new_budget = effective_input_ceiling
+                            .map_or(recovered_budget, |c| recovered_budget.min(c));
                         emit_overflow_notice(
                             color,
                             accumulated_usage.as_ref(),
-                            Some(new_cap),
+                            Some(new_budget.min(u32::MAX as usize) as u32),
                             model,
                             cw_retries + 1,
                         );
-                        let new_budget =
-                            num_ctx_ceiling.map_or(new_cap as usize, |c| (new_cap as usize).min(c));
                         send_budget = Some(new_budget);
+                        effective_input_ceiling = Some(new_budget);
                         // The endpoint's parsed hard limit is authoritative
                         // from here on (Step 20.3; mirrors the Ollama path).
                         send_budget_authoritative = true;
@@ -5322,7 +5369,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // for the configured maximum output.
         let truncation_suspect = false;
         if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
-            let raised = capped_accepted_prompt_tokens(u.input_tokens, num_ctx_ceiling);
+            let raised = capped_accepted_prompt_tokens(u.input_tokens, effective_input_ceiling);
             if raised > budget {
                 send_budget = Some(raised);
                 if debug {
@@ -5849,9 +5896,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
+                    effective_input_ceiling,
                     num_ctx,
-                    input_ceiling_pct as usize,
+                    input_ceiling_pct,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -6344,7 +6391,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         tools_chat,
         &exposure,
         exposure_budget_tokens(
-            initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct),
+            initial_send_budget(max_ok_input, safe_context, None),
             safe_context,
         ),
         &std::collections::BTreeSet::new(),
@@ -6357,7 +6404,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // limits are provider-side. Retain ChatCtx.num_ctx only for the
     // get_context_remaining display seam above; it must not become a local
     // authoritative refusal threshold for a value absent from this wire.
-    let send_budget = initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
+    let send_budget = initial_send_budget(max_ok_input, safe_context, None);
     let send_budget_authoritative = safe_context.is_some();
     let authoritative_budget =
         authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens);
@@ -6542,9 +6589,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     estimate_request_tokens(&input, Some(&tools_chat), estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
+                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None),
                     num_ctx,
-                    input_ceiling_pct as usize,
+                    input_ceiling_pct,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -7715,9 +7762,8 @@ mod cap_exit_unit_tests {
 //   (2) on hitting the cap newt issues ONE final tools-disabled completion and
 //       returns its text (NOT the `(reached tool-call limit)` placeholder).
 //
-// (The companion test that recovers a hard context-window 400 via the
-// `recover_cw_400` hook lives in newt-tui — it exercises the TUI-side probe
-// cache persistence under a HOME env guard.)
+// Hard context-window recovery is covered both by the headless driver tests
+// and by a TUI-side integration test that grounds capability-cache persistence.
 
 /// Token weight of the builtin tool catalog the loop advertises at
 /// `disposition` (default advertise flags, no MCP) — the same
@@ -8794,6 +8840,12 @@ mod tool_round_cap_tests {
         assert_eq!(capped_accepted_prompt_tokens(8_734, None), 8_734);
     }
 
+    #[test]
+    fn authoritative_zero_input_budget_is_not_erased() {
+        assert_eq!(authoritative_request_budget(Some(0), true, None), Some(0));
+        assert_eq!(authoritative_request_budget(Some(0), false, None), None);
+    }
+
     /// Prove the regression fixture isolates the live-tail duplicate — the
     /// protected recovery copy and schemas fit, but the irreducible complete
     /// request (recovery copy + newest user presentation) does not — and
@@ -8970,6 +9022,36 @@ mod tool_round_cap_tests {
         let error = openai_chat_complete(ctx, &mut NoMcp)
             .await
             .expect_err("the declared local window must refuse the irreducible request");
+
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn openai_chat_output_reserve_tightens_declared_window_before_dispatch() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("OPENAI-CHAT-OUTPUT-RESERVE");
+        let budget = mid_sized_pair_budget(&task, false);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+        ctx.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        let context_window = budget + 16_000;
+        assert!(
+            context_window * ctx.input_ceiling_pct as usize / 100 > budget,
+            "fixture must be tightened by output reserve, not percentage"
+        );
+        ctx.num_ctx = Some(context_window as u32);
+
+        let error = openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the 16K output reserve must refuse the irreducible input");
 
         assert_irreducible_refusal(&error);
         assert_no_requests(&server).await;

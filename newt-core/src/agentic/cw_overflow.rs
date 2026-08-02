@@ -4,21 +4,21 @@
 //! Some backends reject an over-long prompt with a hard error the loop's
 //! pre-send budget can't pre-empt: llama.cpp's OpenAI-compatible endpoint
 //! returns `500 {"message":"Context size has been exceeded."}` — a **numberless**
-//! body, so [`newt-tui`'s numbered `parse_context_window_error`] (which reads
-//! the litellm `prompt is too long: N > M` form) matches nothing, and no
-//! recovery fires. The failure is real: a single capped tool result appended
-//! *after* the round's preflight can push the request past the server's
-//! `--ctx-size`, and estimation slack (chars/4) hides it from the gate.
+//! body, so [`parse_context_window_error`] (which reads LiteLLM and vLLM
+//! limits) matches nothing, and no numbered recovery fires. The failure
+//! is real: a single capped tool result appended *after* the round's preflight
+//! can push the request past the server's `--ctx-size`, and estimation slack
+//! (chars/4) hides it from the gate.
 //!
 //! This module supplies the missing piece: [`is_context_overflow`] recognizes
 //! the overflow (numbered OR numberless), and [`core_recover_overflow`] derives
 //! a tightened input cap to compress toward when the error carries no parseable
 //! limit — feeding the loop's existing compress-and-retry machinery (mod.rs
-//! OpenAI/Ollama recovery sites) so the turn self-heals instead of dying. It is
-//! the headless counterpart to the interactive `recover_cw_400` fn-pointer, and
-//! it also repairs the interactive TUI against llama.cpp's numberless body.
+//! OpenAI/Ollama recovery sites) so the turn self-heals instead of dying. The
+//! numbered parser and parse-only callback are shared by interactive and
+//! headless callers; this fallback also covers llama.cpp's numberless body.
 //!
-//! Detection is deliberately TIGHT — only the two known overflow phrases — so an
+//! Detection is deliberately TIGHT — only the known overflow phrases — so an
 //! unrelated 5xx that happens to echo the string can't lose its normal retry.
 
 /// The stable anchor phrases that mark a context-window overflow, across the
@@ -27,8 +27,13 @@
 ///
 /// - llama.cpp (`/v1/chat/completions`, server-side `--ctx-size`): numberless.
 /// - litellm / OpenAI-compatible proxies (issue #223): the numbered form, whose
-///   limits [`newt-tui`'s `parse_context_window_error`] extracts.
-const OVERFLOW_PHRASES: [&str; 2] = ["Context size has been exceeded", "prompt is too long:"];
+///   limits [`parse_context_window_error`] extracts.
+/// - vLLM 0.19: the numbered maximum-context-length validation form.
+const OVERFLOW_PHRASES: [&str; 3] = [
+    "Context size has been exceeded",
+    "prompt is too long:",
+    "This model's maximum context length is",
+];
 
 /// A sane floor for a derived cap — never compress toward less than this many
 /// input tokens (the system/card floor is already irreducible below it).
@@ -39,10 +44,57 @@ const MIN_DERIVED_CAP: u32 = 1024;
 const SHRINK_PCT: u64 = 80;
 
 /// Does `msg` look like a context-window overflow error from any backend newt
-/// drives? Matches the numbered (litellm) and numberless (llama.cpp) bodies;
-/// returns `false` for every other error so their normal retry is preserved.
+/// drives? Matches the numbered (LiteLLM/vLLM) and numberless (llama.cpp)
+/// bodies; returns `false` for every other error so their normal retry is
+/// preserved.
 pub fn is_context_overflow(msg: &str) -> bool {
     OVERFLOW_PHRASES.iter().any(|p| msg.contains(p))
+}
+
+/// Parse a numbered context-window error into `(prompt_tokens, full_window)`.
+///
+/// LiteLLM reports `prompt is too long: N tokens > M maximum`; vLLM reports
+/// `This model's maximum context length is M` followed by either `your prompt
+/// contains N` or `your request has N input tokens`. The error body is often
+/// wrapped in transport text/JSON, so stable phrases are scanned rather than
+/// assuming a response envelope. Numberless llama.cpp overflow remains the
+/// responsibility of [`core_recover_overflow`].
+#[must_use]
+pub fn parse_context_window_error(msg: &str) -> Option<(u64, u64)> {
+    if let Some((_, after)) = msg.split_once("prompt is too long:") {
+        let prompt = first_number(after)?;
+        let (_, after_gt) = after.split_once('>')?;
+        let max = first_number(after_gt)?;
+        return Some((prompt, max));
+    }
+
+    let (_, after) = msg.split_once("This model's maximum context length is")?;
+    let max = first_number(after)?;
+    let prompt = after
+        .split_once("your prompt contains")
+        .and_then(|(_, prompt)| first_number(prompt))
+        .or_else(|| {
+            after
+                .split_once("your request has")
+                .and_then(|(_, prompt)| first_number(prompt))
+        })?;
+    Some((prompt, max))
+}
+
+fn first_number(s: &str) -> Option<u64> {
+    s.split(|c: char| !c.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse().ok())
+}
+
+/// Parse-only [`super::RecoverCw400`] callback shared by interactive and
+/// headless callers. It returns the server's full window and performs no cache
+/// I/O; the loop's `RoundObservation::ContextWindow400` keeps persistence with
+/// the observation owner.
+#[must_use]
+pub fn recover_context_window_400(err: &anyhow::Error, _model: &str, _today: &str) -> Option<u32> {
+    let (_, full_window) = parse_context_window_error(&err.to_string())?;
+    Some(u32::try_from(full_window).unwrap_or(u32::MAX))
 }
 
 /// Derive a tightened input-token cap to compress toward when a context overflow
@@ -105,6 +157,35 @@ mod tests {
     fn detects_litellm_numbered_overflow() {
         let msg = "inference endpoint 400: litellm.ContextWindowExceededError: prompt is too long: 5960028 tokens > 1000000 maximum";
         assert!(is_context_overflow(msg));
+    }
+
+    #[test]
+    fn detects_vllm_numbered_overflow() {
+        let msg = "inference endpoint 400 Bad Request: This model's maximum context length is 32768 tokens. However, you requested 16000 output tokens and your prompt contains 20000 input tokens, for a total of 36000 tokens (20000 + 16000 = 36000 > 32768). Please reduce the length of the input prompt or the number of requested output tokens.";
+        assert!(is_context_overflow(msg));
+    }
+
+    #[test]
+    fn parses_litellm_and_both_vllm_numbered_forms() {
+        assert_eq!(
+            parse_context_window_error(
+                "litellm.ContextWindowExceededError: prompt is too long: 5960028 tokens > 1000000 maximum"
+            ),
+            Some((5_960_028, 1_000_000))
+        );
+        assert_eq!(
+            parse_context_window_error(
+                "This model's maximum context length is 32768 tokens. However, you requested 16000 output tokens and your prompt contains 20000 input tokens"
+            ),
+            Some((20_000, 32_768))
+        );
+        assert_eq!(
+            parse_context_window_error(
+                "This model's maximum context length is 32768 tokens. However, your request has 33000 input tokens."
+            ),
+            Some((33_000, 32_768))
+        );
+        assert_eq!(parse_context_window_error("invalid api key"), None);
     }
 
     #[test]

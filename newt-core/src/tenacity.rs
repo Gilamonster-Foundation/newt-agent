@@ -203,7 +203,7 @@ pub fn resolve_tenacity(
 // combined lazily by [`effective_tenacity`] via [`resolve_tenacity`], so each
 // setter is independent and order-free:
 //   - CLI `--tenacity` flag (highest), set in the CLI dispatch,
-//   - the `[tenacity]` config, stashed at `Config::resolve`,
+//   - the `[tenacity]` config, stashed by `Config::apply_runtime_settings`,
 //   - the active model's family, set at model selection.
 // All absent ⇒ [`Tenacity`]'s `Default` (`Standard`) — behaviour-preserving.
 static CLI_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
@@ -214,6 +214,39 @@ static ACTIVE_FAMILY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(N
 // (review P1#3: a declared persona tenacity is now actually applied, not just
 // rendered). `None` when no persona / the persona declares none.
 static PERSONA_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
+
+std::thread_local! {
+    /// A driven turn resolves tenacity before crossing onto its dedicated
+    /// thread. Keeping that value here makes every downstream resolver read in
+    /// the turn (workflow steering and tool dispatch included) observe the same
+    /// immutable posture without replacing the interactive process globals.
+    static EFFECTIVE_TENACITY_OVERRIDE: std::cell::Cell<Option<Tenacity>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restores the prior current-thread override on drop. The `Rc` marker keeps
+/// the guard on the thread whose TLS slot it owns; driven turns use a
+/// current-thread runtime, so the guard safely spans the whole async turn.
+pub(crate) struct ScopedEffectiveTenacity {
+    previous: Option<Tenacity>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for ScopedEffectiveTenacity {
+    fn drop(&mut self) {
+        let _ = EFFECTIVE_TENACITY_OVERRIDE.try_with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Override [`effective_tenacity`] on the current thread until the returned
+/// guard drops. Overrides nest in lexical (LIFO) order.
+pub(crate) fn scoped_effective_tenacity(level: Tenacity) -> ScopedEffectiveTenacity {
+    let previous = EFFECTIVE_TENACITY_OVERRIDE.with(|slot| slot.replace(Some(level)));
+    ScopedEffectiveTenacity {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
 
 /// Install the explicit CLI `--tenacity` override (highest priority). Call once,
 /// before the agentic loop starts.
@@ -241,8 +274,8 @@ pub fn cli_tenacity() -> Option<Tenacity> {
     CLI_TENACITY.lock().ok().and_then(|s| *s)
 }
 
-/// Install the resolved `[tenacity]` config (per-family + default). Called from
-/// `Config::resolve`, the single canonical config-application entry.
+/// Install the resolved `[tenacity]` config (per-family + default). Called by
+/// `Config::apply_runtime_settings`, the canonical runtime-application entry.
 pub fn set_tenacity_config(config: TenacityConfig) {
     if let Ok(mut slot) = TENACITY_CONFIG.lock() {
         *slot = Some(config);
@@ -277,6 +310,9 @@ pub fn persona_tenacity() -> Option<Tenacity> {
 /// config's per-family override for the active family, then the config default,
 /// then `Standard`.
 pub fn effective_tenacity() -> Tenacity {
+    if let Some(level) = EFFECTIVE_TENACITY_OVERRIDE.with(std::cell::Cell::get) {
+        return level;
+    }
     let cli = CLI_TENACITY.lock().ok().and_then(|s| *s);
     let persona = PERSONA_TENACITY.lock().ok().and_then(|s| *s);
     let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
@@ -381,6 +417,42 @@ mod tests {
         assert_eq!(Tenacity::default(), Tenacity::Standard);
         assert_eq!(Tenacity::Standard.read_only_nudge_after(), 3);
         assert!(!Tenacity::Standard.exit_plan_requires_edit());
+    }
+
+    #[test]
+    fn scoped_override_is_nested_thread_local_and_restores_the_global_resolution() {
+        use crate::test_guard::GlobalSettingsGuard;
+        let _settings = GlobalSettingsGuard::acquire();
+        set_cli_tenacity(Tenacity::Relaxed);
+        assert_eq!(effective_tenacity(), Tenacity::Relaxed);
+
+        let outer = scoped_effective_tenacity(Tenacity::Relentless);
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
+
+        set_cli_tenacity(Tenacity::Insistent);
+        assert_eq!(
+            effective_tenacity(),
+            Tenacity::Relentless,
+            "a concurrent global change cannot alter a captured turn posture"
+        );
+
+        {
+            let _inner = scoped_effective_tenacity(Tenacity::Standard);
+            assert_eq!(effective_tenacity(), Tenacity::Standard);
+        }
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
+
+        let other_thread = std::thread::spawn(effective_tenacity)
+            .join()
+            .expect("tenacity probe thread");
+        assert_eq!(
+            other_thread,
+            Tenacity::Insistent,
+            "the override must stay local to the driven turn thread"
+        );
+
+        drop(outer);
+        assert_eq!(effective_tenacity(), Tenacity::Insistent);
     }
 
     #[test]

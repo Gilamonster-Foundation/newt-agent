@@ -30,7 +30,7 @@
 //! - [`tenacity::TenacityRuntimeSnapshot`]: `CLI_TENACITY`, `PERSONA_TENACITY`,
 //!   **`TENACITY_CONFIG`**, **`ACTIVE_FAMILY`** (all four read by
 //!   `effective_tenacity`). The last two were the gap the piecemeal guard missed:
-//!   `Config::resolve` installs the `[tenacity]` config and the `solve`
+//!   `Config::apply_runtime_settings` installs the `[tenacity]` config and the `solve`
 //!   model-selection path installs the active family, both process-wide, so a
 //!   test exercising either leaked a per-family default / active family into a
 //!   sibling test's `effective_tenacity()`.

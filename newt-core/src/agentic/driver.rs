@@ -58,7 +58,8 @@ use std::sync::Arc;
 
 use super::observation::ShellObservation;
 use super::{
-    chat_complete, ChatCtx, CodeSearch, Embedder, NoMcp, PromptDisposition, SemanticIndex,
+    chat_complete, ChatCtx, CodeSearch, CrewRunner, Embedder, NoMcp, PromptDisposition,
+    SemanticIndex,
 };
 use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, Role, TokenUsage};
 
@@ -124,7 +125,9 @@ pub struct TurnDriverConfig {
     pub workflow_grace_rounds: usize,
     /// Legacy line limit for pre-execution tool previews.
     pub tool_output_lines: usize,
-    /// Ollama `options.num_ctx` (ignored on the OpenAI path).
+    /// Full model context window. Sent as Ollama `options.num_ctx`; on the
+    /// OpenAI-compatible path it stays local and provides the authoritative
+    /// input ceiling after percentage and generation-output reserves.
     pub num_ctx: Option<u32>,
     /// TCP connect timeout.
     pub connect_timeout_secs: u64,
@@ -284,6 +287,26 @@ struct InFlight {
     cancel_tx: Option<oneshot::Sender<()>>,
 }
 
+/// Runtime choices captured for one driver independently of its source-stable
+/// inference configuration. Each submitted turn clones this posture onto the
+/// dedicated worker thread.
+#[derive(Clone)]
+struct HeadlessRuntimePosture {
+    cognition: Option<crate::role_profile::Cognition>,
+    tenacity: crate::tenacity::Tenacity,
+    crew_runner: Option<Arc<dyn CrewRunner>>,
+}
+
+impl HeadlessRuntimePosture {
+    fn capture() -> Self {
+        Self {
+            cognition: crate::cognition::effective_cognition(),
+            tenacity: crate::tenacity::effective_tenacity(),
+            crew_runner: None,
+        }
+    }
+}
+
 /// A pumpable, non-blocking driver for one agentic turn at a time.
 ///
 /// Owns the running transcript and at most one in-flight turn. The external
@@ -293,6 +316,7 @@ struct InFlight {
 /// [`cancel`](Self::cancel) the in-flight turn.
 pub struct TurnDriver {
     config: TurnDriverConfig,
+    runtime: HeadlessRuntimePosture,
     transcript: Vec<MemMessage>,
     in_flight: Option<InFlight>,
 }
@@ -302,6 +326,7 @@ impl TurnDriver {
     pub fn new(config: TurnDriverConfig) -> Self {
         Self {
             config,
+            runtime: HeadlessRuntimePosture::capture(),
             transcript: Vec::new(),
             in_flight: None,
         }
@@ -312,6 +337,7 @@ impl TurnDriver {
     pub fn with_transcript(config: TurnDriverConfig, transcript: Vec<MemMessage>) -> Self {
         Self {
             config,
+            runtime: HeadlessRuntimePosture::capture(),
             transcript,
             in_flight: None,
         }
@@ -328,6 +354,38 @@ impl TurnDriver {
     /// Whether a turn is currently in flight.
     pub fn is_running(&self) -> bool {
         self.in_flight.is_some()
+    }
+
+    /// Pin the cognition projection used by every turn this driver submits.
+    /// The default is captured from the process posture when the driver is
+    /// constructed, before its dedicated turn thread is spawned.
+    #[must_use]
+    pub fn with_cognition(mut self, cognition: Option<crate::role_profile::Cognition>) -> Self {
+        self.runtime.cognition = cognition;
+        self
+    }
+
+    /// Pin the tenacity used by every resolver read in this driver's turns.
+    /// The default is captured from the process posture at construction.
+    #[must_use]
+    pub fn with_tenacity(mut self, tenacity: crate::tenacity::Tenacity) -> Self {
+        self.runtime.tenacity = tenacity;
+        self
+    }
+
+    /// Enable the real crew/team surface for driven turns. The runner is owned
+    /// through an `Arc` because every submitted turn executes on a dedicated
+    /// OS thread.
+    #[must_use]
+    pub fn with_crew_runner(mut self, runner: Arc<dyn CrewRunner>) -> Self {
+        self.runtime.crew_runner = Some(runner);
+        self
+    }
+
+    /// Whether driven turns will advertise and execute crew tools.
+    #[must_use]
+    pub fn has_crew_runner(&self) -> bool {
+        self.runtime.crew_runner.is_some()
     }
 
     /// Append a [`ShellObservation`] to the transcript so it becomes part of the
@@ -368,6 +426,7 @@ impl TurnDriver {
     /// thread promptly instead of waiting out the inference timeout.
     fn spawn_turn(&mut self, task: String) {
         let config = self.config.clone();
+        let runtime = self.runtime.clone();
         let messages = self.transcript.clone();
         let (tx, rx) = oneshot::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -390,7 +449,7 @@ impl TurnDriver {
                     biased;
                     // Cancellation wins the race when signalled.
                     _ = cancel_rx => Err("turn cancelled".to_string()),
-                    out = run_one_turn(&config, &messages, &task) => out,
+                    out = run_one_turn(&config, &runtime, &messages, &task) => out,
                 }
             });
             // The receiver may have been dropped (driver went away); fine.
@@ -458,9 +517,15 @@ impl TurnDriver {
 /// closure so it is directly unit-testable against a wiremock backend.
 async fn run_one_turn(
     config: &TurnDriverConfig,
+    runtime: &HeadlessRuntimePosture,
     messages: &[MemMessage],
     task: &str,
 ) -> Result<TurnOutcome, String> {
+    // Freeze every lazy `effective_tenacity()` read beneath `chat_complete`
+    // (workflow state and exit_plan_mode included) to the posture captured by
+    // this driver. The current-thread runtime keeps this RAII TLS guard on the
+    // dedicated turn thread for the entire future.
+    let _tenacity = crate::tenacity::scoped_effective_tenacity(runtime.tenacity);
     // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
     // borrows these mutably; the borrows release when `ctx` is consumed by the
     // await below, after which they move into the TurnOutcome.
@@ -517,12 +582,11 @@ async fn run_one_turn(
         experience_store: None,
         step_ledger: None,
         caveats: &config.caveats,
-        // Headless cowork driver carries no persona surface (FR-1 part 2, #997),
-        // but honors the process-global cognition override so `--cognition`
-        // (and `--obsessive`) set the reasoning effort on the headless wire too —
-        // the same single resolver the TUI uses, with no persona to layer over.
+        // Headless cowork carries no persona surface (FR-1 part 2, #997). The
+        // driver captured the effective cognition before spawning this thread,
+        // keeping the wire posture and contract observation identical.
         persona_tools: None,
-        cognition: crate::cognition::effective_cognition(),
+        cognition: runtime.cognition,
         chat_completions_capability: config.chat_completions_capability,
         reasoning_replay_scope: config.reasoning_replay_scope,
         max_tool_rounds: config.max_tool_rounds,
@@ -544,9 +608,9 @@ async fn run_one_turn(
         max_ok_input: config.max_ok_input,
         build_check_cmd: config.build_check_cmd.clone(),
         safe_context: config.safe_context,
-        // Session-bound seams a driven cowork turn does not carry (headless,
-        // exactly like the ACP worker / newt-eval callers).
-        recover_cw_400: None,
+        // Numbered context recovery is stateless and shared with the TUI; the
+        // remaining session-bound seams stay absent in this driven cowork.
+        recover_cw_400: Some(super::recover_context_window_400),
         note_sink: None,
         note_nudge: None,
         recall_source: None,
@@ -575,7 +639,7 @@ async fn run_one_turn(
         cancel: None,
         live_tool_output: None,
         git_tool: None,
-        crew_runner: None,
+        crew_runner: runtime.crew_runner.as_deref(),
         operating_mode_control: None,
         plan_mode_control: None,
     };
@@ -649,7 +713,7 @@ pub const VISIBLE_TRANSCRIPT_ROLES: [Role; 2] = [Role::User, Role::Assistant];
 mod tests {
     use super::*;
     use crate::agentic::SessionSemanticIndex;
-    use crate::caveats::Caveats;
+    use crate::caveats::{Caveats, CountBound, Scope};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -676,6 +740,31 @@ mod tests {
         let mut c = TurnDriverConfig::new(url, "test-model", BackendKind::Ollama, ".");
         c.caveats = Caveats::top();
         c
+    }
+
+    #[test]
+    fn constructors_capture_the_current_runtime_posture() {
+        use crate::cognition::{set_cli_cognition, CognitionOverride};
+        use crate::role_profile::Cognition;
+        use crate::tenacity::{set_cli_tenacity, Tenacity};
+        use crate::test_guard::GlobalSettingsGuard;
+
+        let _settings = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Set(Cognition::Pondering));
+        set_cli_tenacity(Tenacity::Insistent);
+        let empty = TurnDriver::new(cfg("http://placeholder"));
+
+        set_cli_cognition(CognitionOverride::Off);
+        set_cli_tenacity(Tenacity::Relaxed);
+        let seeded = TurnDriver::with_transcript(
+            cfg("http://placeholder"),
+            vec![MemMessage::user("already started")],
+        );
+
+        assert_eq!(empty.runtime.cognition, Some(Cognition::Pondering));
+        assert_eq!(empty.runtime.tenacity, Tenacity::Insistent);
+        assert_eq!(seeded.runtime.cognition, None);
+        assert_eq!(seeded.runtime.tenacity, Tenacity::Relaxed);
     }
 
     /// Pump the driver to completion the way a crossterm loop would: poll on an
@@ -778,7 +867,31 @@ mod tests {
         })
     }
 
-    async fn drive_once_capturing(config: TurnDriverConfig) -> Vec<serde_json::Value> {
+    fn advertised_tool(bodies: &[serde_json::Value], name: &str) -> bool {
+        bodies.iter().any(|body| {
+            body["tools"].as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"].as_str() == Some(name))
+            })
+        })
+    }
+
+    struct StubCrewRunner;
+
+    #[async_trait::async_trait]
+    impl CrewRunner for StubCrewRunner {
+        async fn dispatch(
+            &self,
+            _op: &str,
+            _args: &serde_json::Value,
+            _caveats: &Caveats,
+        ) -> Result<String, String> {
+            Ok("unused fixture crew".to_string())
+        }
+    }
+
+    async fn drive_once_capturing(mut driver: TurnDriver) -> Vec<serde_json::Value> {
         let server = MockServer::start().await;
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         Mock::given(method("POST"))
@@ -789,11 +902,9 @@ mod tests {
             })
             .mount(&server)
             .await;
-        // Rebind the config's URL to this server (the caller built it with a
+        // Rebind the driver's URL to this server (the caller built it with a
         // placeholder so the code_search wiring is the only variable).
-        let mut config = config;
-        config.url = server.uri();
-        let mut driver = TurnDriver::new(config);
+        driver.config.url = server.uri();
         driver.submit("find the retry backoff").expect("submit");
         let _ = pump_to_done(&mut driver).await;
         let out = bodies.lock().unwrap().clone();
@@ -806,7 +917,7 @@ mod tests {
     #[tokio::test]
     async fn code_search_advertised_only_when_the_config_carries_retrieval() {
         // Without retrieval: the tool is absent (unchanged headless behavior).
-        let bare = drive_once_capturing(cfg("http://placeholder")).await;
+        let bare = drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
         assert!(
             !advertised_code_search(&bare),
             "no code_search tool without a configured index"
@@ -814,15 +925,278 @@ mod tests {
 
         // With a supplied embedder + index: the tool is advertised + executable.
         let index: Arc<dyn SemanticIndex> = Arc::new(SessionSemanticIndex::default());
-        let with = drive_once_capturing(cfg("http://placeholder").with_code_search(
-            Arc::new(StubEmbedder),
-            index,
-            3,
+        let with = drive_once_capturing(TurnDriver::new(
+            cfg("http://placeholder").with_code_search(Arc::new(StubEmbedder), index, 3),
         ))
         .await;
         assert!(
             advertised_code_search(&with),
             "code_search advertised once the driver carries retrieval"
+        );
+    }
+
+    /// Grounds the owned thread-crossing seam itself: a configured runner is
+    /// what advertises both crew tools, and absence keeps both off the wire.
+    #[tokio::test]
+    async fn crew_advertised_only_when_driver_carries_a_runner() {
+        let bare = drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
+        assert!(!advertised_tool(&bare, "crew"));
+        assert!(!advertised_tool(&bare, "compose_roster"));
+
+        let with = drive_once_capturing(
+            TurnDriver::new(cfg("http://placeholder")).with_crew_runner(Arc::new(StubCrewRunner)),
+        )
+        .await;
+        assert!(advertised_tool(&with, "crew"));
+        assert!(advertised_tool(&with, "compose_roster"));
+    }
+
+    struct CrewCallingOllama;
+
+    impl Respond for CrewCallingOllama {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("chat request JSON");
+            let has_result = body["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
+            if has_result {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "crew result reviewed" }
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "function": {
+                                "name": "crew",
+                                "arguments": {
+                                    "task": "repair qualification harness",
+                                    "mode": "crew",
+                                    "crew": "nemotron-pair",
+                                    "verify": "just check"
+                                }
+                            }
+                        }]
+                    }
+                }))
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CrewDispatch {
+        op: String,
+        args: serde_json::Value,
+        caveats: Caveats,
+        tenacity: crate::tenacity::Tenacity,
+    }
+
+    struct RecordingCrewRunner {
+        dispatches: Arc<std::sync::Mutex<Vec<CrewDispatch>>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for RecordingCrewRunner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CrewRunner for RecordingCrewRunner {
+        async fn dispatch(
+            &self,
+            op: &str,
+            args: &serde_json::Value,
+            caveats: &Caveats,
+        ) -> Result<String, String> {
+            self.dispatches.lock().unwrap().push(CrewDispatch {
+                op: op.to_string(),
+                args: args.clone(),
+                caveats: caveats.clone(),
+                tenacity: crate::tenacity::effective_tenacity(),
+            });
+            Ok("crew ran: diff +3/-1; just check PASS".to_string())
+        }
+    }
+
+    /// Grounds the full model → agent loop → crew seam with a real HTTP turn.
+    /// The owned `Arc` must cross the dedicated driver thread without losing
+    /// the model's arguments or attenuated session authority.
+    #[tokio::test]
+    async fn model_crew_call_dispatches_exact_args_caveats_and_captured_posture() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(CrewCallingOllama)
+            .mount(&server)
+            .await;
+
+        let expected_caveats = Caveats {
+            fs_read: Scope::only(["/qualification/read".to_string()]),
+            fs_write: Scope::only(["/qualification/write".to_string()]),
+            exec: Scope::only(["just".to_string()]),
+            net: Scope::only(["127.0.0.1".to_string()]),
+            max_calls: CountBound::AtMost(9),
+            valid_for_generation: Scope::only([42]),
+        };
+        let expected_args = serde_json::json!({
+            "task": "repair qualification harness",
+            "mode": "crew",
+            "crew": "nemotron-pair",
+            "verify": "just check"
+        });
+        let dispatches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let runner = Arc::new(RecordingCrewRunner {
+            dispatches: dispatches.clone(),
+            drops: drops.clone(),
+        });
+        let weak_runner = Arc::downgrade(&runner);
+
+        let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+        crate::tenacity::set_cli_tenacity(crate::tenacity::Tenacity::Standard);
+
+        let mut config = cfg(&server.uri());
+        config.caveats = expected_caveats.clone();
+        let mut driver = TurnDriver::new(config)
+            .with_cognition(Some(crate::role_profile::Cognition::Pondering))
+            .with_tenacity(crate::tenacity::Tenacity::Relentless)
+            .with_crew_runner(runner.clone());
+        crate::tenacity::set_cli_tenacity(crate::tenacity::Tenacity::Relaxed);
+        drop(runner);
+        assert!(
+            weak_runner.upgrade().is_some(),
+            "the driver owns the only remaining crew runner Arc"
+        );
+
+        driver.submit("field the approved crew").expect("submit");
+        let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
+            panic!("crew turn did not complete")
+        };
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.reply, "crew result reviewed");
+        assert_eq!(
+            dispatches.lock().unwrap().as_slice(),
+            &[CrewDispatch {
+                op: "crew".to_string(),
+                args: expected_args,
+                caveats: expected_caveats,
+                tenacity: crate::tenacity::Tenacity::Relentless,
+            }]
+        );
+
+        drop(driver);
+        assert!(weak_runner.upgrade().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// Integrated regression for headless numbered recovery: the declared 65K
+    /// window is stale, vLLM reports its actual 32K full window, and
+    /// contemplating reserves 16K output. The parser must therefore compact
+    /// toward 16,768 input tokens; the old numberless fallback (80% of the
+    /// current cap twice) leaves this
+    /// fixture above the server threshold and cannot succeed.
+    #[tokio::test]
+    async fn headless_vllm_400_recovers_with_full_window_output_reserve() {
+        const SERVER_MESSAGE_CHAR_LIMIT: usize = 16_768 * 4;
+        struct VllmWindow {
+            calls: Arc<AtomicUsize>,
+            message_chars: Arc<std::sync::Mutex<Vec<usize>>>,
+        }
+        impl Respond for VllmWindow {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("chat request JSON");
+                assert_eq!(body["max_tokens"], 16_000);
+                let chars = body["messages"]
+                    .as_array()
+                    .expect("messages array")
+                    .iter()
+                    .filter_map(|message| message["content"].as_str())
+                    .map(str::len)
+                    .sum();
+                self.message_chars.lock().unwrap().push(chars);
+                if chars > SERVER_MESSAGE_CHAR_LIMIT {
+                    ResponseTemplate::new(400).set_body_string(
+                        "This model's maximum context length is 32768 tokens. However, you requested 16000 output tokens and your prompt contains 20000 input tokens, for a total of 36000 tokens (20000 + 16000 = 36000 > 32768). Please reduce the length of the input prompt or the number of requested output tokens.",
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "test-model",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "recovered"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 16_000,
+                            "completion_tokens": 1,
+                            "total_tokens": 16_001
+                        }
+                    }))
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let message_chars = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(VllmWindow {
+                calls: calls.clone(),
+                message_chars: message_chars.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let mut config =
+            TurnDriverConfig::new(server.uri(), "test-model", BackendKind::Openai, ".");
+        config.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        config.num_ctx = Some(65_536);
+        config.safe_context = Some(52_428);
+        config.max_ok_input = Some(52_428);
+
+        let mut transcript = Vec::new();
+        for index in 0..20 {
+            let content = format!("history-{index:02} {}", "x".repeat(3_988));
+            transcript.push(if index % 2 == 0 {
+                MemMessage::user(content)
+            } else {
+                MemMessage::assistant(content)
+            });
+        }
+        let estimated_history = config
+            .estimation
+            .tokens_for_chars(transcript.iter().map(|m| m.content.len()).sum());
+        assert!(
+            (16_769..31_702).contains(&estimated_history),
+            "fixture must distinguish full-window recovery from two 80% fallbacks: {estimated_history}"
+        );
+
+        let mut driver = TurnDriver::with_transcript(config, transcript)
+            .with_cognition(Some(crate::role_profile::Cognition::Contemplating));
+        driver.submit("finish the current task").expect("submit");
+        let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
+            panic!("headless turn did not complete after numbered recovery")
+        };
+        assert_eq!(outcome.error, None, "numbered recovery must be clean");
+        assert_eq!(outcome.reply, "recovered");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        let observed = message_chars.lock().unwrap();
+        assert!(
+            observed[0] > SERVER_MESSAGE_CHAR_LIMIT,
+            "first request must overflow"
+        );
+        assert!(
+            *observed.last().unwrap() <= SERVER_MESSAGE_CHAR_LIMIT,
+            "retry must compact under the 16,768-token input cap: {observed:?}"
         );
     }
 
