@@ -16,6 +16,7 @@ use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
 use super::spill::{self, SpillStore};
 use crate::caveats::CaveatsExt as _;
+use crate::{Action, PermissionAction, Question};
 #[cfg(test)]
 use output_budget::DEFAULT_MAX_OUTPUT_TOKENS;
 #[cfg(test)]
@@ -1117,11 +1118,24 @@ fn confirm_unrestricted_fs_mutation(
     if ocap_disabled() {
         return true;
     }
+    let prompt = mutation_confirm_question(question);
     match gate {
         Some(g) => g
-            .ask_question(question)
-            .is_some_and(|answer| answer.trim().eq_ignore_ascii_case("y")),
+            .ask_question(&prompt.terminal_text())
+            .and_then(|answer| prompt.parse(&answer))
+            .is_some_and(|answer| answer == PermissionAction::AllowOnce),
         None => false,
+    }
+}
+
+fn mutation_confirm_question(question: &str) -> Question<PermissionAction> {
+    Question {
+        markdown: question.to_string(),
+        actions: vec![
+            Action::new(PermissionAction::AllowOnce, "y", "y to confirm"),
+            Action::new(PermissionAction::Deny, "n", "n to skip"),
+        ],
+        note: None,
     }
 }
 
@@ -11668,8 +11682,8 @@ mod disable_ocap_tests {
         assert_eq!(
             gate.questions,
             vec![
-                "Write this file? [y/N]".to_string(),
-                "Delete this file? [y/N]".to_string()
+                "Write this file? [y/N]\n[y] to confirm   [n] to skip".to_string(),
+                "Delete this file? [y/N]\n[y] to confirm   [n] to skip".to_string(),
             ]
         );
     }

@@ -18,7 +18,7 @@ on:
 
 jobs:
   lean:
-    name: Lean caveat-lattice proofs
+    name: Lean proofs + TLA+ model
     runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
@@ -31,3 +31,9 @@ jobs:
       - name: lake build (checks every theorem; toolchain pinned in lean-toolchain)
         working-directory: formal
         run: lake build
+      - name: TLC prompt-control model
+        working-directory: formal
+        run: |
+          curl -fsSL https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar -o "$RUNNER_TEMP/tla2tools.jar"
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $RUNNER_TEMP/tla2tools.jar" | sha256sum -c -
+          java -cp "$RUNNER_TEMP/tla2tools.jar" tlc2.TLC PromptControls.tla -config PromptControls.cfg -coverage 1

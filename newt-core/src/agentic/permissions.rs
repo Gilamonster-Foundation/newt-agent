@@ -24,9 +24,58 @@
 //! grant is a human editing `[tui.permissions]`.
 
 use crate::caveats::{Caveats, Scope};
+use crate::store::Verdict;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::Path;
+
+macro_rules! permission_actions {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        /// A stable, serializable permission-form action shared by every UI surface.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum PermissionAction {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+        impl PermissionAction {
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+        }
+        impl AsRef<str> for PermissionAction {
+            fn as_ref(&self) -> &str { self.as_str() }
+        }
+    };
+}
+
+permission_actions! {
+    AllowOnce => "allow_once", AllowSession => "allow_session",
+    AllowPermanent => "allow_permanent", Deny => "deny",
+    DenyAlways => "deny_always", DenyPermanent => "deny_permanent",
+    Back => "back", Exit => "exit",
+}
+
+impl From<Verdict> for PermissionAction {
+    fn from(value: Verdict) -> Self {
+        match value {
+            Verdict::AllowOnce => Self::AllowOnce,
+            Verdict::AllowSession => Self::AllowSession,
+            Verdict::Deny => Self::Deny,
+        }
+    }
+}
+
+impl TryFrom<PermissionAction> for Verdict {
+    type Error = ();
+
+    fn try_from(value: PermissionAction) -> Result<Self, Self::Error> {
+        match value {
+            PermissionAction::AllowOnce => Ok(Self::AllowOnce),
+            PermissionAction::AllowSession => Ok(Self::AllowSession),
+            PermissionAction::Deny => Ok(Self::Deny),
+            _ => Err(()),
+        }
+    }
+}
 
 /// The capability axis a denial occurred on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -330,6 +379,34 @@ mod tests {
         assert_eq!(DenialKind::FsRead.as_str(), "fs_read");
         assert_eq!(DenialKind::FsWrite.as_str(), "fs_write");
         assert_eq!(DenialKind::Net.as_str(), "net");
+    }
+
+    #[test]
+    fn permission_actions_have_stable_wire_values_and_verdict_conversions() {
+        let actions = [
+            PermissionAction::AllowOnce,
+            PermissionAction::AllowSession,
+            PermissionAction::AllowPermanent,
+            PermissionAction::Deny,
+            PermissionAction::DenyAlways,
+            PermissionAction::DenyPermanent,
+            PermissionAction::Back,
+            PermissionAction::Exit,
+        ];
+        assert_eq!(
+            serde_json::to_string(&actions).unwrap(),
+            r#"["allow_once","allow_session","allow_permanent","deny","deny_always","deny_permanent","back","exit"]"#
+        );
+        assert_eq!(
+            PermissionAction::from(Verdict::AllowOnce),
+            PermissionAction::AllowOnce
+        );
+        assert_eq!(
+            Verdict::try_from(PermissionAction::AllowSession),
+            Ok(Verdict::AllowSession)
+        );
+        assert_eq!(Verdict::try_from(PermissionAction::Deny), Ok(Verdict::Deny));
+        assert!(Verdict::try_from(PermissionAction::AllowPermanent).is_err());
     }
 
     #[test]

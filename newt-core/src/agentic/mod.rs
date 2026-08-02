@@ -264,8 +264,8 @@ pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use observation::{ShellObservation, SHELL_OBSERVATION_PREFIX};
 pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeControl};
 pub use permissions::{
-    append_denial, load_denials, widen_caveats, DenialKind, PermissionDecision, PermissionGate,
-    PermissionRecord, PermissionRequest, PersistentDenial,
+    append_denial, load_denials, widen_caveats, DenialKind, PermissionAction, PermissionDecision,
+    PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
 };
 pub use plan_mode::PlanModeControl;
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};

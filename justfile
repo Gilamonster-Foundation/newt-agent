@@ -81,6 +81,7 @@ _place-binaries dest:
         cp "$target_dir/release/newt" {{dest}}/newt; \
         cp "$target_dir/release/newt-mcp-server" {{dest}}/newt-mcp-server
     @if command -v codesign >/dev/null 2>&1; then codesign --force --sign - {{dest}}/newt {{dest}}/newt-mcp-server && echo "re-signed ad-hoc (macOS AMFI)"; fi
+    @sh scripts/check-install-path.sh {{dest}}
 
 # Remove the binaries `just install` placed in DEST (default: ~/bin) — the
 # inverse of `just install`, so you can guarantee which build is on PATH.
@@ -131,6 +132,7 @@ check:
     #!/usr/bin/env bash
     set -uo pipefail
     rc=0
+    sh scripts/check-install-path.sh --self-test || rc=1
     cargo fmt --all -- --check || rc=1
     cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings || rc=1
     cargo test --workspace --features newt-data/kernel || rc=1

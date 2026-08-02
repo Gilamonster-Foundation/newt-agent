@@ -1486,12 +1486,24 @@ impl ConversationStore {
     /// decision, short enough that an abandoned request does not linger.
     pub(crate) const PERMISSION_REQUEST_TTL_NANOS: i64 = 5 * 60 * 1_000_000_000;
 
-    /// Publish a pending permission decision for the attach surface to render.
-    /// `requests_json` is a serialized `&[PermissionRequest]`; `danger_json` is
-    /// the GATE-STAMPED per-target tier (the web never classifies danger).
+    /// Publish the typed permission form the attach surface must render.
+    /// `danger_json` retains the gate-stamped tier for store compatibility.
     /// Returns an unguessable `request_id` the gate polls and the web echoes.
     /// Workspace-fenced like [`begin_prompt`]; the caller must own the claim.
-    pub fn publish_permission_request(
+    pub fn publish_permission_question(
+        &self,
+        conversation_id: &str,
+        question: &crate::Question<crate::PermissionAction>,
+        danger_json: &str,
+    ) -> anyhow::Result<String> {
+        self.publish_permission_request(
+            conversation_id,
+            &serde_json::to_string(question)?,
+            danger_json,
+        )
+    }
+
+    fn publish_permission_request(
         &self,
         conversation_id: &str,
         requests_json: &str,
@@ -1562,35 +1574,72 @@ impl ConversationStore {
         .map_err(Into::into)
     }
 
-    /// Record a surface's VERDICT for a pending request (the web calls this).
-    /// Idempotent on `request_id`: a double-submit / SSE reconnect that names
-    /// the same still-unresolved request is a safe no-op. Workspace-fenced.
-    /// This does NOT resolve the request — the gate's poll consumes it (so a
-    /// TTY answer can still win the race first).
-    pub fn answer_permission_request(
+    /// Record a displayed action for a pending request (the web calls this).
+    /// The stored form is rechecked inside the write transaction, so no
+    /// rendering surface can authorize an action the running gate omitted.
+    pub fn answer_permission_action(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+        action: crate::PermissionAction,
+    ) -> anyhow::Result<AnswerOutcome> {
+        let Ok(verdict) = Verdict::try_from(action) else {
+            return Ok(AnswerOutcome::InvalidAction);
+        };
+        self.answer_permission_request_inner(conversation_id, request_id, verdict, Some(action))
+    }
+
+    #[cfg(test)]
+    fn answer_permission_request(
         &self,
         conversation_id: &str,
         request_id: &str,
         verdict: Verdict,
     ) -> anyhow::Result<AnswerOutcome> {
+        self.answer_permission_request_inner(conversation_id, request_id, verdict, None)
+    }
+
+    /// Idempotent on `request_id`: a double-submit / SSE reconnect that names
+    /// the same still-unresolved request is a safe no-op. Workspace-fenced.
+    /// This does NOT resolve the request — the gate's poll consumes it (so a
+    /// TTY answer can still win the race first).
+    fn answer_permission_request_inner(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+        verdict: Verdict,
+        required_action: Option<crate::PermissionAction>,
+    ) -> anyhow::Result<AnswerOutcome> {
         let cutoff = (self.claim_clock)().saturating_sub(Self::PERMISSION_REQUEST_TTL_NANOS);
         let conn = self.lock_conn();
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let state: Option<(i64, Option<String>, i64)> = tx
+        let state: Option<(i64, Option<String>, i64, String)> = tx
             .query_row(
-                "SELECT resolved, verdict, created_tick FROM permission_requests
+                "SELECT resolved, verdict, created_tick, requests_json FROM permission_requests
                   WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3",
                 rusqlite::params![request_id, conversation_id, self.workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
         let outcome = match state {
             None => AnswerOutcome::Unknown,
             // Expired nonce (#1356): an aged-out request is gone — never newly
             // answerable, even while still unresolved.
-            Some((_, _, created_tick)) if created_tick <= cutoff => AnswerOutcome::Unknown,
-            Some((1, _, _)) | Some((_, Some(_), _)) => AnswerOutcome::AlreadyResolved,
-            Some((_, None, _)) => {
+            Some((_, _, created_tick, _)) if created_tick <= cutoff => AnswerOutcome::Unknown,
+            Some((1, _, _, _)) | Some((_, Some(_), _, _)) => AnswerOutcome::AlreadyResolved,
+            Some((_, None, _, questions_json))
+                if required_action.is_some_and(|action| {
+                    serde_json::from_str::<crate::Question<crate::PermissionAction>>(
+                        &questions_json,
+                    )
+                    .ok()
+                    .and_then(|question| question.parse(action.as_str()))
+                        != Some(action)
+                }) =>
+            {
+                AnswerOutcome::InvalidAction
+            }
+            Some((_, None, _, _)) => {
                 tx.execute(
                     "UPDATE permission_requests SET verdict = ?2, answered_by = 'web'
                       WHERE request_id = ?1 AND resolved = 0 AND verdict IS NULL",
@@ -3219,16 +3268,14 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              ON conversation_inbox (conversation_id, workspace_key, delivered, seq);
          -- A4 (W6) permission-decision channel: the RUNNING gate (sole authority
          -- minter) publishes a pending permission decision here; an ATTACH
-         -- surface (newt-web) renders it and writes back a VERDICT (never
-         -- caveats). The gate races this against the TTY and resolves it
-         -- exactly-once. A brand-new table: `IF NOT EXISTS` on every existing db,
-         -- no rebuild. `danger_json` is GATE-STAMPED (the web never classifies
-         -- danger) so a high-danger row cannot be forged to a lower tier.
+         -- surface renders its typed Question and writes back a listed VERDICT.
+         -- The gate resolves it exactly once. `danger_json` remains as
+         -- gate-stamped compatibility metadata for existing databases.
          CREATE TABLE IF NOT EXISTS permission_requests (
              request_id      TEXT PRIMARY KEY,        -- unguessable nonce (new_conversation_id)
              conversation_id TEXT NOT NULL,
              workspace_key   TEXT NOT NULL,           -- same fence every table carries
-             requests_json   TEXT NOT NULL,           -- serialized &[PermissionRequest]
+             requests_json   TEXT NOT NULL,           -- serialized typed Question
              danger_json     TEXT NOT NULL,           -- gate-stamped per-target tier
              verdict         TEXT,                    -- NULL until a surface answers
              answered_by     TEXT,                    -- audit: 'web' | 'tty' | 'expired'
@@ -3881,10 +3928,17 @@ pub struct PendingPermission {
     /// The unguessable nonce that binds a verdict to THIS request (not a later
     /// one — a turn issues several `gate.ask` calls).
     pub request_id: String,
-    /// Serialized `&[PermissionRequest]` (the web deserializes to render).
+    /// Serialized typed [`crate::Question`] (the web renders it directly).
     pub requests_json: String,
-    /// Gate-stamped per-target danger tier (the web renders, never classifies).
+    /// Gate-stamped compatibility metadata; action policy lives in the form.
     pub danger_json: String,
+}
+
+impl PendingPermission {
+    /// Deserialize the exact form published by the running permission gate.
+    pub fn question(&self) -> serde_json::Result<crate::Question<crate::PermissionAction>> {
+        serde_json::from_str(&self.requests_json)
+    }
 }
 
 /// A staged passkey binding awaiting terminal confirmation
@@ -3901,13 +3955,15 @@ pub struct PendingEnrollment {
     pub candidate_json: String,
 }
 
-/// The outcome of [`ConversationStore::answer_permission_request`].
+/// The outcome of [`ConversationStore::answer_permission_action`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnswerOutcome {
     /// The verdict was recorded (awaiting the gate's poll to resolve it).
     Answered,
     /// The request was already answered or resolved — a safe no-op.
     AlreadyResolved,
+    /// The submitted action was absent from the stored form.
+    InvalidAction,
     /// No such open request for this conversation (stale/unknown request_id).
     Unknown,
 }
@@ -5384,6 +5440,44 @@ mod tests {
     /// exactly-once by the gate; a TTY resolve wins the race so a late web
     /// answer is discarded; verdicts bind to their own request_id; and the
     /// whole channel is workspace-fenced.
+    #[test]
+    fn permission_answer_rejects_an_action_omitted_from_the_stored_form() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("session", None).unwrap();
+        let question = crate::Question {
+            markdown: "permission needed".into(),
+            actions: vec![crate::Action::new(
+                crate::PermissionAction::Deny,
+                "d",
+                "deny",
+            )],
+            note: None,
+        };
+        let request_id = store
+            .publish_permission_question(&conv, &question, r#"["high"]"#)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .answer_permission_action(
+                    &conv,
+                    &request_id,
+                    crate::PermissionAction::AllowSession,
+                )
+                .unwrap(),
+            AnswerOutcome::InvalidAction
+        );
+        assert!(store.pending_permission_request(&conv).unwrap().is_some());
+        assert_eq!(
+            store
+                .answer_permission_action(&conv, &request_id, crate::PermissionAction::Deny)
+                .unwrap(),
+            AnswerOutcome::Answered
+        );
+    }
+
     #[test]
     fn permission_request_expires_on_created_tick_ttl() {
         // #1356: an unanswered permission-decision nonce must expire on its

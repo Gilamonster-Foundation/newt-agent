@@ -112,3 +112,32 @@ theorem po_e_non_match_empty (p : Pack U C M) (t : Tree U C) (u : U)
   simp only [deriveGated, h, Bool.false_eq_true, if_false]
 
 end ProjectModel
+
+-- Prompt-form authorization: only displayed actions can be accepted.
+namespace PromptForm
+
+structure Form (Action : Type) where
+  actions : Action → Bool
+
+def authorize {Action} (form : Form Action) (action : Action) : Option Action :=
+  if form.actions action then some action else none
+def displayed {Action} (form : Form Action) (action : Action) : Prop :=
+  form.actions action = true
+
+theorem authorization_sound {Action} (form : Form Action) {requested granted : Action}
+    (h : authorize form requested = some granted) : displayed form granted := by
+  by_cases hreq : form.actions requested = true
+  · have : requested = granted := by
+      have h' : some requested = some granted := by simpa [authorize, hreq] using h
+      exact by
+        simpa using Option.some.inj h'
+    subst granted
+    exact hreq
+  · exfalso
+    simp [authorize, hreq] at h
+
+theorem hidden_action_rejected {Action} (form : Form Action) (action : Action)
+    (hidden : form.actions action = false) : authorize form action = none := by
+  simp [authorize, hidden]
+
+end PromptForm

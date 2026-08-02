@@ -117,3 +117,42 @@ implementation (newt-web owns no agent logic), the characterization-net
 discipline from #1319 applies to the web surface from W1 (HTML shell golden:
 missing-fails, double-render determinism, negative control), one-issue-one-PR,
 merge on green.
+
+## Shared prompt form contract (active)
+
+**Status:** Proposed (2026-08-02)
+
+For permission and confirmation prompts, all surfaces must consume one schema:
+
+- `newt-core::Question<Action>`
+- `newt-core::Action` values with a canonical (`key`, `value`, `label`) triple
+
+The contract is:
+
+- The permission gate publishes one typed question (`Question`) into
+  `ConversationStore`.
+- TUI and HTMX render from that same published object (`terminal_text` or
+  `render_markdown`), never from hand-built strings.
+- Any answer is parsed through the same form membership check (`question.parse`),
+  so no action not on the form can be accepted.
+
+### Proof and regression strategy
+
+- **Lean** (`formal/ProjectModel/Basic.lean`, `PromptForm`) — only displayed
+  actions can authorize; hidden actions are rejected.
+- **TLA+** (`formal/PromptControls.tla`) — control key transitions and exit
+  semantics are modeled and checked by TLC.
+- **Unit tests**:
+  - `newt-core` rejects hidden actions on store answer,
+  - `newt-tui` verifies cross-surface action parity and danger-tier gating,
+  - `newt-web` verifies HTMX form rendering and rejected forged answers.
+
+### Outage handoff
+
+Current implementation status:
+
+- Permission/confirm flows are on shared form code (`newt-core::Question`) and
+  store-backed publish/consume.
+- Remaining work is to migrate remaining interactive UI prompts (beyond permission
+  and confirmation) onto the same typed-form approach where a non-TTY surface
+  is a valid consumer.

@@ -51,14 +51,9 @@
   .md a { color: inherit; }
   form.prompt { display: flex; gap: 0.5rem; padding: 0.5rem 0.75rem; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
   form.prompt input[name=text] { flex: 1; }
-  /* A4: the pending permission-decision card (danger-gated buttons). */
+  /* A4: pending typed permission form. */
   .perm { margin: 0.5rem 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); display: grid; gap: 0.35rem; }
-  .perm-high { border-color: #d9534f; background: color-mix(in srgb, #d9534f 10%, transparent); }
   .perm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
-  .perm .tier { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; padding: 0.05em 0.4em; border-radius: 3px; }
-  .perm .tier-high { background: #d9534f; color: #fff; }
-  .perm .tier-low { background: color-mix(in srgb, currentColor 20%, transparent); }
-  .perm-reason { opacity: 0.75; font-size: 0.8rem; }
   .perm-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
 </style>
 </head>

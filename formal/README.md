@@ -42,6 +42,16 @@ rescan is a performance CHEAT; these theorems make it SOUND:
 - **PO-E** `po_e_non_match_empty` — a pack that doesn't detect its build system
   derives the empty model (no phantom project).
 
+`ProjectModel/Basic.lean` also proves displayed-actions-only authorization
+(`PromptForm` namespace) so hidden actions cannot authorize.
+
+The permission path is the first concrete instantiation of this contract:
+`newt-core::Question` is emitted once, then consumed by both the TTY and HTMX
+surfaces through the same typed action list (`action.parse` in both consumers,
+shared by store row and form serialization).
+`PromptControls.tla` + `.cfg` model-check Submit, Esc back/cancel, immediate
+Ctrl-C/Ctrl-D exit, and terminal exit behavior.
+
 Self-contained (no Mathlib), `sorry`-free. PO-D (no LLM authoring the model) is a
 dep-graph/map lint, not a theorem.
 
@@ -53,6 +63,8 @@ version is pinned in `lean-toolchain`). No Mathlib.
 ```sh
 cd formal
 lake build        # checks every theorem; exit 0 iff all proofs go through
+java -cp /path/to/tla2tools.jar tlc2.TLC PromptControls.tla \
+  -config PromptControls.cfg -coverage 1
 ```
 
 CI runs this on every change under `formal/` (`.github/workflows/formal.yml`), so

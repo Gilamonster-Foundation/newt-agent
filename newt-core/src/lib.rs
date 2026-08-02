@@ -127,14 +127,15 @@ pub use agentic::{
     CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ErrorClass,
     EvidenceKind, ExperienceStore, ExposureSettings, GatherCaps, GatherManifest,
     HeadlessCodeSearch, IndexStatus, LiveToolOutput, ManualCompressOutcome, McpTools, MemAddr,
-    MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, ParseSignal, PermissionDecision,
-    PermissionGate, PermissionRecord, PermissionRequest, PlanModeControl, PlanSnapshot, RankedHit,
-    RecallSource, RejectReason, RetrievalResult, RetrievalSteer, RoundObservation, ScratchpadStore,
-    SemanticIndex, SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex,
-    SessionSpillStore, SessionStepLedger, ShellObservation, SolveObservation, SpillStore, Step,
-    StepLedger, StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture,
-    Summarizer, ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle,
-    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
+    MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, ParseSignal, PermissionAction,
+    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PlanModeControl,
+    PlanSnapshot, RankedHit, RecallSource, RejectReason, RetrievalResult, RetrievalSteer,
+    RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
+    SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, SessionStepLedger,
+    ShellObservation, SolveObservation, SpillStore, Step, StepLedger, StepStatus,
+    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
+    ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
+    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::{resolve_surface_budget, ApiSurfaceProvider};
@@ -211,6 +212,7 @@ pub use store::{
     Verdict,
 };
 pub use tokens::TokenEstimation;
+pub use tty::{Action, Question};
 pub use workflows::{
     builtin_workflows, load_workflows_from_dir, merge_workflows, workflow_config_dir,
     WorkflowClassifierConfig, WorkflowConfig, WorkflowSteerer, WorkflowStep,
