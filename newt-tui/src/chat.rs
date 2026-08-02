@@ -195,6 +195,233 @@ mod origin_upgrade_tests {
     }
 }
 
+/// Preserve the unit boundary between a backend's full context window and an
+/// already-derived input cap. OpenAI-compatible loops need the former so core
+/// can reserve the active generation policy; Ollama keeps using the latter as
+/// its conservative `num_ctx` KV-allocation fallback.
+fn context_window_for_core(
+    kind: newt_core::BackendKind,
+    full_context_window: Option<u32>,
+    safe_context: Option<u32>,
+) -> Option<u32> {
+    match kind {
+        newt_core::BackendKind::Openai => full_context_window,
+        newt_core::BackendKind::Ollama | newt_core::BackendKind::Embedded => safe_context,
+    }
+}
+
+/// A numbered server rejection is an authoritative upper bound on later
+/// turns. It may tighten an explicit/session window but never raise a tighter
+/// operator choice. An ordinary discovered window is deliberately not passed
+/// here, so experimental raises remain possible until the server rejects one.
+fn cap_context_window_by_recovery(
+    requested: Option<u32>,
+    recovered_hard_window: Option<u32>,
+) -> Option<u32> {
+    match (requested, recovered_hard_window) {
+        (Some(requested), Some(recovered)) => Some(requested.min(recovered)),
+        (requested, recovered) => requested.or(recovered),
+    }
+}
+
+/// Match the agentic loop's initial send-budget calculation for the visible
+/// next-turn gauge. A hard 400 may discover a smaller full window during the
+/// turn, so retain both the original declared ceiling and the newly observed
+/// one; like core's recovery path, the tighter result wins.
+#[allow(clippy::too_many_arguments)]
+fn context_gauge_budget(
+    kind: newt_core::BackendKind,
+    api: newt_core::OpenAiApi,
+    declared_context_window: Option<u32>,
+    observed_context_window: Option<u32>,
+    input_ceiling_pct: u32,
+    cognition: Option<newt_core::role_profile::Cognition>,
+    chat_capability: newt_core::model_card::ChatCompletionsCapability,
+    reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope,
+    max_ok_input: Option<u32>,
+    safe_context: Option<u32>,
+) -> Option<u32> {
+    let budget_for = |window| {
+        newt_core::agentic::initial_context_input_budget(
+            kind,
+            api,
+            window,
+            input_ceiling_pct,
+            cognition,
+            chat_capability,
+            reasoning_replay_scope,
+            max_ok_input,
+            safe_context,
+        )
+    };
+    match (
+        budget_for(declared_context_window),
+        budget_for(observed_context_window),
+    ) {
+        (Some(declared), Some(observed)) => Some(declared.min(observed)),
+        (declared, observed) => declared.or(observed),
+    }
+}
+
+#[cfg(test)]
+mod context_window_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn hard_recovery_caps_future_declared_windows_without_raising_tighter_ones() {
+        assert_eq!(
+            cap_context_window_by_recovery(Some(65_536), Some(32_768)),
+            Some(32_768),
+        );
+        assert_eq!(
+            cap_context_window_by_recovery(Some(16_384), Some(32_768)),
+            Some(16_384),
+        );
+        assert_eq!(
+            cap_context_window_by_recovery(Some(65_536), None),
+            Some(65_536),
+            "an ordinary probe is not a hard cap on an explicit override",
+        );
+        assert_eq!(
+            cap_context_window_by_recovery(None, Some(32_768)),
+            Some(32_768),
+        );
+
+        let capable = newt_core::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        let next_chat_window = cap_context_window_by_recovery(Some(65_536), Some(32_768));
+        assert_eq!(
+            newt_core::agentic::initial_context_input_budget(
+                newt_core::BackendKind::Openai,
+                newt_core::OpenAiApi::ChatCompletions,
+                next_chat_window,
+                90,
+                Some(newt_core::role_profile::Cognition::Contemplating),
+                capable,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn,
+                Some(29_491),
+                Some(29_491),
+            ),
+            Some(16_768),
+            "the next 90%-configured Chat turn must retain the 32K hard window and 16K output reserve",
+        );
+
+        let next_ollama_window = cap_context_window_by_recovery(Some(50_000), Some(32_768));
+        assert_eq!(
+            newt_core::agentic::initial_context_input_budget(
+                newt_core::BackendKind::Ollama,
+                newt_core::OpenAiApi::ChatCompletions,
+                next_ollama_window,
+                80,
+                None,
+                Default::default(),
+                newt_core::model_card::ReasoningReplayScope::Never,
+                Some(50_000),
+                Some(50_000),
+            ),
+            Some(26_214),
+            "the next Ollama turn must cap a raised /context size at the recovered full window",
+        );
+    }
+
+    #[test]
+    fn openai_handoff_keeps_the_full_window_separate_from_the_input_cap() {
+        assert_eq!(
+            context_window_for_core(newt_core::BackendKind::Openai, Some(32_768), Some(26_214),),
+            Some(32_768),
+        );
+        assert_eq!(
+            newt_core::config::input_percentage_ceiling(32_768, 90),
+            29_491,
+            "the configured percentage, not a hardcoded 80%, seeds the OpenAI input cap",
+        );
+        assert_eq!(
+            context_window_for_core(newt_core::BackendKind::Openai, None, Some(26_214)),
+            None,
+            "a cached input cap must not be reinterpreted as a full OpenAI window",
+        );
+        assert_eq!(
+            context_window_for_core(newt_core::BackendKind::Ollama, Some(32_768), Some(26_214),),
+            Some(26_214),
+            "Ollama retains the conservative KV-allocation fallback",
+        );
+    }
+
+    #[test]
+    fn openai_gauge_reports_the_output_reserved_send_budget() {
+        let capability = newt_core::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            context_gauge_budget(
+                newt_core::BackendKind::Openai,
+                newt_core::OpenAiApi::ChatCompletions,
+                Some(32_768),
+                Some(32_768),
+                80,
+                Some(newt_core::role_profile::Cognition::Contemplating),
+                capability,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn,
+                Some(26_214),
+                Some(26_214),
+            ),
+            Some(16_768),
+            "the visible gauge must match the contemplating request's actual input ceiling",
+        );
+        assert_eq!(
+            context_gauge_budget(
+                newt_core::BackendKind::Openai,
+                newt_core::OpenAiApi::ChatCompletions,
+                Some(65_536),
+                None,
+                80,
+                Some(newt_core::role_profile::Cognition::Contemplating),
+                capability,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn,
+                Some(26_214),
+                Some(26_214),
+            ),
+            Some(26_214),
+            "an ordinary 32K probe must not defeat an explicit 65K turn window",
+        );
+        assert_eq!(
+            context_gauge_budget(
+                newt_core::BackendKind::Openai,
+                newt_core::OpenAiApi::ChatCompletions,
+                Some(65_536),
+                Some(32_768),
+                80,
+                Some(newt_core::role_profile::Cognition::Contemplating),
+                capability,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn,
+                Some(26_214),
+                Some(26_214),
+            ),
+            Some(16_768),
+            "the same 32K value must tighten only after a numbered 400 observed it",
+        );
+        assert_eq!(
+            context_gauge_budget(
+                newt_core::BackendKind::Ollama,
+                newt_core::OpenAiApi::ChatCompletions,
+                Some(50_000),
+                None,
+                80,
+                None,
+                Default::default(),
+                newt_core::model_card::ReasoningReplayScope::Never,
+                Some(50_000),
+                Some(50_000),
+            ),
+            Some(40_000),
+            "an ordinary Ollama probe must not defeat /context size",
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingRetry {
     text: String,
@@ -618,6 +845,10 @@ pub(crate) fn run_chat(
     // #1199: the server-declared window from adopt, fresh per session — feeds
     // the budget without the persisted cache.
     let mut inf_context_window: Option<u32> = choice.context_window;
+    // Numbered hard-window rejections are stronger than ordinary probes and
+    // must survive into later turns. Keep their provenance separate so a
+    // normal discovered window does not defeat an explicit experimental raise.
+    let mut recovered_context_windows = std::collections::HashMap::<String, u32>::new();
 
     // Resolve + validate the active profile against config, now that the model is
     // known. Precedence: --profile (explicit) > --bundle > a bundle inferred from
@@ -3854,6 +4085,12 @@ pub(crate) fn run_chat(
                     );
                     let eff_compaction_trigger_policy =
                         compaction_trigger_policy(&cfg, compaction_trigger_policy_override);
+                    let eff_input_ceiling_pct = newt_core::config::normalize_input_ceiling_pct(
+                        cfg.context
+                            .as_ref()
+                            .map(|c| c.input_ceiling_pct)
+                            .unwrap_or(80),
+                    );
 
                     // Lazy context-window discovery: /api/show is attempted at
                     // most ONCE per model per session — even when the fetch
@@ -3864,7 +4101,13 @@ pub(crate) fn run_chat(
                     // empirically-confirmed max input (max_ok_input) used as
                     // the pre-send budget gate (issue #223) and the learned
                     // estimate-calibration ratio (Phase 20 §2.3).
-                    let (eff_safe_context, eff_max_ok_input, eff_estimate_ratio) = {
+                    let (
+                        eff_context_window,
+                        eff_safe_context,
+                        eff_max_ok_input,
+                        eff_estimate_ratio,
+                        eff_recovered_hard_window,
+                    ) = {
                         let entry = cap_cache.entry(inf_model.clone()).or_default();
                         // #1199: the server-declared window from session-start
                         // adopt (`inf_context_window`) is authoritative and
@@ -3884,18 +4127,50 @@ pub(crate) fn run_chat(
                                 inf_kind,
                             );
                         let cached_sc = entry.safe_context;
+                        let cached_window = entry.context_window;
+                        let cached_hard_window = entry.hard_context_window;
                         let moi = entry.max_ok_input;
                         let ratio = entry.estimate_ratio;
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
-                        // The fresh server window (at 80%) wins; the cached
-                        // probe and a configured `context_window` are fallback.
-                        let sc = inf_context_window
-                            .map(|w| w * 80 / 100)
-                            .or(cached_sc)
+                        // Keep the full window separate from the derived input
+                        // cap. Chat Completions needs the former to reserve its
+                        // active maximum output; Ollama still uses the latter
+                        // as its conservative KV-allocation fallback.
+                        let requested_full_window = inf_context_window
+                            .or(cached_window)
                             .or_else(|| model_tune.and_then(|t| t.context_window));
-                        (sc, moi, ratio)
+                        let recovered_hard_window = cap_context_window_by_recovery(
+                            recovered_context_windows.get(&inf_model).copied(),
+                            cached_hard_window,
+                        );
+                        let full_window = cap_context_window_by_recovery(
+                            requested_full_window,
+                            recovered_hard_window,
+                        );
+                        let sc = if inf_kind == newt_core::BackendKind::Openai {
+                            full_window
+                                .map(|window| {
+                                    newt_core::config::input_percentage_ceiling(
+                                        window,
+                                        eff_input_ceiling_pct,
+                                    )
+                                })
+                                .or(cached_sc)
+                        } else {
+                            recovered_hard_window
+                                .map(|window| {
+                                    newt_core::config::input_percentage_ceiling(
+                                        window,
+                                        eff_input_ceiling_pct,
+                                    )
+                                })
+                                .or_else(|| inf_context_window.map(|w| w * 80 / 100))
+                                .or(cached_sc)
+                                .or_else(|| model_tune.and_then(|t| t.context_window))
+                        };
+                        (full_window, sc, moi, ratio, recovered_hard_window)
                     };
 
                     // Apply the `/context size <N>` session override: it caps
@@ -3908,14 +4183,20 @@ pub(crate) fn run_chat(
                         None => (eff_safe_context, eff_max_ok_input),
                     };
 
-                    // num_ctx resolution: explicit config > safe_context > model default.
-                    // Wiring safe_context as the fallback caps Ollama's KV allocation to
-                    // what we've empirically confirmed is safe, preventing silent truncation
-                    // of the system prompt when the conversation exceeds the raw context window.
-                    let eff_num_ctx = model_tune
+                    // Context-window resolution: explicit num_ctx first. For
+                    // OpenAI, hand core the full window so its input percentage
+                    // and output reserve apply exactly once. For Ollama, retain
+                    // the safe-context fallback that caps KV allocation.
+                    let requested_num_ctx = model_tune
                         .and_then(|t| t.num_ctx)
                         .or_else(|| num_ctx(&cfg))
-                        .or(eff_safe_context);
+                        .or_else(|| {
+                            context_window_for_core(inf_kind, eff_context_window, eff_safe_context)
+                        });
+                    let eff_num_ctx = cap_context_window_by_recovery(
+                        requested_num_ctx,
+                        eff_recovered_hard_window,
+                    );
 
                     // Build message list from memory manager. A fresh runtime
                     // block is prepended to the (frozen) system prompt EACH turn
@@ -4360,18 +4641,34 @@ pub(crate) fn run_chat(
                     // 8,734-token prompt because the only write-back lived in
                     // the Ok-arm epilogue below. `turn_saw_accepted` is a Cell
                     // so the epilogue can read it without contending with the
-                    // closure's captures.
+                    // closure's captures. Keep hard-400 discovery separate
+                    // from the ordinary session probe: only the former may
+                    // tighten an explicit per-turn window in the gauge.
                     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                     let turn_saw_accepted = std::cell::Cell::new(false);
+                    let recovered_context_window = std::cell::Cell::new(None);
                     let mut on_obs = |obs: newt_core::RoundObservation| {
                         if matches!(obs, newt_core::RoundObservation::Accepted { .. }) {
                             turn_saw_accepted.set(true);
                         }
                         // Inner block: the `entry` borrow must end before
                         // `save_cache` takes its shared borrow of the map.
-                        let dirty = {
+                        let (dirty, persisted_hard_window) = {
                             let entry = cap_cache.entry(inf_model.clone()).or_default();
-                            probe::apply_observation(entry, &obs, &today)
+                            let dirty = probe::apply_observation_with_input_ceiling_pct(
+                                entry,
+                                &obs,
+                                &today,
+                                eff_input_ceiling_pct,
+                            );
+                            (dirty, entry.hard_context_window)
+                        };
+                        if matches!(obs, newt_core::RoundObservation::ContextWindow400 { .. }) {
+                            let hard_window = persisted_hard_window
+                                .expect("a numbered context-window observation persists its cap");
+                            recovered_context_windows.insert(inf_model.clone(), hard_window);
+                            inf_context_window = Some(hard_window);
+                            recovered_context_window.set(Some(hard_window));
                         };
                         if dirty {
                             probe::save_cache(&cap_cache);
@@ -4622,12 +4919,7 @@ pub(crate) fn run_chat(
                                             .as_ref()
                                             .map(|c| c.summary_input_cap_floor_chars)
                                             .unwrap_or(8_192),
-                                        input_ceiling_pct: cfg
-                                            .context
-                                            .as_ref()
-                                            .map(|c| c.input_ceiling_pct)
-                                            .unwrap_or(80)
-                                            .clamp(1, 99),
+                                        input_ceiling_pct: eff_input_ceiling_pct,
                                         low_budget_pct: cfg
                                             .context
                                             .as_ref()
@@ -5037,16 +5329,36 @@ pub(crate) fn run_chat(
                                         }
                                     }
                                     // Step 24.6 (#559): refresh the context-budget
-                                    // gauge for the next header — this turn's input
-                                    // tokens against the resolved send budget.
-                                    // Match initial_send_budget's max semantics: take the
-                                    // larger of the empirical ratchet and the declared/probed
-                                    // context so a configured context_window shows through
-                                    // even when the ratchet hasn't grown that large yet.
-                                    let gauge_budget = match (eff_max_ok_input, eff_safe_context) {
-                                        (Some(m), Some(s)) => Some(m.max(s)),
-                                        (m, s) => m.or(s),
+                                    // gauge for the next header. Read observation state
+                                    // again here: a numbered hard 400 may have replaced
+                                    // the full window and cached caps during this turn.
+                                    // Then use core's send-budget resolver so the visible
+                                    // number includes the same cognition output reserve as
+                                    // preflight, compaction, and context_remaining.
+                                    let observed = cap_cache.get(&inf_model);
+                                    let (gauge_max_ok, gauge_safe) = match context_size_override {
+                                        Some(n) => (Some(n), Some(n)),
+                                        None => (
+                                            observed
+                                                .and_then(|entry| entry.max_ok_input)
+                                                .or(eff_max_ok_input),
+                                            observed
+                                                .and_then(|entry| entry.safe_context)
+                                                .or(eff_safe_context),
+                                        ),
                                     };
+                                    let gauge_budget = context_gauge_budget(
+                                        inf_kind,
+                                        choice.api,
+                                        eff_num_ctx,
+                                        recovered_context_window.get(),
+                                        eff_input_ceiling_pct,
+                                        cognition,
+                                        choice.chat_completions_capability,
+                                        choice.reasoning_replay_scope,
+                                        gauge_max_ok,
+                                        gauge_safe,
+                                    );
                                     if let Some(budget) = gauge_budget {
                                         token_gauge = Some((input_tokens, budget));
                                     }

@@ -46,6 +46,11 @@ pub struct ContractInputs<'a> {
     pub context_window: Option<u32>,
     /// The tenacity level the run resolved (family override / default).
     pub tenacity: &'a str,
+    /// Effective cognition label (`default` when Newt sends no selection, or
+    /// one of the explicit cognition levels).
+    pub cognition: &'a str,
+    /// `on` / `off` — whether a real crew runner was installed for the turn.
+    pub crew: &'static str,
     /// `"on"` / `"off"` — whether OCAP enforcement was live for the run.
     pub ocap: &'static str,
     /// The max tool-rounds cap the driver actually used.
@@ -100,6 +105,8 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     }
     let mut effective_config = serde_json::json!({
         "tenacity": i.tenacity,
+        "cognition": i.cognition,
+        "crew": i.crew,
         "ocap": i.ocap,
         "max_rounds": i.max_rounds,
     });
@@ -138,6 +145,8 @@ mod tests {
             outcome: "completed",
             context_window: Some(32768),
             tenacity: "standard",
+            cognition: "default",
+            crew: "off",
             ocap: "off",
             max_rounds: 40,
             wall_ms: 10_000,
@@ -285,7 +294,8 @@ mod tests {
             parsed["effective_config"],
             serde_json::json!({
                 "context_window": 32768, "tenacity": "standard",
-                "ocap": "off", "max_rounds": 40
+                "cognition": "default", "crew": "off", "ocap": "off",
+                "max_rounds": 40
             })
         );
         // 500 tokens over 10s ⇒ 50 tok/s, derived — never measured twice.

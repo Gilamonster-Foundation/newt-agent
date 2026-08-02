@@ -300,10 +300,11 @@ fn matching_packs<'a>(repo_dir: &Path, packs: &'a [ToolingPack]) -> Vec<&'a Tool
         .collect()
 }
 
-/// The repo's `[lifecycle]` override, published once when config resolves.
+/// The repo's `[lifecycle]` override, published once when runtime settings apply.
 static LIFECYCLE_OVERRIDE: OnceLock<PhaseCommands> = OnceLock::new();
 
-/// Publish the repo `[lifecycle]` table (from `Config::resolve`), once.
+/// Publish the repo `[lifecycle]` table from
+/// `Config::apply_runtime_settings`, once.
 pub fn set_lifecycle_override(cmds: PhaseCommands) {
     let _ = LIFECYCLE_OVERRIDE.set(cmds);
 }

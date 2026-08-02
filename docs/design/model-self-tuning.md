@@ -86,8 +86,11 @@ Three principles:
 | `emits_thinking` *(new)* | model returned thinking-only responses (empty content, non-empty `thinking`) | observed once | manual reset |
 
 Send budget = `max(max_ok_input, safe_context)` composed via `min` with the
-80%-of-`num_ctx` ceiling. The cw-400 path already reins `safe_context` to its
-cap, so `max()` still lands on the authoritative number after a hard 400.
+effective input ceiling. That ceiling is the tighter of the configured
+percentage of the full context window and the room remaining after the active
+maximum output allowance. The cw-400 path persists the recovered full window,
+reapplies both bounds to the active request, and reins the generic cached input
+caps to 80% of the recovered window for later sessions.
 
 ### 2.2 The per-round observation hook
 
@@ -104,6 +107,8 @@ pub enum RoundObservation {
     /// Persistent empty responses at `prompt_tokens` after retries (the
     /// 85%-of-safe-context silent-overflow exit).
     SuspectedOverflow { prompt_tokens: u32 },
+    /// A numbered hard rejection revealed the endpoint's full window.
+    ContextWindow400 { context_window: u32 },
     /// Response carried only non-content fields (thinking/reasoning) with
     /// empty content.
     ThinkingOnly,
@@ -114,7 +119,9 @@ pub on_round_usage: Option<&'a mut dyn FnMut(RoundObservation)>,
 
 The TUI handler applies observations to the capability cache and saves
 immediately — evidence survives turns that later bail, crash, or hit the
-round cap. `Accepted` is **quality-gated** (the round produced usable output)
+round cap. Numbered 400 recovery uses this same owner, so an accepted retry
+cannot overwrite a separately loaded stale cache. `Accepted` is
+**quality-gated** (the round produced usable output)
 and **truncation-gated** (skipped when `prompt_tokens >= 95%` of the request's
 `num_ctx`, where Ollama may have silently dropped the head of the prompt).
 

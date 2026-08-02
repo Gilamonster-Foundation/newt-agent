@@ -36,11 +36,17 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use newt_core::caveats::{Caveats, CountBound, Scope};
-use newt_core::{BackendKind, Config, TurnDriver, TurnDriverConfig, TurnStatus};
+use newt_core::model_card::ChatCompletionsCapability;
+use newt_core::role_profile::Cognition;
+use newt_core::{
+    BackendKind, Config, OpenAiApi, RuntimeSettingsSnapshot, TurnDriver, TurnDriverConfig,
+    TurnStatus,
+};
 
 use crate::solve_contract;
 
@@ -59,11 +65,11 @@ pub struct SolveArgs {
     pub events: Option<PathBuf>,
     pub max_rounds: Option<usize>,
     /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`).
-    /// newt reserves the configured reply headroom and gates input at
-    /// `[context].input_ceiling_pct`, so a long turn compacts under the window
-    /// instead of overrunning it during generation (the "Context size has been
-    /// exceeded" 500s). None keeps newt's default.
-    pub context_window: Option<usize>,
+    /// Newt gates input at the tighter of `[context].input_ceiling_pct` and the
+    /// room left after the active cognition policy's maximum output, so a long
+    /// turn compacts under the shared window instead of overrunning it during
+    /// generation. None keeps Newt's default.
+    pub context_window: Option<u32>,
     /// Operator-supplied sha256 of the weights actually served, for the
     /// contract record's `model_digest` (W0 #1511). Also settable via the
     /// `NEWT_MODEL_DIGEST` env twin. `None` ⇒ the field is OMITTED from the
@@ -124,27 +130,45 @@ fn apply_context_config(driver: &mut TurnDriverConfig, context: Option<&newt_cor
         return;
     };
     driver.compaction_trigger_policy = context.compaction_trigger_policy;
-    driver.input_ceiling_pct = context.input_ceiling_pct;
+    driver.input_ceiling_pct =
+        newt_core::config::normalize_input_ceiling_pct(context.input_ceiling_pct);
     driver.low_budget_pct = context.low_budget_pct;
     driver.estimation = context.estimation;
     driver.summary_input_cap_floor_chars = context.summary_input_cap_floor_chars;
 }
 
-fn apply_context_window(driver: &mut TurnDriverConfig, context_window: usize) {
-    let context_window = context_window as u32;
+fn apply_context_window(driver: &mut TurnDriverConfig, context_window: u32) {
     let input_budget =
-        (u64::from(context_window) * u64::from(driver.input_ceiling_pct) / 100) as u32;
+        newt_core::config::input_percentage_ceiling(context_window, driver.input_ceiling_pct);
     driver.safe_context = Some(input_budget);
     driver.max_ok_input = Some(input_budget);
     driver.num_ctx = Some(context_window);
 }
 
-fn resolved_tenacity_for_contract(
-    config: Option<&newt_core::tenacity::TenacityConfig>,
-    model: &str,
-) -> String {
-    newt_core::tenacity::attribute_active_family(config, model);
-    newt_core::tenacity::effective_tenacity().to_string()
+fn resolve_runtime_posture(cfg: &Config, model: &str) -> RuntimeSettingsSnapshot {
+    newt_core::tenacity::attribute_active_family(cfg.tenacity.as_ref(), model);
+    RuntimeSettingsSnapshot::resolve(cfg, None, None)
+}
+
+/// The cognition level this backend can actually receive from Newt. Responses
+/// always has a defined `reasoning.effort` projection; Chat Completions must
+/// explicitly opt into the local generation fields; Ollama has no projection.
+/// The contract and driver both consume this one answer.
+fn projected_cognition(
+    cognition: Option<Cognition>,
+    kind: BackendKind,
+    api: OpenAiApi,
+    chat_capability: ChatCompletionsCapability,
+) -> Option<Cognition> {
+    match (kind, api) {
+        (BackendKind::Openai, OpenAiApi::Responses) => cognition,
+        (BackendKind::Openai, OpenAiApi::ChatCompletions)
+            if chat_capability.cognition == Some(true) =>
+        {
+            cognition
+        }
+        _ => None,
+    }
 }
 
 /// Run one task headless and emit its trace. Returns the process exit code:
@@ -156,7 +180,10 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     //    search order (Config::resolve — honors disk drop-ins + --backend-*).
     let cfg = match &args.profile {
         Some(path) => {
-            Config::load(path).with_context(|| format!("loading --profile {}", path.display()))?
+            let mut cfg = Config::load(path)
+                .with_context(|| format!("loading --profile {}", path.display()))?;
+            cfg.apply_runtime_settings();
+            cfg
         }
         None => Config::resolve().context("resolving config")?,
     };
@@ -214,10 +241,12 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         .to_string();
     let kind = backend.kind.unwrap_or(BackendKind::Openai);
     let api_key = backend.resolve_api_key();
+    let api = backend.api.unwrap_or_default();
+    let chat_capability = backend.chat_completions_capability();
     // Surface the backend's wire API (`api = "responses"`) to the agentic loop,
     // exactly as the chat path does — without this, a responses-only model like
     // gpt-5.6-sol is driven over /v1/chat/completions and 400s on function tools.
-    newt_tui::apply_openai_api_env(backend.api.unwrap_or_default());
+    newt_tui::apply_openai_api_env(api);
 
     // #tenacity: attribute the model's family so a per-family `[tenacity]` config
     // default applies to this run (an explicit `--tenacity` still supersedes it).
@@ -228,15 +257,22 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
     // contract's effective_config — the bench never re-derives it from a
     // profile (contract requirement 5).
-    let tenacity_level = resolved_tenacity_for_contract(cfg.tenacity.as_ref(), &model);
+    let runtime = resolve_runtime_posture(&cfg, &model);
+    let tenacity_level = runtime.tenacity.label();
+    let cognition = projected_cognition(runtime.cognition, kind, api, chat_capability);
+    // `None` means Newt projects no cognition controls. Call that `default`
+    // rather than `off`: a capable server may enable reasoning by default.
+    let cognition_level = cognition.map_or("default", |level| level.label());
 
     // 4. The task instruction.
-    let instruction = std::fs::read_to_string(&args.instruction_file).with_context(|| {
+    let instruction_file = args.instruction_file.canonicalize().with_context(|| {
         format!(
-            "reading --instruction-file {}",
+            "resolving --instruction-file {}",
             args.instruction_file.display()
         )
     })?;
+    let instruction = std::fs::read_to_string(&instruction_file)
+        .with_context(|| format!("reading --instruction-file {}", instruction_file.display()))?;
     let workspace = args
         .cwd
         .canonicalize()
@@ -248,7 +284,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
     dc.api_key = api_key;
-    dc.chat_completions_capability = backend.chat_completions_capability();
+    dc.chat_completions_capability = chat_capability;
     dc.reasoning_replay_scope = backend.reasoning_replay_scope();
     if let Some(r) = args.max_rounds {
         dc.max_tool_rounds = r;
@@ -264,20 +300,33 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // Pin the model's served context window so the loop's pre-send guard +
     // compaction keep each request under the backend's `--ctx-size` (e.g. dgx1
     // llama.cpp serves qwen3-coder at 32768). `--context-window` is the FULL
-    // served window; the input budget uses `[context].input_ceiling_pct`,
-    // reserving the remainder for the reply. The server's KV window is shared
-    // by input+output, so gating on the full window (no headroom) overruns it
-    // during generation and 500s (that was the leak). This matches the workspace
-    // convention that `safe_context` is discounted by the configured input
-    // ceiling (mirrors the Ollama path). num_ctx is inert on the OpenAI wire but
-    // kept for the Ollama path.
+    // served window. `safe_context` starts at the configured percentage bound;
+    // the OpenAI loop then applies the tighter `full_window - max_tokens` bound
+    // for the active cognition policy. Because the KV window is shared by input
+    // and output, gating on the undiscounted window overruns it during
+    // generation. `num_ctx` is inert on the OpenAI wire but carries the full
+    // window locally (and remains a real wire option on the Ollama path).
     if let Some(cw) = args.context_window {
         apply_context_window(&mut dc, cw);
     }
     // Captured before `dc` moves into the driver: the cap the run ACTUALLY
     // uses (post `--max-rounds`), for the contract's effective_config.
     let max_rounds = dc.max_tool_rounds as u32;
-    let mut driver = TurnDriver::new(dc);
+    let mut driver = TurnDriver::new(dc)
+        .with_cognition(cognition)
+        .with_tenacity(runtime.tenacity);
+    if runtime.crew {
+        driver = driver.with_crew_runner(Arc::new(crate::crew_runner::LocalCrewRunner::new(
+            cfg.clone(),
+            PathBuf::from(&workspace),
+            newt_core::agentic::Presence::Prompt,
+        )));
+    }
+    let crew_level = if driver.has_crew_runner() {
+        "on"
+    } else {
+        "off"
+    };
     let started = Instant::now();
     driver
         .submit(instruction.trim())
@@ -338,7 +387,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     };
     let record = serde_json::json!({
         "kind": "solve_result",
-        "task_file": args.instruction_file.to_string_lossy(),
+        "task_file": instruction_file.to_string_lossy(),
         "cwd": workspace,
         "model": model,
         "endpoint": url,
@@ -398,8 +447,10 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             backend_name: &backend.name,
             backend_kind: kind.label(),
             outcome: outcome_label,
-            context_window: args.context_window.map(|c| c as u32),
-            tenacity: &tenacity_level,
+            context_window: args.context_window,
+            tenacity: tenacity_level,
+            cognition: cognition_level,
+            crew: crew_level,
             ocap: if lane == HeadlessLane::Yolo {
                 "off"
             } else {
@@ -658,7 +709,55 @@ mod tests {
         newt_core::tenacity::set_tenacity_config(Default::default());
         newt_core::tenacity::set_cli_tenacity(newt_core::Tenacity::Insistent);
 
-        assert_eq!(resolved_tenacity_for_contract(None, "model"), "insistent");
+        assert_eq!(
+            resolve_runtime_posture(&Config::default(), "model").tenacity,
+            newt_core::Tenacity::Insistent
+        );
+    }
+
+    #[test]
+    fn contract_cognition_is_the_level_the_backend_can_receive() {
+        let level = Some(Cognition::Contemplating);
+        let capable = ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            projected_cognition(
+                level,
+                BackendKind::Openai,
+                OpenAiApi::Responses,
+                Default::default()
+            ),
+            level,
+            "Responses always has a cognition projection"
+        );
+        assert_eq!(
+            projected_cognition(
+                level,
+                BackendKind::Openai,
+                OpenAiApi::ChatCompletions,
+                capable,
+            ),
+            level,
+            "an explicitly capable Chat endpoint receives the local policy"
+        );
+        assert_eq!(
+            projected_cognition(
+                level,
+                BackendKind::Openai,
+                OpenAiApi::ChatCompletions,
+                Default::default(),
+            ),
+            None,
+            "an unknown Chat endpoint receives no cognition fields"
+        );
+        assert_eq!(
+            projected_cognition(level, BackendKind::Ollama, OpenAiApi::Responses, capable,),
+            None,
+            "the Ollama wire has no cognition projection"
+        );
     }
 
     #[test]

@@ -29,8 +29,8 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     println!("# [tui] markdown  = \"auto\" | \"on\" | \"off\"   (auto = render RichTUI Markdown when styled)");
     println!("# [tui] spill_lines = 3   (collapsed live + completed tool rows; 0 = unbounded completion only)");
     println!("#");
-    println!("# [context] input_ceiling_pct = 80   (% of num_ctx usable as INPUT before trim;");
-    println!("#           raise for large-window models like Opus, e.g. 90; clamped 1..=99)");
+    println!("# [context] input_ceiling_pct = 80   (percentage input bound; the active max-output");
+    println!("#           reserve may be tighter; invalid values fall back to 80; valid 1..=99)");
     println!("# [context] low_budget_pct   = 15   (% of ceiling below which the low-budget nudge");
     println!("#           fires; raise to be warned earlier, 0 disables; clamped 0..=100)");
     println!("#");

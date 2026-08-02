@@ -30,8 +30,9 @@ pub(super) const DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN: usize = 3;
 
 /// Process-wide model-facing output budget, in tokens. Defaults to
 /// [`DEFAULT_MAX_OUTPUT_TOKENS`]; the resolved `[tools] max_output_tokens`
-/// config value is pushed here once at the config-resolution entry
-/// (`Config::resolve`) so the tool loop never re-reads config from disk. This is
+/// config value is pushed here at the runtime-application entry
+/// (`Config::apply_runtime_settings`) so the tool loop never re-reads config
+/// from disk. This is
 /// the v1 (three-Cs "working code first") seam: a const default with the config
 /// override wired at the entry, rather than threading a new `usize` through
 /// `ChatCtx` + `execute_tool` + every call site (≈60, mostly tests). Follow-up:
@@ -41,9 +42,10 @@ static OUTPUT_HEAD_TOKENS: AtomicUsize = AtomicUsize::new(DEFAULT_OUTPUT_HEAD_TO
 static OUTPUT_CAP_CHARS_PER_TOKEN: AtomicUsize =
     AtomicUsize::new(DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN);
 
-/// Set the process-wide model-facing output budget (tokens). Called once from
-/// `Config::resolve` with the resolved `[tools] max_output_tokens`. `0` means
-/// "no cap" — see [`cap_model_output`] / [`paginate_read`].
+/// Set the process-wide model-facing output budget (tokens). Called from
+/// `Config::apply_runtime_settings` with the resolved `[tools]
+/// `max_output_tokens`. `0` means "no cap" — see [`cap_model_output`] /
+/// [`paginate_read`].
 pub fn set_max_output_tokens(max_tokens: usize) {
     MAX_OUTPUT_TOKENS.store(max_tokens, Ordering::Relaxed);
 }
@@ -65,9 +67,10 @@ pub(super) fn output_head_tokens() -> usize {
     OUTPUT_HEAD_TOKENS.load(Ordering::Relaxed)
 }
 
-/// Set the conservative chars/token used to size the output cap. Called once
-/// from `Config::resolve` with `[tools] output_cap_chars_per_token`. Clamped to
-/// a minimum of 1 by [`crate::tokens::TokenEstimation::new`] at the use site.
+/// Set the conservative chars/token used to size the output cap. Called from
+/// `Config::apply_runtime_settings` with `[tools]
+/// `output_cap_chars_per_token`. Clamped to a minimum of 1 by
+/// [`crate::tokens::TokenEstimation::new`] at the use site.
 pub fn set_output_cap_chars_per_token(chars_per_token: usize) {
     OUTPUT_CAP_CHARS_PER_TOKEN.store(chars_per_token, Ordering::Relaxed);
 }

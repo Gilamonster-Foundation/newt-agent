@@ -675,11 +675,11 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         max_rounds: Option<usize>,
         /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`,
-        /// 32768). newt gates input at 80% of it, reserving ~20% for the reply,
-        /// so a long turn compacts under the window instead of overrunning it
-        /// during generation.
+        /// 32768). Newt gates input at the tighter of the configured percentage
+        /// ceiling and the room left by the request's maximum output, so a long
+        /// turn compacts instead of overrunning the shared window.
         #[arg(long, value_name = "N")]
-        context_window: Option<usize>,
+        context_window: Option<u32>,
         /// Operator-supplied sha256 of the weights actually served (GGUF file
         /// hash / HF revision SHA) for the contract record's `model_digest`
         /// (W0 #1511). Env twin: `NEWT_MODEL_DIGEST`. Omitted from the record
@@ -1786,6 +1786,19 @@ mod tests {
 
         assert!(cli.debug);
         assert_eq!(cli.num_ctx, Some(8192));
+    }
+
+    #[test]
+    fn solve_context_window_rejects_values_that_cannot_enter_the_contract() {
+        assert!(Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "task.md",
+            "--context-window",
+            "4294967296",
+        ])
+        .is_err());
     }
 
     #[test]

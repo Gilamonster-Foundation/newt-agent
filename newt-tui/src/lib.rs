@@ -77,6 +77,7 @@ pub(crate) use chat::{InputSurface, ReadOutcome};
 pub use color::color_supported;
 use color::{color_enabled_for, resolve_color_mode};
 use newt_core::agentic::{newt_line, print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT};
+use newt_core::recover_context_window_400;
 #[cfg(test)]
 use prompt::expand_prompt_tokens;
 #[cfg(feature = "rich-tui")]
@@ -7100,25 +7101,6 @@ fn persona_swap_kept_context_message(active_persona: Option<&Persona>) -> String
     }
 }
 
-/// Inspect a failed dispatch error for a recoverable context-window 400.
-///
-/// Hosted endpoints reject an over-long prompt with a non-retryable HTTP 400
-/// whose body names the model's real maximum (e.g. `prompt is too long:
-/// 5960028 tokens > 1000000 maximum`). On match this persists the discovered
-/// limit to `model-capabilities.json` (so future sessions start tightened) and
-/// returns the new pre-send budget in input tokens. Returns `None` for any
-/// other error, which the caller should propagate. See issue #223.
-fn recover_context_window_400(err: &anyhow::Error, model: &str, today: &str) -> Option<u32> {
-    let (_prompt, hard_limit) = probe::parse_context_window_error(&err.to_string())?;
-    let hard_limit = u32::try_from(hard_limit).unwrap_or(u32::MAX);
-    let mut cache = probe::load_cache();
-    let entry = cache.entry(model.to_string()).or_default();
-    entry.record_context_window_400(hard_limit, today);
-    let new_cap = entry.max_ok_input;
-    probe::save_cache(&cache);
-    new_cap
-}
-
 /// Resolve the token-based mid-loop trim trigger (issue #223): the per-model
 /// override wins over the global `[tui].mid_loop_trim_tokens`. A configured
 /// ZERO (from either source) means DISABLED — the old `trim_to_token_budget`
@@ -12525,7 +12507,7 @@ mod posture_command_tests {
 // Context-window 400 recovery (issue #223) — the one agentic-loop test that
 // stays TUI-side after Step 9.7 moved the loop suites to newt-core::agentic:
 // it exercises the TUI's `recover_cw_400` hook (`recover_context_window_400`),
-// whose probe-cache persistence lives here and needs the HOME env guard.
+// plus the observation-owned probe-cache persistence that follows it.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tool_round_cap_tests {
@@ -12543,6 +12525,23 @@ mod tool_round_cap_tests {
             MemMessage::system("you are a test"),
             MemMessage::user("do the thing"),
         ]
+    }
+
+    /// Grounds the parse-only recovery callback contract: cache ownership
+    /// remains in the observation hook exercised by the integration below.
+    #[test]
+    fn context_window_400_hook_returns_the_full_window() {
+        let err = anyhow::anyhow!("prompt is too long: 42000 tokens > 32768 maximum");
+        let recovered = recover_context_window_400(&err, "cw-hook-model", "2026-08-01");
+        assert_eq!(recovered, Some(32_768));
+
+        let vllm = anyhow::anyhow!(
+            "This model's maximum context length is 32768 tokens. However, you requested 16000 output tokens and your prompt contains 20000 input tokens, for a total of 36000 tokens (20000 + 16000 = 36000 > 32768). Please reduce the length of the input prompt or the number of requested output tokens."
+        );
+        assert_eq!(
+            recover_context_window_400(&vllm, "cw-hook-model", "2026-08-01"),
+            Some(32_768),
+        );
     }
 
     /// Regression for issue #223: a hard context-window 400 must NOT kill the
@@ -12563,15 +12562,16 @@ mod tool_round_cap_tests {
             fn respond(&self, _req: &Request) -> ResponseTemplate {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
-                    // First dispatch overflows the context window (the real
-                    // litellm message shape from the issue).
+                    // First dispatch overflows the context window using the
+                    // exact vLLM 0.19 output-plus-prompt validation wording.
                     ResponseTemplate::new(400).set_body_string(
-                        "litellm.ContextWindowExceededError: prompt is too long: 5960028 tokens > 1000000 maximum",
+                        "This model's maximum context length is 1000000 tokens. However, you requested 16000 output tokens and your prompt contains 5960028 input tokens, for a total of 5976028 tokens (5960028 + 16000 = 5976028 > 1000000). Please reduce the length of the input prompt or the number of requested output tokens.",
                     )
                 } else {
                     // After trim+retry, answer with no tool calls so the loop ends.
                     ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "choices": [{ "message": { "content": self.final_answer } }]
+                        "choices": [{ "message": { "content": self.final_answer } }],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 2, "total_tokens": 102}
                     }))
                 }
             }
@@ -12590,102 +12590,135 @@ mod tool_round_cap_tests {
             .enable_all()
             .build()
             .unwrap();
-        let (result, calls_made, persisted_cap) = rt.block_on(async {
-            let server = MockServer::start().await;
-            let calls = Arc::new(AtomicUsize::new(0));
-            Mock::given(method("POST"))
-                .and(path("/v1/chat/completions"))
-                .respond_with(CwResponder {
-                    calls: calls.clone(),
-                    final_answer: "recovered answer".into(),
-                })
-                .mount(&server)
-                .await;
+        let (result, calls_made, recovered_window, accepted_observed, persisted) =
+            rt.block_on(async {
+                let server = MockServer::start().await;
+                let calls = Arc::new(AtomicUsize::new(0));
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .respond_with(CwResponder {
+                        calls: calls.clone(),
+                        final_answer: "recovered answer".into(),
+                    })
+                    .mount(&server)
+                    .await;
 
-            let messages = msgs();
-            let caveats = Caveats::top();
-            let out = openai_chat_complete(
-                ChatCtx {
-                    url: &server.uri(),
-                    model: "cw-test-model",
-                    kind: BackendKind::Openai,
-                    api_key: Some("sk-test"),
-                    messages: &messages,
-                    task: "do the thing",
-                    workspace: ".",
-                    color: false,
-                    markdown: false,
-                    tool_offload: false,
-                    spill_store: None,
-                    compaction_store: None,
-                    scratchpad: false,
-                    scratchpad_store: None,
-                    code_search: None,
-                    where_is: None,
-                    nav: None,
-                    exposure: Default::default(),
-                    experience_store: None,
-                    step_ledger: None,
-                    caveats: &caveats,
-                    persona_tools: None,
-                    cognition: None,
-                    chat_completions_capability: Default::default(),
-                    reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
-                    max_tool_rounds: 5,
-                    narration_nudge_cap: 1,
-                    action_nudges: true,
-                    prompt_disposition: newt_core::agentic::PromptDisposition::Act,
-                    prompt_intake: None,
-                    workflow_grace_rounds: 0,
-                    tool_output_lines: 20,
-                    debug: false,
-                    trace: false,
-                    num_ctx: None,
-                    input_ceiling_pct: 80,
-                    low_budget_pct: 15,
-                    connect_timeout_secs: 5,
-                    inference_timeout_secs: 120,
-                    mid_loop_trim_threshold: 40,
-                    compaction_trigger_policy: newt_core::CompactionTriggerPolicy::HeadroomAware,
-                    mid_loop_trim_tokens: None,
-                    max_ok_input: None,
-                    build_check_cmd: None,
-                    safe_context: None,
-                    // The hook under test: the TUI's probe-cache-backed recovery.
-                    recover_cw_400: Some(recover_context_window_400),
-                    note_sink: None,
-                    note_nudge: None,
-                    recall_source: None,
-                    memory_source: None,
-                    summarizer: None,
-                    compress_state: None,
-                    tool_events: None,
-                    phantom_reaches: None,
-                    end_reason: None,
-                    solve_obs: None,
-                    permission_gate: None,
-                    on_round_usage: None,
-                    estimate_ratio: None,
-                    estimation: newt_core::TokenEstimation::default(),
-                    summary_input_cap_floor_chars: 8_192,
-                    exec_floor: None,
-                    write_ledger: None,
-                    cancel: None,
-                    live_tool_output: None,
-                    git_tool: None,
-                    crew_runner: None,
-                    operating_mode_control: None,
-                    plan_mode_control: None,
-                },
-                &mut Mcp::empty(),
-            )
-            .await;
-            // Read the persisted cap while HOME still points at the temp dir.
-            let persisted = probe::load_cache()
-                .get("cw-test-model")
-                .and_then(|e| e.max_ok_input);
-            (out, calls.load(Ordering::SeqCst), persisted)
-        });
+                let messages = msgs();
+                let caveats = Caveats::top();
+                let today = "2026-08-01";
+                let mut cap_cache = probe::load_cache();
+                let mut recovered_window = None;
+                let mut accepted_observed = false;
+                let out = {
+                    let mut on_obs = |obs: newt_core::RoundObservation| {
+                        if matches!(obs, newt_core::RoundObservation::Accepted { .. }) {
+                            accepted_observed = true;
+                        }
+                        if let newt_core::RoundObservation::ContextWindow400 { context_window } =
+                            obs
+                        {
+                            recovered_window = Some(context_window);
+                        }
+                        let dirty = {
+                            let entry = cap_cache.entry("cw-test-model".to_string()).or_default();
+                            probe::apply_observation(entry, &obs, today)
+                        };
+                        if dirty {
+                            probe::save_cache(&cap_cache);
+                        }
+                    };
+                    openai_chat_complete(
+                        ChatCtx {
+                            url: &server.uri(),
+                            model: "cw-test-model",
+                            kind: BackendKind::Openai,
+                            api_key: Some("sk-test"),
+                            messages: &messages,
+                            task: "do the thing",
+                            workspace: ".",
+                            color: false,
+                            markdown: false,
+                            tool_offload: false,
+                            spill_store: None,
+                            compaction_store: None,
+                            scratchpad: false,
+                            scratchpad_store: None,
+                            code_search: None,
+                            where_is: None,
+                            nav: None,
+                            exposure: Default::default(),
+                            experience_store: None,
+                            step_ledger: None,
+                            caveats: &caveats,
+                            persona_tools: None,
+                            cognition: None,
+                            chat_completions_capability: Default::default(),
+                            reasoning_replay_scope:
+                                newt_core::model_card::ReasoningReplayScope::Never,
+                            max_tool_rounds: 5,
+                            narration_nudge_cap: 1,
+                            action_nudges: true,
+                            prompt_disposition: newt_core::agentic::PromptDisposition::Act,
+                            prompt_intake: None,
+                            workflow_grace_rounds: 0,
+                            tool_output_lines: 20,
+                            debug: false,
+                            trace: false,
+                            num_ctx: None,
+                            input_ceiling_pct: 80,
+                            low_budget_pct: 15,
+                            connect_timeout_secs: 5,
+                            inference_timeout_secs: 120,
+                            mid_loop_trim_threshold: 40,
+                            compaction_trigger_policy:
+                                newt_core::CompactionTriggerPolicy::HeadroomAware,
+                            mid_loop_trim_tokens: None,
+                            max_ok_input: None,
+                            build_check_cmd: None,
+                            safe_context: None,
+                            // Parse-only recovery reports the hard window through the
+                            // same observation owner as the successful retry.
+                            recover_cw_400: Some(recover_context_window_400),
+                            note_sink: None,
+                            note_nudge: None,
+                            recall_source: None,
+                            memory_source: None,
+                            summarizer: None,
+                            compress_state: None,
+                            tool_events: None,
+                            phantom_reaches: None,
+                            end_reason: None,
+                            solve_obs: None,
+                            permission_gate: None,
+                            on_round_usage: Some(&mut on_obs),
+                            estimate_ratio: None,
+                            estimation: newt_core::TokenEstimation::default(),
+                            summary_input_cap_floor_chars: 8_192,
+                            exec_floor: None,
+                            write_ledger: None,
+                            cancel: None,
+                            live_tool_output: None,
+                            git_tool: None,
+                            crew_runner: None,
+                            operating_mode_control: None,
+                            plan_mode_control: None,
+                        },
+                        &mut Mcp::empty(),
+                    )
+                    .await
+                };
+                // Read the persisted facts after both the 400 and accepted retry.
+                let persisted = probe::load_cache()
+                    .get("cw-test-model")
+                    .map(|e| (e.context_window, e.max_ok_input, e.safe_context));
+                (
+                    out,
+                    calls.load(Ordering::SeqCst),
+                    recovered_window,
+                    accepted_observed,
+                    persisted,
+                )
+            });
 
         // Clear the thread-local cache override before any assertion can unwind.
         probe::set_cache_dir_override(None);
@@ -12697,8 +12730,14 @@ mod tool_round_cap_tests {
             calls_made >= 2,
             "expected at least one retry after the 400, got {calls_made} call(s)"
         );
-        // Persistence (issue #223 req 4): 1_000_000 * 80% = 800_000.
-        assert_eq!(persisted_cap, Some(800_000));
+        assert_eq!(recovered_window, Some(1_000_000));
+        assert!(accepted_observed, "the successful retry must emit Accepted");
+        // Persistence (issue #223 req 4): the full window and its generic 80%
+        // caps survive the Accepted observation emitted by the retry.
+        assert_eq!(
+            persisted,
+            Some((Some(1_000_000), Some(800_000), Some(800_000)))
+        );
     }
 }
 

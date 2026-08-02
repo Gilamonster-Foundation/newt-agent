@@ -105,7 +105,7 @@ pub const KNOWN_KNOBS: &[KnownKnob] = &[
         key: "input_ceiling_pct",
         scope: KnobScope::GlobalInline,
         min: 1,
-        max: 100,
+        max: 99,
         doc: "percent of the context budget usable for input before trimming",
     },
     KnownKnob {
@@ -353,6 +353,11 @@ mod tests {
         assert_eq!(
             known_knob("low_budget_pct").unwrap().scope,
             KnobScope::GlobalInline
+        );
+        assert_eq!(
+            known_knob("input_ceiling_pct").unwrap().max,
+            99,
+            "the nudger must not emit a value config normalization rewrites to 80",
         );
         assert_eq!(
             known_knob("note_nudge_interval").unwrap().scope,

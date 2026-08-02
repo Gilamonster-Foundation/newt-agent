@@ -18,6 +18,8 @@ use std::path::PathBuf;
 
 use newt_core::TokenEstimation;
 
+pub use newt_core::parse_context_window_error;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -83,6 +85,13 @@ pub struct CapabilityEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
 
+    /// Smallest full context window reported by a numbered hard rejection.
+    /// Kept distinct from an ordinary declaration/probe so explicit overrides
+    /// remain experimental until the server actually refuses one. Once known,
+    /// this ceiling only tightens and survives process restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_context_window: Option<u32>,
+
     /// Empirically confirmed safe `num_ctx` to send to Ollama.
     /// Starts at 80 % of `context_window`; ratchets down on overflow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +156,7 @@ impl Default for CapabilityEntry {
             conformance: ToolConformance::NoTools,
             tested_date: String::new(),
             context_window: None,
+            hard_context_window: None,
             safe_context: None,
             overflow_at: None,
             max_ok_input: None,
@@ -182,22 +192,41 @@ impl CapabilityEntry {
 
     /// Record a hard context-window rejection (HTTP 400 /
     /// `ContextWindowExceededError`) where the endpoint reported its real
-    /// maximum input size as `hard_limit` tokens.
+    /// full context limit as `hard_limit` tokens.
     ///
-    /// Sets `max_ok_input` to 80 % of the reported limit (leaving headroom for
-    /// the chars/4 estimate's inaccuracy) so the pre-send guard trims future
-    /// requests *before* they are dispatched, and persists the discovery so
-    /// later sessions don't repeat the same crash. Confidence drops to `Low`
-    /// because the previous tuning clearly overshot. See issue #223.
+    /// Persists the reported full window and sets `max_ok_input` to the default
+    /// 80% input ceiling. Runtime callers with a configured percentage use
+    /// [`Self::record_context_window_400_with_pct`] instead, so later requests
+    /// reserve their actual generation allowance against the same effective
+    /// ceiling. Confidence drops to `Low` because the previous tuning clearly
+    /// overshot. See issue #223.
     ///
     /// Returns `true` if state changed (caller should save cache).
     pub fn record_context_window_400(&mut self, hard_limit: u32, today: &str) -> bool {
+        self.record_context_window_400_with_pct(hard_limit, 80, today)
+    }
+
+    /// Runtime variant of [`Self::record_context_window_400`] that persists the
+    /// active normalized input-ceiling percentage.
+    pub fn record_context_window_400_with_pct(
+        &mut self,
+        hard_limit: u32,
+        input_ceiling_pct: u32,
+        today: &str,
+    ) -> bool {
         // The reported `hard_limit` is authoritative about the model's true
-        // ceiling, so set the pre-send gate to 80 % of it directly — even when
-        // that raises a previously-low `max_ok_input` (issue #223 saw a stale
-        // 251_640 while the real max was 1_000_000, so the gate must move up to
-        // ~800_000, not stay needlessly tiny).
-        let new_cap = (hard_limit as u64 * 80 / 100) as u32;
+        // ceiling. Keep that full-window fact separate from the conservative
+        // input cap so cognition output can be reserved on future sessions.
+        let hard_limit = self
+            .hard_context_window
+            .map_or(hard_limit, |known| known.min(hard_limit));
+        self.hard_context_window = Some(hard_limit);
+        self.context_window = Some(hard_limit);
+        // Set the pre-send gate from the normalized configured percentage —
+        // even when that raises a previously-low `max_ok_input` (issue #223 saw
+        // a stale 251_640 while the real max was 1_000_000, so the gate must
+        // move up to the authoritative configured cap).
+        let new_cap = newt_core::config::input_percentage_ceiling(hard_limit, input_ceiling_pct);
         self.max_ok_input = Some(new_cap);
         self.consecutive_ok = 0;
         self.tune_confidence = TuneConfidence::Low;
@@ -304,6 +333,17 @@ pub fn apply_observation(
     obs: &newt_core::RoundObservation,
     today: &str,
 ) -> bool {
+    apply_observation_with_input_ceiling_pct(entry, obs, today, 80)
+}
+
+/// Runtime form of [`apply_observation`] that composes numbered hard-window
+/// evidence with the active normalized input ceiling instead of assuming 80%.
+pub fn apply_observation_with_input_ceiling_pct(
+    entry: &mut CapabilityEntry,
+    obs: &newt_core::RoundObservation,
+    today: &str,
+    input_ceiling_pct: u32,
+) -> bool {
     match *obs {
         newt_core::RoundObservation::Accepted {
             prompt_tokens,
@@ -316,6 +356,9 @@ pub fn apply_observation(
         }
         newt_core::RoundObservation::SuspectedOverflow { prompt_tokens } => {
             entry.record_overflow(prompt_tokens, today)
+        }
+        newt_core::RoundObservation::ContextWindow400 { context_window } => {
+            entry.record_context_window_400_with_pct(context_window, input_ceiling_pct, today)
         }
         newt_core::RoundObservation::ThinkingOnly => entry.record_thinking_only(),
     }
@@ -1288,37 +1331,6 @@ fn probe_tool_schema() -> serde_json::Value {
     }])
 }
 
-/// Parse a context-window-exceeded error and extract `(prompt_tokens,
-/// max_tokens)`.
-///
-/// Hosted endpoints (NVIDIA inference API → LiteLLM → Bedrock/Anthropic)
-/// surface context overflow as an HTTP 400 whose body contains a message like:
-///
-/// ```text
-/// litellm.ContextWindowExceededError: prompt is too long: 5960028 tokens > 1000000 maximum
-/// ```
-///
-/// The error body is embedded in the harness's `"inference endpoint 400: <body>"`
-/// string, so this scans the whole message for the `prompt is too long: …`
-/// pattern (the `N` and `M` numbers) rather than parsing structured JSON.
-/// Returns `None` when the pattern is absent (the 400 was for some other
-/// reason). See issue #223.
-pub fn parse_context_window_error(msg: &str) -> Option<(u64, u64)> {
-    // Anchor on the stable phrase; tolerate surrounding JSON/escaping.
-    let after = msg.split("prompt is too long:").nth(1)?;
-    let prompt = first_number(after)?;
-    let after_gt = after.split('>').nth(1)?;
-    let max = first_number(after_gt)?;
-    Some((prompt, max))
-}
-
-/// Return the first run of ASCII digits in `s` parsed as `u64`, if any.
-fn first_number(s: &str) -> Option<u64> {
-    s.split(|c: char| !c.is_ascii_digit())
-        .find(|t| !t.is_empty())
-        .and_then(|t| t.parse().ok())
-}
-
 /// Return `true` if `content` looks like a tool-call JSON object or array
 /// embedded as text — the "text mode" conformance pattern.
 pub fn looks_like_tool_call_json(content: &str) -> bool {
@@ -1874,6 +1886,34 @@ mod tests {
             &newt_core::RoundObservation::ThinkingOnly,
             today
         ));
+
+        // A numbered context-window 400 updates the same in-memory entry as
+        // the accepted retry, so the latter cannot overwrite recovered facts
+        // from a separately loaded stale cache.
+        let mut e = make_entry();
+        e.context_window = Some(65_536);
+        e.safe_context = Some(52_428);
+        e.max_ok_input = Some(52_428);
+        assert!(apply_observation(
+            &mut e,
+            &newt_core::RoundObservation::ContextWindow400 {
+                context_window: 32_768,
+            },
+            today,
+        ));
+        assert_eq!(e.context_window, Some(32_768));
+        assert_eq!(e.safe_context, Some(26_214));
+        assert_eq!(e.max_ok_input, Some(26_214));
+        assert!(apply_observation(
+            &mut e,
+            &newt_core::RoundObservation::Accepted {
+                prompt_tokens: 1_000,
+                estimated_tokens: 1_000,
+            },
+            today,
+        ));
+        assert_eq!(e.context_window, Some(32_768));
+        assert_eq!(e.safe_context, Some(26_214));
     }
 
     /// New fields round-trip through JSON and stay absent (not `null`) when
@@ -1925,6 +1965,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_context_window_error_extracts_vllm_output_and_prompt_limits() {
+        // Exact vLLM 0.19 validation wording when requested output plus prompt
+        // input exceeds max_model_len (wrapped as Newt sees the HTTP 400 body).
+        let msg = "inference endpoint 400 Bad Request: This model's maximum context length is 32768 tokens. However, you requested 16000 output tokens and your prompt contains 20000 input tokens, for a total of 36000 tokens (20000 + 16000 = 36000 > 32768). Please reduce the length of the input prompt or the number of requested output tokens.";
+        assert_eq!(
+            super::parse_context_window_error(msg),
+            Some((20_000, 32_768))
+        );
+    }
+
+    #[test]
+    fn parse_context_window_error_extracts_vllm_input_only_limit() {
+        // Exact sibling validation wording when the input alone reaches the
+        // full model window.
+        let msg = "inference endpoint 400 Bad Request: This model's maximum context length is 32768 tokens. However, your request has 33000 input tokens. Please reduce the length of the input messages.";
+        assert_eq!(
+            super::parse_context_window_error(msg),
+            Some((33_000, 32_768))
+        );
+    }
+
+    #[test]
     fn parse_context_window_error_none_without_max_clause() {
         // Truncated message missing the max half must not panic.
         let msg = "prompt is too long: 5960028 tokens";
@@ -1939,10 +2001,34 @@ mod tests {
         e.max_ok_input = Some(251_640);
         let dirty = e.record_context_window_400(1_000_000, "2026-06-08");
         assert!(dirty);
+        assert_eq!(e.context_window, Some(1_000_000));
         // 1_000_000 * 80% = 800_000 (headroom below the hard max).
         assert_eq!(e.max_ok_input, Some(800_000));
         assert_eq!(e.tune_confidence, TuneConfidence::Low);
         assert_eq!(e.consecutive_ok, 0);
+    }
+
+    #[test]
+    fn runtime_context_window_400_persists_the_configured_percentage_cap() {
+        let mut e = make_entry();
+        e.max_ok_input = Some(52_428);
+        e.record_context_window_400_with_pct(32_768, 90, "2026-08-01");
+        assert_eq!(e.context_window, Some(32_768));
+        assert_eq!(e.hard_context_window, Some(32_768));
+        assert_eq!(e.max_ok_input, Some(29_491));
+
+        e.record_context_window_400_with_pct(65_536, 90, "2026-08-01");
+        assert_eq!(
+            e.hard_context_window,
+            Some(32_768),
+            "a later, larger error must not raise the persisted hard ceiling",
+        );
+        assert_eq!(e.context_window, Some(32_768));
+        assert_eq!(e.max_ok_input, Some(29_491));
+
+        let persisted = serde_json::to_string(&e).unwrap();
+        let restored: CapabilityEntry = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(restored.hard_context_window, Some(32_768));
     }
 
     #[test]
@@ -2014,6 +2100,7 @@ mod tests {
                 conformance: ToolConformance::Native,
                 tested_date: "2026-06-08".into(),
                 context_window: Some(8_192),
+                hard_context_window: None,
                 safe_context: Some(6_553),
                 overflow_at: None,
                 max_ok_input: Some(25_602),
