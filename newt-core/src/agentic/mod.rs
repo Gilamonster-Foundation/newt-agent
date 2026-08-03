@@ -1707,239 +1707,249 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // Re-price the exact request after every compression/nudge and refuse
         // before the wire rather than relying on a backend 400 or silent head
         // truncation. Only schemas actually advertised on this request count.
-        preflight_full_message_request(
-            &messages,
-            tools_supported.then_some(&tools),
-            authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            ),
-            cal,
-            estimation,
-            model,
-        )?;
-
-        // Phase 20 §2.2: chars/4 estimate of EXACTLY the request about to be
-        // dispatched (the message list as sent, plus tool schemas) — paired
-        // with the backend's reported prompt size in the `Accepted`
-        // observation so the caller can learn the calibration ratio.
-        let round_est_raw =
-            estimate_request_tokens(&messages, tools_supported.then_some(&tools), estimation);
-
-        // Tool-call rounds: stream:false (fast, just JSON).
-        // Final text round: stream:true so the user sees tokens arrive.
-        // We don't know which round is last, so we probe with stream:false first
-        // and switch to streaming only when the model returns no tool calls.
-        let mut body_no_stream = if let Some(ctx_size) = num_ctx {
-            serde_json::json!({
-                "model": model,
-                "messages": messages,
-                "stream": false,
-                "tools": tools.clone(),
-                "options": { "num_ctx": ctx_size },
-            })
-        } else {
-            serde_json::json!({
-                "model": model,
-                "messages": messages,
-                "stream": false,
-                "tools": tools.clone(),
-            })
-        };
-        // Drop tools entirely for a model that rejects them (set below on a
-        // "does not support tools" 400) — an empty array still trips strict
-        // models, so remove the key.
-        if !tools_supported {
-            if let Some(o) = body_no_stream.as_object_mut() {
-                o.remove("tools");
-            }
-        }
-
-        // Retry the send+status+parse as one unit — a connection drop at any
-        // of these steps is transient and worth retrying with backoff. Raced
-        // against the interrupt flag so Esc bails out of a slow / stuck probe
-        // (the common "the model isn't answering" case) without waiting for it.
-        // Wrapped in the thinking animation so this otherwise-silent wait shows
-        // a live hourglass + clock instead of a frozen line.
-        let dispatch = match crate::tty::with_spinner(
-            legacy_caps(animate),
-            "thinking…",
-            crate::tty::Sink::Stdout,
-            color,
-            cancellable(
-                cancel,
-                with_backoff_notify(
-                    &retry,
-                    || async {
-                        // W0 (#1511): classify while the error is TYPED — the
-                        // DispatchError keeps the historical message text and
-                        // carries the structural class to the driver boundary.
-                        let resp = client
-                            .post(&chat_url)
-                            .json(&body_no_stream)
-                            .send()
-                            .await
-                            .map_err(|e| {
-                                anyhow::Error::new(observability::DispatchError::from_reqwest(
-                                    "request failed",
-                                    e,
-                                ))
-                            })?;
-                        if !resp.status().is_success() {
-                            let status = resp.status();
-                            let text = resp.text().await.unwrap_or_default();
-                            return Err(observability::DispatchError::http_status(format!(
-                                "Ollama {status}: {text}"
-                            ))
-                            .into());
-                        }
-                        resp.json::<serde_json::Value>()
-                            .await
-                            .map_err(anyhow::Error::from)
-                    },
-                    |attempt, delay| print_retry_indicator(attempt, delay, color),
+        // #1528: inner recovery loop — a cw-400 (or a tools-unsupported error)
+        // retries THIS logical round IN PLACE. Only a COMPLETED dispatch `break`s
+        // out and lets `round` advance, so recovery never consumes a tool-capable
+        // round (critical at hard_tool_rounds == 1 or near the cap): the recovered
+        // request is re-sent WITH tools, never demoted to the tools-disabled summary.
+        let (json, round_est_raw): (serde_json::Value, usize) = loop {
+            preflight_full_message_request(
+                &messages,
+                tools_supported.then_some(&tools),
+                authoritative_request_budget(
+                    send_budget,
+                    send_budget_authoritative,
+                    mid_loop_trim_tokens,
                 ),
-            ),
-        )
-        .await
-        {
-            Some(d) => d,
-            // Interrupted mid-probe: abandon the turn.
-            None => return Ok((String::new(), false, accumulated_usage, hallucination_count)),
-        };
-        let json: serde_json::Value = match dispatch {
-            Ok(j) => j,
-            Err(e) => {
-                // No-tools recovery: a model that rejects the `tools` field
-                // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
-                // and re-dispatch the same turn — self-limiting because the
-                // rebuilt body omits tools. A malformed XML tool-call error is
-                // different: Ollama accepted tools but choked on the model's
-                // generated markup, so keep tools available and retry with a
-                // bounded corrective nudge.
-                let tools_unsupported = is_tools_unsupported_error(&e);
-                let malformed_xml_tool_call = is_ollama_tool_xml_error(&e);
-                if tools_supported && tools_unsupported {
-                    tools_supported = false;
-                    if !tools_unsupported_notified {
-                        tools_unsupported_notified = true;
-                        let notice = format!(
-                            "{model} does not support tools — tools disabled for this turn"
-                        );
-                        print_newt(&notice, color, false);
+                cal,
+                estimation,
+                model,
+            )?;
+
+            // Phase 20 §2.2: chars/4 estimate of EXACTLY the request about to be
+            // dispatched (the message list as sent, plus tool schemas) — paired
+            // with the backend's reported prompt size in the `Accepted`
+            // observation so the caller can learn the calibration ratio.
+            let round_est_raw =
+                estimate_request_tokens(&messages, tools_supported.then_some(&tools), estimation);
+
+            // Tool-call rounds: stream:false (fast, just JSON).
+            // Final text round: stream:true so the user sees tokens arrive.
+            // We don't know which round is last, so we probe with stream:false first
+            // and switch to streaming only when the model returns no tool calls.
+            let mut body_no_stream = if let Some(ctx_size) = num_ctx {
+                serde_json::json!({
+                    "model": model,
+                    "messages": messages,
+                    "stream": false,
+                    "tools": tools.clone(),
+                    "options": { "num_ctx": ctx_size },
+                })
+            } else {
+                serde_json::json!({
+                    "model": model,
+                    "messages": messages,
+                    "stream": false,
+                    "tools": tools.clone(),
+                })
+            };
+            // Drop tools entirely for a model that rejects them (set below on a
+            // "does not support tools" 400) — an empty array still trips strict
+            // models, so remove the key.
+            if !tools_supported {
+                if let Some(o) = body_no_stream.as_object_mut() {
+                    o.remove("tools");
+                }
+            }
+
+            // Retry the send+status+parse as one unit — a connection drop at any
+            // of these steps is transient and worth retrying with backoff. Raced
+            // against the interrupt flag so Esc bails out of a slow / stuck probe
+            // (the common "the model isn't answering" case) without waiting for it.
+            // Wrapped in the thinking animation so this otherwise-silent wait shows
+            // a live hourglass + clock instead of a frozen line.
+            let dispatch = match crate::tty::with_spinner(
+                legacy_caps(animate),
+                "thinking…",
+                crate::tty::Sink::Stdout,
+                color,
+                cancellable(
+                    cancel,
+                    with_backoff_notify(
+                        &retry,
+                        || async {
+                            // W0 (#1511): classify while the error is TYPED — the
+                            // DispatchError keeps the historical message text and
+                            // carries the structural class to the driver boundary.
+                            let resp = client
+                                .post(&chat_url)
+                                .json(&body_no_stream)
+                                .send()
+                                .await
+                                .map_err(|e| {
+                                    anyhow::Error::new(observability::DispatchError::from_reqwest(
+                                        "request failed",
+                                        e,
+                                    ))
+                                })?;
+                            if !resp.status().is_success() {
+                                let status = resp.status();
+                                let text = resp.text().await.unwrap_or_default();
+                                return Err(observability::DispatchError::http_status(format!(
+                                    "Ollama {status}: {text}"
+                                ))
+                                .into());
+                            }
+                            resp.json::<serde_json::Value>()
+                                .await
+                                .map_err(anyhow::Error::from)
+                        },
+                        |attempt, delay| print_retry_indicator(attempt, delay, color),
+                    ),
+                ),
+            )
+            .await
+            {
+                Some(d) => d,
+                // Interrupted mid-probe: abandon the turn.
+                None => return Ok((String::new(), false, accumulated_usage, hallucination_count)),
+            };
+            match dispatch {
+                Ok(j) => break (j, round_est_raw),
+                Err(e) => {
+                    // No-tools recovery: a model that rejects the `tools` field
+                    // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
+                    // and re-dispatch the same turn — self-limiting because the
+                    // rebuilt body omits tools. A malformed XML tool-call error is
+                    // different: Ollama accepted tools but choked on the model's
+                    // generated markup, so keep tools available and retry with a
+                    // bounded corrective nudge.
+                    let tools_unsupported = is_tools_unsupported_error(&e);
+                    let malformed_xml_tool_call = is_ollama_tool_xml_error(&e);
+                    if tools_supported && tools_unsupported {
+                        tools_supported = false;
+                        if !tools_unsupported_notified {
+                            tools_unsupported_notified = true;
+                            let notice = format!(
+                                "{model} does not support tools — tools disabled for this turn"
+                            );
+                            print_newt(&notice, color, false);
+                        }
+                        continue;
                     }
-                    continue 'round_loop;
-                }
-                if tools_supported && malformed_xml_tool_call && ollama_xml_retry_nudges < 2 {
-                    ollama_xml_retry_nudges += 1;
-                    print_newt(
-                        &format!(
-                            "{model} produced malformed Ollama XML tool-call syntax — \
+                    if tools_supported && malformed_xml_tool_call && ollama_xml_retry_nudges < 2 {
+                        ollama_xml_retry_nudges += 1;
+                        print_newt(
+                            &format!(
+                                "{model} produced malformed Ollama XML tool-call syntax — \
                              retrying with a stricter tool-call nudge"
-                        ),
-                        color,
-                        false,
-                    );
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": ollama_tool_xml_retry_nudge()
-                    }));
-                    continue 'round_loop;
-                }
-                // Graceful context-window overflow recovery: parse the model's
-                // real limit, tighten the budget, compress, and retry once (#223;
-                // compress-not-trim since Step 18.4). A numberless overflow with
-                // no parseable limit (llama.cpp served over the Ollama-compat
-                // `/api/chat`) falls back to a cap derived from the current send
-                // budget / the `num_ctx` ceiling, so the turn self-heals.
-                if cw_retries < 2 {
-                    if let Some(new_cap) = recover_cw_400
-                        .and_then(|f| f(&e, model, &today))
-                        .or_else(|| {
-                            cw_overflow::core_recover_overflow(
-                                &e.to_string(),
-                                send_budget,
-                                num_ctx_ceiling,
-                            )
-                        })
-                    {
-                        emit_overflow_notice(
+                            ),
                             color,
-                            accumulated_usage.as_ref(),
-                            Some(new_cap),
-                            model,
-                            cw_retries + 1,
+                            false,
                         );
-                        // A recovered cap can only tighten — the request still
-                        // carries the same `num_ctx`, so its ceiling holds (#282).
-                        let new_budget =
-                            num_ctx_ceiling.map_or(new_cap as usize, |c| (new_cap as usize).min(c));
-                        send_budget = Some(new_budget);
-                        // The endpoint's parsed hard limit is authoritative —
-                        // a refuse on it is correct from here on (Step 20.3).
-                        send_budget_authoritative = true;
-                        let outcome = compress(
-                            CompressRequest {
-                                // Real-token budget minus real-token schema
-                                // overhead, converted into the pipeline's
-                                // chars/4 currency (Phase 20 §2.3).
-                                messages: &messages,
-                                budget: calibrate_down(
-                                    new_budget.saturating_sub(tool_tokens_real),
-                                    cal,
-                                ),
-                                max_messages: None,
-                                task: active_task,
-                                hard_budget: true,
-                                authoritative: true,
-                                focus: None,
-                                est: estimation,
-                                summary_input_cap_floor_chars,
-                                compaction_store,
-                            },
-                            summarizer,
-                            compress_state,
-                        )
-                        .await;
-                        if let Some(notice) = outcome.notice {
-                            print_harness_notice(&notice, color);
-                        }
-                        if outcome.action == CompressAction::Refused {
-                            // Refuse the resend; surface the endpoint's 400.
-                            return Err(e);
-                        }
-                        if outcome.fired {
-                            messages = outcome.messages;
-                            prompt_tracker.invalidate();
-                            apply_post_compaction_continuation(
-                                &mut messages,
-                                &mut narration_nudges,
-                                outcome.action,
-                                step_ledger,
-                                prompt_context,
-                                round > 0,
-                                action_nudges,
-                            );
-                            record_compaction_artifact(
-                                artifact_sink,
-                                artifact_context,
-                                outcome.action,
-                                outcome.tokens_before,
-                                outcome.tokens_after,
-                                calibrate_down(new_budget.saturating_sub(tool_tokens_real), cal),
-                                round,
-                                "context_window_400",
-                                None,
-                                false,
-                                color,
-                            );
-                        }
-                        cw_retries += 1;
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": ollama_tool_xml_retry_nudge()
+                        }));
                         continue 'round_loop;
                     }
+                    // Graceful context-window overflow recovery: parse the model's
+                    // real limit, tighten the budget, compress, and retry once (#223;
+                    // compress-not-trim since Step 18.4). A numberless overflow with
+                    // no parseable limit (llama.cpp served over the Ollama-compat
+                    // `/api/chat`) falls back to a cap derived from the current send
+                    // budget / the `num_ctx` ceiling, so the turn self-heals.
+                    if cw_retries < 2 {
+                        if let Some(new_cap) = recover_cw_400
+                            .and_then(|f| f(&e, model, &today))
+                            .or_else(|| {
+                                cw_overflow::core_recover_overflow(
+                                    &e.to_string(),
+                                    send_budget,
+                                    num_ctx_ceiling,
+                                )
+                            })
+                        {
+                            emit_overflow_notice(
+                                color,
+                                accumulated_usage.as_ref(),
+                                Some(new_cap),
+                                model,
+                                cw_retries + 1,
+                            );
+                            // A recovered cap can only tighten — the request still
+                            // carries the same `num_ctx`, so its ceiling holds (#282).
+                            let new_budget = num_ctx_ceiling
+                                .map_or(new_cap as usize, |c| (new_cap as usize).min(c));
+                            send_budget = Some(new_budget);
+                            // The endpoint's parsed hard limit is authoritative —
+                            // a refuse on it is correct from here on (Step 20.3).
+                            send_budget_authoritative = true;
+                            let outcome = compress(
+                                CompressRequest {
+                                    // Real-token budget minus real-token schema
+                                    // overhead, converted into the pipeline's
+                                    // chars/4 currency (Phase 20 §2.3).
+                                    messages: &messages,
+                                    budget: calibrate_down(
+                                        new_budget.saturating_sub(tool_tokens_real),
+                                        cal,
+                                    ),
+                                    max_messages: None,
+                                    task: active_task,
+                                    hard_budget: true,
+                                    authoritative: true,
+                                    focus: None,
+                                    est: estimation,
+                                    summary_input_cap_floor_chars,
+                                    compaction_store,
+                                },
+                                summarizer,
+                                compress_state,
+                            )
+                            .await;
+                            if let Some(notice) = outcome.notice {
+                                print_harness_notice(&notice, color);
+                            }
+                            if outcome.action == CompressAction::Refused {
+                                // Refuse the resend; surface the endpoint's 400.
+                                return Err(e);
+                            }
+                            if outcome.fired {
+                                messages = outcome.messages;
+                                prompt_tracker.invalidate();
+                                apply_post_compaction_continuation(
+                                    &mut messages,
+                                    &mut narration_nudges,
+                                    outcome.action,
+                                    step_ledger,
+                                    prompt_context,
+                                    round > 0,
+                                    action_nudges,
+                                );
+                                record_compaction_artifact(
+                                    artifact_sink,
+                                    artifact_context,
+                                    outcome.action,
+                                    outcome.tokens_before,
+                                    outcome.tokens_after,
+                                    calibrate_down(
+                                        new_budget.saturating_sub(tool_tokens_real),
+                                        cal,
+                                    ),
+                                    round,
+                                    "context_window_400",
+                                    None,
+                                    false,
+                                    color,
+                                );
+                            }
+                            cw_retries += 1;
+                            continue;
+                        }
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
 
@@ -5020,199 +5030,210 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             }
         }
 
-        let wire_messages = openai_chat_wire_messages(&messages)?;
+        // #1528: inner recovery loop — a cw-400 (or a tools-unsupported error)
+        // retries THIS logical round IN PLACE. Only a COMPLETED dispatch `break`s
+        // out and lets `round` advance, so recovery never consumes a tool-capable
+        // round (critical at hard_tool_rounds == 1 or near the cap): the recovered
+        // request is re-sent WITH tools, never demoted to the tools-disabled summary.
+        let (json, round_est_raw): (serde_json::Value, usize) = loop {
+            let wire_messages = openai_chat_wire_messages(&messages)?;
 
-        // Mirror the Ollama full-request gate. A known authoritative ceiling
-        // means the harness must not dispatch an impossible request,
-        // especially after a giant exact prompt_read result.
-        preflight_full_message_request(
-            &wire_messages,
-            tools_supported.then_some(&tools),
-            authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            ),
-            cal,
-            estimation,
-            model,
-        )?;
+            // Mirror the Ollama full-request gate. A known authoritative ceiling
+            // means the harness must not dispatch an impossible request,
+            // especially after a giant exact prompt_read result.
+            preflight_full_message_request(
+                &wire_messages,
+                tools_supported.then_some(&tools),
+                authoritative_request_budget(
+                    send_budget,
+                    send_budget_authoritative,
+                    mid_loop_trim_tokens,
+                ),
+                cal,
+                estimation,
+                model,
+            )?;
 
-        // Phase 20 §2.2: chars/4 estimate of exactly the request about to be
-        // dispatched — mirrors the Ollama path.
-        let round_est_raw = estimate_request_tokens(
-            &wire_messages,
-            tools_supported.then_some(&tools),
-            estimation,
-        );
+            // Phase 20 §2.2: chars/4 estimate of exactly the request about to be
+            // dispatched — mirrors the Ollama path.
+            let round_est_raw = estimate_request_tokens(
+                &wire_messages,
+                tools_supported.then_some(&tools),
+                estimation,
+            );
 
-        // OpenAI-compatible endpoints don't use Ollama's `options.num_ctx` —
-        // context limits are configured server-side (vLLM --max-model-len).
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": wire_messages,
-            "tools": tools.clone(),
-            "tool_choice": "auto",
-            "stream": false,
-        });
-        // Drop tools (and the now-meaningless tool_choice) for a model that
-        // rejected them on a prior "does not support tools" 400.
-        if !tools_supported {
-            if let Some(o) = body.as_object_mut() {
-                o.remove("tools");
-                o.remove("tool_choice");
+            // OpenAI-compatible endpoints don't use Ollama's `options.num_ctx` —
+            // context limits are configured server-side (vLLM --max-model-len).
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": wire_messages,
+                "tools": tools.clone(),
+                "tool_choice": "auto",
+                "stream": false,
+            });
+            // Drop tools (and the now-meaningless tool_choice) for a model that
+            // rejected them on a prior "does not support tools" 400.
+            if !tools_supported {
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("tools");
+                    o.remove("tool_choice");
+                }
             }
-        }
-        // No `num_ctx` is sent here, so #282's per-request input ceiling has
-        // no value to key on either — the pre-send guard stays on the cached
-        // `max_ok_input` ∥ `safe_context` numbers and the cw-400 recovery
-        // (these endpoints DO reject oversize requests with a parseable 400,
-        // unlike Ollama's silent truncation).
-        let _ = num_ctx; // not applicable for OpenAI-compatible endpoints
-        let dispatch = with_backoff_notify(
-            &retry,
-            || async {
-                let mut req = client.post(&chat_url).json(&body);
-                if let Some(key) = api_key {
-                    req = req.bearer_auth(key);
-                }
-                // W0 (#1511): classify while the error is TYPED — the
-                // DispatchError keeps the historical message text and carries
-                // the structural class to the driver boundary.
-                let resp = req.send().await.map_err(|e| {
-                    anyhow::Error::new(observability::DispatchError::from_reqwest(
-                        "request failed",
-                        e,
-                    ))
-                })?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(observability::DispatchError::http_status(format!(
-                        "inference endpoint {status}: {text}"
-                    ))
-                    .into());
-                }
-                resp.json::<serde_json::Value>()
-                    .await
-                    .map_err(anyhow::Error::from)
-            },
-            |attempt, delay| print_retry_indicator(attempt, delay, color),
-        )
-        .await;
-        let json: serde_json::Value = match dispatch {
-            Ok(j) => j,
-            Err(e) => {
-                // No-tools recovery: a model that rejects the `tools` field
-                // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
-                // and re-dispatch the same round — self-limiting (the rebuilt
-                // body omits tools) and session-persistent.
-                if tools_supported && is_tools_unsupported_error(&e) {
-                    tools_supported = false;
-                    if !tools_unsupported_notified {
-                        tools_unsupported_notified = true;
-                        print_newt(
-                            &format!(
+            // No `num_ctx` is sent here, so #282's per-request input ceiling has
+            // no value to key on either — the pre-send guard stays on the cached
+            // `max_ok_input` ∥ `safe_context` numbers and the cw-400 recovery
+            // (these endpoints DO reject oversize requests with a parseable 400,
+            // unlike Ollama's silent truncation).
+            let _ = num_ctx; // not applicable for OpenAI-compatible endpoints
+            let dispatch = with_backoff_notify(
+                &retry,
+                || async {
+                    let mut req = client.post(&chat_url).json(&body);
+                    if let Some(key) = api_key {
+                        req = req.bearer_auth(key);
+                    }
+                    // W0 (#1511): classify while the error is TYPED — the
+                    // DispatchError keeps the historical message text and carries
+                    // the structural class to the driver boundary.
+                    let resp = req.send().await.map_err(|e| {
+                        anyhow::Error::new(observability::DispatchError::from_reqwest(
+                            "request failed",
+                            e,
+                        ))
+                    })?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(observability::DispatchError::http_status(format!(
+                            "inference endpoint {status}: {text}"
+                        ))
+                        .into());
+                    }
+                    resp.json::<serde_json::Value>()
+                        .await
+                        .map_err(anyhow::Error::from)
+                },
+                |attempt, delay| print_retry_indicator(attempt, delay, color),
+            )
+            .await;
+            match dispatch {
+                Ok(j) => break (j, round_est_raw),
+                Err(e) => {
+                    // No-tools recovery: a model that rejects the `tools` field
+                    // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
+                    // and re-dispatch the same round — self-limiting (the rebuilt
+                    // body omits tools) and session-persistent.
+                    if tools_supported && is_tools_unsupported_error(&e) {
+                        tools_supported = false;
+                        if !tools_unsupported_notified {
+                            tools_unsupported_notified = true;
+                            print_newt(
+                                &format!(
                                 "{model} does not support tools — tools disabled for this session"
                             ),
-                            color,
-                            false,
-                        );
-                    }
-                    continue 'round_loop;
-                }
-                // Graceful context-window overflow recovery: parse the model's
-                // real limit, tighten the budget, compress, and retry once (#223;
-                // compress-not-trim since Step 18.4). When the endpoint carries
-                // NO parseable limit — llama.cpp's numberless `500 "Context size
-                // has been exceeded"`, which `recover_cw_400` (litellm-numbered)
-                // can't read, and which headless has no `recover_cw_400` for at
-                // all — fall back to deriving a tightened cap from the current
-                // send budget so the turn self-heals instead of dying on a blind
-                // resend of the same oversized prompt. No `num_ctx` ceiling on
-                // this wire (limits are server-side), so derive from send_budget.
-                if cw_retries < 2 {
-                    if let Some(new_cap) = recover_cw_400
-                        .and_then(|f| f(&e, model, &today))
-                        .or_else(|| {
-                            cw_overflow::core_recover_overflow(&e.to_string(), send_budget, None)
-                        })
-                    {
-                        emit_overflow_notice(
-                            color,
-                            accumulated_usage.as_ref(),
-                            Some(new_cap),
-                            model,
-                            cw_retries + 1,
-                        );
-                        send_budget = Some(new_cap as usize);
-                        // The endpoint's parsed hard limit is authoritative
-                        // from here on (Step 20.3; mirrors the Ollama path).
-                        send_budget_authoritative = true;
-                        let outcome = compress(
-                            CompressRequest {
-                                // Real-token cap minus real-token schema
-                                // overhead → pipeline chars/4 currency
-                                // (Phase 20 §2.3; mirrors the Ollama path).
-                                messages: &messages,
-                                budget: calibrate_down(
-                                    (new_cap as usize).saturating_sub(tool_tokens_real),
-                                    cal,
-                                ),
-                                max_messages: None,
-                                task: active_task,
-                                hard_budget: true,
-                                authoritative: true,
-                                focus: None,
-                                est: estimation,
-                                summary_input_cap_floor_chars,
-                                compaction_store,
-                            },
-                            summarizer,
-                            compress_state,
-                        )
-                        .await;
-                        if let Some(notice) = outcome.notice {
-                            print_harness_notice(&notice, color);
-                        }
-                        if outcome.action == CompressAction::Refused {
-                            // Refuse the resend; surface the endpoint's 400.
-                            return Err(e);
-                        }
-                        if outcome.fired {
-                            messages = outcome.messages;
-                            prompt_tracker.invalidate();
-                            apply_post_compaction_continuation(
-                                &mut messages,
-                                &mut narration_nudges,
-                                outcome.action,
-                                step_ledger,
-                                prompt_context,
-                                round > 0,
-                                action_nudges,
-                            );
-                            record_compaction_artifact(
-                                artifact_sink,
-                                artifact_context,
-                                outcome.action,
-                                outcome.tokens_before,
-                                outcome.tokens_after,
-                                calibrate_down(
-                                    (new_cap as usize).saturating_sub(tool_tokens_real),
-                                    cal,
-                                ),
-                                round,
-                                "context_window_400",
-                                None,
-                                false,
                                 color,
+                                false,
                             );
                         }
-                        cw_retries += 1;
-                        continue 'round_loop;
+                        continue;
                     }
+                    // Graceful context-window overflow recovery: parse the model's
+                    // real limit, tighten the budget, compress, and retry once (#223;
+                    // compress-not-trim since Step 18.4). When the endpoint carries
+                    // NO parseable limit — llama.cpp's numberless `500 "Context size
+                    // has been exceeded"`, which `recover_cw_400` (litellm-numbered)
+                    // can't read, and which headless has no `recover_cw_400` for at
+                    // all — fall back to deriving a tightened cap from the current
+                    // send budget so the turn self-heals instead of dying on a blind
+                    // resend of the same oversized prompt. No `num_ctx` ceiling on
+                    // this wire (limits are server-side), so derive from send_budget.
+                    if cw_retries < 2 {
+                        if let Some(new_cap) = recover_cw_400
+                            .and_then(|f| f(&e, model, &today))
+                            .or_else(|| {
+                                cw_overflow::core_recover_overflow(
+                                    &e.to_string(),
+                                    send_budget,
+                                    None,
+                                )
+                            })
+                        {
+                            emit_overflow_notice(
+                                color,
+                                accumulated_usage.as_ref(),
+                                Some(new_cap),
+                                model,
+                                cw_retries + 1,
+                            );
+                            send_budget = Some(new_cap as usize);
+                            // The endpoint's parsed hard limit is authoritative
+                            // from here on (Step 20.3; mirrors the Ollama path).
+                            send_budget_authoritative = true;
+                            let outcome = compress(
+                                CompressRequest {
+                                    // Real-token cap minus real-token schema
+                                    // overhead → pipeline chars/4 currency
+                                    // (Phase 20 §2.3; mirrors the Ollama path).
+                                    messages: &messages,
+                                    budget: calibrate_down(
+                                        (new_cap as usize).saturating_sub(tool_tokens_real),
+                                        cal,
+                                    ),
+                                    max_messages: None,
+                                    task: active_task,
+                                    hard_budget: true,
+                                    authoritative: true,
+                                    focus: None,
+                                    est: estimation,
+                                    summary_input_cap_floor_chars,
+                                    compaction_store,
+                                },
+                                summarizer,
+                                compress_state,
+                            )
+                            .await;
+                            if let Some(notice) = outcome.notice {
+                                print_harness_notice(&notice, color);
+                            }
+                            if outcome.action == CompressAction::Refused {
+                                // Refuse the resend; surface the endpoint's 400.
+                                return Err(e);
+                            }
+                            if outcome.fired {
+                                messages = outcome.messages;
+                                prompt_tracker.invalidate();
+                                apply_post_compaction_continuation(
+                                    &mut messages,
+                                    &mut narration_nudges,
+                                    outcome.action,
+                                    step_ledger,
+                                    prompt_context,
+                                    round > 0,
+                                    action_nudges,
+                                );
+                                record_compaction_artifact(
+                                    artifact_sink,
+                                    artifact_context,
+                                    outcome.action,
+                                    outcome.tokens_before,
+                                    outcome.tokens_after,
+                                    calibrate_down(
+                                        (new_cap as usize).saturating_sub(tool_tokens_real),
+                                        cal,
+                                    ),
+                                    round,
+                                    "context_window_400",
+                                    None,
+                                    false,
+                                    color,
+                                );
+                            }
+                            cw_retries += 1;
+                            continue;
+                        }
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
         // Merge per-round token usage (input = max single prompt, output =
@@ -9766,6 +9787,193 @@ mod tool_round_cap_tests {
         assert_eq!(
             reply, "nudge received, writing file now",
             "model should have responded to the nudge with a final answer"
+        );
+    }
+
+    /// A `recover_cw_400` hook for the chat-path cw-400 recovery tests. It
+    /// parses nothing — it unconditionally reports a roomy recovered input cap
+    /// so the loop's compress-and-retry path fires: the small test history
+    /// easily fits the recovered budget, so compaction does not refuse and the
+    /// SAME logical round is retried in place (#1528, chat-path parity).
+    fn recover_cw_400_to_40k(_e: &anyhow::Error, _model: &str, _today: &str) -> Option<u32> {
+        Some(40_000)
+    }
+
+    /// Serves, in order: a numbered context-window 400, then a real tool round
+    /// (`get_context_remaining` — executed synthetically in-loop, no side
+    /// effect), then a plain-text final answer. OpenAI `choices[0].message`
+    /// shape.
+    struct OpenAiOverflowThenToolThenDone {
+        served: Arc<AtomicUsize>,
+    }
+    impl Respond for OpenAiOverflowThenToolThenDone {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            match self.served.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                })),
+                1 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "get_context_remaining", "arguments": "{}"}
+                        }]
+                    }}]
+                })),
+                _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                })),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools() {
+        // #1528 (chat-path parity): a cw-400 must retry the SAME logical tool
+        // round in place, not advance the round counter. With max_tool_rounds ==
+        // 1 the buggy `continue 'round_loop` consumed the only round on recovery
+        // and demoted the recovered request to the tools-disabled summary — 2
+        // requests: [400, summary]. The fix dispatches a real recovered TOOL
+        // round (still carrying tools); only a COMPLETED round then advances to
+        // the summary — 3 requests: [400, recovered tool round, summary].
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiOverflowThenToolThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "SAME ROUND: recovery must not burn the only tool round";
+        let messages = vec![
+            MemMessage::system("base policy"),
+            MemMessage::user("historical A"),
+            MemMessage::assistant("A done"),
+            MemMessage::user(task),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_cw_400_to_40k);
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect("recovery retries the round in place and the turn completes");
+        assert_eq!(reply, "done");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            reqs.len(),
+            3,
+            "expected [400, recovered tool round, summary]; a 2-request run means \
+             recovery burned the only round and demoted to the tools-disabled summary"
+        );
+        let body = |i: usize| -> serde_json::Value {
+            serde_json::from_slice(&reqs[i].body).unwrap_or_default()
+        };
+        assert!(
+            body(1)["tools"].is_array(),
+            "the RECOVERED request must still carry tools — a real tool round, not the summary"
+        );
+        assert!(
+            body(2)["tools"].is_null(),
+            "only the final summary (after the completed round) is tools-disabled"
+        );
+    }
+
+    /// Ollama `message` shape of [`OpenAiOverflowThenToolThenDone`]: a numbered
+    /// context-window 400, then a `get_context_remaining` tool round, then a
+    /// plain-text final answer.
+    struct OllamaOverflowThenToolThenDone {
+        served: Arc<AtomicUsize>,
+    }
+    impl Respond for OllamaOverflowThenToolThenDone {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            match self.served.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                })),
+                1 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{"function": {
+                            "name": "get_context_remaining", "arguments": {}
+                        }}]
+                    },
+                    "prompt_eval_count": 10, "eval_count": 1
+                })),
+                _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "done"}
+                })),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_chat_cw_400_recovery_retries_the_same_logical_round_with_tools() {
+        // #1528 (chat-path parity, Ollama loop): identical intent to the
+        // OpenAI-chat case. With max_tool_rounds == 1 the buggy
+        // `continue 'round_loop` consumed the only round and demoted the
+        // recovered request to the tools-disabled summary — 2 requests. The fix
+        // retries the SAME round in place (still WITH tools); only a completed
+        // round advances to the summary — 3 requests: [400, recovered tool
+        // round, summary].
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaOverflowThenToolThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "SAME ROUND: Ollama recovery must not burn the only tool round";
+        let messages = vec![
+            MemMessage::system("base policy"),
+            MemMessage::user("historical A"),
+            MemMessage::assistant("A done"),
+            MemMessage::user(task),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Ollama);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_cw_400_to_40k);
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect("recovery retries the round in place and the turn completes");
+        assert_eq!(reply, "done");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            reqs.len(),
+            3,
+            "expected [400, recovered tool round, summary]; a 2-request run means \
+             recovery burned the only round and demoted to the tools-disabled summary"
+        );
+        let body = |i: usize| -> serde_json::Value {
+            serde_json::from_slice(&reqs[i].body).unwrap_or_default()
+        };
+        assert!(
+            body(1)["tools"].is_array(),
+            "the RECOVERED request must still carry tools — a real tool round, not the summary"
+        );
+        assert!(
+            body(2)["tools"].is_null(),
+            "only the final summary (after the completed round) is tools-disabled"
         );
     }
 }
