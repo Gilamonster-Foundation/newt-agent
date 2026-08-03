@@ -182,9 +182,11 @@ async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBa
             authenticated = openai.resolve_api_key().is_some(),
             "worker: using configured OpenAI-compatible backend"
         );
-        return Ok(Arc::new(
-            newt_inference::local::LocalVllmBackend::from_config(openai),
-        ));
+        // API-aware transport: `api = "responses"` posts to /v1/responses, else
+        // Chat Completions. Without this the worker drove a Responses-only model
+        // (e.g. gpt-5.6-sol) over /v1/chat/completions. Both the flat and coder
+        // ACP paths consume this one backend, so both now obey the wire API.
+        return Ok(newt_inference::openai_inference_backend(openai));
     }
 
     let default_model =
