@@ -64,6 +64,7 @@ def _strip_rust(text: str) -> list[tuple[str, int]]:
     i, n, depth = 0, len(text), 0
     state = "code"
     raw_hashes = 0
+    block_depth = 0
     while i < n:
         c = text[i]
         nxt = text[i + 1] if i + 1 < n else ""
@@ -71,7 +72,7 @@ def _strip_rust(text: str) -> list[tuple[str, int]]:
             if c == "/" and nxt == "/":
                 state = "line"; i += 2; continue
             if c == "/" and nxt == "*":
-                state = "block"; i += 2; continue
+                state = "block"; block_depth = 1; i += 2; continue
             if c == '"':
                 state = "str"; i += 1; continue
             if c == "r" and nxt in ('"', "#"):
@@ -98,8 +99,15 @@ def _strip_rust(text: str) -> list[tuple[str, int]]:
                 state = "code"; out.append(("\n", depth))
             i += 1; continue
         if state == "block":
+            # Rust block comments NEST: /* /* */ */ — track depth, exit only at 0,
+            # else code after the first inner `*/` is lexed as live (phantom defs).
+            if c == "/" and nxt == "*":
+                block_depth += 1; i += 2; continue
             if c == "*" and nxt == "/":
-                state = "code"; i += 2; continue
+                block_depth -= 1; i += 2
+                if block_depth == 0:
+                    state = "code"
+                continue
             i += 1; continue
         if state == "str":
             if c == "\\":
@@ -205,7 +213,12 @@ def rust_test_defs(text: str) -> list[tuple[tuple[str, ...], str]]:
             body_depth = depths[m.end() - 1]  # depth just after the `{`
             modstack.append((m.group(1), body_depth))
         elif m.group(2) and _fn_is_test(s, m.start()):  # `fn NAME` with a test attr
-            defs.append((tuple(nm for nm, _ in modstack), m.group(2)))
+            # A #[test] fn is Cargo-runnable only at MODULE scope (rustc's
+            # `unnameable_test_items`): a #[test] nested inside another fn's body
+            # never runs, so it must not satisfy a rust_tests ref.
+            scope_depth = modstack[-1][1] if modstack else 0
+            if depth_here == scope_depth:
+                defs.append((tuple(nm for nm, _ in modstack), m.group(2)))
     return defs
 
 
@@ -261,16 +274,41 @@ _CFG_KEYWORDS = {
 }
 
 
+def strip_tla_comments(text: str) -> str:
+    """Blank TLA+/`.cfg` comments: NESTING `(* … *)` blocks + `\\*` line comments.
+    TLC's parser nests block comments, so a non-nesting regex leaves a commented-out
+    operator/INVARIANT visible — a false green where the linter certifies something
+    TLC never checks. Newlines are preserved so `(?m)^` anchors still hold."""
+    out: list[str] = []
+    i, n, block = 0, len(text), 0
+    while i < n:
+        two = text[i:i + 2]
+        if block == 0 and two == "\\*":            # line comment → end of line
+            j = text.find("\n", i)
+            if j == -1:
+                break
+            out.append("\n"); i = j + 1; continue
+        if two == "(*":
+            block += 1; i += 2; continue
+        if two == "*)" and block > 0:
+            block -= 1; i += 2; continue
+        if block == 0:
+            out.append(text[i])
+        elif text[i] == "\n":
+            out.append("\n")
+        i += 1
+    return "".join(out)
+
+
 def tla_operator_defined(tla_text: str, name: str) -> bool:
     """True if <name> is defined as an operator (`name == …` or `name(args) == …`)."""
-    text = re.sub(r"\(\*.*?\*\)", " ", tla_text, flags=re.S)  # (* block *) comments
-    text = re.sub(r"\\\*[^\n]*", "", text)                    # \* line comments
+    text = strip_tla_comments(tla_text)
     return re.search(rf"(?m)^\s*{re.escape(name)}\s*(?:\([^()]*\))?\s*==", text) is not None
 
 
 def cfg_declared_invariants(cfg_text: str) -> set[str]:
     """Operator names TLC is told to check as invariants (INVARIANT/INVARIANTS)."""
-    text = re.sub(r"\\\*[^\n]*", "", cfg_text)  # \* line comments
+    text = strip_tla_comments(cfg_text)
     out: set[str] = set()
     collecting = False
     for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text):

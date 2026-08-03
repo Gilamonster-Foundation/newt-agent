@@ -192,6 +192,34 @@ LIFETIME_RUST = (
 run_case("lifetimes are not char literals (symbol after a lifetime still resolves)",
          rust=LIFETIME_RUST, want_exit=0)
 
+# 16c. False-green (found by adversarial verify): a #[test] nested inside another
+#      fn's BODY is not Cargo-runnable (rustc `unnameable_test_items`) and must NOT
+#      satisfy a rust_tests ref, even though the fn + attribute both exist.
+NESTED_TEST_RUST = (
+    "mod m {\n"
+    "    pub fn outer() {\n"
+    "        #[test]\n"
+    "        fn foo() { assert!(true); }\n"
+    "        let _ = foo;\n"
+    "    }\n"
+    "}\n"
+    "pub fn prod() {}\n"
+)
+run_case("a #[test] nested in a fn body does not satisfy a rust_tests ref",
+         rust=NESTED_TEST_RUST, want_exit=1, want_msg="rust_tests r.rs::m::foo does not resolve")
+
+# 16d. False-green (found by adversarial verify): Rust block comments NEST
+#      (/* /* */ */). A #[test] fn and a production symbol commented out with an
+#      inner block comment must NOT resolve (Cargo compiles/runs neither).
+NESTED_COMMENT_RUST = (
+    "mod m {\n    #[test]\n    fn foo() {}\n}\n"
+    "/* disabled /* inner note */\n"
+    "pub fn prod() {}\n"
+    "*/\n"
+)
+run_case("symbols inside a nested block comment do not resolve",
+         rust=NESTED_COMMENT_RUST, want_exit=1, want_msg="production r.rs::prod does not resolve")
+
 # ── TLA reference validator (item 4: exact, pre-AgentTurn) ───────────────────
 # A contract that declares tla = "checked" and points at a real spec/invariant.
 TLA_MAP = """\
@@ -236,6 +264,20 @@ run_case("tla ref with no matching .cfg fails",
 run_case("tla ref whose invariant is not declared in the .cfg fails",
          mapping=TLA_MAP, tla={"Agent": (GOOD_TLA, "SPECIFICATION Spec\n")},
          want_exit=1, want_msg="not declared as an INVARIANT")
+
+# 22. False-green (found by adversarial verify): a BLOCK-commented INVARIANT line in
+#     the .cfg disables the TLC check but must not pass as declared. TLA+ comments
+#     nest, so a non-nesting strip would leak it.
+run_case("tla ref whose INVARIANT is block-commented in the .cfg fails",
+         mapping=TLA_MAP, tla={"Agent": (GOOD_TLA, "SPECIFICATION Spec\n(* INVARIANT Bounded *)\n")},
+         want_exit=1, want_msg="not declared as an INVARIANT")
+
+# 23. False-green: an operator sitting inside a NESTED (* (* *) … *) comment is not
+#     really defined (TLC: "not defined in the specification") and must fail.
+run_case("tla ref whose operator is inside a nested block comment fails",
+         mapping=TLA_MAP,
+         tla={"Agent": ("---- MODULE Agent ----\n(* h: (* x *) Bounded == TRUE *)\n====", GOOD_CFG)},
+         want_exit=1, want_msg="not defined as an operator")
 
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
