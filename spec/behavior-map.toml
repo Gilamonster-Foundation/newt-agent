@@ -1,0 +1,331 @@
+# Behavioral constitution — the BHV-* contract registry (epic #1529).
+#
+# Each load-bearing POLICY rule has a durable id, a PER-LAYER status, and
+# STRUCTURED references validated exactly by `spec/lint-behavior-map.py`:
+#
+#   [[BHV-X.refs.lean]]        module = "NewtPolicy.Backend"  symbol = "thm"
+#   [[BHV-X.refs.rust_tests]]  path = "crate/src/f.rs"        symbol = "mod::fn"
+#   [[BHV-X.refs.production]]  path = "crate/src/f.rs"        symbol = "def_name"
+#   [[BHV-X.refs.tla]]         spec = "AgentTurn"             invariant = "Inv"
+#
+# `rust_tests.symbol` is the IN-FILE module path + fn (`path` already pins the
+# crate module). The linter checks the intended namespace/module + name, not a
+# bare basename, and fails on zero, ambiguous (multi-match), duplicate, invalid
+# status, missing field, or an unmet `conformance = "full"`.
+#
+# Per-layer status (each validated against `refs`):
+#   lean  : none | spec (types + by-construction lemmas, lake-checked)
+#                | proven (a theorem with real content about a defined fn)
+#   rust  : none | tested
+#   tla   : none | planned | checked
+#   trace : none | planned | validated
+#   conformance : partial | full   (full ⇒ proven+tested+checked+validated)
+#
+# `pending_pr = <n>` marks a reference whose artifact lands on an unmerged PR
+# (this seed is stacked on the #1526 psyche PR). Only pending refs may WARN
+# instead of fail; everything else is fail-closed. Run the linter with
+# `--strict` on `main` once #1526 merges, then delete every `pending_pr` marker.
+
+schema = 3
+
+# ─────────────────────────────── Backend selection ───────────────────────────
+
+[BHV-BACKEND-001]
+description = "An explicitly selected backend is authoritative; adding or reordering unrelated backends cannot change it."
+[BHV-BACKEND-001.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-BACKEND-001.refs.lean]]
+module = "NewtPolicy.Backend"
+symbol = "adding_a_backend_preserves_selection"
+[[BHV-BACKEND-001.refs.lean]]
+module = "NewtPolicy.Backend"
+symbol = "adding_a_differently_named_backend_cannot_fabricate_a_selection"
+[[BHV-BACKEND-001.refs.lean]]
+module = "NewtPolicy.Backend"
+symbol = "selection_is_position_independent"
+[[BHV-BACKEND-001.refs.rust_tests]]
+path = "newt-core/src/config.rs"
+symbol = "select_backend_tests::default_backend_selects_ollama_over_configured_openai"
+pending_pr = 1526
+[[BHV-BACKEND-001.refs.rust_tests]]
+path = "newt-core/src/config.rs"
+symbol = "select_backend_tests::newt_provider_selects_openai_responses"
+pending_pr = 1526
+[[BHV-BACKEND-001.refs.rust_tests]]
+path = "newt-acp-worker/src/lib.rs"
+symbol = "backend_selection_tests::ollama_host_does_not_erase_an_explicitly_selected_openai_backend"
+pending_pr = 1526
+[[BHV-BACKEND-001.refs.production]]
+path = "newt-core/src/config.rs"
+symbol = "select_backend"
+pending_pr = 1526
+
+[BHV-BACKEND-002]
+description = "A configuration-resolution failure never triggers backend discovery — it propagates."
+[BHV-BACKEND-002.status]
+lean = "none"
+rust = "tested"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+[[BHV-BACKEND-002.refs.rust_tests]]
+path = "newt-acp-worker/src/lib.rs"
+symbol = "backend_selection_tests::resolver_errors_on_an_unknown_named_backend"
+pending_pr = 1526
+[[BHV-BACKEND-002.refs.production]]
+path = "newt-acp-worker/src/lib.rs"
+symbol = "resolve_backend"
+pending_pr = 1526
+
+# ─────────────────────────────── Responses decode ────────────────────────────
+
+[BHV-RESPONSE-001]
+description = "A top-level provider error dominates all apparent output (wins over any status/output)."
+[BHV-RESPONSE-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-RESPONSE-001.refs.rust_tests]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "tests::missing_status_with_top_level_error_fails"
+pending_pr = 1526
+[[BHV-RESPONSE-001.refs.rust_tests]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "tests::top_level_error_wins_over_a_completed_status"
+pending_pr = 1526
+[[BHV-RESPONSE-001.refs.production]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "decode_response"
+pending_pr = 1526
+
+[BHV-RESPONSE-002]
+description = "A refusal plus tool calls never causes a tool effect; a refusal is never silently dropped."
+[BHV-RESPONSE-002.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-RESPONSE-002.refs.rust_tests]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "tests::refusal_with_a_tool_call_is_mixed_and_rejected_never_executed"
+pending_pr = 1526
+[[BHV-RESPONSE-002.refs.rust_tests]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "tests::status_less_mixed_refusal_and_tool_call_is_still_rejected"
+pending_pr = 1526
+[[BHV-RESPONSE-002.refs.production]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "decode_response"
+pending_pr = 1526
+
+[BHV-RESPONSE-003]
+description = "Empty or ambiguous output is not a successful completion (fail-closed)."
+[BHV-RESPONSE-003.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-RESPONSE-003.refs.rust_tests]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "tests::empty_object_body_is_malformed"
+pending_pr = 1526
+[[BHV-RESPONSE-003.refs.rust_tests]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "tests::completed_but_empty_body_is_malformed_not_empty_success"
+pending_pr = 1526
+[[BHV-RESPONSE-003.refs.rust_tests]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "tests::unknown_output_item_with_no_usable_content_is_malformed"
+pending_pr = 1526
+[[BHV-RESPONSE-003.refs.production]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "decode_response"
+pending_pr = 1526
+
+# ─────────────────────────────── Tool batch ──────────────────────────────────
+
+[BHV-TOOLS-001]
+description = "The entire tool-call batch is validated before ANY call executes; the validated batch is a capability token the executor cannot bypass."
+# lean = "spec": the module DEFINES the ValidatedCall/ValidatedBatch capability
+# tokens and proves their invariants BY CONSTRUCTION. It does NOT yet define a
+# `validateBatch : RawBatch -> Except _ ValidatedBatch` nor prove SOUNDNESS, and
+# `args_object : True` is a placeholder. Promotion to "proven" lands with the
+# two-stage capability types (#1529): RawBatch -> CorrelatedBatch -> ValidatedBatch.
+[BHV-TOOLS-001.status]
+lean = "spec"
+rust = "tested"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+[[BHV-TOOLS-001.refs.lean]]
+module = "NewtPolicy.ToolBatch"
+symbol = "validated_call_id_nonempty"
+[[BHV-TOOLS-001.refs.lean]]
+module = "NewtPolicy.ToolBatch"
+symbol = "executable"
+[[BHV-TOOLS-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "tests::batch_valid_then_malformed_dispatches_zero"
+pending_pr = 1526
+[[BHV-TOOLS-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "tests::batch_all_valid_dispatches_every_call"
+pending_pr = 1526
+[[BHV-TOOLS-001.refs.production]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "validate_tool_call_batch"
+pending_pr = 1526
+
+[BHV-TOOLS-002]
+description = "Missing or duplicate correlation ids terminate the turn (no fabricated outputs, no follow-up); a validated batch has non-empty, pairwise-distinct ids."
+[BHV-TOOLS-002.status]
+lean = "spec"
+rust = "tested"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+[[BHV-TOOLS-002.refs.lean]]
+module = "NewtPolicy.ToolBatch"
+symbol = "validated_call_id_nonempty"
+[[BHV-TOOLS-002.refs.lean]]
+module = "NewtPolicy.ToolBatch"
+symbol = "validated_batch_ids_distinct"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "tests::batch_missing_id_is_correlation_impossible"
+pending_pr = 1526
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "tests::batch_duplicate_id_is_correlation_impossible"
+pending_pr = 1526
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_missing_call_id_aborts_without_a_followup_request"
+pending_pr = 1526
+[[BHV-TOOLS-002.refs.production]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "validate_tool_call_batch"
+pending_pr = 1526
+
+[BHV-TOOLS-003]
+description = "Every executed call produces at most one correlated output (exactly-once result routing)."
+[BHV-TOOLS-003.status]
+lean = "none"
+rust = "none"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+
+# ─────────────────────────────── Context budget ──────────────────────────────
+
+[BHV-CONTEXT-001]
+description = "Every dispatched request fits its effective input budget (ceiling minus output reserve), refusing pre-dispatch otherwise."
+[BHV-CONTEXT-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-CONTEXT-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_refuses_locally_when_a_configured_window_cannot_fit"
+pending_pr = 1526
+[[BHV-CONTEXT-001.refs.rust_tests]]
+path = "newt-core/src/agentic/generation_policy.rs"
+symbol = "tests::cognition_output_reserve_is_the_one_source_of_the_output_budget"
+pending_pr = 1526
+[[BHV-CONTEXT-001.refs.production]]
+path = "newt-core/src/agentic/send_budget.rs"
+symbol = "num_ctx_input_ceiling"
+pending_pr = 1526
+[[BHV-CONTEXT-001.refs.production]]
+path = "newt-core/src/agentic/generation_policy.rs"
+symbol = "cognition_output_reserve"
+pending_pr = 1526
+
+[BHV-CONTEXT-002]
+description = "A learned context ceiling never increases during a turn (monotone tightening)."
+[BHV-CONTEXT-002.status]
+lean = "none"
+rust = "none"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+
+# 003 was split: transport-level dispatch retries and mid-turn compaction/recovery
+# are DIFFERENT bounds with different state machines (and likely different TLA+
+# invariants). The single test below proves only the former; compaction bounding
+# is #1528 work, tracked separately as 003B so nothing claims coverage it lacks.
+
+[BHV-CONTEXT-003A]
+description = "Transport-level retries for a single dispatch are bounded (a fixed cap, not an unbounded retry loop)."
+[BHV-CONTEXT-003A.status]
+lean = "none"
+rust = "tested"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+[[BHV-CONTEXT-003A.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::dispatch_responses_json_retries_transient_transport_failures"
+pending_pr = 1526
+
+[BHV-CONTEXT-003B]
+description = "Compaction and context-window-recovery attempts within a turn are bounded (no unbounded compact/redispatch loop)."
+# Compaction/recovery for the Responses loop is #1528; no bounding test exists yet,
+# so rust = "none" (nothing claims tested coverage). Promote when #1528 lands the
+# bounded-redispatch machinery + its regression test.
+[BHV-CONTEXT-003B.status]
+lean = "none"
+rust = "none"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+
+# ─────────────────────────────── Replay / storage ────────────────────────────
+
+[BHV-REPLAY-001]
+description = "Reasoning-tail replay protection follows the endpoint's replay scope (scope=Never protects nothing)."
+[BHV-REPLAY-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-REPLAY-001.refs.rust_tests]]
+path = "newt-core/src/agentic/compress.rs"
+symbol = "tests::never_scope_protects_no_reasoning_tail"
+pending_pr = 1526
+[[BHV-REPLAY-001.refs.production]]
+path = "newt-core/src/agentic/compress.rs"
+symbol = "protected_reasoning_tail_len"
+pending_pr = 1526
+
+[BHV-STORAGE-001]
+description = "Remote (server-side) storage is an explicit policy, never inherited from the API default."
+[BHV-STORAGE-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-STORAGE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_request_sets_store_false"
+pending_pr = 1526
+[[BHV-STORAGE-001.refs.rust_tests]]
+path = "newt-inference/src/responses.rs"
+symbol = "tests::transport_sets_store_false_for_stateless_no_retention"
+pending_pr = 1526
+[[BHV-STORAGE-001.refs.production]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "STORE_RESPONSE_SERVER_SIDE"
+pending_pr = 1526

@@ -1,0 +1,61 @@
+name: behavior-formal (constitution)
+
+# The EXECUTED formal layers of the behavioral constitution (epic #1529): the Lean
+# proofs (`lake build`) and the fail-closed, checksum-pinned TLC harness. These are
+# the expensive checks (Lean toolchain + JDK), so — unlike the registry linter —
+# they run only when the specs or proofs themselves change (spec/ or formal/), not
+# on every Rust edit. Complements `formal.yml` (Lean-only) by also TLC-checking the
+# pinned harness on a CLEAN cache, proving the download+verify path end-to-end.
+
+on:
+  push:
+    paths: ['spec/**', 'formal/**', '.github/workflows/behavior-formal.yml']
+  pull_request:
+    paths: ['spec/**', 'formal/**', '.github/workflows/behavior-formal.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  behavior-formal:
+    name: Lean proofs + TLC harness
+    runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          set -euo pipefail
+          curl -sSfL https://elan.lean-lang.org/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Set up JDK 17 (for TLC)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Lean — lake build (every NewtPolicy theorem is machine-checked)
+        working-directory: formal
+        run: |
+          set -euo pipefail
+          lake build
+          echo "::notice title=Lean::formal/ lake build succeeded — all theorems checked"
+
+      - name: TLC — fail-closed runner tests + checked specs on a CLEAN cache
+        env:
+          # Force the download+verify path: unset any override, fresh empty cache,
+          # and (on a runner) no ~/opt install — so the pinned jar MUST be fetched
+          # and checksum-verified. This is the clean-cache verified-download proof.
+          TLA2TOOLS_JAR: ''
+          XDG_CACHE_HOME: ${{ runner.temp }}/tla-cache
+        run: |
+          set -euo pipefail
+          rm -rf "$XDG_CACHE_HOME"
+          bash spec/tla/test-check.sh
+          out="$(bash spec/tla/check.sh 2>&1)"; printf '%s\n' "$out"
+          count="$(printf '%s\n' "$out" | sed -n 's/^tla-checked-count=//p')"
+          specs="$(cd spec/tla && ls -1 *.cfg 2>/dev/null | sed 's/\.cfg$//' | tr '\n' ' ')"
+          test -n "$count" && [ "$count" -ge 1 ] || { echo "no specs checked"; exit 1; }
+          echo "::notice title=TLC::tla2tools 1.7.4 fetched+verified on a clean cache; checked ${count} spec(s): ${specs}"
