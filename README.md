@@ -7,9 +7,8 @@
 > Free, friendly, local agentic coder.
 > **vi to Hermes-Agent's emacs.**
 
-A single Rust binary with a sharp, minimal tool set. It runs against your
-local hardware by default — no cloud bytes leave your machine unless you
-deliberately install a provider plugin. Opinionated, not extensible.
+An agentic coder written in Rust. The scoreboard below is the claim — measured
+on Terminal-Bench, confined and unconfined.
 
 ## Terminal-Bench
 
