@@ -25,5 +25,7 @@
 //! [`PromptWindow`]: crate::tty::PromptWindow
 
 pub mod notice;
+pub mod question;
 
 pub use notice::{Level, Notice};
+pub use question::{Action, Question};

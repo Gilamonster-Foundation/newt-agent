@@ -253,25 +253,36 @@ async fn decide_route(
     let Some(attach) = reg.attach_of(id) else {
         return StatusCode::NOT_FOUND;
     };
-    let verdict = match form.verdict.as_str() {
-        "allow_once" => newt_core::Verdict::AllowOnce,
-        "allow_session" => newt_core::Verdict::AllowSession,
-        _ => newt_core::Verdict::Deny,
-    };
     let (state, _) = store_paths();
     let conv = attach.conv_id.clone();
     let request_id = form.request_id;
-    let ok = tokio::task::spawn_blocking(move || {
-        newt_core::ConversationStore::new(&state, &attach.workspace, 1000)
-            .and_then(|s| s.answer_permission_request(&conv, &request_id, verdict))
-            .is_ok()
+    let submitted = form.verdict;
+    let result = tokio::task::spawn_blocking(move || {
+        let store =
+            newt_core::ConversationStore::new(&state, &attach.workspace, 1000).map_err(|_| ())?;
+        let pending = store.pending_permission_request(&conv).map_err(|_| ())?;
+        let Some(pending) = pending.filter(|p| p.request_id == request_id) else {
+            return Ok(false);
+        };
+        let question = pending.question().map_err(|_| ())?;
+        let Some(action) = question.parse(&submitted) else {
+            return Ok(false);
+        };
+        store
+            .answer_permission_action(&conv, &request_id, action)
+            .map(|outcome| {
+                !matches!(
+                    outcome,
+                    newt_core::AnswerOutcome::InvalidAction | newt_core::AnswerOutcome::Unknown
+                )
+            })
+            .map_err(|_| ())
     })
-    .await
-    .unwrap_or(false);
-    if ok {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+    .await;
+    match result {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT,
+        Ok(Ok(false)) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -957,16 +968,17 @@ mod tests {
             "no card before a request: {empty:?}"
         );
 
-        // The running gate publishes a HIGH-danger request.
-        let req_json = serde_json::to_string(&newt_core::PermissionRequest {
-            tool: "run_command".into(),
-            kind: newt_core::DenialKind::Exec,
-            target: "bash".into(),
-            reason: "needs a shell".into(),
-        })
-        .unwrap();
+        // The running gate publishes the exact HIGH-danger form to render.
+        let question = newt_core::Question {
+            markdown: "⊘ run_command wants to run `bash` — needs a shell.".into(),
+            actions: vec![
+                newt_core::Action::new(newt_core::PermissionAction::AllowOnce, "a", "allow once"),
+                newt_core::Action::new(newt_core::PermissionAction::Deny, "d", "deny"),
+            ],
+            note: Some("High danger: session authorization is unavailable.".into()),
+        };
         let rid = store
-            .publish_permission_request(&conv, &req_json, "\"high\"")
+            .publish_permission_question(&conv, &question, "\"high\"")
             .unwrap();
 
         // The card renders — allow-once + deny, but NOT allow-session (high).
@@ -981,6 +993,16 @@ mod tests {
         assert!(
             !card.contains("allow_session"),
             "high-danger must NOT offer a standing session grant: {card}"
+        );
+
+        // The action list is enforcement, not decoration: an HTMX request may
+        // not submit a high-danger session grant the rendered form omitted.
+        let forged = format!("request_id={rid}&verdict=allow_session");
+        let (status, _) = req(&app, "POST", "/agents/1/decision", Some(&forged)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            store.pending_permission_request(&conv).unwrap().is_some(),
+            "an action absent from the form must leave the decision pending"
         );
 
         // Answer allow-once → 204, and the gate's poll takes exactly that.
