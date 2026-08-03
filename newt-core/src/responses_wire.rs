@@ -29,6 +29,20 @@
 
 use serde_json::Value;
 
+/// Whether a Responses request opts into OpenAI **server-side storage**
+/// (`store: true`) of the response payload.
+///
+/// Newt's policy is `false` — **stateless** (#1526, invariant #5; the
+/// sovereign-data doctrine). The harness replays the full turn history on every
+/// request and never uses `previous_response_id`, so server-side retention buys
+/// nothing — it would only leave an implicit, unaudited copy of the operator's
+/// prompts, source, and reasoning on the provider. The Responses API defaults
+/// `store` to **`true`**, so this MUST be set on every request; relying on the
+/// default silently retains data. Both Responses request builders (the agentic
+/// loop and the inference transport) send this one value, so the policy is
+/// explicit and identical on every surface.
+pub const STORE_RESPONSE_SERVER_SIDE: bool = false;
+
 /// Split chat-style messages into the Responses API's `(instructions, input)`:
 /// `system`/`developer` messages concatenate into top-level `instructions`;
 /// `user`/`assistant` become `input` message items with plain string content.

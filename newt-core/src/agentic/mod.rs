@@ -6404,7 +6404,18 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 
     let reasoning = responses_reasoning_field(cognition);
     let build_body = |input: &[serde_json::Value], with_tools: bool| {
-        let mut body = serde_json::json!({ "model": model, "input": input, "stream": false });
+        // `store` is set EXPLICITLY (#1526, invariant #5): the Responses API
+        // defaults it to `true` (server-side retention). Newt is stateless — it
+        // replays the full history here and never uses `previous_response_id` —
+        // so retention buys nothing and would leave an unaudited copy of the
+        // operator's prompts/source/reasoning on the provider. Policy lives in
+        // one place (`responses_wire::STORE_RESPONSE_SERVER_SIDE`).
+        let mut body = serde_json::json!({
+            "model": model,
+            "input": input,
+            "stream": false,
+            "store": crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+        });
         if let Some(ins) = &instructions {
             body["instructions"] = serde_json::json!(ins);
         }
@@ -9163,6 +9174,13 @@ mod tool_round_cap_tests {
         assert!(
             body.get("reasoning").is_none(),
             "no cognition set → no reasoning.effort on the wire (request unchanged)"
+        );
+        // #1526 (invariant #5): storage is an EXPLICIT policy — the body opts out
+        // of server-side retention rather than inheriting the API's `store: true`.
+        assert_eq!(
+            body.get("store"),
+            Some(&serde_json::Value::Bool(false)),
+            "Responses must explicitly set store:false (stateless, no retention)"
         );
     }
 

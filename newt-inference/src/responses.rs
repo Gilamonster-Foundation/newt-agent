@@ -70,10 +70,15 @@ impl ResponsesBackend {
             .map(|m| serde_json::json!({ "role": &m.role, "content": &m.content }))
             .collect();
         let (instructions, input) = newt_core::responses_wire::build_responses_input(&msgs);
+        // `store` is set EXPLICITLY (#1526, invariant #5): the Responses API
+        // defaults to server-side retention (`store: true`). This seam sends the
+        // whole turn each call and never uses `previous_response_id`, so it opts
+        // out of retention — one shared policy across both Responses surfaces.
         let mut body = serde_json::json!({
             "model": self.model,
             "input": input,
             "stream": false,
+            "store": newt_core::responses_wire::STORE_RESPONSE_SERVER_SIDE,
         });
         if let Some(instructions) = instructions {
             body["instructions"] = serde_json::json!(instructions);
@@ -236,6 +241,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn transport_sets_store_false_for_stateless_no_retention() {
+        // #1526 (invariant #5): the ACP-worker Responses transport opts out of
+        // server-side retention explicitly, not by inheriting the API default.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let backend =
+            ResponsesBackend::from_config(&backend_cfg(&server.uri(), OpenAiApi::Responses));
+        backend
+            .complete(ChatRequest::new().user("hi"))
+            .await
+            .expect("completion");
+
+        let requests = server.received_requests().await.expect("journal");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body.get("store"),
+            Some(&serde_json::Value::Bool(false)),
+            "store:false must be explicit on the wire"
+        );
     }
 
     #[tokio::test]
