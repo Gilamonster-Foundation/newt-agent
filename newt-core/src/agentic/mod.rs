@@ -6155,55 +6155,6 @@ fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
 /// required 'reasoning' item") if the call is sent back without it. Preserving
 /// original order keeps each reasoning item adjacent to its call. Falls back to a
 /// flattened top-level `output_text` if the structured walk found no text.
-fn parse_responses_output(
-    json: &serde_json::Value,
-) -> (String, Vec<serde_json::Value>, Vec<serde_json::Value>) {
-    let mut text = String::new();
-    let mut calls = Vec::new();
-    let mut echo = Vec::new();
-    if let Some(items) = json["output"].as_array() {
-        for item in items {
-            match item["type"].as_str() {
-                Some("message") => {
-                    if let Some(parts) = item["content"].as_array() {
-                        for p in parts {
-                            if let Some(t) = p["text"].as_str() {
-                                text.push_str(t);
-                            }
-                        }
-                    }
-                }
-                Some("function_call") => {
-                    calls.push(item.clone());
-                    echo.push(item.clone());
-                }
-                // Reasoning items (`rs_…`) carry the chain that produced the
-                // following function_call; the Responses API requires them echoed
-                // back alongside the call, so preserve them in output order.
-                Some("reasoning") => echo.push(item.clone()),
-                _ => {}
-            }
-        }
-    }
-    if text.is_empty() {
-        if let Some(t) = json["output_text"].as_str() {
-            text.push_str(t);
-        }
-    }
-    (text, calls, echo)
-}
-
-/// Responses API usage → `TokenUsage` (`input_tokens`/`output_tokens`, distinct
-/// from chat/completions' `prompt_tokens`/`completion_tokens`).
-fn responses_usage(v: &serde_json::Value) -> Option<crate::TokenUsage> {
-    let input = v["input_tokens"].as_u64().map(|n| n as u32);
-    let output = v["output_tokens"].as_u64().map(|n| n as u32);
-    input.zip(output).map(|(i, o)| crate::TokenUsage {
-        input_tokens: i,
-        output_tokens: o,
-    })
-}
-
 /// The OpenAI **Responses API** agentic loop (`POST {endpoint}/v1/responses`).
 /// Parallel to [`openai_chat_complete`] but over the Responses shapes, for
 /// models served only there (`gpt-5-codex`). Non-streaming; selected via
@@ -6509,9 +6460,31 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             }
         };
 
-        let round_usage = responses_usage(&json["usage"]);
-        accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
-        let (text, calls, echo) = parse_responses_output(&json);
+        let decoded = crate::responses_decode::decode_response(&json);
+        accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
+
+        // Invariant: an HTTP 2xx body is NOT a completed turn. A `failed` status
+        // is a hard error — never let it fall through to the benign "empty
+        // response" path where a failure reads as success.
+        if let crate::responses_decode::Completion::Failed { message } = &decoded.completion {
+            return Err(anyhow::anyhow!("Responses turn failed: {message}"));
+        }
+        // `incomplete` / non-terminal statuses (e.g. hitting max_output_tokens)
+        // are truncations, not clean completions. Capture the reason so a
+        // truncated dead-end turn is surfaced rather than reported as benign
+        // empty output. (Budget-driven recovery on truncation is W5; here we only
+        // refuse to mistake truncation for success.)
+        let truncation: Option<String> = match &decoded.completion {
+            crate::responses_decode::Completion::Incomplete { reason } => {
+                Some(reason.clone().unwrap_or_else(|| "incomplete".to_string()))
+            }
+            crate::responses_decode::Completion::Other { status } => {
+                Some(format!("status={status}"))
+            }
+            crate::responses_decode::Completion::Completed
+            | crate::responses_decode::Completion::Failed { .. } => None,
+        };
+        let (text, calls, echo) = (decoded.text, decoded.tool_calls, decoded.echo);
 
         if debug {
             let excerpt: String = text.chars().take(80).collect();
@@ -6525,6 +6498,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
 
         if calls.is_empty() {
+            // A truncated turn with no tool calls is NOT a completion — surface it
+            // rather than falling through to the benign "empty response" hint. A
+            // truncated turn WITH tool calls proceeds (the Responses API only
+            // emits complete function_call items; the next round gets fresh budget).
+            if let Some(reason) = &truncation {
+                let excerpt: String = text.chars().take(200).collect();
+                return Err(anyhow::anyhow!(
+                    "Responses turn did not complete ({reason}) and produced no tool calls; partial text: {excerpt:?}"
+                ));
+            }
             let out = if text.is_empty() {
                 "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
             } else {
@@ -6721,9 +6704,28 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         .into());
     }
     let json: serde_json::Value = resp.json().await?;
-    accumulated_usage = merge_round_usage(accumulated_usage, responses_usage(&json["usage"]));
-    let (text, _, _) = parse_responses_output(&json);
-    Ok((text, false, accumulated_usage, hallucination_count))
+    let decoded = crate::responses_decode::decode_response(&json);
+    accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
+    // 2xx ≠ completed: this text-only follow-up must not return a failed or
+    // truncated turn's (possibly empty) text as a successful reply.
+    match &decoded.completion {
+        crate::responses_decode::Completion::Completed => {}
+        crate::responses_decode::Completion::Failed { message } => {
+            return Err(anyhow::anyhow!("Responses turn failed: {message}"));
+        }
+        crate::responses_decode::Completion::Incomplete { reason } => {
+            return Err(anyhow::anyhow!(
+                "Responses turn did not complete ({})",
+                reason.as_deref().unwrap_or("incomplete")
+            ));
+        }
+        crate::responses_decode::Completion::Other { status } => {
+            return Err(anyhow::anyhow!(
+                "Responses turn returned non-terminal status {status:?}"
+            ));
+        }
+    }
+    Ok((decoded.text, false, accumulated_usage, hallucination_count))
 }
 
 /// Whether the reasoning spinner is enabled: `NEWT_THINKING` (set by
@@ -8802,8 +8804,13 @@ mod tool_round_cap_tests {
     }
 
     #[test]
-    fn parse_responses_output_extracts_text_calls_and_usage() {
+    fn responses_loop_consumes_the_shared_decoder_for_text_calls_and_usage() {
+        // The agentic loop now shares ONE decoder with the inference transport
+        // (`crate::responses_decode`). This grounds that the loop's consumption
+        // path gets text, calls, echo (reasoning + function_call in order), and
+        // usage from that single decoder — no second hand-rolled parser.
         let json = serde_json::json!({
+            "status": "completed",
             "output": [
                 {"type": "reasoning", "summary": "…"},
                 {"type": "message", "role": "assistant",
@@ -8813,18 +8820,19 @@ mod tool_round_cap_tests {
             ],
             "usage": {"input_tokens": 100, "output_tokens": 20}
         });
-        let (text, calls, echo) = parse_responses_output(&json);
-        assert_eq!(text, "the answer");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["call_id"], "call_1");
+        let d = crate::responses_decode::decode_response(&json);
+        assert!(d.completion.is_completed());
+        assert_eq!(d.text, "the answer");
+        assert_eq!(d.tool_calls.len(), 1);
+        assert_eq!(d.tool_calls[0]["call_id"], "call_1");
         // The echo re-sends the reasoning item AND the function_call in output
         // order, so a reasoning model (gpt-5.6-sol) does not 400 on the follow-up
         // turn for a function_call missing its required reasoning item.
-        assert_eq!(echo.len(), 2, "reasoning + function_call are echoed");
-        assert_eq!(echo[0]["type"], "reasoning");
-        assert_eq!(echo[1]["type"], "function_call");
-        assert_eq!(echo[1]["call_id"], "call_1");
-        let usage = responses_usage(&json["usage"]).unwrap();
+        assert_eq!(d.echo.len(), 2, "reasoning + function_call are echoed");
+        assert_eq!(d.echo[0]["type"], "reasoning");
+        assert_eq!(d.echo[1]["type"], "function_call");
+        assert_eq!(d.echo[1]["call_id"], "call_1");
+        let usage = d.usage.unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 20);
     }

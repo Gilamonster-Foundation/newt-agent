@@ -101,58 +101,37 @@ impl ResponsesBackend {
         }
 
         let json: serde_json::Value = resp.json().await?;
-        let content = extract_output_text(&json);
-        let model_id = json["model"]
-            .as_str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.model.clone());
-        // Responses usage is `input_tokens`/`output_tokens`; accept the Chat
-        // Completions names too for lenient servers.
-        let usage = {
-            let input = json["usage"]["input_tokens"]
-                .as_u64()
-                .or_else(|| json["usage"]["prompt_tokens"].as_u64())
-                .map(|n| n as u32);
-            let output = json["usage"]["output_tokens"]
-                .as_u64()
-                .or_else(|| json["usage"]["completion_tokens"].as_u64())
-                .map(|n| n as u32);
-            input.zip(output).map(|(i, o)| newt_core::TokenUsage {
-                input_tokens: i,
-                output_tokens: o,
-            })
-        };
-
-        Ok(ChatReply {
-            content,
-            model_id,
-            usage,
-        })
-    }
-}
-
-/// Concatenate the `output_text` parts of a Responses reply's `output[]`,
-/// falling back to a flat top-level `output_text` string. Mirrors the agentic
-/// loop's extraction (`newt-core::agentic`).
-fn extract_output_text(json: &serde_json::Value) -> String {
-    if let Some(items) = json["output"].as_array() {
-        let mut out = String::new();
-        for item in items {
-            if let Some(parts) = item["content"].as_array() {
-                for part in parts {
-                    if part["type"] == "output_text" {
-                        if let Some(t) = part["text"].as_str() {
-                            out.push_str(t);
-                        }
-                    }
-                }
+        // ONE typed decoder, shared with the agentic loop (`newt_core`). It also
+        // enforces the invariant that an HTTP 2xx body is NOT a completed turn:
+        // an `incomplete` (max_output_tokens) or `failed` status decodes to a
+        // non-`Completed` verdict, which this simple ChatReply seam surfaces as
+        // an error rather than returning a truncated/empty reply as success.
+        let decoded = newt_core::responses_decode::decode_response(&json);
+        use newt_core::responses_decode::Completion;
+        match &decoded.completion {
+            Completion::Completed => {}
+            Completion::Incomplete { reason } => anyhow::bail!(
+                "Responses turn did not complete ({}) — raise max_output_tokens or shorten the input",
+                reason.as_deref().unwrap_or("incomplete")
+            ),
+            Completion::Failed { message } => {
+                anyhow::bail!("Responses turn failed: {message}")
+            }
+            Completion::Other { status } => {
+                // Avoid the literal "returned " token so the retry classifier
+                // (which parses "<backend> returned <code>") never misreads this
+                // turn-status error as an HTTP status code.
+                anyhow::bail!("Responses turn ended with non-terminal status {status:?}")
             }
         }
-        if !out.is_empty() {
-            return out;
-        }
+        let model_id = decoded.model.unwrap_or_else(|| self.model.clone());
+
+        Ok(ChatReply {
+            content: decoded.text,
+            model_id,
+            usage: decoded.usage,
+        })
     }
-    json["output_text"].as_str().unwrap_or("").to_string()
 }
 
 #[async_trait]
@@ -262,6 +241,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn incomplete_status_on_a_200_is_an_error_not_a_silent_reply() {
+        // Invariant: HTTP 2xx ≠ a completed turn. A 200 body whose status is
+        // `incomplete` (the model hit max_output_tokens) must surface as an
+        // error, NOT return the partial text as a successful ChatReply.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "partial…"}]
+                }]
+            })))
+            .expect(1) // Fatal (non-retryable) → exactly one attempt.
+            .mount(&server)
+            .await;
+
+        let backend =
+            ResponsesBackend::from_config(&backend_cfg(&server.uri(), OpenAiApi::Responses));
+        let err = backend
+            .complete(ChatRequest::new().user("hi"))
+            .await
+            .expect_err("incomplete 200 must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("did not complete"), "got: {msg}");
+        assert!(msg.contains("max_output_tokens"), "names the reason: {msg}");
+    }
+
+    #[tokio::test]
+    async fn failed_status_on_a_200_is_an_error_not_a_silent_reply() {
+        // A 200 body whose status is `failed` carries a turn-level error; it must
+        // surface, never be swallowed into an empty-but-successful reply.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "failed",
+                "error": {"message": "model overloaded mid-turn"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend =
+            ResponsesBackend::from_config(&backend_cfg(&server.uri(), OpenAiApi::Responses));
+        let err = backend
+            .complete(ChatRequest::new().user("hi"))
+            .await
+            .expect_err("failed 200 must be an error");
+        assert!(
+            err.to_string().contains("model overloaded mid-turn"),
+            "surfaces the server's failure message: {err}"
+        );
     }
 
     #[test]
