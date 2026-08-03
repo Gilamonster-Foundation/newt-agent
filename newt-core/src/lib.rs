@@ -56,7 +56,7 @@ pub mod prune;
 /// psyche dials ([`cognition`] + [`tenacity`], + crew at the caller) at once.
 pub mod psyche;
 pub mod reasoning;
-pub mod responses_decode;
+pub mod responses_wire;
 pub mod retry;
 /// #1030 node evaluators: Task/Plan done-ness from objective git state.
 pub mod roadmap_eval;

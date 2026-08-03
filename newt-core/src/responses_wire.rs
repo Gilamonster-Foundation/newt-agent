@@ -1,24 +1,63 @@
-//! One typed decoder for the OpenAI **Responses API** payload (`POST
-//! /v1/responses` result), shared by the newt-inference transport (the
-//! [`InferenceBackend`](../../newt_inference/backend/trait.InferenceBackend.html)
-//! `ChatReply` seam) and the newt-core agentic loop.
+//! The one owner of the OpenAI **Responses API** wire contract (`POST
+//! /v1/responses`), in **both** directions, shared by the newt-inference
+//! transport (the [`InferenceBackend`](../../newt_inference/backend/trait.InferenceBackend.html)
+//! `ChatReply` seam) and the newt-core agentic loop:
 //!
-//! Before this module there were two hand-rolled `json["output"]` walkers — one
-//! in `newt-inference/src/responses.rs`, one in `newt-core/src/agentic/mod.rs` —
-//! that had drifted (the inference one gated on `part.type == "output_text"`;
-//! the agentic one pulled `part.text` from any part and *also* extracted
-//! `function_call` / `reasoning` items). Two decoders for one wire shape is the
-//! sprawl this workspace treats as a bug class, so this is the single owner.
+//! - **encode** — [`build_responses_input`] splits chat-style messages into the
+//!   `(instructions, input)` the request body carries.
+//! - **decode** — [`decode_response`] parses the reply payload into a typed
+//!   [`DecodedResponse`].
+//!
+//! Before this module there were TWO hand-rolled copies of *each* direction —
+//! one pair in `newt-inference/src/responses.rs`, one in
+//! `newt-core/src/agentic/mod.rs` — that had drifted (the inference decoder
+//! gated on `part.type == "output_text"`; the agentic one pulled `part.text`
+//! from any part and also extracted `function_call` / `reasoning`; the two
+//! request builders joined `instructions` with different separators). Two
+//! implementations of one wire shape is the sprawl this workspace treats as a
+//! bug class, so this is the single owner. (Backend-neutral *policy* — tools,
+//! reasoning effort, budgeting — stays in the agentic loop; only the wire
+//! shaping lives here.)
 //!
 //! ## Invariant: HTTP `2xx` is NOT a completed response
 //!
 //! A `200 OK` transport status says only "the request was accepted". Whether the
-//! *turn* finished lives in the body's `status` field. This decoder surfaces
-//! that as a [`Completion`] so no consumer can mistake an `incomplete` (the
-//! model hit `max_output_tokens`) or `failed` body for success — the defect that
-//! let a truncated/failed turn read as an empty-but-fine reply.
+//! *turn* finished lives in the body's `status` field. [`decode_response`]
+//! surfaces that as a [`Completion`] so no consumer can mistake an `incomplete`
+//! (the model hit `max_output_tokens`) or `failed` body for success — the defect
+//! that let a truncated/failed turn read as an empty-but-fine reply.
 
 use serde_json::Value;
+
+/// Split chat-style messages into the Responses API's `(instructions, input)`:
+/// `system`/`developer` messages concatenate into top-level `instructions`;
+/// `user`/`assistant` become `input` message items with plain string content.
+/// Any item already shaped as a Responses item (carrying a `type` field, e.g.
+/// `function_call` / `function_call_output` / `reasoning`) passes through
+/// untouched, preserving output order — the reasoning-echo contract the agentic
+/// loop relies on.
+///
+/// This is the single request-shaper both the agentic loop and the inference
+/// transport call, so the two can never drift on the instructions/input split.
+#[must_use]
+pub fn build_responses_input(messages: &[Value]) -> (Option<String>, Vec<Value>) {
+    let mut instructions: Vec<String> = Vec::new();
+    let mut input: Vec<Value> = Vec::new();
+    for m in messages {
+        if m.get("type").is_some() {
+            input.push(m.clone());
+            continue;
+        }
+        let role = m["role"].as_str().unwrap_or("user");
+        let content = m["content"].as_str().unwrap_or("");
+        match role {
+            "system" | "developer" => instructions.push(content.to_string()),
+            _ => input.push(serde_json::json!({ "role": role, "content": content })),
+        }
+    }
+    let ins = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
+    (ins, input)
+}
 
 /// Whether a Responses turn actually completed. Only [`Completed`](Self::Completed)
 /// is a success; every other variant is a `2xx` body that did **not** finish and
@@ -178,6 +217,45 @@ fn decode_usage(usage: &Value) -> Option<crate::TokenUsage> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn build_input_splits_system_to_instructions_and_passes_typed_items() {
+        let msgs = vec![
+            json!({"role": "system", "content": "be terse"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+            // an already-typed Responses item passes through untouched, in order
+            json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+        ];
+        let (instructions, input) = build_responses_input(&msgs);
+        assert_eq!(instructions.as_deref(), Some("be terse"));
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "hi");
+        assert_eq!(input[2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn build_input_joins_multiple_system_messages_and_treats_developer_as_system() {
+        let msgs = vec![
+            json!({"role": "system", "content": "one"}),
+            json!({"role": "developer", "content": "two"}),
+            json!({"role": "user", "content": "go"}),
+        ];
+        let (instructions, input) = build_responses_input(&msgs);
+        // system + developer concatenate into instructions, joined with a blank line.
+        assert_eq!(instructions.as_deref(), Some("one\n\ntwo"));
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn build_input_has_no_instructions_when_no_system_message() {
+        let (instructions, input) =
+            build_responses_input(&[json!({"role": "user", "content": "x"})]);
+        assert_eq!(instructions, None);
+        assert_eq!(input.len(), 1);
+    }
 
     #[test]
     fn completed_message_extracts_text_and_usage() {

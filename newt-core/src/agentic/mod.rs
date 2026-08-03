@@ -6092,32 +6092,6 @@ fn responses_reasoning_field(
     cognition.map(|c| serde_json::json!({ "effort": c.reasoning_effort() }))
 }
 
-/// Split chat-style messages into the Responses API's `(instructions, input)`:
-/// `system`/`developer` messages concatenate into top-level `instructions`;
-/// `user`/`assistant` become `input` message items (plain string content). Any
-/// item already shaped as a Responses item (carrying a `type` field, e.g.
-/// `function_call` / `function_call_output`) passes through untouched.
-fn build_responses_input(
-    messages: &[serde_json::Value],
-) -> (Option<String>, Vec<serde_json::Value>) {
-    let mut instructions: Vec<String> = Vec::new();
-    let mut input: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
-        if m.get("type").is_some() {
-            input.push(m.clone());
-            continue;
-        }
-        let role = m["role"].as_str().unwrap_or("user");
-        let content = m["content"].as_str().unwrap_or("");
-        match role {
-            "system" | "developer" => instructions.push(content.to_string()),
-            _ => input.push(serde_json::json!({ "role": role, "content": content })),
-        }
-    }
-    let ins = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
-    (ins, input)
-}
-
 /// Translate the chat/completions tool array (`{type:function,
 /// function:{name,…}}` elements, as returned by `merged_tool_definitions`) to
 /// the Responses API's flatter `{type:function, name, description, parameters}`.
@@ -6317,7 +6291,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     } else {
         prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
     }
-    let (instructions, mut input) = build_responses_input(&msgs_json);
+    let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
         mcp,
         advertise_save_note,
@@ -6460,13 +6434,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             }
         };
 
-        let decoded = crate::responses_decode::decode_response(&json);
+        let decoded = crate::responses_wire::decode_response(&json);
         accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
 
         // Invariant: an HTTP 2xx body is NOT a completed turn. A `failed` status
         // is a hard error — never let it fall through to the benign "empty
         // response" path where a failure reads as success.
-        if let crate::responses_decode::Completion::Failed { message } = &decoded.completion {
+        if let crate::responses_wire::Completion::Failed { message } = &decoded.completion {
             return Err(anyhow::anyhow!("Responses turn failed: {message}"));
         }
         // `incomplete` / non-terminal statuses (e.g. hitting max_output_tokens)
@@ -6475,14 +6449,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // empty output. (Budget-driven recovery on truncation is W5; here we only
         // refuse to mistake truncation for success.)
         let truncation: Option<String> = match &decoded.completion {
-            crate::responses_decode::Completion::Incomplete { reason } => {
+            crate::responses_wire::Completion::Incomplete { reason } => {
                 Some(reason.clone().unwrap_or_else(|| "incomplete".to_string()))
             }
-            crate::responses_decode::Completion::Other { status } => {
-                Some(format!("status={status}"))
-            }
-            crate::responses_decode::Completion::Completed
-            | crate::responses_decode::Completion::Failed { .. } => None,
+            crate::responses_wire::Completion::Other { status } => Some(format!("status={status}")),
+            crate::responses_wire::Completion::Completed
+            | crate::responses_wire::Completion::Failed { .. } => None,
         };
         let (text, calls, echo) = (decoded.text, decoded.tool_calls, decoded.echo);
 
@@ -6704,22 +6676,22 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         .into());
     }
     let json: serde_json::Value = resp.json().await?;
-    let decoded = crate::responses_decode::decode_response(&json);
+    let decoded = crate::responses_wire::decode_response(&json);
     accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
     // 2xx ≠ completed: this text-only follow-up must not return a failed or
     // truncated turn's (possibly empty) text as a successful reply.
     match &decoded.completion {
-        crate::responses_decode::Completion::Completed => {}
-        crate::responses_decode::Completion::Failed { message } => {
+        crate::responses_wire::Completion::Completed => {}
+        crate::responses_wire::Completion::Failed { message } => {
             return Err(anyhow::anyhow!("Responses turn failed: {message}"));
         }
-        crate::responses_decode::Completion::Incomplete { reason } => {
+        crate::responses_wire::Completion::Incomplete { reason } => {
             return Err(anyhow::anyhow!(
                 "Responses turn did not complete ({})",
                 reason.as_deref().unwrap_or("incomplete")
             ));
         }
-        crate::responses_decode::Completion::Other { status } => {
+        crate::responses_wire::Completion::Other { status } => {
             return Err(anyhow::anyhow!(
                 "Responses turn returned non-terminal status {status:?}"
             ));
@@ -8722,23 +8694,6 @@ mod tool_round_cap_tests {
     }
 
     #[test]
-    fn responses_input_splits_system_to_instructions_and_passes_typed_items() {
-        let msgs = vec![
-            serde_json::json!({"role": "system", "content": "be terse"}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({"role": "assistant", "content": "hello"}),
-            // an already-typed Responses item passes through untouched
-            serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
-        ];
-        let (instructions, input) = build_responses_input(&msgs);
-        assert_eq!(instructions.as_deref(), Some("be terse"));
-        assert_eq!(input.len(), 3);
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "hi");
-        assert_eq!(input[2]["type"], "function_call_output");
-    }
-
-    #[test]
     fn responses_keeps_exact_active_prompt_at_user_priority() {
         let exact = "operator text must remain user data";
         let mut messages = vec![
@@ -8750,7 +8705,7 @@ mod tool_round_cap_tests {
             prompt_read::PromptReadContext::new(None, exact, None),
         );
 
-        let (instructions, input) = build_responses_input(&messages);
+        let (instructions, input) = crate::responses_wire::build_responses_input(&messages);
         let instructions = instructions.expect("base and metadata instructions");
         assert!(instructions.contains(prompt_read::ACTIVE_PROMPT_PREFIX));
         assert!(
@@ -8806,7 +8761,7 @@ mod tool_round_cap_tests {
     #[test]
     fn responses_loop_consumes_the_shared_decoder_for_text_calls_and_usage() {
         // The agentic loop now shares ONE decoder with the inference transport
-        // (`crate::responses_decode`). This grounds that the loop's consumption
+        // (`crate::responses_wire`). This grounds that the loop's consumption
         // path gets text, calls, echo (reasoning + function_call in order), and
         // usage from that single decoder — no second hand-rolled parser.
         let json = serde_json::json!({
@@ -8820,7 +8775,7 @@ mod tool_round_cap_tests {
             ],
             "usage": {"input_tokens": 100, "output_tokens": 20}
         });
-        let d = crate::responses_decode::decode_response(&json);
+        let d = crate::responses_wire::decode_response(&json);
         assert!(d.completion.is_completed());
         assert_eq!(d.text, "the answer");
         assert_eq!(d.tool_calls.len(), 1);

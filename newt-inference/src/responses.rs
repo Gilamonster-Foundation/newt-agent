@@ -61,26 +61,21 @@ impl ResponsesBackend {
     }
 
     async fn try_complete(&self, req: &ChatRequest) -> anyhow::Result<ChatReply> {
-        // Responses shape: the system prompt(s) become `instructions`; the rest
-        // of the turn is `input` as role/content items.
-        let mut instructions = String::new();
-        let mut input = Vec::new();
-        for m in &req.messages {
-            if m.role == "system" {
-                if !instructions.is_empty() {
-                    instructions.push('\n');
-                }
-                instructions.push_str(&m.content);
-            } else {
-                input.push(serde_json::json!({ "role": &m.role, "content": &m.content }));
-            }
-        }
+        // Shape the request through the ONE shared Responses request-builder
+        // (`newt_core::responses_wire`) so this transport and the agentic loop
+        // can never drift on the system→`instructions` / rest→`input` split.
+        let msgs: Vec<serde_json::Value> = req
+            .messages
+            .iter()
+            .map(|m| serde_json::json!({ "role": &m.role, "content": &m.content }))
+            .collect();
+        let (instructions, input) = newt_core::responses_wire::build_responses_input(&msgs);
         let mut body = serde_json::json!({
             "model": self.model,
             "input": input,
             "stream": false,
         });
-        if !instructions.is_empty() {
+        if let Some(instructions) = instructions {
             body["instructions"] = serde_json::json!(instructions);
         }
         if let Some(max) = req.max_tokens {
@@ -106,8 +101,8 @@ impl ResponsesBackend {
         // an `incomplete` (max_output_tokens) or `failed` status decodes to a
         // non-`Completed` verdict, which this simple ChatReply seam surfaces as
         // an error rather than returning a truncated/empty reply as success.
-        let decoded = newt_core::responses_decode::decode_response(&json);
-        use newt_core::responses_decode::Completion;
+        let decoded = newt_core::responses_wire::decode_response(&json);
+        use newt_core::responses_wire::Completion;
         match &decoded.completion {
             Completion::Completed => {}
             Completion::Incomplete { reason } => anyhow::bail!(
