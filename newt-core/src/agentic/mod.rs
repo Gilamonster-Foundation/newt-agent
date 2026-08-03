@@ -6016,7 +6016,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Reached the round cap. Trim the message list and make ONE final
     // tools-disabled completion (matches the Ollama path).
     let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
-    let replay_protected_tail_len = compress::reasoning_replay_tail_len(&messages);
+    let replay_protected_tail_len =
+        compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
