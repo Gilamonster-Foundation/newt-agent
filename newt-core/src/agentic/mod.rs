@@ -6226,8 +6226,21 @@ fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
 /// The OpenAI **Responses API** agentic loop (`POST {endpoint}/v1/responses`).
 /// Parallel to [`openai_chat_complete`] but over the Responses shapes, for
 /// models served only there (`gpt-5-codex`). Non-streaming; selected via
-/// `api = "responses"`. The chat path's budget / cw-400 recovery is not yet
-/// mirrored here (opt-in path) — tracked as a follow-up.
+/// `api = "responses"`.
+///
+/// ## Long-turn budgeting: fail-CLOSED preview (not full parity yet)
+///
+/// This loop enforces a configured context window as a local ceiling and
+/// reserves output headroom (`BHV-CONTEXT-001`), and it refuses an over-budget
+/// request **before** dispatch. But it does NOT yet mirror the Chat Completions
+/// long-turn survival machinery — mid-loop compaction, context-limit (cw-400)
+/// recovery, monotonically tightening learned ceilings, and bounded redispatch
+/// (`summarizer` / `compress_state` / `recover_cw_400` / `on_round_usage` are
+/// received but unused here). Consequence: a long tool turn whose accumulated
+/// input exceeds the ceiling **fails the turn** rather than compacting and
+/// continuing. This is fail-closed (never a silent truncation), but it is
+/// **preview**, not production-grade for long agentic turns over Responses —
+/// completing it is the blocking follow-up **#1528**.
 pub async fn openai_responses_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
