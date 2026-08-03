@@ -1,107 +1,351 @@
 #!/usr/bin/env python3
-"""Registry-reference linter for spec/behavior-map.toml (epic #1529).
+"""Exact, fail-closed reference linter for spec/behavior-map.toml (epic #1529).
 
-A behavioral change must not silently orphan a constitution entry. This checks
-that every reference in the registry still resolves:
+A behavioral change must not silently orphan a constitution entry. This validates
+that every reference resolves to its INTENDED artifact — not merely that a like-
+named string exists somewhere:
 
-  * `lean`       theorems appear in formal/NewtPolicy/**.lean
-  * `production` paths exist
-  * `rust_tests` `fn <name>` appear somewhere in the workspace
+  * lean       {module, symbol}  -> a decl of that name inside that namespace,
+                                     in formal/NewtPolicy/**.lean, exactly once.
+  * rust_tests {path, symbol}    -> `fn <leaf>` at the in-file module path
+                                     `<mod...>::<leaf>` inside <path>, exactly once.
+  * production {path, symbol}    -> exactly one definition of <symbol> in <path>.
 
-Cross-branch reality: the registry lives on its own branch; some referenced Rust
-tests / production files land only when a feature branch (e.g. the #1526 psyche
-PR) merges. So by default this is STRICT on `lean` (fully present here) and
-ADVISORY on `production` / `rust_tests` (warn, don't fail). Run with `--strict`
-on `main` (post-merge) to fail on any unresolved reference.
+Fail-closed. Anything that does not resolve is an ERROR, EXCEPT a reference that
+carries explicit `pending_pr = <n>` (its artifact lives on an unmerged PR): those
+WARN, naming the contract and the PR. `--strict` makes even pending refs fail (run
+it on `main` after the dependency merges; then delete the markers).
 
-Usage:  python3 spec/lint-behavior-map.py [--strict]
-Exit 0 = clean (per the mode); 1 = an unresolved reference in a strict layer.
+Searches are scoped to the NAMED file (rust/production) or formal/NewtPolicy
+(lean) — never the registry, the docs, or this linter — so a reference can never
+satisfy itself by matching a string in prose.
+
+Also enforced: valid status vocabulary; status<->refs consistency (rust=tested
+needs rust refs; lean in {spec,proven} needs resolving lean refs; tla=checked
+needs a checked spec ref; conformance=full needs every prerequisite layer);
+required fields; duplicate section headers; duplicate refs; zero and ambiguous
+(multi-match) resolutions.
+
+Usage:  python3 spec/lint-behavior-map.py [--strict] [--map P] [--repo D] [--lean-dir D]
+Exit 0 = clean (per mode); 1 = at least one hard error.
 """
 from __future__ import annotations
 
+import argparse
 import re
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-MAP = REPO / "spec" / "behavior-map.toml"
-LEAN_DIR = REPO / "formal" / "NewtPolicy"
+STATUS_VOCAB = {
+    "lean": {"none", "spec", "proven"},
+    "rust": {"none", "tested"},
+    "tla": {"none", "planned", "checked"},
+    "trace": {"none", "planned", "validated"},
+    "conformance": {"partial", "full"},
+}
+RUST_DEF_KEYWORDS = ("fn", "const", "static", "struct", "enum", "type", "trait", "union")
 
 
-def grep(pattern: str, *globs: str) -> bool:
-    """True if `pattern` (fixed string) appears in any file matching the globs."""
-    cmd = ["grep", "-rslF", "--", pattern]
-    cmd += [str(REPO / g) for g in globs] if globs else [str(REPO)]
-    return subprocess.run(cmd, capture_output=True).returncode == 0
+# ─────────────────────────── source parsing ────────────────────────────────
+
+def _strip_rust(text: str) -> list[tuple[str, int]]:
+    """[(char, brace_depth_after)] with comments/strings blanked out. A small
+    lexer — good enough for well-formed Rust (fixtures + the real files)."""
+    out: list[tuple[str, int]] = []
+    i, n, depth = 0, len(text), 0
+    state = "code"
+    raw_hashes = 0
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if c == "/" and nxt == "/":
+                state = "line"; i += 2; continue
+            if c == "/" and nxt == "*":
+                state = "block"; i += 2; continue
+            if c == '"':
+                state = "str"; i += 1; continue
+            if c == "r" and nxt in ('"', "#"):
+                j = i + 1; raw_hashes = 0
+                while j < n and text[j] == "#":
+                    raw_hashes += 1; j += 1
+                if j < n and text[j] == '"':
+                    state = "raw"; i = j + 1; continue
+            if c == "'":
+                state = "chr"; i += 1; continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            out.append((c, depth)); i += 1; continue
+        if state == "line":
+            if c == "\n":
+                state = "code"; out.append(("\n", depth))
+            i += 1; continue
+        if state == "block":
+            if c == "*" and nxt == "/":
+                state = "code"; i += 2; continue
+            i += 1; continue
+        if state == "str":
+            if c == "\\":
+                i += 2; continue
+            if c == '"':
+                state = "code"
+            i += 1; continue
+        if state == "chr":
+            if c == "\\":
+                i += 2; continue
+            if c == "'":
+                state = "code"
+            i += 1; continue
+        if state == "raw":
+            if c == '"':
+                j = i + 1; k = 0
+                while k < raw_hashes and j < n and text[j] == "#":
+                    k += 1; j += 1
+                if k == raw_hashes:
+                    state = "code"; i = j; continue
+            i += 1; continue
+    return out
 
 
-def lean_theorem_defined(fqn: str) -> bool:
-    # `NewtPolicy.Backend.adding_a_backend_preserves_selection` -> theorem/def name.
-    name = fqn.rsplit(".", 1)[-1]
-    if not LEAN_DIR.exists():
-        return False
-    for f in LEAN_DIR.rglob("*.lean"):
-        text = f.read_text(encoding="utf-8", errors="replace")
-        if re.search(rf"^\s*(theorem|def|lemma)\s+{re.escape(name)}\b", text, re.M):
-            return True
-    return False
+def rust_test_defs(text: str) -> list[tuple[tuple[str, ...], str]]:
+    """[(in-file module path, fn name)] tracking `mod X { … }` nesting by depth."""
+    lex = _strip_rust(text)
+    s = "".join(c for c, _ in lex)
+    depths = [d for _, d in lex]
+    defs: list[tuple[tuple[str, ...], str]] = []
+    modstack: list[tuple[str, int]] = []  # (name, body_depth)
+    for m in re.finditer(
+        r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{|\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\b|\}", s
+    ):
+        depth_here = depths[m.start()]
+        while modstack and depth_here < modstack[-1][1]:
+            modstack.pop()
+        if m.group(0) == "}":
+            continue
+        if m.group(1):  # `mod NAME {`
+            body_depth = depths[m.end() - 1]  # depth just after the `{`
+            modstack.append((m.group(1), body_depth))
+        elif m.group(2):  # `fn NAME`
+            defs.append((tuple(nm for nm, _ in modstack), m.group(2)))
+    return defs
 
 
-def rust_test_defined(ref: str) -> bool:
-    # `module::path::test_name` -> `fn test_name`.
-    name = ref.split("::")[-1]
-    return grep(f"fn {name}(", "newt-core", "newt-inference", "newt-acp-worker", "newt-cli") or grep(
-        f"fn {name}("
-    )
+def rust_definition_count(text: str, symbol: str) -> int:
+    """How many definitions of `symbol` (any def keyword) exist in the file."""
+    s = "".join(c for c, _ in _strip_rust(text))
+    kw = "|".join(RUST_DEF_KEYWORDS)
+    return len(re.findall(rf"\b(?:{kw})\s+{re.escape(symbol)}\b", s))
+
+
+def lean_decls(text: str) -> list[str]:
+    """Fully-qualified declaration names, tracking `namespace`/`end` + comments."""
+    fqs: list[str] = []
+    stack: list[str] = []
+    in_block = False
+    for raw in text.splitlines():
+        line = raw
+        if in_block:
+            if "-/" in line:
+                line = line.split("-/", 1)[1]; in_block = False
+            else:
+                continue
+        while "/-" in line:
+            before, _, rest = line.partition("/-")
+            if "-/" in rest:
+                line = before + rest.split("-/", 1)[1]
+            else:
+                line = before; in_block = True; break
+        line = re.split(r"--", line, maxsplit=1)[0]
+        m = re.match(r"\s*namespace\s+([A-Za-z0-9_.']+)", line)
+        if m:
+            stack.append(m.group(1)); continue
+        m = re.match(r"\s*end\s+([A-Za-z0-9_.']+)\s*$", line)
+        if m:
+            if stack and stack[-1] == m.group(1):
+                stack.pop()
+            continue
+        m = re.match(
+            r"\s*(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+)*"
+            r"(?:theorem|lemma|def|abbrev|structure|inductive|class|instance)\s+([A-Za-z0-9_']+)",
+            line,
+        )
+        if m:
+            fqs.append(".".join(stack + [m.group(1)]))
+    return fqs
+
+
+# ─────────────────────────── the linter ────────────────────────────────────
+
+class Linter:
+    def __init__(self, repo: Path, lean_dir: Path, strict: bool):
+        self.repo = repo
+        self.lean_dir = lean_dir
+        self.strict = strict
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+        self._lean_cache: list[str] | None = None
+
+    def err(self, bhv: str, msg: str) -> None:
+        self.errors.append(f"{bhv}: {msg}")
+
+    def warn(self, bhv: str, msg: str) -> None:
+        self.warnings.append(f"{bhv}: {msg}")
+
+    def lean_declset(self) -> list[str]:
+        if self._lean_cache is None:
+            decls: list[str] = []
+            if self.lean_dir.exists():
+                for f in sorted(self.lean_dir.rglob("*.lean")):
+                    decls += lean_decls(f.read_text(encoding="utf-8", errors="replace"))
+            self._lean_cache = decls
+        return self._lean_cache
+
+    def resolve_lean(self, ref: dict) -> int:
+        return self.lean_declset().count(f"{ref['module']}.{ref['symbol']}")
+
+    def resolve_rust_test(self, ref: dict) -> int | None:
+        p = self.repo / ref["path"]
+        if not p.exists():
+            return None
+        parts = ref["symbol"].split("::")
+        parents, leaf = tuple(parts[:-1]), parts[-1]
+        defs = rust_test_defs(p.read_text(encoding="utf-8", errors="replace"))
+        return sum(1 for mp, fn in defs if fn == leaf and mp == parents)
+
+    def resolve_production(self, ref: dict) -> int | None:
+        p = self.repo / ref["path"]
+        if not p.exists():
+            return None
+        return rust_definition_count(p.read_text(encoding="utf-8", errors="replace"), ref["symbol"])
+
+    def check_resolvable(self, bhv: str, kind: str, ref: dict, count: int | None) -> None:
+        pending = ref.get("pending_pr")
+        label = f"{kind} {ref.get('module', ref.get('path'))}::{ref['symbol']}"
+        if count is None or count == 0:
+            if pending and not self.strict:
+                self.warn(bhv, f"{label} unresolved (pending PR #{pending})")
+            else:
+                self.err(bhv, f"{label} does not resolve"
+                              + (f" (pending PR #{pending}, and --strict)" if pending else ""))
+        elif count > 1:
+            self.err(bhv, f"{label} is AMBIGUOUS ({count} matches)")
+
+    def check_contract(self, bhv: str, body: dict) -> None:
+        if not isinstance(body, dict):
+            self.err(bhv, "entry is not a table")
+            return
+        desc = body.get("description")
+        if not isinstance(desc, str) or not desc.strip():
+            self.err(bhv, "missing non-empty `description`")
+        status = body.get("status")
+        if not isinstance(status, dict):
+            self.err(bhv, "missing `status` table")
+            return
+        for key, vocab in STATUS_VOCAB.items():
+            if key not in status:
+                self.err(bhv, f"status.{key} is required")
+            elif status[key] not in vocab:
+                self.err(bhv, f"status.{key} = {status[key]!r} is invalid (allowed: {sorted(vocab)})")
+
+        refs = body.get("refs", {})
+        if not isinstance(refs, dict):
+            self.err(bhv, "`refs` must be a table")
+            refs = {}
+        lean_refs = refs.get("lean", [])
+        rust_refs = refs.get("rust_tests", [])
+        prod_refs = refs.get("production", [])
+        tla_refs = refs.get("tla", [])
+
+        def dups(items, keyfn):
+            seen, out = set(), set()
+            for it in items:
+                k = keyfn(it)
+                (out if k in seen else seen).add(k)
+            return out
+        for kind, items, keyfn in (
+            ("lean", lean_refs, lambda r: (r.get("module"), r.get("symbol"))),
+            ("rust_tests", rust_refs, lambda r: (r.get("path"), r.get("symbol"))),
+            ("production", prod_refs, lambda r: (r.get("path"), r.get("symbol"))),
+        ):
+            for d in dups(items, keyfn):
+                self.err(bhv, f"duplicate {kind} reference {d}")
+
+        if status.get("lean") in {"spec", "proven"} and not lean_refs:
+            self.err(bhv, f"status.lean = {status.get('lean')!r} but no `refs.lean`")
+        if status.get("rust") == "tested" and not rust_refs:
+            self.err(bhv, "status.rust = 'tested' but no `refs.rust_tests`")
+        if status.get("tla") == "checked" and not tla_refs:
+            self.err(bhv, "status.tla = 'checked' but no `refs.tla`")
+        if status.get("conformance") == "full" and not (
+            status.get("lean") == "proven" and status.get("rust") == "tested"
+            and status.get("tla") == "checked" and status.get("trace") == "validated"
+        ):
+            self.err(bhv, "conformance = 'full' requires lean=proven, rust=tested, "
+                          "tla=checked, trace=validated (oracle/model/trace prerequisites)")
+
+        for r in lean_refs:
+            if not (r.get("module") and r.get("symbol")):
+                self.err(bhv, f"lean ref needs `module` and `symbol`: {r}"); continue
+            self.check_resolvable(bhv, "lean", r, self.resolve_lean(r))
+        for r in rust_refs:
+            if not (r.get("path") and r.get("symbol")):
+                self.err(bhv, f"rust_tests ref needs `path` and `symbol`: {r}"); continue
+            self.check_resolvable(bhv, "rust_tests", r, self.resolve_rust_test(r))
+        for r in prod_refs:
+            if not (r.get("path") and r.get("symbol")):
+                self.err(bhv, f"production ref needs `path` and `symbol`: {r}"); continue
+            self.check_resolvable(bhv, "production", r, self.resolve_production(r))
+        for r in tla_refs:
+            if not r.get("spec"):
+                self.err(bhv, f"tla ref needs `spec`: {r}"); continue
+            if not (self.repo / "spec" / "tla" / f"{r['spec']}.tla").exists():
+                self.err(bhv, f"tla ref spec {r['spec']!r} has no spec/tla/{r['spec']}.tla")
+
+    def run(self, map_path: Path) -> int:
+        raw = map_path.read_text(encoding="utf-8")
+        headers = re.findall(r"(?m)^\[(BHV-[A-Za-z0-9_-]+)\]\s*$", raw)
+        for h in {x for x in headers if headers.count(x) > 1}:
+            self.errors.append(f"{h}: duplicate section header")
+        try:
+            data = tomllib.loads(raw)
+        except tomllib.TOMLDecodeError as e:
+            print(f"[ERROR] behavior-map.toml does not parse: {e}", file=sys.stderr)
+            return 1
+        bhvs = [k for k in data if k.startswith("BHV-")]
+        if not bhvs:
+            print("[ERROR] no BHV-* contracts found", file=sys.stderr)
+            return 1
+        for bhv in bhvs:
+            self.check_contract(bhv, data[bhv])
+
+        if self.warnings:
+            print(f"[warn ] {len(self.warnings)} pending-PR advisory reference(s):", file=sys.stderr)
+            for w in self.warnings:
+                print(f"        {w}", file=sys.stderr)
+        if self.errors:
+            print(f"[ERROR] {len(self.errors)} unresolved/invalid reference(s):", file=sys.stderr)
+            for e in self.errors:
+                print(f"        {e}", file=sys.stderr)
+            return 1
+        print(f"behavior-map.toml: {len(bhvs)} contracts OK — "
+              f"{len(self.warnings)} pending-PR advisory, 0 errors.")
+        return 0
 
 
 def main() -> int:
-    strict = "--strict" in sys.argv[1:]
-    data = tomllib.loads(MAP.read_text())
-
-    lean_missing: list[str] = []
-    prod_missing: list[str] = []
-    test_missing: list[str] = []
-
-    for bhv, body in data.items():
-        if not bhv.startswith("BHV-") or not isinstance(body, dict):
-            continue
-        refs = body.get("refs", {})
-        for thm in refs.get("lean", []):
-            if not lean_theorem_defined(thm):
-                lean_missing.append(f"{bhv}: lean {thm}")
-        for path in refs.get("production", []):
-            if not (REPO / path).exists():
-                prod_missing.append(f"{bhv}: production {path}")
-        for test in refs.get("rust_tests", []):
-            if not rust_test_defined(test):
-                test_missing.append(f"{bhv}: rust_test {test}")
-
-    def report(label: str, items: list[str], fatal: bool) -> None:
-        if not items:
-            return
-        tag = "ERROR" if fatal else "warn "
-        print(f"[{tag}] {label}: {len(items)} unresolved", file=sys.stderr)
-        for it in items:
-            print(f"        {it}", file=sys.stderr)
-
-    # `lean` is always strict (fully present on this branch). `production` /
-    # `rust_tests` are strict only under --strict (post-merge on main).
-    report("lean references", lean_missing, fatal=True)
-    report("production references", prod_missing, fatal=strict)
-    report("rust_test references", test_missing, fatal=strict)
-
-    failed = bool(lean_missing) or (strict and (prod_missing or test_missing))
-    if not (lean_missing or prod_missing or test_missing):
-        print("behavior-map.toml: all references resolve.")
-    elif not failed:
-        print(
-            "behavior-map.toml: lean references resolve; "
-            "production/rust advisory (unmerged branches resolve later — use --strict on main)."
-        )
-    return 1 if failed else 0
+    here = Path(__file__).resolve().parent
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--map", default=str(here / "behavior-map.toml"))
+    ap.add_argument("--repo", default=str(here.parent))
+    ap.add_argument("--lean-dir", default=None)
+    ap.add_argument("--strict", action="store_true")
+    a = ap.parse_args()
+    repo = Path(a.repo).resolve()
+    lean_dir = Path(a.lean_dir).resolve() if a.lean_dir else repo / "formal" / "NewtPolicy"
+    return Linter(repo, lean_dir, a.strict).run(Path(a.map).resolve())
 
 
 if __name__ == "__main__":

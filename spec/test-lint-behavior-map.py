@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Self-tests for spec/lint-behavior-map.py — proves the registry linter is exact
+and fail-closed via fixture trees + negative cases. Run:
+
+    python3 spec/test-lint-behavior-map.py
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LINTER = HERE / "lint-behavior-map.py"
+
+# A minimal fixture that fully RESOLVES; each negative case mutates one piece.
+BASE_LEAN = "namespace A\ntheorem t : True := trivial\nend A\n"
+BASE_RUST = "mod m {\n    #[test]\n    fn foo() {}\n}\npub fn prod() {}\n"
+BASE_MAP = """\
+schema = 3
+[BHV-X-001]
+description = "a resolving contract"
+[BHV-X-001.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-X-001.refs.lean]]
+module = "A"
+symbol = "t"
+[[BHV-X-001.refs.rust_tests]]
+path = "r.rs"
+symbol = "m::foo"
+[[BHV-X-001.refs.production]]
+path = "r.rs"
+symbol = "prod"
+"""
+
+_pass = 0
+_fail = 0
+
+
+def run_case(name, *, mapping=BASE_MAP, lean=BASE_LEAN, rust=BASE_RUST,
+             strict=False, want_exit, want_msg=None):
+    global _pass, _fail
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        (repo / "formal" / "NewtPolicy").mkdir(parents=True)
+        (repo / "formal" / "NewtPolicy" / "Fix.lean").write_text(lean)
+        (repo / "r.rs").write_text(rust)
+        (repo / "map.toml").write_text(mapping)
+        cmd = [sys.executable, str(LINTER), "--map", str(repo / "map.toml"),
+               "--repo", str(repo), "--lean-dir", str(repo / "formal" / "NewtPolicy")]
+        if strict:
+            cmd.append("--strict")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        ok = (r.returncode == want_exit) and (want_msg is None or want_msg in out)
+        if ok:
+            print(f"ok   - {name}")
+            _pass += 1
+        else:
+            print(f"FAIL - {name}: exit={r.returncode} (want {want_exit})"
+                  + (f", missing {want_msg!r}" if want_msg and want_msg not in out else ""))
+            print("       " + out.replace("\n", "\n       ").strip())
+            _fail += 1
+
+
+# 0. Positive control: everything resolves → exit 0.
+run_case("all references resolve", want_exit=0)
+
+# 1. Wrong Lean namespace with the SAME theorem basename elsewhere.
+run_case("wrong lean namespace (same basename under B) fails",
+         lean="namespace B\ntheorem t : True := trivial\nend B\n",
+         want_exit=1, want_msg="lean A::t does not resolve")
+
+# 2. Wrong Rust module with the SAME test basename elsewhere.
+run_case("wrong rust module (foo only under b) fails",
+         rust="mod b {\n    fn foo() {}\n}\npub fn prod() {}\n",
+         want_exit=1, want_msg="rust_tests r.rs::m::foo does not resolve")
+
+# 3. Missing production symbol in an existing file.
+run_case("missing production symbol fails",
+         rust="mod m {\n    fn foo() {}\n}\n",  # no `prod`
+         want_exit=1, want_msg="production r.rs::prod does not resolve")
+
+# 4. Invalid status value.
+run_case("invalid status value fails",
+         mapping=BASE_MAP.replace('lean = "proven"', 'lean = "bogus"'),
+         want_exit=1, want_msg="status.lean = 'bogus' is invalid")
+
+# 5. A missing reference (no pending marker) is a hard error.
+run_case("missing non-pending reference fails",
+         mapping=BASE_MAP.replace('symbol = "prod"', 'symbol = "does_not_exist"'),
+         want_exit=1, want_msg="production r.rs::does_not_exist does not resolve")
+
+# 6. Ambiguous (multi-match) resolution fails.
+run_case("ambiguous production symbol fails",
+         rust="mod m {\n    fn foo() {}\n}\npub fn prod() {}\nfn prod() {}\n",
+         want_exit=1, want_msg="AMBIGUOUS")
+
+# 7. Invalid conformance = "full" (prerequisite layers not represented).
+run_case("conformance=full without prerequisites fails",
+         mapping=BASE_MAP.replace('conformance = "partial"', 'conformance = "full"'),
+         want_exit=1, want_msg="conformance = 'full' requires")
+
+# 8. rust = "tested" with no rust refs fails.
+NO_RUST_REFS = """\
+schema = 3
+[BHV-Y-001]
+description = "tested but no rust refs"
+[BHV-Y-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+"""
+run_case("rust=tested with no rust refs fails", mapping=NO_RUST_REFS,
+         want_exit=1, want_msg="status.rust = 'tested' but no `refs.rust_tests`")
+
+# 9. lean = "proven" with no lean refs fails.
+NO_LEAN_REFS = NO_RUST_REFS.replace('rust = "tested"', 'rust = "none"').replace(
+    'lean = "none"', 'lean = "proven"')
+run_case("lean=proven with no lean refs fails", mapping=NO_LEAN_REFS,
+         want_exit=1, want_msg="no `refs.lean`")
+
+# 10. tla = "checked" with no tla ref fails.
+TLA_CHECKED = NO_RUST_REFS.replace('rust = "tested"', 'rust = "none"').replace(
+    'tla = "none"', 'tla = "checked"')
+run_case("tla=checked with no tla ref fails", mapping=TLA_CHECKED,
+         want_exit=1, want_msg="status.tla = 'checked' but no `refs.tla`")
+
+# 11. Missing description fails.
+NO_DESC = BASE_MAP.replace('description = "a resolving contract"\n', "")
+run_case("missing description fails", mapping=NO_DESC,
+         want_exit=1, want_msg="missing non-empty `description`")
+
+# 12. Duplicate reference within a contract fails.
+DUP_REF = BASE_MAP + '[[BHV-X-001.refs.production]]\npath = "r.rs"\nsymbol = "prod"\n'
+run_case("duplicate reference fails", mapping=DUP_REF,
+         want_exit=1, want_msg="duplicate production reference")
+
+# 13. A pending_pr reference that is missing WARNS (exit 0) but FAILS under --strict.
+PENDING = BASE_MAP.replace(
+    '[[BHV-X-001.refs.production]]\npath = "r.rs"\nsymbol = "prod"\n',
+    '[[BHV-X-001.refs.production]]\npath = "missing.rs"\nsymbol = "later"\npending_pr = 999\n')
+run_case("pending missing ref warns (exit 0)", mapping=PENDING,
+         want_exit=0, want_msg="pending PR #999")
+run_case("pending missing ref fails under --strict", mapping=PENDING, strict=True,
+         want_exit=1, want_msg="pending PR #999")
+
+# 14. The linter must not satisfy a ref by matching a string in prose/docs: the
+#     symbol appears ONLY in a comment, not as a definition → fails.
+run_case("comment-only symbol does not satisfy a production ref",
+         rust="mod m {\n    fn foo() {}\n}\n// pub fn prod is described here but not defined\n",
+         want_exit=1, want_msg="production r.rs::prod does not resolve")
+
+print(f"\n{_pass} passed, {_fail} failed")
+sys.exit(1 if _fail else 0)
