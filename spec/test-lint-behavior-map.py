@@ -43,7 +43,9 @@ _fail = 0
 
 
 def run_case(name, *, mapping=BASE_MAP, lean=BASE_LEAN, rust=BASE_RUST,
-             strict=False, want_exit, want_msg=None):
+             tla=None, strict=False, want_exit, want_msg=None):
+    """tla: optional {spec_name: (tla_text, cfg_text_or_None)} written under
+    spec/tla/ so the TLA reference validator can be exercised."""
     global _pass, _fail
     with tempfile.TemporaryDirectory() as d:
         repo = Path(d)
@@ -51,6 +53,12 @@ def run_case(name, *, mapping=BASE_MAP, lean=BASE_LEAN, rust=BASE_RUST,
         (repo / "formal" / "NewtPolicy" / "Fix.lean").write_text(lean)
         (repo / "r.rs").write_text(rust)
         (repo / "map.toml").write_text(mapping)
+        if tla:
+            (repo / "spec" / "tla").mkdir(parents=True)
+            for spec, (tla_text, cfg_text) in tla.items():
+                (repo / "spec" / "tla" / f"{spec}.tla").write_text(tla_text)
+                if cfg_text is not None:
+                    (repo / "spec" / "tla" / f"{spec}.cfg").write_text(cfg_text)
         cmd = [sys.executable, str(LINTER), "--map", str(repo / "map.toml"),
                "--repo", str(repo), "--lean-dir", str(repo / "formal" / "NewtPolicy")]
         if strict:
@@ -76,14 +84,15 @@ run_case("wrong lean namespace (same basename under B) fails",
          lean="namespace B\ntheorem t : True := trivial\nend B\n",
          want_exit=1, want_msg="lean A::t does not resolve")
 
-# 2. Wrong Rust module with the SAME test basename elsewhere.
+# 2. Wrong Rust module with the SAME test basename elsewhere (foo IS a test, but
+#    under `b`, not the referenced `m`) → module mismatch, not attribute mismatch.
 run_case("wrong rust module (foo only under b) fails",
-         rust="mod b {\n    fn foo() {}\n}\npub fn prod() {}\n",
+         rust="mod b {\n    #[test]\n    fn foo() {}\n}\npub fn prod() {}\n",
          want_exit=1, want_msg="rust_tests r.rs::m::foo does not resolve")
 
-# 3. Missing production symbol in an existing file.
+# 3. Missing production symbol in an existing file (foo stays a valid test).
 run_case("missing production symbol fails",
-         rust="mod m {\n    fn foo() {}\n}\n",  # no `prod`
+         rust="mod m {\n    #[test]\n    fn foo() {}\n}\n",  # no `prod`
          want_exit=1, want_msg="production r.rs::prod does not resolve")
 
 # 4. Invalid status value.
@@ -155,8 +164,78 @@ run_case("pending missing ref fails under --strict", mapping=PENDING, strict=Tru
 # 14. The linter must not satisfy a ref by matching a string in prose/docs: the
 #     symbol appears ONLY in a comment, not as a definition → fails.
 run_case("comment-only symbol does not satisfy a production ref",
-         rust="mod m {\n    fn foo() {}\n}\n// pub fn prod is described here but not defined\n",
+         rust="mod m {\n    #[test]\n    fn foo() {}\n}\n// pub fn prod is described here but not defined\n",
          want_exit=1, want_msg="production r.rs::prod does not resolve")
+
+# 15. MG2: a fn WITHOUT a recognized test attribute cannot satisfy a rust_tests ref
+#     (deleting `#[test]` orphans the ref, even though the fn still exists).
+run_case("rust fn without a test attribute does not satisfy a rust_tests ref",
+         rust="mod m {\n    fn foo() {}\n}\npub fn prod() {}\n",
+         want_exit=1, want_msg="rust_tests r.rs::m::foo does not resolve")
+
+# 16. MG2: `#[tokio::test]` (async fn) IS recognized — the positive control for the
+#     attribute requirement, exercising the tail-segment rule + modifier skip.
+run_case("tokio::test on an async fn satisfies a rust_tests ref",
+         rust="mod m {\n    #[tokio::test]\n    async fn foo() {}\n}\npub fn prod() {}\n",
+         want_exit=0)
+
+# 16b. Regression: Rust LIFETIMES ('a, &'a) must not be lexed as char literals — a
+#      char-literal misread eats to the next `'`, blanking `fn`/`mod`/`{` so the
+#      symbol after a lifetime silently "does not resolve". Char/byte literals in
+#      the same file must still parse. (Found by running the linter on real code.)
+LIFETIME_RUST = (
+    "pub fn helper<'a>(x: &'a str) -> &'a str { x }\n"
+    "fn eats_quotes() { let _ = ('a', b'z', '\\''); }\n"
+    "mod m {\n    #[test]\n    fn foo() {}\n}\n"
+    "pub fn prod() {}\n"
+)
+run_case("lifetimes are not char literals (symbol after a lifetime still resolves)",
+         rust=LIFETIME_RUST, want_exit=0)
+
+# ── TLA reference validator (item 4: exact, pre-AgentTurn) ───────────────────
+# A contract that declares tla = "checked" and points at a real spec/invariant.
+TLA_MAP = """\
+schema = 3
+[BHV-T-001]
+description = "a checked tla contract"
+[BHV-T-001.status]
+lean = "none"
+rust = "none"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-T-001.refs.tla]]
+spec = "Agent"
+invariant = "Bounded"
+"""
+GOOD_TLA = "---- MODULE Agent ----\nBounded == TRUE\n===="
+GOOD_CFG = "SPECIFICATION Spec\nINVARIANT Bounded\n"
+
+# 17. A fully-resolving tla ref (operator defined + declared in the .cfg) → exit 0.
+run_case("tla ref resolves when operator is defined and declared as INVARIANT",
+         mapping=TLA_MAP, tla={"Agent": (GOOD_TLA, GOOD_CFG)}, want_exit=0)
+
+# 18. Missing `invariant` field fails (a spec alone proves nothing is checked).
+run_case("tla ref without an invariant fails",
+         mapping=TLA_MAP.replace('invariant = "Bounded"\n', ""),
+         tla={"Agent": (GOOD_TLA, GOOD_CFG)},
+         want_exit=1, want_msg="needs `invariant`")
+
+# 19. Invariant not defined as an operator in the .tla fails.
+run_case("tla ref whose invariant is not an operator in the module fails",
+         mapping=TLA_MAP, tla={"Agent": ("---- MODULE Agent ----\nOther == TRUE\n====", GOOD_CFG)},
+         want_exit=1, want_msg="not defined as an operator")
+
+# 20. Missing .cfg fails.
+run_case("tla ref with no matching .cfg fails",
+         mapping=TLA_MAP, tla={"Agent": (GOOD_TLA, None)},
+         want_exit=1, want_msg="has no spec/tla/Agent.cfg")
+
+# 21. Operator defined but NOT declared as an INVARIANT in the .cfg fails
+#     (TLC would parse it but never check it).
+run_case("tla ref whose invariant is not declared in the .cfg fails",
+         mapping=TLA_MAP, tla={"Agent": (GOOD_TLA, "SPECIFICATION Spec\n")},
+         want_exit=1, want_msg="not declared as an INVARIANT")
 
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)

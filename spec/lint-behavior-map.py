@@ -7,9 +7,17 @@ named string exists somewhere:
 
   * lean       {module, symbol}  -> a decl of that name inside that namespace,
                                      in formal/NewtPolicy/**.lean, exactly once.
-  * rust_tests {path, symbol}    -> `fn <leaf>` at the in-file module path
-                                     `<mod...>::<leaf>` inside <path>, exactly once.
+  * rust_tests {path, symbol}    -> a `fn <leaf>` at the in-file module path
+                                     `<mod...>::<leaf>` inside <path>, exactly once,
+                                     AND carrying a recognized test attribute
+                                     (`#[test]`, `#[tokio::test]`, …). A plain `fn`
+                                     Cargo would not execute cannot satisfy it, so
+                                     deleting `#[test]` flips the ref to unresolved.
   * production {path, symbol}    -> exactly one definition of <symbol> in <path>.
+  * tla        {spec, invariant} -> spec/tla/<spec>.tla DEFINES <invariant> as an
+                                     operator AND spec/tla/<spec>.cfg declares it in
+                                     an INVARIANT(S) line (not merely a file that
+                                     exists) — required before any tla="checked".
 
 Fail-closed. Anything that does not resolve is an ERROR, EXCEPT a reference that
 carries explicit `pending_pr = <n>` (its artifact lives on an unmerged PR): those
@@ -73,7 +81,13 @@ def _strip_rust(text: str) -> list[tuple[str, int]]:
                 if j < n and text[j] == '"':
                     state = "raw"; i = j + 1; continue
             if c == "'":
-                state = "chr"; i += 1; continue
+                # A char literal ('x', '\n') vs a lifetime/label ('a, 'static, '_).
+                # Only the former opens a quoted span; a lifetime is ordinary code —
+                # mis-treating it as a char literal eats to the next `'`, blanking
+                # out `fn`/`mod`/`{` and desyncing brace depth.
+                if nxt == "\\" or (i + 2 < n and text[i + 2] == "'"):
+                    state = "chr"; i += 1; continue
+                out.append((c, depth)); i += 1; continue
             if c == "{":
                 depth += 1
             elif c == "}":
@@ -110,8 +124,70 @@ def _strip_rust(text: str) -> list[tuple[str, int]]:
     return out
 
 
+# Attribute clusters that mark a function as a Cargo-executed test. Matched on the
+# LAST `::` segment so `test`, `tokio::test`, `async_std::test`, `actix_rt::test`
+# all count; plus a small allowlist of well-known test-macro names.
+_TEST_ATTR_NAMES = {"rstest", "test_case", "googletest", "gtest"}
+_MOD_TAIL = re.compile(
+    r"(?:\bpub\b(?:\s*\([^()]*\))?|\basync\b|\bunsafe\b|\bconst\b|\bextern\b"
+    r"|\bdefault\b|\bmove\b)\s*$"
+)
+
+
+def _is_test_attr(body: str) -> bool:
+    """True if an attribute body (between `#[` and `]`) is a recognized test marker."""
+    head = re.split(r"[(\s]", body.strip(), maxsplit=1)[0]
+    head = head.replace(" ", "").replace("\t", "")
+    if not head:
+        return False
+    last = head.split("::")[-1]
+    return last == "test" or head in _TEST_ATTR_NAMES or last in _TEST_ATTR_NAMES
+
+
+def _attrs_before(s: str, p: int) -> list[str]:
+    """Attribute bodies attached to the item whose keyword starts at index `p`,
+    walking back over intervening whitespace and modifier keywords (pub/async/…)."""
+    attrs: list[str] = []
+    i = p
+    while True:
+        j = i
+        while j > 0 and s[j - 1].isspace():
+            j -= 1
+        mt = _MOD_TAIL.search(s[:j])  # a modifier keyword sits between attrs and fn
+        if mt:
+            i = mt.start()
+            continue
+        if j > 0 and s[j - 1] == "]":  # an attribute `#[ … ]` ends right here
+            depth, k = 0, j - 1
+            while k >= 0:
+                if s[k] == "]":
+                    depth += 1
+                elif s[k] == "[":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k -= 1
+            if k < 0:
+                break
+            b = k - 1
+            if b >= 0 and s[b] == "!":  # inner attribute `#![ … ]`
+                b -= 1
+            if b >= 0 and s[b] == "#":
+                attrs.append(s[k + 1:j - 1])
+                i = b
+                continue
+        break
+    return attrs
+
+
+def _fn_is_test(s: str, kw_start: int) -> bool:
+    return any(_is_test_attr(a) for a in _attrs_before(s, kw_start))
+
+
 def rust_test_defs(text: str) -> list[tuple[tuple[str, ...], str]]:
-    """[(in-file module path, fn name)] tracking `mod X { … }` nesting by depth."""
+    """[(in-file module path, fn name)] for TEST-ATTRIBUTED fns only, tracking
+    `mod X { … }` nesting by depth. A `fn` without a recognized test attribute is
+    NOT returned — so a rust_tests ref cannot resolve to something Cargo won't run."""
     lex = _strip_rust(text)
     s = "".join(c for c, _ in lex)
     depths = [d for _, d in lex]
@@ -128,7 +204,7 @@ def rust_test_defs(text: str) -> list[tuple[tuple[str, ...], str]]:
         if m.group(1):  # `mod NAME {`
             body_depth = depths[m.end() - 1]  # depth just after the `{`
             modstack.append((m.group(1), body_depth))
-        elif m.group(2):  # `fn NAME`
+        elif m.group(2) and _fn_is_test(s, m.start()):  # `fn NAME` with a test attr
             defs.append((tuple(nm for nm, _ in modstack), m.group(2)))
     return defs
 
@@ -175,6 +251,36 @@ def lean_decls(text: str) -> list[str]:
         if m:
             fqs.append(".".join(stack + [m.group(1)]))
     return fqs
+
+
+# TLC .cfg section keywords — an INVARIANT(S) list runs until the next one.
+_CFG_KEYWORDS = {
+    "SPECIFICATION", "INIT", "NEXT", "CONSTANT", "CONSTANTS", "INVARIANT",
+    "INVARIANTS", "PROPERTY", "PROPERTIES", "SYMMETRY", "VIEW", "CONSTRAINT",
+    "ACTION_CONSTRAINT", "ALIAS", "POSTCONDITION", "CHECK_DEADLOCK",
+}
+
+
+def tla_operator_defined(tla_text: str, name: str) -> bool:
+    """True if <name> is defined as an operator (`name == …` or `name(args) == …`)."""
+    text = re.sub(r"\(\*.*?\*\)", " ", tla_text, flags=re.S)  # (* block *) comments
+    text = re.sub(r"\\\*[^\n]*", "", text)                    # \* line comments
+    return re.search(rf"(?m)^\s*{re.escape(name)}\s*(?:\([^()]*\))?\s*==", text) is not None
+
+
+def cfg_declared_invariants(cfg_text: str) -> set[str]:
+    """Operator names TLC is told to check as invariants (INVARIANT/INVARIANTS)."""
+    text = re.sub(r"\\\*[^\n]*", "", cfg_text)  # \* line comments
+    out: set[str] = set()
+    collecting = False
+    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text):
+        if tok in ("INVARIANT", "INVARIANTS"):
+            collecting = True
+        elif tok in _CFG_KEYWORDS:
+            collecting = False
+        elif collecting:
+            out.add(tok)
+    return out
 
 
 # ─────────────────────────── the linter ────────────────────────────────────
@@ -232,6 +338,26 @@ class Linter:
                               + (f" (pending PR #{pending}, and --strict)" if pending else ""))
         elif count > 1:
             self.err(bhv, f"{label} is AMBIGUOUS ({count} matches)")
+
+    def check_tla_ref(self, bhv: str, ref: dict) -> None:
+        """A tla ref must name a spec + an invariant that is BOTH defined as an
+        operator in <spec>.tla AND declared in an INVARIANT(S) line of <spec>.cfg —
+        a file that merely exists is not proof TLC checks anything."""
+        spec, inv = ref.get("spec"), ref.get("invariant")
+        if not spec:
+            self.err(bhv, f"tla ref needs `spec`: {ref}"); return
+        if not inv:
+            self.err(bhv, f"tla ref {spec!r} needs `invariant` (the operator TLC checks)"); return
+        tla = self.repo / "spec" / "tla" / f"{spec}.tla"
+        cfg = self.repo / "spec" / "tla" / f"{spec}.cfg"
+        if not tla.exists():
+            self.err(bhv, f"tla ref spec {spec!r} has no spec/tla/{spec}.tla"); return
+        if not cfg.exists():
+            self.err(bhv, f"tla ref spec {spec!r} has no spec/tla/{spec}.cfg"); return
+        if not tla_operator_defined(tla.read_text(encoding="utf-8", errors="replace"), inv):
+            self.err(bhv, f"tla ref {spec}!{inv} is not defined as an operator in {spec}.tla")
+        elif inv not in cfg_declared_invariants(cfg.read_text(encoding="utf-8", errors="replace")):
+            self.err(bhv, f"tla ref {spec}!{inv} is not declared as an INVARIANT in {spec}.cfg")
 
     def check_contract(self, bhv: str, body: dict) -> None:
         if not isinstance(body, dict):
@@ -299,10 +425,7 @@ class Linter:
                 self.err(bhv, f"production ref needs `path` and `symbol`: {r}"); continue
             self.check_resolvable(bhv, "production", r, self.resolve_production(r))
         for r in tla_refs:
-            if not r.get("spec"):
-                self.err(bhv, f"tla ref needs `spec`: {r}"); continue
-            if not (self.repo / "spec" / "tla" / f"{r['spec']}.tla").exists():
-                self.err(bhv, f"tla ref spec {r['spec']!r} has no spec/tla/{r['spec']}.tla")
+            self.check_tla_ref(bhv, r)
 
     def run(self, map_path: Path) -> int:
         raw = map_path.read_text(encoding="utf-8")
