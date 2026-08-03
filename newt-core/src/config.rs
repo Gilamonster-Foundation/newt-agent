@@ -3227,6 +3227,49 @@ pub struct ProviderConfig {
     pub tiers: Vec<Tier>,
 }
 
+/// The backend the shared precedence selected — a configured `[[backends]]`
+/// entry or a `[[providers]]` plugin. Returned inside [`SelectionOutcome`] by
+/// [`Config::select_backend`] so every surface resolves ONE backend, then
+/// instantiates exactly that one.
+///
+/// Not `PartialEq`/`Eq`: it borrows [`BackendConfig`] (which carries an `f64`
+/// field, so it cannot be `Eq`) and [`ProviderConfig`]. Compare on an owned
+/// projection (a name/endpoint), not on the borrow.
+#[derive(Debug, Clone)]
+pub enum SelectedBackend<'a> {
+    Configured(&'a BackendConfig),
+    Provider(&'a ProviderConfig),
+}
+
+/// The outcome of the shared backend-selection contract
+/// ([`Config::select_backend`]). Three cases — kept distinct so the caller
+/// cannot collapse an operator error into a silent fallback:
+///
+/// - [`Selected`](Self::Selected): the precedence picked a concrete backend
+///   or provider — instantiate exactly that one.
+/// - [`UnknownNamed`](Self::UnknownNamed): an *explicit* selector
+///   (`$NEWT_PROVIDER` or `default_backend`) named an entry that matches **no**
+///   configured backend or provider. This is an operator error (a typo in the
+///   selector), NOT a cue to run some other backend. The caller MUST surface it
+///   rather than fall back — otherwise a mistyped `$NEWT_PROVIDER` silently
+///   runs the wrong model (invariant: an explicitly selected backend is
+///   authoritative; no silent fallback).
+/// - [`Unset`](Self::Unset): nothing was explicitly selected and nothing
+///   configured qualified. Only here may the caller fall back to local
+///   discovery.
+///
+/// Not `PartialEq`/`Eq` for the same reason as [`SelectedBackend`]; match on it
+/// or compare an owned projection.
+#[derive(Debug, Clone)]
+pub enum SelectionOutcome<'a> {
+    /// The precedence selected this backend/provider.
+    Selected(SelectedBackend<'a>),
+    /// An explicit selector named something that matches no configured entry.
+    UnknownNamed(String),
+    /// Nothing explicitly selected and nothing configured qualified.
+    Unset,
+}
+
 // ---------------------------------------------------------------------------
 // Default
 // ---------------------------------------------------------------------------
@@ -3927,6 +3970,66 @@ impl Config {
             .iter()
             .find(|b| b.kind == Some(BackendKind::Openai) && !b.endpoint.is_empty())
             .or_else(|| self.backends.iter().find(|b| !b.endpoint.is_empty()))
+    }
+
+    /// The ONE backend-selection contract, unified across `[[backends]]` and
+    /// `[[providers]]`, so an explicitly named backend is authoritative on every
+    /// surface (chat / solve / worker). Precedence, most-specific first:
+    /// `$NEWT_PROVIDER` (names a backend OR a provider) > `default_backend`
+    /// (either) > a sole configured backend > the preference rules of
+    /// [`Self::select_configured_backend`] > a sole/first provider.
+    ///
+    /// Returns a [`SelectionOutcome`]: `Selected` when the precedence picks a
+    /// concrete backend/provider; `UnknownNamed` when an *explicit* selector
+    /// names something that matches nothing configured (an operator error — the
+    /// caller must NOT fall back to a different backend); `Unset` only when
+    /// nothing is explicitly selected and nothing configured qualifies, at which
+    /// point the caller may fall back to local discovery.
+    ///
+    /// A provider is chosen only when the precedence selects it: a bare
+    /// `providers.first()` never bypasses `$NEWT_PROVIDER` / `default_backend`
+    /// (the ACP-worker bug this closes).
+    pub fn select_backend(&self) -> SelectionOutcome<'_> {
+        // The most-specific PRESENT selector decides — `$NEWT_PROVIDER` if set,
+        // else `default_backend`. Only that one selector is consulted: if it is
+        // set but names nothing, we must NOT fall through to the next selector or
+        // to preference (either would be a silent fallback). A mistyped
+        // `$NEWT_PROVIDER` is an error, not permission to run `default_backend`.
+        let explicit_selector = std::env::var("NEWT_PROVIDER")
+            .ok()
+            .filter(|n| !n.is_empty())
+            .or_else(|| self.default_backend.clone().filter(|n| !n.is_empty()));
+        if let Some(name) = explicit_selector {
+            // A usable backend claims this name → fall through to the shared
+            // precedence below (which re-checks `$NEWT_PROVIDER` / `default_backend`
+            // and selects exactly that backend). Backends win a name tie.
+            let usable_backend = self
+                .backends
+                .iter()
+                .any(|b| b.name == name && !b.endpoint.is_empty());
+            if !usable_backend {
+                // A provider claims this name → select it.
+                if let Some(provider) = self.providers.iter().find(|p| p.name == name) {
+                    return SelectionOutcome::Selected(SelectedBackend::Provider(provider));
+                }
+                // The name matches nothing configured — neither a backend (even an
+                // endpointless one) nor a provider — so it is an operator error.
+                // (A name matching only an endpointless backend is "configured but
+                // unusable", not "unknown": fall through to the preference rules.)
+                if !self.backends.iter().any(|b| b.name == name) {
+                    return SelectionOutcome::UnknownNamed(name);
+                }
+            }
+        }
+        // The shared backend precedence (sole > prefer-openai > first usable).
+        if let Some(backend) = self.select_configured_backend() {
+            return SelectionOutcome::Selected(SelectedBackend::Configured(backend));
+        }
+        // Nothing in [[backends]] qualified: a sole/first provider, else Unset.
+        match self.providers.first() {
+            Some(provider) => SelectionOutcome::Selected(SelectedBackend::Provider(provider)),
+            None => SelectionOutcome::Unset,
+        }
     }
 
     /// Serialize the config to pretty TOML for **audit**, with inline secret
@@ -7845,5 +7948,291 @@ net = [\"already.example.com\"]
         assert_eq!(resolved.profile, ExposureProfile::Minimal);
         // Omitted keys fall back to the shared defaults.
         assert_eq!(resolved.schema_budget_pct, 15);
+    }
+}
+
+/// W1 (unified backend resolution) — the authoritative selection suite for
+/// [`Config::select_backend`], covering all eight precedence scenarios the
+/// corrective spec names. The companion `newt-acp-worker` suite proves the
+/// *destination* (transport + URL) each selected backend instantiates to; this
+/// suite proves *which* entry the ONE contract selects.
+///
+/// Every test is serialized on `newt_provider_env`: `select_backend` reads the
+/// process-global `$NEWT_PROVIDER`, so these must never run concurrently with
+/// one another (the env-mutating cases would otherwise leak into the env-free
+/// ones). Each `$NEWT_PROVIDER` case restores the prior value *before* asserting
+/// so a failed assert cannot pollute the next test in the lane.
+#[cfg(test)]
+mod select_backend_tests {
+    use super::*;
+
+    fn openai(name: &str, api: OpenAiApi, endpoint: &str) -> BackendConfig {
+        BackendConfig {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            model: Some("m".into()),
+            tiers: vec![Tier::Fast],
+            kind: Some(BackendKind::Openai),
+            api: Some(api),
+            ..Default::default()
+        }
+    }
+
+    fn ollama(name: &str, endpoint: &str) -> BackendConfig {
+        BackendConfig {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            model: Some("llama3.1:8b".into()),
+            tiers: vec![Tier::Fast],
+            kind: Some(BackendKind::Ollama),
+            ..Default::default()
+        }
+    }
+
+    fn plugin(name: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            command: "newt-provider-openai".into(),
+            model: Some("gpt-test".into()),
+            env_pass: vec![],
+            tiers: vec![Tier::Complex],
+        }
+    }
+
+    fn cfg(
+        backends: Vec<BackendConfig>,
+        providers: Vec<ProviderConfig>,
+        default: Option<&str>,
+    ) -> Config {
+        Config {
+            backends,
+            providers,
+            default_backend: default.map(str::to_string),
+            ..Config::default()
+        }
+    }
+
+    /// An owned, comparable summary of a [`SelectionOutcome`] so a test can drop
+    /// the borrow on `Config` before asserting (keeps env-restore panic-safe).
+    fn summary(c: &Config) -> String {
+        match c.select_backend() {
+            SelectionOutcome::Selected(SelectedBackend::Configured(b)) => {
+                format!("configured:{}:{}", b.name, b.endpoint)
+            }
+            SelectionOutcome::Selected(SelectedBackend::Provider(p)) => {
+                format!("provider:{}", p.name)
+            }
+            SelectionOutcome::UnknownNamed(n) => format!("unknown:{n}"),
+            SelectionOutcome::Unset => "unset".to_string(),
+        }
+    }
+
+    /// Run `f` with `$NEWT_PROVIDER=value`, restoring the prior value afterwards.
+    /// The closure returns an OWNED value so no borrow escapes the restore.
+    fn with_newt_provider<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("NEWT_PROVIDER").ok();
+        unsafe { std::env::set_var("NEWT_PROVIDER", value) };
+        let out = f();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("NEWT_PROVIDER", p) },
+            None => unsafe { std::env::remove_var("NEWT_PROVIDER") },
+        }
+        out
+    }
+
+    /// Guarantee `$NEWT_PROVIDER` is unset for an env-free scenario (so the lane
+    /// is deterministic regardless of a stray ambient value), restoring after.
+    fn without_newt_provider<T>(f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("NEWT_PROVIDER").ok();
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let out = f();
+        if let Some(p) = prev {
+            unsafe { std::env::set_var("NEWT_PROVIDER", p) };
+        }
+        out
+    }
+
+    // 1. default_backend selects Ollama while OpenAI is ALSO configured.
+    //    "mixed ⇒ OpenAI wins" is WRONG when Ollama was explicitly selected.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn default_backend_selects_ollama_over_configured_openai() {
+        let c = cfg(
+            vec![
+                ollama("local", "http://ollama:11434/"),
+                openai("cloud", OpenAiApi::ChatCompletions, "http://vllm:8000/"),
+            ],
+            vec![],
+            Some("local"),
+        );
+        assert_eq!(
+            without_newt_provider(|| summary(&c)),
+            "configured:local:http://ollama:11434/"
+        );
+    }
+
+    // 2. $NEWT_PROVIDER selects Ollama (over an also-configured OpenAI backend).
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn newt_provider_selects_ollama() {
+        let c = cfg(
+            vec![
+                ollama("local", "http://ollama:11434/"),
+                openai("cloud", OpenAiApi::ChatCompletions, "http://vllm:8000/"),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            with_newt_provider("local", || summary(&c)),
+            "configured:local:http://ollama:11434/"
+        );
+    }
+
+    // 3. $NEWT_PROVIDER selects the OpenAI *Chat Completions* backend by name.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn newt_provider_selects_openai_chat_completions() {
+        let c = cfg(
+            vec![
+                openai(
+                    "cloud-chat",
+                    OpenAiApi::ChatCompletions,
+                    "http://chat:8000/",
+                ),
+                openai("cloud-resp", OpenAiApi::Responses, "http://resp:8000/"),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            with_newt_provider("cloud-chat", || summary(&c)),
+            "configured:cloud-chat:http://chat:8000/"
+        );
+    }
+
+    // 4. $NEWT_PROVIDER selects the OpenAI *Responses* backend by name — the same
+    //    config as (3), a different selector, a different destination.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn newt_provider_selects_openai_responses() {
+        let c = cfg(
+            vec![
+                openai(
+                    "cloud-chat",
+                    OpenAiApi::ChatCompletions,
+                    "http://chat:8000/",
+                ),
+                openai("cloud-resp", OpenAiApi::Responses, "http://resp:8000/"),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            with_newt_provider("cloud-resp", || summary(&c)),
+            "configured:cloud-resp:http://resp:8000/"
+        );
+    }
+
+    // 5. A selected provider-plugin backend (named via default_backend), even
+    //    with an OpenAI backend also present.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn selects_provider_plugin_when_named() {
+        let c = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm:8000/",
+            )],
+            vec![plugin("myplugin")],
+            Some("myplugin"),
+        );
+        assert_eq!(without_newt_provider(|| summary(&c)), "provider:myplugin");
+    }
+
+    // 6. An explicitly selected UNSUPPORTED backend still selects *that* entry —
+    //    the "unsupported" verdict is the instantiator's job (worker suite), not
+    //    a reason for the selector to pick a different backend.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn explicitly_selected_backend_is_returned_even_if_unusual_kind() {
+        let mut embedded = BackendConfig {
+            name: "in-proc".into(),
+            endpoint: "http://in-proc/".into(),
+            kind: Some(BackendKind::Embedded),
+            model: Some("tiny".into()),
+            ..Default::default()
+        };
+        embedded.tiers = vec![Tier::Fast];
+        let c = cfg(
+            vec![
+                embedded,
+                openai("cloud", OpenAiApi::ChatCompletions, "http://vllm:8000/"),
+            ],
+            vec![],
+            Some("in-proc"),
+        );
+        // The Embedded backend is what was selected — NOT the OpenAI one.
+        assert_eq!(
+            without_newt_provider(|| summary(&c)),
+            "configured:in-proc:http://in-proc/"
+        );
+    }
+
+    // 7. No configured backend ⇒ Unset, which alone permits local discovery.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn no_configured_backend_is_unset() {
+        let c = cfg(vec![], vec![], None);
+        assert_eq!(without_newt_provider(|| summary(&c)), "unset");
+    }
+
+    // 8. An explicit selector naming a nonexistent entry is UnknownNamed — an
+    //    operator error, NOT a silent fallback to the present OpenAI backend.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn unknown_named_backend_is_an_error_not_a_fallback() {
+        let c = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm:8000/",
+            )],
+            vec![],
+            Some("ghost"),
+        );
+        assert_eq!(without_newt_provider(|| summary(&c)), "unknown:ghost");
+        // And the same via $NEWT_PROVIDER (the live override), which must not
+        // silently defer to default_backend or to preference.
+        let c2 = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm:8000/",
+            )],
+            vec![],
+            None,
+        );
+        assert_eq!(with_newt_provider("typo", || summary(&c2)), "unknown:typo");
+    }
+
+    // Guard: preference still prefers OpenAI when NOTHING is explicitly selected
+    // (the historical default is preserved — only explicit selection overrides it).
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn prefers_openai_when_nothing_is_explicitly_selected() {
+        let c = cfg(
+            vec![
+                ollama("local", "http://ollama:11434/"),
+                openai("cloud", OpenAiApi::ChatCompletions, "http://vllm:8000/"),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            without_newt_provider(|| summary(&c)),
+            "configured:cloud:http://vllm:8000/"
+        );
     }
 }
