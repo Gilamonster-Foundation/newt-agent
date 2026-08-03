@@ -2,3 +2,4 @@
 -- tool-batch validation, …). See `NewtPolicy/Basic.lean` and the behavioral
 -- constitution epic #1529.
 import NewtPolicy.Basic
+import NewtPolicy.PromptForm

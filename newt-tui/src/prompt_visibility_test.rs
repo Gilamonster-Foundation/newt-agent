@@ -168,7 +168,26 @@ fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn control child");
-    std::thread::sleep(Duration::from_millis(200));
+    // Type only once the child's prompt is actually on screen. A fixed pre-type
+    // sleep raced the child's raw-mode entry on loaded CI runners: the key
+    // landed in cooked mode, was echoed (`^C`) and swallowed, and the 2s web
+    // timeout then resolved "Deny" instead of the control under test. Both
+    // children render the target (the question text / the web-wait banner)
+    // through the prompt window, which enters raw mode before drawing — so once
+    // this text is visible, typed bytes are buffered for the prompt reader
+    // instead of the line discipline.
+    let armed_by = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let screen = pty.screen();
+        if screen.contains("example.com") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < armed_by,
+            "child never presented its prompt; screen={screen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     pty.type_in(key);
     // Wait comfortably longer than the gate's `web_decision_timeout` (2s). The
     // invariant under test is that a control key resolves BEFORE that timeout —

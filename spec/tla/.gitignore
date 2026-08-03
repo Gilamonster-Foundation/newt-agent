@@ -1,0 +1,2 @@
+# TLC writes its states/ scratch metadir into the cwd; check.sh runs in here.
+/states/
