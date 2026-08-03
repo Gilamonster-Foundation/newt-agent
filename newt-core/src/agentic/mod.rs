@@ -2756,7 +2756,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             .collect();
         let validated = match tools::validate_tool_call_batch(&extracted, false) {
             Ok(v) => Some(v),
-            Err(reason) => {
+            // This wire carries no ids (`require_call_id = false`), so the batch
+            // can only ever be `ContentInvalid`; `reason()` reads either class.
+            Err(rejection) => {
+                let reason = rejection.reason().to_string();
                 for _tc in tcs {
                     print_synthetic_tool_result(
                         "(rejected tool-call batch)",
@@ -5874,7 +5877,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             .collect();
         let validated = match tools::validate_tool_call_batch(&extracted, true) {
             Ok(v) => Some(v),
-            Err(reason) => {
+            Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
+                // A missing/blank/duplicate `tool_call_id`: a tool result cannot
+                // be correlated. Abort the turn — do not fabricate an id.
+                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+            }
+            Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                // ids are valid + unique → echo a correctly keyed rejection per
+                // call and re-dispatch so the model can retry.
                 for tc in tcs {
                     let id = tc["id"].as_str().unwrap_or("");
                     print_synthetic_tool_result(
@@ -6602,15 +6612,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // Echo the model's reasoning + function_call items back into the running
         // input (in output order, so each call keeps its required reasoning item),
         // then run each call and append its function_call_output.
-        for item in &echo {
-            input.push(item.clone());
-        }
-        // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch before
-        // any side effect. A malformed / idless / duplicate-id sibling rejects the
-        // WHOLE batch — echo the reason as every call's `function_call_output` and
-        // execute NOTHING, so no valid mutating call runs ahead of the untrusted
-        // batch being known good. The function_call items were already echoed into
-        // `input` above, so pairing each with an output keeps the wire well-formed.
+        // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch BEFORE
+        // echoing anything into `input` and before any side effect. Nothing is
+        // echoed until validation decides, so a correlation-impossible batch
+        // leaves `input` untouched and no follow-up request is issued.
         let extracted: Vec<(Option<&str>, Option<&str>, &serde_json::Value)> = calls
             .iter()
             .map(|c| {
@@ -6623,7 +6628,19 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             .collect();
         let validated = match tools::validate_tool_call_batch(&extracted, true) {
             Ok(v) => v,
-            Err(reason) => {
+            Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
+                // A missing/blank/duplicate call id: a `function_call_output`
+                // cannot be correlated. Abort the turn — fabricating an id only
+                // produces a provider 400 or a silent mispairing. Nothing was
+                // echoed, so no malformed follow-up is dispatched.
+                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+            }
+            Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                // ids are valid + unique → echo the calls and a correctly keyed
+                // rejection per call, then re-dispatch so the model can retry.
+                for item in &echo {
+                    input.push(item.clone());
+                }
                 for call in &calls {
                     let call_id = call["call_id"]
                         .as_str()
@@ -6653,7 +6670,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 continue;
             }
         };
-        // Phase 2: every call in the batch is valid — execute in order.
+        // Every call is valid: echo the reasoning + function_call items (in output
+        // order, so each call keeps its required reasoning item), then execute.
+        for item in &echo {
+            input.push(item.clone());
+        }
+        // Phase 2: execute in order.
         for (call, vc) in calls.iter().zip(validated.iter()) {
             let call_id = vc.call_id.as_str();
             let name = vc.name.as_str();
@@ -9341,6 +9363,75 @@ mod tool_round_cap_tests {
         .expect_err("a persistent 503 exhausts retries");
         assert!(err.to_string().contains("503"), "got: {err}");
         // `.expect(3)` is verified on server drop — it retried, not sent once.
+    }
+
+    #[tokio::test]
+    async fn responses_missing_call_id_aborts_without_a_followup_request() {
+        // RR2: a `function_call` with no `call_id` cannot be correlated to its
+        // output. The turn ABORTS — no fabricated id, no follow-up request. The
+        // mock's `.expect(1)` proves only the initial dispatch reached the server.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "completed",
+                "output": [{"type": "function_call", "name": "run_command", "arguments": "{}"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let task = "do a thing";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000); // fits → dispatches, then aborts on validation
+
+        let err = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a call with no id cannot be correlated");
+        assert!(
+            err.to_string().contains("malformed provider output"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_duplicate_call_ids_abort_without_a_followup_request() {
+        // RR2: duplicate `call_id`s mis-route results — abort, no follow-up.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "completed",
+                "output": [
+                    {"type": "function_call", "call_id": "dup", "name": "a", "arguments": "{}"},
+                    {"type": "function_call", "call_id": "dup", "name": "b", "arguments": "{}"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let task = "do a thing";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000);
+
+        let err = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("duplicate ids cannot be correlated");
+        assert!(
+            err.to_string().contains("malformed provider output"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

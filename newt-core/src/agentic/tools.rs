@@ -131,6 +131,32 @@ pub(crate) struct ValidatedCall {
     pub args: serde_json::Value,
 }
 
+/// Why a whole tool-call batch was rejected. The two classes call for DIFFERENT
+/// recovery — one is recoverable on the wire, one is not:
+#[derive(Debug)]
+pub(crate) enum BatchRejection {
+    /// A call's id is missing, blank, or duplicated — a tool result **cannot** be
+    /// correlated back to its call. There is no valid recovery message to send,
+    /// so the caller MUST abort the turn (no fabricated outputs, no follow-up).
+    /// Fabricating an empty/duplicate id only yields a provider 400 or a silent
+    /// mispairing.
+    CorrelationImpossible(String),
+    /// Correlation is intact (every id is present + unique, or the wire carries
+    /// no ids at all), but a call's name/arguments is invalid. The caller MAY
+    /// echo a synthetic rejection keyed by each (valid) id and re-dispatch, so
+    /// the model can retry with a well-formed call.
+    ContentInvalid(String),
+}
+
+impl BatchRejection {
+    /// The human-readable reason, whichever class.
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::CorrelationImpossible(r) | Self::ContentInvalid(r) => r,
+        }
+    }
+}
+
 /// Validate an ENTIRE batch of model-emitted tool calls **before any execution**
 /// (invariant #3, at the batch level). A single response can carry several calls;
 /// validating-then-executing one at a time lets a valid *mutating* call run
@@ -140,34 +166,50 @@ pub(crate) struct ValidatedCall {
 /// batch being known good.
 ///
 /// Wire shapes differ (Responses vs the two chat forms), so each call is passed
-/// pre-extracted as `(call_id, name, raw_args)`. Beyond per-call name/arg
-/// validity ([`validate_tool_call`]), the batch requires — when `require_call_id`
-/// (the id-carrying wires: Responses `call_id`/`id`, chat `tool_call_id`) — that
-/// every call has a **non-empty, unique** id, so a truncated or duplicated id
-/// cannot mis-correlate a tool result. Order is preserved.
+/// pre-extracted as `(call_id, name, raw_args)`. **Correlation is checked FIRST**
+/// — when `require_call_id` (the id-carrying wires: Responses `call_id`/`id`,
+/// chat `tool_call_id`), every call must have a **non-empty, unique** id, else
+/// [`BatchRejection::CorrelationImpossible`] (unrecoverable — the caller aborts).
+/// Only then is each call's name/arguments validated ([`validate_tool_call`]); a
+/// bad one yields [`BatchRejection::ContentInvalid`] (recoverable — ids are known
+/// good, so a rejection can be correctly correlated). Order is preserved.
 pub(crate) fn validate_tool_call_batch(
     calls: &[(Option<&str>, Option<&str>, &serde_json::Value)],
     require_call_id: bool,
-) -> Result<Vec<ValidatedCall>, String> {
+) -> Result<Vec<ValidatedCall>, BatchRejection> {
+    // 1. Correlation first: an id problem is unrecoverable and must abort before
+    //    we even consider content (a follow-up on a mis-keyed transcript is worse
+    //    than aborting the turn).
+    if require_call_id {
+        let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (i, &(call_id, _, _)) in calls.iter().enumerate() {
+            let n = i + 1;
+            let id = call_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    BatchRejection::CorrelationImpossible(format!(
+                        "tool call #{n} is missing a call id — its result cannot be correlated"
+                    ))
+                })?;
+            if !seen_ids.insert(id) {
+                return Err(BatchRejection::CorrelationImpossible(format!(
+                    "tool call #{n} repeats call id {id:?} — ambiguous result routing"
+                )));
+            }
+        }
+    }
+    // 2. Content: name + object arguments for every call (ids are now known good).
     let mut validated = Vec::with_capacity(calls.len());
-    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (i, &(call_id, name, raw_args)) in calls.iter().enumerate() {
         let n = i + 1;
-        let (name, args) =
-            validate_tool_call(name, raw_args).map_err(|e| format!("tool call #{n}: {e}"))?;
-        let trimmed = call_id.map(str::trim).filter(|s| !s.is_empty());
-        let call_id = if require_call_id {
-            let id =
-                trimmed.ok_or_else(|| format!("tool call #{n} ('{name}') is missing a call id"))?;
-            if !seen_ids.insert(id) {
-                return Err(format!(
-                    "tool call #{n} ('{name}') repeats call id {id:?} — ambiguous result routing"
-                ));
-            }
-            id.to_string()
-        } else {
-            trimmed.unwrap_or("").to_string()
-        };
+        let (name, args) = validate_tool_call(name, raw_args)
+            .map_err(|e| BatchRejection::ContentInvalid(format!("tool call #{n}: {e}")))?;
+        let call_id = call_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string();
         validated.push(ValidatedCall {
             call_id,
             name,
@@ -4494,6 +4536,44 @@ mod tests {
             vec!["git", "write_file", "list_dir"]
         );
         assert_eq!(out[0].call_id, "id1");
+    }
+
+    // The rejection CLASS decides recovery: a correlation problem is
+    // unrecoverable (caller aborts); a content problem is recoverable (caller may
+    // echo a keyed rejection and re-dispatch).
+
+    #[test]
+    fn batch_missing_id_is_correlation_impossible() {
+        let a = serde_json::json!("{}");
+        let calls = [(None, Some("git"), &a)];
+        assert!(matches!(
+            validate_tool_call_batch(&calls, true),
+            Err(BatchRejection::CorrelationImpossible(_))
+        ));
+    }
+
+    #[test]
+    fn batch_duplicate_id_is_correlation_impossible() {
+        let a = serde_json::json!("{}");
+        let calls = [
+            (Some("dup"), Some("git"), &a),
+            (Some("dup"), Some("list_dir"), &a),
+        ];
+        assert!(matches!(
+            validate_tool_call_batch(&calls, true),
+            Err(BatchRejection::CorrelationImpossible(_))
+        ));
+    }
+
+    #[test]
+    fn batch_bad_args_with_valid_ids_is_content_invalid() {
+        // ids are present + unique → correlation is fine; the failure is content.
+        let bad = serde_json::json!("not json");
+        let calls = [(Some("id1"), Some("git"), &bad)];
+        assert!(matches!(
+            validate_tool_call_batch(&calls, true),
+            Err(BatchRejection::ContentInvalid(_))
+        ));
     }
 
     // --- per-call validator (still used by the batch gate) ---
