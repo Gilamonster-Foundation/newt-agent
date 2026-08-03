@@ -6536,28 +6536,25 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             }
         };
 
-        let decoded = crate::responses_wire::decode_response(&json);
-        accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
-
-        // Invariant: an HTTP 2xx body is NOT a completed turn. A `failed` status
-        // is a hard error — never let it fall through to the benign "empty
-        // response" path where a failure reads as success.
-        if let crate::responses_wire::Completion::Failed { message } = &decoded.completion {
-            return Err(anyhow::anyhow!("Responses turn failed: {message}"));
-        }
-        // `incomplete` / non-terminal statuses (e.g. hitting max_output_tokens)
-        // are truncations, not clean completions. Capture the reason so a
-        // truncated dead-end turn is surfaced rather than reported as benign
-        // empty output. (Budget-driven recovery on truncation is W5; here we only
-        // refuse to mistake truncation for success.)
-        let truncation: Option<String> = match &decoded.completion {
-            crate::responses_wire::Completion::Incomplete { reason } => {
-                Some(reason.clone().unwrap_or_else(|| "incomplete".to_string()))
+        // Fail-closed decode (invariant #2). A `200 OK` is NOT a completed turn:
+        // only affirmative success output decodes to `Ok`. A refusal is the
+        // model's final answer for this turn; every other error (provider error,
+        // failed / incomplete / non-terminal status, malformed/empty body) is
+        // surfaced — never mistaken for a benign empty reply.
+        let decoded = match crate::responses_wire::decode_response(&json) {
+            Ok(d) => d,
+            Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
+                accumulated_usage = merge_round_usage(accumulated_usage, usage);
+                return Ok((
+                    format!("(the model refused the request) {message}"),
+                    false,
+                    accumulated_usage,
+                    hallucination_count,
+                ));
             }
-            crate::responses_wire::Completion::Other { status } => Some(format!("status={status}")),
-            crate::responses_wire::Completion::Completed
-            | crate::responses_wire::Completion::Failed { .. } => None,
+            Err(e) => return Err(anyhow::anyhow!("Responses turn not usable: {e}")),
         };
+        accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
         let (text, calls, echo) = (decoded.text, decoded.tool_calls, decoded.echo);
 
         if debug {
@@ -6572,22 +6569,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
 
         if calls.is_empty() {
-            // A truncated turn with no tool calls is NOT a completion — surface it
-            // rather than falling through to the benign "empty response" hint. A
-            // truncated turn WITH tool calls proceeds (the Responses API only
-            // emits complete function_call items; the next round gets fresh budget).
-            if let Some(reason) = &truncation {
-                let excerpt: String = text.chars().take(200).collect();
-                return Err(anyhow::anyhow!(
-                    "Responses turn did not complete ({reason}) and produced no tool calls; partial text: {excerpt:?}"
-                ));
-            }
-            let out = if text.is_empty() {
-                "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
-            } else {
-                text
-            };
-            return Ok((out, false, accumulated_usage, hallucination_count));
+            // The decoder guarantees affirmative output here (text or calls); with
+            // no calls, `text` is non-empty — return it as the turn's answer.
+            return Ok((text, false, accumulated_usage, hallucination_count));
         }
 
         // Echo the model's reasoning + function_call items back into the running
@@ -6819,27 +6803,23 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         .into());
     }
     let json: serde_json::Value = resp.json().await?;
-    let decoded = crate::responses_wire::decode_response(&json);
+    // Fail-closed decode (invariant #2): this text-only follow-up must not return
+    // a failed, truncated, or empty body's text as a successful reply. A refusal
+    // is the model's final answer; every other error is surfaced.
+    let decoded = match crate::responses_wire::decode_response(&json) {
+        Ok(d) => d,
+        Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
+            accumulated_usage = merge_round_usage(accumulated_usage, usage);
+            return Ok((
+                format!("(the model refused the request) {message}"),
+                false,
+                accumulated_usage,
+                hallucination_count,
+            ));
+        }
+        Err(e) => return Err(anyhow::anyhow!("Responses turn not usable: {e}")),
+    };
     accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
-    // 2xx ≠ completed: this text-only follow-up must not return a failed or
-    // truncated turn's (possibly empty) text as a successful reply.
-    match &decoded.completion {
-        crate::responses_wire::Completion::Completed => {}
-        crate::responses_wire::Completion::Failed { message } => {
-            return Err(anyhow::anyhow!("Responses turn failed: {message}"));
-        }
-        crate::responses_wire::Completion::Incomplete { reason } => {
-            return Err(anyhow::anyhow!(
-                "Responses turn did not complete ({})",
-                reason.as_deref().unwrap_or("incomplete")
-            ));
-        }
-        crate::responses_wire::Completion::Other { status } => {
-            return Err(anyhow::anyhow!(
-                "Responses turn returned non-terminal status {status:?}"
-            ));
-        }
-    }
     Ok((decoded.text, false, accumulated_usage, hallucination_count))
 }
 
@@ -8957,8 +8937,7 @@ mod tool_round_cap_tests {
             ],
             "usage": {"input_tokens": 100, "output_tokens": 20}
         });
-        let d = crate::responses_wire::decode_response(&json);
-        assert!(d.completion.is_completed());
+        let d = crate::responses_wire::decode_response(&json).expect("a completed tool-call turn");
         assert_eq!(d.text, "the answer");
         assert_eq!(d.tool_calls.len(), 1);
         assert_eq!(d.tool_calls[0]["call_id"], "call_1");

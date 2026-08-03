@@ -101,29 +101,16 @@ impl ResponsesBackend {
         }
 
         let json: serde_json::Value = resp.json().await?;
-        // ONE typed decoder, shared with the agentic loop (`newt_core`). It also
-        // enforces the invariant that an HTTP 2xx body is NOT a completed turn:
-        // an `incomplete` (max_output_tokens) or `failed` status decodes to a
-        // non-`Completed` verdict, which this simple ChatReply seam surfaces as
-        // an error rather than returning a truncated/empty reply as success.
-        let decoded = newt_core::responses_wire::decode_response(&json);
-        use newt_core::responses_wire::Completion;
-        match &decoded.completion {
-            Completion::Completed => {}
-            Completion::Incomplete { reason } => anyhow::bail!(
-                "Responses turn did not complete ({}) — raise max_output_tokens or shorten the input",
-                reason.as_deref().unwrap_or("incomplete")
-            ),
-            Completion::Failed { message } => {
-                anyhow::bail!("Responses turn failed: {message}")
-            }
-            Completion::Other { status } => {
-                // Avoid the literal "returned " token so the retry classifier
-                // (which parses "<backend> returned <code>") never misreads this
-                // turn-status error as an HTTP status code.
-                anyhow::bail!("Responses turn ended with non-terminal status {status:?}")
-            }
-        }
+        // ONE fail-closed decoder, shared with the agentic loop (`newt_core`). A
+        // `200 OK` is NOT a completed turn: only a body with affirmative success
+        // output decodes to `Ok`. Every other case — a top-level error, `failed`
+        // / `incomplete` / non-terminal status, an explicit refusal, or a
+        // malformed/empty body — is a typed error this ChatReply seam surfaces,
+        // never a truncated/empty reply dressed up as success. The error strings
+        // avoid the "returned "/"request failed" tokens so `retry::classify`
+        // treats a bad turn body as Fatal, not a transient transport error.
+        let decoded = newt_core::responses_wire::decode_response(&json)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let model_id = decoded.model.unwrap_or_else(|| self.model.clone());
 
         Ok(ChatReply {

@@ -22,10 +22,13 @@
 //! ## Invariant: HTTP `2xx` is NOT a completed response
 //!
 //! A `200 OK` transport status says only "the request was accepted". Whether the
-//! *turn* finished lives in the body's `status` field. [`decode_response`]
-//! surfaces that as a [`Completion`] so no consumer can mistake an `incomplete`
-//! (the model hit `max_output_tokens`) or `failed` body for success — the defect
-//! that let a truncated/failed turn read as an empty-but-fine reply.
+//! *turn* finished lives in the body. [`decode_response`] is **fail-closed**: it
+//! returns `Ok(DecodedResponse)` ONLY when the body carries affirmative success
+//! output, and a typed [`ResponseDecodeError`] for every other case — a
+//! top-level error (which always wins), a `failed` / `incomplete` / non-terminal
+//! status, an explicit `refusal`, or a malformed/empty body. No consumer can
+//! mistake a truncated, failed, refused, or empty body for an empty-but-fine
+//! reply.
 
 use serde_json::Value;
 
@@ -73,49 +76,21 @@ pub fn build_responses_input(messages: &[Value]) -> (Option<String>, Vec<Value>)
     (ins, input)
 }
 
-/// Whether a Responses turn actually completed. Only [`Completed`](Self::Completed)
-/// is a success; every other variant is a `2xx` body that did **not** finish and
-/// must not be treated as a valid reply.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Completion {
-    /// `status == "completed"`, or a lenient server that omits `status` entirely
-    /// while returning output.
-    Completed,
-    /// `status == "incomplete"` — the model stopped early. `reason` mirrors
-    /// `incomplete_details.reason` (e.g. `max_output_tokens`, `content_filter`).
-    Incomplete { reason: Option<String> },
-    /// `status == "failed"` — a turn-level error, message drawn from `error`.
-    Failed { message: String },
-    /// `status` present but not a recognized terminal value (`in_progress`,
-    /// `cancelled`, or anything unknown). Treated as non-success.
-    Other { status: String },
-}
-
-impl Completion {
-    /// `true` only for [`Completed`](Self::Completed).
-    #[must_use]
-    pub fn is_completed(&self) -> bool {
-        matches!(self, Self::Completed)
-    }
-}
-
-/// A typed view of a decoded Responses payload. The `output`/`echo` items stay as
-/// raw [`Value`]s because the agentic loop echoes them back **verbatim** in the
-/// next request's `input` (the Responses API requires the exact `function_call`
-/// and preceding `reasoning` items replayed).
+/// A successfully decoded, **completed** Responses turn. Produced ONLY when the
+/// body carries affirmative evidence of success (assistant text and/or tool
+/// calls) and no terminal error. The `echo` items stay as raw [`Value`]s because
+/// the agentic loop replays them **verbatim** in the next request's `input` (the
+/// Responses API requires the exact `function_call` + preceding `reasoning`).
 #[derive(Debug, Clone)]
 pub struct DecodedResponse {
-    /// Did the turn complete? (The 2xx-≠-completed verdict.)
-    pub completion: Completion,
-    /// Concatenated assistant text: every `message` item's content-part `text`,
+    /// Concatenated assistant text: every `message` item's `output_text` part,
     /// with a flat top-level `output_text` fallback.
     pub text: String,
     /// Raw `function_call` output items, in output order — the tool calls the
     /// model requested.
     pub tool_calls: Vec<Value>,
-    /// Raw items to ECHO back alongside the tool calls, in output order: every
-    /// `function_call` AND the `reasoning` items that precede them (the Responses
-    /// API requires the reasoning chain replayed with its call).
+    /// Raw items to ECHO back with the tool calls, in output order: every
+    /// `function_call` AND the `reasoning` items that precede them.
     pub echo: Vec<Value>,
     /// The model id the server reports (`model`), if present.
     pub model: Option<String>,
@@ -123,67 +98,152 @@ pub struct DecodedResponse {
     pub usage: Option<crate::TokenUsage>,
 }
 
-/// Decode a Responses-API JSON body into a typed [`DecodedResponse`].
+/// Why a Responses body is NOT a usable completed turn. Kept distinct so a caller
+/// cannot collapse a failure, a refusal, or a malformed body into an empty
+/// "success". A `200 OK` transport status only means the request was accepted;
+/// [`decode_response`] returns `Ok` ONLY with affirmative success output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseDecodeError {
+    /// The model explicitly declined (a `refusal` content part) with no other
+    /// usable output. Represented separately from a provider/turn failure.
+    Refused {
+        message: String,
+        usage: Option<crate::TokenUsage>,
+    },
+    /// A top-level `error` object/string is present. This ALWAYS wins, regardless
+    /// of `status` — a status-less error body is still a failure, not a success.
+    ProviderError(String),
+    /// `status == "failed"` (with no top-level error object).
+    Failed(String),
+    /// `status == "incomplete"` — the turn was truncated (e.g. `max_output_tokens`).
+    Incomplete { reason: Option<String> },
+    /// `status` present but not a recognized terminal value (`in_progress`,
+    /// `cancelled`, or anything unknown).
+    NonTerminal(String),
+    /// No terminal error and a completed/absent status, but NO affirmative
+    /// success output (no text, no tool calls, no recognized output item). A
+    /// `2xx` body with nothing usable is malformed, not an empty success.
+    Malformed(String),
+}
+
+impl std::fmt::Display for ResponseDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { message, .. } => write!(f, "the model refused the request: {message}"),
+            Self::ProviderError(m) => write!(f, "the Responses provider reported an error: {m}"),
+            Self::Failed(m) => write!(f, "Responses turn failed: {m}"),
+            Self::Incomplete { reason } => write!(
+                f,
+                "Responses turn did not complete ({})",
+                reason.as_deref().unwrap_or("incomplete")
+            ),
+            Self::NonTerminal(s) => {
+                write!(f, "Responses turn ended with non-terminal status {s:?}")
+            }
+            Self::Malformed(m) => write!(f, "malformed Responses body: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ResponseDecodeError {}
+
+/// Decode a Responses-API JSON body into a **completed** [`DecodedResponse`], or a
+/// typed [`ResponseDecodeError`] for every body that is not a trustworthy success.
 ///
-/// This never fails to *parse*: a malformed body yields empty text/calls with a
-/// best-effort [`Completion`]. The completion verdict is where "2xx ≠ completed"
-/// is enforced — callers MUST inspect [`DecodedResponse::completion`] (via
-/// [`Completion::is_completed`] or a `match`) rather than assuming a 200 body is
-/// a finished turn.
-#[must_use]
-pub fn decode_response(json: &Value) -> DecodedResponse {
-    let completion = decode_completion(json);
-    let (text, tool_calls, echo) = decode_output(json);
-    let model = json["model"].as_str().map(str::to_string);
+/// Fail-CLOSED. In order: a top-level `error` always wins; an explicit `failed`
+/// / non-terminal status is an error; a truncated (`incomplete`) turn is an
+/// error; a `refusal`-only body is [`Refused`](ResponseDecodeError::Refused); a
+/// completed-or-absent status is `Ok` ONLY if it carries affirmative output
+/// (text or tool calls) — an empty or shape-unrecognized body is
+/// [`Malformed`](ResponseDecodeError::Malformed), never an empty success. A
+/// missing `status` (lenient/older servers) is accepted only with such output.
+pub fn decode_response(json: &Value) -> Result<DecodedResponse, ResponseDecodeError> {
     let usage = decode_usage(&json["usage"]);
-    DecodedResponse {
-        completion,
+    let model = json["model"].as_str().map(str::to_string);
+
+    // 1. A top-level error ALWAYS wins, whatever the status says.
+    if let Some(message) = top_level_error(json) {
+        return Err(ResponseDecodeError::ProviderError(message));
+    }
+    // 2. Explicit terminal / non-terminal statuses.
+    match json["status"].as_str() {
+        Some("failed") => {
+            return Err(ResponseDecodeError::Failed(
+                "the provider reported status \"failed\" with no error detail".to_string(),
+            ));
+        }
+        Some("incomplete") => {
+            return Err(ResponseDecodeError::Incomplete {
+                reason: json["incomplete_details"]["reason"]
+                    .as_str()
+                    .map(str::to_string),
+            });
+        }
+        // Only `completed` / absent may proceed to the success check below.
+        Some(other) if other != "completed" => {
+            return Err(ResponseDecodeError::NonTerminal(other.to_string()));
+        }
+        _ => {}
+    }
+    // 3. Parse the output; a refusal is represented explicitly.
+    let (text, tool_calls, echo, refusal) = decode_output(json);
+    let has_output = !text.is_empty() || !tool_calls.is_empty();
+    if let Some(message) = refusal {
+        if !has_output {
+            return Err(ResponseDecodeError::Refused { message, usage });
+        }
+    }
+    // 4. A completed/absent status REQUIRES affirmative success output.
+    if !has_output {
+        return Err(ResponseDecodeError::Malformed(
+            "no assistant text, tool calls, or recognized output".to_string(),
+        ));
+    }
+    Ok(DecodedResponse {
         text,
         tool_calls,
         echo,
         model,
         usage,
+    })
+}
+
+/// A top-level `error` (object with `message`, or a bare string). Returns `None`
+/// only when `error` is absent/null.
+fn top_level_error(json: &Value) -> Option<String> {
+    match &json["error"] {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Object(o) => Some(
+            o.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("the provider returned an error object with no message")
+                .to_string(),
+        ),
+        other => Some(other.to_string()),
     }
 }
 
-fn decode_completion(json: &Value) -> Completion {
-    match json["status"].as_str() {
-        // A lenient/older server may omit `status` while returning output; treat
-        // that as completed (the historical behaviour of both old parsers).
-        None | Some("completed") => Completion::Completed,
-        Some("incomplete") => Completion::Incomplete {
-            reason: json["incomplete_details"]["reason"]
-                .as_str()
-                .map(str::to_string),
-        },
-        Some("failed") => {
-            let message = json["error"]["message"]
-                .as_str()
-                .or_else(|| json["error"].as_str())
-                .unwrap_or("Responses turn reported status \"failed\" with no error detail")
-                .to_string();
-            Completion::Failed { message }
-        }
-        Some(other) => Completion::Other {
-            status: other.to_string(),
-        },
-    }
-}
-
-fn decode_output(json: &Value) -> (String, Vec<Value>, Vec<Value>) {
+/// Extract `(text, tool_calls, echo, refusal)`. `refusal` is `Some` when a
+/// `message` item carries a `refusal` content part (the model declining).
+fn decode_output(json: &Value) -> (String, Vec<Value>, Vec<Value>, Option<String>) {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     let mut echo = Vec::new();
+    let mut refusal = String::new();
     if let Some(items) = json["output"].as_array() {
         for item in items {
             match item["type"].as_str() {
                 Some("message") => {
                     if let Some(parts) = item["content"].as_array() {
                         for p in parts {
-                            // Within a `message` item only the `output_text` part
-                            // carries a `text` field; pulling `text` from any part
-                            // gets it and skips a `refusal` part (which has none).
-                            if let Some(t) = p["text"].as_str() {
+                            // A `refusal` part carries a `refusal` field; an
+                            // `output_text` part carries `text`. Capture both.
+                            if p["type"] == "refusal" {
+                                if let Some(r) = p["refusal"].as_str() {
+                                    refusal.push_str(r);
+                                }
+                            } else if let Some(t) = p["text"].as_str() {
                                 text.push_str(t);
                             }
                         }
@@ -206,7 +266,8 @@ fn decode_output(json: &Value) -> (String, Vec<Value>, Vec<Value>) {
             text.push_str(t);
         }
     }
-    (text, tool_calls, echo)
+    let refusal = (!refusal.is_empty()).then_some(refusal);
+    (text, tool_calls, echo, refusal)
 }
 
 /// Responses API usage (`input_tokens`/`output_tokens`), accepting the Chat
@@ -282,9 +343,7 @@ mod tests {
             }],
             "usage": {"input_tokens": 11, "output_tokens": 7},
         });
-        let d = decode_response(&body);
-        assert_eq!(d.completion, Completion::Completed);
-        assert!(d.completion.is_completed());
+        let d = decode_response(&body).expect("completed success");
         assert_eq!(d.text, "the answer");
         assert_eq!(d.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(d.usage.unwrap().input_tokens, 11);
@@ -292,69 +351,113 @@ mod tests {
     }
 
     #[test]
-    fn flat_output_text_is_the_fallback() {
-        let d = decode_response(&json!({"output_text": "ok"}));
+    fn missing_status_with_output_text_succeeds() {
+        // Legacy/lenient compatibility: absent status + affirmative output is Ok.
+        let d = decode_response(&json!({"output_text": "ok"})).expect("legacy success");
         assert_eq!(d.text, "ok");
-        // A missing `status` is a lenient-server completed turn.
-        assert_eq!(d.completion, Completion::Completed);
     }
 
     #[test]
-    fn incomplete_status_is_not_completed_and_carries_the_reason() {
-        // A 200 body whose turn hit the output cap. Invariant: NOT a success.
+    fn missing_status_with_structured_message_succeeds() {
+        let d = decode_response(&json!({
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}]
+        }))
+        .expect("structured success");
+        assert_eq!(d.text, "hi");
+    }
+
+    #[test]
+    fn missing_status_with_top_level_error_fails() {
+        let err = decode_response(&json!({"error": {"message": "provider failure"}}))
+            .expect_err("a status-less error body is a failure, not empty success");
+        assert!(matches!(err, ResponseDecodeError::ProviderError(m) if m == "provider failure"));
+    }
+
+    #[test]
+    fn top_level_error_wins_over_a_completed_status() {
+        // Even a `completed` status with output must fail if `error` is present.
+        let err = decode_response(&json!({
+            "status": "completed",
+            "error": {"message": "late failure"},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "x"}]}]
+        }))
+        .expect_err("top-level error always wins");
+        assert!(matches!(err, ResponseDecodeError::ProviderError(_)));
+    }
+
+    #[test]
+    fn empty_object_body_is_malformed() {
+        assert!(matches!(
+            decode_response(&json!({})),
+            Err(ResponseDecodeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn completed_but_empty_body_is_malformed_not_empty_success() {
+        assert!(matches!(
+            decode_response(&json!({"status": "completed", "output": []})),
+            Err(ResponseDecodeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn refusal_only_response_returns_refused() {
+        let body = json!({
+            "output": [{
+                "type": "message",
+                "content": [{"type": "refusal", "refusal": "I cannot comply"}]
+            }],
+            "usage": {"input_tokens": 4, "output_tokens": 6}
+        });
+        match decode_response(&body) {
+            Err(ResponseDecodeError::Refused { message, usage }) => {
+                assert_eq!(message, "I cannot comply");
+                assert_eq!(usage.unwrap().output_tokens, 6);
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_status_is_an_error_carrying_the_reason() {
         let body = json!({
             "status": "incomplete",
             "incomplete_details": {"reason": "max_output_tokens"},
-            "output": [{
-                "type": "message",
-                "content": [{"type": "output_text", "text": "partial…"}],
-            }],
+            "output": [{"type": "message",
+                "content": [{"type": "output_text", "text": "partial…"}]}],
         });
-        let d = decode_response(&body);
-        assert!(!d.completion.is_completed());
-        assert_eq!(
-            d.completion,
-            Completion::Incomplete {
-                reason: Some("max_output_tokens".into())
-            }
-        );
-        // The partial text is still decoded, but the caller MUST NOT treat the
-        // turn as complete — the `completion` verdict is what gates that.
-        assert_eq!(d.text, "partial…");
+        assert!(matches!(
+            decode_response(&body),
+            Err(ResponseDecodeError::Incomplete { reason: Some(r) }) if r == "max_output_tokens"
+        ));
     }
 
     #[test]
-    fn failed_status_carries_the_error_message() {
-        let body = json!({
-            "status": "failed",
-            "error": {"message": "the model burst into flames"},
-        });
-        let d = decode_response(&body);
-        assert_eq!(
-            d.completion,
-            Completion::Failed {
-                message: "the model burst into flames".into()
-            }
-        );
-        assert!(!d.completion.is_completed());
+    fn failed_status_is_an_error() {
+        let err = decode_response(&json!({"status": "failed"}))
+            .expect_err("failed status must be an error");
+        assert!(matches!(err, ResponseDecodeError::Failed(_)));
     }
 
     #[test]
-    fn failed_status_without_error_detail_still_reports_failed() {
-        let d = decode_response(&json!({"status": "failed"}));
-        assert!(matches!(d.completion, Completion::Failed { .. }));
+    fn unknown_status_is_non_terminal_error() {
+        assert!(matches!(
+            decode_response(&json!({"status": "in_progress"})),
+            Err(ResponseDecodeError::NonTerminal(s)) if s == "in_progress"
+        ));
     }
 
     #[test]
-    fn unknown_status_is_other_not_completed() {
-        let d = decode_response(&json!({"status": "in_progress"}));
-        assert_eq!(
-            d.completion,
-            Completion::Other {
-                status: "in_progress".into()
-            }
-        );
-        assert!(!d.completion.is_completed());
+    fn unknown_output_item_with_no_usable_content_is_malformed() {
+        // A shape we don't recognize, no text, no calls → malformed, not success.
+        assert!(matches!(
+            decode_response(&json!({
+                "status": "completed",
+                "output": [{"type": "web_search_call", "id": "ws_1"}]
+            })),
+            Err(ResponseDecodeError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -370,7 +473,7 @@ mod tests {
             "status": "completed",
             "output": [reasoning.clone(), call.clone()],
         });
-        let d = decode_response(&body);
+        let d = decode_response(&body).expect("tool-call turn is a success");
         // tool_calls is just the function_call; echo preserves reasoning+call
         // in output order so the loop can replay them verbatim.
         assert_eq!(d.tool_calls, vec![call.clone()]);
@@ -382,8 +485,10 @@ mod tests {
     fn chat_completions_usage_names_are_accepted() {
         let d = decode_response(&json!({
             "status": "completed",
+            "output_text": "hi",
             "usage": {"prompt_tokens": 3, "completion_tokens": 5},
-        }));
+        }))
+        .expect("success");
         let u = d.usage.expect("usage");
         assert_eq!((u.input_tokens, u.output_tokens), (3, 5));
     }
