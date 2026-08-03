@@ -4,11 +4,12 @@
   <img src="docs/logos/newt-agent-logo_source.png" alt="Newt-Agent logo" width="256" />
 </p>
 
-> Free, friendly, local agentic coder.
-> **vi to Hermes-Agent's emacs.**
+> **Experimental.** A local-first agentic coder in Rust,
+> written for the privacy-minded.
 
-An agentic coder written in Rust. The scoreboard below is the claim — measured
-on Terminal-Bench, confined and unconfined.
+The default build ships no cloud provider — remote models are opt-in subprocess
+plugins. The scoreboard below is the claim, measured on Terminal-Bench, confined
+and unconfined.
 
 ## Terminal-Bench
 
