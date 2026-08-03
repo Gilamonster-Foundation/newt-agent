@@ -288,6 +288,36 @@ class RunnerTests(unittest.TestCase):
         provenance = json.loads((out / "provenance.json").read_text(encoding="utf-8"))
         self.assertTrue(provenance["harness"]["dirty"])
 
+    def _revalidate(self, out: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(VALIDATOR), "--expected-mode", "qualification", str(out)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=60,
+        )
+
+    def test_validation_is_hermetic_against_task_tree_changes(self) -> None:
+        # B2: revalidation must depend only on the retained bundle, never the live
+        # task tree. The fixture task has no setup.sh, so the manifest pins
+        # tasks_with_setup = []. Adding a setup.sh to the live tree afterward — the
+        # exact mutation the old `is_file()` check reacted to — must NOT change the
+        # verdict, and neither must deleting the tree entirely.
+        result = self.run_fixture("hermetic")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        out = self.root / "hermetic"
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["matrix"]["tasks_with_setup"], [])
+        tasks_dir = Path(manifest["matrix"]["tasks_dir"])
+        # Mutate the live tree: add a setup.sh the pinned bundle never captured.
+        for task in manifest["matrix"]["tasks"]:
+            (tasks_dir / task / "setup.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        self.assertEqual(self._revalidate(out).returncode, 0, "added setup.sh must not matter")
+        # And it still validates after the original tree is deleted entirely.
+        shutil.rmtree(tasks_dir)
+        self.assertEqual(self._revalidate(out).returncode, 0, "deleted tree must not matter")
+
     def test_complete_fixture_passes_and_retains_raw_artifacts(self) -> None:
         expected_dirty = bool(
             subprocess.run(

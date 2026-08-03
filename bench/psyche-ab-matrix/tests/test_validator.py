@@ -137,6 +137,7 @@ def make_valid_fixture(root: Path) -> None:
                 "ocap_modes": OCAPS,
                 "tasks": ["write-greeting"],
                 "tasks_dir": "/fixture/canonical/tasks",
+                "tasks_with_setup": [],
                 "max_rounds": 15,
             },
         },
@@ -758,22 +759,15 @@ class ValidatorFixtureTests(unittest.TestCase):
         self._rewrite_source_identity(sources)
         self.assert_rejected("tasks/write-greeting/verify.sh")
 
-    def test_source_manifest_lists_discoverable_task_setup(self) -> None:
-        tasks_dir = (self.root / "fixture-tasks").resolve()
-        task_dir = tasks_dir / "write-greeting"
-        task_dir.mkdir(parents=True)
-        for name in ("instruction.txt", "verify.sh", "setup.sh"):
-            (task_dir / name).write_text("fixture\n", encoding="utf-8")
+    def test_pinned_task_setup_requires_a_retained_setup_source(self) -> None:
+        # Hermetic: a task PINNED as having a setup.sh (manifest.tasks_with_setup)
+        # must have its setup.sh source retained in the bundle. This is derived
+        # from the pinned fact, NOT from stat-ing the live task tree, so it holds
+        # regardless of the current filesystem. The fixture retains no setup.sh
+        # source, so pinning it as present must be rejected.
         manifest = self._json("manifest.json")
-        manifest["matrix"]["tasks_dir"] = str(tasks_dir)
+        manifest["matrix"]["tasks_with_setup"] = ["write-greeting"]
         write_json(self.root / "manifest.json", manifest)
-        for path in (self.root / "events").glob("*.jsonl"):
-            records = [json.loads(line) for line in path.read_text().splitlines()]
-            records[0]["task_file"] = str((task_dir / "instruction.txt").resolve())
-            path.write_text(
-                "".join(json.dumps(record) + "\n" for record in records),
-                encoding="utf-8",
-            )
         self.assert_rejected("tasks/write-greeting/setup.sh")
 
     def test_launch_manifest_must_match_and_retain_its_hash(self) -> None:

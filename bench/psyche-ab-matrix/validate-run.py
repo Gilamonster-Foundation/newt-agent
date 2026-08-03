@@ -606,6 +606,16 @@ class RunValidator:
             or str(Path(tasks_dir).resolve()) != tasks_dir
         ):
             self.error("manifest.matrix.tasks_dir must be a canonical absolute path")
+        # The setup.sh-presence fact must be pinned so revalidation is hermetic
+        # (see build_source_manifest_requirements). A subset of the declared tasks.
+        tasks_with_setup = matrix.get("tasks_with_setup")
+        tasks = matrix.get("tasks")
+        if not isinstance(tasks_with_setup, list) or not all(
+            isinstance(t, str) for t in tasks_with_setup
+        ):
+            self.error("manifest.matrix.tasks_with_setup must be a list of task names")
+        elif isinstance(tasks, list) and not set(tasks_with_setup).issubset(set(tasks)):
+            self.error("manifest.matrix.tasks_with_setup must be a subset of matrix.tasks")
 
         provenance = self.load_json("provenance.json")
         if provenance.get("schema_version") != 1:
@@ -783,7 +793,11 @@ class RunValidator:
 
         required_labels = {f"harness/{name}" for name in HARNESS_FILES}
         tasks = matrix.get("tasks")
-        tasks_dir = matrix.get("tasks_dir")
+        # Hermetic: which tasks carried a setup.sh is a fact PINNED in the manifest
+        # at run time. Revalidation reads it and NEVER stat()s the live task tree,
+        # so a bundle validates identically after the checkout moves or a task
+        # gains/loses a setup.sh later.
+        tasks_with_setup = matrix.get("tasks_with_setup")
         if isinstance(tasks, list):
             for task in tasks:
                 if not isinstance(task, str):
@@ -794,10 +808,7 @@ class RunValidator:
                         f"tasks/{task}/verify.sh",
                     }
                 )
-                if (
-                    isinstance(tasks_dir, str)
-                    and (Path(tasks_dir) / task / "setup.sh").is_file()
-                ):
+                if isinstance(tasks_with_setup, list) and task in tasks_with_setup:
                     required_labels.add(f"tasks/{task}/setup.sh")
         for missing in sorted(required_labels - labels):
             self.error(f"harness source manifest lacks required source {missing}")

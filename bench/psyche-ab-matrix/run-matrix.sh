@@ -266,10 +266,17 @@ if ! "$PY" - "$OUT/manifest.json" "$MODE" "$MODEL_ID" "$MODEL_DIGEST" "$CONTEXT_
   "$POSTURES_JSON" "$OCAPS_JSON" "$TASKS_JSON" "$TASKS_DIR" "$SERVER_KIND" \
   "$SERVER_VERSION" "$CHAT_TEMPLATE_ID" "$TOOL_PARSER_ID" "$REASONING_PARSER_ID" \
   "$LAUNCH_MANIFEST_SHA" <<'PY'
-import json, sys
+import json, os, sys
 (path, mode, model, digest, context, backend, api, profile, endpoint, rounds,
  postures, ocaps, tasks, tasks_dir, server_kind, server_version, chat_template,
  tool_parser, reasoning_parser, launch_sha) = sys.argv[1:]
+task_list = json.loads(tasks)
+# Pin, at RUN time, which tasks carry a setup.sh. The validator reads this fact
+# instead of stat()-ing the live task tree — so a bundle validates identically
+# after the checkout moves or a task gains/loses a setup.sh later (hermeticity).
+tasks_with_setup = [
+    t for t in task_list if os.path.isfile(os.path.join(tasks_dir, t, "setup.sh"))
+]
 value = {
     "schema_version": 1,
     "mode": mode,
@@ -291,8 +298,9 @@ value = {
     "matrix": {
         "postures": json.loads(postures),
         "ocap_modes": json.loads(ocaps),
-        "tasks": json.loads(tasks),
+        "tasks": task_list,
         "tasks_dir": tasks_dir,
+        "tasks_with_setup": tasks_with_setup,
         "max_rounds": int(rounds),
     },
 }
