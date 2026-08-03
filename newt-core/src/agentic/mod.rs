@@ -2734,25 +2734,32 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         let mut round_wrote = false;
         let mut round_modified_workspace = false;
         let mut round_progress = false;
-        for tc in tool_calls.unwrap() {
-            let anthropic_native = tc["function"].is_null();
-            // Atomic validation BEFORE any side effect (#3): a malformed name or
-            // unparseable/non-object `arguments` must never reach a tool. On the
-            // malformed branch echo the reason back as a tool result and skip the
-            // call — no tool runs on garbage.
-            let (call_name, call_raw_args) = if anthropic_native {
-                (tc["name"].as_str(), &tc["input"])
-            } else {
-                (
-                    tc["function"]["name"].as_str(),
-                    &tc["function"]["arguments"],
-                )
-            };
-            let (name_owned, args) = match tools::validate_tool_call(call_name, call_raw_args) {
-                Ok(pair) => pair,
-                Err(reason) => {
+        let tcs = tool_calls.unwrap();
+        // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch before
+        // any side effect. This Ollama/Anthropic-native wire carries no per-call
+        // ids, so ids are not required — but a malformed sibling still rejects the
+        // WHOLE batch: echo the reason for every call and execute nothing, so no
+        // valid call mutates the workspace ahead of an unvalidated batch.
+        let extracted: Vec<(Option<&str>, Option<&str>, &serde_json::Value)> = tcs
+            .iter()
+            .map(|tc| {
+                if tc["function"].is_null() {
+                    (None, tc["name"].as_str(), &tc["input"])
+                } else {
+                    (
+                        None,
+                        tc["function"]["name"].as_str(),
+                        &tc["function"]["arguments"],
+                    )
+                }
+            })
+            .collect();
+        let validated = match tools::validate_tool_call_batch(&extracted, false) {
+            Ok(v) => Some(v),
+            Err(reason) => {
+                for _tc in tcs {
                     print_synthetic_tool_result(
-                        "(malformed tool call)",
+                        "(rejected tool-call batch)",
                         &serde_json::Value::Null,
                         workspace,
                         &reason,
@@ -2760,17 +2767,25 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     );
                     if let Some(rec) = tool_events.as_deref_mut() {
                         rec.push(crate::ToolEvent::from_call(
-                            "(malformed tool call)",
+                            "(rejected tool-call batch)",
                             &serde_json::Value::Null,
                             false,
                             Some(0),
                         ));
                     }
-                    messages.push(serde_json::json!({ "role": "tool", "content": reason }));
-                    continue;
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "content": format!("tool-call batch rejected before execution: {reason}"),
+                    }));
                 }
-            };
-            let name = name_owned.as_str();
+                None
+            }
+        };
+        // Phase 2: every call in the batch is valid — execute in order. `flatten`
+        // yields nothing (so this runs zero tools) when the batch was rejected.
+        for (_tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
+            let name = vc.name.as_str();
+            let args = vc.args.clone();
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
@@ -5832,41 +5847,38 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         messages.push(assistant_turn);
         let mut round_modified_workspace = false;
         let mut round_progress = false;
-        for tc in tool_calls.unwrap() {
-            let id = tc["id"].as_str().unwrap_or("");
-            // Some API proxies (e.g. NVIDIA inference → Anthropic backend) wrap
-            // Anthropic-native tool-use blocks inside the OpenAI `tool_calls`
-            // array without converting the inner schema.  Fall back from the
-            // OpenAI path (`function.name` / `function.arguments`) to the
-            // Anthropic-native path (`name` / `input`) when the `function` key
-            // is absent, so both wire formats route correctly.
-            let anthropic_native = tc["function"].is_null();
-            if anthropic_native && debug {
-                let raw_name = tc["name"].as_str().unwrap_or("<missing>");
-                print_debug(
-                    &format!(
-                        "tool call in Anthropic-native format inside tool_calls array \
-                         (no `function` key) — name={raw_name:?}"
-                    ),
-                    color,
-                );
-            }
-            // Atomic validation BEFORE any side effect (#3): a malformed name or
-            // unparseable/non-object `arguments` must never reach a tool. Echo the
-            // reason back (as this tool_call's result) and skip execution.
-            let (call_name, call_raw_args) = if anthropic_native {
-                (tc["name"].as_str(), &tc["input"])
-            } else {
-                (
-                    tc["function"]["name"].as_str(),
-                    &tc["function"]["arguments"],
-                )
-            };
-            let (name_owned, args) = match tools::validate_tool_call(call_name, call_raw_args) {
-                Ok(pair) => pair,
-                Err(reason) => {
+        let tcs = tool_calls.unwrap();
+        // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch before
+        // any side effect. Every OpenAI `tool_call` must have a non-empty, UNIQUE
+        // `id` and a valid name/object-args; a bad sibling rejects the WHOLE batch
+        // — echo the reason for each call (keyed by its id) and execute nothing,
+        // so no valid call mutates the workspace ahead of an unvalidated batch.
+        //
+        // Some API proxies (NVIDIA inference → Anthropic backend) wrap
+        // Anthropic-native tool-use blocks in the OpenAI `tool_calls` array
+        // without converting the inner schema, so fall back to `name`/`input`
+        // when the `function` key is absent.
+        let extracted: Vec<(Option<&str>, Option<&str>, &serde_json::Value)> = tcs
+            .iter()
+            .map(|tc| {
+                if tc["function"].is_null() {
+                    (tc["id"].as_str(), tc["name"].as_str(), &tc["input"])
+                } else {
+                    (
+                        tc["id"].as_str(),
+                        tc["function"]["name"].as_str(),
+                        &tc["function"]["arguments"],
+                    )
+                }
+            })
+            .collect();
+        let validated = match tools::validate_tool_call_batch(&extracted, true) {
+            Ok(v) => Some(v),
+            Err(reason) => {
+                for tc in tcs {
+                    let id = tc["id"].as_str().unwrap_or("");
                     print_synthetic_tool_result(
-                        "(malformed tool call)",
+                        "(rejected tool-call batch)",
                         &serde_json::Value::Null,
                         workspace,
                         &reason,
@@ -5874,7 +5886,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     );
                     if let Some(rec) = tool_events.as_deref_mut() {
                         rec.push(crate::ToolEvent::from_call(
-                            "(malformed tool call)",
+                            "(rejected tool-call batch)",
                             &serde_json::Value::Null,
                             false,
                             Some(0),
@@ -5883,12 +5895,26 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     messages.push(serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
-                        "content": reason,
+                        "content": format!("tool-call batch rejected before execution: {reason}"),
                     }));
-                    continue;
                 }
-            };
-            let name = name_owned.as_str();
+                None
+            }
+        };
+        // Phase 2: every call is valid — execute in order (empty when rejected).
+        for (tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
+            let id = vc.call_id.as_str();
+            let name = vc.name.as_str();
+            let args = vc.args.clone();
+            if debug && tc["function"].is_null() {
+                print_debug(
+                    &format!(
+                        "tool call in Anthropic-native format inside tool_calls array \
+                         (no `function` key) — name={name:?}"
+                    ),
+                    color,
+                );
+            }
             if trace {
                 print_trace(
                     &format!(
@@ -6570,43 +6596,59 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         for item in &echo {
             input.push(item.clone());
         }
-        for call in &calls {
-            let call_id = call["call_id"]
-                .as_str()
-                .or_else(|| call["id"].as_str())
-                .unwrap_or("");
-            // Atomic validation BEFORE any side effect (#3): a malformed name or
-            // unparseable/non-object `arguments` must never reach a tool. Echo the
-            // reason back as this call's `function_call_output` and skip it — no
-            // tool runs on garbage; the model can retry with a well-formed call.
-            let (name_owned, args) =
-                match tools::validate_tool_call(call["name"].as_str(), &call["arguments"]) {
-                    Ok(pair) => pair,
-                    Err(reason) => {
-                        print_synthetic_tool_result(
-                            "(malformed tool call)",
+        // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch before
+        // any side effect. A malformed / idless / duplicate-id sibling rejects the
+        // WHOLE batch — echo the reason as every call's `function_call_output` and
+        // execute NOTHING, so no valid mutating call runs ahead of the untrusted
+        // batch being known good. The function_call items were already echoed into
+        // `input` above, so pairing each with an output keeps the wire well-formed.
+        let extracted: Vec<(Option<&str>, Option<&str>, &serde_json::Value)> = calls
+            .iter()
+            .map(|c| {
+                (
+                    c["call_id"].as_str().or_else(|| c["id"].as_str()),
+                    c["name"].as_str(),
+                    &c["arguments"],
+                )
+            })
+            .collect();
+        let validated = match tools::validate_tool_call_batch(&extracted, true) {
+            Ok(v) => v,
+            Err(reason) => {
+                for call in &calls {
+                    let call_id = call["call_id"]
+                        .as_str()
+                        .or_else(|| call["id"].as_str())
+                        .unwrap_or("");
+                    print_synthetic_tool_result(
+                        "(rejected tool-call batch)",
+                        &serde_json::Value::Null,
+                        workspace,
+                        &reason,
+                        color,
+                    );
+                    if let Some(rec) = tool_events.as_deref_mut() {
+                        rec.push(crate::ToolEvent::from_call(
+                            "(rejected tool-call batch)",
                             &serde_json::Value::Null,
-                            workspace,
-                            &reason,
-                            color,
-                        );
-                        if let Some(rec) = tool_events.as_deref_mut() {
-                            rec.push(crate::ToolEvent::from_call(
-                                "(malformed tool call)",
-                                &serde_json::Value::Null,
-                                false,
-                                Some(0),
-                            ));
-                        }
-                        input.push(serde_json::json!({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": reason,
-                        }));
-                        continue;
+                            false,
+                            Some(0),
+                        ));
                     }
-                };
-            let name = name_owned.as_str();
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": format!("tool-call batch rejected before execution: {reason}"),
+                    }));
+                }
+                continue;
+            }
+        };
+        // Phase 2: every call in the batch is valid — execute in order.
+        for (call, vc) in calls.iter().zip(validated.iter()) {
+            let call_id = vc.call_id.as_str();
+            let name = vc.name.as_str();
+            let args = vc.args.clone();
             if trace {
                 print_trace(
                     &format!(

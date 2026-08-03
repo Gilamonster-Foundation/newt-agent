@@ -124,6 +124,59 @@ pub(crate) fn validate_tool_call(
     Ok((name.to_string(), args))
 }
 
+/// One validated tool call, ready to dispatch.
+pub(crate) struct ValidatedCall {
+    pub call_id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+/// Validate an ENTIRE batch of model-emitted tool calls **before any execution**
+/// (invariant #3, at the batch level). A single response can carry several calls;
+/// validating-then-executing one at a time lets a valid *mutating* call run
+/// before a later sibling is found malformed. This checks the whole batch up
+/// front and returns `Err` if ANY call is bad, so the caller executes ZERO calls
+/// from an unvalidated response — no sibling mutates the workspace ahead of the
+/// batch being known good.
+///
+/// Wire shapes differ (Responses vs the two chat forms), so each call is passed
+/// pre-extracted as `(call_id, name, raw_args)`. Beyond per-call name/arg
+/// validity ([`validate_tool_call`]), the batch requires — when `require_call_id`
+/// (the id-carrying wires: Responses `call_id`/`id`, chat `tool_call_id`) — that
+/// every call has a **non-empty, unique** id, so a truncated or duplicated id
+/// cannot mis-correlate a tool result. Order is preserved.
+pub(crate) fn validate_tool_call_batch(
+    calls: &[(Option<&str>, Option<&str>, &serde_json::Value)],
+    require_call_id: bool,
+) -> Result<Vec<ValidatedCall>, String> {
+    let mut validated = Vec::with_capacity(calls.len());
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (i, &(call_id, name, raw_args)) in calls.iter().enumerate() {
+        let n = i + 1;
+        let (name, args) =
+            validate_tool_call(name, raw_args).map_err(|e| format!("tool call #{n}: {e}"))?;
+        let trimmed = call_id.map(str::trim).filter(|s| !s.is_empty());
+        let call_id = if require_call_id {
+            let id =
+                trimmed.ok_or_else(|| format!("tool call #{n} ('{name}') is missing a call id"))?;
+            if !seen_ids.insert(id) {
+                return Err(format!(
+                    "tool call #{n} ('{name}') repeats call id {id:?} — ambiguous result routing"
+                ));
+            }
+            id.to_string()
+        } else {
+            trimmed.unwrap_or("").to_string()
+        };
+        validated.push(ValidatedCall {
+            call_id,
+            name,
+            args,
+        });
+    }
+    Ok(validated)
+}
+
 pub fn venv_cmd_prefix() -> Option<String> {
     let venv = std::env::var("NEWT_VENV")
         .or_else(|_| std::env::var("VIRTUAL_ENV"))
@@ -4353,7 +4406,97 @@ mod tests {
     use super::*;
     use crate::agentic::NoMcp;
 
-    // --- W4: atomic tool-call validation (invariant #3) ---
+    // --- R1: BATCH-level atomic tool-call validation (invariant #3) ---
+
+    /// Run a batch through the gate and DISPATCH (count) only on Ok — the honest
+    /// invocation-counting model of the real loop's two phases. Returns the number
+    /// of tools that would run; a rejected batch runs ZERO.
+    fn dispatched_count(
+        calls: &[(Option<&str>, Option<&str>, &serde_json::Value)],
+        require_call_id: bool,
+    ) -> usize {
+        match validate_tool_call_batch(calls, require_call_id) {
+            Ok(validated) => validated.len(), // phase 2 executes each; count == invocations
+            Err(_) => 0,                      // phase 1 rejected → zero executes
+        }
+    }
+
+    #[test]
+    fn batch_valid_then_malformed_dispatches_zero() {
+        let a = serde_json::json!("{\"op\":\"status\"}");
+        let bad = serde_json::json!("{\"op\": "); // truncated JSON
+        let calls = [
+            (Some("id1"), Some("git"), &a),
+            (Some("id2"), Some("write_file"), &bad),
+        ];
+        assert_eq!(
+            dispatched_count(&calls, true),
+            0,
+            "a malformed sibling rejects the whole batch — the valid mutating call must NOT run first"
+        );
+    }
+
+    #[test]
+    fn batch_malformed_then_valid_dispatches_zero() {
+        let bad = serde_json::json!("not json");
+        let b = serde_json::json!("{}");
+        let calls = [
+            (Some("id1"), Some("git"), &bad),
+            (Some("id2"), Some("list_dir"), &b),
+        ];
+        assert_eq!(dispatched_count(&calls, true), 0);
+    }
+
+    #[test]
+    fn batch_missing_call_id_dispatches_zero_when_required() {
+        let a = serde_json::json!("{}");
+        let calls = [(None, Some("git"), &a)];
+        assert_eq!(dispatched_count(&calls, true), 0);
+        // ...but the id-less Ollama wire (require_call_id=false) accepts it.
+        assert_eq!(dispatched_count(&calls, false), 1);
+    }
+
+    #[test]
+    fn batch_duplicate_call_ids_dispatch_zero() {
+        let a = serde_json::json!("{}");
+        let calls = [
+            (Some("dup"), Some("git"), &a),
+            (Some("dup"), Some("list_dir"), &a),
+        ];
+        assert_eq!(
+            dispatched_count(&calls, true),
+            0,
+            "duplicate ids mis-correlate results — reject the batch"
+        );
+    }
+
+    #[test]
+    fn batch_malformed_argument_json_dispatches_zero() {
+        let bad = serde_json::json!("{\"path\": \"a"); // truncated
+        let calls = [(Some("id1"), Some("write_file"), &bad)];
+        assert_eq!(dispatched_count(&calls, true), 0);
+    }
+
+    #[test]
+    fn batch_all_valid_dispatches_every_call() {
+        let a = serde_json::json!("{\"op\":\"status\"}");
+        let b = serde_json::json!(serde_json::json!({"path": "x"})); // object value
+        let c = serde_json::Value::Null; // no-arg tool
+        let calls = [
+            (Some("id1"), Some("git"), &a),
+            (Some("id2"), Some("write_file"), &b),
+            (Some("id3"), Some("list_dir"), &c),
+        ];
+        let out = validate_tool_call_batch(&calls, true).expect("all valid");
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            vec!["git", "write_file", "list_dir"]
+        );
+        assert_eq!(out[0].call_id, "id1");
+    }
+
+    // --- per-call validator (still used by the batch gate) ---
 
     #[test]
     fn validate_accepts_a_string_encoded_object() {
