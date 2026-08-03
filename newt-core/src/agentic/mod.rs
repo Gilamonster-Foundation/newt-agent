@@ -9300,12 +9300,43 @@ mod tool_round_cap_tests {
             body.get("reasoning").is_none(),
             "no cognition set → no reasoning.effort on the wire (request unchanged)"
         );
-        // #1526 (invariant #5): storage is an EXPLICIT policy — the body opts out
-        // of server-side retention rather than inheriting the API's `store: true`.
+    }
+
+    #[tokio::test]
+    async fn responses_request_sets_store_false() {
+        // BHV-STORAGE-001: the AGENTIC-loop Responses request explicitly opts out
+        // of server-side retention (`store: false`), not by inheriting the API's
+        // `store: true` default. A dedicated, correctly-scoped assertion (the
+        // storage contract must not lean on an unrelated num_ctx test).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "store policy";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000); // fits → the request dispatches
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("request succeeds");
+
+        let requests = server.received_requests().await.expect("journal");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(
             body.get("store"),
             Some(&serde_json::Value::Bool(false)),
-            "Responses must explicitly set store:false (stateless, no retention)"
+            "the agentic Responses request must set store:false explicitly"
         );
     }
 
