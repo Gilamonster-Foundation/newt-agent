@@ -104,12 +104,19 @@ pub struct DecodedResponse {
 /// [`decode_response`] returns `Ok` ONLY with affirmative success output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseDecodeError {
-    /// The model explicitly declined (a `refusal` content part) with no other
-    /// usable output. Represented separately from a provider/turn failure.
+    /// The model explicitly declined (a `refusal` content part) with no tool
+    /// calls. Represented separately from a provider/turn failure — the caller
+    /// returns it as the turn's answer. `message` carries the refusal text (plus
+    /// any accompanying assistant text).
     Refused {
         message: String,
         usage: Option<crate::TokenUsage>,
     },
+    /// The model BOTH refused AND requested tool calls — an undefined mixed
+    /// state. Newt has no partial-refusal policy, so it rejects the WHOLE turn
+    /// rather than silently drop the decline and execute the calls. Never leads
+    /// to a side effect.
+    MixedRefusalAndToolCalls { refusal: String },
     /// A top-level `error` object/string is present. This ALWAYS wins, regardless
     /// of `status` — a status-less error body is still a failure, not a success.
     ProviderError(String),
@@ -130,6 +137,10 @@ impl std::fmt::Display for ResponseDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused { message, .. } => write!(f, "the model refused the request: {message}"),
+            Self::MixedRefusalAndToolCalls { refusal } => write!(
+                f,
+                "the model both refused and requested tool calls — refusing the whole turn: {refusal}"
+            ),
             Self::ProviderError(m) => write!(f, "the Responses provider reported an error: {m}"),
             Self::Failed(m) => write!(f, "Responses turn failed: {m}"),
             Self::Incomplete { reason } => write!(
@@ -185,15 +196,27 @@ pub fn decode_response(json: &Value) -> Result<DecodedResponse, ResponseDecodeEr
         }
         _ => {}
     }
-    // 3. Parse the output; a refusal is represented explicitly.
+    // 3. Parse the output; a refusal is classified explicitly BEFORE any output
+    //    is accepted, so a decline is never silently dropped.
     let (text, tool_calls, echo, refusal) = decode_output(json);
-    let has_output = !text.is_empty() || !tool_calls.is_empty();
-    if let Some(message) = refusal {
-        if !has_output {
-            return Err(ResponseDecodeError::Refused { message, usage });
+    if let Some(refusal) = refusal {
+        // A refusal alongside tool calls is an undefined mixed state — reject the
+        // WHOLE turn rather than drop the decline and let the loop execute the
+        // calls (there is no partial-refusal policy).
+        if !tool_calls.is_empty() {
+            return Err(ResponseDecodeError::MixedRefusalAndToolCalls { refusal });
         }
+        // Refusal-only, or refusal + accompanying assistant text (no calls): the
+        // decline IS the turn's answer, with the text appended for context.
+        let message = if text.is_empty() {
+            refusal
+        } else {
+            format!("{refusal}\n\n{text}")
+        };
+        return Err(ResponseDecodeError::Refused { message, usage });
     }
     // 4. A completed/absent status REQUIRES affirmative success output.
+    let has_output = !text.is_empty() || !tool_calls.is_empty();
     if !has_output {
         return Err(ResponseDecodeError::Malformed(
             "no assistant text, tool calls, or recognized output".to_string(),
@@ -417,6 +440,81 @@ mod tests {
             }
             other => panic!("expected Refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn refusal_with_text_returns_refused_including_the_text() {
+        let body = json!({
+            "output": [{
+                "type": "message",
+                "content": [
+                    {"type": "refusal", "refusal": "I won't run that"},
+                    {"type": "output_text", "text": "but here is why"}
+                ]
+            }]
+        });
+        match decode_response(&body) {
+            Err(ResponseDecodeError::Refused { message, .. }) => {
+                assert!(message.contains("I won't run that"), "got: {message}");
+                assert!(
+                    message.contains("but here is why"),
+                    "text preserved: {message}"
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refusal_with_a_tool_call_is_mixed_and_rejected_never_executed() {
+        // The dangerous case: a decline AND a function call. The refusal must not
+        // be dropped and the call must not execute — the whole turn is rejected.
+        let body = json!({
+            "output": [
+                {"type": "message",
+                 "content": [{"type": "refusal", "refusal": "I cannot perform that operation"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "run_command",
+                 "arguments": "{\"command\":\"rm -rf /\"}"}
+            ]
+        });
+        match decode_response(&body) {
+            Err(ResponseDecodeError::MixedRefusalAndToolCalls { refusal }) => {
+                assert_eq!(refusal, "I cannot perform that operation");
+            }
+            other => panic!("expected MixedRefusalAndToolCalls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refusal_with_multiple_tool_calls_is_mixed_and_rejected() {
+        let body = json!({
+            "output": [
+                {"type": "message",
+                 "content": [{"type": "refusal", "refusal": "no"}]},
+                {"type": "function_call", "call_id": "c1", "name": "a", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c2", "name": "b", "arguments": "{}"}
+            ]
+        });
+        assert!(matches!(
+            decode_response(&body),
+            Err(ResponseDecodeError::MixedRefusalAndToolCalls { .. })
+        ));
+    }
+
+    #[test]
+    fn status_less_mixed_refusal_and_tool_call_is_still_rejected() {
+        // No `status` (lenient server) must NOT weaken the mixed-state rejection.
+        let body = json!({
+            "output": [
+                {"type": "message",
+                 "content": [{"type": "refusal", "refusal": "declined"}]},
+                {"type": "function_call", "call_id": "c1", "name": "a", "arguments": "{}"}
+            ]
+        });
+        assert!(matches!(
+            decode_response(&body),
+            Err(ResponseDecodeError::MixedRefusalAndToolCalls { .. })
+        ));
     }
 
     #[test]
