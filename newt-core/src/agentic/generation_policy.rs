@@ -1,6 +1,22 @@
 use crate::model_card::{ChatCompletionsCapability, ReasoningReplayScope};
 use crate::role_profile::Cognition;
 
+/// The per-cognition output-token allowance — the ONE source of the generation
+/// output budget, keyed only on the cognition dial (NOT on ChatCompletions
+/// capability). [`GenerationPolicy::resolve`] uses it for the Chat Completions
+/// `max_tokens`; the Responses loop uses it to RESERVE local output headroom in
+/// its context ceiling (that wire sends no `max_output_tokens`, but the window
+/// must still leave room to generate). `None` cognition reserves nothing — an
+/// opt-in reserve, so a caller with no cognition dial is unchanged.
+pub(crate) fn cognition_output_reserve(cognition: Option<Cognition>) -> Option<u32> {
+    cognition.map(|c| match c {
+        Cognition::Glancing => 2_048,
+        Cognition::Pondering => 4_096,
+        Cognition::Deliberating => 10_000,
+        Cognition::Contemplating => 16_000,
+    })
+}
+
 /// Backend-neutral generation choices resolved once per Chat Completions turn.
 /// Request serialization projects these values only onto fields the endpoint
 /// explicitly declared it accepts.
@@ -42,14 +58,14 @@ impl GenerationPolicy {
             return policy;
         };
 
-        let (thinking, max_output_tokens, temperature, top_p) = match cognition {
-            Cognition::Glancing => (false, 2_048, 0.0, 1.0),
-            Cognition::Pondering => (true, 4_096, 0.6, 0.95),
-            Cognition::Deliberating => (true, 10_000, 0.6, 0.95),
-            Cognition::Contemplating => (true, 16_000, 0.6, 0.95),
+        let (thinking, temperature, top_p) = match cognition {
+            Cognition::Glancing => (false, 0.0, 1.0),
+            Cognition::Pondering => (true, 0.6, 0.95),
+            Cognition::Deliberating => (true, 0.6, 0.95),
+            Cognition::Contemplating => (true, 0.6, 0.95),
         };
         policy.thinking = Some(thinking);
-        policy.max_output_tokens = Some(max_output_tokens);
+        policy.max_output_tokens = cognition_output_reserve(Some(cognition));
         policy.temperature = Some(temperature);
         policy.top_p = Some(top_p);
         policy
@@ -120,6 +136,40 @@ mod tests {
             parallel_tool_calls: Some(false),
             bounded_reasoning_continuation: Some(true),
         }
+    }
+
+    #[test]
+    fn cognition_output_reserve_is_the_one_source_of_the_output_budget() {
+        // The Responses loop reserves this locally (no `max_output_tokens` on the
+        // wire); the Chat Completions policy sends it. One table, both surfaces.
+        assert_eq!(
+            cognition_output_reserve(Some(Cognition::Glancing)),
+            Some(2_048)
+        );
+        assert_eq!(
+            cognition_output_reserve(Some(Cognition::Pondering)),
+            Some(4_096)
+        );
+        assert_eq!(
+            cognition_output_reserve(Some(Cognition::Deliberating)),
+            Some(10_000)
+        );
+        assert_eq!(
+            cognition_output_reserve(Some(Cognition::Contemplating)),
+            Some(16_000)
+        );
+        // Opt-in: no cognition dial reserves nothing (behaviour unchanged).
+        assert_eq!(cognition_output_reserve(None), None);
+        // Grounds that `resolve` draws its `max_tokens` from the same table.
+        assert_eq!(
+            GenerationPolicy::resolve(
+                Some(Cognition::Contemplating),
+                local_capability(),
+                ReasoningReplayScope::Never
+            )
+            .max_output_tokens,
+            cognition_output_reserve(Some(Cognition::Contemplating))
+        );
     }
 
     #[test]

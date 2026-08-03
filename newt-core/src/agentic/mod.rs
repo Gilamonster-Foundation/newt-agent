@@ -6450,9 +6450,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // budget below, so a request that would overflow a declared window is refused
     // pre-dispatch instead of relying solely on a reactive 400 / silent
     // truncation. `None` num_ctx (the cloud default) resolves to `None` and
-    // leaves the prior behaviour unchanged. No output reserve on this wire (it
-    // sends no `max_output_tokens`), so the ceiling is the percentage ceiling.
-    let responses_input_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None);
+    // leaves the prior behaviour unchanged.
+    //
+    // R4: RESERVE local output headroom in the ceiling. This wire sends no
+    // `max_output_tokens`, but a configured window must still leave room for the
+    // model's generation — else the input ceiling over-counts and a long turn
+    // refuses with no headroom. Reserve uses the cognition dial directly (opt-in:
+    // `None` cognition reserves nothing), so a declared window now composes with
+    // the output reserve exactly as the Chat Completions path does.
+    let output_reserve = generation_policy::cognition_output_reserve(cognition);
+    let responses_input_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct, output_reserve);
     let tools_chat = crate::agentic::tools::select_exposed(
         tools_chat,
         &exposure,
