@@ -6358,11 +6358,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // projected to Responses tools, so the estimate and the wire agree.
     // Identity under `ExposureProfile::Full`. The send budget is computed just
     // below on this wire, so derive the live budget inline here.
+    // #1526 (invariant #4): the configured context window is a LOCAL safety
+    // limit even though the Responses wire never carries `num_ctx` (provider-side
+    // limits). Derive its input ceiling here and thread it through every local
+    // budget below, so a request that would overflow a declared window is refused
+    // pre-dispatch instead of relying solely on a reactive 400 / silent
+    // truncation. `None` num_ctx (the cloud default) resolves to `None` and
+    // leaves the prior behaviour unchanged. No output reserve on this wire (it
+    // sends no `max_output_tokens`), so the ceiling is the percentage ceiling.
+    let responses_input_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None);
     let tools_chat = crate::agentic::tools::select_exposed(
         tools_chat,
         &exposure,
         exposure_budget_tokens(
-            initial_send_budget(max_ok_input, safe_context, None),
+            initial_send_budget(max_ok_input, safe_context, responses_input_ceiling),
             safe_context,
         ),
         &std::collections::BTreeSet::new(),
@@ -6371,12 +6380,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
     let cal = sanitize_estimate_ratio(estimate_ratio);
-    // Responses, like Chat Completions, has no client-sent `num_ctx`: model
-    // limits are provider-side. Retain ChatCtx.num_ctx only for the
-    // get_context_remaining display seam above; it must not become a local
-    // authoritative refusal threshold for a value absent from this wire.
-    let send_budget = initial_send_budget(max_ok_input, safe_context, None);
-    let send_budget_authoritative = safe_context.is_some();
+    let send_budget = initial_send_budget(max_ok_input, safe_context, responses_input_ceiling);
+    // A declared window is authoritative just like a cached `safe_context`: both
+    // are local safety limits the preflight may refuse against.
+    let send_budget_authoritative = safe_context.is_some() || responses_input_ceiling.is_some();
     let authoritative_budget =
         authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens);
     preflight_irreducible_request(
@@ -9109,7 +9116,11 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
-    async fn responses_ignores_unsent_num_ctx_as_a_local_refusal_budget() {
+    async fn responses_never_sends_num_ctx_on_the_wire() {
+        // A configured window is a LOCAL limit (see the refusal test below), but
+        // it must NEVER be sent on the Responses wire (limits are provider-side).
+        // Here the window is large enough to fit the small request, so it
+        // succeeds AND the body carries no `num_ctx`.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -9131,11 +9142,13 @@ mod tool_round_cap_tests {
         let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
         ctx.safe_context = None;
         ctx.max_ok_input = None;
-        ctx.num_ctx = Some(1);
+        // A generous configured window: a local ceiling, but the small request
+        // fits well under it, so nothing is refused.
+        ctx.num_ctx = Some(1_000_000);
 
         let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
             .await
-            .expect("an unsent num_ctx must not block the provider request");
+            .expect("the request fits the configured window");
         assert_eq!(reply, "provider accepted");
         let requests = server
             .received_requests()
@@ -9151,6 +9164,38 @@ mod tool_round_cap_tests {
             body.get("reasoning").is_none(),
             "no cognition set → no reasoning.effort on the wire (request unchanged)"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_refuses_locally_when_a_configured_window_cannot_fit() {
+        // #1526 (invariant #4): a CONFIGURED context window is a local safety
+        // limit even though it is never sent on the Responses wire. A window too
+        // small to hold the irreducible request must be refused PRE-DISPATCH —
+        // no request reaches the provider — rather than relying on a reactive
+        // 400 or a silent truncation. (The previous contract wrongly let this
+        // sail through; that assertion is now reversed.)
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0) // nothing may be dispatched
+            .mount(&server)
+            .await;
+
+        let task = "a normal Responses request";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        // A 1-token window leaves zero input capacity → local refusal.
+        ctx.num_ctx = Some(1);
+
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a 1-token configured window cannot fit the request");
+        assert_no_requests(&server).await;
     }
 
     #[tokio::test]

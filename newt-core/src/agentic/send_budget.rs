@@ -26,10 +26,14 @@ pub(super) fn num_ctx_input_ceiling(
 /// output reserve, and cached-cap composition used by the dispatch loops.
 ///
 /// Only explicitly capable Chat Completions endpoints receive Newt's local
-/// generation policy. Responses also ignores `context_window` because that API
-/// does not send the local `num_ctx` hint; its real loop intentionally derives
-/// no refusal ceiling from an unsent value. Ollama and embedded backends retain
-/// the percentage-only local-window ceiling.
+/// generation policy (its output reserve). Responses reserves no local output
+/// (it sends no `max_output_tokens` on this wire) so `max_output_tokens` stays
+/// `None` for it — but the CONFIGURED context window is still a **local safety
+/// limit** (#1526, invariant #4): a window the operator declared bounds the
+/// input ceiling even though the Responses wire does not carry `num_ctx`.
+/// Ceiling-from-an-unsent-value is deliberate here — the alternative is an
+/// over-window request that only a reactive 400 (or a silent truncation) can
+/// catch. Ollama and embedded backends keep the percentage-only local ceiling.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn initial_context_input_budget(
@@ -54,17 +58,12 @@ pub fn initial_context_input_budget(
         } else {
             None
         };
-    let dispatched_context_window =
-        if kind == crate::BackendKind::Openai && api == crate::OpenAiApi::Responses {
-            None
-        } else {
-            context_window
-        };
-    let ceiling = num_ctx_input_ceiling(
-        dispatched_context_window,
-        input_ceiling_pct,
-        max_output_tokens,
-    );
+    // #1526 (invariant #4): the configured context window is a LOCAL safety
+    // limit for every backend, including Responses. Responses reserves no local
+    // output (`max_output_tokens` is `None` above) and never sends `num_ctx` on
+    // the wire, but a declared window must still bound the input ceiling so an
+    // over-window request is caught pre-dispatch, not only by a reactive 400.
+    let ceiling = num_ctx_input_ceiling(context_window, input_ceiling_pct, max_output_tokens);
     initial_send_budget(max_ok_input, safe_context, ceiling)
         .map(|budget| u32::try_from(budget).expect("input budgets originate as u32 values"))
 }
@@ -191,12 +190,38 @@ mod send_budget_tests {
     use crate::{BackendKind, CompactionTriggerPolicy, OpenAiApi};
 
     #[test]
-    fn responses_reporting_ignores_the_unsent_local_window_like_dispatch() {
+    fn responses_honors_the_configured_window_as_a_local_safety_limit() {
+        // #1526 (invariant #4): a CONFIGURED context window is a local safety
+        // limit for Responses even though the wire sends no `num_ctx`. Responses
+        // reserves no local output, so the budget is the percentage ceiling of
+        // the declared window — NOT `None` (the old, now-reversed contract).
+        let ceiling = super::initial_context_input_budget(
+            BackendKind::Openai,
+            OpenAiApi::Responses,
+            Some(32_768),
+            80,
+            Some(Cognition::Contemplating),
+            ChatCompletionsCapability {
+                cognition: Some(true),
+                ..Default::default()
+            },
+            ReasoningReplayScope::CurrentUserTurn,
+            None,
+            None,
+        );
+        // 80% of 32_768, with no output reserve on this wire.
+        assert_eq!(
+            ceiling,
+            Some(26_214),
+            "a declared Responses window is a local refusal budget (invariant #4)"
+        );
+        // The cloud default (no configured window) still yields no local ceiling —
+        // the change is opt-in via configuration and does not affect hosted OpenAI.
         assert_eq!(
             super::initial_context_input_budget(
                 BackendKind::Openai,
                 OpenAiApi::Responses,
-                Some(1),
+                None,
                 80,
                 Some(Cognition::Contemplating),
                 ChatCompletionsCapability {
@@ -208,7 +233,7 @@ mod send_budget_tests {
                 None,
             ),
             None,
-            "Responses dispatch has no local refusal budget from an unsent num_ctx",
+            "an UNset num_ctx (cloud Responses) still has no local ceiling",
         );
     }
 
