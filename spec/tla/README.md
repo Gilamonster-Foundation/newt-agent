@@ -5,13 +5,27 @@ answers *"across all orderings and failures, what states may the system reach?"*
 the agent-turn lifecycle, validate-before-execute ordering, retry / cancellation /
 compaction / recovery, and exactly-once tool-result correlation.
 
-**Status: harness only.** This directory currently contains the reproducible,
-checksum-verified TLC harness and a *checked* smoke spec that proves it works in
-CI. The real models (`AgentTurn.tla`, `ContextRecovery.tla`) are **not** committed
+**Status.** The reproducible, checksum-verified TLC harness, a *checked* smoke
+spec, and the **first real checked model** — `ChatRecovery.tla` (the chat-loop
+dispatch-recovery temporal contract for #1533 / epic #1529). The effective round
+cap is a value CHOSEN once per behavior from `RoundCaps = {1, 2}`, so a SINGLE
+`check.sh` run explores both the one-round crucible and the multi-round case —
+the one-round check is a real merge gate, with no second `.cfg` to drift. It
+genuinely rejects the historic bug: making a recovery advance the round violates
+`RetryObligationIsSameRound`. Its seven invariants back the `BHV-ROUND-*` /
+`BHV-RECOVERY-*` contracts in `../behavior-map.toml`.
+
+The remaining models (`AgentTurn.tla`, `ContextRecovery.tla`) are **not** committed
 yet — per the standing rule, an unchecked spec committed "to claim progress" is
 worse than none. They land at steps 3 + 5 of the canonical implementation order
 in [`../README.md`](../README.md) — after the `BehaviorEvent` alphabet (step 2)
 exists to validate implementation traces against.
+
+**`.cfg` note:** a liveness `PROPERTY` (e.g. `ChatRecovery`'s `Termination`)
+requires the fairness-carrying `SPECIFICATION Spec`, not a bare `INIT`/`NEXT` — a
+bare next-state relation omits `WF_vars(Next)` and TLC reports a false liveness
+violation. Intended terminal states carry a stuttering action so the deadlock
+check flags only genuine stuck states.
 
 ## Pinned toolchain (what this PR pins AND checks)
 
