@@ -27,15 +27,23 @@ behaviors the constitution admits.
   oracle) — today every row is `partial`.
 - **`lint-behavior-map.py`** — the EXACT, fail-closed registry-reference linter.
   References are structured (`{module, symbol}` for Lean; `{path, symbol}` for
-  Rust/production) and validated to their intended namespace/module — a renamed
-  theorem, test, or production symbol fails, as do zero/ambiguous/duplicate refs,
-  invalid status, a missing required field, and an unmet `conformance = "full"`.
-  Fail-closed: an unresolved reference is an ERROR unless it carries an explicit
-  `pending_pr = <n>` (its artifact lives on an unmerged PR — this seed is stacked
-  on #1526), in which case it WARNS, naming the PR. `--strict` fails even those;
-  run it on `main` after #1526 merges, then delete the markers. Self-tests:
-  `test-lint-behavior-map.py` (16 cases incl. the required negatives). Enforced in
-  CI by `.github/workflows/behavior-fast.yml`.
+  Rust/production; `{spec, invariant}` for TLA) and validated to their intended
+  artifact — a renamed theorem, test, or production symbol fails, as do
+  zero/ambiguous/duplicate refs, invalid status, a missing required field, and an
+  unmet `conformance = "full"`. A `rust_tests` ref must resolve to a fn carrying a
+  recognized **test attribute** (`#[test]`, `#[tokio::test]`, …) — deleting the
+  attribute orphans the ref even though the fn remains. A `tla` ref must name an
+  invariant that is both **defined** as an operator in `<spec>.tla` and
+  **declared** in an `INVARIANT` line of `<spec>.cfg`. Fail-closed: an unresolved
+  reference is an ERROR unless it carries an explicit `pending_pr = <n>` (its
+  artifact lives on an unmerged PR — this seed is stacked on #1526), in which case
+  it WARNS, naming the PR. `--strict` fails even those; run it on `main` after
+  #1526 merges, then delete the markers. Self-tests: `test-lint-behavior-map.py`
+  (24 cases incl. the required negatives). The linter is pure Python (no Lean/JDK),
+  so CI runs it on **every Rust-source change** — `behavior-registry.yml` (paths:
+  `spec/**`, `formal/**`, `**/*.rs`, Cargo manifests) — precisely so a Rust-only PR
+  cannot silently orphan a reference. The expensive Lean+TLC checks run only on
+  `spec/`/`formal/` changes via `behavior-formal.yml`.
 - **`../formal/NewtPolicy/`** — the Lean layer (pure policy, machine-checked with
   `lake build`, no Mathlib). Shipped now: the backend-selection metamorphic
   theorems (`lean = proven` — the exact #1526 regression: adding/reordering

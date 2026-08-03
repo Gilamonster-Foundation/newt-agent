@@ -1,25 +1,24 @@
-name: behavior-fast (constitution)
+name: behavior-formal (constitution)
 
-# The behavioral-constitution enforcement gate (epic #1529): it actually EXECUTES
-# the three layers' checks — Lean proofs, the exact registry-reference linter, and
-# the fail-closed TLC harness — so the machinery is genuinely exercised, not just
-# claimed. Complements `formal.yml` (Lean-only); this additionally lints the
-# registry and TLC-checks the pinned harness on a CLEAN cache.
-#
-# Runs when the constitution or its enforcement machinery changes.
+# The EXECUTED formal layers of the behavioral constitution (epic #1529): the Lean
+# proofs (`lake build`) and the fail-closed, checksum-pinned TLC harness. These are
+# the expensive checks (Lean toolchain + JDK), so — unlike the registry linter —
+# they run only when the specs or proofs themselves change (spec/ or formal/), not
+# on every Rust edit. Complements `formal.yml` (Lean-only) by also TLC-checking the
+# pinned harness on a CLEAN cache, proving the download+verify path end-to-end.
 
 on:
   push:
-    paths: ['formal/**', 'spec/**', '.github/workflows/behavior-fast.yml']
+    paths: ['spec/**', 'formal/**', '.github/workflows/behavior-formal.yml']
   pull_request:
-    paths: ['formal/**', 'spec/**', '.github/workflows/behavior-fast.yml']
+    paths: ['spec/**', 'formal/**', '.github/workflows/behavior-formal.yml']
 
 permissions:
   contents: read
 
 jobs:
-  behavior-fast:
-    name: Lean + registry + TLC
+  behavior-formal:
+    name: Lean proofs + TLC harness
     runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
@@ -43,13 +42,6 @@ jobs:
           set -euo pipefail
           lake build
           echo "::notice title=Lean::formal/ lake build succeeded — all theorems checked"
-
-      - name: Registry — linter self-tests + exact reference validation
-        run: |
-          set -euo pipefail
-          python3 spec/test-lint-behavior-map.py
-          python3 spec/lint-behavior-map.py
-          echo "::notice title=Registry::behavior-map.toml validated (linter self-tests + exact refs)"
 
       - name: TLC — fail-closed runner tests + checked specs on a CLEAN cache
         env:
