@@ -21,17 +21,34 @@ fn wait_for_child(
     child: &mut std::process::Child,
     timeout: Duration,
 ) -> Option<std::process::ExitStatus> {
+    wait_for_child_nudging(child, timeout, || {})
+}
+
+/// Poll the child to exit, invoking `nudge` once per second while it hasn't.
+/// Kills (and reaps) the child at `timeout`.
+fn wait_for_child_nudging(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    mut nudge: impl FnMut(),
+) -> Option<std::process::ExitStatus> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait().expect("poll prompt child") {
-            return Some(status);
+        nudge();
+        let slice_end = std::cmp::min(std::time::Instant::now() + Duration::from_secs(1), deadline);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll prompt child") {
+                return Some(status);
+            }
+            if std::time::Instant::now() >= slice_end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         if std::time::Instant::now() >= deadline {
             child.kill().ok();
             child.wait().ok();
             return None;
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -169,13 +186,10 @@ fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
         .spawn()
         .expect("spawn control child");
     // Type only once the child's prompt is actually on screen. A fixed pre-type
-    // sleep raced the child's raw-mode entry on loaded CI runners: the key
-    // landed in cooked mode, was echoed (`^C`) and swallowed, and the 2s web
-    // timeout then resolved "Deny" instead of the control under test. Both
-    // children render the target (the question text / the web-wait banner)
-    // through the prompt window, which enters raw mode before drawing — so once
-    // this text is visible, typed bytes are buffered for the prompt reader
-    // instead of the line discipline.
+    // sleep raced the child's terminal setup on loaded CI runners: the key
+    // landed in cooked mode, was echoed (`^C`) and swallowed by the line
+    // discipline, and the web-decision timeout then resolved "Deny" instead of
+    // the control under test.
     let armed_by = std::time::Instant::now() + Duration::from_secs(8);
     loop {
         let screen = pty.screen();
@@ -188,15 +202,17 @@ fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    pty.type_in(key);
-    // Wait comfortably longer than the gate's `web_decision_timeout` (2s). The
-    // invariant under test is that a control key resolves BEFORE that timeout —
-    // an immediate control exits with "Back"/"Exit" almost instantly (this poll
-    // returns as soon as the child exits), whereas a non-immediate control would
-    // be overtaken by the 2s web timeout and render "Deny", failing the screen
-    // assertion below. A tight 1s wait instead flaked on loaded CI runners,
-    // cutting off a genuinely-immediate child before it could exit.
-    let status = wait_for_child(&mut child, Duration::from_secs(10));
+    // The marker narrows the race but cannot close it alone: the TTY child's
+    // modal reader enters raw mode BEFORE rendering the question (its window
+    // only sets canonical mode), but the web child prints its banner just
+    // BEFORE its first reader arm — a sliver of cooked mode where Ctrl-C/
+    // Ctrl-D can still be eaten. So re-type the key each second until the
+    // child exits: a swallowed key is re-sent once the reader is armed (typed
+    // bytes are kernel-buffered across the raw-mode switch, never flushed),
+    // and an extra byte after resolution is simply never read. The 10s cap
+    // stays comfortably above the web-decision timeout so a genuinely
+    // non-immediate control still loses to it and fails the screen assertion.
+    let status = wait_for_child_nudging(&mut child, Duration::from_secs(10), || pty.type_in(key));
     let screen = pty.screen();
     assert!(
         status.is_some_and(|s| s.success()) && screen.contains(expected),
