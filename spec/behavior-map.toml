@@ -329,3 +329,140 @@ pending_pr = 1526
 path = "newt-core/src/responses_wire.rs"
 symbol = "STORE_RESPONSE_SERVER_SIDE"
 pending_pr = 1526
+
+# ─────────────────────── Chat-loop dispatch recovery (#1533) ──────────────────
+# The temporal contract for the chat loops' dispatch recovery, machine-checked by
+# spec/tla/ChatRecovery.tla (TLC, MaxRounds 1 & 2). A dispatch RECOVERY retries
+# the SAME logical round; only a completed dispatch consumes a round; the summary
+# begins only after the round cap; an exhausted recovery terminates explicitly.
+# The Rust refs are the existing chat-recovery regression tests (on-branch, no
+# pending_pr). The Rust POLICY EXTRACTION (typed classify_recovery) and the Lean
+# SameRoundState kernel are the next slices — lean stays "none" until then.
+
+[BHV-ROUND-001]
+description = "A dispatch recovery retries the same logical round; only a successfully completed dispatch may consume a logical round."
+[BHV-ROUND-001.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-ROUND-001.refs.tla]]
+spec = "ChatRecovery"
+invariant = "RetryObligationIsSameRound"
+[[BHV-ROUND-001.refs.tla]]
+spec = "ChatRecovery"
+invariant = "RecoveryRequestStaysInRound"
+[[BHV-ROUND-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools"
+[[BHV-ROUND-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::ollama_chat_cw_400_recovery_retries_the_same_logical_round_with_tools"
+# Each recovery BRANCH is coded independently (no shared typed recovery-policy
+# yet), so cw-400 coverage cannot stand in for the others: cite the same-round
+# test for every recovery kind this general contract governs.
+[[BHV-ROUND-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::ollama_chat_tools_unsupported_recovers_in_the_same_round"
+[[BHV-ROUND-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::openai_chat_tools_unsupported_recovers_in_the_same_round"
+[[BHV-ROUND-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_retries_the_same_logical_round_with_tools"
+
+[BHV-ROUND-002]
+# "Effective" cap, not the soft configured cap: the production loops extend
+# max_tool_rounds by an explicitly granted workflow-grace window
+# (current_tool_round_limit). The TLA `roundCap` abstracts this effective cap.
+description = "The tools-disabled final summary may begin only after the EFFECTIVE logical-round cap (the configured max_tool_rounds plus any explicitly granted workflow-grace window) has completed."
+[BHV-ROUND-002.status]
+lean = "none"
+rust = "none"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-ROUND-002.refs.tla]]
+spec = "ChatRecovery"
+invariant = "SummaryOnlyAfterCompletedCap"
+
+[BHV-RECOVERY-001]
+# rust = "none": the TLA `RecoveryBounds` invariant proves the BOUNDED claim; the
+# same-round claim is proven for the CHAT loops by the cw-400 same-round tests, but
+# a dedicated CHAT-loop cw-400 BOUNDED regression test does not exist yet — it
+# lands with the scenario-matrix slice. Do NOT borrow the Responses transport's
+# bounded test as chat evidence.
+description = "Context-window recovery is bounded and does not consume logical rounds."
+[BHV-RECOVERY-001.status]
+lean = "none"
+rust = "none"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-RECOVERY-001.refs.tla]]
+spec = "ChatRecovery"
+invariant = "RecoveryBounds"
+[[BHV-RECOVERY-001.refs.tla]]
+spec = "ChatRecovery"
+invariant = "RecoveryRequestStaysInRound"
+
+[BHV-RECOVERY-002]
+description = "Unsupported-tools recovery retries the same round with tools disabled."
+[BHV-RECOVERY-002.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-RECOVERY-002.refs.tla]]
+spec = "ChatRecovery"
+invariant = "UnsupportedToolsRetryDisablesTools"
+[[BHV-RECOVERY-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::ollama_chat_tools_unsupported_recovers_in_the_same_round"
+[[BHV-RECOVERY-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::openai_chat_tools_unsupported_recovers_in_the_same_round"
+
+[BHV-RECOVERY-003]
+description = "Malformed-XML recovery retries the same round with tools retained and a bounded corrective nudge."
+[BHV-RECOVERY-003.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-RECOVERY-003.refs.tla]]
+spec = "ChatRecovery"
+invariant = "MalformedXmlRetryRetainsTools"
+[[BHV-RECOVERY-003.refs.tla]]
+spec = "ChatRecovery"
+invariant = "RecoveryBounds"
+[[BHV-RECOVERY-003.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_retries_the_same_logical_round_with_tools"
+[[BHV-RECOVERY-003.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_is_bounded_to_two_nudges"
+
+[BHV-RECOVERY-004]
+# tla = "none": the "exhaustion -> Error, never a summary" claim is a LIVENESS/
+# reachability property (roughly `MalformedXmlExhausted ~> phase = "Error"`), NOT
+# a state invariant. `SummaryOnlyAfterCompletedCap` only constrains WHEN a summary
+# may occur — a modified model could reach the cap and summarize while still
+# satisfying it — so it does not discharge this contract and must not be cited as
+# if it did. Registering the temporal property properly needs `PROPERTY`-aware
+# tla-ref support in the linter (a later constitution enhancement); until then the
+# Rust regression (`ollama_chat_malformed_xml_is_bounded_to_two_nudges`) is the
+# honest evidence.
+description = "Malformed-XML retry exhaustion terminates explicitly and never enters summary generation."
+[BHV-RECOVERY-004.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-RECOVERY-004.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_is_bounded_to_two_nudges"
