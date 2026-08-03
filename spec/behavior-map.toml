@@ -2,154 +2,239 @@
 #
 # Each load-bearing POLICY rule has a durable id referenced by its Lean theorem
 # (`formal/NewtPolicy`), its TLA+ invariant (`spec/tla`, as those land), its Rust
-# conformance tests, and its production function. The anti-drift rule: a
-# behavioral change is incomplete until the model, the oracle, and the production
-# conformance test agree.
+# conformance tests, and its production function. Anti-drift rule: a behavioral
+# change is incomplete until the model, the oracle, and the production conformance
+# test agree.
 #
-# `status`:  proven  = a checked Lean theorem exists
-#            tested  = Rust conformance tests exist (no formal proof yet)
-#            planned = named, not yet built
+# Per-contract `[BHV-*.status]` tracks each LAYER independently, plus an overall
+# `conformance`. A contract is "conformance = full" ONLY when a CHECKED model is
+# differentially established to REFINE the production code (an executable oracle),
+# not merely when a test and a proof both exist in isolation.
 #
-# A future CI job (`behavior-fast`) fails if a referenced artifact disappears.
+#   lean   : none | spec   (types + by-construction lemmas, `lake build`-checked,
+#                            but NO validator/decision-soundness theorem yet)
+#                 | proven (a theorem with real content about a DEFINED policy
+#                            function — e.g. the backend-selection metamorphics)
+#   rust   : none | tested
+#   tla    : none | planned | checked   (TLC/Apalache-verified)
+#   trace  : none | planned | validated (impl traces validated vs. the TLA+ model)
+#   conformance : partial | full
+#
+# `spec/lint-behavior-map.py` checks every named Lean theorem / production path
+# exists and greps every Rust test, so a rename can't silently orphan an entry.
+# (Rust refs to tests on an unmerged branch resolve once that branch lands.)
 
-schema = 1
+schema = 2
 
 # ─────────────────────────────── Backend selection ───────────────────────────
 
 [BHV-BACKEND-001]
 description = "An explicitly selected backend is authoritative; adding or reordering unrelated backends cannot change it."
-status = "proven"
+[BHV-BACKEND-001.status]
+lean = "proven"          # real theorems about the `selectsUsable` model
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"  # model proven; not yet differentially tested vs. production select_backend
+[BHV-BACKEND-001.refs]
 lean = [
   "NewtPolicy.Backend.adding_a_backend_preserves_selection",
   "NewtPolicy.Backend.adding_a_differently_named_backend_cannot_fabricate_a_selection",
   "NewtPolicy.Backend.selection_is_position_independent",
 ]
 rust_tests = [
-  "newt_core::config::select_backend_tests::default_backend_selects_ollama_over_configured_openai",
-  "newt_core::config::select_backend_tests::newt_provider_selects_openai_responses",
-  "newt_core::config::select_backend_tests::unknown_named_backend_is_an_error_not_a_fallback",
-  "newt_acp_worker::backend_selection_tests::ollama_host_does_not_erase_an_explicitly_selected_openai_backend",
+  "select_backend_tests::default_backend_selects_ollama_over_configured_openai",
+  "select_backend_tests::newt_provider_selects_openai_responses",
+  "select_backend_tests::unknown_named_backend_is_an_error_not_a_fallback",
+  "backend_selection_tests::ollama_host_does_not_erase_an_explicitly_selected_openai_backend",
 ]
-production = ["newt-core/src/config.rs#select_backend"]
+production = ["newt-core/src/config.rs"]  # fn select_backend
 
 [BHV-BACKEND-002]
 description = "A configuration-resolution failure never triggers backend discovery — it propagates."
-status = "tested"
-rust_tests = ["newt_acp_worker::backend_selection_tests::resolver_errors_on_an_unknown_named_backend"]
-production = ["newt-acp-worker/src/lib.rs#resolve_backend"]
-tla = "spec/tla/AgentTurn.tla#ConfigFailureIsTerminal"   # planned
+[BHV-BACKEND-002.status]
+lean = "none"
+rust = "tested"
+tla = "planned"   # spec/tla/AgentTurn.tla#ConfigFailureIsTerminal
+trace = "none"
+conformance = "partial"
+[BHV-BACKEND-002.refs]
+rust_tests = ["backend_selection_tests::resolver_errors_on_an_unknown_named_backend"]
+production = ["newt-acp-worker/src/lib.rs"]  # fn resolve_backend
 
 # ─────────────────────────────── Responses decode ────────────────────────────
 
 [BHV-RESPONSE-001]
 description = "A top-level provider error dominates all apparent output (wins over any status/output)."
-status = "tested"
+[BHV-RESPONSE-001.status]
+lean = "none"     # planned: NewtPolicy.Responses.error_dominates
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[BHV-RESPONSE-001.refs]
 rust_tests = [
-  "newt_core::responses_wire::tests::missing_status_with_top_level_error_fails",
-  "newt_core::responses_wire::tests::top_level_error_wins_over_a_completed_status",
+  "responses_wire::tests::missing_status_with_top_level_error_fails",
+  "responses_wire::tests::top_level_error_wins_over_a_completed_status",
 ]
-production = ["newt-core/src/responses_wire.rs#decode_response"]
-lean = ["NewtPolicy.Responses.error_dominates"]   # planned
+production = ["newt-core/src/responses_wire.rs"]  # fn decode_response
 
 [BHV-RESPONSE-002]
 description = "A refusal plus tool calls never causes a tool effect; a refusal is never silently dropped."
-status = "tested"
+[BHV-RESPONSE-002.status]
+lean = "none"     # planned: NewtPolicy.Responses.refusal_with_calls_never_completes
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[BHV-RESPONSE-002.refs]
 rust_tests = [
-  "newt_core::responses_wire::tests::refusal_with_a_tool_call_is_mixed_and_rejected_never_executed",
-  "newt_core::responses_wire::tests::status_less_mixed_refusal_and_tool_call_is_still_rejected",
+  "responses_wire::tests::refusal_with_a_tool_call_is_mixed_and_rejected_never_executed",
+  "responses_wire::tests::status_less_mixed_refusal_and_tool_call_is_still_rejected",
 ]
-production = ["newt-core/src/responses_wire.rs#decode_response"]
-lean = ["NewtPolicy.Responses.refusal_with_calls_never_completes"]   # planned
+production = ["newt-core/src/responses_wire.rs"]  # fn decode_response
 
 [BHV-RESPONSE-003]
 description = "Empty or ambiguous output is not a successful completion (fail-closed)."
-status = "tested"
+[BHV-RESPONSE-003.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[BHV-RESPONSE-003.refs]
 rust_tests = [
-  "newt_core::responses_wire::tests::empty_object_body_is_malformed",
-  "newt_core::responses_wire::tests::completed_but_empty_body_is_malformed_not_empty_success",
-  "newt_core::responses_wire::tests::unknown_output_item_with_no_usable_content_is_malformed",
+  "responses_wire::tests::empty_object_body_is_malformed",
+  "responses_wire::tests::completed_but_empty_body_is_malformed_not_empty_success",
+  "responses_wire::tests::unknown_output_item_with_no_usable_content_is_malformed",
 ]
-production = ["newt-core/src/responses_wire.rs#decode_response"]
+production = ["newt-core/src/responses_wire.rs"]  # fn decode_response
 
 # ─────────────────────────────── Tool batch ──────────────────────────────────
 
 [BHV-TOOLS-001]
-description = "The entire tool-call batch is validated before ANY call executes; a validated batch is a capability token the executor cannot bypass."
-status = "proven"
+description = "The entire tool-call batch is validated before ANY call executes; the validated batch is a capability token the executor cannot bypass."
+# lean = "spec": the module DEFINES the ValidatedCall/ValidatedBatch capability
+# tokens and proves their invariants BY CONSTRUCTION. It does NOT yet define a
+# `validateBatch : RawBatch -> Except _ ValidatedBatch` nor prove SOUNDNESS, and
+# `args_object : True` is a placeholder for a real `IsObject` predicate. Promoting
+# to "proven" is tracked with the two-stage capability types (#1529 §3):
+# RawBatch -> CorrelatedBatch -> ValidatedBatch -> execute_batch.
+[BHV-TOOLS-001.status]
+lean = "spec"
+rust = "tested"
+tla = "planned"   # spec/tla/AgentTurn.tla#NoEffectsBeforeValidation
+trace = "none"
+conformance = "partial"
+[BHV-TOOLS-001.refs]
 lean = [
   "NewtPolicy.ToolBatch.validated_call_id_nonempty",
-  "NewtPolicy.ToolBatch.executable",  # execution projects from ValidatedBatch, never RawCall
+  "NewtPolicy.ToolBatch.executable",
 ]
 rust_tests = [
-  "newt_core::agentic::tools::tests::batch_valid_then_malformed_dispatches_zero",
-  "newt_core::agentic::tools::tests::batch_malformed_then_valid_dispatches_zero",
-  "newt_core::agentic::tools::tests::batch_all_valid_dispatches_every_call",
+  "tools::tests::batch_valid_then_malformed_dispatches_zero",
+  "tools::tests::batch_malformed_then_valid_dispatches_zero",
+  "tools::tests::batch_all_valid_dispatches_every_call",
 ]
-production = ["newt-core/src/agentic/tools.rs#validate_tool_call_batch"]
-tla = "spec/tla/AgentTurn.tla#NoEffectsBeforeValidation"   # planned
+production = ["newt-core/src/agentic/tools.rs"]  # fn validate_tool_call_batch
 
 [BHV-TOOLS-002]
 description = "Missing or duplicate correlation ids terminate the turn (no fabricated outputs, no follow-up); a validated batch has non-empty, pairwise-distinct ids."
-status = "proven"
+[BHV-TOOLS-002.status]
+lean = "spec"     # by-construction (see BHV-TOOLS-001 note); validator soundness pending
+rust = "tested"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+[BHV-TOOLS-002.refs]
 lean = [
   "NewtPolicy.ToolBatch.validated_call_id_nonempty",
   "NewtPolicy.ToolBatch.validated_batch_ids_distinct",
 ]
 rust_tests = [
-  "newt_core::agentic::tools::tests::batch_missing_id_is_correlation_impossible",
-  "newt_core::agentic::tools::tests::batch_duplicate_id_is_correlation_impossible",
-  "newt_core::agentic::tool_round_cap_tests::responses_missing_call_id_aborts_without_a_followup_request",
-  "newt_core::agentic::tool_round_cap_tests::responses_duplicate_call_ids_abort_without_a_followup_request",
+  "tools::tests::batch_missing_id_is_correlation_impossible",
+  "tools::tests::batch_duplicate_id_is_correlation_impossible",
+  "tool_round_cap_tests::responses_missing_call_id_aborts_without_a_followup_request",
+  "tool_round_cap_tests::responses_duplicate_call_ids_abort_without_a_followup_request",
 ]
-production = ["newt-core/src/agentic/tools.rs#validate_tool_call_batch"]
+production = ["newt-core/src/agentic/tools.rs"]  # fn validate_tool_call_batch
 
 [BHV-TOOLS-003]
 description = "Every executed call produces at most one correlated output (exactly-once result routing)."
-status = "planned"
-tla = "spec/tla/AgentTurn.tla#AtMostOneOutputPerCall"   # planned
+[BHV-TOOLS-003.status]
+lean = "none"
+rust = "none"
+tla = "planned"   # spec/tla/AgentTurn.tla#AtMostOneOutputPerCall
+trace = "none"
+conformance = "partial"
 
 # ─────────────────────────────── Context budget ──────────────────────────────
 
 [BHV-CONTEXT-001]
 description = "Every dispatched request fits its effective input budget (ceiling minus output reserve), refusing pre-dispatch otherwise."
-status = "tested"
+[BHV-CONTEXT-001.status]
+lean = "none"     # planned: NewtPolicy.ContextBudget.input_plus_reserve_within_ceiling
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[BHV-CONTEXT-001.refs]
 rust_tests = [
-  "newt_core::agentic::tool_round_cap_tests::responses_refuses_locally_when_a_configured_window_cannot_fit",
-  "newt_core::agentic::send_budget::send_budget_tests::responses_honors_the_configured_window_as_a_local_safety_limit",
-  "newt_core::agentic::generation_policy::tests::cognition_output_reserve_is_the_one_source_of_the_output_budget",
+  "tool_round_cap_tests::responses_refuses_locally_when_a_configured_window_cannot_fit",
+  "send_budget_tests::responses_honors_the_configured_window_as_a_local_safety_limit",
+  "generation_policy::tests::cognition_output_reserve_is_the_one_source_of_the_output_budget",
 ]
 production = [
-  "newt-core/src/agentic/send_budget.rs#num_ctx_input_ceiling",
-  "newt-core/src/agentic/generation_policy.rs#cognition_output_reserve",
+  "newt-core/src/agentic/send_budget.rs",       # num_ctx_input_ceiling
+  "newt-core/src/agentic/generation_policy.rs", # cognition_output_reserve
 ]
-lean = ["NewtPolicy.ContextBudget.input_plus_reserve_within_ceiling"]   # planned
 
 [BHV-CONTEXT-002]
 description = "A learned context ceiling never increases during a turn (monotone tightening)."
-status = "planned"   # blocked on #1528 (Responses long-turn budgeting parity)
-tla = "spec/tla/ContextRecovery.tla#CeilingNeverIncreases"
-lean = ["NewtPolicy.ContextBudget.effective_ceiling_monotone"]
+[BHV-CONTEXT-002.status]
+lean = "none"     # planned: NewtPolicy.ContextBudget.effective_ceiling_monotone
+rust = "none"
+tla = "planned"   # spec/tla/ContextRecovery.tla#CeilingNeverIncreases
+trace = "none"
+conformance = "partial"   # BLOCKED on #1528 (Responses long-turn budgeting parity)
 
 [BHV-CONTEXT-003]
 description = "Retry and compaction attempts are bounded."
-status = "planned"   # partial: R5 (retry) tested; compaction bound blocked on #1528
-tla = "spec/tla/ContextRecovery.tla#RetriesBounded"
-rust_tests = ["newt_core::agentic::tool_round_cap_tests::dispatch_responses_json_retries_transient_transport_failures"]
+[BHV-CONTEXT-003.status]
+lean = "none"
+rust = "tested"   # retry side only; compaction bound blocked on #1528
+tla = "planned"   # spec/tla/ContextRecovery.tla#RetriesBounded
+trace = "none"
+conformance = "partial"
+[BHV-CONTEXT-003.refs]
+rust_tests = ["tool_round_cap_tests::dispatch_responses_json_retries_transient_transport_failures"]
 
 # ─────────────────────────────── Replay / storage ────────────────────────────
 
 [BHV-REPLAY-001]
 description = "Reasoning-tail replay protection follows the endpoint's replay scope (scope=Never protects nothing)."
-status = "tested"
-rust_tests = ["newt_core::agentic::compress::tests::never_scope_protects_no_reasoning_tail"]
-production = ["newt-core/src/agentic/compress.rs#protected_reasoning_tail_len"]
-lean = ["NewtPolicy.ReplayPolicy.never_scope_is_vacuous"]   # planned
+[BHV-REPLAY-001.status]
+lean = "none"     # planned: NewtPolicy.ReplayPolicy.never_scope_is_vacuous
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[BHV-REPLAY-001.refs]
+rust_tests = ["compress::tests::never_scope_protects_no_reasoning_tail"]
+production = ["newt-core/src/agentic/compress.rs"]  # fn protected_reasoning_tail_len
 
 [BHV-STORAGE-001]
 description = "Remote (server-side) storage is an explicit policy, never inherited from the API default."
-status = "tested"
+[BHV-STORAGE-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+# Direct, correctly-scoped store:false assertions — one per Responses surface.
+[BHV-STORAGE-001.refs]
 rust_tests = [
-  "newt_core::agentic::tool_round_cap_tests::responses_never_sends_num_ctx_on_the_wire",
-  "newt_inference::responses::tests::transport_sets_store_false_for_stateless_no_retention",
+  "tool_round_cap_tests::responses_request_sets_store_false",                 # agentic loop
+  "responses::tests::transport_sets_store_false_for_stateless_no_retention",  # inference transport
 ]
-production = ["newt-core/src/responses_wire.rs#STORE_RESPONSE_SERVER_SIDE"]
+production = ["newt-core/src/responses_wire.rs"]  # const STORE_RESPONSE_SERVER_SIDE
