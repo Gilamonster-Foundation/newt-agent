@@ -6242,6 +6242,51 @@ pub async fn openai_responses_complete_with_prompt(
     .await
 }
 
+/// One retrying Responses dispatch: POST `body`, classify + retry transient
+/// transport failures via [`with_backoff_notify`], surface a typed HTTP-status
+/// error, and parse the JSON body. BOTH the per-round loop and the final
+/// tools-disabled summary go through this, so a transient 500 / timeout /
+/// connection reset on the LAST request no longer discards the turn after every
+/// tool round was already spent — the summary retries like any other round.
+async fn dispatch_responses_json(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+    retry: &RetryPolicy,
+    color: bool,
+) -> anyhow::Result<serde_json::Value> {
+    with_backoff_notify(
+        retry,
+        || async {
+            let mut req = client.post(url).json(body);
+            if let Some(key) = api_key {
+                req = req.bearer_auth(key);
+            }
+            // Typed classification at the source (W0 #1511).
+            let resp = req.send().await.map_err(|e| {
+                anyhow::Error::new(observability::DispatchError::from_reqwest(
+                    "request failed",
+                    e,
+                ))
+            })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(observability::DispatchError::http_status(format!(
+                    "inference endpoint {status}: {text}"
+                ))
+                .into());
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(anyhow::Error::from)
+        },
+        |attempt, delay| print_retry_indicator(attempt, delay, color),
+    )
+    .await
+}
+
 async fn openai_responses_complete_with_prompt_and_artifacts(
     ctx: ChatCtx<'_>,
     turn_prompt_context: Option<&crate::TurnPromptContext>,
@@ -6485,35 +6530,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             model,
         )?;
         let body = build_body(&input, tools_supported);
-        let dispatch = with_backoff_notify(
-            &retry,
-            || async {
-                let mut req = client.post(&responses_url).json(&body);
-                if let Some(key) = api_key {
-                    req = req.bearer_auth(key);
-                }
-                // Typed classification at the source (W0 #1511).
-                let resp = req.send().await.map_err(|e| {
-                    anyhow::Error::new(observability::DispatchError::from_reqwest(
-                        "request failed",
-                        e,
-                    ))
-                })?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(observability::DispatchError::http_status(format!(
-                        "inference endpoint {status}: {text}"
-                    ))
-                    .into());
-                }
-                resp.json::<serde_json::Value>()
-                    .await
-                    .map_err(anyhow::Error::from)
-            },
-            |attempt, delay| print_retry_indicator(attempt, delay, color),
-        )
-        .await;
+        let dispatch =
+            dispatch_responses_json(&client, &responses_url, api_key, &body, &retry, color).await;
 
         let json = match dispatch {
             Ok(j) => j,
@@ -6787,22 +6805,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         model,
     )?;
     let body = build_body(&input, false);
-    let mut req = client.post(&responses_url).json(&body);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-    // Bare `?` keeps the raw typed reqwest error in the chain (the boundary's
-    // `error_class` classifies it as a fallback); the status bail is typed.
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(observability::DispatchError::http_status(format!(
-            "inference endpoint {status}: {text}"
-        ))
-        .into());
-    }
-    let json: serde_json::Value = resp.json().await?;
+    // Shared retrying dispatch (R5): the tools-disabled final summary retries
+    // transient transport failures exactly like every round, so a 500 / timeout /
+    // reset on the LAST request no longer discards the turn after all tool rounds
+    // were spent.
+    let json =
+        dispatch_responses_json(&client, &responses_url, api_key, &body, &retry, color).await?;
     // Fail-closed decode (invariant #2): this text-only follow-up must not return
     // a failed, truncated, or empty body's text as a successful reply. A refusal
     // is the model's final answer; every other error is surfaced.
@@ -9289,6 +9297,43 @@ mod tool_round_cap_tests {
             .await
             .expect_err("a 1-token configured window cannot fit the request");
         assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_responses_json_retries_transient_transport_failures() {
+        // R5: the ONE shared Responses dispatch (used by BOTH the per-round loop
+        // and the final tools-disabled summary) retries a transient status. A
+        // persistent 503 exhausts the retries — the mock's `.expect(3)` (initial
+        // + 2 retries) proves the summary path is no longer a bare, un-retried
+        // `send()` that a transient blip could discard after all rounds were spent.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503)) // retryable transport failure
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let retry = crate::retry::RetryPolicy {
+            max_retries: 2,
+            base: std::time::Duration::from_millis(0),
+            max: std::time::Duration::from_millis(0),
+            jitter: false,
+        };
+        let client = reqwest::Client::new();
+        let url = format!("{}/v1/responses", server.uri());
+        let err = super::dispatch_responses_json(
+            &client,
+            &url,
+            None,
+            &serde_json::json!({"model": "m", "input": []}),
+            &retry,
+            false,
+        )
+        .await
+        .expect_err("a persistent 503 exhausts retries");
+        assert!(err.to_string().contains("503"), "got: {err}");
+        // `.expect(3)` is verified on server drop — it retried, not sent once.
     }
 
     #[tokio::test]
