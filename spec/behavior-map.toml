@@ -260,18 +260,35 @@ tla = "planned"
 trace = "none"
 conformance = "partial"
 
-[BHV-CONTEXT-003]
-description = "Retry and compaction attempts are bounded."
-[BHV-CONTEXT-003.status]
+# 003 was split: transport-level dispatch retries and mid-turn compaction/recovery
+# are DIFFERENT bounds with different state machines (and likely different TLA+
+# invariants). The single test below proves only the former; compaction bounding
+# is #1528 work, tracked separately as 003B so nothing claims coverage it lacks.
+
+[BHV-CONTEXT-003A]
+description = "Transport-level retries for a single dispatch are bounded (a fixed cap, not an unbounded retry loop)."
+[BHV-CONTEXT-003A.status]
 lean = "none"
 rust = "tested"
 tla = "planned"
 trace = "none"
 conformance = "partial"
-[[BHV-CONTEXT-003.refs.rust_tests]]
+[[BHV-CONTEXT-003A.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::dispatch_responses_json_retries_transient_transport_failures"
 pending_pr = 1526
+
+[BHV-CONTEXT-003B]
+description = "Compaction and context-window-recovery attempts within a turn are bounded (no unbounded compact/redispatch loop)."
+# Compaction/recovery for the Responses loop is #1528; no bounding test exists yet,
+# so rust = "none" (nothing claims tested coverage). Promote when #1528 lands the
+# bounded-redispatch machinery + its regression test.
+[BHV-CONTEXT-003B.status]
+lean = "none"
+rust = "none"
+tla = "planned"
+trace = "none"
+conformance = "partial"
 
 # ─────────────────────────────── Replay / storage ────────────────────────────
 
