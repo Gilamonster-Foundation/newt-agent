@@ -217,6 +217,11 @@ class RunnerTests(unittest.TestCase):
                 "OCAP_MODES": "off on",
                 "TASK_TIMEOUT": "5",
                 "FAKE_TIMEOUT_LOG": str(self.timeout_log),
+                # These fixtures exercise the RUN + dirty-recording paths, not the
+                # clean-tree gate, and the dev/CI checkout may itself be dirty —
+                # so opt into the dirty override. The gate itself is covered by
+                # test_qualification_* below.
+                "ALLOW_DIRTY_QUALIFICATION": "1",
             }
         )
 
@@ -239,6 +244,49 @@ class RunnerTests(unittest.TestCase):
             check=False,
             timeout=30,
         )
+
+    def _run_env(self, name: str, **overrides: object) -> subprocess.CompletedProcess[str]:
+        env = self.env.copy()
+        env["OUT"] = str(self.root / name)
+        for key, value in overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = str(value)
+        return subprocess.run(
+            ["bash", str(RUNNER)],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=30,
+        )
+
+    def test_qualification_rejects_a_dirty_tree_without_override(self) -> None:
+        # B3: a dirty source tree in qualification mode fails closed BEFORE any
+        # inference — the bundle would otherwise pin a commit + binary hash for
+        # something git cannot reconstruct.
+        result = self._run_env(
+            "dirty-reject", FAKE_SOURCE_DIRTY="true", ALLOW_DIRTY_QUALIFICATION=None
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("clean source tree", result.stdout)
+        # It bailed early: no results were produced.
+        self.assertFalse((self.root / "dirty-reject" / "results.csv").is_file())
+
+    def test_dirty_override_runs_and_retains_the_diff(self) -> None:
+        # B3: the explicit override still runs, but retains the diff + untracked
+        # listing so the run is reproducible/inspectable.
+        result = self._run_env(
+            "dirty-override", FAKE_SOURCE_DIRTY="true", ALLOW_DIRTY_QUALIFICATION="1"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        out = self.root / "dirty-override"
+        self.assertTrue((out / "source-dirty.patch").is_file())
+        self.assertTrue((out / "source-dirty-status.txt").is_file())
+        provenance = json.loads((out / "provenance.json").read_text(encoding="utf-8"))
+        self.assertTrue(provenance["harness"]["dirty"])
 
     def test_complete_fixture_passes_and_retains_raw_artifacts(self) -> None:
         expected_dirty = bool(

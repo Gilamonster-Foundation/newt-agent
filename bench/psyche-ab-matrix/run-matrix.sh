@@ -51,6 +51,9 @@ if [ -n "$(git -C "$REPO" status --porcelain --untracked-files=normal 2>/dev/nul
 else
   SOURCE_DIRTY=false
 fi
+# Test hook (consistent with FAKE_EFFECTIVE_MODEL / FAKE_TIMEOUT_LOG): let tests
+# drive the dirty-tree gate deterministically without mutating the real repo.
+SOURCE_DIRTY="${FAKE_SOURCE_DIRTY:-$SOURCE_DIRTY}"
 
 # Run identity and backend contract. Qualification intentionally has no fake
 # defaults for facts that must come from the inference-server launch.
@@ -105,6 +108,14 @@ if [ -n "$MODEL_DIGEST" ] \
 fi
 
 if [ "$MODE" = "qualification" ]; then
+  # A dirty source tree makes the bundle irreproducible: `commit` + the candidate
+  # binary hash then identify something that cannot be reconstructed from git —
+  # the hash is a museum label on an empty pedestal. Reject by default. An
+  # explicit override still runs, but the diff + untracked sources are retained
+  # in the bundle (below) so the run remains reproducible/inspectable.
+  if [ "$SOURCE_DIRTY" = "true" ] && [ "${ALLOW_DIRTY_QUALIFICATION:-}" != "1" ]; then
+    fatal "qualification requires a clean source tree (git status is dirty). Commit or stash changes, or set ALLOW_DIRTY_QUALIFICATION=1 to override (the diff + untracked listing are then retained in the bundle)."
+  fi
   [ "$MODEL_API" = "chat_completions" ] || fatal "qualification requires MODEL_API=chat_completions"
   [ "$CAPABILITY_PROFILE" = "nemotron" ] || fatal "qualification requires CAPABILITY_PROFILE=nemotron"
   [ -n "$MODEL_DIGEST" ] || fatal "qualification requires MODEL_DIGEST"
@@ -181,6 +192,13 @@ fi
 mkdir -p "$OUT"
 mkdir -p "$OUT/events" "$OUT/traces" "$OUT/ws" "$OUT/preflight" \
   "$OUT/workspace-baselines"
+# Reproducibility for a dirty override (only reachable when
+# ALLOW_DIRTY_QUALIFICATION=1, or in exploratory mode): retain the exact uncommitted
+# state so `commit` + binary hash are not the only record of what ran.
+if [ "$SOURCE_DIRTY" = "true" ]; then
+  git -C "$REPO" diff --binary HEAD > "$OUT/source-dirty.patch" 2>/dev/null || true
+  git -C "$REPO" status --porcelain --untracked-files=all > "$OUT/source-dirty-status.txt" 2>/dev/null || true
+fi
 CSV="$OUT/results.csv"
 MD="$OUT/matrix.md"
 CFG="$OUT/config.toml"
