@@ -124,6 +124,9 @@ mod report;
 // #714: the `resume_context` tool — a self-scoped read of THIS conversation's
 // own pre-interrupt work (the affordance `recall` structurally cannot be).
 mod resume;
+// #1528: pure Value↔Value bridge letting the Responses `input` shape reuse the
+// chat-shaped `compress::compress` compactor on a context-window-400 recovery.
+mod responses_compaction;
 mod send_budget;
 // FR-3 (#998): the grant-independent absolute deny-list — a fixed exec veto
 // (ssh / rm / systemctl restart …) no capability, mode, or persona unlocks,
@@ -6147,8 +6150,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 // items vs `choices`, `input_tokens`/`output_tokens` usage), so this is a
 // parallel — deliberately leaner — loop. Selected per backend via
 // `api = "responses"` (surfaced to the loop as `NEWT_OPENAI_API`). Non-streaming
-// in v1 (matching the chat path's UX); the chat path's budget / cw-400 recovery
-// is intentionally not duplicated here yet (opt-in path) — tracked.
+// in v1 (matching the chat path's UX). Reactive context-window-400 recovery is
+// now present here too (#1528): a hard cw-400 learns the true window, tightens a
+// monotone input ceiling, compacts the running history through the shared
+// `compress::compress` (via `responses_compaction`), and re-dispatches — bounded
+// to 2 recoveries. The remaining #1528 follow-ups are PROACTIVE mid-loop
+// compaction (compact before overflow) and usage-learning ceiling raises.
 
 /// `true` when the active OpenAI backend selected the Responses API
 /// (`[backends].api = "responses"`, surfaced to the loop as `NEWT_OPENAI_API`).
@@ -6228,19 +6235,25 @@ fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
 /// models served only there (`gpt-5-codex`). Non-streaming; selected via
 /// `api = "responses"`.
 ///
-/// ## Long-turn budgeting: fail-CLOSED preview (not full parity yet)
+/// ## Long-turn budgeting: fail-closed ceiling + reactive cw-400 recovery
 ///
 /// This loop enforces a configured context window as a local ceiling and
-/// reserves output headroom (`BHV-CONTEXT-001`), and it refuses an over-budget
-/// request **before** dispatch. But it does NOT yet mirror the Chat Completions
-/// long-turn survival machinery — mid-loop compaction, context-limit (cw-400)
-/// recovery, monotonically tightening learned ceilings, and bounded redispatch
-/// (`summarizer` / `compress_state` / `recover_cw_400` / `on_round_usage` are
-/// received but unused here). Consequence: a long tool turn whose accumulated
-/// input exceeds the ceiling **fails the turn** rather than compacting and
-/// continuing. This is fail-closed (never a silent truncation), but it is
-/// **preview**, not production-grade for long agentic turns over Responses —
-/// completing it is the blocking follow-up **#1528**.
+/// reserves output headroom (`BHV-CONTEXT-001`), refusing an over-budget request
+/// **before** dispatch. On top of that (#1528 slice 1) it now mirrors the Chat
+/// Completions path's **reactive** context-limit survival: a hard context-window
+/// 400 learns the endpoint's true window (`recover_cw_400`), tightens a
+/// **monotonically** shrinking learned input ceiling, **compacts** the running
+/// history to fit through the shared [`compress`] pipeline (bridged in/out of the
+/// Responses `input` shape by [`responses_compaction`], and reported through
+/// `on_round_usage` / `compress_state`), and **re-dispatches** — bounded to 2
+/// recoveries, after which the raw 400 surfaces. A numberless overflow falls back
+/// to a derived cap. So a long tool turn that overflows now compacts and
+/// continues instead of failing (still never a silent truncation).
+///
+/// Remaining #1528 follow-ups (NOT in this slice): **proactive** mid-loop
+/// compaction (compact *before* the overflow, driven by the mid-loop trim
+/// threshold) and **usage-learning** acceptance-side ceiling *raises* (an
+/// `on_round_usage` `Accepted` widening the budget on proven-good rounds).
 pub async fn openai_responses_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -6365,23 +6378,26 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
-        recover_cw_400: _,
+        // #1528: activated — the Responses loop now recovers a hard cw-400 by
+        // learning the window, tightening a monotone ceiling, compacting via the
+        // shared `compress::compress`, and re-dispatching (bounded to 2).
+        recover_cw_400,
         mut note_sink,
         mut note_nudge,
         recall_source,
         memory_source,
-        summarizer: _,
-        compress_state: _,
+        summarizer,
+        compress_state,
         mut tool_events,
         mut phantom_reaches,
         end_reason: _,
         solve_obs: _,
         mut permission_gate,
-        on_round_usage: _,
+        mut on_round_usage,
         estimate_ratio,
         // #727: bound for the get_context_remaining used-token estimate.
         estimation,
-        summary_input_cap_floor_chars: _,
+        summary_input_cap_floor_chars,
         input_ceiling_pct,
         low_budget_pct,
         exec_floor,
@@ -6394,9 +6410,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         plan_mode_control,
     } = ctx;
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
-    // The OpenAI-Responses loop offloads tool output (spill_store) but does not
-    // run the compressor, so it never stores compaction spans.
-    let _ = compaction_store;
+    // #1528: headless callers may pass no session state — fall back to a local
+    // one so the cw-400 recovery's `compress::compress` always has anti-thrash
+    // state to consult (mirrors the Chat Completions path).
+    let mut local_compress_state = CompressState::new();
+    let compress_state = match compress_state {
+        Some(s) => s,
+        None => &mut local_compress_state,
+    };
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -6496,12 +6517,27 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
     let cal = sanitize_estimate_ratio(estimate_ratio);
-    let send_budget = initial_send_budget(max_ok_input, safe_context, responses_input_ceiling);
+    // #1528: real-token schema overhead — subtracted from a recovered input cap
+    // before the compaction budget is converted back to chars/4 currency, so the
+    // compacted history leaves room for the tool schemas that ride every request
+    // (mirrors the Chat Completions path's `tool_tokens_real`).
+    let tool_tokens_real =
+        calibrate_up(estimate_value_tokens(&tools_for_estimate, estimation), cal);
+    // #1528: mutable so a recovered cw-400 can tighten the send budget monotonically.
+    let mut send_budget = initial_send_budget(max_ok_input, safe_context, responses_input_ceiling);
     // A declared window is authoritative just like a cached `safe_context`: both
     // are local safety limits the preflight may refuse against.
     let send_budget_authoritative = safe_context.is_some() || responses_input_ceiling.is_some();
-    let authoritative_budget =
+    // #1528: the monotone learned input ceiling (mirror of the Chat path's
+    // `effective_input_ceiling`). Seeded from the declared-window ceiling and only
+    // ever tightened by a recovered 400 — never raised.
+    let mut effective_input_ceiling = responses_input_ceiling;
+    let mut authoritative_budget =
         authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens);
+    // #1528: hard context-window 400s recovered this turn (parse limit → tighten
+    // → compact → redispatch), bounded to 2 (mirror of the Chat path). See #223.
+    let mut cw_retries: u32 = 0;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     preflight_irreducible_request(
         &msgs_json,
         Some(&tools_for_estimate),
@@ -6550,37 +6586,147 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
-        preflight_responses_request(
-            instructions.as_deref(),
-            &input,
-            tools_supported.then_some(tools.as_slice()),
-            authoritative_budget,
-            cal,
-            estimation,
-            model,
-        )?;
-        let body = build_body(&input, tools_supported);
-        let dispatch =
-            dispatch_responses_json(&client, &responses_url, api_key, &body, &retry, color).await;
+        // #1528: inner recovery loop — a cw-400 (or a tools-unsupported error)
+        // retries THIS logical round IN PLACE. Only a COMPLETED dispatch `break`s
+        // out and lets `round` advance, so recovery never consumes a tool-capable
+        // round (critical at max_tool_rounds == 1 or near the cap): the recovered
+        // request is re-sent WITH tools, never demoted to the tools-disabled summary.
+        let json = loop {
+            preflight_responses_request(
+                instructions.as_deref(),
+                &input,
+                tools_supported.then_some(tools.as_slice()),
+                authoritative_budget,
+                cal,
+                estimation,
+                model,
+            )?;
+            let body = build_body(&input, tools_supported);
+            let dispatch =
+                dispatch_responses_json(&client, &responses_url, api_key, &body, &retry, color)
+                    .await;
 
-        let json = match dispatch {
-            Ok(j) => j,
-            Err(e) => {
-                if tools_supported && is_tools_unsupported_error(&e) {
-                    tools_supported = false;
-                    if !tools_unsupported_notified {
-                        tools_unsupported_notified = true;
-                        print_newt(
-                            &format!(
+            match dispatch {
+                Ok(j) => break j,
+                Err(e) => {
+                    if tools_supported && is_tools_unsupported_error(&e) {
+                        tools_supported = false;
+                        if !tools_unsupported_notified {
+                            tools_unsupported_notified = true;
+                            print_newt(
+                                &format!(
                                 "{model} does not support tools — tools disabled for this session"
                             ),
-                            color,
-                            false,
-                        );
+                                color,
+                                false,
+                            );
+                        }
+                        continue;
                     }
-                    continue;
+                    // #1528: graceful context-window overflow recovery on the
+                    // Responses wire — parse the model's real limit, tighten the input
+                    // ceiling MONOTONICALLY, compact the running history via the shared
+                    // `compress::compress` (bridged in/out of the Responses `input`
+                    // shape), and re-dispatch. Bounded to 2 recoveries; a numberless
+                    // overflow falls back to a derived cap. Mirrors the Chat
+                    // Completions path (see #223 + the block above `chat_url`).
+                    if cw_retries < 2 {
+                        let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                        if let Some(recovered_budget) = recovered_window
+                            .map(|context_window| {
+                                recovered_input_budget(
+                                    context_window,
+                                    input_ceiling_pct,
+                                    output_reserve,
+                                    effective_input_ceiling,
+                                )
+                            })
+                            .or_else(|| {
+                                cw_overflow::core_recover_overflow(
+                                    &e.to_string(),
+                                    send_budget,
+                                    None,
+                                )
+                                .map(|cap| cap as usize)
+                            })
+                        {
+                            if let Some(context_window) = recovered_window {
+                                emit_context_window_400(&mut on_round_usage, context_window);
+                            }
+                            // Retain any tighter learned ceiling — a recovery may only
+                            // tighten the input budget, never raise it.
+                            let new_budget = effective_input_ceiling
+                                .map_or(recovered_budget, |ceiling| recovered_budget.min(ceiling));
+                            send_budget = Some(new_budget);
+                            effective_input_ceiling = Some(new_budget);
+                            // The endpoint's parsed hard limit is authoritative from
+                            // here on; the next round's preflight refuses against it.
+                            authoritative_budget = authoritative_request_budget(
+                                send_budget,
+                                true,
+                                mid_loop_trim_tokens,
+                            );
+                            // Bridge the Responses `input` into chat-shaped messages
+                            // (instructions as a protected system head), compact, then
+                            // bridge the result back into user/assistant `input` items.
+                            let chat = responses_compaction::responses_input_to_chat(
+                                instructions.as_deref(),
+                                &input,
+                            );
+                            let outcome = compress(
+                                CompressRequest {
+                                    messages: &chat,
+                                    // Real-token cap minus real-token schema overhead
+                                    // → pipeline chars/4 currency (mirrors the Chat path).
+                                    budget: calibrate_down(
+                                        new_budget.saturating_sub(tool_tokens_real),
+                                        cal,
+                                    ),
+                                    max_messages: None,
+                                    replay_protected_tail_len: 0,
+                                    task,
+                                    hard_budget: true,
+                                    authoritative: true,
+                                    focus: None,
+                                    est: estimation,
+                                    summary_input_cap_floor_chars,
+                                    compaction_store,
+                                },
+                                summarizer,
+                                compress_state,
+                            )
+                            .await;
+                            if let Some(notice) = outcome.notice {
+                                print_harness_notice(&notice, color);
+                            }
+                            if outcome.action == CompressAction::Refused {
+                                // Refuse the resend; surface the endpoint's 400.
+                                return Err(e);
+                            }
+                            if outcome.fired {
+                                // Drop the instructions system head we injected for
+                                // head-protection: `instructions` is re-sent ONCE via
+                                // its own field (unchanged), never duplicated into the
+                                // user `input` (which would re-trip the budget we just
+                                // reclaimed). The compressor keeps the head verbatim at
+                                // index 0, so this is the exact card we prepended.
+                                let compacted = &outcome.messages;
+                                let rebuilt: &[serde_json::Value] = if instructions.is_some()
+                                    && compacted.first().and_then(|m| m["role"].as_str())
+                                        == Some("system")
+                                {
+                                    &compacted[1..]
+                                } else {
+                                    compacted
+                                };
+                                input = responses_compaction::chat_to_responses_input(rebuilt);
+                            }
+                            cw_retries += 1;
+                            continue;
+                        }
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
 
@@ -9407,6 +9553,289 @@ mod tool_round_cap_tests {
         .expect_err("a persistent 503 exhausts retries");
         assert!(err.to_string().contains("503"), "got: {err}");
         // `.expect(3)` is verified on server drop — it retried, not sent once.
+    }
+
+    /// Build a history (~36k estimated tokens) far larger than the recovered
+    /// cw-400 budget, so the recovery's compaction is forced to FIRE (not merely
+    /// fit) even after the always-advertised tool schemas (~5k tokens) claim their
+    /// share of the recovered 40k-token window.
+    fn overflowing_responses_history(task: &str) -> Vec<MemMessage> {
+        let mut messages = vec![MemMessage::system("base policy")];
+        for i in 0..60 {
+            messages.push(MemMessage::user(format!(
+                "historical step {i} {}",
+                "x".repeat(1_200)
+            )));
+            messages.push(MemMessage::assistant(format!(
+                "did step {i} {}",
+                "y".repeat(1_200)
+            )));
+        }
+        messages.push(MemMessage::user(task));
+        messages
+    }
+
+    #[tokio::test]
+    async fn responses_recovers_from_a_context_window_400_by_compacting_and_redispatching() {
+        // #1528: a hard context-window 400 on the Responses wire must be
+        // RECOVERED — learn the true window, tighten the input ceiling, compact
+        // the running history to fit, and re-dispatch — never surfaced as a raw
+        // 400. Regression: before this slice the Responses loop returned the 400
+        // directly (no compaction, no redispatch).
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct OverflowThenOk {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for OverflowThenOk {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                if self.served.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // A numbered LiteLLM/vLLM overflow cw_overflow recognizes.
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "recovered and done"}]}]
+                    }))
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(OverflowThenOk {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "RECOVER: keep going after the window shrinks";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        // Cloud default: no local window → the first (over-window) request
+        // dispatches and the provider's 400 drives recovery.
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        ctx.max_tool_rounds = 4;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("cw-400 recovery compacts and redispatches to success");
+        assert_eq!(reply, "recovered and done");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "exactly one 400 then one recovered 200 — the raw 400 never surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_context_window_400_recovery_is_bounded() {
+        // #1528: recovery is capped at 2 retries. A server that 400s every time
+        // must ultimately surface the error after at most 1 + 2 dispatches, never
+        // looping forever.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+            })))
+            .expect(3) // initial + exactly 2 bounded recoveries
+            .mount(&server)
+            .await;
+
+        let task = "BOUNDED: never loop forever on a persistent 400";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        // max_tool_rounds == 1 so the bound proven is the INNER `cw_retries` cap
+        // (recovery retries in place), not the outer round cap: a single logical
+        // round still dispatches at most initial + 2 recoveries before surfacing.
+        ctx.max_tool_rounds = 1;
+
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a persistent cw-400 surfaces after the bounded retries");
+        // `.expect(3)` verified on drop: initial + exactly 2 recoveries.
+    }
+
+    #[test]
+    fn responses_cw_recovery_ceiling_is_monotone_non_increasing() {
+        // #1528: each recovery composes the freshly-learned window with the
+        // previously-tightened ceiling via `min` (the same `recovered_input_budget`
+        // declared-ceiling composition the recovery branch uses), so the effective
+        // input ceiling can only shrink — never rebound — across successive 400s.
+        let pct = 80;
+        // First 400 learns a 6000-token window → 4800 input ceiling.
+        let first = recovered_input_budget(6000, pct, None, None);
+        assert_eq!(first, 4800);
+        // A later 400 reporting a LARGER window must NOT raise the ceiling: the
+        // retained tighter ceiling wins.
+        let second = recovered_input_budget(100_000, pct, None, Some(first));
+        assert!(second <= first, "ceiling rose: {second} > {first}");
+        assert_eq!(second, first);
+        // A later 400 reporting a SMALLER window tightens further.
+        let third = recovered_input_budget(2_000, pct, None, Some(second));
+        assert!(
+            third < second,
+            "ceiling failed to tighten: {third} !< {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_cw_400_recovery_retries_the_same_logical_round_with_tools() {
+        // #1528 (review P1): a cw-400 must retry the SAME logical tool round in
+        // place, not advance the round counter. With max_tool_rounds == 1 the buggy
+        // loop consumed the only round on recovery and demoted the recovered request
+        // to the tools-disabled summary — 2 requests: [400, summary]. The fix
+        // dispatches a real recovered TOOL round (still carrying tools); only a
+        // COMPLETED round then advances to the summary — 3 requests:
+        // [400, recovered tool round, summary].
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct OverflowThenToolThenDone {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for OverflowThenToolThenDone {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                match self.served.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                    })),
+                    // The recovered request: a real tool round (get_context_remaining
+                    // is executed synthetically in-loop — no external side effect).
+                    1 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "function_call", "name": "get_context_remaining",
+                            "arguments": "{}", "call_id": "c1"}]
+                    })),
+                    _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "done"}]}]
+                    })),
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(OverflowThenToolThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "SAME ROUND: recovery must not burn the only tool round";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("recovery retries the round in place and the turn completes");
+        assert_eq!(reply, "done");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            reqs.len(),
+            3,
+            "expected [400, recovered tool round, summary]; a 2-request run means \
+             recovery burned the only round and demoted to the tools-disabled summary"
+        );
+        let body = |i: usize| -> serde_json::Value {
+            serde_json::from_slice(&reqs[i].body).unwrap_or_default()
+        };
+        assert!(
+            body(1)["tools"].is_array(),
+            "the RECOVERED request must still carry tools — a real tool round, not the summary"
+        );
+        assert!(
+            body(2)["tools"].is_null(),
+            "only the final summary (after the completed round) is tools-disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_cw_400_on_the_final_round_recovers_in_place() {
+        // #1528 (review P1): a cw-400 on the LAST logical round retries THAT round
+        // rather than jumping to the summary. max_tool_rounds == 2: round 0 completes
+        // a tool call; round 1 400s, recovers IN PLACE and does another tool call,
+        // then the completed round advances to the summary — 4 requests. The buggy
+        // loop would `continue` past round 1 straight into the summary — 3 requests.
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct ToolThen400ThenToolThenDone {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for ToolThen400ThenToolThenDone {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                let tool = serde_json::json!({
+                    "model": "mock",
+                    "output": [{"type": "function_call", "name": "get_context_remaining",
+                        "arguments": "{}", "call_id": "c1"}]
+                });
+                match self.served.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(200).set_body_json(tool),
+                    1 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                    })),
+                    2 => ResponseTemplate::new(200).set_body_json(tool),
+                    _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "finished"}]}]
+                    })),
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ToolThen400ThenToolThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "FINAL ROUND: a 400 on the last round retries it, not the summary";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        ctx.max_tool_rounds = 2;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("the final round recovers in place and completes");
+        assert_eq!(reply, "finished");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            reqs.len(),
+            4,
+            "expected round0 tool, round1 400, round1 recovered tool, summary; a \
+             3-request run means the 400 burned round 1 and jumped to the summary"
+        );
     }
 
     #[tokio::test]
