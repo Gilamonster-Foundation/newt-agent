@@ -4,12 +4,11 @@
   <img src="docs/logos/newt-agent-logo_source.png" alt="Newt-Agent logo" width="256" />
 </p>
 
-> **Experimental.** A local-first agentic coder in Rust,
-> written for the privacy-minded.
+> **Experimental agentic coder.**
 
-The default build ships no cloud provider — remote models are opt-in subprocess
-plugins. The scoreboard below is the claim, measured on Terminal-Bench, confined
-and unconfined.
+Written in Rust. The default build ships no cloud provider — remote models are
+opt-in subprocess plugins. The scoreboard below is the claim, measured on
+Terminal-Bench, confined and unconfined.
 
 ## Terminal-Bench
 
