@@ -40,9 +40,12 @@ behaviors the constitution admits.
   its soundness, and a real `IsObject` predicate for `args_object` (today a
   `True` placeholder) — landing with the two-stage `CorrelatedBatch` /
   `ValidatedBatch` capability types (#1529 §3).
-- **`tla/`** — the TLA+ layer (turn lifecycle, recovery). *Planned* — requires
-  `tla2tools`/Apalache, not yet on this host; models are not committed until they
-  can be TLC-checked (no ceremonial specs).
+- **`tla/`** — the TLA+ layer (turn lifecycle, recovery). **Harness ready**: the
+  pinned, checksum-verified `tla2tools` (1.7.4) runner (`check.sh`) + a *checked*
+  smoke spec prove the toolchain works in CI. The real models (`AgentTurn.tla`,
+  `ContextRecovery.tla`) are NOT committed yet — they land at step 6, after the
+  `BehaviorEvent` alphabet exists to validate implementation traces against (no
+  ceremonial specs).
 
 ## What is NOT formalized
 
