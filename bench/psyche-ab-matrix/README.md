@@ -10,6 +10,23 @@ The runner is intended for the Nemotron reference lane first, with a separate
 llama.cpp portability lane. It does not claim a performance result merely
 because inference completed.
 
+> **This produces OPERATOR-ATTESTED qualification evidence, not independently
+> verified qualification.** On the vLLM lane the harness independently observes
+> only that (a) the requested model name appears in `/v1/models` and (b) the
+> server's `/version` matches `SERVER_VERSION`. It does **not** independently
+> bind the endpoint to the declared weight digest, context window, chat
+> template, tool parser, or reasoning parser — those come from an
+> operator-supplied launch manifest, and the identity gate proves the manifest
+> is self-consistent, not that the live process matches it. A stale or
+> pre-existing server that happens to serve the same display name and version —
+> but was launched with a different revision, context, template, or parser
+> flags — will pass. No attacker is required; a leftover container or terminal
+> is enough. Binding the evidence to the actual inference process (harness-owned
+> server lifecycle, or a nonce-bound launch attestation) is tracked as future
+> work; until then, read every bundle as *the operator's declaration, checked
+> for internal consistency*. (The llama.cpp lane is stronger: it independently
+> reads `build_info`, `n_ctx`, and the chat-template hash from `/props`.)
+
 ## What cognition means on Chat Completions
 
 Chat Completions can carry Newt's cognition policy when the endpoint explicitly
