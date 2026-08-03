@@ -11,109 +11,17 @@ A single Rust binary with a sharp, minimal tool set. It runs against your
 local hardware by default — no cloud bytes leave your machine unless you
 deliberately install a provider plugin. Opinionated, not extensible.
 
-## Why — the bridle, not just the harness
+## Terminal-Bench
 
-An agent *harness* helps the model do work; a **bridle** lets the operator
-*steer* — and prove, after the fact, exactly where the horse went. Newt is an
-experiment in making Object Capability (OCAP) security — long considered
-theoretically correct but practically unimplementable — pragmatic inside an
-agent loop, as a reusable concept
-([`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle))
-intended to be pluggable into other harnesses, not just this one.
-
-OCAP's algebraic construction means some questions are answered
-*structurally*, not by audit-log archaeology:
-
-- Who acted on what, and when?
-- Who granted the authority for this to do that?
-- Did what they permitted actually happen — and did **only** what they
-  permitted happen?
-
-For anyone whose work lives on provenance, authority, integrity, and data
-sovereignty — lawyers, clinicians, data scientists — those answers have to be
-properties of the system, not promises in a policy document.
-
-If it doesn't find its day in the sun, it was fun anyway.
-
-## Quick start
-
-```bash
-git clone https://github.com/Gilamonster-Foundation/newt-agent
-cd newt-agent
-just install          # release binaries → ~/bin/newt, ~/bin/newt-mcp-server
-newt setup dgx1.home.lab  # probe configured ports and select detected inference
-newt code             # TUI coder in the current directory
-```
-
-Bare setup hosts are probed anonymously across the configured discovery ports
-(including 8000 and 8080 by default). For an authenticated endpoint, use its
-exact HTTPS URL and store only a secret reference:
-
-```bash
-newt setup https://inference.example.net:8000 --token-env INFERENCE_TOKEN
-newt setup https://inference.example.net:8080 --token-file ~/.config/newt/token
-```
-
-Detected endpoints are stored as `~/.newt/backends/*.toml`; the main
-`~/.newt/config.toml` only records the selected `default_backend`.
-
-### Tool output scrollback
-
-Completed tool results use a bounded, tail-biased spill (`[tui]
-spill_lines = 3` by default). On Unix, the default interactive build also
-streams an active shell tool into that bounded frame when both stdin and stdout
-are terminals and `TERM` is not `dumb`. Up/Down scroll retained lines; Space or
-Enter toggles `⧉` expand and `▣` collapse. Expansion never exceeds safe terminal
-capacity, and each tool still commits one canonical completed block to normal
-terminal scrollback.
-
-Use `/spill <N>` for a session-only row count, `/spill reset` to restore
-configuration, or `/spill 0` for unbounded completed output with live display
-disabled. The default `newt` binary enables `live-spill`; a
-`--no-default-features` build strips it. See the
-[TUI README](./newt-tui/README.md) and
-[decision record](./docs/decisions/live_spill_viewport.md).
-
-### Operating modes and permission postures
-
-Inside the TUI, `/mode` lists and selects a working style: `chat`, `dev`,
-`admin`, `plan`, `diagnose`, `auto`, or `full-auto`. Bare `/mode` includes a
-description of each. `plan` is workspace-read-only with access to Newt's plan
-ledger, and `diagnose` is bounded read-only research. In `auto`, the model can
-select a bounded style for a later action-shaped turn, but protected intake
-still wins and only the human can select `full-auto`. Every mode still honors
-all permission and safety boundaries. `dev` and `full-auto` both carry TDD,
-worktree-safe Git, targeted-test, and full-preflight guidance; `full-auto`
-changes persistence and interruption policy, not authority.
-
-`/posture` is the separate authority control. It lists or applies a configured
-skill/framing binding and its optional permission floor; `/posture off` clears
-it. A configured floor can only narrow authority, while a posture without one
-leaves authority unchanged. Existing posture bindings remain under
-`[modes.<name>]` in TOML for compatibility. See the
-[mode/posture decision](./docs/decisions/operating_modes_and_permission_postures.md).
-
-Run `newt --help` for every mode (worker, MCP server, doctor, config, …) —
-the binary is the authority on its own surface, this file is not. Python
-bindings live in [`newt-agent-py/`](./newt-agent-py/) (`pip install
-newt-agent-py`, import path `newt_agent`).
-
-## Terminal-Bench scoreboard
-
-newt is measured on [Terminal-Bench](https://github.com/harbor-framework/terminal-bench)
-via `newt solve` (headless) + the Harbor adapter. The release gate is a
+Measured on [Terminal-Bench](https://github.com/harbor-framework/terminal-bench)
+via `newt solve` (headless) plus the Harbor adapter. The release gate is a
 **per-model monotonic ratchet** — a model's score never goes down across
-releases; we establish a starting number and keep beating it. The table below is
-published from `scripts/eval/bench-results.jsonl` every release
-(`scripts/eval/bench_scoreboard.py render`).
-
-For the full DGX Spark capability survey — the model ladder, the hosted-model and
-newt-vs-Codex comparisons, and the integrity log for how the numbers were kept
-honest — see
-[docs/findings/dgx-spark-terminal-bench-survey.md](docs/findings/dgx-spark-terminal-bench-survey.md).
+releases; establish a starting number, then keep beating it. Both lanes are
+published, because confined (**OCAP on**) versus unconfined (**OCAP off**) is
+the claim worth making: security you can afford to leave switched on.
 
 <!-- BENCH-SCOREBOARD:START -->
-_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do not edit by hand._
+_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down). Measured models only; the roster's unrun models are in the full table. Auto-generated; do not edit by hand._
 
 | Model | OCAP off | OCAP on |
 |-------|----------|---------|
@@ -125,18 +33,56 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 | `nemotron-3-nano_30b`<br><sub>nemotron · tb-30 · ctx 65536 · v0.7.5 · 2026-07-29</sub> | 6.7% (2/30) | _pending_ |
 | `glm-4.7-flash`<br><sub>glm · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 3.3% (1/30) |
 | `gpt-4.1-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | _pending_ | 3.3% (1/30) |
-| `deepseek-coder-v2_16b`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
-| `deepseek-r1_32b`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
-| `gemma4_31b`<br><sub>gemma · queued</sub> | _queued_ | _queued_ |
-| `kimi-dev_72b`<br><sub>kimi · queued</sub> | _queued_ | _queued_ |
-| `nemotron-3-super_120b`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
-| `nemotron-mini_4b`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
-| `nemotron_70b-instruct-q8_0`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
-| `ornith-1.0-397b-iq1_m`<br><sub>ornith · queued</sub> | _queued_ | _queued_ |
-| `qwen2.5-coder_32b`<br><sub>qwen · queued</sub> | _queued_ | _queued_ |
-| `qwen3-coder-next_latest`<br><sub>qwen · queued</sub> | _queued_ | _queued_ |
 
 <!-- BENCH-SCOREBOARD:END -->
+
+**Full results** — every model including those still queued, per-run provenance,
+and the harness methodology — are published by
+[gilamonster-bench](https://github.com/Gilamonster-Foundation/gilamonster-bench),
+a separate instrument that has no dependency on newt. If the ruler shipped with
+the thing it measures, one commit could move both at once. For how these
+particular numbers were kept honest — including the runs thrown out — see the
+[DGX Spark capability survey](./docs/findings/dgx-spark-terminal-bench-survey.md).
+
+## Quick start
+
+```bash
+git clone https://github.com/Gilamonster-Foundation/newt-agent
+cd newt-agent
+just install                       # → ~/bin/newt, ~/bin/newt-mcp-server
+newt setup inference.example.net   # probe discovery ports, select a model
+newt code                          # TUI coder in the current directory
+```
+
+Authenticated endpoints, discovery ports, and where backends are stored:
+[the setup guide](./docs/guide/setup.md). Inside the TUI, `/mode` picks a working
+style and `/posture` is the separate authority control — a posture floor can only
+ever narrow authority
+([decision record](./docs/decisions/operating_modes_and_permission_postures.md)).
+Tool output renders through a bounded, tail-biased spill that `/spill` tunes
+([newt-tui](./newt-tui/README.md)). Run `newt --help` for every mode (worker, MCP
+server, doctor, config, …) — the binary is the authority on its own surface, this
+file is not. Python bindings live in [`newt-agent-py/`](./newt-agent-py/).
+
+## Why a bridle, not just a harness
+
+An agent *harness* helps the model do work; a **bridle** lets the operator
+*steer* — and prove, after the fact, exactly where the horse went. Newt is an
+experiment in making Object Capability (OCAP) security — long considered
+theoretically correct but practically unimplementable — pragmatic inside an agent
+loop, as a reusable concept
+([`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle))
+intended to be pluggable into other harnesses, not just this one.
+
+Because OCAP is an algebraic construction, some questions are answered
+*structurally* rather than by audit-log archaeology: who acted on what and when,
+who granted the authority for it, and whether **only** what was permitted
+actually happened. For anyone whose work lives on provenance, authority,
+integrity, and data sovereignty — lawyers, clinicians, data scientists — those
+answers have to be properties of the system, not promises in a policy document.
+The long form is [`docs/vision.md`](./docs/vision.md).
+
+If it doesn't find its day in the sun, it was fun anyway.
 
 ## Design laws
 
@@ -154,7 +100,8 @@ The invariants. Each links to the decision record that argues it.
   the pre-push hook runs it. One operator's leverage *is* this discipline.
 - **Patch, not prose.** Delegated work is verified by the harness (real
   diffs, real test runs — [`newt-eval/`](./newt-eval/)), never by trusting a
-  model's summary of itself.
+  model's summary of itself. The bench ratchet above is the same law at
+  release scale: verify by artifact, never by self-report.
 - **Skills are on-demand context.** The prompt carries an index; bodies load
   when used. See [`docs/decisions/agent-skills.md`](./docs/decisions/agent-skills.md)
   and the bundled skills in [`.newt/bundled-skills/`](./.newt/bundled-skills/).
@@ -167,30 +114,26 @@ The invariants. Each links to the decision record that argues it.
 
 ## Field notes
 
-The durable output of this experiment is what building it teaches about how
-LLMs behave inside a harness:
+The durable output of this experiment is what building it teaches about how LLMs
+behave inside a harness.
 
-- **[Summarization-induced hallucination](./docs/notes/2026-06-13-summarization-induced-hallucination.md)**
-  — context compression that *summarizes* a session can make the model
-  hallucinate APIs it had already read. A confident summary is worse than a
-  labelled absence: absence routes the model to re-read; a summary suppresses
-  recovery.
-- **[Truncation honesty](./docs/testing/results/context-baseline-f0f4f6e.md)**
-  — silent context truncation yields *silently wrong* answers; every fix
-  moves the failure, it doesn't always remove it.
-- **[Coder-driving sweet spots](./docs/notes/2026-05-31-newt-coder-driving-sweet-spots.md)**
-  — where small local models are and aren't reliable at agentic coding.
-- **[Hermes learnings](./docs/design/context-memory-hermes-learnings.md)**
-  — take the algorithms, refuse the architecture.
+- **[Summarization-induced hallucination](./docs/notes/2026-06-13-summarization-induced-hallucination.md)** — a confident summary is worse than a labelled absence: absence routes the model to re-read, a summary suppresses recovery.
+- **[Truncation honesty](./docs/testing/results/context-baseline-f0f4f6e.md)** — silent context truncation yields *silently wrong* answers; every fix moves the failure, it doesn't always remove it.
+- **[Coder-driving sweet spots](./docs/notes/2026-05-31-newt-coder-driving-sweet-spots.md)** — where small local models are and aren't reliable at agentic coding.
+- **[Hermes learnings](./docs/design/context-memory-hermes-learnings.md)** — take the algorithms, refuse the architecture.
 
 ## Where things live
 
 | What | Where |
 |---|---|
+| Setup beyond the quick start | [`docs/guide/setup.md`](./docs/guide/setup.md) |
+| Benchmark results & methodology | [gilamonster-bench](https://github.com/Gilamonster-Foundation/gilamonster-bench) |
 | Forward plan | [`ROADMAP.md`](./ROADMAP.md) (issue numbers are the live state) |
 | Release history | [`CHANGELOG.md`](./CHANGELOG.md) |
 | Design docs & studies | [`docs/design/`](./docs/design/) |
 | Decision records | [`docs/decisions/`](./docs/decisions/) |
+| Field notes | [`docs/notes/`](./docs/notes/) |
+| Terminal UI | [`newt-tui/README.md`](./newt-tui/README.md) |
 | Evaluation harness | [`newt-eval/README.md`](./newt-eval/README.md) |
 | Local gate | `just check` (see [`justfile`](./justfile)) |
 
