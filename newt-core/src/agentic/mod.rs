@@ -6147,12 +6147,27 @@ fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
                 .map(|t| {
                     let f = &t["function"];
                     if f.is_object() {
-                        serde_json::json!({
+                        // `parameters` is copied wholesale, so `required` /
+                        // `additionalProperties` / nested schemas keep their exact
+                        // validation semantics.
+                        let mut tool = serde_json::json!({
                             "type": "function",
                             "name": f["name"],
                             "description": f["description"],
                             "parameters": f["parameters"],
-                        })
+                        });
+                        // #1526 (invariant #6): a schema conversion must not
+                        // silently change validation semantics. Chat Completions
+                        // puts `strict` on the `function` object; the Responses API
+                        // puts it at the tool's TOP level. Dropping it would
+                        // downgrade a strict schema (additionalProperties:false +
+                        // all-required enforced) to permissive — so the model could
+                        // send args the strict schema rejects. Carry it through
+                        // verbatim; absent stays absent (no spurious strictness).
+                        if let Some(strict) = f.get("strict").filter(|s| !s.is_null()) {
+                            tool["strict"] = strict.clone();
+                        }
+                        tool
                     } else {
                         t.clone()
                     }
@@ -8822,6 +8837,45 @@ mod tool_round_cap_tests {
         );
         assert_eq!(out[0]["description"], "run git");
         assert!(out[0]["function"].is_null(), "no nested function wrapper");
+        // A non-strict tool stays non-strict — no strictness is invented.
+        assert!(
+            out[0].get("strict").is_none(),
+            "absent strict must not become present"
+        );
+    }
+
+    #[test]
+    fn tools_to_responses_preserves_strictness_semantics() {
+        // #1526 (invariant #6): a strict Chat Completions schema must stay strict
+        // after conversion. `strict` moves from the `function` object to the
+        // Responses tool's TOP level, and the parameters' `additionalProperties` /
+        // `required` are carried through wholesale (not silently relaxed).
+        let chat = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "write a file",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }]);
+        let out = tools_to_responses(&chat);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]["strict"], true,
+            "strict must survive at the Responses tool's top level"
+        );
+        // Validation-semantic fields inside `parameters` are unchanged.
+        assert_eq!(
+            out[0]["parameters"]["required"],
+            serde_json::json!(["path"])
+        );
+        assert_eq!(out[0]["parameters"]["additionalProperties"], false);
     }
 
     #[test]
