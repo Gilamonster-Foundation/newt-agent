@@ -83,7 +83,7 @@ pub struct Config {
     /// target, per-session plans) lives (#844). `dir` may be relative (under the
     /// repo, default `.scratch`) or absolute (`/tmp`, a k8s PVC mount) for
     /// read-only checkouts. `NEWT_SCRATCH_DIR` overrides it. Applied in
-    /// [`Config::resolve`] via [`crate::scratch::set_scratch_dir`].
+    /// [`Config::apply_runtime_settings`] via [`crate::scratch::set_scratch_dir`].
     #[serde(default)]
     pub scratch: Option<ScratchConfig>,
 
@@ -784,9 +784,11 @@ impl ColorMode {
 }
 
 /// Markdown rendering mode — the `[tui] markdown` key and the `/markdown`
-/// command (Step 25.4, #568). `Auto` renders Markdown whenever color is active;
-/// `On`/`Off` force the choice (`On` still needs color to emit ANSI). The
-/// effective decision is `mode.forced().unwrap_or(color_on) && color_on`.
+/// command (Step 25.4, #568). This controls RichTUI text output, including
+/// assistant replies and built-in Markdown documents such as `/help`. `Auto`
+/// renders Markdown whenever color is active; `On`/`Off` force the choice
+/// (`On` still needs color to emit ANSI). The effective decision is
+/// `mode.forced().unwrap_or(color_on) && color_on`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MarkdownMode {
@@ -1185,13 +1187,17 @@ pub struct ContextConfig {
     #[serde(default)]
     pub api_surface: ApiSurfaceConfig,
 
-    /// Percent of a request's `num_ctx` window usable as INPUT before the
-    /// pre-send budget gate trims (the rest is reply headroom). The historical
-    /// hardcoded value was 80 (reserve 20% for the reply). Large-window models
-    /// (e.g. Opus) can safely run this higher — raising it lets more context
-    /// ride each turn before trimming kicks in. Clamped to `1..=99`; anything
-    /// outside falls back to 80. See `num_ctx_input_ceiling` (#282).
-    #[serde(default = "default_input_ceiling_pct")]
+    /// Percentage bound on how much of a request's `num_ctx` window may be
+    /// input before the pre-send gate trims. The effective input ceiling is
+    /// the tighter of this bound and the room left by the active maximum
+    /// output. The historical hardcoded value was 80. Large-window models can
+    /// safely run this higher to pack more input when the output reserve is not
+    /// already tighter. Normalized to `1..=99`; anything outside falls back to
+    /// 80. See `num_ctx_input_ceiling` (#282).
+    #[serde(
+        default = "default_input_ceiling_pct",
+        deserialize_with = "deserialize_input_ceiling_pct"
+    )]
     pub input_ceiling_pct: u32,
 
     /// Percent-of-ceiling below which the loop emits the low-remaining-budget
@@ -1208,6 +1214,35 @@ fn default_summary_input_cap_floor_chars() -> usize {
 
 fn default_input_ceiling_pct() -> u32 {
     80
+}
+
+/// Normalize a configured input-ceiling percentage to its documented safe
+/// domain. Invalid values fall back to the historical 80% default: zero must
+/// not erase an authoritative ceiling, and 100%+ must not permit over-window
+/// input budgets.
+#[must_use]
+pub fn normalize_input_ceiling_pct(value: u32) -> u32 {
+    if (1..=99).contains(&value) {
+        value
+    } else {
+        default_input_ceiling_pct()
+    }
+}
+
+/// Resolve only the configured percentage bound for a full context window.
+/// Generation-policy output reserves compose with this value in the agentic
+/// loop; callers that hold an already-derived input cap must not apply it again.
+#[must_use]
+pub fn input_percentage_ceiling(context_window: u32, input_ceiling_pct: u32) -> u32 {
+    let pct = normalize_input_ceiling_pct(input_ceiling_pct);
+    (u64::from(context_window) * u64::from(pct) / 100) as u32
+}
+
+fn deserialize_input_ceiling_pct<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u32::deserialize(deserializer).map(normalize_input_ceiling_pct)
 }
 
 fn default_low_budget_pct() -> usize {
@@ -1697,7 +1732,8 @@ pub struct TuiConfig {
     // (#559), so the summarizer can run on its own backend. Old `[tui]` keys
     // (`summarizer_timeout_secs` / `summarizer_retries` / `summarizer_model`)
     // are no longer read — `#[serde(default)]` ignores them in stale configs.
-    /// Markdown rendering of assistant output (Step 25.4, #568). `auto`
+    /// Markdown rendering of RichTUI text output (Step 25.4, #568), including
+    /// assistant replies and built-in documents such as `/help`. `auto`
     /// (default) renders whenever color is active; `on`/`off` force it. The
     /// `/markdown [on|off]` command overrides this for the session.
     #[serde(default)]
@@ -2844,6 +2880,25 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// Resolve explicitly accepted Chat Completions request extensions.
+    #[must_use]
+    pub fn chat_completions_capability(&self) -> crate::model_card::ChatCompletionsCapability {
+        self.capability
+            .as_ref()
+            .and_then(|capability| capability.chat_completions)
+            .unwrap_or_default()
+    }
+
+    /// Resolve the backend's reasoning replay contract. Unknown or legacy
+    /// endpoints remain conservative and never receive replayed reasoning.
+    #[must_use]
+    pub fn reasoning_replay_scope(&self) -> crate::model_card::ReasoningReplayScope {
+        self.capability
+            .as_ref()
+            .and_then(|capability| capability.reasoning_replay_scope)
+            .unwrap_or_default()
+    }
+
     /// The declared model, if any — empty strings count as unset. This is the
     /// ONLY sanctioned way to read `model`; when it returns `None` the backend
     /// expects the served model to be adopted from the endpoint (Phase B).
@@ -3015,15 +3070,15 @@ impl BackendOverride {
 }
 
 /// Process-global CLI backend override, set once from the CLI before any config
-/// resolution. Mirrors the other single-canonical-entry publishes in
-/// [`Config::resolve`] (max_output_tokens, scratch dir): the CLI can't thread a
-/// value through every `Config::resolve()` call site, so it stashes it here and
-/// `resolve` applies it.
+/// application. Mirrors the other publishes in
+/// [`Config::apply_runtime_settings`] (max_output_tokens, scratch dir): the CLI
+/// can't thread a value through every runtime consumer, so it stashes it here
+/// and the canonical apply operation installs it last.
 static CLI_BACKEND_OVERRIDE: std::sync::Mutex<Option<BackendOverride>> =
     std::sync::Mutex::new(None);
 
 /// Install the CLI backend override (see [`BackendOverride`]). Call once, before
-/// the first [`Config::resolve`].
+/// the first [`Config::apply_runtime_settings`] call.
 pub fn set_cli_backend_override(over: BackendOverride) {
     if let Ok(mut slot) = CLI_BACKEND_OVERRIDE.lock() {
         *slot = Some(over);
@@ -3252,7 +3307,7 @@ pub fn writeback_probed_backend(
     merged.provenance = Some(BackendProvenance {
         source: Some(format!(
             "newt adopt v{} (probed; delete this file to reset)",
-            env!("CARGO_PKG_VERSION")
+            crate::build_info::VERSION_WITH_COMMIT
         )),
         probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
         derived_serving: patch
@@ -3354,9 +3409,10 @@ impl Config {
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
         // root — `cd repo && newt` → same host-RCE class as the walk-up) rather
-        // than an operator-explicit base? Only `$NEWT_CONFIG` can pin a base here
-        // (the `--config` flag routes through `Config::load`, never `resolve`);
-        // if it points AT `./newt.toml` that is the operator's explicit choice
+        // than an operator-explicit base? `$NEWT_CONFIG` pins a base at this
+        // resolution layer (interactive `--config` publishes that env;
+        // explicit-profile consumers may instead call `Config::load`). If it
+        // points AT `./newt.toml`, that is the operator's explicit choice
         // (Trusted). Every other `./newt.toml` base is ambient → Untrusted.
         let base_ambient = base_is_ambient_newt_toml(base_path.as_deref());
         // A project-local config that *is* the base (e.g. cwd is the project and
@@ -3428,15 +3484,6 @@ impl Config {
         if cfg.backends.is_empty() {
             cfg.backends.push(fallback_localhost_backend());
         }
-        // CLI `--backend-*` flags win over disk drop-ins and localhost
-        // discovery: apply the process-global override LAST so an operator who
-        // pins a backend on the command line gets exactly it, and no probe
-        // write-back can silently reroute the session (the ollama-fallback
-        // incident). Applied here — the single canonical config-application
-        // entry — so every consumer (TUI, cowork, eval) honors it.
-        if let Some(over) = cli_backend_override() {
-            over.apply(&mut cfg);
-        }
         // Per-file bundles (the model-support-kit control surface): drop a
         // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
         cfg.merge_disk_bundles();
@@ -3453,30 +3500,45 @@ impl Config {
         // own file, no inline `[[dgx.nodes]]`. The active selection
         // (active_node/active_endpoint/active_model) stays in `[dgx]`.
         cfg.merge_disk_dgx_nodes();
+        cfg.apply_runtime_settings();
+        Ok(cfg)
+    }
+
+    /// Apply one final resolved configuration to the runtime.
+    ///
+    /// Configuration loading stays pure. Runtime consumers that use
+    /// [`Config::load`] for an explicit profile must invoke this once after
+    /// loading; normal discovery via [`Config::resolve`] invokes it before
+    /// returning. This is also the single owner for process-global
+    /// `--backend-*` precedence, so an explicit config file cannot defeat a
+    /// higher-precedence per-invocation backend pin.
+    pub fn apply_runtime_settings(&mut self) {
+        // CLI `--backend-*` flags win over every configuration source. Apply
+        // them here, after both explicit loading and normal discovery have
+        // finished, so all runtime entry points receive the same backend.
+        if let Some(over) = cli_backend_override() {
+            over.apply(self);
+        }
         // #726: push the resolved `[tools] max_output_tokens` into the
-        // process-wide model-facing output budget. `Config::resolve` is the
-        // single canonical config-application entry, so every consumer (TUI,
-        // cowork driver, eval) gets the override here without threading a new
-        // `usize` through `ChatCtx` + `execute_tool` + every call site. Idempotent.
-        crate::agentic::set_max_output_tokens(cfg.max_output_tokens());
-        crate::agentic::set_output_head_tokens(cfg.output_head_tokens());
-        crate::agentic::set_output_cap_chars_per_token(cfg.output_cap_chars_per_token());
-        // #tenacity: publish the resolved `[tenacity]` config so `effective_tenacity`
-        // can pick the per-family default for the active model. An explicit
-        // `--tenacity` still supersedes it (resolved in `effective_tenacity`).
-        crate::tenacity::set_tenacity_config(cfg.tenacity.clone().unwrap_or_default());
-        // #880: publish the repo `[lifecycle]` overrides the same way — the single
-        // canonical config-application entry — so the crew's normalize (and future
-        // phase consumers) honor `.newt/config.toml`.
-        if let Some(lc) = &cfg.lifecycle {
+        // process-wide model-facing output budget without threading a new
+        // `usize` through `ChatCtx` + `execute_tool` + every call site.
+        crate::agentic::set_max_output_tokens(self.max_output_tokens());
+        crate::agentic::set_output_head_tokens(self.output_head_tokens());
+        crate::agentic::set_output_cap_chars_per_token(self.output_cap_chars_per_token());
+        // #tenacity: publish the resolved `[tenacity]` config so
+        // `effective_tenacity` can pick the per-family default for the active
+        // model. An explicit `--tenacity` still supersedes it.
+        crate::tenacity::set_tenacity_config(self.tenacity.clone().unwrap_or_default());
+        // #880: publish the repo `[lifecycle]` overrides so the crew's normalize
+        // (and future phase consumers) honor them.
+        if let Some(lc) = &self.lifecycle {
             crate::tooling::set_lifecycle_override(lc.clone());
         }
-        // #844: publish `[scratch] dir` the same way — so crew worktrees / the crew
-        // target / session plans honor it. `NEWT_SCRATCH_DIR` still overrides.
-        if let Some(dir) = cfg.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
+        // #844: publish `[scratch] dir` so crew worktrees / the crew target /
+        // session plans honor it. `NEWT_SCRATCH_DIR` still overrides.
+        if let Some(dir) = self.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
             crate::scratch::set_scratch_dir(dir);
         }
-        Ok(cfg)
     }
 
     /// The configured model-facing output token budget (`[tools]
@@ -3826,6 +3888,45 @@ impl Config {
     /// This is the first path `resolve()` reads and the target for `save()`.
     pub fn user_config_path() -> Option<PathBuf> {
         Self::user_config_dir().map(|dir| dir.join("config.toml"))
+    }
+
+    /// The shared config-based backend-selection precedence (#1320, PR-3) — the
+    /// single definition used by chat's `resolve_backend_choice` config rungs, by
+    /// `solve`, and by the ACP worker, so every entry point agrees on which
+    /// configured backend the operator named. Most-specific first: `$NEWT_PROVIDER`
+    /// names a backend > `default_backend` (usable) > a sole backend > prefer an
+    /// OpenAI-kind entry, else the first endpoint-bearing one. `None` only when no
+    /// backend has an endpoint. Env-synthesized fallbacks (codex, legacy dgx,
+    /// localhost) stay in chat's `resolve_backend_choice`, layered around this.
+    #[must_use]
+    pub fn select_configured_backend(&self) -> Option<&BackendConfig> {
+        // 1. Operator / live override: $NEWT_PROVIDER names a backend.
+        if let Ok(name) = std::env::var("NEWT_PROVIDER") {
+            if !name.is_empty() {
+                if let Some(b) = self.backends.iter().find(|b| b.name == name) {
+                    return Some(b);
+                }
+            }
+        }
+        // 2. The configured default (usable — skip an endpointless one).
+        if let Some(name) = &self.default_backend {
+            if let Some(b) = self
+                .backends
+                .iter()
+                .find(|b| b.name == *name && !b.endpoint.is_empty())
+            {
+                return Some(b);
+            }
+        }
+        // 3. A sole backend is the obvious choice.
+        if self.backends.len() == 1 {
+            return self.backends.first().filter(|b| !b.endpoint.is_empty());
+        }
+        // 4. Prefer an OpenAI-kind entry, else the first endpoint-bearing one.
+        self.backends
+            .iter()
+            .find(|b| b.kind == Some(BackendKind::Openai) && !b.endpoint.is_empty())
+            .or_else(|| self.backends.iter().find(|b| !b.endpoint.is_empty()))
     }
 
     /// Serialize the config to pretty TOML for **audit**, with inline secret
@@ -4743,6 +4844,32 @@ mod tests {
     }
 
     #[test]
+    fn context_input_ceiling_pct_normalizes_at_deserialization_boundary() {
+        for value in [1, 80, 99] {
+            let parsed: ContextConfig =
+                toml::from_str(&format!("input_ceiling_pct = {value}")).unwrap();
+            assert_eq!(parsed.input_ceiling_pct, value);
+        }
+
+        for value in [0, 100, 101, u32::MAX] {
+            let parsed: ContextConfig =
+                toml::from_str(&format!("input_ceiling_pct = {value}")).unwrap();
+            assert_eq!(
+                parsed.input_ceiling_pct,
+                default_input_ceiling_pct(),
+                "out-of-range value {value} must fall back to the documented safe default"
+            );
+        }
+
+        assert_eq!(input_percentage_ceiling(32_768, 90), 29_491);
+        assert_eq!(
+            input_percentage_ceiling(32_768, 0),
+            26_214,
+            "programmatic callers share the same invalid-value fallback",
+        );
+    }
+
+    #[test]
     fn scratch_section_defaults_and_parses() {
         // #844: `[scratch] dir` parses onto Config; absent → None (the `.scratch`
         // default applies at resolution). Uses `from_str` (not `resolve`) so this
@@ -5455,6 +5582,47 @@ mod tests {
         let out = toml::to_string(&legacy).unwrap();
         assert!(!out.contains("serving"), "unset fields are skipped: {out}");
         assert!(!out.contains("provenance"));
+    }
+
+    #[test]
+    fn backend_reasoning_replay_scope_is_explicit_and_defaults_never() {
+        let default_backend: BackendConfig =
+            toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\n").unwrap();
+        assert_eq!(
+            default_backend.reasoning_replay_scope(),
+            crate::model_card::ReasoningReplayScope::Never
+        );
+
+        let replay_backend: BackendConfig = toml::from_str(
+            "endpoint=\"http://h:1\"\nmodel=\"m\"\n\
+             [capability]\nreasoning_replay_scope=\"current_user_turn\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            replay_backend.reasoning_replay_scope(),
+            crate::model_card::ReasoningReplayScope::CurrentUserTurn
+        );
+    }
+
+    #[test]
+    fn backend_chat_completions_generation_policy_is_explicit_capability_data() {
+        let backend: BackendConfig = toml::from_str(
+            "endpoint=\"http://h:1\"\nmodel=\"m\"\nkind=\"openai\"\n\
+             [capability.chat_completions]\ncognition=true\n\
+             chat_template_kwargs=true\nparallel_tool_calls=false\n\
+             bounded_reasoning_continuation=true\n",
+        )
+        .expect("chat-completions policy is valid capability data");
+
+        let capability = serde_json::to_value(backend.capability.expect("capability present"))
+            .expect("capability serializes");
+        assert_eq!(capability["chat_completions"]["cognition"], true);
+        assert_eq!(capability["chat_completions"]["chat_template_kwargs"], true);
+        assert_eq!(capability["chat_completions"]["parallel_tool_calls"], false);
+        assert_eq!(
+            capability["chat_completions"]["bounded_reasoning_continuation"],
+            true
+        );
     }
 
     #[test]

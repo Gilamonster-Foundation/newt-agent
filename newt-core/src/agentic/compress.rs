@@ -546,6 +546,11 @@ pub(crate) struct CompressRequest<'a> {
     /// Message-count ceiling (set by the mid-loop count trigger). When
     /// `Some`, the structural prune alone can never satisfy the request.
     pub max_messages: Option<usize>,
+    /// Number of trailing messages whose replay contract is endpoint-owned.
+    /// Count-only compression keeps this suffix byte-identical. Hard token
+    /// pressure may one-line older tool results inside it, but never drops or
+    /// summarizes the assistant plans that anchor the suffix.
+    pub replay_protected_tail_len: usize,
     /// The original task — anchored verbatim into the summary request.
     pub task: &'a str,
     /// True when `budget` rests on an authoritative ceiling (Step 20.3) — a
@@ -604,6 +609,7 @@ impl<'a> CompressRequest<'a> {
             messages,
             budget: estimate_tokens(messages, est) / 2,
             max_messages: None,
+            replay_protected_tail_len: 0,
             task,
             hard_budget: false,
             // Moot for a soft (`hard_budget: false`) manual run — it never
@@ -762,7 +768,10 @@ pub(crate) async fn compress(
     }
 
     // (1) Structural prune — zero LLM cost (Step 18.3's passes).
-    let pruned = prune(req.messages, &PruneConfig::default());
+    let replay_protected_tail_len = req.replay_protected_tail_len.min(req.messages.len());
+    let mut prune_config = PruneConfig::default();
+    prune_config.keep_last = prune_config.keep_last.max(replay_protected_tail_len);
+    let pruned = prune(req.messages, &prune_config);
     let prune_changed = pruned.chars_reclaimed > 0;
     let mut pruned = pruned.messages;
     let after_prune = estimate_tokens(&pruned, req.est);
@@ -782,7 +791,13 @@ pub(crate) async fn compress(
 
     // (2) Boundary: head + token-budgeted (and, for the count trigger,
     // count-capped) tail, last-user anchored, tool-pair aligned.
-    let boundary = compute_boundary(&pruned, req.budget, req.max_messages, req.est);
+    let boundary = compute_boundary_with_protected_tail(
+        &pruned,
+        req.budget,
+        req.max_messages,
+        req.est,
+        replay_protected_tail_len,
+    );
 
     // (2.5) Working-set protection: pin the single most-recent read that the
     // boundary leaves in the summarizable middle, so a refactor target survives
@@ -823,7 +838,13 @@ pub(crate) async fn compress(
         _ => None,
     };
     let boundary = if pinned_path.is_some() {
-        compute_boundary(&pruned, req.budget, req.max_messages, req.est)
+        compute_boundary_with_protected_tail(
+            &pruned,
+            req.budget,
+            req.max_messages,
+            req.est,
+            replay_protected_tail_len,
+        )
     } else {
         boundary
     };
@@ -923,7 +944,11 @@ pub(crate) async fn compress(
         let aggressive = prune(
             &assembled,
             &PruneConfig {
-                keep_last: trailing_tool_group_len(&assembled).max(2),
+                keep_last: trailing_tool_group_len_with_protected_tail(
+                    &assembled,
+                    replay_protected_tail_len,
+                )
+                .max(2),
                 ..PruneConfig::default()
             },
         );
@@ -945,7 +970,12 @@ pub(crate) async fn compress(
         // problem, so the F1c protection stays absolute there.
         if req.hard_budget
             && estimate_tokens(&assembled, req.est) > req.budget
-            && reclaim_within_trailing_group(&mut assembled, req.budget, req.est)
+            && reclaim_within_trailing_group(
+                &mut assembled,
+                req.budget,
+                req.est,
+                replay_protected_tail_len,
+            )
             && action == CompressAction::Fit
         {
             action = CompressAction::Pruned;
@@ -1168,13 +1198,25 @@ struct Boundary {
 /// caps the tail by count so the assembled `head + summary + tail` actually
 /// lands at or under the ceiling — a token-budgeted tail alone can swallow
 /// an entire small-message conversation and leave nothing to summarize.
+#[cfg(test)]
 fn compute_boundary(
     messages: &[Value],
     budget: usize,
     max_messages: Option<usize>,
     est: TokenEstimation,
 ) -> Boundary {
+    compute_boundary_with_protected_tail(messages, budget, max_messages, est, 0)
+}
+
+fn compute_boundary_with_protected_tail(
+    messages: &[Value],
+    budget: usize,
+    max_messages: Option<usize>,
+    est: TokenEstimation,
+    replay_protected_tail_len: usize,
+) -> Boundary {
     let head = head_len(messages);
+    let replay_protected_tail_len = replay_protected_tail_len.min(messages.len());
     let max_tail = max_messages.map(|m| m.saturating_sub(head + 1).max(1));
 
     // Token-budgeted tail: walk backward accumulating estimates until ~25%
@@ -1236,6 +1278,16 @@ fn compute_boundary(
         }
     }
 
+    // Reasoning-capable Chat Completions endpoints can require every
+    // assistant plan from the active tool loop to be replayed. The loop strips
+    // old-turn/default-scope reasoning before messages reach this pipeline, so
+    // any surviving reasoning-bearing assistant starts an atomic current-turn
+    // suffix. Count pressure treats that suffix as one logical item; hard token
+    // pressure may still compact older tool results within it below.
+    if replay_protected_tail_len > 0 {
+        tail_start = tail_start.min(messages.len() - replay_protected_tail_len);
+    }
+
     Boundary { head, tail_start }
 }
 
@@ -1251,22 +1303,68 @@ fn head_len(messages: &[Value]) -> usize {
 // Trailing-group protection (#270 / #285)
 // ---------------------------------------------------------------------------
 
-/// Length of the suffix the aggressive fit pass protects: from the LAST
-/// message carrying `tool_calls` (the assistant turn that issued the calls)
-/// through the end of the list — that turn, its fresh (unseen) results, and
-/// anything interleaved after them. `0` when nothing in the list ever
-/// called a tool.
+/// Number of trailing messages beginning with the first reasoning-bearing
+/// assistant message. Callers opt into replay protection by passing this
+/// value back through [`CompressRequest::replay_protected_tail_len`].
+pub(crate) fn reasoning_replay_tail_len(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .position(|message| {
+            if message["role"].as_str() != Some("assistant") {
+                return false;
+            }
+            let split_reasoning = message["reasoning_content"]
+                .as_str()
+                .is_some_and(|reasoning| !reasoning.is_empty());
+            let inline_reasoning = message["content"]
+                .as_str()
+                .is_some_and(|content| crate::reasoning::split_reasoning(content).1.is_some());
+            split_reasoning || inline_reasoning
+        })
+        .map_or(0, |start| messages.len() - start)
+}
+
+/// Count a replay-required reasoning suffix as one atomic logical message for
+/// count-only compression pressure. Token budgets continue to use its full
+/// serialized size.
+pub(crate) fn compression_message_count(
+    messages: &[Value],
+    replay_protected_tail_len: usize,
+) -> usize {
+    if replay_protected_tail_len == 0 {
+        messages.len()
+    } else {
+        messages
+            .len()
+            .saturating_sub(replay_protected_tail_len.min(messages.len()))
+            + 1
+    }
+}
+
+/// Length of the fresh tool-call suffix the generic aggressive fit pass
+/// protects. Protection starts at the LAST message carrying `tool_calls` and
+/// includes its results plus anything interleaved after them. `0` when no
+/// assistant call exists.
 ///
 /// Deriving the group by counting trailing `role == "tool"` messages was the
-/// #270 gap: the read-only-round nudge injects a `user` message immediately
-/// before the compression call site, the trailing count read zero,
-/// `keep_last` fell to its floor of 2, and every older unseen result in the
-/// fresh group was one-lined pre-dispatch for a round. Anchoring on the
-/// turn that ISSUED the calls makes the group immune to whatever lands
-/// after it (a nudge, a compaction notice). Only `tool_calls` is consulted
-/// — the loop appends the backend's `message` object verbatim, and a `role`
-/// field is not guaranteed on every wire dialect.
+/// #270 gap: a user-role nudge immediately before compression made that count
+/// zero and exposed unseen results to one-lining. Anchoring on the assistant
+/// call is immune to nudges and compaction notices that follow it.
+#[cfg(test)]
 fn trailing_tool_group_len(messages: &[Value]) -> usize {
+    trailing_tool_group_len_with_protected_tail(messages, 0)
+}
+
+/// Endpoint-declared replay protection wins over the generic fresh-call
+/// anchor. The explicit length keeps capability policy out of this pipeline.
+fn trailing_tool_group_len_with_protected_tail(
+    messages: &[Value],
+    replay_protected_tail_len: usize,
+) -> usize {
+    let replay_protected_tail_len = replay_protected_tail_len.min(messages.len());
+    if replay_protected_tail_len > 0 {
+        return replay_protected_tail_len;
+    }
     messages
         .iter()
         .rposition(|m| m["tool_calls"].as_array().is_some_and(|t| !t.is_empty()))
@@ -1291,8 +1389,10 @@ fn reclaim_within_trailing_group(
     assembled: &mut Vec<Value>,
     budget: usize,
     est: TokenEstimation,
+    replay_protected_tail_len: usize,
 ) -> bool {
-    let group_len = trailing_tool_group_len(assembled);
+    let group_len =
+        trailing_tool_group_len_with_protected_tail(assembled, replay_protected_tail_len);
     if group_len == 0 {
         return false;
     }
@@ -2030,6 +2130,7 @@ mod tests {
                 messages,
                 budget,
                 max_messages,
+                replay_protected_tail_len: 0,
                 task: "fix the failing test",
                 hard_budget: true,
                 authoritative: true,
@@ -2059,6 +2160,7 @@ mod tests {
                 messages,
                 budget,
                 max_messages,
+                replay_protected_tail_len: 0,
                 task: "fix the failing test",
                 hard_budget: true,
                 authoritative: false,
@@ -2087,6 +2189,7 @@ mod tests {
                 messages,
                 budget,
                 max_messages,
+                replay_protected_tail_len: 0,
                 task: "fix the failing test",
                 hard_budget: false,
                 authoritative: false,
@@ -2253,6 +2356,7 @@ mod tests {
                 messages: &protected,
                 budget: before / 4,
                 max_messages: None,
+                replay_protected_tail_len: 0,
                 task: active_task,
                 hard_budget: true,
                 authoritative: true,
@@ -2515,6 +2619,7 @@ mod tests {
                 messages: &msgs,
                 budget: before / 3,
                 max_messages: None,
+                replay_protected_tail_len: 0,
                 task,
                 hard_budget: true,
                 authoritative: true,
@@ -2730,6 +2835,125 @@ mod tests {
         assert_eq!(trailing_tool_group_len(&roleless), 2);
     }
 
+    #[test]
+    fn reasoning_replay_tail_keeps_all_same_turn_tool_rounds_atomic() {
+        let mut msgs = vec![
+            sys("you are newt"),
+            user("an older turn"),
+            json!({"role": "assistant", "content": "older answer"}),
+            user("the current task"),
+        ];
+        let first_reasoning = msgs.len();
+        msgs.push(json!({
+            "role": "assistant",
+            "content": "<think>first private plan</think>",
+            "reasoning_content": "first split plan",
+            "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "a.rs"}}}]
+        }));
+        msgs.push(tool_result("first result"));
+        // An unprefixed harness nudge currently looks like an ordinary user
+        // message to the generic boundary logic.
+        msgs.push(user("[Plan progress: 0/2 done. Keep working this step.]"));
+        msgs.push(json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "second split plan",
+            "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "b.rs"}}}]
+        }));
+        msgs.push(tool_result("second result"));
+
+        let replay_protected_tail_len = reasoning_replay_tail_len(&msgs);
+        let boundary = compute_boundary_with_protected_tail(
+            &msgs,
+            100,
+            Some(4),
+            EST,
+            replay_protected_tail_len,
+        );
+        assert!(
+            boundary.tail_start <= first_reasoning,
+            "compression must not split the current-turn reasoning transcript (tail_start {})",
+            boundary.tail_start
+        );
+        assert_eq!(
+            trailing_tool_group_len_with_protected_tail(&msgs, replay_protected_tail_len,),
+            msgs.len() - first_reasoning,
+            "the aggressive pass must protect every reasoning-bearing tool round"
+        );
+        assert_eq!(
+            compression_message_count(&msgs, replay_protected_tail_len),
+            first_reasoning + 1,
+            "count pressure must treat the replay transcript as one atomic item"
+        );
+    }
+
+    #[test]
+    fn inline_reasoning_does_not_enable_generic_compression_protection() {
+        let mut ordinary = vec![sys("you are newt"), user("the current task")];
+        ordinary.push(json!({"role": "assistant", "content": "visible plan"}));
+        for i in 0..8 {
+            ordinary.push(user(&format!("follow-up {i}")));
+            ordinary.push(json!({"role": "assistant", "content": format!("answer {i}")}));
+        }
+        let mut inline = ordinary.clone();
+        inline[2]["content"] = json!("<think>private plan</think>visible plan");
+
+        assert_eq!(
+            compute_boundary(&inline, 100, Some(4), EST).tail_start,
+            compute_boundary(&ordinary, 100, Some(4), EST).tail_start,
+            "generic compression must not infer endpoint capabilities from message text"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_only_compression_preserves_the_full_reasoning_replay_tail() {
+        let first_result = format!("FIRST-RESULT:{}", "x".repeat(600));
+        let mut msgs = vec![sys("you are newt"), user("the current task")];
+        msgs.push(json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "read every file before deciding",
+            "tool_calls": [{"function": {
+                "name": "read_file",
+                "arguments": {"path": "first.rs"}
+            }}]
+        }));
+        msgs.push(tool_result(&first_result));
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("later-{i}.rs")}),
+            ));
+            msgs.push(tool_result(&format!("later result {i}")));
+        }
+
+        let mut state = CompressState::new();
+        let out = compress(
+            CompressRequest {
+                messages: &msgs,
+                budget: usize::MAX,
+                max_messages: Some(4),
+                replay_protected_tail_len: reasoning_replay_tail_len(&msgs),
+                task: "the current task",
+                hard_budget: false,
+                authoritative: false,
+                focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
+                compaction_store: None,
+            },
+            None,
+            &mut state,
+        )
+        .await;
+        assert!(
+            out.messages
+                .iter()
+                .any(|message| message["content"].as_str() == Some(first_result.as_str())),
+            "count-only structural pruning must not rewrite an explicitly replayed tool result"
+        );
+    }
+
     /// The #270 repro through the whole pipeline: an over-budget session
     /// whose fresh trailing group (two unseen results) is followed by the
     /// read-only nudge's user message. Pre-fix the aggressive pass saw zero
@@ -2855,25 +3079,25 @@ mod tests {
         // Under-budget group: untouched, returns false (the F1c property).
         let mut fits = group(&[&small, &small, &small]);
         let before = fits.clone();
-        assert!(!reclaim_within_trailing_group(&mut fits, 10_000, EST));
+        assert!(!reclaim_within_trailing_group(&mut fits, 10_000, EST, 0));
         assert_eq!(fits, before, "a group within its share is never touched");
 
         // No group at all: no-op.
         let mut no_group = vec![sys("s"), user(&big)];
-        assert!(!reclaim_within_trailing_group(&mut no_group, 100, EST));
+        assert!(!reclaim_within_trailing_group(&mut no_group, 100, EST, 0));
 
         // Single-member group over budget: the newest IS the only member —
         // untouched, truthful over-budget residual (clipping inside one
         // result is out of scope).
         let mut single = group(&[&big]);
         let before = single.clone();
-        assert!(!reclaim_within_trailing_group(&mut single, 1_000, EST));
+        assert!(!reclaim_within_trailing_group(&mut single, 1_000, EST, 0));
         assert_eq!(single, before);
 
         // Oversized group, early stop: one-lining the OLDEST member alone
         // fits the budget — the middle and newest members stay whole.
         let mut early = group(&[&big, &small, &small]);
-        assert!(reclaim_within_trailing_group(&mut early, 1_500, EST));
+        assert!(reclaim_within_trailing_group(&mut early, 1_500, EST, 0));
         let results: Vec<&str> = early
             .iter()
             .filter(|m| m["role"].as_str() == Some("tool"))
@@ -2891,7 +3115,7 @@ mod tests {
         // Newest alone exceeds the budget: all older members one-lined, the
         // newest still whole, the list honestly stays over.
         let mut residual = group(&[&small, &small, &big]);
-        assert!(reclaim_within_trailing_group(&mut residual, 1_000, EST));
+        assert!(reclaim_within_trailing_group(&mut residual, 1_000, EST, 0));
         let results: Vec<&str> = residual
             .iter()
             .filter(|m| m["role"].as_str() == Some("tool"))
@@ -3563,6 +3787,7 @@ mod tests {
                 messages: &messages,
                 budget: 128,
                 max_messages: None,
+                replay_protected_tail_len: 0,
                 task: &exact,
                 hard_budget: true,
                 authoritative: true,
@@ -3630,6 +3855,7 @@ mod tests {
                 messages: &msgs,
                 budget: 300,
                 max_messages: None,
+                replay_protected_tail_len: 0,
                 task: "task",
                 hard_budget: true,
                 authoritative: true,

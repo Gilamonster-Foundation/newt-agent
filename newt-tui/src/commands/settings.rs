@@ -1,7 +1,9 @@
-//! `/prompt` · `/vi` · `/emacs` · `/nano` · `/edit-mode` · `/thinking` · `/nudge` — the
-//! session-setting commands, each of which sets an `NEWT_*` env var that a
-//! later step in `run_chat` picks up. Moved verbatim from the `dispatch_slash`
-//! match in `lib.rs`.
+//! `/prompt` · `/vi` · `/emacs` · `/nano` · `/edit-mode` · `/thinking` · `/nudge` ·
+//! `/tenacity` · `/cognition` · `/psyche` — the session-setting commands. The
+//! editor-family ones set an `NEWT_*` env var a later step in `run_chat` picks
+//! up; the psyche dials (`/tenacity`, `/cognition`) mutate a process-global and
+//! `/psyche` renders all three effort dials read-only. Moved from the
+//! `dispatch_slash` match in `lib.rs`.
 
 use newt_core::agentic::print_newt;
 
@@ -159,6 +161,15 @@ pub(crate) fn dispatch(
         // explicit override that wins over `[tenacity]` config + the CLI flag.
         "tenacity" => print_newt(&tenacity_command(arg1), color, verbose),
 
+        // Psyche cognition: the backend-neutral per-call reasoning depth.
+        // `/cognition` shows the session override; `/cognition <level>` forces it,
+        // `/cognition off` suppresses the field, `/cognition auto` follows persona.
+        "cognition" => print_newt(&cognition_command(arg1), color, verbose),
+
+        // The psyche panel: all three effort dials (cognition/tenacity/crew) at a
+        // glance. `/psyche obsessive` engages the max-everything live dials.
+        "psyche" => print_newt(&psyche_command(arg1), color, verbose),
+
         other => {
             unreachable!("commands::settings::dispatch routed a non-setting command: {other:?}")
         }
@@ -171,18 +182,19 @@ pub(crate) fn dispatch(
 /// [`newt_core::tenacity::effective_tenacity`]). Pure for the show/list/error
 /// paths; the set path mutates the process-global via `set_cli_tenacity`.
 fn tenacity_command(arg: &str) -> String {
-    use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+    use newt_core::tenacity::{clear_cli_tenacity, effective_tenacity, set_cli_tenacity, Tenacity};
     match arg.trim() {
         "" | "status" | "show" => {
             let t = effective_tenacity();
             format!(
-                "tenacity: {} — {}  (/tenacity <relaxed|standard|insistent|relentless>|list)",
+                "tenacity: {} — {}  (/tenacity <auto|relaxed|standard|insistent|relentless>|list)",
                 t.label(),
                 t.describe()
             )
         }
         "list" => {
             let mut out = String::from("tenacity levels (patient → forcing):");
+            out.push_str("\n  auto       inherit from the persona / config / model family");
             for t in Tenacity::all() {
                 let active = if t == effective_tenacity() {
                     " ← active"
@@ -193,21 +205,232 @@ fn tenacity_command(arg: &str) -> String {
             }
             out
         }
+        // review-2 #2: clear the `--tenacity`/`/tenacity` override so tenacity
+        // resolves from the persona / config / family again — the undo `/tenacity`
+        // previously lacked (a session override could not be released).
+        "auto" | "inherit" | "reset" => {
+            clear_cli_tenacity();
+            format!(
+                "tenacity → auto (override cleared) — now {} (from persona / config / family)",
+                effective_tenacity().label()
+            )
+        }
         other => match other.parse::<Tenacity>() {
             Ok(level) => {
                 set_cli_tenacity(level);
                 format!("tenacity → {} — {}", level.label(), level.describe())
             }
             Err(e) => {
-                format!("{e}  (/tenacity <level>|list|status)")
+                format!("{e}  (/tenacity <auto|level>|list|status)")
             }
         },
     }
 }
 
+/// Build the `/cognition` response and, when `arg` names a level (or `off`/`auto`),
+/// install the session override — the highest-priority input in
+/// [`newt_core::cognition::resolve_cognition`], layered over the active persona's
+/// `cognition:`. Pure for the show/list/error paths; the set paths mutate the
+/// process-global via `set_cli_cognition`.
+fn cognition_command(arg: &str) -> String {
+    use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+    use newt_core::role_profile::Cognition;
+    let usage = "(/cognition <glancing|pondering|deliberating|contemplating>|off|auto|list)";
+    match arg.trim() {
+        "" | "status" | "show" => {
+            match cli_cognition() {
+                CognitionOverride::Unset => {
+                    format!("cognition: auto — follows the active persona's `cognition:` (or off)  {usage}")
+                }
+                CognitionOverride::Off => {
+                    format!("cognition: off — no reasoning controls sent, overriding any persona  {usage}")
+                }
+                CognitionOverride::Set(c) => format!(
+                    "cognition: {} — {}  (session override, beats the persona)  {usage}",
+                    c.label(),
+                    c.describe()
+                ),
+            }
+        }
+        "list" => {
+            let active = cli_cognition();
+            let mut out = String::from("cognition levels (light → deep):");
+            for c in Cognition::all() {
+                let mark = if matches!(active, CognitionOverride::Set(a) if a == c) {
+                    " ← override"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("\n  {:<14} {}{mark}", c.label(), c.describe()));
+            }
+            out.push_str("\n  off            no reasoning controls (overrides the persona)");
+            out.push_str("\n  auto           follow the active persona (default)");
+            out
+        }
+        "off" | "none" => {
+            set_cli_cognition(CognitionOverride::Off);
+            "cognition → off — no reasoning controls will be sent".to_string()
+        }
+        "auto" | "reset" | "persona" => {
+            set_cli_cognition(CognitionOverride::Unset);
+            "cognition → auto — following the active persona".to_string()
+        }
+        other => match other.parse::<Cognition>() {
+            Ok(level) => {
+                set_cli_cognition(CognitionOverride::Set(level));
+                format!("cognition → {} — {}", level.label(), level.describe())
+            }
+            Err(e) => format!("{e}  {usage}"),
+        },
+    }
+}
+
+/// Build the `/psyche` panel — the agent's effort posture at a glance: the three
+/// orthogonal dials (cognition / tenacity / crew) and how to change each. Reads
+/// the live session state — the cognition + tenacity process-globals and the
+/// crew `NEWT_TEAM` startup gate (the same gate newt-cli reads to build the crew
+/// runner). The three are kept factored on purpose: cognition rides the wire
+/// request, tenacity steers the harness loop, crew sets how many minds work.
+fn psyche_command(arg: &str) -> String {
+    use newt_core::cognition::{cli_cognition, CognitionOverride};
+    use newt_core::tenacity::effective_tenacity;
+    // `/psyche obsessive` — engage the max-everything posture's two LIVE dials.
+    // Crew is a startup gate (crew_runner is built once at launch), so it can't
+    // be turned on mid-session; say so honestly and point at the launch flag.
+    let a = arg.trim();
+    if a.eq_ignore_ascii_case("obsessive") || a.eq_ignore_ascii_case("obsessive-relentless") {
+        let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
+        return format!(
+            "obsessive engaged (live): cognition → {}, tenacity → {}.\n\
+             crew is a launch gate — relaunch with `newt --obsessive` (or set \
+             NEWT_TEAM) to add the crew this session.",
+            cog.label(),
+            ten.label()
+        );
+    }
+    // Show the EFFECTIVE cognition + where it resolves from (review-2 #6): a
+    // status view, not just an override inspector.
+    let cog = match cli_cognition() {
+        CognitionOverride::Off => "off — no reasoning controls (session override)".to_string(),
+        CognitionOverride::Set(c) => {
+            format!("{} — {} (session override)", c.label(), c.describe())
+        }
+        CognitionOverride::Unset => match newt_core::cognition::persona_cognition() {
+            Some(c) => format!("{} — {} (from the active persona)", c.label(), c.describe()),
+            None => "auto — no reasoning controls (no persona sets it)".to_string(),
+        },
+    };
+    let ten = effective_tenacity();
+    // Mirror newt-cli's startup gate: the crew runner is built iff NEWT_TEAM is set.
+    let crew = if std::env::var("NEWT_TEAM").is_ok() {
+        "on"
+    } else {
+        "off"
+    };
+    let mut out = String::from("psyche — how hard the agent works (three orthogonal dials):");
+    out.push_str(&format!("\n  cognition   {cog}"));
+    out.push_str(
+        "\n              backend-specific reasoning depth                    (/cognition)",
+    );
+    out.push_str(&format!(
+        "\n  tenacity    {} — {}",
+        ten.label(),
+        ten.describe()
+    ));
+    out.push_str("\n              how hard the loop pushes read → act            (/tenacity)");
+    out.push_str(&format!("\n  crew        {crew}"));
+    out.push_str(
+        "\n              how many minds work the task                   (NEWT_TEAM / newt crew)",
+    );
+    out.push_str("\nobsessive = the max-everything posture: contemplating + relentless + crew on.");
+    out.push_str("\n/psyche edit — open the config panel to adjust these dials (TTY).");
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tenacity_command;
+    use super::{cognition_command, tenacity_command};
+
+    #[test]
+    fn cognition_status_list_set_off_auto_and_error_are_informative() {
+        use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+        use newt_core::role_profile::Cognition;
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // Start clean; the guard restores the process-global on drop.
+        let restore = cli_cognition();
+        set_cli_cognition(CognitionOverride::Unset);
+
+        // Status (unset) explains it follows the persona and shows usage.
+        let status = cognition_command("");
+        assert!(status.starts_with("cognition: auto"), "{status}");
+        assert!(status.contains("/cognition"), "{status}");
+        // List enumerates every level plus off/auto.
+        let list = cognition_command("list");
+        for label in [
+            "glancing",
+            "pondering",
+            "deliberating",
+            "contemplating",
+            "off",
+            "auto",
+        ] {
+            assert!(list.contains(label), "list missing {label}: {list}");
+        }
+        // Setting a level installs the override live.
+        let msg = cognition_command("contemplating");
+        assert!(msg.contains("contemplating"), "{msg}");
+        assert_eq!(
+            cli_cognition(),
+            CognitionOverride::Set(Cognition::Contemplating)
+        );
+        // `off` forces the off state; `auto` returns to following the persona.
+        cognition_command("off");
+        assert_eq!(cli_cognition(), CognitionOverride::Off);
+        cognition_command("auto");
+        assert_eq!(cli_cognition(), CognitionOverride::Unset);
+        // An unknown level explains itself rather than silently doing nothing.
+        let err = cognition_command("banana");
+        assert!(err.contains("unknown cognition"), "{err}");
+
+        set_cli_cognition(restore);
+    }
+
+    #[test]
+    fn psyche_panel_shows_all_three_dials_and_how_to_change_them() {
+        let out = super::psyche_command("");
+        for k in ["cognition", "tenacity", "crew", "obsessive"] {
+            assert!(out.contains(k), "psyche panel missing '{k}': {out}");
+        }
+        assert!(
+            out.contains("/cognition") && out.contains("/tenacity"),
+            "panel should point at how to change each dial: {out}"
+        );
+    }
+
+    #[test]
+    fn psyche_obsessive_engages_the_max_live_dials_and_notes_crew() {
+        use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+        use newt_core::role_profile::Cognition;
+        use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // Reset to a non-obsessive baseline so the assertions are meaningful.
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
+
+        let out = super::psyche_command("obsessive");
+        // The two live dials are actually maxed.
+        assert_eq!(
+            cli_cognition(),
+            CognitionOverride::Set(Cognition::Contemplating)
+        );
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
+        // The message is honest about crew being a launch gate.
+        assert!(out.to_lowercase().contains("crew"), "{out}");
+        assert!(out.contains("--obsessive"), "{out}");
+
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
+    }
 
     #[test]
     fn tenacity_status_and_list_and_error_are_informative() {
@@ -232,10 +455,23 @@ mod tests {
     #[test]
     fn tenacity_command_sets_the_level_live() {
         use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
         let restore = effective_tenacity();
         let msg = tenacity_command("relentless");
         assert!(msg.contains("relentless"), "{msg}");
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
+        // review-2 #2: `/tenacity auto` releases the override (was un-undoable).
+        let msg = tenacity_command("auto");
+        assert!(msg.contains("cleared"), "{msg}");
+        assert_eq!(
+            newt_core::tenacity::cli_tenacity(),
+            None,
+            "/tenacity auto clears the session override"
+        );
+        // `inherit` / `reset` are aliases for the same clear.
+        set_cli_tenacity(Tenacity::Insistent);
+        tenacity_command("reset");
+        assert_eq!(newt_core::tenacity::cli_tenacity(), None);
         // Restore so the process-global doesn't leak into sibling tests.
         set_cli_tenacity(restore);
     }

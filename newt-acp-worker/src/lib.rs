@@ -135,9 +135,17 @@ fn select_openai_backend(
     if ollama_override {
         return None;
     }
-    cfg.backends
-        .iter()
-        .find(|b| b.kind == Some(newt_core::BackendKind::Openai))
+    // #1320 (PR-3): honor the shared config precedence (NEWT_PROVIDER /
+    // default_backend / …) so the worker agrees with chat + solve — but the
+    // worker's vLLM path needs an OpenAI-kind backend, so use the precedence pick
+    // only when it IS OpenAI; otherwise fall back to the first OpenAI entry.
+    match cfg.select_configured_backend() {
+        Some(b) if b.kind == Some(newt_core::BackendKind::Openai) => Some(b),
+        _ => cfg
+            .backends
+            .iter()
+            .find(|b| b.kind == Some(newt_core::BackendKind::Openai)),
+    }
 }
 
 fn select_provider_config(
@@ -174,9 +182,11 @@ async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBa
             authenticated = openai.resolve_api_key().is_some(),
             "worker: using configured OpenAI-compatible backend"
         );
-        return Ok(Arc::new(
-            newt_inference::local::LocalVllmBackend::from_config(openai),
-        ));
+        // API-aware transport: `api = "responses"` posts to /v1/responses, else
+        // Chat Completions. Without this the worker drove a Responses-only model
+        // (e.g. gpt-5.6-sol) over /v1/chat/completions. Both the flat and coder
+        // ACP paths consume this one backend, so both now obey the wire API.
+        return Ok(newt_inference::openai_inference_backend(openai));
     }
 
     let default_model =

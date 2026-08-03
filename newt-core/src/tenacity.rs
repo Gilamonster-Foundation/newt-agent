@@ -185,14 +185,17 @@ impl TenacityConfig {
 }
 
 /// Full resolution order, most-specific first: an explicit operator choice
-/// (`--tenacity`) wins over any config; config per-family wins over config
-/// default; `Standard` is the floor. `config == None` ⇒ CLI-or-`Standard`.
+/// (`--tenacity`) wins over the active `persona` declaration, which wins over
+/// config per-family, which wins over the config default; `Standard` is the
+/// floor. `config == None` ⇒ CLI-or-persona-or-`Standard`.
 pub fn resolve_tenacity(
     cli: Option<Tenacity>,
+    persona: Option<Tenacity>,
     config: Option<&TenacityConfig>,
     family: Option<&str>,
 ) -> Tenacity {
-    cli.unwrap_or_else(|| config.map(|c| c.resolve(family)).unwrap_or_default())
+    cli.or(persona)
+        .unwrap_or_else(|| config.map(|c| c.resolve(family)).unwrap_or_default())
 }
 
 // The three tenacity inputs, each stashed by the one site that knows it — the
@@ -200,12 +203,50 @@ pub fn resolve_tenacity(
 // combined lazily by [`effective_tenacity`] via [`resolve_tenacity`], so each
 // setter is independent and order-free:
 //   - CLI `--tenacity` flag (highest), set in the CLI dispatch,
-//   - the `[tenacity]` config, stashed at `Config::resolve`,
+//   - the `[tenacity]` config, stashed by `Config::apply_runtime_settings`,
 //   - the active model's family, set at model selection.
 // All absent ⇒ [`Tenacity`]'s `Default` (`Standard`) — behaviour-preserving.
 static CLI_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
 static TENACITY_CONFIG: std::sync::Mutex<Option<TenacityConfig>> = std::sync::Mutex::new(None);
 static ACTIVE_FAMILY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+// The active persona's declared `tenacity:` — a resolution layer BELOW the CLI
+// override and ABOVE the config/family default, set when a persona activates
+// (review P1#3: a declared persona tenacity is now actually applied, not just
+// rendered). `None` when no persona / the persona declares none.
+static PERSONA_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
+
+std::thread_local! {
+    /// A driven turn resolves tenacity before crossing onto its dedicated
+    /// thread. Keeping that value here makes every downstream resolver read in
+    /// the turn (workflow steering and tool dispatch included) observe the same
+    /// immutable posture without replacing the interactive process globals.
+    static EFFECTIVE_TENACITY_OVERRIDE: std::cell::Cell<Option<Tenacity>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restores the prior current-thread override on drop. The `Rc` marker keeps
+/// the guard on the thread whose TLS slot it owns; driven turns use a
+/// current-thread runtime, so the guard safely spans the whole async turn.
+pub(crate) struct ScopedEffectiveTenacity {
+    previous: Option<Tenacity>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for ScopedEffectiveTenacity {
+    fn drop(&mut self) {
+        let _ = EFFECTIVE_TENACITY_OVERRIDE.try_with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Override [`effective_tenacity`] on the current thread until the returned
+/// guard drops. Overrides nest in lexical (LIFO) order.
+pub(crate) fn scoped_effective_tenacity(level: Tenacity) -> ScopedEffectiveTenacity {
+    let previous = EFFECTIVE_TENACITY_OVERRIDE.with(|slot| slot.replace(Some(level)));
+    ScopedEffectiveTenacity {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
 
 /// Install the explicit CLI `--tenacity` override (highest priority). Call once,
 /// before the agentic loop starts.
@@ -215,8 +256,26 @@ pub fn set_cli_tenacity(level: Tenacity) {
     }
 }
 
-/// Install the resolved `[tenacity]` config (per-family + default). Called from
-/// `Config::resolve`, the single canonical config-application entry.
+/// Clear the explicit CLI `--tenacity` override, so tenacity resolves from config
+/// / family again. The complement of [`set_cli_tenacity`]: it lets a surface
+/// express "inherit" (no override) rather than pinning the currently-resolved
+/// value — e.g. the config panel must not persist an untouched dial.
+pub fn clear_cli_tenacity() {
+    if let Ok(mut slot) = CLI_TENACITY.lock() {
+        *slot = None;
+    }
+}
+
+/// The raw CLI `--tenacity` override, if one is installed (`None` = inherit from
+/// config / family). Distinct from [`effective_tenacity`], which resolves the
+/// full precedence ladder to a concrete level.
+#[must_use]
+pub fn cli_tenacity() -> Option<Tenacity> {
+    CLI_TENACITY.lock().ok().and_then(|s| *s)
+}
+
+/// Install the resolved `[tenacity]` config (per-family + default). Called by
+/// `Config::apply_runtime_settings`, the canonical runtime-application entry.
 pub fn set_tenacity_config(config: TenacityConfig) {
     if let Ok(mut slot) = TENACITY_CONFIG.lock() {
         *slot = Some(config);
@@ -231,14 +290,120 @@ pub fn set_active_model_family(family: Option<String>) {
     }
 }
 
-/// The tenacity in effect, resolved from the three inputs (most-specific first):
-/// the CLI `--tenacity` flag, then the `[tenacity]` config's per-family override
-/// for the active family, then the config default, then `Standard`.
+/// Install the active persona's declared `tenacity:` (review P1#3). Called when a
+/// persona activates (its declared level) or clears (`None`), so the declaration
+/// is actually applied — below the CLI override, above the config/family default.
+pub fn set_persona_tenacity(level: Option<Tenacity>) {
+    if let Ok(mut slot) = PERSONA_TENACITY.lock() {
+        *slot = level;
+    }
+}
+
+/// The active persona's declared tenacity, if any (for status rendering).
+#[must_use]
+pub fn persona_tenacity() -> Option<Tenacity> {
+    PERSONA_TENACITY.lock().ok().and_then(|s| *s)
+}
+
+/// The tenacity in effect, resolved most-specific first: the CLI `--tenacity`
+/// flag, then the active persona's declared `tenacity:`, then the `[tenacity]`
+/// config's per-family override for the active family, then the config default,
+/// then `Standard`.
 pub fn effective_tenacity() -> Tenacity {
+    if let Some(level) = EFFECTIVE_TENACITY_OVERRIDE.with(std::cell::Cell::get) {
+        return level;
+    }
     let cli = CLI_TENACITY.lock().ok().and_then(|s| *s);
+    let persona = PERSONA_TENACITY.lock().ok().and_then(|s| *s);
     let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
     let family = ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone());
-    resolve_tenacity(cli, config.as_ref(), family.as_deref())
+    resolve_tenacity(cli, persona, config.as_ref(), family.as_deref())
+}
+
+/// The installed `[tenacity]` config, if any (for status rendering + the snapshot
+/// used by the test guard). Read accessor for the otherwise write-only
+/// [`TENACITY_CONFIG`].
+#[must_use]
+pub fn tenacity_config() -> Option<TenacityConfig> {
+    TENACITY_CONFIG.lock().ok().and_then(|s| s.clone())
+}
+
+/// The active model family, if any (for the config-panel projection + the test
+/// guard snapshot). Read accessor for the otherwise write-only [`ACTIVE_FAMILY`].
+#[must_use]
+pub fn active_model_family() -> Option<String> {
+    ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone())
+}
+
+/// Tenacity with **no CLI override and no persona layer** — just the config
+/// per-family override for the active family, the config default, then `Standard`.
+/// This is the value a persona that declares no `tenacity:` inherits, so the
+/// config panel projects a selected persona's effective tenacity as
+/// `persona.tenacity.unwrap_or(base_tenacity())`.
+#[must_use]
+pub fn base_tenacity() -> Tenacity {
+    let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
+    let family = ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone());
+    resolve_tenacity(None, None, config.as_ref(), family.as_deref())
+}
+
+/// Attribute the active model's family for per-family `[tenacity]` resolution and
+/// install it (`ACTIVE_FAMILY`). The card's `family` wins when a built-in card
+/// names one; else the family is inferred from the model NAME against the
+/// configured `[tenacity.families]` keys. Call at every point a session settles on
+/// a model — solve AND chat (#1139: chat previously never did this, so per-family
+/// defaults silently did not apply there). `config == None` ⇒ only a card family.
+pub fn attribute_active_family(config: Option<&TenacityConfig>, model: &str) {
+    let card_family = crate::model_card::builtin_card(model).and_then(|c| c.family);
+    let family = config
+        .and_then(|t| t.family_for(model, card_family.as_deref()))
+        .or(card_family);
+    set_active_model_family(family);
+}
+
+/// A complete snapshot of **every** mutable global that feeds
+/// [`effective_tenacity`] — the CLI override, the persona layer, the `[tenacity]`
+/// config, and the active model family. The test guard snapshots and restores
+/// this as one unit so no tenacity-resolution input can leak between tests (the
+/// earlier piecemeal guard missed `TENACITY_CONFIG` + `ACTIVE_FAMILY`, which
+/// `Config::resolve` and the `solve` model-selection path mutate process-wide).
+#[doc(hidden)]
+pub struct TenacityRuntimeSnapshot {
+    cli: Option<Tenacity>,
+    persona: Option<Tenacity>,
+    config: Option<TenacityConfig>,
+    active_family: Option<String>,
+}
+
+/// Snapshot all four tenacity-resolution globals (see [`TenacityRuntimeSnapshot`]).
+#[doc(hidden)]
+#[must_use]
+pub fn snapshot_runtime_state() -> TenacityRuntimeSnapshot {
+    TenacityRuntimeSnapshot {
+        cli: CLI_TENACITY.lock().ok().and_then(|s| *s),
+        persona: PERSONA_TENACITY.lock().ok().and_then(|s| *s),
+        config: TENACITY_CONFIG.lock().ok().and_then(|s| s.clone()),
+        active_family: ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone()),
+    }
+}
+
+/// Restore all four tenacity-resolution globals from a snapshot (see
+/// [`TenacityRuntimeSnapshot`]). Total: every input is overwritten, so a test
+/// that installed a config / family / override is fully undone.
+#[doc(hidden)]
+pub fn restore_runtime_state(snapshot: TenacityRuntimeSnapshot) {
+    if let Ok(mut s) = CLI_TENACITY.lock() {
+        *s = snapshot.cli;
+    }
+    if let Ok(mut s) = PERSONA_TENACITY.lock() {
+        *s = snapshot.persona;
+    }
+    if let Ok(mut s) = TENACITY_CONFIG.lock() {
+        *s = snapshot.config;
+    }
+    if let Ok(mut s) = ACTIVE_FAMILY.lock() {
+        *s = snapshot.active_family;
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +417,42 @@ mod tests {
         assert_eq!(Tenacity::default(), Tenacity::Standard);
         assert_eq!(Tenacity::Standard.read_only_nudge_after(), 3);
         assert!(!Tenacity::Standard.exit_plan_requires_edit());
+    }
+
+    #[test]
+    fn scoped_override_is_nested_thread_local_and_restores_the_global_resolution() {
+        use crate::test_guard::GlobalSettingsGuard;
+        let _settings = GlobalSettingsGuard::acquire();
+        set_cli_tenacity(Tenacity::Relaxed);
+        assert_eq!(effective_tenacity(), Tenacity::Relaxed);
+
+        let outer = scoped_effective_tenacity(Tenacity::Relentless);
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
+
+        set_cli_tenacity(Tenacity::Insistent);
+        assert_eq!(
+            effective_tenacity(),
+            Tenacity::Relentless,
+            "a concurrent global change cannot alter a captured turn posture"
+        );
+
+        {
+            let _inner = scoped_effective_tenacity(Tenacity::Standard);
+            assert_eq!(effective_tenacity(), Tenacity::Standard);
+        }
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
+
+        let other_thread = std::thread::spawn(effective_tenacity)
+            .join()
+            .expect("tenacity probe thread");
+        assert_eq!(
+            other_thread,
+            Tenacity::Insistent,
+            "the override must stay local to the driven turn thread"
+        );
+
+        drop(outer);
+        assert_eq!(effective_tenacity(), Tenacity::Insistent);
     }
 
     #[test]
@@ -334,33 +535,86 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tenacity_lets_the_cli_flag_win_over_config() {
+    fn attribute_active_family_installs_card_then_substring_then_clears() {
+        use crate::test_guard::GlobalSettingsGuard;
+        let _g = GlobalSettingsGuard::acquire();
+
+        // Card path: with no config at all (`config == None` ⇒ only a card family),
+        // a built-in card that names a family installs it. ornith-1.0-35b → qwen3.
+        set_active_model_family(None);
+        attribute_active_family(None, "ornith-1.0-35b");
+        assert_eq!(
+            active_model_family().as_deref(),
+            Some("qwen3"),
+            "the built-in card's declared family is installed"
+        );
+
+        // Substring path: no card for this name, but the model NAME contains a
+        // configured `[tenacity.families]` key → that family is inferred + installed.
+        // This is the #1139 chat fix — chat now attributes family exactly as solve does.
+        let c = cfg(None, &[("qwen3", Tenacity::Relentless)]);
+        set_active_model_family(None);
+        attribute_active_family(Some(&c), "Qwen3-Coder-30B");
+        assert_eq!(
+            active_model_family().as_deref(),
+            Some("qwen3"),
+            "a family is inferred from the model name against the config families"
+        );
+
+        // No card + no matching family → ACTIVE_FAMILY is CLEARED (not left stale),
+        // so effective_tenacity falls back to the config default / Standard.
+        set_active_model_family(Some("stale".to_string()));
+        attribute_active_family(Some(&c), "mystery-model-7b");
+        assert_eq!(
+            active_model_family(),
+            None,
+            "an unrecognized model clears the family rather than leaving a stale one"
+        );
+    }
+
+    #[test]
+    fn resolve_tenacity_precedence_cli_over_persona_over_config() {
         let c = cfg(
             Some(Tenacity::Relaxed),
             &[("nemotron", Tenacity::Relentless)],
         );
-        // CLI override beats even a matching per-family default.
+        // CLI override beats even a matching per-family default AND a persona.
         assert_eq!(
-            resolve_tenacity(Some(Tenacity::Standard), Some(&c), Some("nemotron")),
+            resolve_tenacity(
+                Some(Tenacity::Standard),
+                Some(Tenacity::Insistent),
+                Some(&c),
+                Some("nemotron")
+            ),
             Tenacity::Standard
         );
-        // No CLI → config per-family.
+        // No CLI → the persona declaration wins over config per-family (P1#3).
         assert_eq!(
-            resolve_tenacity(None, Some(&c), Some("nemotron")),
+            resolve_tenacity(None, Some(Tenacity::Insistent), Some(&c), Some("nemotron")),
+            Tenacity::Insistent,
+            "an active persona's declared tenacity is applied, not just rendered"
+        );
+        // No CLI, no persona → config per-family.
+        assert_eq!(
+            resolve_tenacity(None, None, Some(&c), Some("nemotron")),
             Tenacity::Relentless
         );
-        // No CLI, unknown family → config default.
+        // No CLI, no persona, unknown family → config default.
         assert_eq!(
-            resolve_tenacity(None, Some(&c), Some("kimi")),
+            resolve_tenacity(None, None, Some(&c), Some("kimi")),
             Tenacity::Relaxed
         );
-        // No config at all → CLI-or-Standard.
+        // No config at all → CLI-or-persona-or-Standard.
         assert_eq!(
-            resolve_tenacity(None, None, Some("nemotron")),
+            resolve_tenacity(None, None, None, Some("nemotron")),
             Tenacity::Standard
         );
         assert_eq!(
-            resolve_tenacity(Some(Tenacity::Insistent), None, None),
+            resolve_tenacity(None, Some(Tenacity::Insistent), None, None),
+            Tenacity::Insistent
+        );
+        assert_eq!(
+            resolve_tenacity(Some(Tenacity::Insistent), None, None, None),
             Tenacity::Insistent
         );
     }
@@ -398,6 +652,93 @@ mod tests {
         // Resolving that inferred family gives the per-family level.
         let fam = c.family_for("qwen3-coder_30b", None);
         assert_eq!(c.resolve(fam.as_deref()), Tenacity::Standard);
+    }
+
+    #[test]
+    fn snapshot_restore_round_trips_every_tenacity_resolution_global() {
+        // CR3 area 4: the guard must isolate ALL FOUR inputs to effective_tenacity
+        // — CLI override, persona layer, TENACITY_CONFIG, ACTIVE_FAMILY. Exercise
+        // the exact snapshot/restore the guard's Drop runs.
+        use crate::test_guard::GlobalSettingsGuard;
+        let _g = GlobalSettingsGuard::acquire(); // serialize + final cleanup
+
+        // Known-empty baseline → snapshot it.
+        clear_cli_tenacity();
+        set_persona_tenacity(None);
+        set_tenacity_config(TenacityConfig::default());
+        set_active_model_family(None);
+        let snap = snapshot_runtime_state();
+
+        // Mutate every axis.
+        set_cli_tenacity(Tenacity::Relentless);
+        set_persona_tenacity(Some(Tenacity::Insistent));
+        set_tenacity_config(cfg(
+            Some(Tenacity::Relaxed),
+            &[("nemotron", Tenacity::Relentless)],
+        ));
+        set_active_model_family(Some("nemotron".to_string()));
+        assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
+        assert_eq!(persona_tenacity(), Some(Tenacity::Insistent));
+        assert!(tenacity_config().is_some_and(|c| !c.families.is_empty()));
+        assert_eq!(active_model_family().as_deref(), Some("nemotron"));
+
+        // Restore — exactly what GlobalSettingsGuard::drop does — undoes all four.
+        restore_runtime_state(snap);
+        assert_eq!(cli_tenacity(), None, "CLI tenacity restored");
+        assert_eq!(persona_tenacity(), None, "persona tenacity restored");
+        assert_eq!(
+            tenacity_config(),
+            Some(TenacityConfig::default()),
+            "TENACITY_CONFIG restored (the gap the piecemeal guard missed)"
+        );
+        assert_eq!(active_model_family(), None, "ACTIVE_FAMILY restored");
+    }
+
+    #[test]
+    fn base_tenacity_ignores_cli_and_persona_overrides() {
+        // The config-panel projection uses base_tenacity() as the value a persona
+        // inherits when it declares none: it must strip the CLI + persona layers.
+        use crate::test_guard::GlobalSettingsGuard;
+        let _g = GlobalSettingsGuard::acquire();
+        set_tenacity_config(cfg(
+            Some(Tenacity::Relaxed),
+            &[("nemotron", Tenacity::Relentless)],
+        ));
+        set_active_model_family(Some("nemotron".to_string()));
+        set_cli_tenacity(Tenacity::Standard); // present…
+        set_persona_tenacity(Some(Tenacity::Insistent)); // …present…
+        assert_eq!(
+            base_tenacity(),
+            Tenacity::Relentless,
+            "base strips CLI + persona, leaving the per-family override"
+        );
+        set_active_model_family(None);
+        assert_eq!(
+            base_tenacity(),
+            Tenacity::Relaxed,
+            "no family → the config default"
+        );
+    }
+
+    #[test]
+    fn guarded_state_is_restored_even_when_a_test_panics() {
+        // CR3 area 4: restoration must survive a panic (Drop runs during unwind).
+        use crate::test_guard::GlobalSettingsGuard;
+        let sentinel = "panic-family-sentinel";
+        let result = std::panic::catch_unwind(|| {
+            let _g = GlobalSettingsGuard::acquire();
+            set_active_model_family(Some(sentinel.to_string()));
+            set_cli_tenacity(Tenacity::Relentless);
+            assert_eq!(active_model_family().as_deref(), Some(sentinel));
+            panic!("intentional panic inside a guarded test");
+        });
+        assert!(result.is_err(), "the guarded closure panicked as intended");
+        let _g = GlobalSettingsGuard::acquire();
+        assert_ne!(
+            active_model_family().as_deref(),
+            Some(sentinel),
+            "GlobalSettingsGuard::drop restored ACTIVE_FAMILY during unwind"
+        );
     }
 
     #[test]

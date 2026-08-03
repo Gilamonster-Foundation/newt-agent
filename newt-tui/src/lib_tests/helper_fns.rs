@@ -628,10 +628,7 @@ fn resolve_workspace_none_uses_current_dir() {
 #[test]
 fn expand_prompt_tokens_replaces_all_tokens() {
     let out = expand_prompt_tokens("\\w|\\W|\\v|\\m|\\M", "/tmp/proj", "gpt-4.1", true);
-    assert_eq!(
-        out,
-        format!("proj|/tmp/proj|{}|gpt-4.1|vi", env!("CARGO_PKG_VERSION"))
-    );
+    assert_eq!(out, format!("proj|/tmp/proj|{VERSION}|gpt-4.1|vi"));
     // \h expands to *some* hostname — the token itself must be gone.
     let host = expand_prompt_tokens("on \\h!", "/tmp/proj", "m", false);
     assert!(!host.contains("\\h"), "got: {host}");
@@ -979,6 +976,8 @@ async fn adopt_detects_openai_when_kind_absent() {
         kind: newt_core::BackendKind::Ollama, // placeholder
         kind_needs_probe: true,
         api_key: None,
+        chat_completions_capability: Default::default(),
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -1015,6 +1014,8 @@ async fn adopt_detects_ollama_when_kind_absent() {
         kind: newt_core::BackendKind::Openai, // wrong placeholder — probe must win
         kind_needs_probe: true,
         api_key: None,
+        chat_completions_capability: Default::default(),
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -1047,6 +1048,8 @@ async fn adopt_respects_explicit_kind_without_detect() {
         kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: false,
         api_key: None,
+        chat_completions_capability: Default::default(),
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -1086,6 +1089,8 @@ async fn adopt_detects_authenticated_openai_with_bearer() {
         kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: true,
         api_key: Some("secret-token".into()),
+        chat_completions_capability: Default::default(),
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,

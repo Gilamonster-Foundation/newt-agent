@@ -234,7 +234,7 @@ pub(crate) fn expand_prompt_tokens(
     let date = now.format("%Y-%m-%d").to_string();
     let time = now.format("%H:%M:%S").to_string();
     let mode = if is_vi { "vi" } else { "emacs" };
-    let version = env!("CARGO_PKG_VERSION");
+    let version = crate::VERSION;
     template
         // Readable `$NAME` macros. Longer names BEFORE their prefixes
         // (`$TIMESTAMP` before `$TIME`, `$MODEL` before `$MODE`) so a short

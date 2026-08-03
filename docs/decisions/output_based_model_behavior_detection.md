@@ -170,6 +170,69 @@ against the existing round limits.
   dialect set.
 - **Rung 3 — non-action spiral** ⇒ the existing tenacity machinery, unchanged.
 
+### 2a. Turn-scoped reasoning replay is an endpoint contract
+
+Some reasoning-capable Chat Completions endpoints require an assistant tool
+call's reasoning to be replayed during later tool rounds in the same human
+turn, while strict endpoints reject that field. Newt therefore treats replay
+scope as an explicit endpoint capability, not a model-name behavior gate:
+
+```toml
+[[backends]]
+name = "nemotron-local"
+endpoint = "http://127.0.0.1:8000"
+model = "nemotron-3-nano"
+kind = "openai"
+
+[backends.capability]
+reasoning_replay_scope = "current_user_turn"
+
+[backends.capability.chat_completions]
+cognition = true
+chat_template_kwargs = true
+parallel_tool_calls = false
+bounded_reasoning_continuation = true
+```
+
+Unknown and legacy endpoints default to `never`. `current_user_turn` preserves
+both split `reasoning_content` and inline reasoning only while a tool loop is
+continuing the active human turn; reasoning from completed turns remains
+excluded from outbound history and from user-visible answers. While replay is
+active, count-only compaction treats the reasoning-bearing suffix as one atomic
+item; hard token pressure may compact older tool results but does not discard
+the assistant plans. The tools-disabled round-cap completion preserves that
+same suffix. The configured scope is backend behavior data: it can
+later be populated by a successful contract probe without changing the
+message-replay implementation.
+
+The nested `chat_completions` table is also explicit endpoint behavior data.
+Newt never infers these extensions from the model display name. With
+`cognition = true`, the psyche dial resolves to this initial local policy:
+
+| Cognition | Thinking | `max_tokens` | Temperature | `top_p` |
+|---|---:|---:|---:|---:|
+| `glancing` | off | 2,048 | 0.0 | 1.0 |
+| `pondering` | on | 4,096 | 0.6 | 0.95 |
+| `deliberating` | on | 10,000 | 0.6 | 0.95 |
+| `contemplating` | on | 16,000 | 0.6 | 0.95 |
+
+`chat_template_kwargs = true` permits Newt to project thinking as
+`enable_thinking` plus `truncate_history_thinking = true`.
+`parallel_tool_calls` is sent only on requests that include tools. Unknown
+strict OpenAI-compatible endpoints receive none of these additional fields,
+even when the active persona sets cognition.
+
+`bounded_reasoning_continuation = true` is effective only with a non-`never`
+reasoning replay scope. On the exact `finish_reason = length`, empty visible
+content, non-empty reasoning, and no-call signature, Newt appends the assistant
+partial without exposing its reasoning, spends one more ordinary tool round,
+and grants one fresh policy-bounded output allowance. It never retries a
+`finish_reason = stop` reply, parser failure, tool call, or ordinary empty
+response. Every parsed Chat Completions response emits a
+`chat_completion_finish` trace event; an incident also emits
+`reasoning_overflow` with attempted/succeeded status and an estimated reasoning
+token count.
+
 ### 3. Kill the name gate — in the right order
 
 `emits_leading_reasoning` (the list) is deleted and the splitter becomes

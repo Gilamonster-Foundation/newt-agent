@@ -11,8 +11,12 @@ pub mod answer_authz;
 pub mod api_surface;
 pub mod artifact;
 pub mod backend_probe;
+pub mod build_info;
 pub mod caveats;
 pub mod classifiers;
+/// The cognition session dial — the `/cognition` override resolved over a
+/// persona's `cognition:` (psyche sibling of [`tenacity`]).
+pub mod cognition;
 pub mod config;
 pub mod conversation;
 pub mod credential_registry;
@@ -48,6 +52,9 @@ pub mod project_map;
 pub mod project_model;
 pub mod prompt;
 pub mod prune;
+/// Psyche posture macros (e.g. `obsessive`) — named acts that move several
+/// psyche dials ([`cognition`] + [`tenacity`], + crew at the caller) at once.
+pub mod psyche;
 pub mod reasoning;
 pub mod retry;
 /// #1030 node evaluators: Task/Plan done-ness from objective git state.
@@ -56,6 +63,7 @@ pub mod roadmap_eval;
 pub mod roadmap_file;
 pub mod role_profile;
 pub mod router;
+pub mod runtime;
 pub mod sas_confirm;
 pub mod sas_transcript;
 pub mod scope_grounding;
@@ -68,6 +76,9 @@ pub mod store;
 pub mod symbols;
 pub mod templates;
 pub mod tenacity;
+/// A shared RAII guard for tests that touch the process-global operator settings
+/// (cognition / tenacity / `NEWT_*`) — one lock + Drop-restored snapshot.
+pub mod test_guard;
 pub mod tokens;
 pub mod tooling;
 /// Terminal-line ownership: the process-wide arbiter every ephemeral writer
@@ -109,11 +120,12 @@ pub use agentic::{
     format_search_hits, format_search_model, format_search_preview, format_search_rejects,
     gather_code_files, gather_with_manifest, index_files, load_denials,
     memory_fetch_tool_definition, openai_chat_complete, openai_chat_complete_with_prompt,
-    openai_responses_complete, openai_responses_complete_with_prompt, plan_block,
-    render_code_evidence, retrieve_evidence, retrieve_evidence_steered, retrieve_ranked,
-    set_spill_lines, transcript_lines, transcript_lines_styled, trim_for_summary, widen_caveats,
-    ChatCtx, CodeSearch, CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient,
-    ErrorClass, EvidenceKind, ExperienceStore, ExposureSettings, GatherCaps, GatherManifest,
+    openai_responses_complete, openai_responses_complete_with_prompt, parse_context_window_error,
+    plan_block, recover_context_window_400, render_code_evidence, retrieve_evidence,
+    retrieve_evidence_steered, retrieve_ranked, set_spill_lines, transcript_lines,
+    transcript_lines_styled, trim_for_summary, widen_caveats, BehaviorSignal, ChatCtx, CodeSearch,
+    CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ErrorClass,
+    EvidenceKind, ExperienceStore, ExposureSettings, GatherCaps, GatherManifest,
     HeadlessCodeSearch, IndexStatus, LiveToolOutput, ManualCompressOutcome, McpTools, MemAddr,
     MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, ParseSignal, PermissionDecision,
     PermissionGate, PermissionRecord, PermissionRequest, PlanModeControl, PlanSnapshot, RankedHit,
@@ -161,6 +173,7 @@ pub use navigator::{
     RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
 };
 pub use project_map::ProjectMapProvider;
+pub use runtime::{BackendState, RuntimeSettingsSnapshot};
 pub use tenacity::Tenacity;
 pub use where_is::{
     build_where_is_index, build_where_is_index_from_workspace, execute_where_is,

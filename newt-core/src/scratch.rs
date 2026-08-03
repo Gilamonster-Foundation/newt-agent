@@ -33,8 +33,9 @@ pub const DEFAULT_SCRATCH_DIR: &str = ".scratch";
 static CONFIGURED_SCRATCH_DIR: OnceLock<String> = OnceLock::new();
 
 /// Publish the config-file scratch dir (`[scratch] dir`), once. First non-empty
-/// value wins; a no-op for `None`/empty. Called from `Config::resolve` so every
-/// config-loading entry point picks it up. `NEWT_SCRATCH_DIR` still overrides.
+/// value wins; a no-op for `None`/empty. Called from
+/// `Config::apply_runtime_settings` before runtime work begins.
+/// `NEWT_SCRATCH_DIR` still overrides.
 pub fn set_scratch_dir(dir: impl Into<String>) {
     let dir = dir.into();
     if !dir.trim().is_empty() {

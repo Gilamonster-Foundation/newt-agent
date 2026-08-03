@@ -195,6 +195,233 @@ mod origin_upgrade_tests {
     }
 }
 
+/// Preserve the unit boundary between a backend's full context window and an
+/// already-derived input cap. OpenAI-compatible loops need the former so core
+/// can reserve the active generation policy; Ollama keeps using the latter as
+/// its conservative `num_ctx` KV-allocation fallback.
+fn context_window_for_core(
+    kind: newt_core::BackendKind,
+    full_context_window: Option<u32>,
+    safe_context: Option<u32>,
+) -> Option<u32> {
+    match kind {
+        newt_core::BackendKind::Openai => full_context_window,
+        newt_core::BackendKind::Ollama | newt_core::BackendKind::Embedded => safe_context,
+    }
+}
+
+/// A numbered server rejection is an authoritative upper bound on later
+/// turns. It may tighten an explicit/session window but never raise a tighter
+/// operator choice. An ordinary discovered window is deliberately not passed
+/// here, so experimental raises remain possible until the server rejects one.
+fn cap_context_window_by_recovery(
+    requested: Option<u32>,
+    recovered_hard_window: Option<u32>,
+) -> Option<u32> {
+    match (requested, recovered_hard_window) {
+        (Some(requested), Some(recovered)) => Some(requested.min(recovered)),
+        (requested, recovered) => requested.or(recovered),
+    }
+}
+
+/// Match the agentic loop's initial send-budget calculation for the visible
+/// next-turn gauge. A hard 400 may discover a smaller full window during the
+/// turn, so retain both the original declared ceiling and the newly observed
+/// one; like core's recovery path, the tighter result wins.
+#[allow(clippy::too_many_arguments)]
+fn context_gauge_budget(
+    kind: newt_core::BackendKind,
+    api: newt_core::OpenAiApi,
+    declared_context_window: Option<u32>,
+    observed_context_window: Option<u32>,
+    input_ceiling_pct: u32,
+    cognition: Option<newt_core::role_profile::Cognition>,
+    chat_capability: newt_core::model_card::ChatCompletionsCapability,
+    reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope,
+    max_ok_input: Option<u32>,
+    safe_context: Option<u32>,
+) -> Option<u32> {
+    let budget_for = |window| {
+        newt_core::agentic::initial_context_input_budget(
+            kind,
+            api,
+            window,
+            input_ceiling_pct,
+            cognition,
+            chat_capability,
+            reasoning_replay_scope,
+            max_ok_input,
+            safe_context,
+        )
+    };
+    match (
+        budget_for(declared_context_window),
+        budget_for(observed_context_window),
+    ) {
+        (Some(declared), Some(observed)) => Some(declared.min(observed)),
+        (declared, observed) => declared.or(observed),
+    }
+}
+
+#[cfg(test)]
+mod context_window_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn hard_recovery_caps_future_declared_windows_without_raising_tighter_ones() {
+        assert_eq!(
+            cap_context_window_by_recovery(Some(65_536), Some(32_768)),
+            Some(32_768),
+        );
+        assert_eq!(
+            cap_context_window_by_recovery(Some(16_384), Some(32_768)),
+            Some(16_384),
+        );
+        assert_eq!(
+            cap_context_window_by_recovery(Some(65_536), None),
+            Some(65_536),
+            "an ordinary probe is not a hard cap on an explicit override",
+        );
+        assert_eq!(
+            cap_context_window_by_recovery(None, Some(32_768)),
+            Some(32_768),
+        );
+
+        let capable = newt_core::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        let next_chat_window = cap_context_window_by_recovery(Some(65_536), Some(32_768));
+        assert_eq!(
+            newt_core::agentic::initial_context_input_budget(
+                newt_core::BackendKind::Openai,
+                newt_core::OpenAiApi::ChatCompletions,
+                next_chat_window,
+                90,
+                Some(newt_core::role_profile::Cognition::Contemplating),
+                capable,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn,
+                Some(29_491),
+                Some(29_491),
+            ),
+            Some(16_768),
+            "the next 90%-configured Chat turn must retain the 32K hard window and 16K output reserve",
+        );
+
+        let next_ollama_window = cap_context_window_by_recovery(Some(50_000), Some(32_768));
+        assert_eq!(
+            newt_core::agentic::initial_context_input_budget(
+                newt_core::BackendKind::Ollama,
+                newt_core::OpenAiApi::ChatCompletions,
+                next_ollama_window,
+                80,
+                None,
+                Default::default(),
+                newt_core::model_card::ReasoningReplayScope::Never,
+                Some(50_000),
+                Some(50_000),
+            ),
+            Some(26_214),
+            "the next Ollama turn must cap a raised /context size at the recovered full window",
+        );
+    }
+
+    #[test]
+    fn openai_handoff_keeps_the_full_window_separate_from_the_input_cap() {
+        assert_eq!(
+            context_window_for_core(newt_core::BackendKind::Openai, Some(32_768), Some(26_214),),
+            Some(32_768),
+        );
+        assert_eq!(
+            newt_core::config::input_percentage_ceiling(32_768, 90),
+            29_491,
+            "the configured percentage, not a hardcoded 80%, seeds the OpenAI input cap",
+        );
+        assert_eq!(
+            context_window_for_core(newt_core::BackendKind::Openai, None, Some(26_214)),
+            None,
+            "a cached input cap must not be reinterpreted as a full OpenAI window",
+        );
+        assert_eq!(
+            context_window_for_core(newt_core::BackendKind::Ollama, Some(32_768), Some(26_214),),
+            Some(26_214),
+            "Ollama retains the conservative KV-allocation fallback",
+        );
+    }
+
+    #[test]
+    fn openai_gauge_reports_the_output_reserved_send_budget() {
+        let capability = newt_core::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            context_gauge_budget(
+                newt_core::BackendKind::Openai,
+                newt_core::OpenAiApi::ChatCompletions,
+                Some(32_768),
+                Some(32_768),
+                80,
+                Some(newt_core::role_profile::Cognition::Contemplating),
+                capability,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn,
+                Some(26_214),
+                Some(26_214),
+            ),
+            Some(16_768),
+            "the visible gauge must match the contemplating request's actual input ceiling",
+        );
+        assert_eq!(
+            context_gauge_budget(
+                newt_core::BackendKind::Openai,
+                newt_core::OpenAiApi::ChatCompletions,
+                Some(65_536),
+                None,
+                80,
+                Some(newt_core::role_profile::Cognition::Contemplating),
+                capability,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn,
+                Some(26_214),
+                Some(26_214),
+            ),
+            Some(26_214),
+            "an ordinary 32K probe must not defeat an explicit 65K turn window",
+        );
+        assert_eq!(
+            context_gauge_budget(
+                newt_core::BackendKind::Openai,
+                newt_core::OpenAiApi::ChatCompletions,
+                Some(65_536),
+                Some(32_768),
+                80,
+                Some(newt_core::role_profile::Cognition::Contemplating),
+                capability,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn,
+                Some(26_214),
+                Some(26_214),
+            ),
+            Some(16_768),
+            "the same 32K value must tighten only after a numbered 400 observed it",
+        );
+        assert_eq!(
+            context_gauge_budget(
+                newt_core::BackendKind::Ollama,
+                newt_core::OpenAiApi::ChatCompletions,
+                Some(50_000),
+                None,
+                80,
+                None,
+                Default::default(),
+                newt_core::model_card::ReasoningReplayScope::Never,
+                Some(50_000),
+                Some(50_000),
+            ),
+            Some(40_000),
+            "an ordinary Ollama probe must not defeat /context size",
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingRetry {
     text: String,
@@ -588,6 +815,18 @@ pub(crate) fn run_chat(
     // turn (`ensure_context_window` only early-outs on success).
     let mut ctx_window_probed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // The OPERATOR's backend baseline: what a `/persona clear` (or a switch to a
+    // persona that declares no backend) reverts to — the operator's own latest
+    // explicit choice, NOT the last persona's route. Seeded from startup
+    // (`--backend` / loadout / sticky), then updated below whenever an operator
+    // backend command (`/backends` / `/model` / `/backend`) runs — a persona's own
+    // routing never touches it (review P1#2). `None` ⇒ the configured default.
+    let mut base_provider = std::env::var("NEWT_PROVIDER").ok();
+    let mut base_model = std::env::var("NEWT_DGX_MODEL").ok();
+    // P2#4 visibility: warn ONCE if cognition is set on a backend that ignores it
+    // (Responses-only) so the dial isn't silently dropped.
+    let mut cognition_scope_noted = false;
+
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
     let mut choice = resolve_backend_choice(&cfg);
@@ -597,9 +836,19 @@ pub(crate) fn run_chat(
         print_newt(&line, color, verbose);
     }
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+    // #1139: attribute the resolved model's family so per-family `[tenacity]`
+    // config defaults apply in CHAT, exactly as they do in solve. This was the
+    // ACTIVE_FAMILY gap — `set_active_model_family` was called ONLY in solve, so
+    // chat left the family None and a `[tenacity.families]` default silently never
+    // applied to an interactive session.
+    newt_core::tenacity::attribute_active_family(cfg.tenacity.as_ref(), &inf_model);
     // #1199: the server-declared window from adopt, fresh per session — feeds
     // the budget without the persisted cache.
     let mut inf_context_window: Option<u32> = choice.context_window;
+    // Numbered hard-window rejections are stronger than ordinary probes and
+    // must survive into later turns. Keep their provenance separate so a
+    // normal discovered window does not defeat an explicit experimental raise.
+    let mut recovered_context_windows = std::collections::HashMap::<String, u32>::new();
 
     // Resolve + validate the active profile against config, now that the model is
     // known. Precedence: --profile (explicit) > --bundle > a bundle inferred from
@@ -936,6 +1185,42 @@ pub(crate) fn run_chat(
                 active_persona = Some(synthetic_altitude_persona(alt));
             }
             None => {}
+        }
+    }
+
+    // P1#3 / review-2: install a `--persona`'s declared tenacity + cognition as
+    // real resolution layers at startup too (below any `--tenacity` / `--cognition`,
+    // above config/family), so the loop obeys them and status surfaces agree.
+    newt_core::tenacity::set_persona_tenacity(
+        active_persona.as_ref().and_then(|p| p.profile.tenacity),
+    );
+    newt_core::cognition::set_persona_cognition(
+        active_persona.as_ref().and_then(|p| p.profile.cognition),
+    );
+
+    // Persona backend auto-route (startup): if `--persona` named a persona that
+    // declares a `backend:`, repoint the session to it now — before the memory /
+    // budget setup below reads inf_model. Follow-ups (both minor, cloud backends
+    // like sol unaffected): the active_profile pick above used the pre-persona
+    // model and is not recomputed; and this re-resolve re-probes the endpoint a
+    // second time (the first was the default at session start).
+    if active_persona.is_some() {
+        let url_changed = apply_persona_backend(
+            active_persona.as_ref(),
+            &base_provider,
+            &base_model,
+            &cfg,
+            &mut choice,
+            &mut inf_url,
+            &mut inf_model,
+            &mut inf_kind,
+            &mut inf_key,
+            &mut inf_context_window,
+            color,
+            verbose,
+        );
+        if url_changed && verbose {
+            dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url).map(|d| d.into_sampler(2));
         }
     }
 
@@ -1461,7 +1746,12 @@ pub(crate) fn run_chat(
                     // <cmd>`) uniformly — even the ones handled inline below.
                     // A bare `/help` falls through to the full command list.
                     if let Some(topic) = help_request(&task) {
-                        print_command_help(&topic, color, verbose);
+                        print_command_help(
+                            &topic,
+                            color,
+                            verbose,
+                            markdown_enabled(&cfg, color, markdown_override),
+                        );
                         println!();
                         continue;
                     }
@@ -3265,6 +3555,28 @@ pub(crate) fn run_chat(
                                 color,
                                 verbose,
                             );
+                            // Persona backend auto-route: repoint the session's
+                            // wire target to the new persona's `backend:` (if any),
+                            // exactly as `/backends <name>` would; a persona with no
+                            // backend (or a cleared one) reverts to the baseline.
+                            let url_changed = apply_persona_backend(
+                                active_persona.as_ref(),
+                                &base_provider,
+                                &base_model,
+                                &cfg,
+                                &mut choice,
+                                &mut inf_url,
+                                &mut inf_model,
+                                &mut inf_kind,
+                                &mut inf_key,
+                                &mut inf_context_window,
+                                color,
+                                verbose,
+                            );
+                            if url_changed && verbose {
+                                dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                    .map(|d| d.into_sampler(2));
+                            }
                         }
                         surface.save_history();
                         println!();
@@ -3311,7 +3623,173 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
-                    let cont = dispatch_slash(&task, workspace, color, verbose)?;
+                    if slash_body == "psyche edit" {
+                        // The harness config panel (#14): a transient overlay for
+                        // the psyche operator dials. It applies dials through the
+                        // same globals the slash commands do (picked up next turn,
+                        // no re-resolve); persona select + save come back for us to
+                        // act on, since the session owns that state. Rich-tui only —
+                        // the lean build has no ratatui surface, so it points at the
+                        // text /psyche + per-dial commands instead.
+                        #[cfg(feature = "rich-tui")]
+                        {
+                            use config_panel::{PanelOutcome, PersonaAction, PersonaChoice};
+                            // review-3 §3: hand the panel each persona's declarations
+                            // so it can PROJECT the selected persona's effective
+                            // posture, plus the config/family tenacity base.
+                            let personas: Vec<PersonaChoice> = persona_store
+                                .list()
+                                .map(|v| {
+                                    v.into_iter()
+                                        .filter_map(|s| persona_store.load(&s.name).ok())
+                                        .map(|p| PersonaChoice {
+                                            name: p.name.clone(),
+                                            cognition: p.profile.cognition,
+                                            tenacity: p.profile.tenacity,
+                                            backend: p.profile.backend.clone(),
+                                            crew: p.profile.crew,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            // review-3 §3: the projection fallback for a persona that
+                            // declares no backend is the operator BASELINE — what
+                            // apply_persona_backend reverts to — NOT the outgoing
+                            // persona's current backend.
+                            let backend = base_provider.clone();
+                            let current_persona = active_persona.as_ref().map(|p| p.name.clone());
+                            let base_tenacity = newt_core::tenacity::base_tenacity();
+                            // review-3 §1: the ONLY filesystem I/O, injected so a failed
+                            // write keeps the panel open and mutates nothing. Report the
+                            // store's NORMALIZED (on-disk) name so the confirmation
+                            // matches the written file.
+                            let persist =
+                                |name: &str, content: &str, overwrite: bool| match persona_store
+                                    .save(name, content, overwrite)
+                                {
+                                    Ok(path) => config_panel::SaveResult::Saved {
+                                        name: path
+                                            .file_stem()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| name.to_string()),
+                                    },
+                                    Err(PersonaSaveError::Exists) => {
+                                        config_panel::SaveResult::Exists {
+                                            name: name.to_string(),
+                                        }
+                                    }
+                                    Err(PersonaSaveError::InvalidName(m)) => {
+                                        config_panel::SaveResult::InvalidName(m)
+                                    }
+                                    Err(PersonaSaveError::Io(e)) => {
+                                        config_panel::SaveResult::Failed(e)
+                                    }
+                                };
+                            let outcome = run_psyche_panel(
+                                personas,
+                                current_persona,
+                                backend,
+                                base_tenacity,
+                                persist,
+                                color,
+                                verbose,
+                            );
+                            // Commit (review-3 §1/§2): the file (if any) was persisted
+                            // inside the panel; dials were applied inside run() on an
+                            // explicit apply. Here we report the save, apply the persona
+                            // action, reroute the backend, then report the committed
+                            // posture from FRESH runtime state (never the working copy).
+                            let (persona_action, saved_name, applied) = match outcome {
+                                PanelOutcome::Cancelled => (None, None, false),
+                                PanelOutcome::Saved { name } => (None, Some(name), false),
+                                PanelOutcome::Applied { persona } => (Some(persona), None, true),
+                                PanelOutcome::SavedAndApplied { name, persona } => {
+                                    (Some(persona), Some(name), true)
+                                }
+                            };
+                            if let Some(name) = &saved_name {
+                                print_newt(&format!("saved persona '{name}'"), color, verbose);
+                            }
+                            if !applied {
+                                if saved_name.is_none() {
+                                    print_newt("psyche edit cancelled", color, verbose);
+                                }
+                            } else {
+                                if let Some(action) = persona_action {
+                                    let persona_command = match action {
+                                        PersonaAction::Keep => None,
+                                        PersonaAction::Clear => Some("persona clear".to_string()),
+                                        PersonaAction::Switch(name) => {
+                                            Some(format!("persona set {name} --keep-context"))
+                                        }
+                                    };
+                                    if let Some(cmd) = persona_command {
+                                        let mut reset_ctx = ConversationResetContext {
+                                            memory: &mut memory,
+                                            system: &mut system,
+                                            conversation_id: &mut active_conversation_id,
+                                            mode_states: &conversation_mode_states,
+                                        };
+                                        let msg = match handle_persona_command(
+                                            &cmd,
+                                            workspace,
+                                            &persona_store,
+                                            &mut active_persona,
+                                            &mut reset_ctx,
+                                        ) {
+                                            Ok(msg) => msg,
+                                            Err(e) => format!("error: {e}"),
+                                        };
+                                        print_newt(&msg, color, verbose);
+                                        let _ = apply_persona_backend(
+                                            active_persona.as_ref(),
+                                            &base_provider,
+                                            &base_model,
+                                            &cfg,
+                                            &mut choice,
+                                            &mut inf_url,
+                                            &mut inf_model,
+                                            &mut inf_kind,
+                                            &mut inf_key,
+                                            &mut inf_context_window,
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                // Recompute + report from FRESH runtime state (§2).
+                                // #1139: one resolved snapshot is the single source
+                                // for this apply line — the same render `/psyche` and
+                                // `solve` read, not a re-derivation of each dial here.
+                                let snap = newt_core::RuntimeSettingsSnapshot::resolve(
+                                    &cfg,
+                                    active_persona.as_ref().map(|p| p.name.as_str()),
+                                    active_persona
+                                        .as_ref()
+                                        .and_then(|p| p.profile.backend.as_deref()),
+                                );
+                                print_newt(&snap.summary(), color, verbose);
+                            }
+                        }
+                        #[cfg(not(feature = "rich-tui"))]
+                        print_newt(
+                            "the psyche panel needs an interactive rich terminal — use \
+                             /psyche for the text view, or /cognition / /tenacity to \
+                             change the dials.",
+                            color,
+                            verbose,
+                        );
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    let cont = dispatch_slash(
+                        &task,
+                        workspace,
+                        color,
+                        verbose,
+                        markdown_enabled(&cfg, color, markdown_override),
+                    )?;
                     surface.save_history();
                     // Skip config reload and terminal reinit when exiting — unnecessary
                     // work that can hang if the terminal is in a degraded state.
@@ -3330,35 +3808,38 @@ pub(crate) fn run_chat(
                     if !ephemeral_session {
                         conversation_store = Some(conversation_store_for(workspace, &cfg)?);
                     }
-                    let prev_inf_url = inf_url.clone();
-                    choice = resolve_backend_choice(&cfg);
-                    // #1126 C1b: adopt served reality on a backend/model
-                    // switch too — but only when the endpoint or session
-                    // override actually changed (a plain slash command must
-                    // not re-probe every time).
-                    if choice.url != prev_inf_url || choice.model != inf_model {
-                        for line in adopt_backend_choice(&mut choice) {
-                            print_newt(&line, color, verbose);
-                        }
-                    }
-                    inf_url = choice.url.clone();
-                    inf_model = choice.model.clone();
-                    inf_kind = choice.kind;
-                    inf_key = choice.api_key.clone();
-                    inf_context_window = choice.context_window;
-                    apply_openai_api_env(choice.api);
+                    let url_changed = refresh_backend(
+                        &cfg,
+                        &mut choice,
+                        &mut inf_url,
+                        &mut inf_model,
+                        &mut inf_kind,
+                        &mut inf_key,
+                        &mut inf_context_window,
+                        color,
+                        verbose,
+                    );
                     // Re-probe DCGM ONLY when the backend URL actually changed
                     // (and only in verbose mode, where the snapshot is shown).
                     // `try_connect` is a blocking ~3s network call (issue #412);
                     // a `/vi`/`/emacs` toggle never changes the URL. Dropping the
                     // old receiver stops the previous background sampler (#414).
-                    if inf_url != prev_inf_url {
+                    if url_changed {
                         dgx_rx = if verbose {
                             dgx_probe::DgxTelemetry::try_connect(&inf_url)
                                 .map(|d| d.into_sampler(2))
                         } else {
                             None
                         };
+                    }
+                    // Review P1#2: an operator backend command (/backends, /model,
+                    // /backend) just wrote its explicit choice to the env — capture
+                    // it as the baseline a later `/persona clear` reverts to. A
+                    // persona's own routing runs in a separate branch that never
+                    // reaches here, so it can never pollute the operator baseline.
+                    if is_operator_backend_command(slash_body) {
+                        base_provider = std::env::var("NEWT_PROVIDER").ok();
+                        base_model = std::env::var("NEWT_DGX_MODEL").ok();
                     }
                     if cap.reapply(resolve_tui(&cfg), workspace) {
                         print_newt(
@@ -3604,6 +4085,12 @@ pub(crate) fn run_chat(
                     );
                     let eff_compaction_trigger_policy =
                         compaction_trigger_policy(&cfg, compaction_trigger_policy_override);
+                    let eff_input_ceiling_pct = newt_core::config::normalize_input_ceiling_pct(
+                        cfg.context
+                            .as_ref()
+                            .map(|c| c.input_ceiling_pct)
+                            .unwrap_or(80),
+                    );
 
                     // Lazy context-window discovery: /api/show is attempted at
                     // most ONCE per model per session — even when the fetch
@@ -3614,7 +4101,13 @@ pub(crate) fn run_chat(
                     // empirically-confirmed max input (max_ok_input) used as
                     // the pre-send budget gate (issue #223) and the learned
                     // estimate-calibration ratio (Phase 20 §2.3).
-                    let (eff_safe_context, eff_max_ok_input, eff_estimate_ratio) = {
+                    let (
+                        eff_context_window,
+                        eff_safe_context,
+                        eff_max_ok_input,
+                        eff_estimate_ratio,
+                        eff_recovered_hard_window,
+                    ) = {
                         let entry = cap_cache.entry(inf_model.clone()).or_default();
                         // #1199: the server-declared window from session-start
                         // adopt (`inf_context_window`) is authoritative and
@@ -3634,18 +4127,50 @@ pub(crate) fn run_chat(
                                 inf_kind,
                             );
                         let cached_sc = entry.safe_context;
+                        let cached_window = entry.context_window;
+                        let cached_hard_window = entry.hard_context_window;
                         let moi = entry.max_ok_input;
                         let ratio = entry.estimate_ratio;
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
-                        // The fresh server window (at 80%) wins; the cached
-                        // probe and a configured `context_window` are fallback.
-                        let sc = inf_context_window
-                            .map(|w| w * 80 / 100)
-                            .or(cached_sc)
+                        // Keep the full window separate from the derived input
+                        // cap. Chat Completions needs the former to reserve its
+                        // active maximum output; Ollama still uses the latter
+                        // as its conservative KV-allocation fallback.
+                        let requested_full_window = inf_context_window
+                            .or(cached_window)
                             .or_else(|| model_tune.and_then(|t| t.context_window));
-                        (sc, moi, ratio)
+                        let recovered_hard_window = cap_context_window_by_recovery(
+                            recovered_context_windows.get(&inf_model).copied(),
+                            cached_hard_window,
+                        );
+                        let full_window = cap_context_window_by_recovery(
+                            requested_full_window,
+                            recovered_hard_window,
+                        );
+                        let sc = if inf_kind == newt_core::BackendKind::Openai {
+                            full_window
+                                .map(|window| {
+                                    newt_core::config::input_percentage_ceiling(
+                                        window,
+                                        eff_input_ceiling_pct,
+                                    )
+                                })
+                                .or(cached_sc)
+                        } else {
+                            recovered_hard_window
+                                .map(|window| {
+                                    newt_core::config::input_percentage_ceiling(
+                                        window,
+                                        eff_input_ceiling_pct,
+                                    )
+                                })
+                                .or_else(|| inf_context_window.map(|w| w * 80 / 100))
+                                .or(cached_sc)
+                                .or_else(|| model_tune.and_then(|t| t.context_window))
+                        };
+                        (full_window, sc, moi, ratio, recovered_hard_window)
                     };
 
                     // Apply the `/context size <N>` session override: it caps
@@ -3658,14 +4183,20 @@ pub(crate) fn run_chat(
                         None => (eff_safe_context, eff_max_ok_input),
                     };
 
-                    // num_ctx resolution: explicit config > safe_context > model default.
-                    // Wiring safe_context as the fallback caps Ollama's KV allocation to
-                    // what we've empirically confirmed is safe, preventing silent truncation
-                    // of the system prompt when the conversation exceeds the raw context window.
-                    let eff_num_ctx = model_tune
+                    // Context-window resolution: explicit num_ctx first. For
+                    // OpenAI, hand core the full window so its input percentage
+                    // and output reserve apply exactly once. For Ollama, retain
+                    // the safe-context fallback that caps KV allocation.
+                    let requested_num_ctx = model_tune
                         .and_then(|t| t.num_ctx)
                         .or_else(|| num_ctx(&cfg))
-                        .or(eff_safe_context);
+                        .or_else(|| {
+                            context_window_for_core(inf_kind, eff_context_window, eff_safe_context)
+                        });
+                    let eff_num_ctx = cap_context_window_by_recovery(
+                        requested_num_ctx,
+                        eff_recovered_hard_window,
+                    );
 
                     // Build message list from memory manager. A fresh runtime
                     // block is prepended to the (frozen) system prompt EACH turn
@@ -4038,6 +4569,29 @@ pub(crate) fn run_chat(
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());
+                    // Psyche: the turn's cognition → `reasoning.effort` (via
+                    // ChatCtx.cognition). Effective precedence: a live `/cognition`
+                    // override wins; else the active persona's declared cognition
+                    // (installed as PERSONA_COGNITION on activation); else `None`.
+                    let cognition = newt_core::cognition::effective_cognition();
+                    // Cognition always rides the Responses wire and may also
+                    // project to Chat Completions when the endpoint explicitly
+                    // advertises that extension. Otherwise say so once — never
+                    // silently accept and ignore a live dial.
+                    if cognition.is_some() && !cognition_scope_noted {
+                        let responses = std::env::var("NEWT_OPENAI_API")
+                            .is_ok_and(|v| v.eq_ignore_ascii_case("responses"));
+                        let capable_chat = choice.kind == newt_core::BackendKind::Openai
+                            && choice.chat_completions_capability.cognition == Some(true);
+                        if !responses && !capable_chat {
+                            print_newt(
+                                "note: the active backend does not advertise a cognition generation policy — cognition is ignored.",
+                                color,
+                                verbose,
+                            );
+                            cognition_scope_noted = true;
+                        }
+                    }
                     // The active posture's optional clamp is threaded to the
                     // gate (re-clamps any session grant). A skill/framing-only
                     // compatibility binding is genuinely `None` here.
@@ -4087,18 +4641,34 @@ pub(crate) fn run_chat(
                     // 8,734-token prompt because the only write-back lived in
                     // the Ok-arm epilogue below. `turn_saw_accepted` is a Cell
                     // so the epilogue can read it without contending with the
-                    // closure's captures.
+                    // closure's captures. Keep hard-400 discovery separate
+                    // from the ordinary session probe: only the former may
+                    // tighten an explicit per-turn window in the gauge.
                     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                     let turn_saw_accepted = std::cell::Cell::new(false);
+                    let recovered_context_window = std::cell::Cell::new(None);
                     let mut on_obs = |obs: newt_core::RoundObservation| {
                         if matches!(obs, newt_core::RoundObservation::Accepted { .. }) {
                             turn_saw_accepted.set(true);
                         }
                         // Inner block: the `entry` borrow must end before
                         // `save_cache` takes its shared borrow of the map.
-                        let dirty = {
+                        let (dirty, persisted_hard_window) = {
                             let entry = cap_cache.entry(inf_model.clone()).or_default();
-                            probe::apply_observation(entry, &obs, &today)
+                            let dirty = probe::apply_observation_with_input_ceiling_pct(
+                                entry,
+                                &obs,
+                                &today,
+                                eff_input_ceiling_pct,
+                            );
+                            (dirty, entry.hard_context_window)
+                        };
+                        if matches!(obs, newt_core::RoundObservation::ContextWindow400 { .. }) {
+                            let hard_window = persisted_hard_window
+                                .expect("a numbered context-window observation persists its cap");
+                            recovered_context_windows.insert(inf_model.clone(), hard_window);
+                            inf_context_window = Some(hard_window);
+                            recovered_context_window.set(Some(hard_window));
                         };
                         if dirty {
                             probe::save_cache(&cap_cache);
@@ -4278,6 +4848,10 @@ pub(crate) fn run_chat(
                                         // posture is active.
                                         caveats: &turn_caveats,
                                         persona_tools,
+                                        cognition,
+                                        chat_completions_capability: choice
+                                            .chat_completions_capability,
+                                        reasoning_replay_scope: choice.reasoning_replay_scope,
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,
                                         // #1162: the /nudge dial — env set by the
@@ -4345,12 +4919,7 @@ pub(crate) fn run_chat(
                                             .as_ref()
                                             .map(|c| c.summary_input_cap_floor_chars)
                                             .unwrap_or(8_192),
-                                        input_ceiling_pct: cfg
-                                            .context
-                                            .as_ref()
-                                            .map(|c| c.input_ceiling_pct)
-                                            .unwrap_or(80)
-                                            .clamp(1, 99),
+                                        input_ceiling_pct: eff_input_ceiling_pct,
                                         low_budget_pct: cfg
                                             .context
                                             .as_ref()
@@ -4760,16 +5329,36 @@ pub(crate) fn run_chat(
                                         }
                                     }
                                     // Step 24.6 (#559): refresh the context-budget
-                                    // gauge for the next header — this turn's input
-                                    // tokens against the resolved send budget.
-                                    // Match initial_send_budget's max semantics: take the
-                                    // larger of the empirical ratchet and the declared/probed
-                                    // context so a configured context_window shows through
-                                    // even when the ratchet hasn't grown that large yet.
-                                    let gauge_budget = match (eff_max_ok_input, eff_safe_context) {
-                                        (Some(m), Some(s)) => Some(m.max(s)),
-                                        (m, s) => m.or(s),
+                                    // gauge for the next header. Read observation state
+                                    // again here: a numbered hard 400 may have replaced
+                                    // the full window and cached caps during this turn.
+                                    // Then use core's send-budget resolver so the visible
+                                    // number includes the same cognition output reserve as
+                                    // preflight, compaction, and context_remaining.
+                                    let observed = cap_cache.get(&inf_model);
+                                    let (gauge_max_ok, gauge_safe) = match context_size_override {
+                                        Some(n) => (Some(n), Some(n)),
+                                        None => (
+                                            observed
+                                                .and_then(|entry| entry.max_ok_input)
+                                                .or(eff_max_ok_input),
+                                            observed
+                                                .and_then(|entry| entry.safe_context)
+                                                .or(eff_safe_context),
+                                        ),
                                     };
+                                    let gauge_budget = context_gauge_budget(
+                                        inf_kind,
+                                        choice.api,
+                                        eff_num_ctx,
+                                        recovered_context_window.get(),
+                                        eff_input_ceiling_pct,
+                                        cognition,
+                                        choice.chat_completions_capability,
+                                        choice.reasoning_replay_scope,
+                                        gauge_max_ok,
+                                        gauge_safe,
+                                    );
                                     if let Some(budget) = gauge_budget {
                                         token_gauge = Some((input_tokens, budget));
                                     }

@@ -22,6 +22,7 @@ mod crew_attest;
 mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
+mod generation_policy;
 mod git_tool;
 pub(crate) mod self_verify;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
@@ -161,6 +162,7 @@ pub use compress::{
 };
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
+pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, newt_line, print_harness_notice,
     print_list_item, print_newt, set_spill_lines, GaugeLevel, NEWT_ORANGE_CT,
@@ -176,8 +178,8 @@ pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use observability::{
-    classify_reqwest, error_class, round_parse_signal, DispatchError, ErrorClass, ParseSignal,
-    SolveObservation, ToolCallDialect,
+    classify_reqwest, error_class, round_parse_signal, BehaviorSignal, DispatchError, ErrorClass,
+    ParseSignal, SolveObservation, ToolCallDialect,
 };
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
@@ -268,6 +270,7 @@ pub use permissions::{
 pub use plan_mode::PlanModeControl;
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
+pub use send_budget::initial_context_input_budget;
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
@@ -295,8 +298,8 @@ use display::{
     emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator, print_trace,
 };
 use send_budget::{
-    calibrate_down, calibrate_up, emit_accepted, initial_send_budget, num_ctx_input_ceiling,
-    sanitize_estimate_ratio,
+    calibrate_down, calibrate_up, emit_accepted, emit_context_window_400, initial_send_budget,
+    num_ctx_input_ceiling, recovered_input_budget, sanitize_estimate_ratio,
 };
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
@@ -332,14 +335,18 @@ fn authoritative_request_budget(
     send_budget_authoritative: bool,
     token_threshold: Option<usize>,
 ) -> Option<usize> {
-    let send = send_budget_authoritative
-        .then_some(send_budget)
-        .flatten()
-        .filter(|budget| *budget > 0);
+    let send = send_budget_authoritative.then_some(send_budget).flatten();
     match (send, token_threshold.filter(|budget| *budget > 0)) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     }
+}
+
+fn capped_accepted_prompt_tokens(
+    accepted_prompt_tokens: u32,
+    declared_ceiling: Option<usize>,
+) -> usize {
+    (accepted_prompt_tokens as usize).min(declared_ceiling.unwrap_or(usize::MAX))
 }
 
 /// Refuse before inference when the compression-immune system/card/exact-user
@@ -450,7 +457,10 @@ fn preflight_responses_request(
 }
 
 /// Hook recovering a hard context-window 400:
-/// `(error, model, today) → new input-token cap`. See [`ChatCtx::recover_cw_400`].
+/// `(error, model, today) → parsed full context window`. The loop composes the
+/// returned window with its percentage ceiling and generation output reserve;
+/// callbacks must not pre-discount it into an input cap. See
+/// [`ChatCtx::recover_cw_400`].
 pub type RecoverCw400 = fn(&anyhow::Error, &str, &str) -> Option<u32>;
 
 /// One per-round capability observation, reported through
@@ -474,6 +484,10 @@ pub enum RoundObservation {
     /// Persistent empty responses at `prompt_tokens` after retries (the
     /// 85%-of-safe-context silent-overflow exit).
     SuspectedOverflow { prompt_tokens: u32 },
+    /// A hard HTTP error reported the endpoint's full context window. The TUI
+    /// applies this through the same in-memory capability entry as subsequent
+    /// accepted-round evidence, avoiding stale whole-cache overwrites.
+    ContextWindow400 { context_window: u32 },
     /// Response carried only non-content fields (thinking/reasoning) with
     /// empty content.
     ThinkingOnly,
@@ -596,6 +610,21 @@ pub struct ChatCtx<'a> {
     /// axis-scoped `caveats` (which part 1, #1002, already meets in). Headless
     /// / driver / eval callers pass `None` (no persona surface).
     pub persona_tools: Option<&'a [String]>,
+    /// The psyche **cognition** dial for this turn — how much reasoning effort to
+    /// request. `Some(level)` emits OpenAI **Responses** `reasoning.effort` or,
+    /// for an explicitly capable Chat Completions endpoint, resolves a local
+    /// generation policy. `None` omits cognition-derived fields. The TUI
+    /// resolves this from the active persona's `cognition:` front-matter
+    /// alongside `persona_tools`; headless / eval callers pass `None`.
+    pub cognition: Option<crate::role_profile::Cognition>,
+    /// Chat Completions extensions explicitly accepted by this endpoint.
+    /// Unknown endpoints use the all-unset default and retain the historical
+    /// request body even when cognition is active.
+    pub chat_completions_capability: crate::model_card::ChatCompletionsCapability,
+    /// Whether assistant reasoning may be replayed to the active backend.
+    /// Unknown endpoints default to `Never`; local reasoning backends opt in via
+    /// their explicit capability profile.
+    pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 40).
     pub max_tool_rounds: usize,
@@ -639,7 +668,9 @@ pub struct ChatCtx<'a> {
     /// Also feeds the pre-send budget as a hard input ceiling for this turn's
     /// requests (issue #282): Ollama silently evaluates only the window's
     /// tail, so anything newt sends must already fit inside the `num_ctx` it
-    /// sends it with. Ignored on the OpenAI path (no such request field).
+    /// sends it with. OpenAI requests do not serialize `num_ctx`, but local
+    /// compatible endpoints still use it as an authoritative declared window
+    /// for preflight, compaction, reporting, and 400 recovery.
     pub num_ctx: Option<u32>,
     /// TCP connect timeout. Short (5 s default) so a down endpoint fails fast
     /// rather than blocking the full `inference_timeout_secs`.
@@ -675,11 +706,12 @@ pub struct ChatCtx<'a> {
     /// `None` disables overflow detection.
     pub safe_context: Option<u32>,
     /// Hook invoked when a dispatch fails, to recover a hard context-window
-    /// 400: `(error, model, today) → new input-token cap`. The TUI wires its
-    /// `recover_context_window_400` (which parses the endpoint's real limit
-    /// and persists it to `model-capabilities.json` — that cache stays
-    /// TUI-side with the probe module). `None` disables recovery: the error
-    /// propagates exactly as it did when no limit could be parsed. See #223.
+    /// 400: `(error, model, today) → parsed full context window`. The loop
+    /// derives the effective input cap after reserving its configured maximum
+    /// output; callbacks must not return a pre-discounted input budget. The
+    /// loop emits [`RoundObservation::ContextWindow400`] so the TUI's existing
+    /// observation owner can persist the discovery. `None` disables numbered
+    /// recovery.
     pub recover_cw_400: Option<RecoverCw400>,
     /// Model-writable note store behind the `save_note` tool (Step 19.3,
     /// #248). `None` ⇒ the tool is not advertised and the loop never writes
@@ -775,10 +807,11 @@ pub struct ChatCtx<'a> {
     /// `[context] summary_input_cap_floor_chars` — floor for the summarizer
     /// input cap so a tight budget never starves the summarizer of material.
     pub summary_input_cap_floor_chars: usize,
-    /// `[context] input_ceiling_pct` — percent of `num_ctx` usable as input
-    /// before the reply reserve. Historically hardcoded at 80 (20% headroom);
-    /// large-window models (e.g. Opus) can safely raise this to pack more
-    /// context per turn. Applied by `num_ctx_input_ceiling`.
+    /// `[context] input_ceiling_pct` — percentage-based input limit inside the
+    /// declared context window. The effective ceiling is the tighter of this
+    /// limit and the space left after the generation policy's maximum output.
+    /// Historically hardcoded at 80 (20% headroom). Applied by
+    /// `num_ctx_input_ceiling`.
     pub input_ceiling_pct: u32,
     /// `[context] low_budget_pct` — remaining-budget percent below which the
     /// loop treats the turn as "low budget" and nudges toward wrapping up.
@@ -1167,6 +1200,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        // Ollama has no Chat Completions capability projection. Bound these
+        // fields to `_` so its request body remains unchanged.
+        cognition: _,
+        chat_completions_capability: _,
+        reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
@@ -1319,16 +1357,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // so without the ceiling the first turn dispatched 10× over the real
     // window with zero events — B6). Mutable because a recovered 400 tightens
     // it mid-turn. See #223.
-    let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct);
+    let mut effective_input_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None);
     let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, num_ctx, input_ceiling_pct);
+        initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
     // does it rest on the proven-good high-water mark (`max_ok_input`) alone?
     // `safe_context` (a believed/declared window) and the per-request
     // `num_ctx` ceiling are authoritative; a cw-400 recovery flips this true
     // mid-turn. Cloud endpoints with no `/api/show` seed neither, so their
     // guard is non-authoritative and fails open instead of refusing.
-    let mut send_budget_authoritative = safe_context.is_some() || num_ctx_ceiling.is_some();
+    let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
@@ -1606,6 +1644,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 messages: &messages,
                                 budget: pipeline_budget,
                                 max_messages: trigger.max_messages,
+                                replay_protected_tail_len: 0,
                                 task: active_task,
                                 hard_budget: trigger.hard_budget,
                                 authoritative: token_fired || send_budget_authoritative,
@@ -1854,28 +1893,44 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 // `/api/chat`) falls back to a cap derived from the current send
                 // budget / the `num_ctx` ceiling, so the turn self-heals.
                 if cw_retries < 2 {
-                    if let Some(new_cap) = recover_cw_400
-                        .and_then(|f| f(&e, model, &today))
+                    let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                    if let Some(recovered_budget) = recovered_window
+                        .map(|context_window| {
+                            recovered_input_budget(
+                                context_window,
+                                input_ceiling_pct,
+                                None,
+                                effective_input_ceiling,
+                            )
+                        })
                         .or_else(|| {
                             cw_overflow::core_recover_overflow(
                                 &e.to_string(),
                                 send_budget,
-                                num_ctx_ceiling,
+                                effective_input_ceiling,
                             )
+                            .map(|cap| cap as usize)
                         })
                     {
+                        if let Some(context_window) = recovered_window {
+                            emit_context_window_400(&mut on_round_usage, context_window);
+                        }
+                        // A recovered full window is composed through the same
+                        // effective-ceiling operation as the declared window;
+                        // numberless recovery already derives an input cap.
+                        let new_budget = effective_input_ceiling
+                            .map_or(recovered_budget, |c| recovered_budget.min(c));
                         emit_overflow_notice(
                             color,
                             accumulated_usage.as_ref(),
-                            Some(new_cap),
+                            Some(new_budget.min(u32::MAX as usize) as u32),
                             model,
                             cw_retries + 1,
                         );
                         // A recovered cap can only tighten — the request still
                         // carries the same `num_ctx`, so its ceiling holds (#282).
-                        let new_budget =
-                            num_ctx_ceiling.map_or(new_cap as usize, |c| (new_cap as usize).min(c));
                         send_budget = Some(new_budget);
+                        effective_input_ceiling = Some(new_budget);
                         // The endpoint's parsed hard limit is authoritative —
                         // a refuse on it is correct from here on (Step 20.3).
                         send_budget_authoritative = true;
@@ -1890,6 +1945,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     cal,
                                 ),
                                 max_messages: None,
+                                replay_protected_tail_len: 0,
                                 task: active_task,
                                 hard_budget: true,
                                 authoritative: true,
@@ -1964,7 +2020,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // within the same turn (Phase 20 §2.2). Never lowers; stays under the
         // per-request input ceiling.
         if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
-            let raised = (u.input_tokens as usize).min(num_ctx_ceiling.unwrap_or(usize::MAX));
+            let raised =
+                (u.input_tokens as usize).min(effective_input_ceiling.unwrap_or(usize::MAX));
             if raised > budget {
                 send_budget = Some(raised);
                 if debug {
@@ -2502,6 +2559,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 messages: &messages,
                                 budget: target,
                                 max_messages: None,
+                                replay_protected_tail_len: 0,
                                 task: active_task,
                                 hard_budget: true,
                                 // A suspected silent overflow is a real failure
@@ -2731,9 +2789,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
+                    effective_input_ceiling,
                     num_ctx,
-                    input_ceiling_pct as usize,
+                    input_ceiling_pct,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -4410,6 +4468,29 @@ fn openai_chat_wire_messages(
     Ok(wire)
 }
 
+fn prepare_openai_assistant_replay(
+    message: &serde_json::Value,
+    clean_content: &str,
+    replay_scope: crate::model_card::ReasoningReplayScope,
+    current_user_turn: bool,
+) -> serde_json::Value {
+    let mut assistant = message.clone();
+    if assistant["role"].as_str().is_none() {
+        assistant["role"] = serde_json::Value::String("assistant".into());
+    }
+
+    let keep_reasoning = replay_scope == crate::model_card::ReasoningReplayScope::FullHistory
+        || (replay_scope == crate::model_card::ReasoningReplayScope::CurrentUserTurn
+            && current_user_turn);
+    if !keep_reasoning {
+        assistant["content"] = serde_json::Value::String(clean_content.to_string());
+        if let Some(object) = assistant.as_object_mut() {
+            object.remove("reasoning_content");
+        }
+    }
+    assistant
+}
+
 /// Final tools-disabled completion for the OpenAI (`/v1/chat/completions`) path.
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
@@ -4420,6 +4501,7 @@ async fn final_summary_openai(
     model: &str,
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
+    generation_policy: generation_policy::GenerationPolicy,
     cap: CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     let CapExit {
@@ -4460,11 +4542,12 @@ async fn final_summary_openai(
         ));
     }
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": &messages,
         "stream": false,
     });
+    generation_policy.apply_to_chat_completions_body(&mut body);
     let retry = tui_retry_policy();
     let result = with_backoff_notify(
         &retry,
@@ -4607,6 +4690,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        // Chat Completions does not use the Responses-only `reasoning_effort`
+        // field. Explicit endpoint capability data may instead project cognition
+        // into a local generation policy.
+        cognition,
+        chat_completions_capability,
+        reasoning_replay_scope,
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
@@ -4656,6 +4745,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // execution-pressure nudges.
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
+    let generation_policy = generation_policy::GenerationPolicy::resolve(
+        cognition,
+        chat_completions_capability,
+        reasoning_replay_scope,
+    );
+    let reasoning_replay_scope = generation_policy.reasoning_replay_scope;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
     let compress_state = match compress_state {
@@ -4691,7 +4786,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
-        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .map(|m| {
+            let content = if m.role == crate::Role::Assistant
+                && reasoning_replay_scope != crate::model_card::ReasoningReplayScope::FullHistory
+            {
+                crate::reasoning::split_reasoning(&m.content).0
+            } else {
+                m.content.clone()
+            };
+            serde_json::json!({"role": m.role.as_str(), "content": content})
+        })
         .collect();
     let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
         crate::TurnPromptContext::ephemeral_operator(
@@ -4723,6 +4827,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // At most one reasoning-only length-stop continuation per user turn. The
+    // signal index lets the next response record whether that bounded recovery
+    // produced visible content or an executable call.
+    let mut reasoning_continuation_attempted = false;
+    let mut reasoning_overflow_signal_index: Option<usize> = None;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
     // No-tools recovery (mirrors the Ollama path): a model that rejects the
@@ -4730,17 +4839,18 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
     // Pre-send token budget gate; tightened mid-turn by a recovered 400
-    // (#223). Phase 20 §2.1 max(proven, believed) semantics — no `num_ctx`
-    // ceiling on this wire (limits are server-side, e.g. vLLM
-    // --max-model-len), so the ceiling leg is `None`.
+    // (#223). `num_ctx` is not sent on this wire, but an operator-declared
+    // local endpoint window still provides an authoritative input ceiling.
+    // Cloud endpoints leave it unset and continue to fail open on proven-good
+    // evidence alone.
+    let mut effective_input_ceiling = num_ctx_input_ceiling(
+        num_ctx,
+        input_ceiling_pct,
+        generation_policy.max_output_tokens,
+    );
     let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
-    // Step 20.3: on this wire there is no `num_ctx` ceiling, so the send
-    // budget is authoritative only when a believed window (`safe_context`)
-    // seeds it. Cloud OpenAI-compatible models have no `/api/show` to seed
-    // one, so their budget rests on the proven-good HWM alone — the guard
-    // fails open rather than refusing. A cw-400 flips this true mid-turn.
-    let mut send_budget_authoritative = safe_context.is_some();
+        initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
+    let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     let tools = merged_tool_definitions(
         mcp,
@@ -4911,8 +5021,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 mid_loop_trim_tokens,
             )
             .is_some();
+            let reasoning_tail_len = compress::reasoning_replay_tail_len(&messages);
             if let Some(trigger) = compression_trigger(
-                messages.len(),
+                compress::compression_message_count(&messages, reasoning_tail_len),
                 current,
                 message_tokens,
                 CompressionTriggerLimits {
@@ -4939,7 +5050,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     CompressRequest {
                         messages: &messages,
                         budget: pipeline_budget,
-                        max_messages: trigger.max_messages,
+                        // A current-turn reasoning transcript is one atomic
+                        // logical item for count pressure. Token pressure still
+                        // applies to its real size, but a physical count cap
+                        // must not split away the plan the endpoint requires.
+                        max_messages: if reasoning_tail_len > 0 {
+                            None
+                        } else {
+                            trigger.max_messages
+                        },
+                        replay_protected_tail_len: reasoning_tail_len,
                         task: active_task,
                         hard_budget: trigger.hard_budget,
                         authoritative: token_fired || send_budget_authoritative,
@@ -5055,6 +5175,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             "tool_choice": "auto",
             "stream": false,
         });
+        generation_policy.apply_to_chat_completions_body(&mut body);
         // Drop tools (and the now-meaningless tool_choice) for a model that
         // rejected them on a prior "does not support tools" 400.
         if !tools_supported {
@@ -5063,12 +5184,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 o.remove("tool_choice");
             }
         }
-        // No `num_ctx` is sent here, so #282's per-request input ceiling has
-        // no value to key on either — the pre-send guard stays on the cached
-        // `max_ok_input` ∥ `safe_context` numbers and the cw-400 recovery
-        // (these endpoints DO reject oversize requests with a parseable 400,
-        // unlike Ollama's silent truncation).
-        let _ = num_ctx; // not applicable for OpenAI-compatible endpoints
+        // OpenAI-compatible endpoints do not accept a `num_ctx` request field,
+        // but the operator-declared local window still bounds Newt's pre-send
+        // budget. These endpoints reject oversize requests rather than silently
+        // truncating them, so no wire field is needed to enforce the local cap.
         let dispatch = with_backoff_notify(
             &retry,
             || async {
@@ -5125,27 +5244,46 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // real limit, tighten the budget, compress, and retry once (#223;
                 // compress-not-trim since Step 18.4). When the endpoint carries
                 // NO parseable limit — llama.cpp's numberless `500 "Context size
-                // has been exceeded"`, which `recover_cw_400` (litellm-numbered)
-                // can't read, and which headless has no `recover_cw_400` for at
-                // all — fall back to deriving a tightened cap from the current
-                // send budget so the turn self-heals instead of dying on a blind
-                // resend of the same oversized prompt. No `num_ctx` ceiling on
-                // this wire (limits are server-side), so derive from send_budget.
+                // has been exceeded"` — fall back to deriving a tightened cap
+                // from the current send budget. The shared parse-only hook reads
+                // both LiteLLM and vLLM numbered forms in interactive and
+                // headless drivers; this fallback is only for numberless errors.
+                // It remains capped by the operator-declared local window even
+                // though no `num_ctx` field rides on this wire.
                 if cw_retries < 2 {
-                    if let Some(new_cap) = recover_cw_400
-                        .and_then(|f| f(&e, model, &today))
+                    let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                    if let Some(recovered_budget) = recovered_window
+                        .map(|context_window| {
+                            recovered_input_budget(
+                                context_window,
+                                input_ceiling_pct,
+                                generation_policy.max_output_tokens,
+                                effective_input_ceiling,
+                            )
+                        })
                         .or_else(|| {
                             cw_overflow::core_recover_overflow(&e.to_string(), send_budget, None)
+                                .map(|cap| cap as usize)
                         })
                     {
+                        if let Some(context_window) = recovered_window {
+                            emit_context_window_400(&mut on_round_usage, context_window);
+                        }
+                        // The callback returns the endpoint's full hard window,
+                        // not an already-discounted input cap. Reserve this
+                        // request's maximum output against the actual window,
+                        // then retain any tighter declared-window ceiling.
+                        let new_budget = effective_input_ceiling
+                            .map_or(recovered_budget, |c| recovered_budget.min(c));
                         emit_overflow_notice(
                             color,
                             accumulated_usage.as_ref(),
-                            Some(new_cap),
+                            Some(new_budget.min(u32::MAX as usize) as u32),
                             model,
                             cw_retries + 1,
                         );
-                        send_budget = Some(new_cap as usize);
+                        send_budget = Some(new_budget);
+                        effective_input_ceiling = Some(new_budget);
                         // The endpoint's parsed hard limit is authoritative
                         // from here on (Step 20.3; mirrors the Ollama path).
                         send_budget_authoritative = true;
@@ -5156,10 +5294,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 // (Phase 20 §2.3; mirrors the Ollama path).
                                 messages: &messages,
                                 budget: calibrate_down(
-                                    (new_cap as usize).saturating_sub(tool_tokens_real),
+                                    new_budget.saturating_sub(tool_tokens_real),
                                     cal,
                                 ),
                                 max_messages: None,
+                                replay_protected_tail_len: compress::reasoning_replay_tail_len(
+                                    &messages,
+                                ),
                                 task: active_task,
                                 hard_budget: true,
                                 authoritative: true,
@@ -5197,10 +5338,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 outcome.action,
                                 outcome.tokens_before,
                                 outcome.tokens_after,
-                                calibrate_down(
-                                    (new_cap as usize).saturating_sub(tool_tokens_real),
-                                    cal,
-                                ),
+                                calibrate_down(new_budget.saturating_sub(tool_tokens_real), cal),
                                 round,
                                 "context_window_400",
                                 None,
@@ -5225,10 +5363,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
         // Phase 20 §2.2: no `num_ctx` on this wire, so there is no silent
         // head-truncation mode to suspect (oversize requests get a parseable
-        // 400 instead) and no per-request ceiling on the mid-turn raise.
+        // 400 instead). The declared local `num_ctx` still caps Newt's input
+        // budget even though that field is not sent on this wire: accepting a
+        // prompt with a short reply does not prove the same prompt leaves room
+        // for the configured maximum output.
         let truncation_suspect = false;
         if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
-            let raised = u.input_tokens as usize;
+            let raised = capped_accepted_prompt_tokens(u.input_tokens, effective_input_ceiling);
             if raised > budget {
                 send_budget = Some(raised);
                 if debug {
@@ -5284,6 +5425,98 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             _ => None,
         };
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        let finish_reason = json["choices"][0]["finish_reason"].as_str();
+        if let Some(obs) = solve_obs.as_deref_mut() {
+            obs.behavior_signals
+                .push(observability::BehaviorSignal::ChatCompletionFinish {
+                    round,
+                    finish_reason: finish_reason.map(str::to_string),
+                });
+        }
+        let reasoning_text = separate_reasoning.or(inline_reasoning.as_deref());
+        let reasoning_overflow = observability::reasoning_overflow_signature(
+            finish_reason,
+            oa_content.is_empty(),
+            reasoning_text.is_some(),
+            has_tools,
+        );
+
+        // Resolve the pending telemetry record on the first response after a
+        // continuation. A tool call or visible answer is a successful recovery;
+        // another reasoning-only/empty response remains an honest failure.
+        if reasoning_continuation_attempted && !reasoning_overflow {
+            if has_tools || !oa_content.is_empty() {
+                if let (Some(obs), Some(index)) =
+                    (solve_obs.as_deref_mut(), reasoning_overflow_signal_index)
+                {
+                    if let Some(signal) = obs.behavior_signals.get_mut(index) {
+                        signal.mark_continuation_succeeded();
+                    }
+                }
+            }
+            reasoning_overflow_signal_index = None;
+        }
+
+        if reasoning_overflow {
+            let has_round_budget = round + 1 < current_tool_round_limit;
+            let can_continue = generation_policy
+                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget);
+
+            let resolving_existing_continuation =
+                reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
+            if !resolving_existing_continuation {
+                if let Some(obs) = solve_obs.as_deref_mut() {
+                    let index = obs.behavior_signals.len();
+                    obs.behavior_signals
+                        .push(observability::BehaviorSignal::ReasoningOverflow {
+                            round,
+                            reasoning_overflow_detected: true,
+                            continuation_attempted: can_continue,
+                            continuation_succeeded: false,
+                            finish_reason: "length".into(),
+                            reasoning_tokens_estimate: estimation.tokens_for_chars(
+                                reasoning_text
+                                    .map(|reasoning| reasoning.chars().count())
+                                    .unwrap_or(0),
+                            ),
+                        });
+                    reasoning_overflow_signal_index = Some(index);
+                }
+            }
+
+            if can_continue {
+                print_newt(
+                    "reasoning reached the output limit before an answer — continuing once",
+                    color,
+                    false,
+                );
+                messages.push(prepare_openai_assistant_replay(
+                    message,
+                    &oa_content,
+                    reasoning_replay_scope,
+                    true,
+                ));
+                reasoning_continuation_attempted = true;
+                continue 'round_loop;
+            }
+
+            let reason = if resolving_existing_continuation {
+                "the bounded continuation also reached the output limit"
+            } else if reasoning_continuation_attempted {
+                "the turn already used its bounded continuation"
+            } else if !generation_policy.one_bounded_reasoning_continuation {
+                "the endpoint does not advertise bounded continuation"
+            } else if reasoning_replay_scope == crate::model_card::ReasoningReplayScope::Never {
+                "the endpoint does not allow current-turn reasoning replay"
+            } else {
+                "the turn has no remaining round budget"
+            };
+            print_newt(
+                &format!("reasoning overflow detected — {reason}"),
+                color,
+                false,
+            );
+        }
         // W0 (#1511): served-model + parse-status observation for the solve
         // contract — mirror of the Ollama loop above.
         if let Some(obs) = solve_obs.as_deref_mut() {
@@ -5567,21 +5800,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             truncation_suspect,
             round_est_raw,
         );
-        // #857: re-send a CLEAN assistant turn — stripped content (no inline
-        // <think>) and no prior-turn `reasoning_content` (the model must not be fed
-        // its own CoT back). The `tool_calls` are preserved.
-        let mut assistant_turn = message.clone();
-        // OpenAI-compatible proxies are not perfectly uniform: some omit the
-        // otherwise-required `role` field from a tool-calling response. Keep
-        // the transcript canonical before compression/repair so its matched
-        // `role="tool"` results are not mistaken for orphans and discarded.
-        if assistant_turn["role"].as_str().is_none() {
-            assistant_turn["role"] = serde_json::Value::String("assistant".into());
-        }
-        assistant_turn["content"] = serde_json::Value::String(oa_content.clone());
-        if let Some(obj) = assistant_turn.as_object_mut() {
-            obj.remove("reasoning_content");
-        }
+        // #857: unknown endpoints keep the historical clean replay (no inline
+        // <think> or reasoning_content). A capability-profiled reasoning backend
+        // may instead retain the assistant's current-turn plan across tool rounds.
+        // Some proxies omit the otherwise-required role; preparation also
+        // canonicalizes that field before compression can inspect tool pairs.
+        let assistant_turn =
+            prepare_openai_assistant_replay(message, &oa_content, reasoning_replay_scope, true);
         messages.push(assistant_turn);
         let mut round_modified_workspace = false;
         let mut round_progress = false;
@@ -5665,15 +5890,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             // #727: intercept the read-only budget self-read (see the Ollama path).
-            // num_ctx is not applicable on OpenAI-compatible endpoints (so the
-            // ceiling is usually None → an honest "no ceiling configured"), but the
-            // used-token figure is still reported.
+            // OpenAI-compatible endpoints do not receive `num_ctx`, but a local
+            // endpoint's operator-declared window still provides the displayed
+            // input ceiling. Cloud endpoints normally leave it unset.
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
+                    effective_input_ceiling,
                     num_ctx,
-                    input_ceiling_pct as usize,
+                    input_ceiling_pct,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -5789,7 +6014,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Reached the round cap. Trim the message list and make ONE final
     // tools-disabled completion (matches the Ollama path).
     let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
-    let trimmed = trim_for_summary(&messages, protected_head, 6);
+    let replay_protected_tail_len = compress::reasoning_replay_tail_len(&messages);
+    let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     let (text, streamed, usage) = final_summary_openai(
@@ -5798,6 +6024,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         model,
         api_key,
         trimmed,
+        generation_policy,
         CapExit {
             max_tool_rounds,
             accumulated: accumulated_usage,
@@ -5847,6 +6074,19 @@ fn responses_api_selected() -> bool {
     std::env::var("NEWT_OPENAI_API")
         .ok()
         .is_some_and(|v| v.eq_ignore_ascii_case("responses"))
+}
+
+/// The Responses-wire `reasoning` object for a cognition level, or `None` to omit
+/// it. The **single owner** of how the psyche `cognition` dial becomes a wire
+/// field: the value mapping lives in [`Cognition::reasoning_effort`], the Responses
+/// *shape* (`{"effort": …}`) lives here, so the chat-shape projection
+/// (`reasoning_effort: …`, a follow-up once the chat bodies are consolidated)
+/// reuses the same value without duplicating the ladder. `None` → the field is
+/// never added, leaving the request bit-for-bit unchanged for non-opt-in callers.
+fn responses_reasoning_field(
+    cognition: Option<crate::role_profile::Cognition>,
+) -> Option<serde_json::Value> {
+    cognition.map(|c| serde_json::json!({ "effort": c.reasoning_effort() }))
 }
 
 /// Split chat-style messages into the Responses API's `(instructions, input)`:
@@ -5902,15 +6142,22 @@ fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// Extract `(assistant_text, function_call_items)` from a Responses reply's
-/// `output[]`: text is the concatenation of `output_text` parts inside
-/// `message` items; `function_call` items are returned verbatim (they carry
-/// `call_id` / `name` / `arguments` and are echoed back into the next request).
-/// Falls back to a flattened top-level `output_text` if the structured walk
-/// found no text.
-fn parse_responses_output(json: &serde_json::Value) -> (String, Vec<serde_json::Value>) {
+/// Extract `(assistant_text, function_call_items, echo_items)` from a Responses
+/// reply's `output[]`. `text` is the concatenation of `output_text` parts inside
+/// `message` items. `function_call_items` are the calls the loop executes.
+/// `echo_items` is the ordered subsequence of `reasoning` AND `function_call`
+/// items that must be echoed VERBATIM into the next request's `input`: a
+/// reasoning model (gpt-5.6-sol, gpt-5-codex) pairs each `function_call` with a
+/// preceding `reasoning` item (`rs_…`) and 400s ("function_call … without its
+/// required 'reasoning' item") if the call is sent back without it. Preserving
+/// original order keeps each reasoning item adjacent to its call. Falls back to a
+/// flattened top-level `output_text` if the structured walk found no text.
+fn parse_responses_output(
+    json: &serde_json::Value,
+) -> (String, Vec<serde_json::Value>, Vec<serde_json::Value>) {
     let mut text = String::new();
     let mut calls = Vec::new();
+    let mut echo = Vec::new();
     if let Some(items) = json["output"].as_array() {
         for item in items {
             match item["type"].as_str() {
@@ -5923,7 +6170,14 @@ fn parse_responses_output(json: &serde_json::Value) -> (String, Vec<serde_json::
                         }
                     }
                 }
-                Some("function_call") => calls.push(item.clone()),
+                Some("function_call") => {
+                    calls.push(item.clone());
+                    echo.push(item.clone());
+                }
+                // Reasoning items (`rs_…`) carry the chain that produced the
+                // following function_call; the Responses API requires them echoed
+                // back alongside the call, so preserve them in output order.
+                Some("reasoning") => echo.push(item.clone()),
                 _ => {}
             }
         }
@@ -5933,7 +6187,7 @@ fn parse_responses_output(json: &serde_json::Value) -> (String, Vec<serde_json::
             text.push_str(t);
         }
     }
-    (text, calls)
+    (text, calls, echo)
 }
 
 /// Responses API usage → `TokenUsage` (`input_tokens`/`output_tokens`, distinct
@@ -6007,6 +6261,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        cognition,
+        chat_completions_capability: _,
+        reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,
         narration_nudge_cap: _,
@@ -6134,7 +6391,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         tools_chat,
         &exposure,
         exposure_budget_tokens(
-            initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct),
+            initial_send_budget(max_ok_input, safe_context, None),
             safe_context,
         ),
         &std::collections::BTreeSet::new(),
@@ -6147,7 +6404,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // limits are provider-side. Retain ChatCtx.num_ctx only for the
     // get_context_remaining display seam above; it must not become a local
     // authoritative refusal threshold for a value absent from this wire.
-    let send_budget = initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
+    let send_budget = initial_send_budget(max_ok_input, safe_context, None);
     let send_budget_authoritative = safe_context.is_some();
     let authoritative_budget =
         authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens);
@@ -6167,10 +6424,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
 
+    let reasoning = responses_reasoning_field(cognition);
     let build_body = |input: &[serde_json::Value], with_tools: bool| {
         let mut body = serde_json::json!({ "model": model, "input": input, "stream": false });
         if let Some(ins) = &instructions {
             body["instructions"] = serde_json::json!(ins);
+        }
+        // Psyche cognition → `reasoning.effort` (omitted entirely when unset).
+        if let Some(reasoning) = &reasoning {
+            body["reasoning"] = reasoning.clone();
         }
         if with_tools && !tools.is_empty() {
             body["tools"] = serde_json::json!(tools);
@@ -6246,7 +6508,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 
         let round_usage = responses_usage(&json["usage"]);
         accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
-        let (text, calls) = parse_responses_output(&json);
+        let (text, calls, echo) = parse_responses_output(&json);
 
         if debug {
             let excerpt: String = text.chars().take(80).collect();
@@ -6268,10 +6530,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             return Ok((out, false, accumulated_usage, hallucination_count));
         }
 
-        // Echo the model's function_call items back into the running input,
-        // then run each and append its function_call_output.
-        for call in &calls {
-            input.push(call.clone());
+        // Echo the model's reasoning + function_call items back into the running
+        // input (in output order, so each call keeps its required reasoning item),
+        // then run each call and append its function_call_output.
+        for item in &echo {
+            input.push(item.clone());
         }
         for call in &calls {
             let call_id = call["call_id"]
@@ -6326,9 +6589,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     estimate_request_tokens(&input, Some(&tools_chat), estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
+                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None),
                     num_ctx,
-                    input_ceiling_pct as usize,
+                    input_ceiling_pct,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -6456,7 +6719,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     }
     let json: serde_json::Value = resp.json().await?;
     accumulated_usage = merge_round_usage(accumulated_usage, responses_usage(&json["usage"]));
-    let (text, _) = parse_responses_output(&json);
+    let (text, _, _) = parse_responses_output(&json);
     Ok((text, false, accumulated_usage, hallucination_count))
 }
 
@@ -7499,9 +7762,8 @@ mod cap_exit_unit_tests {
 //   (2) on hitting the cap newt issues ONE final tools-disabled completion and
 //       returns its text (NOT the `(reached tool-call limit)` placeholder).
 //
-// (The companion test that recovers a hard context-window 400 via the
-// `recover_cw_400` hook lives in newt-tui — it exercises the TUI-side probe
-// cache persistence under a HOME env guard.)
+// Hard context-window recovery is covered both by the headless driver tests
+// and by a TUI-side integration test that grounds capability-cache persistence.
 
 /// Token weight of the builtin tool catalog the loop advertises at
 /// `disposition` (default advertise flags, no MCP) — the same
@@ -7681,6 +7943,54 @@ mod tool_round_cap_tests {
         }
     }
 
+    struct OpenAiReasoningCapResponder {
+        round: AtomicUsize,
+        first_plan_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
+        policy_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Respond for OpenAiReasoningCapResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if request_has_tools(req) {
+                let round = self.round.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {
+                        "content": null,
+                        "reasoning_content": format!("persistent plan round {round}"),
+                        "tool_calls": [{
+                            "id": "call_cap",
+                            "type": "function",
+                            "function": {
+                                "name": "definitely_not_a_real_tool",
+                                "arguments": "{}"
+                            }
+                        }]
+                    }}]
+                }));
+            }
+
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let first_plan_seen = body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["reasoning_content"].as_str() == Some("persistent plan round 0")
+                })
+            });
+            self.first_plan_seen_on_final
+                .store(first_plan_seen, Ordering::SeqCst);
+            self.policy_seen_on_final.store(
+                body["max_tokens"] == 10_000
+                    && body["temperature"] == 0.6
+                    && body["top_p"] == 0.95
+                    && body["chat_template_kwargs"]["enable_thinking"] == true
+                    && body.get("parallel_tool_calls").is_none(),
+                Ordering::SeqCst,
+            );
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "cap summary"}}]
+            }))
+        }
+    }
+
     fn msgs() -> Vec<MemMessage> {
         vec![
             MemMessage::system("you are a test"),
@@ -7718,6 +8028,9 @@ mod tool_round_cap_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 1,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -7853,6 +8166,50 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
+    async fn openai_cap_exit_preserves_the_full_current_turn_reasoning_tail() {
+        let server = MockServer::start().await;
+        let first_plan_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let policy_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiReasoningCapResponder {
+                round: AtomicUsize::new(0),
+                first_plan_seen_on_final: first_plan_seen.clone(),
+                policy_seen_on_final: policy_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+        let task = "keep the active plan through cap exit";
+        let messages = vec![MemMessage::system("base"), MemMessage::user(task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        context.safe_context = None;
+        context.max_tool_rounds = 4;
+        context.reasoning_replay_scope = crate::model_card::ReasoningReplayScope::CurrentUserTurn;
+        context.cognition = Some(crate::role_profile::Cognition::Deliberating);
+        context.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            chat_template_kwargs: Some(true),
+            parallel_tool_calls: Some(false),
+            bounded_reasoning_continuation: Some(true),
+        };
+
+        let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
+            .await
+            .expect("cap exit succeeds");
+        assert_eq!(reply, "cap summary");
+        assert!(
+            first_plan_seen.load(Ordering::SeqCst),
+            "the tools-disabled cap-exit request must retain the first current-turn plan"
+        );
+        assert!(
+            policy_seen.load(Ordering::SeqCst),
+            "the cap-exit request must retain cognition policy and omit tool-only fields"
+        );
+    }
+
+    #[tokio::test]
     async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
         let server = MockServer::start().await;
         let served = Arc::new(AtomicUsize::new(0));
@@ -7893,6 +8250,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8102,6 +8462,7 @@ mod tool_round_cap_tests {
             "tiny-model",
             None,
             messages,
+            generation_policy::GenerationPolicy::default(),
             CapExit {
                 max_tool_rounds: 1,
                 accumulated: None,
@@ -8198,6 +8559,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8294,6 +8658,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8412,6 +8779,26 @@ mod tool_round_cap_tests {
     }
 
     #[test]
+    fn cognition_maps_to_the_responses_reasoning_field_or_is_omitted() {
+        use crate::role_profile::Cognition;
+        // Opt-in: each level projects to the Responses `reasoning.effort` value.
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Contemplating)),
+            Some(serde_json::json!({ "effort": "high" }))
+        );
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Glancing)),
+            Some(serde_json::json!({ "effort": "minimal" }))
+        );
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Deliberating)),
+            Some(serde_json::json!({ "effort": "medium" }))
+        );
+        // Not opted in → the field is omitted entirely (request unchanged).
+        assert_eq!(responses_reasoning_field(None), None);
+    }
+
+    #[test]
     fn parse_responses_output_extracts_text_calls_and_usage() {
         let json = serde_json::json!({
             "output": [
@@ -8423,10 +8810,17 @@ mod tool_round_cap_tests {
             ],
             "usage": {"input_tokens": 100, "output_tokens": 20}
         });
-        let (text, calls) = parse_responses_output(&json);
+        let (text, calls, echo) = parse_responses_output(&json);
         assert_eq!(text, "the answer");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["call_id"], "call_1");
+        // The echo re-sends the reasoning item AND the function_call in output
+        // order, so a reasoning model (gpt-5.6-sol) does not 400 on the follow-up
+        // turn for a function_call missing its required reasoning item.
+        assert_eq!(echo.len(), 2, "reasoning + function_call are echoed");
+        assert_eq!(echo[0]["type"], "reasoning");
+        assert_eq!(echo[1]["type"], "function_call");
+        assert_eq!(echo[1]["call_id"], "call_1");
         let usage = responses_usage(&json["usage"]).unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 20);
@@ -8438,6 +8832,18 @@ mod tool_round_cap_tests {
 
     fn mid_sized_pair_task(label: &str) -> String {
         format!("{label} {}", "x".repeat(6_000))
+    }
+
+    #[test]
+    fn accepted_prompt_cannot_raise_budget_past_declared_ceiling() {
+        assert_eq!(capped_accepted_prompt_tokens(61_221, Some(54_394)), 54_394);
+        assert_eq!(capped_accepted_prompt_tokens(8_734, None), 8_734);
+    }
+
+    #[test]
+    fn authoritative_zero_input_budget_is_not_erased() {
+        assert_eq!(authoritative_request_budget(Some(0), true, None), Some(0));
+        assert_eq!(authoritative_request_budget(Some(0), false, None), None);
     }
 
     /// Prove the regression fixture isolates the live-tail duplicate — the
@@ -8602,6 +9008,56 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
+    async fn openai_chat_declared_num_ctx_is_a_local_refusal_budget() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("OPENAI-CHAT-NUM-CTX");
+        let budget = mid_sized_pair_budget(&task, false);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.num_ctx = Some(((budget * 100).div_ceil(80)) as u32);
+
+        let error = openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the declared local window must refuse the irreducible request");
+
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn openai_chat_output_reserve_tightens_declared_window_before_dispatch() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("OPENAI-CHAT-OUTPUT-RESERVE");
+        let budget = mid_sized_pair_budget(&task, false);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+        ctx.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        let context_window = budget + 16_000;
+        assert!(
+            context_window * ctx.input_ceiling_pct as usize / 100 > budget,
+            "fixture must be tightened by output reserve, not percentage"
+        );
+        ctx.num_ctx = Some(context_window as u32);
+
+        let error = openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the 16K output reserve must refuse the irreducible input");
+
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
     async fn responses_mid_sized_irreducible_prompt_pair_refuses_before_dispatch() {
         let server = MockServer::start().await;
         let task = mid_sized_pair_task("RESPONSES-MID-PAIR");
@@ -8656,6 +9112,53 @@ mod tool_round_cap_tests {
         assert!(
             body.get("num_ctx").is_none(),
             "Responses must not send the ChatCtx num_ctx display hint"
+        );
+        assert!(
+            body.get("reasoning").is_none(),
+            "no cognition set → no reasoning.effort on the wire (request unchanged)"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_emits_cognition_as_reasoning_effort_on_the_wire() {
+        // The psyche cognition dial must reach the real /v1/responses request as
+        // `reasoning.effort` — grounds the pure mapping test against the full loop.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "considered"}]
+                }],
+                "usage": {"input_tokens": 20, "output_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "think hard about this";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("the request should dispatch");
+        assert_eq!(reply, "considered");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["reasoning"]["effort"], "high",
+            "cognition=contemplating must ride the wire as reasoning.effort=high"
         );
     }
 
@@ -8899,6 +9402,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9007,6 +9513,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9124,6 +9633,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9253,6 +9765,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9374,6 +9889,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9537,6 +10055,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9709,6 +10230,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9847,6 +10371,9 @@ mod save_note_loop_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -10348,6 +10875,9 @@ mod compression_loop_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -11638,6 +12168,9 @@ mod observation_hook_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
             action_nudges: true,

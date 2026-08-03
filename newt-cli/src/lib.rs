@@ -62,7 +62,11 @@ pub fn parse_with_help() -> anyhow::Result<Cli> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "newt", version, about = "Free, friendly, local agentic coder")]
+#[command(
+    name = "newt",
+    version = newt_core::build_info::VERSION_WITH_COMMIT,
+    about = "Free, friendly, local agentic coder"
+)]
 // `newt help [command]` renders newt's INTERACTIVE `/help` command catalog
 // startup-free (no session, no backend) via the `Help` subcommand below —
 // deliberately taking over the name from clap's auto-generated `help`
@@ -160,6 +164,30 @@ pub struct Cli {
     /// `insistent`/`relentless`.
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
     pub tenacity: Option<newt_core::Tenacity>,
+
+    /// Cognition (#psyche): how much reasoning to spend per call —
+    /// `glancing` | `pondering` | `deliberating` | `contemplating`, mapping to the
+    /// OpenAI `reasoning.effort` wire field (minimal … high) on the Responses API.
+    /// A session-wide override that beats a persona's `cognition:`; applies to the
+    /// interactive TUI AND the headless `solve` / worker path. Unset ⇒ no
+    /// `reasoning.effort` is sent (unless a persona sets one).
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_cognition)]
+    pub cognition: Option<newt_core::role_profile::Cognition>,
+
+    /// Obsessive (#psyche): the max-everything posture — newt's "ultra". A named
+    /// launch act that moves three orthogonal dials at once: cognition to
+    /// `contemplating` (deepest reasoning.effort), tenacity to `relentless` (most
+    /// forcing), and the crew ON (as if `NEWT_TEAM` were set). An explicit
+    /// `--tenacity` alongside still wins. In-session, `/psyche obsessive` engages
+    /// the two live dials; crew needs a launch with this flag. Alias
+    /// `--obsessive-relentless` names the tenacity axis explicitly.
+    #[arg(
+        long,
+        visible_alias = "obsessive-relentless",
+        global = true,
+        default_value_t = false
+    )]
+    pub obsessive: bool,
 
     /// Run with NO conversation persistence: nothing is auto-resumed, no
     /// conversation row is created, and no turn is saved. Equivalent to
@@ -431,6 +459,10 @@ fn parse_tenacity(s: &str) -> Result<newt_core::Tenacity, String> {
     s.parse()
 }
 
+fn parse_cognition(s: &str) -> Result<newt_core::role_profile::Cognition, String> {
+    s.parse()
+}
+
 fn parse_backend_kind(s: &str) -> Result<newt_core::config::BackendKind, String> {
     use newt_core::config::BackendKind;
     match s.trim().to_ascii_lowercase().as_str() {
@@ -643,11 +675,11 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         max_rounds: Option<usize>,
         /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`,
-        /// 32768). newt gates input at 80% of it, reserving ~20% for the reply,
-        /// so a long turn compacts under the window instead of overrunning it
-        /// during generation.
+        /// 32768). Newt gates input at the tighter of the configured percentage
+        /// ceiling and the room left by the request's maximum output, so a long
+        /// turn compacts instead of overrunning the shared window.
         #[arg(long, value_name = "N")]
-        context_window: Option<usize>,
+        context_window: Option<u32>,
         /// Operator-supplied sha256 of the weights actually served (GGUF file
         /// hash / HF revision SHA) for the contract record's `model_digest`
         /// (W0 #1511). Env twin: `NEWT_MODEL_DIGEST`. Omitted from the record
@@ -960,10 +992,36 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // #psyche `--obsessive`: the max-everything launch posture (newt's "ultra").
+    // Applied BEFORE the explicit `--tenacity` below so a simultaneous
+    // `--tenacity <level>` still wins. Engages the two LIVE dials via the single
+    // posture owner; crew is a startup gate, so we also set `NEWT_TEAM` here —
+    // the same var the crew-runner build below reads — for full effect.
+    if cli.obsessive {
+        let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
+        // SAFETY: single-threaded before the TUI starts any async work.
+        unsafe { std::env::set_var("NEWT_TEAM", "1") };
+        eprintln!(
+            "obsessive engaged — cognition={}, tenacity={}, crew=on",
+            cog.label(),
+            ten.label()
+        );
+    }
+
     // CLI `--tenacity`: install the process-global action-forcing level the
     // agentic loop reads when it builds each turn's WorkflowRuntimeState.
     if let Some(level) = cli.tenacity {
         newt_core::tenacity::set_cli_tenacity(level);
+    }
+
+    // CLI `--cognition`: install the session cognition override (→ the
+    // `reasoning.effort` wire field), read by both the TUI's `resolve_cognition`
+    // and the headless driver. Applied AFTER `--obsessive` so an explicit
+    // `--cognition` supersedes the macro's contemplating.
+    if let Some(level) = cli.cognition {
+        newt_core::cognition::set_cli_cognition(newt_core::cognition::CognitionOverride::Set(
+            level,
+        ));
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
@@ -1431,11 +1489,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),
         Command::Models { cmd } => models_cmd::run(cmd).await,
         Command::Summarizer { cmd } => summarizer_cmd::run(cmd).await,
-        // Startup-free help: no session, no backend connect. Renders the SAME
-        // bytes the interactive `/help` prints (both route through
-        // `newt_tui::render_help`), so `newt help` is a hosted-CI-safe way to
-        // inspect the command catalog. A leading `/` on the topic is tolerated
-        // so `newt help /dgx` and `newt help dgx` behave alike.
+        // Startup-free help: no session, no backend connect. Uses the same
+        // command corpus as interactive `/help`, in its stable plain format,
+        // so `newt help` is a hosted-CI-safe way to inspect the catalog. A
+        // leading `/` on the topic is tolerated so `newt help /dgx` and
+        // `newt help dgx` behave alike.
         Command::Help { command } => {
             let topic = command.as_deref().map(|c| c.trim_start_matches('/'));
             print!(
@@ -1728,6 +1786,19 @@ mod tests {
 
         assert!(cli.debug);
         assert_eq!(cli.num_ctx, Some(8192));
+    }
+
+    #[test]
+    fn solve_context_window_rejects_values_that_cannot_enter_the_contract() {
+        assert!(Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "task.md",
+            "--context-window",
+            "4294967296",
+        ])
+        .is_err());
     }
 
     #[test]

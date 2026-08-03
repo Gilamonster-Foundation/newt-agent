@@ -181,6 +181,54 @@ impl Tuning {
     }
 }
 
+/// How assistant reasoning is replayed into later completion requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplayScope {
+    /// Never send model reasoning back to the endpoint.
+    #[default]
+    Never,
+    /// Preserve reasoning only while continuing the current human turn.
+    CurrentUserTurn,
+    /// Preserve reasoning across the complete conversation history.
+    FullHistory,
+}
+
+/// Optional OpenAI Chat Completions extensions accepted by an endpoint.
+/// Every field is opt-in so strict or unknown compatible servers retain the
+/// historical request body.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatCompletionsCapability {
+    /// Project the psyche cognition dial into local generation parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cognition: Option<bool>,
+    /// Accepts `chat_template_kwargs` for thinking-mode selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<bool>,
+    /// Explicit value to send for `parallel_tool_calls`; unset omits the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// Allows one bounded continuation after a reasoning-only length stop.
+    /// The runtime also requires a non-`never` reasoning replay scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_reasoning_continuation: Option<bool>,
+}
+
+impl ChatCompletionsCapability {
+    #[must_use]
+    fn merge(self, o: Self) -> Self {
+        Self {
+            cognition: o.cognition.or(self.cognition),
+            chat_template_kwargs: o.chat_template_kwargs.or(self.chat_template_kwargs),
+            parallel_tool_calls: o.parallel_tool_calls.or(self.parallel_tool_calls),
+            bounded_reasoning_continuation: o
+                .bounded_reasoning_continuation
+                .or(self.bounded_reasoning_continuation),
+        }
+    }
+}
+
 /// Reasoning capability bits the harness reads (retires the `reasoning.rs`
 /// name-match in a later issue).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -197,6 +245,12 @@ pub struct Capability {
     /// `reasoning_content`); `None` = inline `<think>` inside `content`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content_field: Option<String>,
+    /// Scope in which assistant reasoning may be replayed to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay_scope: Option<ReasoningReplayScope>,
+    /// Explicit extensions for OpenAI-compatible Chat Completions servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_completions: Option<ChatCompletionsCapability>,
 }
 
 impl Capability {
@@ -206,6 +260,11 @@ impl Capability {
             emits_leading_reasoning: o.emits_leading_reasoning.or(self.emits_leading_reasoning),
             thinking_default: o.thinking_default.or(self.thinking_default),
             reasoning_content_field: o.reasoning_content_field.or(self.reasoning_content_field),
+            reasoning_replay_scope: o.reasoning_replay_scope.or(self.reasoning_replay_scope),
+            chat_completions: match (self.chat_completions, o.chat_completions) {
+                (Some(base), Some(overlay)) => Some(base.merge(overlay)),
+                (base, overlay) => overlay.or(base),
+            },
         }
     }
 }
@@ -558,6 +617,24 @@ capability:
     }
 
     #[test]
+    fn capability_parses_turn_scoped_reasoning_replay() {
+        let card = parse_card(
+            r#"
+name = "reasoning-model"
+
+[capability]
+reasoning_replay_scope = "current_user_turn"
+"#,
+            "toml",
+        )
+        .expect("reasoning replay scope is a supported capability");
+
+        let capability = serde_json::to_value(card.capability.expect("capability present"))
+            .expect("capability serializes");
+        assert_eq!(capability["reasoning_replay_scope"], "current_user_turn");
+    }
+
+    #[test]
     fn parse_rejects_unknown_extension_and_bad_syntax() {
         assert!(parse_card(ornith_toml(), "json").is_err());
         assert!(parse_card("name = \"x\"\nbogus_field = 1", "toml").is_err()); // deny_unknown_fields
@@ -585,6 +662,31 @@ capability:
             merged.capability.as_ref().unwrap().thinking_default,
             Some(true)
         );
+    }
+
+    #[test]
+    fn chat_completions_capability_deep_merges_field_by_field() {
+        let base: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"llama_cpp\"\n\
+             [capability.chat_completions]\ncognition = true\n\
+             chat_template_kwargs = true\nparallel_tool_calls = false\n",
+        )
+        .unwrap();
+        let overlay: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"llama_cpp\"\n\
+             [capability.chat_completions]\nbounded_reasoning_continuation = true\n",
+        )
+        .unwrap();
+
+        let merged = base.merge(overlay);
+        let capability = merged
+            .capability
+            .and_then(|capability| capability.chat_completions)
+            .expect("chat-completions capability survives the merge");
+        assert_eq!(capability.cognition, Some(true));
+        assert_eq!(capability.chat_template_kwargs, Some(true));
+        assert_eq!(capability.parallel_tool_calls, Some(false));
+        assert_eq!(capability.bounded_reasoning_continuation, Some(true));
     }
 
     #[test]
