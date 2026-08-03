@@ -25,10 +25,17 @@ behaviors the constitution admits.
   "proved against production". A contract is `conformance = full` only when a
   checked model is differentially established to *refine* the code (an executable
   oracle) — today every row is `partial`.
-- **`lint-behavior-map.py`** — the registry-reference linter: fails if a named
-  Lean theorem / production path / Rust test is renamed out from under an entry.
-  Strict on `lean` here; `--strict` (on `main`, post-merge) makes production/rust
-  refs strict too. Wire into CI as `behavior-fast`.
+- **`lint-behavior-map.py`** — the EXACT, fail-closed registry-reference linter.
+  References are structured (`{module, symbol}` for Lean; `{path, symbol}` for
+  Rust/production) and validated to their intended namespace/module — a renamed
+  theorem, test, or production symbol fails, as do zero/ambiguous/duplicate refs,
+  invalid status, a missing required field, and an unmet `conformance = "full"`.
+  Fail-closed: an unresolved reference is an ERROR unless it carries an explicit
+  `pending_pr = <n>` (its artifact lives on an unmerged PR — this seed is stacked
+  on #1526), in which case it WARNS, naming the PR. `--strict` fails even those;
+  run it on `main` after #1526 merges, then delete the markers. Self-tests:
+  `test-lint-behavior-map.py` (16 cases incl. the required negatives). Enforced in
+  CI by `.github/workflows/behavior-fast.yml`.
 - **`../formal/NewtPolicy/`** — the Lean layer (pure policy, machine-checked with
   `lake build`, no Mathlib). Shipped now: the backend-selection metamorphic
   theorems (`lean = proven` — the exact #1526 regression: adding/reordering
@@ -40,12 +47,12 @@ behaviors the constitution admits.
   its soundness, and a real `IsObject` predicate for `args_object` (today a
   `True` placeholder) — landing with the two-stage `CorrelatedBatch` /
   `ValidatedBatch` capability types (#1529 §3).
-- **`tla/`** — the TLA+ layer (turn lifecycle, recovery). **Harness ready**: the
-  pinned, checksum-verified `tla2tools` (1.7.4) runner (`check.sh`) + a *checked*
-  smoke spec prove the toolchain works in CI. The real models (`AgentTurn.tla`,
-  `ContextRecovery.tla`) are NOT committed yet — they land at step 6, after the
-  `BehaviorEvent` alphabet exists to validate implementation traces against (no
-  ceremonial specs).
+- **`tla/`** — the TLA+ layer (turn lifecycle, recovery). **Harness only**: the
+  fail-closed, checksum-pinned `tla2tools` (1.7.4) TLC runner (`check.sh`) + a
+  *checked* smoke spec prove the toolchain works in CI. Only **TLC** is pinned and
+  executed; **Apalache is a planned compatibility target**, not pinned/run here
+  (see `tla/README.md`). The real models (`AgentTurn.tla`, `ContextRecovery.tla`)
+  are NOT committed yet — no ceremonial specs.
 
 ## What is NOT formalized
 
@@ -53,8 +60,18 @@ Exact JSON field placement, HTTP header casing, serde details, ANSI/ConPTY byte
 behavior, tokenizer precision, log formatting — those get corpus, contract, and
 differential tests, not proofs.
 
-## Status
+## Implementation order (canonical — do not drift)
 
-Seed. See #1529 for the full plan and priority order. Currently: the registry +
-the first checked Lean proofs. Next: extract `newt-policy` capability types, then
-`AgentTurn.tla`, then `BehaviorEvent` traces + `proptest-state-machine`.
+The observation surface must exist *before* the temporal model, so the model
+consumes a deliberate `BehaviorEvent` alphabet rather than inventing its own:
+
+1. Rust `CorrelatedBatch` / `ValidatedBatch` capability types (the compile-time
+   choke point: `RawBatch → CorrelatedBatch → ValidatedBatch → execute_batch`).
+2. Redacted `BehaviorEvent` observation alphabet (ids / counts / classifications
+   only — never prompts, source, arguments, reasoning, or secrets).
+3. Checked `AgentTurn.tla` model (consuming that alphabet).
+4. Rust trace projection + TLA+ / Apalache-ITF implementation-trace validation.
+5. `ContextRecovery.tla` + deeper state-machine / property testing.
+
+The TLC tooling bootstrap (this PR) is landed now; the models above are gated on
+steps 1–2. See #1529 for the full plan.
