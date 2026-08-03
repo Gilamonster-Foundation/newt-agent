@@ -5021,7 +5021,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 mid_loop_trim_tokens,
             )
             .is_some();
-            let reasoning_tail_len = compress::reasoning_replay_tail_len(&messages);
+            let reasoning_tail_len =
+                compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
             if let Some(trigger) = compression_trigger(
                 compress::compression_message_count(&messages, reasoning_tail_len),
                 current,
@@ -5298,8 +5299,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     cal,
                                 ),
                                 max_messages: None,
-                                replay_protected_tail_len: compress::reasoning_replay_tail_len(
+                                replay_protected_tail_len: compress::protected_reasoning_tail_len(
                                     &messages,
+                                    reasoning_replay_scope,
                                 ),
                                 task: active_task,
                                 hard_budget: true,

@@ -1324,6 +1324,25 @@ pub(crate) fn reasoning_replay_tail_len(messages: &[Value]) -> usize {
         .map_or(0, |start| messages.len() - start)
 }
 
+/// The reasoning tail to PROTECT during compaction, honouring the endpoint's
+/// replay scope. An endpoint whose scope is
+/// [`Never`](crate::model_card::ReasoningReplayScope::Never) never receives
+/// replayed reasoning, so there is nothing to protect — return 0. Protecting it
+/// anyway wastes compaction budget and can stop a physical count cap from
+/// trimming, which is the contract violation this closes. Compaction call sites
+/// must route through this, not [`reasoning_replay_tail_len`] directly, so the
+/// `Never` case cannot be forgotten at one of them.
+pub(crate) fn protected_reasoning_tail_len(
+    messages: &[Value],
+    scope: crate::model_card::ReasoningReplayScope,
+) -> usize {
+    if scope == crate::model_card::ReasoningReplayScope::Never {
+        0
+    } else {
+        reasoning_replay_tail_len(messages)
+    }
+}
+
 /// Count a replay-required reasoning suffix as one atomic logical message for
 /// count-only compression pressure. Token budgets continue to use its full
 /// serialized size.
@@ -2833,6 +2852,33 @@ mod tests {
             tool_result("result a"),
         ];
         assert_eq!(trailing_tool_group_len(&roleless), 2);
+    }
+
+    #[test]
+    fn never_scope_protects_no_reasoning_tail() {
+        use crate::model_card::ReasoningReplayScope;
+        // A trailing assistant message carrying reasoning — a protectable tail.
+        let msgs = vec![
+            user("go"),
+            json!({"role": "assistant", "reasoning_content": "thinking", "content": "answer"}),
+        ];
+        // The pure helper sees the tail...
+        assert_eq!(reasoning_replay_tail_len(&msgs), 1);
+        // ...but a Never-scope endpoint never replays it, so nothing is protected
+        // (protecting it wasted compaction budget / blocked a count cap — the bug).
+        assert_eq!(
+            protected_reasoning_tail_len(&msgs, ReasoningReplayScope::Never),
+            0
+        );
+        // ...while replay-capable scopes still protect it.
+        assert_eq!(
+            protected_reasoning_tail_len(&msgs, ReasoningReplayScope::CurrentUserTurn),
+            1
+        );
+        assert_eq!(
+            protected_reasoning_tail_len(&msgs, ReasoningReplayScope::FullHistory),
+            1
+        );
     }
 
     #[test]
