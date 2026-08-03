@@ -63,6 +63,67 @@ pub use exposure::ExposureSettings;
 /// `NEWT_VENV` (set from `--venv` or auto-detected from `$VIRTUAL_ENV` by the
 /// CLI) takes precedence; falls back to `$VIRTUAL_ENV` if the TUI was invoked
 /// directly without going through the CLI's `dispatch`.
+/// Atomically validate a model-emitted tool call **before any side effect**
+/// (invariant #3: no malformed tool call reaches a tool). Both the name and the
+/// arguments are checked up front; the caller receives EITHER a ready-to-dispatch
+/// `(name, object-args)` pair OR a human-readable reason the call is malformed —
+/// and on the malformed branch it must echo the reason back to the model and
+/// execute nothing.
+///
+/// This replaces the `serde_json::from_str(s).unwrap_or(Value::Null)` coercion
+/// that used to sit at three separate dispatch sites (both chat loops + the
+/// Responses loop): a garbled or truncated `arguments` string was silently turned
+/// into `null` and the tool ran anyway with empty/wrong input. Routing every site
+/// through this one gate makes that class of bug unrepresentable — a malformed
+/// call cannot produce a `(name, args)` pair to execute.
+///
+/// Rules:
+/// - `name` must be a present, non-blank string.
+/// - `arguments` must resolve to a JSON **object**: an object passes through;
+///   `null`/absent and an empty/whitespace string mean "no arguments" (`{}`); a
+///   non-empty string is parsed and must yield an object; anything else (an
+///   unparseable string, or a JSON scalar/array) is malformed. A parse failure is
+///   NEVER coerced to `null`.
+pub(crate) fn validate_tool_call(
+    name: Option<&str>,
+    raw_args: &serde_json::Value,
+) -> Result<(String, serde_json::Value), String> {
+    let name = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| "tool call is missing a name".to_string())?;
+    let args = match raw_args {
+        serde_json::Value::Null => serde_json::json!({}),
+        serde_json::Value::Object(_) => raw_args.clone(),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(v @ serde_json::Value::Object(_)) => v,
+                    Ok(_) => {
+                        return Err(format!(
+                            "tool '{name}' arguments must be a JSON object, but the model sent a non-object JSON value"
+                        ))
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "tool '{name}' arguments are not valid JSON (call truncated or malformed): {e}"
+                        ))
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "tool '{name}' arguments must be a JSON object, got {other}"
+            ))
+        }
+    };
+    Ok((name.to_string(), args))
+}
+
 pub fn venv_cmd_prefix() -> Option<String> {
     let venv = std::env::var("NEWT_VENV")
         .or_else(|_| std::env::var("VIRTUAL_ENV"))
@@ -4291,6 +4352,113 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
 mod tests {
     use super::*;
     use crate::agentic::NoMcp;
+
+    // --- W4: atomic tool-call validation (invariant #3) ---
+
+    #[test]
+    fn validate_accepts_a_string_encoded_object() {
+        let (name, args) = validate_tool_call(
+            Some("write_file"),
+            &serde_json::json!("{\"path\":\"a.txt\"}"),
+        )
+        .expect("valid");
+        assert_eq!(name, "write_file");
+        assert_eq!(args["path"], "a.txt");
+    }
+
+    #[test]
+    fn validate_accepts_an_object_value_directly() {
+        let (name, args) =
+            validate_tool_call(Some("git"), &serde_json::json!({"op": "status"})).expect("valid");
+        assert_eq!(name, "git");
+        assert_eq!(args["op"], "status");
+    }
+
+    #[test]
+    fn validate_treats_absent_or_empty_arguments_as_no_args() {
+        // A no-arg tool: null, absent, and "" all mean an empty object — valid.
+        for raw in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+        ] {
+            let (_, args) = validate_tool_call(Some("list_dir"), &raw).expect("valid no-args");
+            assert_eq!(args, serde_json::json!({}), "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_arguments_instead_of_coercing_to_null() {
+        // The core bug this closes: a truncated/garbled args string used to become
+        // `null` and execute anyway. It must now be rejected.
+        let err = validate_tool_call(Some("write_file"), &serde_json::json!("{\"path\": \"a"))
+            .expect_err("truncated JSON must be rejected");
+        assert!(err.contains("not valid JSON"), "got: {err}");
+        assert!(err.contains("write_file"), "names the tool: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_non_object_json_arguments() {
+        // A JSON scalar or array is not a tool-args object.
+        for raw in [serde_json::json!("[1,2,3]"), serde_json::json!("\"bare\"")] {
+            let err = validate_tool_call(Some("git"), &raw)
+                .expect_err("non-object args must be rejected");
+            assert!(
+                err.contains("must be a JSON object"),
+                "raw={raw:?} got: {err}"
+            );
+        }
+        // ...and a live (already-parsed) non-object value is rejected too.
+        assert!(validate_tool_call(Some("git"), &serde_json::json!(42)).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_missing_or_blank_name() {
+        assert!(validate_tool_call(None, &serde_json::json!({})).is_err());
+        assert!(validate_tool_call(Some(""), &serde_json::json!({})).is_err());
+        assert!(validate_tool_call(Some("   "), &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn malformed_calls_are_never_dispatched_invocation_count_is_zero() {
+        // The atomic guarantee, as an invocation-counting proof: run a batch of
+        // calls through the ONE validation gate, dispatching (incrementing the
+        // counter) ONLY on a valid `(name, args)`. Every malformed call must yield
+        // ZERO dispatches — no tool is ever invoked on garbage.
+        let batch = vec![
+            // valid
+            serde_json::json!({"name": "git", "arguments": "{\"op\":\"status\"}"}),
+            // malformed: truncated JSON args (the historical null-coercion bug)
+            serde_json::json!({"name": "write_file", "arguments": "{\"path\": \"a"}),
+            // malformed: missing name
+            serde_json::json!({"arguments": "{}"}),
+            // valid: no-arg tool
+            serde_json::json!({"name": "list_dir"}),
+            // malformed: non-object args
+            serde_json::json!({"name": "git", "arguments": "[1,2]"}),
+        ];
+
+        let mut invocations = 0usize;
+        let mut dispatched_names = Vec::new();
+        for call in &batch {
+            match validate_tool_call(call["name"].as_str(), &call["arguments"]) {
+                Ok((name, _args)) => {
+                    // The ONLY path that reaches a tool.
+                    invocations += 1;
+                    dispatched_names.push(name);
+                }
+                Err(_reason) => {
+                    // Malformed → echoed back, never dispatched. No side effect.
+                }
+            }
+        }
+
+        assert_eq!(
+            invocations, 2,
+            "exactly the two well-formed calls dispatch; the three malformed ones invoke nothing"
+        );
+        assert_eq!(dispatched_names, vec!["git", "list_dir"]);
+    }
 
     #[test]
     fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it() {

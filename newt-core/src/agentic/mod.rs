@@ -2736,21 +2736,41 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         let mut round_progress = false;
         for tc in tool_calls.unwrap() {
             let anthropic_native = tc["function"].is_null();
-            let name = if anthropic_native {
-                tc["name"].as_str().unwrap_or("unknown")
+            // Atomic validation BEFORE any side effect (#3): a malformed name or
+            // unparseable/non-object `arguments` must never reach a tool. On the
+            // malformed branch echo the reason back as a tool result and skip the
+            // call — no tool runs on garbage.
+            let (call_name, call_raw_args) = if anthropic_native {
+                (tc["name"].as_str(), &tc["input"])
             } else {
-                tc["function"]["name"].as_str().unwrap_or("unknown")
+                (
+                    tc["function"]["name"].as_str(),
+                    &tc["function"]["arguments"],
+                )
             };
-            let args = if anthropic_native {
-                tc["input"].clone()
-            } else {
-                match &tc["function"]["arguments"] {
-                    serde_json::Value::String(s) => {
-                        serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+            let (name_owned, args) = match tools::validate_tool_call(call_name, call_raw_args) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    print_synthetic_tool_result(
+                        "(malformed tool call)",
+                        &serde_json::Value::Null,
+                        workspace,
+                        &reason,
+                        color,
+                    );
+                    if let Some(rec) = tool_events.as_deref_mut() {
+                        rec.push(crate::ToolEvent::from_call(
+                            "(malformed tool call)",
+                            &serde_json::Value::Null,
+                            false,
+                            Some(0),
+                        ));
                     }
-                    v => v.clone(),
+                    messages.push(serde_json::json!({ "role": "tool", "content": reason }));
+                    continue;
                 }
             };
+            let name = name_owned.as_str();
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
@@ -5831,21 +5851,44 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     color,
                 );
             }
-            let name = if anthropic_native {
-                tc["name"].as_str().unwrap_or("unknown")
+            // Atomic validation BEFORE any side effect (#3): a malformed name or
+            // unparseable/non-object `arguments` must never reach a tool. Echo the
+            // reason back (as this tool_call's result) and skip execution.
+            let (call_name, call_raw_args) = if anthropic_native {
+                (tc["name"].as_str(), &tc["input"])
             } else {
-                tc["function"]["name"].as_str().unwrap_or("unknown")
+                (
+                    tc["function"]["name"].as_str(),
+                    &tc["function"]["arguments"],
+                )
             };
-            let args = if anthropic_native {
-                tc["input"].clone()
-            } else {
-                match &tc["function"]["arguments"] {
-                    serde_json::Value::String(s) => {
-                        serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+            let (name_owned, args) = match tools::validate_tool_call(call_name, call_raw_args) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    print_synthetic_tool_result(
+                        "(malformed tool call)",
+                        &serde_json::Value::Null,
+                        workspace,
+                        &reason,
+                        color,
+                    );
+                    if let Some(rec) = tool_events.as_deref_mut() {
+                        rec.push(crate::ToolEvent::from_call(
+                            "(malformed tool call)",
+                            &serde_json::Value::Null,
+                            false,
+                            Some(0),
+                        ));
                     }
-                    v => v.clone(),
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": reason,
+                    }));
+                    continue;
                 }
             };
+            let name = name_owned.as_str();
             if trace {
                 print_trace(
                     &format!(
@@ -6499,13 +6542,38 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 .as_str()
                 .or_else(|| call["id"].as_str())
                 .unwrap_or("");
-            let name = call["name"].as_str().unwrap_or("unknown");
-            let args = match &call["arguments"] {
-                serde_json::Value::String(s) => {
-                    serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
-                }
-                v => v.clone(),
-            };
+            // Atomic validation BEFORE any side effect (#3): a malformed name or
+            // unparseable/non-object `arguments` must never reach a tool. Echo the
+            // reason back as this call's `function_call_output` and skip it — no
+            // tool runs on garbage; the model can retry with a well-formed call.
+            let (name_owned, args) =
+                match tools::validate_tool_call(call["name"].as_str(), &call["arguments"]) {
+                    Ok(pair) => pair,
+                    Err(reason) => {
+                        print_synthetic_tool_result(
+                            "(malformed tool call)",
+                            &serde_json::Value::Null,
+                            workspace,
+                            &reason,
+                            color,
+                        );
+                        if let Some(rec) = tool_events.as_deref_mut() {
+                            rec.push(crate::ToolEvent::from_call(
+                                "(malformed tool call)",
+                                &serde_json::Value::Null,
+                                false,
+                                Some(0),
+                            ));
+                        }
+                        input.push(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": reason,
+                        }));
+                        continue;
+                    }
+                };
+            let name = name_owned.as_str();
             if trace {
                 print_trace(
                     &format!(
