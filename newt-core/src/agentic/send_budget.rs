@@ -21,19 +21,47 @@ pub(super) fn num_ctx_input_ceiling(
     })
 }
 
+/// #1528: the ONE resolver both the Responses dispatch loop
+/// (`openai_responses_complete_with_prompt_and_artifacts`) and the public
+/// reporting seam ([`initial_context_input_budget`]) build their budget from, so
+/// the seam can no longer report a value the loop does not enforce. A thin,
+/// argument-ordering wrapper over [`ResponsesBudgetState::new`] that names the
+/// "resolve one Responses budget from raw config" seam explicitly; the reserve,
+/// ceiling, and cached-cap composition all live in the state's constructor.
+pub(super) fn resolve_responses_budget(
+    num_ctx: Option<u32>,
+    safe_context: Option<u32>,
+    max_ok_input: Option<u32>,
+    mid_loop_trim_tokens: Option<usize>,
+    input_ceiling_pct: u32,
+    cognition: Option<crate::role_profile::Cognition>,
+) -> ResponsesBudgetState {
+    ResponsesBudgetState::new(
+        num_ctx,
+        input_ceiling_pct,
+        cognition,
+        max_ok_input,
+        safe_context,
+        mid_loop_trim_tokens,
+    )
+}
+
 /// Resolve the initial input budget a caller should report for one backend
 /// turn. This is the public reporting seam for the same percentage, cognition
 /// output reserve, and cached-cap composition used by the dispatch loops.
 ///
-/// Only explicitly capable Chat Completions endpoints receive Newt's local
-/// generation policy (its output reserve). Responses reserves no local output
-/// (it sends no `max_output_tokens` on this wire) so `max_output_tokens` stays
-/// `None` for it — but the CONFIGURED context window is still a **local safety
-/// limit** (#1526, invariant #4): a window the operator declared bounds the
-/// input ceiling even though the Responses wire does not carry `num_ctx`.
-/// Ceiling-from-an-unsent-value is deliberate here — the alternative is an
-/// over-window request that only a reactive 400 (or a silent truncation) can
-/// catch. Ollama and embedded backends keep the percentage-only local ceiling.
+/// The **Responses** branch PROJECTS from the shared [`ResponsesBudgetState`]
+/// (via [`resolve_responses_budget`]) so the reported budget cannot diverge from
+/// what the Responses loop enforces: that state RESERVES local output via the
+/// cognition dial even though this wire sends no `max_output_tokens`, because a
+/// declared window (#1526, invariant #4) must still leave room to generate. The
+/// projected value is the state's soft send budget — cached caps composed with
+/// the reserved hard ceiling — exactly what this seam has always returned.
+/// Explicitly capable **Chat Completions** endpoints receive Newt's local
+/// generation policy (its output reserve). **Ollama and embedded** backends keep
+/// the percentage-only local ceiling. Ceiling-from-an-unsent-value is deliberate
+/// for Responses — the alternative is an over-window request that only a reactive
+/// 400 (or a silent truncation) can catch.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn initial_context_input_budget(
@@ -47,6 +75,22 @@ pub fn initial_context_input_budget(
     max_ok_input: Option<u32>,
     safe_context: Option<u32>,
 ) -> Option<u32> {
+    // #1528: PROJECT the Responses reporting budget from the same resolver the
+    // dispatch loop uses, so the seam applies the cognition output reserve the
+    // loop applies (the old branch re-derived the ceiling with NO reserve and
+    // over-reported, e.g. 26,214 while the loop enforced 16,768).
+    if kind == crate::BackendKind::Openai && api == crate::OpenAiApi::Responses {
+        return resolve_responses_budget(
+            context_window,
+            safe_context,
+            max_ok_input,
+            None,
+            input_ceiling_pct,
+            cognition,
+        )
+        .soft_send_budget()
+        .map(|budget| u32::try_from(budget).expect("input budgets originate as u32 values"));
+    }
     let max_output_tokens =
         if kind == crate::BackendKind::Openai && api == crate::OpenAiApi::ChatCompletions {
             super::generation_policy::GenerationPolicy::resolve(
@@ -58,11 +102,10 @@ pub fn initial_context_input_budget(
         } else {
             None
         };
-    // #1526 (invariant #4): the configured context window is a LOCAL safety
-    // limit for every backend, including Responses. Responses reserves no local
-    // output (`max_output_tokens` is `None` above) and never sends `num_ctx` on
-    // the wire, but a declared window must still bound the input ceiling so an
-    // over-window request is caught pre-dispatch, not only by a reactive 400.
+    // Chat Completions applies the resolved generation output reserve above;
+    // Ollama and embedded backends keep the percentage-only local ceiling
+    // (`max_output_tokens` is `None`). The declared window still bounds the input
+    // ceiling so an over-window request is caught pre-dispatch, not only by a 400.
     let ceiling = num_ctx_input_ceiling(context_window, input_ceiling_pct, max_output_tokens);
     initial_send_budget(max_ok_input, safe_context, ceiling)
         .map(|budget| u32::try_from(budget).expect("input budgets originate as u32 values"))
@@ -304,9 +347,15 @@ impl ResponsesBudgetState {
         super::exposure_budget_tokens(self.soft_send_budget, self.safe_context)
     }
 
-    /// The authoritative preflight refusal budget every dispatch is checked
-    /// against (per round, plus the tools-disabled final summary).
-    pub(super) fn preflight_budget(&self) -> Option<usize> {
+    /// The constraint governing the next attempted dispatch: the hard ceiling and
+    /// soft send budget composed with the mid-loop trim threshold (the authoritative
+    /// value each preflight refuses against — per round and for the tools-disabled
+    /// final summary). Every ENFORCEMENT and REPORTING surface reads THIS value —
+    /// preflight AND `get_context_remaining` — so the self-read can never advertise
+    /// a budget the loop does not enforce. `None` leaves the preflight a no-op.
+    /// (Tool exposure sizes the advertised catalog against the softer
+    /// [`Self::exposure_budget`] instead, matching the Chat/Ollama sibling loops.)
+    pub(super) fn actionable_input_budget(&self) -> Option<usize> {
         self.preflight_budget
     }
 
@@ -315,10 +364,15 @@ impl ResponsesBudgetState {
         self.soft_send_budget
     }
 
-    /// The ENFORCED learned input ceiling — the SAME value the loop enforces,
-    /// which `get_context_remaining` now reports. This replaces the divergent
-    /// `num_ctx_input_ceiling(num_ctx, pct, None)` recompute that advertised the
-    /// looser percentage-only ceiling (26,214) while the loop enforced 16,768.
+    /// The monotone learned HARD ceiling — the seed for cw-400 recovery and the
+    /// hard leg of the hard-vs-soft distinction. Distinct from
+    /// [`Self::actionable_input_budget`] (the value dispatch and
+    /// `get_context_remaining` read), which may be tighter when a soft send /
+    /// mid-loop-trim budget binds. Test-only observability of the hard leg: the
+    /// non-test consumers ([`Self::recover_from_cw400`],
+    /// [`Self::recovered_budget_for_window`], [`Self::compaction_budget`]) read the
+    /// field directly.
+    #[cfg(test)]
     pub(super) fn learned_hard_ceiling(&self) -> Option<usize> {
         self.learned_hard_ceiling
     }
@@ -385,9 +439,11 @@ mod send_budget_tests {
     #[test]
     fn responses_honors_the_configured_window_as_a_local_safety_limit() {
         // #1526 (invariant #4): a CONFIGURED context window is a local safety
-        // limit for Responses even though the wire sends no `num_ctx`. Responses
-        // reserves no local output, so the budget is the percentage ceiling of
-        // the declared window — NOT `None` (the old, now-reversed contract).
+        // limit for Responses even though the wire sends no `num_ctx`. #1528: the
+        // seam PROJECTS from `ResponsesBudgetState`, so it reserves the cognition
+        // output allowance the loop reserves — the budget is the RESERVED ceiling
+        // (16,768), NOT the un-reserved percentage bound (26,214) the seam used to
+        // over-report, and NOT `None` (the old, now-reversed contract).
         let ceiling = super::initial_context_input_budget(
             BackendKind::Openai,
             OpenAiApi::Responses,
@@ -402,11 +458,12 @@ mod send_budget_tests {
             None,
             None,
         );
-        // 80% of 32_768, with no output reserve on this wire.
+        // 32_768 − 16_000 Contemplating output reserve = 16_768, tighter than the
+        // 80% percentage bound (26,214) — the SAME value the Responses loop enforces.
         assert_eq!(
             ceiling,
-            Some(26_214),
-            "a declared Responses window is a local refusal budget (invariant #4)"
+            Some(16_768),
+            "the Responses seam projects the RESERVED ceiling the loop enforces (#1528)"
         );
         // The cloud default (no configured window) still yields no local ceiling —
         // the change is opt-in via configuration and does not affect hosted OpenAI.
@@ -733,9 +790,15 @@ mod send_budget_tests {
         );
         state.set_tool_schema_tokens(0);
 
-        // 1. dispatch preflight, 2. tool exposure, 3. get_context_remaining
-        // ceiling, 4. cw-400 recovery seed — all the enforced 16,768, not 26,214.
-        assert_eq!(state.preflight_budget(), Some(16_768), "dispatch preflight");
+        // Every surface reports the enforced 16,768, not the un-reserved 26,214:
+        // 1. dispatch preflight AND get_context_remaining both read
+        // `actionable_input_budget`, 2. tool exposure reads the soft budget,
+        // 3. the hard ceiling seeds cw-400 recovery. Here they coincide.
+        assert_eq!(
+            state.actionable_input_budget(),
+            Some(16_768),
+            "dispatch preflight + get_context_remaining ceiling"
+        );
         assert_eq!(
             state.exposure_budget(),
             Some(16_768),
@@ -744,7 +807,7 @@ mod send_budget_tests {
         assert_eq!(
             state.learned_hard_ceiling(),
             Some(16_768),
-            "get_context_remaining ceiling"
+            "hard ceiling (seeds cw-400 recovery)"
         );
         assert_eq!(
             state.recovered_budget_for_window(32_768),
@@ -773,17 +836,18 @@ mod send_budget_tests {
             None,
             None,
         );
-        // The value get_context_remaining now feeds to render_context_budget.
-        assert_eq!(state.learned_hard_ceiling(), Some(16_768));
+        // The value get_context_remaining now feeds to render_context_budget is
+        // the actionable input budget (here == the enforced hard ceiling).
+        assert_eq!(state.actionable_input_budget(), Some(16_768));
         // The pre-fix recompute (reserve = None) over-advertised — the divergence.
         assert_eq!(
             num_ctx_input_ceiling(state.num_ctx(), 80, None),
             Some(26_214)
         );
-        assert_ne!(state.learned_hard_ceiling(), Some(26_214));
+        assert_ne!(state.actionable_input_budget(), Some(26_214));
         let report = crate::agentic::budget::render_context_budget(
             0,
-            state.learned_hard_ceiling(),
+            state.actionable_input_budget(),
             state.num_ctx(),
             state.input_ceiling_pct(),
             15,
@@ -820,7 +884,7 @@ mod send_budget_tests {
             Some(8_000),
             "soft collapses to hard"
         );
-        assert_eq!(state.preflight_budget(), Some(8_000));
+        assert_eq!(state.actionable_input_budget(), Some(8_000));
         // A LATER larger recovery cannot raise it.
         state.recover_from_cw400(20_000);
         assert_eq!(
@@ -839,7 +903,7 @@ mod send_budget_tests {
         use super::ResponsesBudgetState;
         let state = ResponsesBudgetState::new(Some(32_768), 80, None, None, None, None);
         assert_eq!(state.learned_hard_ceiling(), Some(26_214));
-        assert_eq!(state.preflight_budget(), Some(26_214));
+        assert_eq!(state.actionable_input_budget(), Some(26_214));
         assert_eq!(state.exposure_budget(), Some(26_214));
     }
 
@@ -885,7 +949,11 @@ mod send_budget_tests {
         let state =
             ResponsesBudgetState::new(None, 80, Some(Cognition::Contemplating), None, None, None);
         assert_eq!(state.learned_hard_ceiling(), None, "no window → no ceiling");
-        assert_eq!(state.preflight_budget(), None, "nothing to refuse against");
+        assert_eq!(
+            state.actionable_input_budget(),
+            None,
+            "nothing to refuse against"
+        );
         assert_eq!(state.exposure_budget(), None, "no live budget → don't clip");
     }
 
@@ -915,6 +983,446 @@ mod send_budget_tests {
             Some(0),
             "authoritative zero shadows cached evidence"
         );
-        assert_eq!(state.preflight_budget(), Some(0));
+        assert_eq!(state.actionable_input_budget(), Some(0));
+    }
+
+    // --- #1534 "finish the single source of truth" — the two equalities ---
+
+    /// P1.1 (#1534): the public reporting seam PROJECTS from the shared
+    /// `ResponsesBudgetState`, so for EVERY cognition level and representative
+    /// configured/learned combo the seam equals the state's authoritative input
+    /// budget (its soft send budget). Pre-fix the Responses branch re-derived the
+    /// ceiling with NO output reserve and diverged (26,214 vs 16,768).
+    #[test]
+    fn seam_projects_the_responses_budget_state_for_every_cognition() {
+        use super::ResponsesBudgetState;
+        let capability = ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        let cognitions = [
+            None,
+            Some(Cognition::Glancing),
+            Some(Cognition::Pondering),
+            Some(Cognition::Deliberating),
+            Some(Cognition::Contemplating),
+        ];
+        // (num_ctx, max_ok_input, safe_context): configured-window-only, cached
+        // caps present, a learned/cached cap tighter than the window, and the
+        // cloud default (no window).
+        let combos = [
+            (Some(32_768u32), None, None),
+            (Some(65_536), Some(40_000), None),
+            (Some(32_768), None, Some(8_000)),
+            (Some(32_768), Some(6_068), Some(26_214)),
+            (None, Some(12_000), Some(20_000)),
+            (None, None, None),
+        ];
+        for cognition in cognitions {
+            for (num_ctx, max_ok_input, safe_context) in combos {
+                let seam = super::initial_context_input_budget(
+                    BackendKind::Openai,
+                    OpenAiApi::Responses,
+                    num_ctx,
+                    80,
+                    cognition,
+                    capability,
+                    ReasoningReplayScope::CurrentUserTurn,
+                    max_ok_input,
+                    safe_context,
+                );
+                let state = ResponsesBudgetState::new(
+                    num_ctx,
+                    80,
+                    cognition,
+                    max_ok_input,
+                    safe_context,
+                    None,
+                );
+                assert_eq!(
+                    seam,
+                    state
+                        .soft_send_budget()
+                        .map(|budget| u32::try_from(budget).unwrap()),
+                    "the seam must project the state's authoritative input budget \
+                     (num_ctx={num_ctx:?}, max_ok={max_ok_input:?}, safe={safe_context:?}, \
+                     cognition={cognition:?})",
+                );
+            }
+        }
+        // Lock the exact reserve divergence the fix closes: Contemplating at 32K
+        // reports the RESERVED 16,768, never the un-reserved 26,214.
+        let contemplating = super::initial_context_input_budget(
+            BackendKind::Openai,
+            OpenAiApi::Responses,
+            Some(32_768),
+            80,
+            Some(Cognition::Contemplating),
+            capability,
+            ReasoningReplayScope::CurrentUserTurn,
+            None,
+            None,
+        );
+        assert_eq!(contemplating, Some(16_768));
+        assert_ne!(contemplating, Some(26_214), "no un-reserved over-report");
+    }
+
+    /// P1.2 (#1534): `get_context_remaining` describes the NEXT dispatch — it
+    /// reads the SAME `actionable_input_budget` the preflight refuses against and
+    /// the SAME `estimate_responses_request_tokens` (instructions, the running
+    /// input, and the real Responses-wire tools) the preflight counts. For every
+    /// budget shape the rendered remaining equals
+    /// `actionable_input_budget − actual_responses_wire_estimate`.
+    #[test]
+    fn get_context_remaining_agrees_with_dispatch_across_budget_shapes() {
+        use super::ResponsesBudgetState;
+        let est = crate::tokens::TokenEstimation::default();
+        let input = [serde_json::json!({"role": "user", "content": "do the thing"})];
+        let big_instructions = "SYSTEM POLICY. ".repeat(200); // ~3,000 chars
+        let wire_tools = [
+            serde_json::json!({
+                "type": "function",
+                "name": "read_file",
+                "description": "read a file in pages",
+                "parameters": {"type": "object", "properties": {
+                    "path": {"type": "string"}, "offset": {"type": "integer"}
+                }, "required": ["path"]}
+            }),
+            serde_json::json!({
+                "type": "function",
+                "name": "run_command",
+                "description": "run a shell command in the workspace",
+                "parameters": {"type": "object", "properties": {
+                    "command": {"type": "string"}
+                }, "required": ["command"]}
+            }),
+        ];
+
+        // The reconstruction the loop performs at the `get_context_remaining`
+        // intercept: used = the shared wire estimator, ceiling = actionable.
+        let agrees = |label: &str,
+                      state: &ResponsesBudgetState,
+                      instructions: Option<&str>,
+                      tools: Option<&[serde_json::Value]>|
+         -> usize {
+            let used =
+                crate::agentic::estimate_responses_request_tokens(instructions, &input, tools, est);
+            let ceiling = state
+                .actionable_input_budget()
+                .unwrap_or_else(|| panic!("{label}: the actionable budget must bind"));
+            let expected = ceiling.saturating_sub(used);
+            let report = crate::agentic::budget::render_context_budget(
+                used,
+                state.actionable_input_budget(),
+                state.num_ctx(),
+                state.input_ceiling_pct(),
+                15,
+            );
+            assert!(
+                report.contains(&format!("{expected} tokens remaining")),
+                "{label}: self-read remaining must equal actionable({ceiling}) − \
+                 wire_estimate({used}) = {expected}; got: {report}",
+            );
+            used
+        };
+
+        // 1. Only num_ctx constrains (no reserve, no cached caps).
+        let s = ResponsesBudgetState::new(Some(32_768), 80, None, None, None, None);
+        assert_eq!(s.actionable_input_budget(), Some(26_214));
+        agrees("only num_ctx", &s, None, None);
+
+        // 2. Only safe_context constrains (no window at all).
+        let s = ResponsesBudgetState::new(None, 80, None, None, Some(8_000), None);
+        assert_eq!(s.actionable_input_budget(), Some(8_000));
+        // Pre-fix divergence: the old ceiling (learned_hard_ceiling) was None here,
+        // so the self-read said "no ceiling" while dispatch refused at 8,000.
+        assert_eq!(
+            s.learned_hard_ceiling(),
+            None,
+            "no window → no hard ceiling"
+        );
+        agrees("only safe_context", &s, None, None);
+
+        // 3. max_ok_input smaller than safe_context (a floor, never a cap).
+        let s = ResponsesBudgetState::new(Some(32_768), 80, None, Some(12_000), Some(20_000), None);
+        assert_eq!(s.actionable_input_budget(), Some(20_000));
+        agrees("max_ok smaller", &s, None, None);
+
+        // 4. mid_loop_trim_tokens smaller than the ceiling — it binds the dispatch.
+        let s = ResponsesBudgetState::new(
+            Some(32_768),
+            80,
+            Some(Cognition::Contemplating),
+            None,
+            None,
+            Some(6_000),
+        );
+        assert_eq!(s.actionable_input_budget(), Some(6_000));
+        // Divergence guard: the OLD ceiling over-advertised 16,768 while dispatch
+        // refuses at 6,000.
+        assert_eq!(s.learned_hard_ceiling(), Some(16_768));
+        assert_ne!(s.learned_hard_ceiling(), s.actionable_input_budget());
+        agrees("mid_loop_trim smaller", &s, None, None);
+
+        // 5. Cognition reserve active (16,768 tighter than the 26,214 pct bound).
+        let s = ResponsesBudgetState::new(
+            Some(32_768),
+            80,
+            Some(Cognition::Contemplating),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(s.actionable_input_budget(), Some(16_768));
+        agrees("cognition reserve", &s, None, None);
+
+        // 6. Substantial instructions — the used side MUST count them (the old
+        // Chat-shaped estimate omitted instructions entirely).
+        let s = ResponsesBudgetState::new(Some(65_536), 80, None, None, None, None);
+        let with_instr = agrees(
+            "instructions substantial",
+            &s,
+            Some(&big_instructions),
+            None,
+        );
+        let without_instr =
+            crate::agentic::estimate_responses_request_tokens(None, &input, None, est);
+        assert!(
+            with_instr > without_instr,
+            "instructions must raise the wire estimate (was omitted pre-fix)",
+        );
+
+        // 7. Responses tool schemas enabled — the used side counts the real
+        //    Responses-wire tools.
+        let with_tools = agrees("tools enabled", &s, None, Some(&wire_tools));
+        // 8. Tools disabled — the used side drops the tool schemas.
+        let without_tools = agrees("tools disabled", &s, None, None);
+        assert!(
+            with_tools > without_tools,
+            "enabled wire tools must raise the estimate over tools-disabled",
+        );
+
+        // 9. A learned hard ceiling tighter than EVERY configured value (a cw-400
+        //    recovery), so the self-read tracks the recovered constraint.
+        let mut s = ResponsesBudgetState::new(
+            Some(65_536),
+            80,
+            Some(Cognition::Deliberating),
+            Some(40_000),
+            Some(40_000),
+            Some(30_000),
+        );
+        s.recover_from_cw400(9_000);
+        assert_eq!(s.actionable_input_budget(), Some(9_000));
+        // Tighter than the window ceiling, the cached caps, and the mid-loop trim.
+        assert!(s.actionable_input_budget().unwrap() < 30_000);
+        agrees(
+            "learned ceiling tighter than all",
+            &s,
+            Some(&big_instructions),
+            Some(&wire_tools),
+        );
+
+        // 10. max_ok_input is the SOLE cached cap and below the ceiling, so it
+        //     binds as the smallest operative limit (safe_context absent — with
+        //     safe_context present the two are max'd and safe_context wins).
+        let s = ResponsesBudgetState::new(Some(32_768), 80, None, Some(12_000), None, None);
+        assert_eq!(
+            s.actionable_input_budget(),
+            Some(12_000),
+            "max_ok binds alone"
+        );
+        agrees("max_ok binds", &s, None, None);
+
+        // 11. No authoritative ceiling (unknown cloud window, no caches): the
+        //     self-read must STATE that no ceiling is known, never fabricate a
+        //     remaining figure. `agrees` requires a bound, so assert directly.
+        let s =
+            ResponsesBudgetState::new(None, 80, Some(Cognition::Contemplating), None, None, None);
+        assert_eq!(
+            s.actionable_input_budget(),
+            None,
+            "an unknown window stays unknown — no fabricated ceiling"
+        );
+        let unknown = crate::agentic::budget::render_context_budget(
+            crate::agentic::estimate_responses_request_tokens(None, &input, None, est),
+            s.actionable_input_budget(),
+            s.num_ctx(),
+            s.input_ceiling_pct(),
+            15,
+        );
+        assert!(
+            unknown.contains("No input-token ceiling is configured"),
+            "ceiling-less self-read must say so, not report remaining: {unknown}",
+        );
+
+        // 12. Authoritative zero (window minus the cognition reserve leaves no
+        //     input room): a real fail-closed budget, never erased to None. The
+        //     self-read reports 0 remaining, NOT "no ceiling".
+        let s = ResponsesBudgetState::new(
+            Some(16_000),
+            80,
+            Some(Cognition::Contemplating),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            s.actionable_input_budget(),
+            Some(0),
+            "window (16,000) − reserve (16,000) = 0 is an authoritative zero, not None",
+        );
+        let zero = crate::agentic::budget::render_context_budget(
+            crate::agentic::estimate_responses_request_tokens(None, &input, None, est),
+            s.actionable_input_budget(),
+            s.num_ctx(),
+            s.input_ceiling_pct(),
+            15,
+        );
+        assert!(
+            zero.contains("0 tokens remaining") && !zero.contains("No input-token ceiling"),
+            "an authoritative zero renders 0 remaining, not ceiling-less: {zero}",
+        );
+
+        // --- fail-on-old: the SELF-READ SOURCE matters. The pre-fix intercept
+        // read `learned_hard_ceiling` (which diverges from the enforced budget
+        // when a soft / mid-loop limit binds, and is `None` when only
+        // safe_context binds) and the CHAT-shaped estimator (which omits
+        // instructions). Rendering / estimating each shape both ways proves the
+        // OLD pair yields the WRONG answer — so a regression of the mod.rs
+        // intercept back to the old source/estimator is caught here (the intercept
+        // reads the NEW pair — `actionable_input_budget` +
+        // `estimate_responses_request_tokens` — per the diff at the
+        // `is_context_remaining_call` site).
+        let render0 = |ceiling: Option<usize>, num_ctx: Option<u32>| {
+            crate::agentic::budget::render_context_budget(0, ceiling, num_ctx, 80, 15)
+        };
+        // Item 2: safe_context=8,000 with no window. OLD (learned=None) → "no
+        // ceiling"; NEW (actionable=8,000) → an 8,000 remaining budget.
+        let s = ResponsesBudgetState::new(None, 80, None, None, Some(8_000), None);
+        let old2 = render0(s.learned_hard_ceiling(), s.num_ctx());
+        let new2 = render0(s.actionable_input_budget(), s.num_ctx());
+        assert!(
+            old2.contains("No input-token ceiling is configured"),
+            "item 2 pre-fix source wrongly reports no ceiling: {old2}"
+        );
+        assert!(
+            new2.contains("8000 tokens remaining"),
+            "item 2 fixed source reports the enforced 8,000: {new2}"
+        );
+        assert_ne!(old2, new2, "item 2: the ceiling source changes the answer");
+        // Item 3: a 6,000 mid-loop trim under a 16,768 hard ceiling. OLD
+        // (learned=16,768) over-advertises; NEW (actionable=6,000) matches dispatch.
+        let s = ResponsesBudgetState::new(
+            Some(32_768),
+            80,
+            Some(Cognition::Contemplating),
+            None,
+            None,
+            Some(6_000),
+        );
+        let old3 = render0(s.learned_hard_ceiling(), s.num_ctx());
+        let new3 = render0(s.actionable_input_budget(), s.num_ctx());
+        assert!(
+            old3.contains("16768 tokens remaining"),
+            "item 3 pre-fix over-advertises the hard ceiling: {old3}"
+        );
+        assert!(
+            new3.contains("6000 tokens remaining"),
+            "item 3 fixed source reports the 6,000 dispatch refuses at: {new3}"
+        );
+        assert_ne!(
+            old3, new3,
+            "item 3: the mid-loop trim is invisible to the pre-fix source"
+        );
+        // Item 5: the pre-fix self-read estimated the CHAT-shaped catalog and
+        // OMITTED instructions. The Responses-wire estimate (instructions + flat
+        // Responses tools) is the larger, honest count dispatch enforces.
+        let responses_used = crate::agentic::estimate_responses_request_tokens(
+            Some(&big_instructions),
+            &input,
+            Some(&wire_tools),
+            est,
+        );
+        // The pre-fix Chat estimator takes the tool catalog as a single array
+        // Value (Chat's nested `{function:{…}}` shape), not the flat Responses tools.
+        let chat_tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "run_command", "description": "run a shell command",
+                "parameters": {"type": "object",
+                    "properties": {"command": {"type": "string"}}, "required": ["command"]}}
+        }]);
+        let chat_used =
+            crate::agentic::trim::estimate_request_tokens(&input, Some(&chat_tools), est);
+        assert!(
+            responses_used > chat_used,
+            "item 5: the Responses-wire estimate (instructions + flat tools, {responses_used}) must \
+             exceed the pre-fix Chat-shaped estimate that omitted instructions ({chat_used})",
+        );
+    }
+
+    /// #1534 monotonicity (CG-6 and the used-side): the actionable budget and the
+    /// reported remaining only ever move in the safe direction — tighter inputs
+    /// never buy more room, and a recovered hard ceiling never loosens.
+    #[test]
+    fn responses_budget_moves_only_in_the_safe_direction() {
+        use super::ResponsesBudgetState;
+        let est = crate::tokens::TokenEstimation::default();
+        let input = [serde_json::json!({"role": "user", "content": "hi"})];
+
+        // (a) Lowering an authoritative limit never RAISES the actionable budget.
+        let loose = ResponsesBudgetState::new(Some(65_536), 80, None, None, None, None);
+        let tight = ResponsesBudgetState::new(Some(32_768), 80, None, None, None, None);
+        assert!(
+            tight.actionable_input_budget() <= loose.actionable_input_budget(),
+            "a smaller window cannot raise the actionable budget",
+        );
+        let capped =
+            ResponsesBudgetState::new(Some(65_536), 80, None, None, Some(8_000), Some(6_000));
+        assert!(
+            capped.actionable_input_budget() <= loose.actionable_input_budget(),
+            "a tighter safe_context + mid-loop trim cannot raise it",
+        );
+
+        // (b)/(c) Adding instructions or tool schemas never RAISES remaining.
+        let s = ResponsesBudgetState::new(Some(65_536), 80, None, None, None, None);
+        let ceiling = s.actionable_input_budget().expect("window binds");
+        let rem = |instr: Option<&str>, tools: Option<&[serde_json::Value]>| {
+            ceiling.saturating_sub(crate::agentic::estimate_responses_request_tokens(
+                instr, &input, tools, est,
+            ))
+        };
+        let big = "POLICY. ".repeat(200);
+        assert!(
+            rem(Some(&big), None) <= rem(None, None),
+            "instructions never increase remaining",
+        );
+        let wire_tools = [serde_json::json!({
+            "type": "function", "name": "run_command",
+            "description": "run a shell command",
+            "parameters": {"type": "object",
+                "properties": {"command": {"type": "string"}}, "required": ["command"]}
+        })];
+        assert!(
+            rem(None, Some(&wire_tools)) <= rem(None, None),
+            "tool schemas never increase remaining",
+        );
+
+        // (d) A cw-400 only TIGHTENS the hard ceiling; a later larger recovered
+        //     window cannot raise it back.
+        let mut s = ResponsesBudgetState::new(Some(65_536), 80, None, None, None, None);
+        let before = s.actionable_input_budget();
+        s.recover_from_cw400(10_000);
+        let after = s.actionable_input_budget();
+        assert!(
+            after <= before && after == Some(10_000),
+            "a cw-400 tightens the actionable budget to the recovered window",
+        );
+        s.recover_from_cw400(50_000);
+        assert_eq!(
+            s.actionable_input_budget(),
+            Some(10_000),
+            "a later larger recovered window cannot raise the hard ceiling",
+        );
     }
 }

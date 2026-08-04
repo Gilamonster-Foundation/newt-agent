@@ -302,7 +302,8 @@ use display::{
 };
 use send_budget::{
     calibrate_down, calibrate_up, emit_accepted, emit_context_window_400, initial_send_budget,
-    num_ctx_input_ceiling, recovered_input_budget, sanitize_estimate_ratio, ResponsesBudgetState,
+    num_ctx_input_ceiling, recovered_input_budget, resolve_responses_budget,
+    sanitize_estimate_ratio,
 };
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
@@ -421,18 +422,21 @@ fn preflight_full_message_request(
     Ok(())
 }
 
-fn preflight_responses_request(
+/// #1528: the ONE token-shape estimate of a Responses request — the
+/// `instructions` (as a protected system head), the running `input`, and the
+/// flattened Responses-WIRE tool schemas — that BOTH [`preflight_responses_request`]
+/// (which refuses when it exceeds the budget) and the `get_context_remaining`
+/// self-read (which reports it as `used`) call, so the self-read counts exactly
+/// what dispatch counts. `tools` is `None` for a tools-disabled request; pass the
+/// Responses-wire `tools` array actually sent, never the Chat-shaped catalog.
+/// Uncalibrated (chars/4) — the caller applies [`calibrate_up`] when it needs
+/// real-token currency.
+fn estimate_responses_request_tokens(
     instructions: Option<&str>,
     input: &[serde_json::Value],
     tools: Option<&[serde_json::Value]>,
-    authoritative_budget: Option<usize>,
-    calibration: f32,
     estimation: crate::tokens::TokenEstimation,
-    model: &str,
-) -> anyhow::Result<()> {
-    let Some(budget) = authoritative_budget else {
-        return Ok(());
-    };
+) -> usize {
     let instructions_tokens = instructions
         .map(|text| {
             estimate_value_tokens(
@@ -445,8 +449,23 @@ fn preflight_responses_request(
     let tool_tokens = tools
         .map(|tools| estimate_value_tokens(&serde_json::Value::Array(tools.to_vec()), estimation))
         .unwrap_or(0);
+    instructions_tokens + input_tokens + tool_tokens
+}
+
+fn preflight_responses_request(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
     let required = calibrate_up(
-        instructions_tokens + input_tokens + tool_tokens,
+        estimate_responses_request_tokens(instructions, input, tools, estimation),
         calibration,
     );
     if required > budget {
@@ -6515,13 +6534,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // (~4887) loops rebuild this identical trio inline and differ ONLY in the
     // output-reserve argument — the sibling duplication this state is designed to
     // absorb next (one-issue-one-PR).
-    let mut budget_state = ResponsesBudgetState::new(
+    let mut budget_state = resolve_responses_budget(
         num_ctx,
+        safe_context,
+        max_ok_input,
+        mid_loop_trim_tokens,
         input_ceiling_pct,
         cognition,
-        max_ok_input,
-        safe_context,
-        mid_loop_trim_tokens,
     );
     let tools_chat = crate::agentic::tools::select_exposed(
         tools_chat,
@@ -6549,7 +6568,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     preflight_irreducible_request(
         &msgs_json,
         Some(&tools_for_estimate),
-        budget_state.preflight_budget(),
+        budget_state.actionable_input_budget(),
         cal,
         estimation,
         model,
@@ -6604,7 +6623,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 instructions.as_deref(),
                 &input,
                 tools_supported.then_some(tools.as_slice()),
-                budget_state.preflight_budget(),
+                budget_state.actionable_input_budget(),
                 cal,
                 estimation,
                 model,
@@ -6868,19 +6887,29 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let tool_t0 = std::time::Instant::now();
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // The Responses loop has no PromptTracker, so `used` is the chars/4
-            // estimate of the running `input` plus tool schemas; num_ctx is normally
-            // unset here, so the report is honestly ceiling-less.
+            // estimate of the ACTUAL Responses request; num_ctx is normally unset
+            // here, so the report is honestly ceiling-less.
             let result = if tools::is_context_remaining_call(name) {
-                // #1528: report the ENFORCED learned ceiling (the same value this
-                // loop refuses against), NOT a fresh `num_ctx_input_ceiling(...,
-                // None)` recompute. The old `None` reserve advertised the looser
-                // percentage-only ceiling (e.g. 26,214) while the loop enforced the
-                // output-reserved ceiling (16,768) — a single state removes the
-                // divergence by construction. A cw-400 that established a ceiling
-                // mid-turn (even from a `None` num_ctx) is now reflected too.
+                // #1528: the self-read must describe the NEXT dispatch, so it reads
+                // the SAME two values the preflight enforces against — the
+                // `actionable_input_budget` (hard ceiling / soft send / mid-loop
+                // trim, the value dispatch refuses at) as the ceiling, and the
+                // SHARED `estimate_responses_request_tokens` (instructions + the
+                // running Responses `input` + the real Responses-wire tool schemas,
+                // respecting tools-disabled) as `used`. The old path read
+                // `learned_hard_ceiling` (which diverges from preflight when a
+                // soft/mid-loop budget is tighter) and estimated the Chat-shaped
+                // catalog while omitting instructions — advertising a budget the
+                // loop did not enforce. Reading one derivation removes the
+                // divergence by construction.
                 let report = budget::render_context_budget(
-                    estimate_request_tokens(&input, Some(&tools_chat), estimation),
-                    budget_state.learned_hard_ceiling(),
+                    estimate_responses_request_tokens(
+                        instructions.as_deref(),
+                        &input,
+                        tools_supported.then_some(tools.as_slice()),
+                        estimation,
+                    ),
+                    budget_state.actionable_input_budget(),
                     budget_state.num_ctx(),
                     budget_state.input_ceiling_pct(),
                     low_budget_pct,
@@ -6987,7 +7016,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         instructions.as_deref(),
         &input,
         None,
-        budget_state.preflight_budget(),
+        budget_state.actionable_input_budget(),
         cal,
         estimation,
         model,
