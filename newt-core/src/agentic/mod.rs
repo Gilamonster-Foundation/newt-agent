@@ -6797,24 +6797,36 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 // (the SHARED B1 estimator, same real-token currency
                                 // dispatch enforces) BEFORE redispatch — never send an
                                 // oversized request, never consume another logical round.
+                                // `pre_bridge` estimates the SAME messages WITHOUT the
+                                // fences, so the typed error attributes the overflow to
+                                // the framing the compressor could not see.
                                 if let Some(budget) = budget_state.actionable_input_budget() {
-                                    let post_bridge = estimate_responses_request_real_tokens(
-                                        instructions.as_deref(),
-                                        &input,
-                                        tools_supported.then_some(tools.as_slice()),
-                                        estimation,
-                                        cal,
+                                    let est_tokens = |items: &[serde_json::Value]| {
+                                        estimate_responses_request_real_tokens(
+                                            instructions.as_deref(),
+                                            items,
+                                            tools_supported.then_some(tools.as_slice()),
+                                            estimation,
+                                            cal,
+                                        )
+                                    };
+                                    let post_bridge = est_tokens(&input);
+                                    let pre_bridge = est_tokens(
+                                        &responses_compaction::rebuild_unfenced_for_estimate(
+                                            &rebuilt_msgs,
+                                        ),
                                     );
-                                    if post_bridge > budget {
-                                        print_harness_notice(
-                                            &format!(
-                                                "context recovery: the compacted request still \
-                                                 exceeds the input budget after provenance fencing \
-                                                 ({post_bridge} > {budget} real tokens) — refusing \
-                                                 to send an oversized request."
-                                            ),
-                                            color,
-                                        );
+                                    if let Err(exceeded) =
+                                        responses_compaction::check_post_bridge_budget(
+                                            budget,
+                                            pre_bridge,
+                                            post_bridge,
+                                        )
+                                    {
+                                        // ZERO second inference: return before the
+                                        // `cw_retries += 1; continue` below — the logical
+                                        // round is NOT consumed.
+                                        print_harness_notice(&exceeded.to_string(), color);
                                         return Err(e);
                                     }
                                 }
