@@ -452,6 +452,53 @@ fn estimate_responses_request_tokens(
     instructions_tokens + input_tokens + tool_tokens
 }
 
+/// The CALIBRATED real-token estimate of a Responses request — the raw
+/// [`estimate_responses_request_tokens`] shape (chars/4) converted to the
+/// backend-token currency dispatch enforces in, via the model's `calibration`.
+/// Budget ceilings and remaining-token reports are real-token currency, so BOTH
+/// the dispatch preflight AND the `get_context_remaining` self-read subtract
+/// THIS, never the raw estimate (BHV-BUDGET-001/002/003: one currency, calibrated
+/// exactly once).
+fn estimate_responses_request_real_tokens(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    estimation: crate::tokens::TokenEstimation,
+    calibration: f32,
+) -> usize {
+    calibrate_up(
+        estimate_responses_request_tokens(instructions, input, tools, estimation),
+        calibration,
+    )
+}
+
+/// The Responses `get_context_remaining` self-read report, extracted so it is
+/// unit-testable and shares ONE calibrated estimate with dispatch: `used` is the
+/// CALIBRATED estimate of the exact next request (the instructions, the running
+/// `input`, and the enabled Responses-wire tool schemas), subtracted from the
+/// SAME `actionable_input_budget` the preflight refuses against, in the SAME
+/// real-token currency — so the self-read's remaining and low-budget
+/// classification match what dispatch would accept or reject (BHV-BUDGET-002).
+fn responses_context_remaining_report(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    budget_state: &send_budget::ResponsesBudgetState,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    low_budget_pct: usize,
+) -> String {
+    let used_real =
+        estimate_responses_request_real_tokens(instructions, input, tools, estimation, calibration);
+    budget::render_context_budget(
+        used_real,
+        budget_state.actionable_input_budget(),
+        budget_state.num_ctx(),
+        budget_state.input_ceiling_pct(),
+        low_budget_pct,
+    )
+}
+
 fn preflight_responses_request(
     instructions: Option<&str>,
     input: &[serde_json::Value],
@@ -464,10 +511,8 @@ fn preflight_responses_request(
     let Some(budget) = authoritative_budget else {
         return Ok(());
     };
-    let required = calibrate_up(
-        estimate_responses_request_tokens(instructions, input, tools, estimation),
-        calibration,
-    );
+    let required =
+        estimate_responses_request_real_tokens(instructions, input, tools, estimation, calibration);
     if required > budget {
         anyhow::bail!(
             "the Responses request needs ~{required} input tokens, which cannot fit model \
@@ -6891,27 +6936,24 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // here, so the report is honestly ceiling-less.
             let result = if tools::is_context_remaining_call(name) {
                 // #1528: the self-read must describe the NEXT dispatch, so it reads
-                // the SAME two values the preflight enforces against — the
+                // the SAME derivation the preflight enforces against — the
                 // `actionable_input_budget` (hard ceiling / soft send / mid-loop
-                // trim, the value dispatch refuses at) as the ceiling, and the
-                // SHARED `estimate_responses_request_tokens` (instructions + the
-                // running Responses `input` + the real Responses-wire tool schemas,
-                // respecting tools-disabled) as `used`. The old path read
-                // `learned_hard_ceiling` (which diverges from preflight when a
-                // soft/mid-loop budget is tighter) and estimated the Chat-shaped
-                // catalog while omitting instructions — advertising a budget the
-                // loop did not enforce. Reading one derivation removes the
-                // divergence by construction.
-                let report = budget::render_context_budget(
-                    estimate_responses_request_tokens(
-                        instructions.as_deref(),
-                        &input,
-                        tools_supported.then_some(tools.as_slice()),
-                        estimation,
-                    ),
-                    budget_state.actionable_input_budget(),
-                    budget_state.num_ctx(),
-                    budget_state.input_ceiling_pct(),
+                // trim, the value dispatch refuses at) as the ceiling, and the SAME
+                // CALIBRATED real-token estimate of the exact request (instructions
+                // + the running Responses `input` + the real Responses-wire tool
+                // schemas, respecting tools-disabled) as `used` — via the shared
+                // `responses_context_remaining_report`. Both operate in real-token
+                // currency (BHV-BUDGET-001/002/003). The pre-fix path subtracted the
+                // RAW chars/4 estimate from the calibrated ceiling — over-reporting
+                // remaining by the calibration factor — and, earlier, read
+                // `learned_hard_ceiling` and the Chat-shaped catalog.
+                let report = responses_context_remaining_report(
+                    instructions.as_deref(),
+                    &input,
+                    tools_supported.then_some(tools.as_slice()),
+                    &budget_state,
+                    cal,
+                    estimation,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
