@@ -10165,11 +10165,20 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
-    async fn responses_proactive_bounded_no_progress_fails_closed_with_zero_dispatch() {
-        // #1528 B3 (req 3/5): when even a SINGLE proactive compaction cannot bring the
-        // request under budget (an irreducible protected newest-user message), the
-        // loop FAILS CLOSED — it never dispatches an oversized request and never spins
-        // compact→still-too-big→compact. ZERO requests reach the server.
+    async fn responses_irreducible_request_refuses_before_the_proactive_guard() {
+        // The B3 proactive guard sits BEHIND the pre-loop irreducible preflight: a
+        // request whose protected head + newest live user alone dwarf the budget can
+        // never be helped by compaction (the newest user is protected), so it is
+        // refused BEFORE the round loop — the guard never runs. This pins that
+        // fail-closed path to its DISTINGUISHING pre-loop message ("the operator
+        // prompt was not truncated"), distinct from the in-loop preflight's "function
+        // outputs were not truncated". (Honesty note per adversarial review: this
+        // exercises the pre-existing irreducible gate, NOT B3's proactive path — B3's
+        // guard is best-effort and DELEGATES the refusal to the authoritative
+        // preflight, so there is no B3-specific fail-closed behavior to assert here.
+        // B3's own new behavior — proactive compaction that lets an over-budget
+        // request SUCCEED — is covered by responses_proactively_compacts_* /
+        // responses_final_summary_is_proactively_compacted.)
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -10182,8 +10191,6 @@ mod tool_round_cap_tests {
             .mount(&server)
             .await;
 
-        // The newest user message (the task) alone dwarfs the budget and is protected
-        // (last-user anchor) — compaction cannot remove it, so the request stays over.
         let task = format!("IRREDUCIBLE {}", "z".repeat(40_000));
         let messages = vec![MemMessage::system("base policy"), MemMessage::user(&task)];
         let caveats = Caveats::top();
@@ -10200,8 +10207,9 @@ mod tool_round_cap_tests {
             .expect_err("an irreducible over-budget request fails closed, never dispatched");
         let msg = err.to_string();
         assert!(
-            msg.contains("refusing") || msg.contains("budget"),
-            "expected a fail-closed budget refusal, got: {msg}"
+            msg.contains("operator prompt was not truncated"),
+            "expected the PRE-LOOP irreducible refusal (distinct from the in-loop \
+             preflight message), got: {msg}"
         );
         // `.expect(0)` verified on MockServer drop: ZERO inference dispatches.
     }
