@@ -220,8 +220,26 @@ fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
     );
 }
 
+/// Real-PTY grounding test for the prompt CONTROL keys — Esc→Back,
+/// Ctrl-C/Ctrl-D→Exit — on both the local-tty prompt and the web-wait prompt.
+/// Unlike the newline-terminated `"d\r"` of the visibility test (which the
+/// cooked-mode line discipline delivers deterministically), this types raw
+/// control BYTES that only take effect once the child's modal reader is in raw
+/// mode. Under the parallel per-PR load the child can be CPU-starved past that
+/// window, so a nudged byte is echoed (`^C`) and swallowed in cooked mode —
+/// making the test inherently non-deterministic in the multi-threaded unit run.
+/// It therefore lives in the single-threaded real-PTY tier
+/// (`.github/workflows/newt-tui-pty.yml`, weekly + release), NOT the per-PR
+/// `cargo test --workspace`, exactly as the output-oracle real tier is gated.
+///
+/// It GROUNDS the mocked control-key unit tests (`permissions.rs` /
+/// `question.rs`: `Action` parse + `PermissionAction`/`HumanQuestionOutcome`
+/// mapping) — those assert the key→outcome mapping in memory; this proves a
+/// real terminal actually delivers the bytes that trigger it. See the CLAUDE.md
+/// testing tiers and the real-resource-migration issue #514.
 #[serial_test::serial(prompt_stdin)]
 #[test]
+#[ignore = "real-PTY control-byte tier; runs single-threaded in newt-tui-pty.yml (weekly/release), not the parallel per-PR gate — see doc comment"]
 fn permission_prompt_controls_are_immediate_and_distinct() {
     for (key, tty, web) in [
         ("\u{1b}", "Back", "true:false"),
