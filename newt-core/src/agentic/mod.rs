@@ -603,74 +603,77 @@ impl ResponsesCompaction {
     }
 }
 
-/// A TRANSACTIONAL wrapper over the session compaction/spill store (#1528 B3,
-/// B3-CG-004). The compressor's progressive-disclosure spill (`store.store(...)`)
-/// is a shared, un-cloneable side effect with no delete API, so a candidate
-/// compaction that runs the compressor and is then REJECTED would otherwise leave
-/// an orphaned redacted span in the live store. This wrapper BUFFERS every
-/// `store` write and returns the same monotonic `s{n}` id the inner store would
-/// assign (nothing else writes to the inner store during a single compaction, so
-/// the ids match on flush). [`Self::commit`] flushes the buffer to the inner store;
-/// a rejected candidate is simply dropped, writing nothing — the spill joins the
-/// SAME commit boundary as `*input` / `*compress_state` / the notice.
+/// A TRANSACTIONAL staging wrapper over the session compaction/spill store (#1528
+/// B3, B3-CG-004). The compressor's progressive-disclosure spill
+/// (`store.store(...)`, `compress.rs`) is a shared side effect with NO delete API,
+/// so a candidate compaction that summarizes and is then REJECTED would otherwise
+/// leave an orphaned redacted span in the live store. This wrapper STAGES each
+/// write as a store-issued RESERVATION: the REAL store allocates the (unique,
+/// concurrency-safe) id at `store` time — that same id is rendered into the
+/// candidate summary — but the payload is not installed until [`Self::commit`],
+/// which flushes each staged `(reservation, payload)` via the store's
+/// `commit_reserved`. A rejected candidate is simply dropped: every reservation is
+/// retired unused, leaving NO fetchable record and NOT bumping the committed count.
+/// The wrapper is created ONLY when there is a REAL inner store — a `None` store is
+/// passed straight through as `None`, so no handle is ever invented (correction 1).
 struct CandidateSpillStore<'a> {
-    inner: Option<&'a dyn crate::agentic::spill::SpillStore>,
-    base: u64,
-    buffered: std::sync::Mutex<Vec<String>>,
+    inner: &'a dyn crate::agentic::spill::SpillStore,
+    staged: std::sync::Mutex<Vec<(crate::agentic::spill::ReservedSpill, String)>>,
 }
 
 impl<'a> CandidateSpillStore<'a> {
-    fn new(inner: Option<&'a dyn crate::agentic::spill::SpillStore>) -> Self {
+    fn new(inner: &'a dyn crate::agentic::spill::SpillStore) -> Self {
         Self {
             inner,
-            base: inner.map_or(0, crate::agentic::spill::SpillStore::spills),
-            buffered: std::sync::Mutex::new(Vec::new()),
+            staged: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    /// Flush buffered spills to the inner store (COMMIT). The inner store's counter
-    /// is still at `base` (nothing else wrote to it), so it re-assigns exactly the
-    /// ids this wrapper handed back during the candidate run.
+    /// COMMIT: install every staged payload under the id the store already issued
+    /// for it. `commit_reserved` is infallible, so this cannot leave `*input`
+    /// referencing an uncommitted spill.
     fn commit(self) {
-        if let Some(inner) = self.inner {
-            for redacted in self.buffered.into_inner().unwrap_or_default() {
-                inner.store(redacted);
-            }
+        for (reservation, payload) in self.staged.into_inner().unwrap_or_default() {
+            self.inner.commit_reserved(reservation, payload);
         }
     }
 }
 
 impl crate::agentic::spill::SpillStore for CandidateSpillStore<'_> {
     fn store(&self, redacted: String) -> String {
-        let mut buf = self.buffered.lock().unwrap();
-        let id = format!("s{}", self.base + buf.len() as u64);
-        buf.push(redacted);
+        // The STORE issues the id (unique even under concurrency); we stage the
+        // payload for commit and hand the real id straight to the summary.
+        let reservation = self.inner.reserve();
+        let id = reservation.id().to_string();
+        self.staged.lock().unwrap().push((reservation, redacted));
         id
     }
     fn fetch(&self, id: &str) -> Option<String> {
-        if let Some(n) = id.strip_prefix('s').and_then(|d| d.parse::<u64>().ok()) {
-            let buf = self.buffered.lock().unwrap();
-            if n >= self.base && (n - self.base) < buf.len() as u64 {
-                return buf.get((n - self.base) as usize).cloned();
-            }
-        }
-        self.inner.and_then(|s| s.fetch(id))
-    }
-    fn spills(&self) -> u64 {
-        self.base + self.buffered.lock().unwrap().len() as u64
-    }
-    fn offloaded_chars(&self) -> u64 {
-        let inner = self
-            .inner
-            .map_or(0, crate::agentic::spill::SpillStore::offloaded_chars);
-        let buffered: u64 = self
-            .buffered
+        // A staged (candidate-local, uncommitted) payload is visible to THIS
+        // candidate only; everything else falls through to the committed store.
+        if let Some((_, payload)) = self
+            .staged
             .lock()
             .unwrap()
             .iter()
-            .map(|c| c.chars().count() as u64)
-            .sum();
-        inner + buffered
+            .find(|(r, _)| r.id() == id)
+        {
+            return Some(payload.clone());
+        }
+        self.inner.fetch(id)
+    }
+    fn spills(&self) -> u64 {
+        // Staged reservations are NOT committed spills.
+        self.inner.spills()
+    }
+    fn offloaded_chars(&self) -> u64 {
+        self.inner.offloaded_chars()
+    }
+    fn reserve(&self) -> crate::agentic::spill::ReservedSpill {
+        self.inner.reserve()
+    }
+    fn commit_reserved(&self, reservation: crate::agentic::spill::ReservedSpill, redacted: String) {
+        self.inner.commit_reserved(reservation, redacted);
     }
 }
 
@@ -718,11 +721,13 @@ async fn compact_responses_input(
         chat.push(serde_json::json!({ "role": "system", "content": ins }));
     }
     chat.extend(responses_compaction::compaction_to_chat(&messages));
-    // Run the compressor against a CANDIDATE state AND a buffering spill store — the
+    // Run the compressor against a CANDIDATE state AND a staging spill store — the
     // live anti-thrash counters / disabled latch and the session compaction store
-    // are mutated only on commit (below).
+    // are mutated only on commit (below). A `None` store is passed straight through
+    // as `None`, so with no real store the compressor invents no retrieval handle
+    // (correction 1); a real store is wrapped so its spill writes are staged.
     let mut candidate_state = compress_state.clone();
-    let candidate_store = CandidateSpillStore::new(compaction_store);
+    let candidate_store = compaction_store.map(CandidateSpillStore::new);
     let outcome = compress(
         CompressRequest {
             messages: &chat,
@@ -737,7 +742,9 @@ async fn compact_responses_input(
             focus: None,
             est: estimation,
             summary_input_cap_floor_chars,
-            compaction_store: Some(&candidate_store),
+            compaction_store: candidate_store
+                .as_ref()
+                .map(|c| c as &dyn crate::agentic::spill::SpillStore),
         },
         summarizer,
         &mut candidate_state,
@@ -781,16 +788,22 @@ async fn compact_responses_input(
         if let Err(exceeded) =
             responses_compaction::check_post_bridge_budget(budget, pre_bridge, post_bridge)
         {
-            // REJECT: `candidate_store` is dropped WITHOUT `commit`, so the buffered
-            // spills never reach the live store; `*input`, `*compress_state`, and the
-            // notice stream are likewise UNTOUCHED — the candidate is discarded whole.
+            // REJECT: `candidate_store` is dropped WITHOUT `commit`, so every staged
+            // reservation is retired unused — nothing is fetchable, the committed
+            // count is unchanged; `*input`, `*compress_state`, and the notice stream
+            // are likewise UNTOUCHED — the candidate is discarded whole.
             return ResponsesCompaction::OverBudgetAfterFence(exceeded);
         }
     }
-    // COMMIT — all FOUR effects together, now that the candidate is accepted.
+    // COMMIT — all FOUR effects, now that the candidate is accepted. Ordered so live
+    // input never references an uncommitted spill: install the staged spills (an
+    // infallible `commit_reserved`) BEFORE swapping in the input that names them,
+    // then the anti-thrash state, then the notice.
+    if let Some(cs) = candidate_store {
+        cs.commit();
+    }
     *input = rebuilt_input;
     *compress_state = candidate_state;
-    candidate_store.commit();
     if let Some(notice) = outcome.notice {
         print_harness_notice(&notice, color);
     }
@@ -10673,10 +10686,22 @@ mod tool_round_cap_tests {
             assert_eq!(
                 store.spills(),
                 0,
-                "TRANSACTIONAL: a rejected candidate writes NOTHING to the spill store"
+                "TRANSACTIONAL: a rejected candidate writes NO committed spill"
+            );
+            assert_eq!(
+                store.fetch("s0"),
+                None,
+                "a rejected candidate's staged payload is NOT fetchable"
+            );
+            assert_eq!(input, make_input(), "live input is UNCHANGED on reject");
+            assert!(
+                !serde_json::to_string(&input)
+                    .unwrap()
+                    .contains("compaction:"),
+                "no retrieval marker leaked into live input"
             );
         }
-        // COMMIT (generous budget): the buffered span is flushed exactly once.
+        // COMMIT (generous budget): the staged span is flushed exactly once.
         {
             let store = SessionSpillStore::default();
             let s = summarizer();
@@ -10705,6 +10730,227 @@ mod tool_round_cap_tests {
                 "committed: the compacted span is flushed to the store exactly once"
             );
         }
+    }
+
+    fn spill_middle_input() -> Vec<serde_json::Value> {
+        let mut v = vec![serde_json::json!({"role": "user", "content": "task"})];
+        for i in 0..6 {
+            v.push(assistant(i, 300));
+        }
+        v.push(serde_json::json!({"role": "user", "content": "recent turn"}));
+        v
+    }
+
+    /// Correction 1: with NO real compaction store, a successful compaction still
+    /// summarizes but promises NO retrieval — no `memory_fetch("compaction:...")`
+    /// handle. Fails on `8b3a1c8`, which wrapped a `None` store and invented
+    /// `compaction:s0` (a phantom, unresolvable handle).
+    #[tokio::test]
+    async fn compact_responses_input_no_store_emits_no_retrieval_handle() {
+        use crate::agentic::compress::Summarizer;
+        let summ: Summarizer = Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) }));
+        let mut input = spill_middle_input();
+        let mut state = crate::agentic::compress::CompressState::new();
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(100_000),
+            400,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            None, // NO real compaction store
+            Some(&*summ),
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, ResponsesCompaction::Compacted));
+        let text = serde_json::to_string(&input).unwrap();
+        assert!(
+            text.contains("newt-compaction-summary"),
+            "it still compacted"
+        );
+        assert!(
+            !text.contains("compaction:"),
+            "no retrieval handle promised without a store: {text:.200}"
+        );
+    }
+
+    /// Correction 4: the emitted retrieval marker uses the STORE-issued id (here a
+    /// non-`s{count}` scheme), and fetching that id returns the exact payload — the
+    /// helper never predicts an id. Fails on `8b3a1c8`, which emitted a predicted
+    /// `compaction:s0`.
+    #[tokio::test]
+    async fn compact_responses_input_uses_store_issued_ids_not_predicted() {
+        use crate::agentic::compress::Summarizer;
+        use crate::agentic::spill::{ReservedSpill, SpillStore};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct UuidishSpillStore {
+            map: Mutex<std::collections::HashMap<String, String>>,
+            next: AtomicU64,
+            committed: AtomicU64,
+            chars: AtomicU64,
+        }
+        impl SpillStore for UuidishSpillStore {
+            fn store(&self, redacted: String) -> String {
+                let r = self.reserve();
+                let id = r.id().to_string();
+                self.commit_reserved(r, redacted);
+                id
+            }
+            fn reserve(&self) -> ReservedSpill {
+                let n = self.next.fetch_add(1, Ordering::Relaxed);
+                ReservedSpill::new(format!("spill-uuid-{}", 17 + n * 25))
+            }
+            fn commit_reserved(&self, r: ReservedSpill, redacted: String) {
+                self.chars
+                    .fetch_add(redacted.chars().count() as u64, Ordering::Relaxed);
+                self.map
+                    .lock()
+                    .unwrap()
+                    .insert(r.id().to_string(), redacted);
+                self.committed.fetch_add(1, Ordering::Relaxed);
+            }
+            fn fetch(&self, id: &str) -> Option<String> {
+                self.map.lock().unwrap().get(id).cloned()
+            }
+            fn spills(&self) -> u64 {
+                self.committed.load(Ordering::Relaxed)
+            }
+            fn offloaded_chars(&self) -> u64 {
+                self.chars.load(Ordering::Relaxed)
+            }
+        }
+        let store = UuidishSpillStore::default();
+        let summ: Summarizer = Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) }));
+        let mut input = spill_middle_input();
+        let mut state = crate::agentic::compress::CompressState::new();
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(100_000),
+            400,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            Some(&store),
+            Some(&*summ),
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, ResponsesCompaction::Compacted));
+        let text = serde_json::to_string(&input).unwrap();
+        assert!(
+            text.contains("compaction:spill-uuid-17"),
+            "the marker uses the STORE-issued id: {text:.200}"
+        );
+        assert!(!text.contains("compaction:s0"), "no predicted s0 marker");
+        assert!(
+            store
+                .fetch("spill-uuid-17")
+                .is_some_and(|p| p.contains("step 0")),
+            "the emitted handle resolves to the committed verbatim span"
+        );
+        assert_eq!(store.spills(), 1);
+    }
+
+    /// Correction 3: the STORE owns id allocation, so an external write that lands
+    /// BETWEEN a candidate reservation and its commit gets its OWN unique id — it
+    /// cannot claim or rebind the candidate's reserved id. Deterministic (channels
+    /// sequence the events; no sleeps). Fails on `8b3a1c8`, whose predicted `s{base}`
+    /// is claimed by the interleaved external writer.
+    #[test]
+    fn candidate_spill_store_binds_reserved_ids_under_an_interleaved_external_write() {
+        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        use std::sync::mpsc;
+        let store = SessionSpillStore::default();
+        let candidate = CandidateSpillStore::new(&store);
+        let (reserved_tx, reserved_rx) = mpsc::channel::<()>();
+        let (ext_done_tx, ext_done_rx) = mpsc::channel::<String>();
+        let store_ref = &store;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                reserved_rx.recv().unwrap(); // 2. after the candidate reserved A
+                let id_b = store_ref.store("payload B".to_string()); // 3. external commits B
+                ext_done_tx.send(id_b).unwrap();
+            });
+            let id_a = candidate.store("payload A".to_string()); // 1. candidate reserves A (staged)
+            reserved_tx.send(()).unwrap();
+            let id_b = ext_done_rx.recv().unwrap();
+            candidate.commit(); // 4. candidate commits A
+            assert_ne!(
+                id_a, id_b,
+                "the interleaved external write got its OWN id (no collision)"
+            );
+            assert_eq!(
+                store.fetch(&id_a).as_deref(),
+                Some("payload A"),
+                "candidate handle → its OWN payload (no rebind)"
+            );
+            assert_eq!(
+                store.fetch(&id_b).as_deref(),
+                Some("payload B"),
+                "external handle → its own payload"
+            );
+        });
+    }
+
+    /// Correction 6: multiple staged spills plus an interleaved external write — every
+    /// handle is unique and resolves to its OWN payload (no swap/alias), and the
+    /// committed count reflects only committed payloads.
+    #[test]
+    fn candidate_spill_store_stages_multiple_payloads_without_swap_or_alias() {
+        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        let store = SessionSpillStore::default();
+        let ext_before = store.store("external before".to_string());
+        let candidate = CandidateSpillStore::new(&store);
+        let a = candidate.store("payload A".to_string());
+        let b = candidate.store("payload B".to_string());
+        let ext_during = store.store("external during".to_string());
+        assert_eq!(store.fetch(&a), None, "staged A not committed yet");
+        assert_eq!(store.fetch(&b), None, "staged B not committed yet");
+        assert_eq!(
+            store.spills(),
+            2,
+            "only the two external stores are committed so far"
+        );
+        candidate.commit();
+        let ids = [
+            ext_before.as_str(),
+            a.as_str(),
+            b.as_str(),
+            ext_during.as_str(),
+        ];
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            4,
+            "all four ids are unique"
+        );
+        assert_eq!(
+            store.fetch(&a).as_deref(),
+            Some("payload A"),
+            "A → A (no swap)"
+        );
+        assert_eq!(
+            store.fetch(&b).as_deref(),
+            Some("payload B"),
+            "B → B (no swap)"
+        );
+        assert_eq!(store.fetch(&ext_before).as_deref(), Some("external before"));
+        assert_eq!(store.fetch(&ext_during).as_deref(), Some("external during"));
+        assert_eq!(
+            store.spills(),
+            4,
+            "committed count reflects only committed payloads"
+        );
     }
 
     // --- #1528 B3 (item 6): pure lifecycle-invariant property tests ---

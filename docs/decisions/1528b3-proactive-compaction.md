@@ -117,6 +117,36 @@ round-preservation theorems). TLA+ (B6) adds the `Dispatch → Completed | Faile
 tail — where `OnlyCompletedRoundAdvances` / `FailedDispatchDoesNotConsumeLogicalRound`
 are proved — that this B3 kernel deliberately leaves out (Problem C).
 
+### B6 TLA+ obligation — transactional spill (precise)
+
+The spill store's transactional reserve/commit is proven single-threaded in Lean
+(`formal/CompactionSpill/Basic.lean`: no-store⟹no-handle, rejected⟹no record, only
+commit increments the count, committed handle resolves to its own payload). Lean does
+NOT claim CONCURRENCY binding — that is a Rust behavioral test today
+(`candidate_spill_store_binds_reserved_ids_under_an_interleaved_external_write`) and a
+B6 temporal model:
+
+```
+CandidateReserve
+  → CandidateSummarize
+  → ExternalStoreWrite
+  → CandidateValidate
+  → CandidateCommit | CandidateReject
+  → Fetch
+```
+
+Required TLA+ properties:
+
+```
+EveryEmittedHandleResolves
+EveryHandleResolvesToItsOwnPayload
+NoStoreMeansNoHandle
+RejectedCandidateLeavesNoRecord
+ConcurrentWritesDoNotRebindReservedHandles
+CommittedCountsReflectCommittedPayloadsOnly
+NoLiveInputBeforeSpillCommit
+```
+
 ## Reuse discipline
 
 - Estimator: B1 `estimate_responses_request_real_tokens` /

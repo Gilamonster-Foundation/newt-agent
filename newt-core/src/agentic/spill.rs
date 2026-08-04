@@ -27,40 +27,95 @@ pub const TOOL_RESULT_SPILL_CAP: usize = 16_000;
 const HEAD_CHARS: usize = 800;
 const TAIL_CHARS: usize = 800;
 
-/// A session store for offloaded (already-redacted) tool payloads (Step 26.3).
-///
-/// Methods take `&self` (interior mutability) so a single shared
-/// `&dyn SpillStore` serves BOTH the loop's write path and the `memory_fetch`
-/// read path without the `&mut dyn _` reborrow/invariance dance.
+/// A reserved-but-not-yet-committed spill id (#1528 B3). The STORE allocates it, so
+/// it is unique even under concurrent activity; the payload is installed later via
+/// [`SpillStore::commit_reserved`] under the SAME id. A reservation that is never
+/// committed leaves NO fetchable record and does NOT count as a committed spill —
+/// its allocated id is simply retired (an internal gap), never reused, never
+/// resolvable.
+#[derive(Debug)]
+pub struct ReservedSpill {
+    id: String,
+}
+
+impl ReservedSpill {
+    /// Construct a reservation for a store-allocated `id`. For SpillStore
+    /// IMPLEMENTORS only — a store issues these from its OWN allocator inside
+    /// [`SpillStore::reserve`]; callers must never fabricate one to predict an id.
+    #[must_use]
+    pub fn new(id: String) -> Self {
+        Self { id }
+    }
+
+    /// The stable id to render into the candidate summary — the SAME id the payload
+    /// is installed under at commit. This is the ONLY id anything should embed; it
+    /// is issued by the store, never predicted.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// A session store for offloaded / evicted (already-redacted) payloads. Methods take
+/// `&self` (interior mutability) so a single shared `&dyn SpillStore` serves BOTH the
+/// loop's write path and the `memory_fetch` read path without the `&mut dyn _`
+/// reborrow/invariance dance. #1528 B3 adds `reserve` / `commit_reserved` so a spill
+/// can be STAGED (id allocated) and committed transactionally.
 pub trait SpillStore: Send + Sync {
-    /// Store an already-redacted payload; returns its `spill:` id.
+    /// Store an already-redacted payload immediately; returns its id. Equivalent to
+    /// [`Self::reserve`] then [`Self::commit_reserved`] in one atomic-enough call.
     fn store(&self, redacted: String) -> String;
-    /// Fetch a stored payload by id (`None` if unknown / expired).
+    /// Fetch a stored payload by id (`None` if unknown / uncommitted / expired).
     fn fetch(&self, id: &str) -> Option<String>;
-    /// Number of payloads offloaded this session (for `/context stats`).
+    /// Number of COMMITTED payloads this session (reservations excluded).
     fn spills(&self) -> u64;
-    /// Total chars elided from context by offloading (for `/context stats`).
+    /// Total chars of COMMITTED payloads elided from context.
     fn offloaded_chars(&self) -> u64;
+    /// Reserve a stable, unique id NOW for a payload committed later — the store owns
+    /// allocation (never predicted by a caller). A reservation is NOT fetchable and
+    /// does NOT count as a committed spill until [`Self::commit_reserved`].
+    fn reserve(&self) -> ReservedSpill;
+    /// Install a reserved payload under its reserved id (COMMIT). Infallible by
+    /// construction, so it can be the last step of a wider transaction.
+    fn commit_reserved(&self, reservation: ReservedSpill, redacted: String);
 }
 
 /// In-memory, session-scoped [`SpillStore`] — pure (no filesystem), discarded at
 /// session end / `/new`. Ids are monotonic (`s0`, `s1`, …) so injected handles
-/// are deterministic and unit-testable (no uuid, no clock).
+/// are deterministic and unit-testable (no uuid, no clock). Allocation
+/// (`alloc_counter`, bumped by `reserve`) is split from the committed count
+/// (`committed`, bumped only by `commit_reserved`), so a reservation reserves a
+/// unique id without counting as a spill.
 #[derive(Default)]
 pub struct SessionSpillStore {
     map: Mutex<HashMap<String, String>>,
-    counter: AtomicU64,
+    alloc_counter: AtomicU64,
+    committed: AtomicU64,
     offloaded_chars: AtomicU64,
 }
 
 impl SpillStore for SessionSpillStore {
     fn store(&self, redacted: String) -> String {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        let id = format!("s{n}");
+        let reservation = self.reserve();
+        let id = reservation.id().to_string();
+        self.commit_reserved(reservation, redacted);
+        id
+    }
+
+    fn reserve(&self) -> ReservedSpill {
+        // Atomic bump → a globally unique id even under concurrent reservations /
+        // stores; NOT counted as a committed spill.
+        let n = self.alloc_counter.fetch_add(1, Ordering::Relaxed);
+        ReservedSpill {
+            id: format!("s{n}"),
+        }
+    }
+
+    fn commit_reserved(&self, reservation: ReservedSpill, redacted: String) {
         self.offloaded_chars
             .fetch_add(redacted.chars().count() as u64, Ordering::Relaxed);
-        self.map.lock().unwrap().insert(id.clone(), redacted);
-        id
+        self.map.lock().unwrap().insert(reservation.id, redacted);
+        self.committed.fetch_add(1, Ordering::Relaxed);
     }
 
     fn fetch(&self, id: &str) -> Option<String> {
@@ -68,7 +123,7 @@ impl SpillStore for SessionSpillStore {
     }
 
     fn spills(&self) -> u64 {
-        self.counter.load(Ordering::Relaxed)
+        self.committed.load(Ordering::Relaxed)
     }
 
     fn offloaded_chars(&self) -> u64 {
@@ -135,6 +190,37 @@ mod tests {
         assert_eq!(s.fetch("s99"), None, "unknown id → None, no panic");
         assert_eq!(s.spills(), 2);
         assert_eq!(s.offloaded_chars(), 9); // "alpha"(5) + "beta"(4)
+    }
+
+    #[test]
+    fn reservation_allocates_a_unique_id_but_does_not_count_until_committed() {
+        // #1528 B3: reserve() allocates a unique id (store-owned) but is NOT a
+        // committed spill and NOT fetchable until commit_reserved; a dropped
+        // (rejected) reservation leaves no record and does not bump the count.
+        let s = SessionSpillStore::default();
+        let r0 = s.reserve();
+        let r1 = s.reserve();
+        let (id0, id1) = (r0.id().to_string(), r1.id().to_string());
+        assert_ne!(id0, id1, "reservations get unique ids");
+        assert_eq!(
+            s.spills(),
+            0,
+            "reserve does NOT increment the committed count"
+        );
+        assert_eq!(s.fetch(&id0), None, "a reservation is not fetchable");
+        // Commit r0; reject (drop) r1.
+        s.commit_reserved(r0, "committed payload".to_string());
+        drop(r1);
+        assert_eq!(s.spills(), 1, "only commit increments the committed count");
+        assert_eq!(s.fetch(&id0).as_deref(), Some("committed payload"));
+        assert_eq!(
+            s.fetch(&id1),
+            None,
+            "a rejected reservation leaves no record"
+        );
+        // A later store() must not reuse the retired id1 (allocator is monotonic).
+        let id2 = s.store("later".to_string());
+        assert_ne!(id2, id1, "a retired reservation id is never reused");
     }
 
     #[test]
