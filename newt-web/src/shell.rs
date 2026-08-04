@@ -103,51 +103,38 @@ const STYLE: &str = r#"
   .md a { color: inherit; }
   form.prompt { display: flex; gap: 0.5rem; padding: 0.5rem 0.75rem; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
   form.prompt input[name=text] { flex: 1; }
-  /* A4: the pending permission-decision card (danger-gated buttons). */
+  /* A4: pending typed permission form. */
   .perm { margin: 0.5rem 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); display: grid; gap: 0.35rem; }
-  .perm-high { border-color: #d9534f; background: color-mix(in srgb, #d9534f 10%, transparent); }
   .perm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
-  .perm .tier { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; padding: 0.05em 0.4em; border-radius: 3px; }
-  .perm .tier-high { background: #d9534f; color: #fff; }
-  .perm .tier-low { background: color-mix(in srgb, currentColor 20%, transparent); }
-  .perm-reason { opacity: 0.75; font-size: 0.8rem; }
   .perm-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
 "#;
 
-/// The pending-permission card for an attach tab (A4/W6): what an operator
-/// answers when the running session's gate needs a decision. The danger tier is
-/// GATE-STAMPED (never computed here), and it gates the buttons — a high-danger
-/// target offers only allow-once / deny, never a standing session grant (the
-/// same menu omission the TTY prompt applies). A web grant is ephemeral; there
-/// is deliberately no "always-allow".
+/// Render exactly the Markdown and actions published by the running gate.
 pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingPermission) -> String {
-    let Ok(req) = serde_json::from_str::<newt_core::PermissionRequest>(&p.requests_json) else {
+    let Ok(question) = p.question() else {
         return String::new();
     };
-    let high = p.danger_json.to_ascii_lowercase().contains("high");
     let rid = escape(&p.request_id);
-    let btn = |verdict: &str, label: &str| {
-        format!(
-            r##"<button hx-post="/agents/{id}/decision" hx-vals='{{"request_id":"{rid}","verdict":"{verdict}"}}' hx-swap="none">{label}</button>"##
-        )
-    };
-    let mut actions = String::new();
-    actions.push_str(&btn("allow_once", "allow once"));
-    if !high {
-        actions.push_str(&btn("allow_session", "allow session"));
-    }
-    actions.push_str(&btn("deny", "deny"));
-    let tier = if high { "high" } else { "low" };
+    let actions = question
+        .actions
+        .iter()
+        .map(|action| format!(
+            r##"<button hx-post="/agents/{id}/decision" hx-vals='{{"request_id":"{rid}","verdict":"{}"}}' hx-swap="none">{}</button>"##,
+            action.value.as_str(), escape(&action.label)
+        ))
+        .collect::<String>();
+    let note = question
+        .note
+        .as_deref()
+        .map(render_markdown)
+        .unwrap_or_default();
     format!(
-        r##"<div class="perm perm-{tier}">
-<div class="perm-head"><strong>Permission needed</strong> <span class="tier tier-{tier}">{tier} danger</span></div>
-<div class="perm-target">{tool} → <code>{target}</code></div>
-<div class="perm-reason">{reason}</div>
+        r##"<div class="perm">
+<div class="perm-head"><strong>Permission needed</strong></div>
+<div class="md">{body}{note}</div>
 <div class="perm-actions">{actions}</div>
 </div>"##,
-        tool = escape(&req.tool),
-        target = escape(&req.target),
-        reason = escape(&req.reason),
+        body = render_markdown(&question.markdown),
     )
 }
 

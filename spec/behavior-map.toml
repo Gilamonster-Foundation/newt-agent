@@ -466,3 +466,169 @@ conformance = "partial"
 [[BHV-RECOVERY-004.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_is_bounded_to_two_nudges"
+
+# ─────────────────── Prompt / action contract (PR #1520) ─────────────────────
+# The unified prompt/action contract across TUI and web: the published Question
+# form is the ONLY source of authorizable actions, local controls and the web
+# decision path resolve a prompt exactly once, and every resolution is
+# fail-closed. Temporal model: spec/tla/PromptControls.tla (its cfg keeps
+# AllowSession in Actions but OUT of Displayed — the decoy that makes
+# AuthorizationDisplayed non-vacuous). Lean kernel: NewtPolicy.PromptForm.
+# All artifacts land on PR #1520 itself, so no pending_pr markers. NOTE:
+# ExitIsTerminal is a temporal PROPERTY in the cfg, not an INVARIANT — it is
+# deliberately not referenced here.
+
+[BHV-PROMPT-001]
+description = "Only a displayed action can authorize: an action absent from the published form is rejected by the parser, the store revalidation, and the web route — and the request stays pending."
+[BHV-PROMPT-001.status]
+lean = "proven"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-PROMPT-001.refs.lean]]
+module = "NewtPolicy.PromptForm"
+symbol = "authorization_sound"
+[[BHV-PROMPT-001.refs.lean]]
+module = "NewtPolicy.PromptForm"
+symbol = "hidden_action_rejected"
+[[BHV-PROMPT-001.refs.tla]]
+spec = "PromptControls"
+invariant = "AuthorizationDisplayed"
+[[BHV-PROMPT-001.refs.rust_tests]]
+path = "newt-core/src/tty/widgets/question.rs"
+symbol = "tests::an_alias_cannot_select_an_action_absent_from_the_question"
+[[BHV-PROMPT-001.refs.rust_tests]]
+path = "newt-core/src/store.rs"
+symbol = "tests::permission_channel_publish_answer_take_race_and_fence"
+[[BHV-PROMPT-001.refs.rust_tests]]
+path = "newt-web/src/main.rs"
+symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
+[[BHV-PROMPT-001.refs.production]]
+path = "newt-core/src/store.rs"
+symbol = "answer_permission_action"
+[[BHV-PROMPT-001.refs.production]]
+path = "newt-core/src/tty/widgets/question.rs"
+symbol = "parse"
+
+[BHV-PROMPT-002]
+description = "Local prompt controls are immediate and distinct: Esc cancels back to chat without a decision; Ctrl-C/Ctrl-D exit; no control ever authorizes an action."
+[BHV-PROMPT-002.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-PROMPT-002.refs.tla]]
+spec = "PromptControls"
+invariant = "EscCancels"
+[[BHV-PROMPT-002.refs.tla]]
+spec = "PromptControls"
+invariant = "ControlsExit"
+# Tier metadata (advisory, #1536): `tier` distinguishes a per-PR gating test
+# (`unit` — runs in ci.yml's `cargo test --workspace`) from a weekly/release
+# integration test (`integration` — `#[ignore]`d out of the per-PR run, executed
+# single-threaded by .github/workflows/newt-tui-pty.yml). It makes explicit that
+# BHV-PROMPT-002's real-PTY grounding does NOT gate every PR while its mocked
+# reader tests DO — so an ignored test never looks like a per-PR gate. Mechanical
+# enforcement (linter cross-check that an `#[ignore]`d ref is `tier=integration`)
+# is the tracked follow-up when tier metadata lands in the linter.
+[[BHV-PROMPT-002.refs.rust_tests]]
+path = "newt-tui/src/prompt_visibility_test.rs"
+symbol = "permission_prompt_controls_are_immediate_and_distinct"
+tier = "integration"
+[[BHV-PROMPT-002.refs.rust_tests]]
+path = "newt-tui/src/permissions.rs"
+symbol = "permission_prompt_tests::ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit"
+tier = "unit"
+[[BHV-PROMPT-002.refs.rust_tests]]
+path = "newt-tui/src/permissions.rs"
+symbol = "permission_prompt_tests::nested_controls_cancel_without_recording_a_permission_decision"
+tier = "unit"
+[[BHV-PROMPT-002.refs.production]]
+path = "newt-core/src/tty/modal.rs"
+symbol = "prompt_control"
+
+[BHV-PROMPT-003]
+description = "A prompt resolves exactly once with a single winner: a local abort and a web decision are mutually exclusive, and the reader-independent timeout denies without authorizing."
+# SingleWinner is a per-state outcome-shape predicate (no history variable):
+# the exactly-once claim at the store is carried by the Rust refs; a model-side
+# strengthening (a resolutions counter) is a proposed follow-up, not claimed.
+[BHV-PROMPT-003.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-PROMPT-003.refs.tla]]
+spec = "PromptControls"
+invariant = "SingleWinner"
+[[BHV-PROMPT-003.refs.tla]]
+spec = "PromptControls"
+invariant = "TimeoutNeverAuthorizes"
+[[BHV-PROMPT-003.refs.rust_tests]]
+path = "newt-tui/src/permissions.rs"
+symbol = "permission_prompt_tests::web_verdict_and_local_control_resolve_exactly_once"
+[[BHV-PROMPT-003.refs.rust_tests]]
+path = "newt-tui/src/permissions.rs"
+symbol = "permission_prompt_tests::web_decision_timeout_resolves_and_denies_without_hanging"
+[[BHV-PROMPT-003.refs.rust_tests]]
+path = "newt-core/src/store.rs"
+symbol = "tests::permission_channel_publish_answer_take_race_and_fence"
+[[BHV-PROMPT-003.refs.production]]
+path = "newt-core/src/store.rs"
+symbol = "take_permission_decision"
+
+[BHV-PROMPT-004]
+description = "A transient control-reader failure neither authorizes nor resolves the prompt; recovery re-arms the local controls; the web decision path stays available while the reader retries."
+[BHV-PROMPT-004.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-PROMPT-004.refs.tla]]
+spec = "PromptControls"
+invariant = "ReaderErrorNeverAuthorizes"
+[[BHV-PROMPT-004.refs.tla]]
+spec = "PromptControls"
+invariant = "RecoveryReArmsControls"
+[[BHV-PROMPT-004.refs.rust_tests]]
+path = "newt-tui/src/permissions.rs"
+symbol = "permission_prompt_tests::transient_reader_error_recovers_and_esc_resolves_through_the_tty_path"
+[[BHV-PROMPT-004.refs.rust_tests]]
+path = "newt-tui/src/permissions.rs"
+symbol = "permission_prompt_tests::transient_reader_error_does_not_deny_when_a_web_verdict_arrives"
+[[BHV-PROMPT-004.refs.rust_tests]]
+path = "newt-tui/src/permissions.rs"
+symbol = "permission_prompt_tests::reader_failing_until_deadline_denies_without_busy_spin"
+
+[BHV-PROMPT-005]
+description = "TUI and web render and accept decisions from ONE serialized Question form: the wire actions are the rendered actions on both surfaces; aliases parse but are never rendered and never widen the action set."
+[BHV-PROMPT-005.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-PROMPT-005.refs.rust_tests]]
+path = "newt-core/src/tty/widgets/question.rs"
+symbol = "tests::aliased_action_round_trips"
+[[BHV-PROMPT-005.refs.rust_tests]]
+path = "newt-core/src/tty/widgets/question.rs"
+symbol = "tests::aliases_are_not_rendered_in_terminal_text"
+[[BHV-PROMPT-005.refs.rust_tests]]
+path = "newt-core/src/tty/widgets/question.rs"
+symbol = "tests::value_wire_name_still_matches"
+[[BHV-PROMPT-005.refs.rust_tests]]
+path = "newt-web/src/main.rs"
+symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
+[[BHV-PROMPT-005.refs.production]]
+path = "newt-core/src/store.rs"
+symbol = "publish_permission_question"
+[[BHV-PROMPT-005.refs.production]]
+path = "newt-core/src/store.rs"
+symbol = "question"
+[[BHV-PROMPT-005.refs.production]]
+path = "newt-core/src/tty/widgets/question.rs"
+symbol = "terminal_text"

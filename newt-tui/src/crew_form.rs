@@ -8,49 +8,12 @@
 //! NOT a ratatui widget surface. The whole flow is parameterised over a
 //! `Console`, so it is exercised end-to-end with a scripted answer queue.
 
-use std::io::{self, Write};
+use crate::line_console::{is_yes, Console, StdinConsole};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use newt_core::config::{Crew, CrewBudgets};
 use newt_core::Config;
-
-// ---------------------------------------------------------------------------
-// Console abstraction (real stdin/stdout vs. scripted answers in tests)
-// ---------------------------------------------------------------------------
-
-/// Line-based console I/O (mirrors `setup::Console`). The real impl talks to
-/// stdin/stdout; tests feed a queue of answers and capture emitted lines.
-pub trait Console {
-    /// Print `prompt` (no trailing newline) and read one trimmed line.
-    fn ask(&mut self, prompt: &str) -> io::Result<String>;
-    /// Emit an informational line.
-    fn say(&mut self, line: &str);
-}
-
-/// Real console: prompts on stdout, reads a line from stdin.
-struct StdinConsole;
-
-impl Console for StdinConsole {
-    fn ask(&mut self, prompt: &str) -> io::Result<String> {
-        print!("{prompt}");
-        io::stdout().flush()?;
-        let mut buf = String::new();
-        if io::stdin().read_line(&mut buf)? == 0 {
-            // EOF (piped/closed input): behave like an empty answer so the
-            // caller's "keep current" default kicks in instead of looping.
-            return Ok(String::new());
-        }
-        Ok(buf.trim().to_string())
-    }
-
-    fn say(&mut self, line: &str) {
-        println!("{line}");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 
 /// `~/.newt/crews/` (next to `config.toml`). Falls back to `./crews` when the
 /// home config path can't be resolved.
@@ -262,15 +225,6 @@ fn save_crew(dir: &Path, name: &str, crew: &Crew) -> anyhow::Result<PathBuf> {
     let path = dir.join(format!("{name}.toml"));
     std::fs::write(&path, toml::to_string_pretty(crew)?)?;
     Ok(path)
-}
-
-/// `[Y/n]`-style yes/no with a default for the empty answer.
-fn is_yes(input: &str, default: bool) -> bool {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        _ => default,
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -24,9 +24,58 @@
 //! grant is a human editing `[tui.permissions]`.
 
 use crate::caveats::{Caveats, Scope};
+use crate::store::Verdict;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::Path;
+
+macro_rules! permission_actions {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        /// A stable, serializable permission-form action shared by every UI surface.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum PermissionAction {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+        impl PermissionAction {
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+        }
+        impl AsRef<str> for PermissionAction {
+            fn as_ref(&self) -> &str { self.as_str() }
+        }
+    };
+}
+
+permission_actions! {
+    AllowOnce => "allow_once", AllowSession => "allow_session",
+    AllowPermanent => "allow_permanent", Deny => "deny",
+    DenyAlways => "deny_always", DenyPermanent => "deny_permanent",
+    Back => "back", Exit => "exit",
+}
+
+impl From<Verdict> for PermissionAction {
+    fn from(value: Verdict) -> Self {
+        match value {
+            Verdict::AllowOnce => Self::AllowOnce,
+            Verdict::AllowSession => Self::AllowSession,
+            Verdict::Deny => Self::Deny,
+        }
+    }
+}
+
+impl TryFrom<PermissionAction> for Verdict {
+    type Error = ();
+
+    fn try_from(value: PermissionAction) -> Result<Self, Self::Error> {
+        match value {
+            PermissionAction::AllowOnce => Ok(Self::AllowOnce),
+            PermissionAction::AllowSession => Ok(Self::AllowSession),
+            PermissionAction::Deny => Ok(Self::Deny),
+            _ => Err(()),
+        }
+    }
+}
 
 /// The capability axis a denial occurred on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -181,6 +230,34 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// The outcome of asking the human a free-text question through
+/// [`PermissionGate::ask_question`]. Replaces a lossy `Option<String>` that
+/// collapsed a real answer, an absent operator, Esc/back, Ctrl-C/Ctrl-D exit,
+/// stdin EOF, and an input I/O failure into two indistinguishable cases — which
+/// made `request_user_input` report a deliberate operator cancel/exit to the
+/// model as "running headless". Each variant below is a distinct, truthful
+/// outcome, and every non-[`Answer`](HumanQuestionOutcome::Answer) variant fails
+/// closed for security-sensitive callers (only an `Answer` may authorize).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HumanQuestionOutcome {
+    /// The operator submitted a line (possibly empty — an explicitly submitted
+    /// empty line is `Answer(String::new())`, which is NOT the input stream
+    /// closing; that is [`InputClosed`](HumanQuestionOutcome::InputClosed)).
+    Answer(String),
+    /// The gate exists but has no interactive operator to consult this session
+    /// (e.g. no attached TTY). Distinct from "no gate at all" — the caller must
+    /// not claim the process is headless unless that is actually known.
+    Unavailable,
+    /// The operator pressed Esc / backed out (turn cancellation applied).
+    Cancelled,
+    /// The operator pressed Ctrl-C / Ctrl-D (turn cancellation AND exit applied).
+    ExitRequested,
+    /// The operator's input stream reached EOF before an answer was provided.
+    InputClosed,
+    /// Reading operator input failed (I/O error); no answer was provided.
+    InputFailed,
+}
+
 /// The interactive human-interface seam (mirrors `NoteSink` / `RecallSource`):
 /// the one gate the agentic loop consults whenever it must reach the human. It
 /// carries two distinct interactions that share the same operator presence:
@@ -203,15 +280,17 @@ pub trait PermissionGate {
     /// request was allowed; any single deny keeps the whole denial.
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision;
 
-    /// #728: ask the human a free-text `question` and return their typed
-    /// answer — the GENERIC ask-the-human primitive behind the
+    /// #728: ask the human a free-text `question` and return a typed
+    /// [`HumanQuestionOutcome`] — the GENERIC ask-the-human primitive behind the
     /// `request_user_input` tool. Distinct from [`PermissionGate::ask`], which
     /// decides capability grants: `ask` can widen authority, `ask_question`
-    /// only gathers text. Returns `None` when there is no human to consult
-    /// (no interactive operator this session, or stdin closed) so the caller
-    /// degrades to a recoverable "no human available" result instead of
-    /// blocking — a headless caller must NEVER hang on it.
-    fn ask_question(&mut self, question: &str) -> Option<String>;
+    /// only gathers text. The typed outcome distinguishes a real answer from an
+    /// absent operator, an Esc/back cancel, a Ctrl-C/Ctrl-D exit, stdin EOF, and
+    /// an input failure, so a caller never misreports a deliberate operator
+    /// cancel/exit as "running headless". A headless caller must NEVER hang on
+    /// it: implementations without an operator return
+    /// [`HumanQuestionOutcome::Unavailable`] rather than blocking.
+    fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome;
 }
 
 /// Build the widened *policy* for a re-mint: `base` with each grant's target
@@ -330,6 +409,34 @@ mod tests {
         assert_eq!(DenialKind::FsRead.as_str(), "fs_read");
         assert_eq!(DenialKind::FsWrite.as_str(), "fs_write");
         assert_eq!(DenialKind::Net.as_str(), "net");
+    }
+
+    #[test]
+    fn permission_actions_have_stable_wire_values_and_verdict_conversions() {
+        let actions = [
+            PermissionAction::AllowOnce,
+            PermissionAction::AllowSession,
+            PermissionAction::AllowPermanent,
+            PermissionAction::Deny,
+            PermissionAction::DenyAlways,
+            PermissionAction::DenyPermanent,
+            PermissionAction::Back,
+            PermissionAction::Exit,
+        ];
+        assert_eq!(
+            serde_json::to_string(&actions).unwrap(),
+            r#"["allow_once","allow_session","allow_permanent","deny","deny_always","deny_permanent","back","exit"]"#
+        );
+        assert_eq!(
+            PermissionAction::from(Verdict::AllowOnce),
+            PermissionAction::AllowOnce
+        );
+        assert_eq!(
+            Verdict::try_from(PermissionAction::AllowSession),
+            Ok(Verdict::AllowSession)
+        );
+        assert_eq!(Verdict::try_from(PermissionAction::Deny), Ok(Verdict::Deny));
+        assert!(Verdict::try_from(PermissionAction::AllowPermanent).is_err());
     }
 
     #[test]

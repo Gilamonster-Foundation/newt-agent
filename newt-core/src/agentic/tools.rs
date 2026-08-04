@@ -9,13 +9,16 @@ use super::git_tool::GitTool;
 use super::mcp::McpTools;
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
-use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
+use super::permissions::{
+    DenialKind, HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
+};
 use super::prompt_intake::PromptDisposition;
 use super::prompt_read::{execute_prompt_read_silent, PromptReadContext};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
 use super::spill::{self, SpillStore};
 use crate::caveats::CaveatsExt as _;
+use crate::{Action, PermissionAction, Question};
 #[cfg(test)]
 use output_budget::DEFAULT_MAX_OUTPUT_TOKENS;
 #[cfg(test)]
@@ -1117,11 +1120,29 @@ fn confirm_unrestricted_fs_mutation(
     if ocap_disabled() {
         return true;
     }
+    let prompt = mutation_confirm_question(question);
     match gate {
-        Some(g) => g
-            .ask_question(question)
-            .is_some_and(|answer| answer.trim().eq_ignore_ascii_case("y")),
+        // ONLY an explicit answer parsed to AllowOnce authorizes the mutation.
+        // Every other outcome — no operator, Esc/Ctrl-C/Ctrl-D, EOF, input
+        // failure, or a non-"y" answer — fails closed (mutation denied).
+        Some(g) => match g.ask_question(&prompt.terminal_text()) {
+            HumanQuestionOutcome::Answer(answer) => {
+                prompt.parse(&answer) == Some(PermissionAction::AllowOnce)
+            }
+            _ => false,
+        },
         None => false,
+    }
+}
+
+fn mutation_confirm_question(question: &str) -> Question<PermissionAction> {
+    Question {
+        markdown: question.to_string(),
+        actions: vec![
+            Action::new(PermissionAction::AllowOnce, "y", "y to confirm").with_aliases(["Y"]),
+            Action::new(PermissionAction::Deny, "n", "n to skip").with_aliases(["N"]),
+        ],
+        note: None,
     }
 }
 
@@ -1728,20 +1749,39 @@ fn execute_request_permissions(
     out
 }
 
-/// #728: returned by `request_user_input` when there is no human to ask — either
-/// no interactive gate this session (headless / eval / ACP / piped) or the gate
-/// has no operator available (`ask_question` returned `None`). A recoverable
-/// signal the model can act on, NEVER a hang.
+/// #728: returned by `request_user_input` when there is NO interactive gate this
+/// session (headless / eval / ACP / piped) — the process genuinely has no human
+/// interface. A recoverable signal the model can act on, NEVER a hang. When a
+/// gate IS present but reports an outcome other than an answer, one of the
+/// specific messages below is returned instead — a deliberate operator cancel or
+/// exit must never be misreported as "running headless".
 const HEADLESS_NO_HUMAN: &str = "no human available this session (running headless) \
     — proceed with your best judgment or state your assumption explicitly.";
+/// Gate present but no interactive operator to answer this session. Does NOT
+/// claim the process is headless (that is not known from here).
+const NO_OPERATOR_AVAILABLE: &str = "no operator is available to answer this session \
+    — proceed with your best judgment or state your assumption explicitly.";
+/// The operator pressed Esc / backed out of the question.
+const OPERATOR_CANCELLED: &str = "the operator cancelled this question; no answer was provided.";
+/// The operator pressed Ctrl-C / Ctrl-D.
+const OPERATOR_EXIT_REQUESTED: &str = "the operator requested exit; stop the current interaction.";
+/// The operator's input stream closed (EOF) before an answer was provided.
+const OPERATOR_INPUT_CLOSED: &str =
+    "the operator input stream closed before an answer was provided.";
+/// Reading operator input failed; no answer was provided.
+const OPERATOR_INPUT_FAILED: &str = "operator input failed; no answer was provided.";
 
 /// #728: the model-facing `request_user_input` tool — the GENERIC ask-the-human
 /// path. It surfaces a free-text `question` to the operator through the SAME
 /// human-interface gate a permission prompt uses ([`PermissionGate::ask_question`])
-/// and returns the typed answer. With an operator present the answer is returned
-/// verbatim; with NO gate (headless / eval / ACP / piped) — or when the gate has
-/// no human to consult (`ask_question` returns `None`) — it returns the
-/// [`HEADLESS_NO_HUMAN`] message and NEVER blocks.
+/// and returns a truthful, model-facing string for each typed
+/// [`HumanQuestionOutcome`]. With an operator present the answer is returned
+/// verbatim; with NO gate (headless / eval / ACP / piped) it returns
+/// [`HEADLESS_NO_HUMAN`]; a deliberate operator cancel/exit, an unavailable
+/// operator, EOF, or an input failure each get their own honest message — never
+/// "headless". It NEVER blocks. The turn-cancel / process-exit flags remain
+/// authoritative inside the gate; this returned text is still required to be
+/// truthful in case it is logged or reaches the model before cancellation.
 ///
 /// Reconciliation with #721: this is the free-text Q&A path; `request_permissions`
 /// is the capability-GRANT path (it mints caveats via the gate). Both surface to
@@ -1761,12 +1801,19 @@ fn execute_request_user_input(
             .to_string();
     }
 
-    // `Some(answer)` from the gate → return it verbatim; a `None` gate (headless)
-    // OR an `ask_question` that returns `None` (no human to consult) → the
-    // recoverable headless message. Either way we never block without an answer.
-    match gate.and_then(|g| g.ask_question(question)) {
-        Some(answer) => answer,
-        None => HEADLESS_NO_HUMAN.to_string(),
+    // No gate at all ⇒ the process is genuinely headless. Otherwise consult the
+    // gate and translate its typed outcome into a truthful, distinct message —
+    // an operator cancel/exit is NOT "headless".
+    let Some(gate) = gate else {
+        return HEADLESS_NO_HUMAN.to_string();
+    };
+    match gate.ask_question(question) {
+        HumanQuestionOutcome::Answer(answer) => answer,
+        HumanQuestionOutcome::Unavailable => NO_OPERATOR_AVAILABLE.to_string(),
+        HumanQuestionOutcome::Cancelled => OPERATOR_CANCELLED.to_string(),
+        HumanQuestionOutcome::ExitRequested => OPERATOR_EXIT_REQUESTED.to_string(),
+        HumanQuestionOutcome::InputClosed => OPERATOR_INPUT_CLOSED.to_string(),
+        HumanQuestionOutcome::InputFailed => OPERATOR_INPUT_FAILED.to_string(),
     }
 }
 
@@ -9512,9 +9559,9 @@ mod execute_tool_branch_tests {
             }
         }
         // #728: this gate exercises the GRANT path only; it has no human to
-        // answer free-text questions, so it returns None (a trivial impl).
-        fn ask_question(&mut self, _question: &str) -> Option<String> {
-            None
+        // answer free-text questions, so it reports no operator available.
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
         }
     }
 
@@ -10133,16 +10180,24 @@ mod execute_tool_branch_tests {
 
     // -- #728 request_user_input (generic ask-the-human) --------------------
 
-    /// A gate that answers a free-text question with a scripted answer (or None
-    /// for "no human"). Its grant path (`ask`) is irrelevant here — it denies.
+    /// A gate that answers a free-text question with a scripted
+    /// [`HumanQuestionOutcome`]. Its grant path (`ask`) is irrelevant here — it
+    /// denies.
     struct AskGate {
-        answer: Option<String>,
+        outcome: HumanQuestionOutcome,
         asked: Vec<String>,
     }
     impl AskGate {
+        /// `Some(answer)` → an answer; `None` → no operator available.
         fn new(answer: Option<&str>) -> Self {
+            let outcome = answer.map_or(HumanQuestionOutcome::Unavailable, |a| {
+                HumanQuestionOutcome::Answer(a.to_string())
+            });
+            Self::with_outcome(outcome)
+        }
+        fn with_outcome(outcome: HumanQuestionOutcome) -> Self {
             Self {
-                answer: answer.map(str::to_string),
+                outcome,
                 asked: Vec::new(),
             }
         }
@@ -10151,9 +10206,9 @@ mod execute_tool_branch_tests {
         fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             super::PermissionDecision::Deny
         }
-        fn ask_question(&mut self, question: &str) -> Option<String> {
+        fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
             self.asked.push(question.to_string());
-            self.answer.clone()
+            self.outcome.clone()
         }
     }
 
@@ -10176,6 +10231,25 @@ mod execute_tool_branch_tests {
     }
 
     #[test]
+    fn request_user_input_reaches_the_operator_even_when_permissions_are_denied() {
+        // Blocker: disabling permission prompts must NOT erase the operator. A
+        // gate whose authorization path denies (AskGate.ask → Deny) but which has
+        // a present human still answers request_user_input — never "headless".
+        let mut gate = AskGate::new(Some("postgres"));
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "which database?"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert_eq!(out, "postgres");
+        assert!(
+            !out.contains("headless"),
+            "a present operator is not headless: {out}"
+        );
+    }
+
+    #[test]
     fn request_user_input_no_gate_reports_headless_never_hangs() {
         // No gate (headless / eval / ACP) → the recoverable "no human available"
         // message — never a hang. (This test completing IS the no-hang proof: it
@@ -10191,17 +10265,95 @@ mod execute_tool_branch_tests {
     }
 
     #[test]
-    fn request_user_input_gate_with_no_human_reports_headless() {
-        // A gate present but with no human to consult (ask_question → None) →
-        // the SAME headless message, not a hang or an empty answer.
-        let mut gate = AskGate::new(None);
+    fn request_user_input_unavailable_reports_no_operator_not_headless() {
+        // A gate present but with no interactive operator (Unavailable) → the
+        // no-operator message, NOT "headless": only an absent gate is headless.
+        let mut gate = AskGate::with_outcome(HumanQuestionOutcome::Unavailable);
         let out = execute_request_user_input(
             &serde_json::json!({"question": "pick one"}),
             Some(&mut gate),
             false,
             20,
         );
-        assert_eq!(out, HEADLESS_NO_HUMAN);
+        assert_eq!(out, NO_OPERATOR_AVAILABLE);
+        assert!(
+            !out.contains("headless"),
+            "Unavailable must not say headless: {out}"
+        );
+    }
+
+    #[test]
+    fn request_user_input_cancelled_reports_cancel_not_headless() {
+        // Esc / slash back-out (Cancelled) → an explicit cancel message, never
+        // "headless" or "no human available" — the operator IS present.
+        let mut gate = AskGate::with_outcome(HumanQuestionOutcome::Cancelled);
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "pick one"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert_eq!(out, OPERATOR_CANCELLED);
+        assert!(!out.contains("headless"), "got: {out}");
+        assert!(!out.contains("no human available"), "got: {out}");
+    }
+
+    #[test]
+    fn request_user_input_exit_reports_exit_not_headless() {
+        // Ctrl-C / Ctrl-D (ExitRequested) → an explicit exit message, not headless.
+        let mut gate = AskGate::with_outcome(HumanQuestionOutcome::ExitRequested);
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "pick one"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert_eq!(out, OPERATOR_EXIT_REQUESTED);
+        assert!(!out.contains("headless"), "got: {out}");
+    }
+
+    #[test]
+    fn request_user_input_eof_is_not_an_empty_answer() {
+        // EOF (InputClosed) must NOT surface as an empty answer (""), and must
+        // not be reported as headless.
+        let mut gate = AskGate::with_outcome(HumanQuestionOutcome::InputClosed);
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "pick one"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert_eq!(out, OPERATOR_INPUT_CLOSED);
+        assert!(!out.is_empty(), "EOF must not become an empty answer");
+        assert!(!out.contains("headless"), "got: {out}");
+    }
+
+    #[test]
+    fn request_user_input_failure_is_distinct_from_headless() {
+        // An input I/O failure (InputFailed) is distinct from a headless session.
+        let mut gate = AskGate::with_outcome(HumanQuestionOutcome::InputFailed);
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "pick one"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert_eq!(out, OPERATOR_INPUT_FAILED);
+        assert_ne!(out, HEADLESS_NO_HUMAN);
+        assert!(!out.contains("headless"), "got: {out}");
+    }
+
+    #[test]
+    fn request_user_input_empty_answer_stays_an_empty_answer() {
+        // An explicitly submitted empty line is Answer("") — distinct from EOF.
+        let mut gate = AskGate::with_outcome(HumanQuestionOutcome::Answer(String::new()));
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "pick one"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert_eq!(out, "");
     }
 
     #[test]
@@ -10667,8 +10819,8 @@ mod execute_tool_branch_tests {
                     valid_for_generation: Scope::All,
                 })
             }
-            fn ask_question(&mut self, _question: &str) -> Option<String> {
-                None
+            fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+                HumanQuestionOutcome::Unavailable
             }
         }
         let ws = tempfile::TempDir::new().unwrap();
@@ -11583,6 +11735,73 @@ mod disable_ocap_tests {
         );
     }
 
+    /// Direct coverage of the fs-mutation confirm guard's parsing + fail-closed
+    /// contract, without the full `execute_tool` path. Proves defect 3 (uppercase
+    /// `Y` confirms again) and defect 2 (every non-answer outcome denies).
+    #[tokio::test]
+    async fn unrestricted_mutation_confirm_accepts_y_case_insensitively_and_fails_closed() {
+        let _l = env_lock().await;
+        let _off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        // fs_write = Scope::All → the guard actually prompts (does not bail true).
+        let caveats = Caveats::top();
+
+        struct ScriptGate(HumanQuestionOutcome);
+        impl super::PermissionGate for ScriptGate {
+            fn ask(&mut self, _r: &[super::PermissionRequest]) -> super::PermissionDecision {
+                super::PermissionDecision::Deny
+            }
+            fn ask_question(&mut self, _q: &str) -> HumanQuestionOutcome {
+                self.0.clone()
+            }
+        }
+
+        fn confirm(caveats: &Caveats, outcome: Option<HumanQuestionOutcome>) -> bool {
+            match outcome {
+                Some(o) => {
+                    let mut gate = ScriptGate(o);
+                    let mut g: Option<&mut dyn super::PermissionGate> = Some(&mut gate);
+                    confirm_unrestricted_fs_mutation(caveats, &mut g, "overwrite ~/x?")
+                }
+                None => {
+                    let mut g: Option<&mut dyn super::PermissionGate> = None;
+                    confirm_unrestricted_fs_mutation(caveats, &mut g, "overwrite ~/x?")
+                }
+            }
+        }
+
+        // defect 3: lowercase and uppercase Y both confirm.
+        assert!(confirm(
+            &caveats,
+            Some(HumanQuestionOutcome::Answer("y".into()))
+        ));
+        assert!(confirm(
+            &caveats,
+            Some(HumanQuestionOutcome::Answer("Y".into()))
+        ));
+        // any other answer denies (n, N, junk, empty).
+        for a in ["n", "N", "maybe", ""] {
+            assert!(
+                !confirm(&caveats, Some(HumanQuestionOutcome::Answer(a.into()))),
+                "answer {a:?} must not confirm the mutation"
+            );
+        }
+        // defect 2: every non-answer outcome fails closed (mutation denied).
+        for o in [
+            HumanQuestionOutcome::Unavailable,
+            HumanQuestionOutcome::Cancelled,
+            HumanQuestionOutcome::ExitRequested,
+            HumanQuestionOutcome::InputClosed,
+            HumanQuestionOutcome::InputFailed,
+        ] {
+            assert!(
+                !confirm(&caveats, Some(o.clone())),
+                "outcome {o:?} must fail closed"
+            );
+        }
+        // no gate at all → denied.
+        assert!(!confirm(&caveats, None));
+    }
+
     /// Non-yolo unrestricted fs mutations still ask, but through the
     /// PermissionGate question seam. In the TUI that seam owns
     /// PromptStdinGuard, so cbreak/VMIN=0 stdin cannot auto-answer "not y".
@@ -11596,9 +11815,12 @@ mod disable_ocap_tests {
             fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
                 super::PermissionDecision::Deny
             }
-            fn ask_question(&mut self, question: &str) -> Option<String> {
+            fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
                 self.questions.push(question.to_string());
-                self.answer.clone()
+                self.answer.clone().map_or(
+                    HumanQuestionOutcome::Unavailable,
+                    HumanQuestionOutcome::Answer,
+                )
             }
         }
 
@@ -11668,8 +11890,8 @@ mod disable_ocap_tests {
         assert_eq!(
             gate.questions,
             vec![
-                "Write this file? [y/N]".to_string(),
-                "Delete this file? [y/N]".to_string()
+                "Write this file? [y/N]\n[y] to confirm   [n] to skip".to_string(),
+                "Delete this file? [y/N]\n[y] to confirm   [n] to skip".to_string(),
             ]
         );
     }
@@ -11798,7 +12020,7 @@ mod disable_ocap_tests {
             fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
                 panic!("yolo exec must never prompt, but the gate was asked: {requests:?}");
             }
-            fn ask_question(&mut self, question: &str) -> Option<String> {
+            fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
                 panic!("yolo exec must never prompt, but the gate was asked: {question:?}");
             }
         }

@@ -1,89 +1,57 @@
-//! §6.5 — **the regression proof**: when the harness blocks on a human, the
-//! question must be the most recent thing on the terminal.
-//!
-//! # What this grounds
-//!
-//! This is the ground-truth tier — an add-on to the mocked unit tier, not a
-//! deviation from it. The arbiter's lease/suspend/erase behavior is covered by
-//! fast, deterministic mocked tests in `newt_core::tty`, but those encode what
-//! we *believe* a terminal does. "The prompt is visible" is a property of an
-//! actual terminal: no mock can observe one writer scribbling over another
-//! writer's bytes. This test drives a real PTY and reads the real byte stream,
-//! so it verifies those mocks are testing something real. Mocked stays the
-//! gate; this proves the gate is measuring reality.
-//!
-//! See CLAUDE.md, "Testing strategy" — every real-resource test records which
-//! mocked behavior it grounds.
-//!
-//! # The bug this pins
-//!
-//! A turn parks a spinner on the cursor line, then — 736 lines later, deep
-//! inside the same turn — a capability denial reaches
-//! `PromptPermissionGate::ask`, which calls `prompt_permission_choice`, which
-//! `print!`s the question with no `\r`, no `ESC[K` and no leading newline, and
-//! blocks in `read_line`. The question lands *appended to spinner chrome*, and
-//! then the spinner's own ticker redraws over it ~10x/second for as long as the
-//! operator is looking at the screen. The process is correctly blocked on a
-//! question the operator cannot see. There is no timeout. It waits forever.
-//!
-//! `gate.ask` has six call sites, so a per-site fix is whack-a-mole. This test
-//! drives the ONE seam they all funnel through
-//! (`newt-tui/src/permissions.rs`, `(self.ask_human)(...)`) with the
-//! *production* `prompt_permission_choice` wired in exactly as `chat.rs` wires
-//! it, and with a *production* `newt_core::tty::Spinner` live — the same
-//! spinner `stream_response` and the probe/compression waits construct.
-//!
-//! # Why a PTY, and why a child process
-//!
-//! The property under test is "what a human sees on a terminal". It is
-//! unobservable without one: the spinner refuses to paint at all unless it can
-//! own a line — correct behavior, and precisely why this bug never showed up in
-//! a piped test.
-//!
-//! The scenario runs in a **child process** (this same test binary, re-invoked
-//! with `--nocapture`) whose stdin and stdout are the pty. That is not
-//! ceremony: `cargo test` installs a thread-local capture that swallows
-//! `print!`, and `prompt_permission_choice` prints the question with `print!`.
-//! Run in-process, the question would vanish into the harness buffer and the
-//! test would "fail" for a reason that has nothing to do with the bug. In a
-//! child with `--nocapture`, every byte the production code writes lands on the
-//! pty, which is the only way this proves anything.
-//!
-//! No filesystem, no network, no real service — a pty pair and a re-exec of the
-//! test binary itself.
-//!
-//! # The assertion
-//!
-//! Everything is judged on the window between the question's first byte and the
-//! operator's keystroke — i.e. exactly while `read_line` is blocked:
-//!
-//! 1. the full multi-line question survives **contiguously** (not truncated to
-//!    its last row, which is all a single-line `ESC[K` can preserve);
-//! 2. **no braille glyph appears after the question starts** — nothing redrew
-//!    over it;
-//! 3. the `> ` menu is the **last thing written** before the human typed.
+//! Real-PTY regression tests for permission prompt behavior.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tests_pty::Pty;
 
 use crate::danger;
 use crate::permissions::{
-    permission_prompt_text, prompt_permission_choice, PermissionPromptState, PromptPermissionGate,
+    permission_question, prompt_permission_choice, PermissionPromptState, PromptPermissionGate,
 };
 use newt_core::caveats::{Caveats, CountBound, Scope};
 use newt_core::tty::{LineCaps, Sink, Spinner};
 use newt_core::{DenialKind, PermissionGate as _, PermissionRequest};
 
-/// The child test's fully-qualified name, used to re-invoke this binary.
 const CHILD_TEST: &str = "prompt_visibility_test::prompt_scenario_child";
 
-/// How long the "operator" takes to answer. Long enough that a 100 ms ticker
-/// gets several chances to redraw over the question — which is what it did.
 const HUMAN_THINKING_TIME: Duration = Duration::from_millis(600);
 
-/// The session's enforced authority: no net at all, so `example.com` denies and
-/// the gate prompts — the `tools.rs` `web_fetch` arm's precondition.
+fn wait_for_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    wait_for_child_nudging(child, timeout, || {})
+}
+
+/// Poll the child to exit, invoking `nudge` once per second while it hasn't.
+/// Kills (and reaps) the child at `timeout`.
+fn wait_for_child_nudging(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    mut nudge: impl FnMut(),
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        nudge();
+        let slice_end = std::cmp::min(std::time::Instant::now() + Duration::from_secs(1), deadline);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll prompt child") {
+                return Some(status);
+            }
+            if std::time::Instant::now() >= slice_end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            return None;
+        }
+    }
+}
+
 fn no_net_caveats() -> Caveats {
     Caveats {
         fs_read: Scope::only(["/ws".to_string()]),
@@ -95,8 +63,6 @@ fn no_net_caveats() -> Caveats {
     }
 }
 
-/// The request `web_fetch` builds when `!caveats.permits_net(&host)` — copied
-/// from the tool arm so this test tracks the real shape.
 fn web_fetch_request(host: &str) -> PermissionRequest {
     PermissionRequest {
         tool: "web_fetch".to_string(),
@@ -106,33 +72,86 @@ fn web_fetch_request(host: &str) -> PermissionRequest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The child: the scenario itself, run with fd 0/1 on a pty.
-// ---------------------------------------------------------------------------
-
-/// Not a test in its own right — the body of the scenario, invoked as a child
-/// process by [`a_permission_prompt_is_visible_and_survives_a_live_spinner`].
-/// `#[ignore]` keeps it out of a normal run; it does nothing unless the parent's
-/// env marker is set.
 #[test]
 #[ignore = "child process of the prompt-visibility regression test"]
 fn prompt_scenario_child() {
-    if std::env::var_os("NEWT_PROMPT_VISIBILITY_CHILD").is_none() {
+    let visibility = std::env::var_os("NEWT_PROMPT_VISIBILITY_CHILD").is_some();
+    let controls = std::env::var_os("NEWT_PROMPT_CONTROLS_CHILD").is_some();
+    let web_controls = std::env::var_os("NEWT_PROMPT_WEB_CONTROLS_CHILD").is_some();
+    if !visibility && !controls && !web_controls {
         return;
     }
 
-    // A live production spinner — the one `stream_response` and the probe /
-    // compression waits construct during a turn. It owns the bottom line and
-    // its shared ticker redraws it every 100 ms.
+    if controls {
+        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let question = permission_question(
+            &web_fetch_request("example.com"),
+            &danger::DangerTable::builtin(),
+        );
+        let choice = prompt_permission_choice(&window, &question);
+        drop(window);
+        println!("PROMPT-CONTROL:{choice:?}");
+        return;
+    }
+
+    if web_controls {
+        let root = tempfile::tempdir().expect("temp conversation root");
+        let workspace = tempfile::tempdir().expect("temp permission workspace");
+        let store = newt_core::ConversationStore::new(root.path(), workspace.path(), 100)
+            .expect("web store");
+        let conv = store
+            .create("conv-prompt-visibility-web", None)
+            .expect("conversation");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let request = web_fetch_request("example.com");
+        let mut state = PermissionPromptState::default();
+        state.web_store = Some(store);
+        {
+            let mut gate = PromptPermissionGate {
+                state: &mut state,
+                base: no_net_caveats(),
+                key_path: None,
+                conversation_id: conv,
+                log_path: None,
+                denials_path: None,
+                config_path: None,
+                preset_clamp: None,
+                danger: danger::DangerTable::builtin(),
+                color: true,
+                verbose: false,
+                // Far longer than the parent's 10s wait: this test asserts a
+                // control key ABORTS the web wait, so the fallback timeout must
+                // never win the race. On a starved CI runner a 2s deadline
+                // (wall-clock) could elapse before the child was scheduled to
+                // read the typed key, resolving as a spurious web-timeout Deny
+                // (`false:false`) instead of the control's cancel/exit. With 30s
+                // the control always wins if read within the parent's budget; a
+                // genuine "control never read" bug still fails (parent times out).
+                authorization_prompts_enabled: true,
+                web_decision_timeout: std::time::Duration::from_secs(30),
+                cancel: Some(cancel.as_ref()),
+                exit: Some(exit.as_ref()),
+                ask_human: prompt_permission_choice,
+            };
+            let _decision = gate.ask(std::slice::from_ref(&request));
+        }
+        println!(
+            "PROMPT-WEB-CONTROL:{:?}:{:?}:{:?}",
+            cancel.load(Ordering::Acquire),
+            exit.load(Ordering::Acquire),
+            state.decisions.len()
+        );
+        return;
+    }
+
     let spinner = Spinner::start_with_caps(LineCaps::Own, "thinking…", Sink::Stdout, true)
         .expect("the pty is a real terminal, so the spinner takes the line");
-    // Let it paint a few frames, exactly as it would mid-turn.
     std::thread::sleep(Duration::from_millis(250));
 
     let request = web_fetch_request("example.com");
     let mut state = PermissionPromptState::default();
     {
-        // Wired exactly as `chat.rs` wires the production gate.
         let mut gate = PromptPermissionGate {
             state: &mut state,
             base: no_net_caveats(),
@@ -145,25 +164,103 @@ fn prompt_scenario_child() {
             danger: danger::DangerTable::builtin(),
             color: true,
             verbose: false,
+            authorization_prompts_enabled: true,
             web_decision_timeout: std::time::Duration::from_secs(2),
+            cancel: None,
+            exit: None,
             ask_human: prompt_permission_choice,
         };
         let _decision = gate.ask(std::slice::from_ref(&request));
     }
-    // Stop the animation before exiting, so the capture is not extended by
-    // frames drawn after the operator already answered.
     drop(spinner);
 }
 
-// ---------------------------------------------------------------------------
-// The parent: allocate the pty, drive the child, judge the capture.
-// ---------------------------------------------------------------------------
+fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
+    let pty = Pty::open();
+    let mut child = std::process::Command::new(std::env::current_exe().expect("self test"))
+        .args(["--exact", child, "--ignored", "--nocapture"])
+        .env(env, "1")
+        .stdin(pty.slave_stdio())
+        .stdout(pty.slave_stdio())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn control child");
+    // Type only once the child's prompt is actually on screen. A fixed pre-type
+    // sleep raced the child's terminal setup on loaded CI runners: the key
+    // landed in cooked mode, was echoed (`^C`) and swallowed by the line
+    // discipline, and the web-decision timeout then resolved "Deny" instead of
+    // the control under test.
+    let armed_by = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let screen = pty.screen();
+        if screen.contains("example.com") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < armed_by,
+            "child never presented its prompt; screen={screen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The marker narrows the race but cannot close it alone: the TTY child's
+    // modal reader enters raw mode BEFORE rendering the question (its window
+    // only sets canonical mode), but the web child prints its banner just
+    // BEFORE its first reader arm — a sliver of cooked mode where Ctrl-C/
+    // Ctrl-D can still be eaten. So re-type the key each second until the
+    // child exits: a swallowed key is re-sent once the reader is armed (typed
+    // bytes are kernel-buffered across the raw-mode switch, never flushed),
+    // and an extra byte after resolution is simply never read. The 10s cap
+    // stays comfortably above the web-decision timeout so a genuinely
+    // non-immediate control still loses to it and fails the screen assertion.
+    let status = wait_for_child_nudging(&mut child, Duration::from_secs(10), || pty.type_in(key));
+    let screen = pty.screen();
+    assert!(
+        status.is_some_and(|s| s.success()) && screen.contains(expected),
+        "{key:?} {screen:?}"
+    );
+}
 
-/// Drive the scenario child on a real pty and judge what the terminal saw.
+/// Real-PTY grounding test for the prompt CONTROL keys — Esc→Back,
+/// Ctrl-C/Ctrl-D→Exit — on both the local-tty prompt and the web-wait prompt.
+/// Unlike the newline-terminated `"d\r"` of the visibility test (which the
+/// cooked-mode line discipline delivers deterministically), this types raw
+/// control BYTES that only take effect once the child's modal reader is in raw
+/// mode. Under the parallel per-PR load the child can be CPU-starved past that
+/// window, so a nudged byte is echoed (`^C`) and swallowed in cooked mode —
+/// making the test inherently non-deterministic in the multi-threaded unit run.
+/// It therefore lives in the single-threaded real-PTY tier
+/// (`.github/workflows/newt-tui-pty.yml`, weekly + release), NOT the per-PR
+/// `cargo test --workspace`, exactly as the output-oracle real tier is gated.
 ///
-/// The pty plumbing lives in `tests-pty` (#1410) — the slave becomes the
-/// child's stdin+stdout, the master is what the "operator" types on and what
-/// we read the screen from.
+/// It GROUNDS the mocked control-key unit tests (`permissions.rs` /
+/// `question.rs`: `Action` parse + `PermissionAction`/`HumanQuestionOutcome`
+/// mapping) — those assert the key→outcome mapping in memory; this proves a
+/// real terminal actually delivers the bytes that trigger it. See the CLAUDE.md
+/// testing tiers and the real-resource-migration issue #514.
+#[serial_test::serial(prompt_stdin)]
+#[test]
+#[ignore = "real-PTY control-byte tier; runs single-threaded in newt-tui-pty.yml (weekly/release), not the parallel per-PR gate — see doc comment"]
+fn permission_prompt_controls_are_immediate_and_distinct() {
+    for (key, tty, web) in [
+        ("\u{1b}", "Back", "true:false"),
+        ("\u{3}", "Exit", "true:true"),
+        ("\u{4}", "Exit", "true:true"),
+    ] {
+        prompt_control_child(
+            "NEWT_PROMPT_CONTROLS_CHILD",
+            &format!("PROMPT-CONTROL:{tty}"),
+            key,
+            CHILD_TEST,
+        );
+        prompt_control_child(
+            "NEWT_PROMPT_WEB_CONTROLS_CHILD",
+            &format!("PROMPT-WEB-CONTROL:{web}:"),
+            key,
+            CHILD_TEST,
+        );
+    }
+}
+
 #[serial_test::serial(prompt_stdin)]
 #[test]
 fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
@@ -180,72 +277,50 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
     .spawn()
     .expect("spawn the pty child");
 
-    // The operator reads the question, thinks, then denies.
     std::thread::sleep(HUMAN_THINKING_TIME);
-    pty.type_in("d\n");
+    pty.type_in("d\r");
 
-    let status = child.wait().expect("wait for the pty child");
+    let status = wait_for_child(&mut child, Duration::from_secs(2));
 
     let screen = pty.screen();
     assert!(
-        status.success(),
-        "the scenario child failed.\n\nscreen:\n{screen:?}"
+        status.is_some_and(|status| status.success()),
+        "child failed; screen={screen:?}"
     );
 
-    // --- the window under test: question's first byte .. operator's keystroke
-    let prompt_start = screen.find('⊘').unwrap_or_else(|| {
-        panic!("the question was never written to the terminal at all.\n\nscreen:\n{screen:?}")
-    });
+    let prompt_start = screen
+        .find('⊘')
+        .unwrap_or_else(|| panic!("question missing; screen={screen:?}"));
     let echo_rel = screen[prompt_start..]
         .find("d\r\n")
         .or_else(|| screen[prompt_start..].find("d\n"))
-        .unwrap_or_else(|| {
-            panic!(
-                "never saw the operator's keystroke echoed — the prompt did not \
-                 reach a blocking read.\n\nscreen:\n{screen:?}"
-            )
-        });
+        .unwrap_or_else(|| panic!("keystroke not echoed; screen={screen:?}"));
     let window = &screen[prompt_start..prompt_start + echo_rel];
 
-    let expected_prompt = permission_prompt_text(
+    let expected_prompt = permission_question(
         &web_fetch_request("example.com"),
         &danger::DangerTable::builtin(),
-    );
+    )
+    .terminal_text();
 
-    // (1) The FULL multi-line question survives, contiguously. A single-line
-    // `ESC[K` can only preserve the final menu row; the header rows would be
-    // stranded in scrollback, leaving a truncated question with no menu.
-    // The pty's ONLCR translates every `\n` the process wrote into `\r\n` on
-    // the wire, so compare against the same normalization.
     let window_lf = window.replace("\r\n", "\n");
     assert!(
         window_lf.contains(expected_prompt.trim_end()),
-        "the question did not survive intact.\n\n  expected:\n{expected_prompt:?}\n\n  \
-         on screen between the question and the keystroke:\n{window:?}"
+        "question not fully visible\nscreen={screen:?}"
     );
 
-    // (2) NOTHING redrew after the question started. This is the assertion that
-    // fails before the fix: the spinner's ticker paints a braille frame over
-    // the menu roughly ten times a second for as long as the operator reads.
     let intruders: Vec<char> = window
         .chars()
         .filter(|c| ('\u{2800}'..='\u{28FF}').contains(c))
         .collect();
     assert!(
         intruders.is_empty(),
-        "an ephemeral writer painted {} spinner frame(s) {:?} OVER the question \
-         while the operator was reading it — this is the reported hang: newt is \
-         correctly blocked on a question that has been scribbled out.\n\n  \
-         on screen:\n{window:?}",
-        intruders.len(),
-        intruders,
+        "expected no redraw after prompt appears\nscreen={screen:?}\nintruders={intruders:?}"
     );
 
-    // (3) The menu is the last thing written before the human typed.
     let visible_tail = window.trim_end_matches(|c: char| c.is_whitespace());
     assert!(
         visible_tail.ends_with('>'),
-        "the choice menu was not the last thing on screen when the read \
-         blocked.\n\n  on screen:\n{window:?}"
+        "menu missing before input\nscreen={screen:?}"
     );
 }
