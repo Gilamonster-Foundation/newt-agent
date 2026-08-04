@@ -19,9 +19,23 @@ name: newt-tui real-PTY tier (#1520)
 # integration.yml / output-oracle-real.yml, this workflow is intentionally
 # OUTSIDE pre-push-hook parity. A real-PTY subprocess tier is too slow/flaky for
 # a local push gate; the pre-push hook mirrors ci.yml (the per-PR unit tier)
-# only.
+# only. The path-filtered pull_request trigger below is a *scoped* PR gate — it
+# fires ONLY when terminal-control / permission / PTY code actually changes, so
+# a PR that alters that byte path proves the real terminal still delivers the
+# control keys, while every other PR stays on the fast unit tier. It is not a
+# fast changed-code hook and is not mirrored into .githooks/pre-push.
 
 on:
+  # Scoped PR gate: run the single-threaded real-PTY test when a PR touches the
+  # terminal-control / permission / reader byte path (Esc / Ctrl-C / Ctrl-D),
+  # since only a real terminal can prove those bytes reach the modal reader.
+  pull_request:
+    paths:
+      - "newt-tui/src/prompt_visibility_test.rs"
+      - "newt-tui/src/permissions.rs"
+      - "newt-core/src/tty/**"
+      - "newt-core/src/agentic/permissions.rs"
+      - ".github/workflows/newt-tui-pty.yml"
   schedule:
     # Weekly, Sunday 05:00 UTC — inside the low-cost window, off the
     # output-oracle (04:00) and nightly slots.

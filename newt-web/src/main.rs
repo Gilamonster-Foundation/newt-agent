@@ -245,6 +245,73 @@ struct DecisionForm {
 /// carries authority). A web grant is ephemeral — there is no durable
 /// "always-allow" (that is terminal-audit-only). 204 on accept, 404 for a tab
 /// that isn't an attach tab.
+/// The web decision boundary's typed result, preserved end to end so each case
+/// maps to a distinct, truthful HTTP status. Collapsing this to a bool is the
+/// bug #1536 fixes: a *losing* web answer (`AlreadyResolved`, or a request that
+/// is no longer the live one) must NOT report the 204 that a *winning* answer
+/// (`Answered`) does. Reporting 204 would let the browser tell the operator
+/// their decision was accepted when the terminal — or another tab — actually
+/// won the race, violating the single-winner authority contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecideOutcome {
+    /// The request the browser is answering is no longer the live pending one —
+    /// the terminal or a prior web answer already resolved it: a lost race.
+    NoLiveRequest,
+    /// The submitted verdict is not a displayed action of the current question.
+    Unparsable,
+    /// The store's authoritative verdict for this answer attempt.
+    Resolved(newt_core::AnswerOutcome),
+}
+
+/// Resolve a submitted web decision against the store, preserving the store's
+/// authoritative [`newt_core::AnswerOutcome`]. This is exactly what
+/// `decide_route` does over the wire, factored out to take an injected store so
+/// the single-winner / stale-answer behavior is unit-testable without the HTTP
+/// plumbing. The store's `answer_permission_action` re-validates, inside its own
+/// immediate transaction, that the action was actually displayed and that the
+/// request is still open — so this is authoritative even under a TOCTOU race
+/// with the terminal between the `pending` read and the answer.
+fn classify_decision(
+    store: &newt_core::ConversationStore,
+    conv: &str,
+    request_id: &str,
+    submitted: &str,
+) -> Result<DecideOutcome, ()> {
+    let Some(pending) = store
+        .pending_permission_request(conv)
+        .map_err(|_| ())?
+        .filter(|p| p.request_id == request_id)
+    else {
+        return Ok(DecideOutcome::NoLiveRequest);
+    };
+    let question = pending.question().map_err(|_| ())?;
+    let Some(action) = question.parse(submitted) else {
+        return Ok(DecideOutcome::Unparsable);
+    };
+    Ok(DecideOutcome::Resolved(
+        store
+            .answer_permission_action(conv, request_id, action)
+            .map_err(|_| ())?,
+    ))
+}
+
+/// Map each decision outcome to a truthful HTTP status. `Answered` is the ONLY
+/// success (204); every non-winning outcome gets its own honest code so the
+/// browser never removes the card believing it won a race it lost:
+/// `AlreadyResolved` / stale request → 409 ("your decision lost a race with
+/// current state"), a non-displayed submission → 400, an unknown/expired
+/// request → 404.
+fn decision_status(outcome: DecideOutcome) -> StatusCode {
+    match outcome {
+        DecideOutcome::Resolved(newt_core::AnswerOutcome::Answered) => StatusCode::NO_CONTENT,
+        DecideOutcome::Resolved(newt_core::AnswerOutcome::AlreadyResolved)
+        | DecideOutcome::NoLiveRequest => StatusCode::CONFLICT,
+        DecideOutcome::Resolved(newt_core::AnswerOutcome::InvalidAction)
+        | DecideOutcome::Unparsable => StatusCode::BAD_REQUEST,
+        DecideOutcome::Resolved(newt_core::AnswerOutcome::Unknown) => StatusCode::NOT_FOUND,
+    }
+}
+
 async fn decide_route(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
@@ -260,28 +327,13 @@ async fn decide_route(
     let result = tokio::task::spawn_blocking(move || {
         let store =
             newt_core::ConversationStore::new(&state, &attach.workspace, 1000).map_err(|_| ())?;
-        let pending = store.pending_permission_request(&conv).map_err(|_| ())?;
-        let Some(pending) = pending.filter(|p| p.request_id == request_id) else {
-            return Ok(false);
-        };
-        let question = pending.question().map_err(|_| ())?;
-        let Some(action) = question.parse(&submitted) else {
-            return Ok(false);
-        };
-        store
-            .answer_permission_action(&conv, &request_id, action)
-            .map(|outcome| {
-                !matches!(
-                    outcome,
-                    newt_core::AnswerOutcome::InvalidAction | newt_core::AnswerOutcome::Unknown
-                )
-            })
-            .map_err(|_| ())
+        classify_decision(&store, &conv, &request_id, &submitted)
     })
     .await;
     match result {
-        Ok(Ok(true)) => StatusCode::NO_CONTENT,
-        Ok(Ok(false)) => StatusCode::BAD_REQUEST,
+        Ok(Ok(outcome)) => decision_status(outcome),
+        // A join failure or a store/DB error is the only 500 path — every
+        // domain outcome resolves to an explicit 2xx/4xx above.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -1016,6 +1068,279 @@ mod tests {
         );
         std::env::remove_var("NEWT_WEB_STATE_DIR");
         std::env::remove_var("NEWT_WEB_WORKSPACE");
+    }
+
+    /// Seed a followed agent (id 1) in `app` with a pending high-danger
+    /// allow_once/deny permission form; returns (store, conv, request_id).
+    /// The caller owns the tempdirs (they must outlive the returned store) and
+    /// the NEWT_WEB_* env, so every caller is `#[serial(newt_web_env)]`.
+    async fn seed_followed_pending_decision(
+        app: &Router,
+        state: &std::path::Path,
+        ws: &std::path::Path,
+    ) -> (newt_core::ConversationStore, String, String) {
+        std::env::set_var("NEWT_WEB_STATE_DIR", state);
+        std::env::set_var("NEWT_WEB_WORKSPACE", ws);
+        let store = newt_core::ConversationStore::new(state, ws, 100).unwrap();
+        let conv = store.create("ssh session", None).unwrap();
+        store.append_turn(&conv, "hi", "hello").unwrap();
+        let form = format!(
+            "conv_id={conv}&title=s&workspace={}",
+            urlencode(&ws.to_string_lossy())
+        );
+        req(app, "POST", "/follow", Some(&form)).await;
+        let question = newt_core::Question {
+            markdown: "⊘ run_command wants to run `bash`.".into(),
+            actions: vec![
+                newt_core::Action::new(newt_core::PermissionAction::AllowOnce, "a", "allow once"),
+                newt_core::Action::new(newt_core::PermissionAction::Deny, "d", "deny"),
+            ],
+            note: None,
+        };
+        let rid = store
+            .publish_permission_question(&conv, &question, "\"high\"")
+            .unwrap();
+        (store, conv, rid)
+    }
+
+    fn clear_web_env() {
+        std::env::remove_var("NEWT_WEB_STATE_DIR");
+        std::env::remove_var("NEWT_WEB_WORKSPACE");
+    }
+
+    /// #1536 P1 — the pure mapping, and the fail-on-old anchor. A *losing*
+    /// answer must never be reported as the 204 a *winner* gets. `AlreadyResolved`
+    /// — the store's verdict when the terminal or another tab already won — must
+    /// map to 409, NOT the 204 the old bool-collapse
+    /// (`!matches!(_, InvalidAction | Unknown)`) produced. Every non-winning
+    /// outcome gets its own truthful code.
+    ///
+    /// This is the SOLE direct guard of the `Resolved(AlreadyResolved)` /
+    /// `Resolved(InvalidAction)` / `Resolved(Unknown)` arms. The pending
+    /// pre-filter (`resolved = 0 AND verdict IS NULL`) means a serialized
+    /// already-resolved request never reaches `answer_permission_action` through
+    /// `classify_decision` — it short-circuits to `NoLiveRequest` — so those
+    /// store arms are reachable at the HTTP boundary only under a genuine TOCTOU
+    /// race. The boundary tests below therefore drive the observably-resolved
+    /// `NoLiveRequest` gate (also 409); the store actually returning
+    /// `AlreadyResolved` is covered by the newt-core store tests, and
+    /// `classify_decision` passes that outcome straight through to this mapping.
+    #[test]
+    fn decision_status_maps_each_outcome_to_a_truthful_status() {
+        use newt_core::AnswerOutcome::{AlreadyResolved, Answered, InvalidAction, Unknown};
+        assert_eq!(
+            decision_status(DecideOutcome::Resolved(Answered)),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            decision_status(DecideOutcome::Resolved(AlreadyResolved)),
+            StatusCode::CONFLICT,
+            "a losing/stale answer must NOT report the winner's 204"
+        );
+        assert_eq!(
+            decision_status(DecideOutcome::Resolved(InvalidAction)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            decision_status(DecideOutcome::Resolved(Unknown)),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            decision_status(DecideOutcome::NoLiveRequest),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            decision_status(DecideOutcome::Unparsable),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// #1536 P1 scenario 1 — the terminal resolves the request, THEN a stale
+    /// browser submits its now-losing answer. It must get 409 (not 204, and not
+    /// the old 400) and record NO new authorization: the terminal's decision
+    /// stands untouched.
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_web_answer_after_local_resolution_conflicts() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let app = app();
+        let (store, conv, rid) =
+            seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+
+        // The terminal wins first (CAS 0->1); the browser's card is now stale.
+        assert!(
+            store
+                .resolve_permission_request(&conv, &rid, "tty")
+                .unwrap(),
+            "the terminal resolves the live request"
+        );
+
+        let (status, _) = req(
+            &app,
+            "POST",
+            "/agents/1/decision",
+            Some(&format!("request_id={rid}&verdict=allow_once")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a stale web answer that lost to the terminal must 409, not 204"
+        );
+        assert_eq!(
+            store.take_permission_decision(&conv, &rid).unwrap(),
+            None,
+            "the losing web answer recorded no authorization"
+        );
+        clear_web_env();
+    }
+
+    /// #1536 P1 scenario 2 — a second web answer after a successful first must
+    /// 409, never re-report 204; the first answer's verdict is what stands.
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_web_answer_conflicts_rather_than_succeeding() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let app = app();
+        let (store, conv, rid) =
+            seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+
+        let (first, _) = req(
+            &app,
+            "POST",
+            "/agents/1/decision",
+            Some(&format!("request_id={rid}&verdict=allow_once")),
+        )
+        .await;
+        assert_eq!(first, StatusCode::NO_CONTENT, "the first answer wins");
+
+        let (second, _) = req(
+            &app,
+            "POST",
+            "/agents/1/decision",
+            Some(&format!("request_id={rid}&verdict=deny")),
+        )
+        .await;
+        assert_eq!(
+            second,
+            StatusCode::CONFLICT,
+            "the second answer lost the race — 409, not a second 204"
+        );
+        assert_eq!(
+            store.take_permission_decision(&conv, &rid).unwrap(),
+            Some(newt_core::Verdict::AllowOnce),
+            "exactly the winning verdict is recorded; the loser did not overwrite"
+        );
+        clear_web_env();
+    }
+
+    /// #1536 P1 scenario 3 — a web Allow racing a local Deny records EXACTLY one
+    /// verdict, whichever wins. Proven deterministically in BOTH orders (a real
+    /// thread race would be flaky): the second mover is always rejected and only
+    /// the first mover's decision is recorded.
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn web_allow_racing_local_deny_records_exactly_one_verdict() {
+        // Order A: the web answer lands first; the terminal then loses the CAS.
+        {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (web, _) = req(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                Some(&format!("request_id={rid}&verdict=allow_once")),
+            )
+            .await;
+            assert_eq!(web, StatusCode::NO_CONTENT);
+            assert!(
+                !store
+                    .resolve_permission_request(&conv, &rid, "tty")
+                    .unwrap(),
+                "the terminal loses: the web answer already holds the verdict"
+            );
+            assert_eq!(
+                store.take_permission_decision(&conv, &rid).unwrap(),
+                Some(newt_core::Verdict::AllowOnce),
+                "exactly the web verdict is recorded"
+            );
+            clear_web_env();
+        }
+        // Order B: the terminal resolves first; the web answer then loses.
+        {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            assert!(store
+                .resolve_permission_request(&conv, &rid, "tty")
+                .unwrap());
+            let (web, _) = req(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                Some(&format!("request_id={rid}&verdict=allow_once")),
+            )
+            .await;
+            assert_eq!(
+                web,
+                StatusCode::CONFLICT,
+                "the web answer lost to the terminal"
+            );
+            assert_eq!(
+                store.take_permission_decision(&conv, &rid).unwrap(),
+                None,
+                "no web verdict recorded: the terminal's decision is the only one"
+            );
+            clear_web_env();
+        }
+    }
+
+    /// #1536 P1 scenario 4 — two different web actions racing: the loser receives
+    /// a conflict, NEVER a 204, and only the winner's verdict is recorded.
+    #[serial_test::serial(newt_web_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_losing_web_action_never_reports_204() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let app = app();
+        let (store, conv, rid) =
+            seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+
+        let (winner, _) = req(
+            &app,
+            "POST",
+            "/agents/1/decision",
+            Some(&format!("request_id={rid}&verdict=deny")),
+        )
+        .await;
+        assert_eq!(winner, StatusCode::NO_CONTENT);
+
+        let (loser, _) = req(
+            &app,
+            "POST",
+            "/agents/1/decision",
+            Some(&format!("request_id={rid}&verdict=allow_once")),
+        )
+        .await;
+        assert_ne!(
+            loser,
+            StatusCode::NO_CONTENT,
+            "the loser must never report the winner's 204"
+        );
+        assert_eq!(loser, StatusCode::CONFLICT);
+        assert_eq!(
+            store.take_permission_decision(&conv, &rid).unwrap(),
+            Some(newt_core::Verdict::Deny),
+            "only the winning verdict stands"
+        );
+        clear_web_env();
     }
 
     /// Regression (#1331 live testing, 2026-07-22): the spawn button "did

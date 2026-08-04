@@ -525,15 +525,26 @@ invariant = "EscCancels"
 [[BHV-PROMPT-002.refs.tla]]
 spec = "PromptControls"
 invariant = "ControlsExit"
+# Tier metadata (advisory, #1536): `tier` distinguishes a per-PR gating test
+# (`unit` — runs in ci.yml's `cargo test --workspace`) from a weekly/release
+# integration test (`integration` — `#[ignore]`d out of the per-PR run, executed
+# single-threaded by .github/workflows/newt-tui-pty.yml). It makes explicit that
+# BHV-PROMPT-002's real-PTY grounding does NOT gate every PR while its mocked
+# reader tests DO — so an ignored test never looks like a per-PR gate. Mechanical
+# enforcement (linter cross-check that an `#[ignore]`d ref is `tier=integration`)
+# is the tracked follow-up when tier metadata lands in the linter.
 [[BHV-PROMPT-002.refs.rust_tests]]
 path = "newt-tui/src/prompt_visibility_test.rs"
 symbol = "permission_prompt_controls_are_immediate_and_distinct"
+tier = "integration"
 [[BHV-PROMPT-002.refs.rust_tests]]
 path = "newt-tui/src/permissions.rs"
 symbol = "permission_prompt_tests::ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit"
+tier = "unit"
 [[BHV-PROMPT-002.refs.rust_tests]]
 path = "newt-tui/src/permissions.rs"
 symbol = "permission_prompt_tests::nested_controls_cancel_without_recording_a_permission_decision"
+tier = "unit"
 [[BHV-PROMPT-002.refs.production]]
 path = "newt-core/src/tty/modal.rs"
 symbol = "prompt_control"
