@@ -547,13 +547,77 @@ enum ResponsesCompaction {
     BridgeError,
 }
 
+/// Why a proactive / reactive compaction attempt did NOT yield a dispatchable
+/// request (#1528 B3, item 4). Carried into the fail-closed error CHAIN (as anyhow
+/// context on the authoritative preflight, or the provider error for reactive
+/// recovery) so headless / structured callers see the reason WITHOUT depending on
+/// terminal rendering. No user-facing notice is emitted for a rejected candidate;
+/// this reason IS the single diagnostic.
+#[derive(Debug, Clone)]
+enum CompactionRejection {
+    /// `input` could not be classified into typed provenance (a forbidden `system`
+    /// item) — BHV-PROVENANCE-002.
+    BridgeClassification,
+    /// The compressor refused: the protected head alone exceeds the budget.
+    CompressorRefused,
+    /// Compaction could not reduce the request further (nothing left to reclaim).
+    NoProgress,
+    /// The fenced rebuild still exceeds the budget after framing (BHV-BUDGET-004).
+    PostBridgeBudgetExceeded(responses_compaction::PostBridgeBudgetExceeded),
+}
+
+impl std::fmt::Display for CompactionRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BridgeClassification => write!(
+                f,
+                "proactive compaction could not classify the request (a forbidden system item)"
+            ),
+            Self::CompressorRefused => write!(
+                f,
+                "proactive compaction refused: the protected head alone exceeds the input budget"
+            ),
+            Self::NoProgress => write!(
+                f,
+                "proactive compaction made no progress: nothing left to reclaim under the budget"
+            ),
+            Self::PostBridgeBudgetExceeded(e) => {
+                write!(f, "proactive compaction fit the compressor budget but {e}")
+            }
+        }
+    }
+}
+
+impl ResponsesCompaction {
+    /// The rejection reason when this outcome is NOT a committed compaction — for
+    /// the fail-closed error chain. `Compacted` → `None`; `NotFired` (compaction
+    /// made no reduction) → `NoProgress`.
+    fn rejection(self) -> Option<CompactionRejection> {
+        match self {
+            Self::Compacted => None,
+            Self::NotFired => Some(CompactionRejection::NoProgress),
+            Self::Refused => Some(CompactionRejection::CompressorRefused),
+            Self::BridgeError => Some(CompactionRejection::BridgeClassification),
+            Self::OverBudgetAfterFence(e) => Some(CompactionRejection::PostBridgeBudgetExceeded(e)),
+        }
+    }
+}
+
 /// Compact the Responses `input` toward `compaction_budget` via the B2 provenance
 /// bridge + the ONE `compress`, then validate the fenced rebuild against
-/// `actionable_budget` before committing. On success `*input` is rewritten in
-/// place; on any refusal/over-budget path `*input` is left UNCHANGED so no caller
-/// can dispatch a half-compacted oversized request. Single-shot (one attempt) —
-/// the caller decides whether to gate on an estimate (proactive) or always call
-/// (reactive), and how to map a non-`Compacted` outcome.
+/// `actionable_budget` before committing.
+///
+/// TRANSACTIONAL (#1528 B3, B3-CG-004): the compressor runs against a CLONE of
+/// `compress_state`, and the candidate is validated (provenance + post-bridge
+/// budget) BEFORE anything live is touched. On success — and only then — the
+/// helper commits ALL THREE effects together: it rewrites `*input`, writes the
+/// candidate anti-thrash state back into `*compress_state`, and emits the
+/// compaction notice. On ANY reject/refuse/over-budget/bridge-error path, `*input`,
+/// `*compress_state`, and the notice stream are left UNTOUCHED, so no caller can
+/// dispatch a half-compacted request or believe an uncommitted compaction
+/// occurred. Single-shot (one attempt) — the caller decides whether to gate on an
+/// estimate (proactive) or always call (reactive), and how to map a non-`Compacted`
+/// outcome (see [`CompactionRejection`]).
 #[allow(clippy::too_many_arguments)]
 async fn compact_responses_input(
     input: &mut Vec<serde_json::Value>,
@@ -582,6 +646,9 @@ async fn compact_responses_input(
         chat.push(serde_json::json!({ "role": "system", "content": ins }));
     }
     chat.extend(responses_compaction::compaction_to_chat(&messages));
+    // Run the compressor against a CANDIDATE state — the live anti-thrash counters
+    // / disabled latch are mutated only on commit (below).
+    let mut candidate_state = compress_state.clone();
     let outcome = compress(
         CompressRequest {
             messages: &chat,
@@ -599,12 +666,10 @@ async fn compact_responses_input(
             compaction_store,
         },
         summarizer,
-        compress_state,
+        &mut candidate_state,
     )
     .await;
-    if let Some(notice) = outcome.notice {
-        print_harness_notice(&notice, color);
-    }
+    // The notice is NOT emitted yet — only a committed compaction surfaces one.
     if outcome.action == CompressAction::Refused {
         return ResponsesCompaction::Refused;
     }
@@ -642,11 +707,17 @@ async fn compact_responses_input(
         if let Err(exceeded) =
             responses_compaction::check_post_bridge_budget(budget, pre_bridge, post_bridge)
         {
-            // Leave `*input` UNCHANGED — never commit an oversized rewrite.
+            // REJECT: leave `*input`, `*compress_state`, and the notice stream
+            // UNCHANGED — the candidate is discarded.
             return ResponsesCompaction::OverBudgetAfterFence(exceeded);
         }
     }
+    // COMMIT — all three effects together, now that the candidate is accepted.
     *input = rebuilt_input;
+    *compress_state = candidate_state;
+    if let Some(notice) = outcome.notice {
+        print_harness_notice(&notice, color);
+    }
     ResponsesCompaction::Compacted
 }
 
@@ -6805,7 +6876,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // head or a fresh, un-summarizable newest tool output — it refuses THERE,
             // with the precise "function outputs were not truncated" message. So this
             // never spins compact→still-too-big→compact and never dispatches oversized.
-            // Tool schemas ride this request, so the target reserves their overhead.
+            // B3-CG-003: the compaction target reserves tool-schema overhead ONLY if
+            // THIS request actually carries tools (`tools_supported`) — an
+            // unsupported-tools retry sends none, so it must not subtract them.
+            // B3-CG-004: `compact_responses_input` is TRANSACTIONAL — on any reject it
+            // leaves `input` / `compress_state` / the notice stream untouched; the
+            // rejection REASON rides the preflight error chain (item 4), not a notice.
+            let mut proactive_rejection: Option<CompactionRejection> = None;
             if let Some(budget) = budget_state.actionable_input_budget() {
                 let before = estimate_responses_request_real_tokens(
                     instructions.as_deref(),
@@ -6815,30 +6892,28 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     cal,
                 );
                 if before > budget {
-                    if let ResponsesCompaction::OverBudgetAfterFence(exceeded) =
-                        compact_responses_input(
-                            &mut input,
-                            instructions.as_deref(),
-                            tools_supported.then_some(tools.as_slice()),
-                            Some(budget),
-                            budget_state.compaction_budget(cal, true),
-                            cal,
-                            estimation,
-                            task,
-                            summary_input_cap_floor_chars,
-                            compaction_store,
-                            summarizer,
-                            compress_state,
-                            color,
-                        )
-                        .await
-                    {
-                        // Surface WHY the fenced request could not be sent; the
-                        // preflight below then refuses (zero dispatch, round intact).
-                        print_harness_notice(&exceeded.to_string(), color);
-                    }
+                    proactive_rejection = compact_responses_input(
+                        &mut input,
+                        instructions.as_deref(),
+                        tools_supported.then_some(tools.as_slice()),
+                        Some(budget),
+                        budget_state.compaction_budget(cal, tools_supported),
+                        cal,
+                        estimation,
+                        task,
+                        summary_input_cap_floor_chars,
+                        compaction_store,
+                        summarizer,
+                        compress_state,
+                        color,
+                    )
+                    .await
+                    .rejection();
                 }
             }
+            // The ONE authoritative fail-closed gate. If compaction could not fit the
+            // request, attach the local reason so the headless error chain explains
+            // WHY (no oversized dispatch, round intact).
             preflight_responses_request(
                 instructions.as_deref(),
                 &input,
@@ -6847,7 +6922,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 cal,
                 estimation,
                 model,
-            )?;
+            )
+            .map_err(|e| match proactive_rejection.take() {
+                Some(reason) => e.context(reason.to_string()),
+                None => e,
+            })?;
             let body = build_body(&input, tools_supported);
             let dispatch =
                 dispatch_responses_json(&client, &responses_url, api_key, &body, &retry, color)
@@ -6903,18 +6982,22 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             budget_state.recover_from_cw400(recovered_budget);
                             // #1528 B3: the compaction "dance" is the ONE shared
                             // `compact_responses_input` — the SAME path the PROACTIVE
-                            // pre-dispatch guard uses. Reactive maps a refusal / bridge
-                            // error / post-fence overflow to the provider's ORIGINAL 400
-                            // (surface it, ZERO redispatch); a successful compaction (or
-                            // a no-op) falls through to the bounded redispatch below.
-                            // Tool schemas ride this request, so the compaction target
-                            // reserves their overhead (`with_tool_schemas = true`).
+                            // pre-dispatch guard uses. A successful compaction (or a
+                            // no-op that keeps the round eligible) falls through to the
+                            // bounded redispatch below; a refusal / bridge error /
+                            // post-fence overflow surfaces the provider's ORIGINAL 400
+                            // (ZERO redispatch) with the local compaction reason attached
+                            // to the error chain (item 4) — no separate notice.
+                            // B3-CG-003: the compaction target reserves tool-schema
+                            // overhead ONLY if this recovered request actually carries
+                            // tools (`tools_supported`) — after a tools-unsupported error
+                            // it does not, so it must not subtract them.
                             match compact_responses_input(
                                 &mut input,
                                 instructions.as_deref(),
                                 tools_supported.then_some(tools.as_slice()),
                                 budget_state.actionable_input_budget(),
-                                budget_state.compaction_budget(cal, true),
+                                budget_state.compaction_budget(cal, tools_supported),
                                 cal,
                                 estimation,
                                 task,
@@ -6926,15 +7009,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             )
                             .await
                             {
-                                ResponsesCompaction::Refused | ResponsesCompaction::BridgeError => {
-                                    return Err(e)
-                                }
-                                ResponsesCompaction::OverBudgetAfterFence(exceeded) => {
-                                    // ZERO second inference: surface the original 400.
-                                    print_harness_notice(&exceeded.to_string(), color);
-                                    return Err(e);
-                                }
                                 ResponsesCompaction::Compacted | ResponsesCompaction::NotFired => {}
+                                // ZERO second inference: surface the original 400 with the
+                                // local compaction context attached for headless callers.
+                                other => {
+                                    return Err(match other.rejection() {
+                                        Some(reason) => e.context(reason.to_string()),
+                                        None => e,
+                                    });
+                                }
                             }
                             cw_retries += 1;
                             continue;
@@ -7217,6 +7300,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // the summary sends NO tool schemas — so the estimate drops them AND the
     // compaction target does NOT reserve their overhead (`with_tool_schemas =
     // false`), avoiding over-compaction (req #7).
+    let mut summary_rejection: Option<CompactionRejection> = None;
     if let Some(budget) = budget_state.actionable_input_budget() {
         let before = estimate_responses_request_real_tokens(
             instructions.as_deref(),
@@ -7226,7 +7310,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             cal,
         );
         if before > budget {
-            if let ResponsesCompaction::OverBudgetAfterFence(exceeded) = compact_responses_input(
+            summary_rejection = compact_responses_input(
                 &mut input,
                 instructions.as_deref(),
                 None,
@@ -7242,14 +7326,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 color,
             )
             .await
-            {
-                print_harness_notice(&exceeded.to_string(), color);
-            }
+            .rejection();
         }
     }
 
     // Round cap: one final tools-disabled call for a summary answer (mirrors
-    // the chat path's final_summary, in the Responses shape).
+    // the chat path's final_summary, in the Responses shape). The authoritative
+    // fail-closed gate; a proactive-compaction reason (if any) rides its error chain.
     preflight_responses_request(
         instructions.as_deref(),
         &input,
@@ -7258,7 +7341,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         cal,
         estimation,
         model,
-    )?;
+    )
+    .map_err(|e| match summary_rejection.take() {
+        Some(reason) => e.context(reason.to_string()),
+        None => e,
+    })?;
     let body = build_body(&input, false);
     // Shared retrying dispatch (R5): the tools-disabled final summary retries
     // transient transport failures exactly like every round, so a 500 / timeout /
@@ -10261,6 +10348,520 @@ mod tool_round_cap_tests {
         );
     }
 
+    // --- #1528 B3 transactional helper unit tests (B3-CG-004/005) ---
+
+    fn assistant(i: usize, chars: usize) -> serde_json::Value {
+        serde_json::json!({"role": "assistant", "content": format!("step {i}: {}", "w ".repeat(chars))})
+    }
+
+    /// B3-CG-004: a candidate compaction REJECTED by the post-bridge budget guard
+    /// commits NOTHING — the live `input` and `CompressState` are untouched and no
+    /// committed notice is emitted (the helper returns before the commit block). The
+    /// typed `OverBudgetAfterFence` carries the reason for the caller's error chain.
+    /// Fails on `711c247` (non-transactional: notice + state mutated before the check).
+    #[tokio::test]
+    async fn compact_responses_input_post_fence_overflow_is_transactional() {
+        use crate::agentic::compress::{CompressState, Summarizer};
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let summ: Summarizer = Box::new(move |_r: String| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok("a short summary".to_string()) })
+        });
+        let mut input = vec![serde_json::json!({"role": "user", "content": "the task"})];
+        for i in 0..6 {
+            input.push(assistant(i, 300));
+        }
+        input.push(serde_json::json!({"role": "user", "content": "recent turn"}));
+        let original = input.clone();
+        let mut state = CompressState::new();
+
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(10), // actionable_budget: tiny → the fenced rebuild overflows it
+            400,      // compaction_budget: generous enough that compress FIRES
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "the task",
+            8_192,
+            None,
+            Some(&*summ),
+            &mut state,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ResponsesCompaction::OverBudgetAfterFence(_)),
+            "expected a post-fence overflow rejection"
+        );
+        assert_eq!(
+            input, original,
+            "TRANSACTIONAL: a rejected candidate leaves input UNCHANGED"
+        );
+        assert_eq!(
+            state.counters().compressions,
+            0,
+            "TRANSACTIONAL: live CompressState attempts UNCHANGED (compaction ran on a clone)"
+        );
+        assert!(
+            !state.is_disabled(),
+            "TRANSACTIONAL: disabled latch UNCHANGED"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the candidate compaction actually ran (summarizer invoked)"
+        );
+    }
+
+    /// B3-CG-004: a forbidden `system` item fails classification (BridgeError) with no
+    /// compaction and no side effects.
+    #[tokio::test]
+    async fn compact_responses_input_bridge_error_is_transactional() {
+        use crate::agentic::compress::CompressState;
+        let mut input = vec![
+            serde_json::json!({"role": "user", "content": "task"}),
+            serde_json::json!({"role": "system", "content": "smuggled"}),
+        ];
+        let original = input.clone();
+        let mut state = CompressState::new();
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(5),
+            5,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            None,
+            None,
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, ResponsesCompaction::BridgeError));
+        assert_eq!(
+            input, original,
+            "transactional: input unchanged on bridge error"
+        );
+        assert_eq!(state.counters().compressions, 0, "no compaction ran");
+    }
+
+    /// B3-CG-004: a compressor refusal (protected head alone exceeds the target)
+    /// commits nothing.
+    #[tokio::test]
+    async fn compact_responses_input_refusal_is_transactional() {
+        use crate::agentic::compress::CompressState;
+        let mut input = vec![serde_json::json!({"role": "user", "content": "x".repeat(4_000)})];
+        for i in 0..3 {
+            input.push(assistant(i, 10));
+        }
+        let original = input.clone();
+        let mut state = CompressState::new();
+        // compaction_budget = 1 → the protected head alone exceeds it → refuse.
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt with a large protected head that cannot shrink"),
+            None,
+            Some(1),
+            1,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            None,
+            None,
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                ResponsesCompaction::Refused | ResponsesCompaction::NotFired
+            ),
+            "an irreducible tiny budget refuses / makes no progress"
+        );
+        assert_eq!(input, original, "transactional: input unchanged on refusal");
+        assert_eq!(
+            state.counters().compressions,
+            0,
+            "transactional: state unchanged"
+        );
+    }
+
+    /// B3-CG-004: a candidate that fits COMMITS all three effects — input rewritten
+    /// to the compacted form, the anti-thrash attempt recorded, and (structurally,
+    /// after this point) the notice emitted.
+    #[tokio::test]
+    async fn compact_responses_input_commits_only_on_success() {
+        use crate::agentic::compress::{CompressState, Summarizer};
+        let summ: Summarizer =
+            Box::new(|_r: String| Box::pin(async { Ok("brief summary".to_string()) }));
+        let mut input = vec![serde_json::json!({"role": "user", "content": "task"})];
+        for i in 0..6 {
+            input.push(assistant(i, 300));
+        }
+        input.push(serde_json::json!({"role": "user", "content": "recent turn"}));
+        let before_len = input.len();
+        let mut state = CompressState::new();
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(100_000), // generous actionable budget → the compacted form fits
+            400,           // tight compaction target → compress fires
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            None,
+            Some(&*summ),
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, ResponsesCompaction::Compacted),
+            "a fitting compaction commits"
+        );
+        assert!(
+            input.len() < before_len,
+            "committed: input rewritten to fewer items ({} < {before_len})",
+            input.len()
+        );
+        assert!(
+            input.iter().any(|m| m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("newt-compaction-summary")),
+            "committed: the reference-summary envelope is present"
+        );
+        assert_eq!(
+            state.counters().compressions,
+            1,
+            "committed: the anti-thrash attempt IS recorded on the live state"
+        );
+    }
+
+    // --- #1528 B3 (item 6): pure lifecycle-invariant property tests ---
+
+    /// A pure, side-effect-free MODEL of one proactive pre-dispatch decision, mirroring
+    /// the guard + transactional `compact_responses_input` + the authoritative preflight
+    /// at the estimate level. `committed_post_estimate` is `Some(fenced estimate)` IFF
+    /// the transactional helper committed a candidate (which it does only when the
+    /// candidate passed `check_post_bridge_budget`, i.e. fits the budget). Corresponds to
+    /// `formal/CompactionLifecycle` (estimate → compact → validate → readyToDispatch |
+    /// abort).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProactiveDecision {
+        DispatchAsIs,
+        DispatchCompacted,
+        FailClosed,
+    }
+
+    fn proactive_decision(
+        actionable_budget: Option<usize>,
+        pre_estimate: usize,
+        committed_post_estimate: Option<usize>,
+    ) -> ProactiveDecision {
+        let Some(budget) = actionable_budget else {
+            return ProactiveDecision::DispatchAsIs; // no budget → no gate
+        };
+        if pre_estimate <= budget {
+            return ProactiveDecision::DispatchAsIs; // already fits → no compaction
+        }
+        match committed_post_estimate {
+            Some(post) if post <= budget => ProactiveDecision::DispatchCompacted,
+            _ => ProactiveDecision::FailClosed,
+        }
+    }
+
+    /// B3-CG-001/005: over the whole finite decision space, DISPATCH implies the
+    /// governing estimate is within budget, and a compaction FAILURE implies zero
+    /// dispatch. Also: no budget → dispatch as-is; a fitting request is never compacted.
+    #[test]
+    fn proactive_decision_never_dispatches_over_budget() {
+        for budget in [None, Some(0usize), Some(100), Some(1000)] {
+            for pre in [0usize, 100, 1000, 5000] {
+                for committed in [None, Some(0usize), Some(100), Some(1000), Some(5000)] {
+                    let d = proactive_decision(budget, pre, committed);
+                    match d {
+                        ProactiveDecision::DispatchAsIs => {
+                            // Only when there is no budget, or the request already fits.
+                            assert!(
+                                budget.is_none() || pre <= budget.unwrap(),
+                                "DispatchAsIs must mean no-budget or already-fits: {budget:?} {pre}"
+                            );
+                        }
+                        ProactiveDecision::DispatchCompacted => {
+                            let b = budget.expect("compacted dispatch requires a budget");
+                            assert!(pre > b, "compaction only runs when over budget");
+                            assert!(
+                                committed.expect("committed implies Some") <= b,
+                                "DISPATCH ⟹ post-fence estimate ≤ actionable budget"
+                            );
+                        }
+                        ProactiveDecision::FailClosed => {
+                            // Failure ⟹ zero dispatch: either no committed candidate, or
+                            // the committed candidate did not fit (never emitted here).
+                            let b = budget.expect("fail-closed only under a budget");
+                            assert!(pre > b);
+                            assert!(committed.is_none_or(|p| p > b));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// B3-CG-003: the tools-disabled compaction target NEVER subtracts schema overhead,
+    /// the tools-enabled one always does, and dropping schemas can only RAISE the target
+    /// — across a sweep of ceilings / schema sizes / calibrations.
+    #[test]
+    fn compaction_target_schema_subtraction_follows_tools() {
+        use super::send_budget::ResponsesBudgetState;
+        for window in [4_096u32, 32_768, 131_072] {
+            for schema in [0usize, 500, 4_000] {
+                for cal in [0.5f32, 1.0, 2.0] {
+                    let mut s = ResponsesBudgetState::new(Some(window), 80, None, None, None, None);
+                    let recovered = s.recovered_budget_for_window(window);
+                    s.recover_from_cw400(recovered);
+                    s.set_tool_schema_tokens(schema);
+                    let with = s.compaction_budget(cal, true);
+                    let without = s.compaction_budget(cal, false);
+                    assert!(
+                        without >= with,
+                        "dropping schemas never lowers the target: {without} >= {with} \
+                         (window={window} schema={schema} cal={cal})"
+                    );
+                    if schema == 0 {
+                        assert_eq!(with, without, "no schemas → the flag is a no-op");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #1528 B3 (item 3, B3-CG-005): the IN-LOOP no-progress path — a tool round
+    /// yields an OVERSIZED fresh result, the next request exceeds the local budget,
+    /// and the proactive guard invokes the compactor EXACTLY ONCE (a counting
+    /// summarizer proves it). The protected newest tool output cannot be reduced, so
+    /// the authoritative preflight refuses: ONE dispatch, ZERO second dispatch, the
+    /// logical round intact. This FAILS if the proactive helper call is deleted — the
+    /// summarizer is never invoked on round 1 (`calls == 0`), which the pre-existing
+    /// preflight-refusal path does not do.
+    #[tokio::test]
+    async fn responses_proactive_no_progress_invokes_the_compactor_exactly_once() {
+        use crate::agentic::compress::Summarizer;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "function_call", "name": "read_file",
+                    "arguments": "{\"path\":\"huge.txt\"}", "call_id": "c1"}]
+            })))
+            .mount(&server)
+            .await;
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("huge.txt"), "x".repeat(64_000)).unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let summ: Summarizer = Box::new(move |_r: String| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok("brief".to_string()) })
+        });
+
+        let task = "read the huge fixture then summarize";
+        // A SMALL reducible history — round 0 fits, and it survives as a summarizable
+        // MIDDLE on round 1 (after the giant tool output becomes the protected tail).
+        let mut messages = vec![MemMessage::system("base policy")];
+        for i in 0..4 {
+            messages.push(MemMessage::user(format!("earlier ask {i}")));
+            messages.push(MemMessage::assistant(format!("earlier reply {i}")));
+        }
+        messages.push(MemMessage::user(task));
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.workspace = workspace.path().to_str().unwrap();
+        ctx.summarizer = Some(&*summ);
+        ctx.safe_context = Some(8_000);
+        ctx.num_ctx = Some(8_000);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 2;
+
+        let error = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the fresh giant tool output cannot be compacted → fail closed");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("function outputs were not truncated"),
+            "in-loop preflight refusal expected: {chain}"
+        );
+        assert!(
+            chain.contains("proactive compaction"),
+            "the B3 compaction reason is attached to the chain: {chain}"
+        );
+        let requests = server.received_requests().await.expect("request journal");
+        assert_eq!(
+            requests.len(),
+            1,
+            "round 0 dispatched; the oversized round 1 never did (zero second dispatch)"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the proactive guard invoked the compactor EXACTLY once on round 1"
+        );
+    }
+
+    /// #1528 B3 (B3-CG-003, item 1): after the provider rejects tools, the SAME round
+    /// retries TOOLS-DISABLED; when that retry is locally over budget the PROACTIVE
+    /// guard compacts it with a target that does NOT subtract tool-schema overhead
+    /// (the request sends none). The HTTP journal shows req1 WITH tools, req2 WITHOUT
+    /// tools and proactively compacted, and the turn completes in the same round.
+    /// (The exact "no schema subtraction" arithmetic is pinned deterministically by
+    /// `compaction_target_schema_subtraction_follows_tools` and the budget unit test.)
+    #[tokio::test]
+    async fn responses_unsupported_tools_retry_is_proactively_compacted_without_schema_overhead() {
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct UnsupportedThenDone {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for UnsupportedThenDone {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                if self.served.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "this model does not support tools"}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "done tools-disabled"}]}]
+                    }))
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(UnsupportedThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "summarize the history";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = Some(12_000);
+        ctx.num_ctx = Some(12_000);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp).await.expect(
+            "tools-disabled retry is proactively compacted and completes in the same round",
+        );
+        assert_eq!(reply, "done tools-disabled");
+        let reqs = server.received_requests().await.expect("request journal");
+        assert_eq!(
+            reqs.len(),
+            2,
+            "req1 (tools) rejected, req2 (tools-disabled) retried IN THE SAME round"
+        );
+        let b1: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap_or_default();
+        assert!(b1["tools"].is_array(), "req1 advertised tools");
+        let b2: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap_or_default();
+        assert!(
+            b2["tools"].is_null(),
+            "req2 is tools-disabled (the schema overhead it must not reserve)"
+        );
+        assert!(
+            b2["input"].to_string().contains("newt-compaction-summary"),
+            "req2 was proactively compacted before dispatch"
+        );
+    }
+
+    /// #1528 B3 (B3-CG-003, item 1, reactive): tools rejected → tools-disabled retry
+    /// → a context-window 400 → REACTIVE recovery compacts the tools-disabled request
+    /// (no schema overhead reserved) and redispatches IN THE SAME round. req3 carries
+    /// no tools, is compacted, and completes.
+    #[tokio::test]
+    async fn responses_unsupported_tools_then_cw400_reactive_recovery_no_schema_overhead() {
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct UnsupportedThen400ThenDone {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for UnsupportedThen400ThenDone {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                match self.served.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "this model does not support tools"}
+                    })),
+                    1 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                    })),
+                    _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "recovered tools-disabled"}]}]
+                    })),
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(UnsupportedThen400ThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "summarize the history";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("tools-disabled cw-400 recovers in the same round and completes");
+        assert_eq!(reply, "recovered tools-disabled");
+        let reqs = server.received_requests().await.expect("request journal");
+        assert_eq!(
+            reqs.len(),
+            3,
+            "req1 tools rejected, req2 tools-disabled 400, req3 tools-disabled recovered"
+        );
+        let b3: serde_json::Value = serde_json::from_slice(&reqs[2].body).unwrap_or_default();
+        assert!(
+            b3["tools"].is_null(),
+            "the recovered request is tools-disabled"
+        );
+        assert!(
+            b3["input"].to_string().contains("newt-compaction-summary"),
+            "the recovered tools-disabled request was compacted"
+        );
+    }
+
     #[tokio::test]
     async fn responses_missing_call_id_aborts_without_a_followup_request() {
         // RR2: a `function_call` with no `call_id` cannot be correlated to its
@@ -10533,11 +11134,21 @@ mod tool_round_cap_tests {
         let error = openai_responses_complete(ctx, &mut NoMcp)
             .await
             .expect_err("giant function output must block the next request");
-        let message = error.to_string();
-        assert!(message.contains("Responses request needs"), "{message}");
+        // #1528 B3: the fresh giant tool output is the newest protected item, so the
+        // proactive guard's best-effort compaction cannot reduce it; the authoritative
+        // preflight then refuses. The headless error CHAIN (`{:#}`) carries BOTH the
+        // preflight refusal (root) AND the attached proactive-compaction reason
+        // (item 4) — so structured callers see the refusal was preceded by a real,
+        // failed compaction attempt, not a naive over-budget send.
+        let chain = format!("{error:#}");
+        assert!(chain.contains("Responses request needs"), "{chain}");
         assert!(
-            message.contains("function outputs were not truncated"),
-            "{message}"
+            chain.contains("function outputs were not truncated"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("proactive compaction"),
+            "the fail-closed error chain must attach the B3 compaction reason: {chain}"
         );
         let requests = server
             .received_requests()

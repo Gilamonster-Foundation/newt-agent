@@ -46,26 +46,76 @@ bridge and B1's estimator.
 ## Formal obligation
 
 8. **Lifecycle proof** for the full proactive path:
-   `estimate → compact → rebuild → validate → (dispatch | abort)`. Modelled as an
-   abstract state machine proving: **no dispatch above budget**
-   (`dispatch_within_budget`), **termination / bounded no-progress**
-   (`fuel_non_increasing`, `validate_exhausted_aborts`, `progress` — a strictly
-   decreasing Nat measure until a terminal), and **same-round retry**
-   (`round_preserved_off_dispatch`, `dispatch_advances_round`, `round_monotone`).
+   `estimate → compact → rebuild → validate → (readyToDispatch | abort)`. Modelled as
+   an abstract state machine (`formal/CompactionLifecycle/Basic.lean`) proving:
+   - **REACHABLE no-over-budget dispatch** — `reachable_ready_to_dispatch_within_budget`
+     (via an `Inv` invariant preserved across a `Reachable` relation from an
+     `Initial` estimate state); a naive one-step lemma is insufficient because
+     `readyToDispatch` self-loops, so reachability is the honest claim.
+   - **Actual finite termination** — `eventually_terminal` / `eventually_ready_or_abort`
+     by well-founded recursion on a strictly-decreasing `measure` (not just the
+     one-step `progress` lemma), with `fuel_never_increases` +
+     `exhausted_validation_aborts` bounding the retry loop.
+   - **Round ≠ safe-to-send** — `no_lifecycle_step_advances_round` (+ per-phase
+     corollaries): NO lifecycle step advances the logical round; reaching
+     `readyToDispatch` is NOT a completed round. Round advancement on a COMPLETED
+     dispatch is the wider agent-turn model's job, deliberately out of this kernel
+     (Problem C, Preferred shape).
+   - **Non-vacuity demos** — `example`s that pin each load-bearing guard (dropping the
+     estimate-budget guard, letting exhausted validation retry, or advancing the round
+     each turns a proof into a build failure).
 
-   **Landed as a Lean lib** — `formal/CompactionLifecycle/Basic.lean` (registered in
-   `formal/lakefile.toml`), because that is what `.github/workflows/formal.yml`
-   machine-checks on THIS branch. `lake build` gates it, sorry-free, bare toolchain
-   (no Mathlib), exactly like the B2 `CompactionProvenance` kernel. The `validate`
-   phase's provenance check (untrusted-derived material never gains operator/model
-   authority) is that B2 kernel; this lib models the budget + round + termination
-   half of the same guard.
+   **Landed as a Lean lib** (registered in `formal/lakefile.toml`), because that is
+   what `.github/workflows/formal.yml` machine-checks on THIS branch — `lake build`,
+   sorry-free, bare toolchain (no Mathlib). The `validate` phase's provenance check
+   (untrusted-derived material never gains operator/model authority) is the B2
+   `CompactionProvenance` kernel; this lib models the budget + round + termination
+   half. **Lean proves the ABSTRACT lifecycle, not Rust refinement** — there is no
+   generated oracle connecting the two (that is a B6 obligation); the Rust
+   `proactive_decision` property test mirrors the same estimate-level invariants.
 
-   **TLA+ temporal model deferred to B6.** A `spec/tla/` TLC/Apalache spec with a
-   `[]`no-over-budget invariant and a `<>`termination property belongs on the
-   integration/main branch where `spec/behavior-map.toml` + a TLA CI job live; on
+   **TLA+ temporal model deferred to B6.** A `spec/tla/` TLC/Apalache spec belongs on
+   the integration/main branch where `spec/behavior-map.toml` + a TLA CI job live; on
    this base there is no TLA gate, and the workspace law "never commit an unchecked
-   spec" forbids landing it here unchecked. Recorded as a #1528 B6 obligation.
+   spec" forbids landing it here unchecked (so this PR adds NO `.tla` file). The Lean
+   kernel proves the pure lifecycle in isolation; TLA+ (B6) composes it with dispatch,
+   retries, cancellation, and the wider agent-turn protocol.
+
+### B6 TLA+ obligation (precise)
+
+The temporal model to land once this branch is rebased onto the
+behavioral-constitution mainline:
+
+```
+Estimate
+  → Compact
+  → Rebuild
+  → ValidateProvenance
+  → ValidateBudget
+  → ReadyToDispatch | Abort
+  → Dispatch
+  → Completed | Failed
+```
+
+Required TLA+ properties:
+
+```
+NoDispatchBeforeProvenanceValidation
+NoDispatchWhenPostBridgeOverBudget
+CompactionDoesNotConsumeLogicalRound
+FailedDispatchDoesNotConsumeLogicalRound
+OnlyCompletedRoundAdvances
+CompactionAttemptsAreBounded
+InstructionsAppearExactlyOnce
+ToolsDisabledMeansNoSchemaOverhead
+EventuallyReadyOrAbort
+```
+
+Lean owns the pure lifecycle kernel in B3 (`estimate → … → readyToDispatch | abort`,
+with `reachable_ready_to_dispatch_within_budget`, `eventually_terminal`, and the
+round-preservation theorems). TLA+ (B6) adds the `Dispatch → Completed | Failed`
+tail — where `OnlyCompletedRoundAdvances` / `FailedDispatchDoesNotConsumeLogicalRound`
+are proved — that this B3 kernel deliberately leaves out (Problem C).
 
 ## Reuse discipline
 

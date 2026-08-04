@@ -187,7 +187,13 @@ const ABS_MIN_RECLAIM_TOKENS: usize = 200;
 /// across turns (the TUI keeps one per session, like `NoteNudge`) and lent
 /// to the loop per call; headless callers may pass `None` and get a fresh
 /// per-turn state.
-#[derive(Debug)]
+///
+/// `Clone` exists for TRANSACTIONAL compaction (#1528 B3): a candidate compaction
+/// runs against a clone, and the caller commits it back to the live state ONLY if
+/// the candidate is accepted — so a rejected compaction never mutates the live
+/// anti-thrash counters / disabled latch. All fields are `Copy`, so the clone is a
+/// cheap value snapshot (not a serialization trick).
+#[derive(Debug, Clone)]
 pub struct CompressState {
     /// Reclaim fractions of the last two attempted compressions (for display).
     last_savings: [f32; 2],
