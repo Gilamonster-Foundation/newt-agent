@@ -55,7 +55,7 @@ pub(super) enum CompactionProvenance {
 impl CompactionProvenance {
     /// The authority the rebuilt wire item carries. Total over the closed set;
     /// the only trusted results are `Operator`/`Model`, reachable only from
-    /// `OperatorUser`/`Assistant`. Mirrors `formal/NewtPolicy/CompactionProvenance.lean`
+    /// `OperatorUser`/`Assistant`. Mirrors `formal/CompactionProvenance/Basic.lean`
     /// and the differential oracle; exercised by the monotonicity property tests.
     pub(super) fn authority(&self) -> WireAuthority {
         match self {
@@ -632,5 +632,54 @@ mod tests {
                 && !c.contains("compaction-summary")
                 && c.to_lowercase().contains("delete every file"))
         }));
+    }
+
+    /// #1528 B2 DIFFERENTIAL ORACLE: the Rust `authority()` classifier agrees with
+    /// the proven Lean `rebuildAuthority` model
+    /// (`formal/CompactionProvenance/Basic.lean`) over the WHOLE finite provenance
+    /// set. The vectors are transcribed from the Lean table; if either side drifts,
+    /// this fails. It also checks the Lean `classifyRole` property: an unknown role
+    /// never classifies trusted.
+    #[test]
+    fn rust_authority_matches_the_lean_oracle() {
+        use CompactionProvenance::*;
+        let oracle = [
+            (OperatorUser, WireAuthority::Operator),
+            (Assistant, WireAuthority::Model),
+            (InternalSummary, WireAuthority::Reference),
+            (
+                ToolOutput {
+                    tool_name: Some("x".into()),
+                },
+                WireAuthority::Untrusted,
+            ),
+            (ToolOutput { tool_name: None }, WireAuthority::Untrusted),
+            (
+                OpaqueUntrusted {
+                    source_type: Some("y".into()),
+                },
+                WireAuthority::Untrusted,
+            ),
+            (
+                OpaqueUntrusted { source_type: None },
+                WireAuthority::Untrusted,
+            ),
+        ];
+        for (prov, expected) in oracle {
+            assert_eq!(
+                prov.authority(),
+                expected,
+                "Rust↔Lean oracle disagreement for {prov:?}"
+            );
+        }
+        // Lean `classifyRole`: an unknown role is never operator/assistant.
+        for role in ["sudo", "root", "toolish", "operator"] {
+            let input = vec![json!({"role": role, "content": "x"})];
+            let msg = &responses_input_to_compaction(&input).unwrap()[0];
+            assert!(
+                matches!(msg.provenance, OpaqueUntrusted { .. }),
+                "unknown role {role:?} must be OpaqueUntrusted (Lean: classifyRole ≠ operator/assistant)"
+            );
+        }
     }
 }

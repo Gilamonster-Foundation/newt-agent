@@ -1,5 +1,5 @@
 name = "caveat-lattice"
-defaultTargets = ["CaveatLattice", "ProjectModel"]
+defaultTargets = ["CaveatLattice", "ProjectModel", "CompactionProvenance"]
 
 # Machine-checked formal specs. Self-contained: no Mathlib, so it builds from a
 # bare Lean toolchain (see lean-toolchain). `lake build` checks every theorem; a
@@ -14,3 +14,9 @@ name = "CaveatLattice"
 
 [[lean_lib]]
 name = "ProjectModel"
+
+# CompactionProvenance — the #1528 B2 compaction-bridge provenance kernel:
+# untrusted-derived provenance never rebuilds to operator/model authority, and an
+# unknown wire role never classifies as operator/assistant.
+[[lean_lib]]
+name = "CompactionProvenance"
