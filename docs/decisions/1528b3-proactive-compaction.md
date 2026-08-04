@@ -1,6 +1,6 @@
 # #1528 B3 — proactive local-overflow compaction
 
-Status: **planned** (slice scaffold; builds on B1 budget policy + B2 provenance
+Status: **implemented** (proactive guard + shared helper + Lean lifecycle proof; builds on B1 budget policy + B2 provenance
 bridge now present in `feat/agent-psyche-production`).
 
 ## Problem
@@ -45,13 +45,27 @@ bridge and B1's estimator.
 
 ## Formal obligation
 
-8. **TLA+ lifecycle coverage** for the full proactive path:
-   `estimate → compact → rebuild → validate → (redispatch | abort)`. The spec must
-   model the state machine and prove: no dispatch above budget, bounded rounds
-   (termination — no infinite compact loop), and same-round retry (the round
-   counter advances only on a completed dispatch). Lands under `formal/` /
-   `spec/tla/` per the behavioral-constitution toolchain; recorded as a B3
-   deliverable, cross-referenced from the #1528 B6 registry obligation.
+8. **Lifecycle proof** for the full proactive path:
+   `estimate → compact → rebuild → validate → (dispatch | abort)`. Modelled as an
+   abstract state machine proving: **no dispatch above budget**
+   (`dispatch_within_budget`), **termination / bounded no-progress**
+   (`fuel_non_increasing`, `validate_exhausted_aborts`, `progress` — a strictly
+   decreasing Nat measure until a terminal), and **same-round retry**
+   (`round_preserved_off_dispatch`, `dispatch_advances_round`, `round_monotone`).
+
+   **Landed as a Lean lib** — `formal/CompactionLifecycle/Basic.lean` (registered in
+   `formal/lakefile.toml`), because that is what `.github/workflows/formal.yml`
+   machine-checks on THIS branch. `lake build` gates it, sorry-free, bare toolchain
+   (no Mathlib), exactly like the B2 `CompactionProvenance` kernel. The `validate`
+   phase's provenance check (untrusted-derived material never gains operator/model
+   authority) is that B2 kernel; this lib models the budget + round + termination
+   half of the same guard.
+
+   **TLA+ temporal model deferred to B6.** A `spec/tla/` TLC/Apalache spec with a
+   `[]`no-over-budget invariant and a `<>`termination property belongs on the
+   integration/main branch where `spec/behavior-map.toml` + a TLA CI job live; on
+   this base there is no TLA gate, and the workspace law "never commit an unchecked
+   spec" forbids landing it here unchecked. Recorded as a #1528 B6 obligation.
 
 ## Reuse discipline
 

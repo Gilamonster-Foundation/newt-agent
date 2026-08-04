@@ -523,6 +523,133 @@ fn preflight_responses_request(
     Ok(())
 }
 
+/// The outcome of the ONE Responses compaction path (#1528 B2/B3): classify the
+/// running `input` into typed provenance, compact via the ONE `compress`, rebuild
+/// EXHAUSTIVELY, and validate the fenced request against the budget. Both triggers
+/// — the REACTIVE cw-400 recovery and the PROACTIVE pre-dispatch guard — call the
+/// same [`compact_responses_input`]; they differ ONLY in how they MAP this outcome
+/// (reactive surfaces the provider's original 400; proactive fails closed with a
+/// fresh refusal). Making the compaction unrepresentable in two places is the
+/// point (reuse discipline): a fix or a guard added here can never be missed at
+/// one call site.
+enum ResponsesCompaction {
+    /// Compression fired and the rebuilt (fenced) request fits the budget — the
+    /// caller's `input` was rewritten to the compacted form.
+    Compacted,
+    /// Compression did not fire (nothing left to reclaim) — `input` unchanged.
+    NotFired,
+    /// The compressor refused: the protected head alone exceeds the budget.
+    Refused,
+    /// The rebuilt request still exceeds the budget AFTER fencing — `input` is left
+    /// UNCHANGED (BHV-BUDGET-004: never dispatch an oversized request).
+    OverBudgetAfterFence(responses_compaction::PostBridgeBudgetExceeded),
+    /// `input` could not be classified (a forbidden `system` item) — fail closed.
+    BridgeError,
+}
+
+/// Compact the Responses `input` toward `compaction_budget` via the B2 provenance
+/// bridge + the ONE `compress`, then validate the fenced rebuild against
+/// `actionable_budget` before committing. On success `*input` is rewritten in
+/// place; on any refusal/over-budget path `*input` is left UNCHANGED so no caller
+/// can dispatch a half-compacted oversized request. Single-shot (one attempt) —
+/// the caller decides whether to gate on an estimate (proactive) or always call
+/// (reactive), and how to map a non-`Compacted` outcome.
+#[allow(clippy::too_many_arguments)]
+async fn compact_responses_input(
+    input: &mut Vec<serde_json::Value>,
+    instructions: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+    actionable_budget: Option<usize>,
+    compaction_budget: usize,
+    cal: f32,
+    estimation: crate::tokens::TokenEstimation,
+    task: &str,
+    summary_input_cap_floor_chars: usize,
+    compaction_store: Option<&dyn crate::agentic::spill::SpillStore>,
+    summarizer: Option<&SummarizeFn>,
+    compress_state: &mut CompressState,
+    color: bool,
+) -> ResponsesCompaction {
+    // Classify the Responses `input` into TYPED provenance (fail-closed) and render
+    // it to chat with `instructions` as a protected system head. A forbidden
+    // `system` item in `input` fails closed here (BHV-PROVENANCE-002).
+    let messages = match responses_compaction::responses_input_to_compaction(input) {
+        Ok(m) => m,
+        Err(_) => return ResponsesCompaction::BridgeError,
+    };
+    let mut chat: Vec<serde_json::Value> = Vec::new();
+    if let Some(ins) = instructions {
+        chat.push(serde_json::json!({ "role": "system", "content": ins }));
+    }
+    chat.extend(responses_compaction::compaction_to_chat(&messages));
+    let outcome = compress(
+        CompressRequest {
+            messages: &chat,
+            // Real-token cap minus real-token schema overhead → pipeline chars/4
+            // currency (mirrors the Chat path).
+            budget: compaction_budget,
+            max_messages: None,
+            replay_protected_tail_len: 0,
+            task,
+            hard_budget: true,
+            authoritative: true,
+            focus: None,
+            est: estimation,
+            summary_input_cap_floor_chars,
+            compaction_store,
+        },
+        summarizer,
+        compress_state,
+    )
+    .await;
+    if let Some(notice) = outcome.notice {
+        print_harness_notice(&notice, color);
+    }
+    if outcome.action == CompressAction::Refused {
+        return ResponsesCompaction::Refused;
+    }
+    if !outcome.fired {
+        return ResponsesCompaction::NotFired;
+    }
+    // Drop the instructions system head we prepended for head protection:
+    // `instructions` is re-sent ONCE via its own field (BHV-PROVENANCE-005), never
+    // duplicated into `input`. The compressor keeps the head verbatim at index 0.
+    let compacted = &outcome.messages;
+    let rebuilt_chat: &[serde_json::Value] = if instructions.is_some()
+        && compacted.first().and_then(|m| m["role"].as_str()) == Some("system")
+    {
+        &compacted[1..]
+    } else {
+        compacted
+    };
+    // Reclassify to typed provenance, then rebuild exhaustively (untrusted-derived
+    // → fenced `user`).
+    let rebuilt_msgs = responses_compaction::chat_to_compaction(rebuilt_chat);
+    let rebuilt_input = responses_compaction::compaction_to_responses(&rebuilt_msgs);
+    // #1528 B2 (BHV-BUDGET-004): the provenance fences are added AFTER the
+    // compressor fit its budget, so validate the REBUILT request against the
+    // authoritative budget (the SHARED B1 estimator, same real-token currency
+    // dispatch enforces) BEFORE committing. `pre_bridge` estimates the SAME
+    // messages WITHOUT the fences, attributing any overflow to the framing.
+    if let Some(budget) = actionable_budget {
+        let est_tokens = |items: &[serde_json::Value]| {
+            estimate_responses_request_real_tokens(instructions, items, tools, estimation, cal)
+        };
+        let post_bridge = est_tokens(&rebuilt_input);
+        let pre_bridge = est_tokens(&responses_compaction::rebuild_unfenced_for_estimate(
+            &rebuilt_msgs,
+        ));
+        if let Err(exceeded) =
+            responses_compaction::check_post_bridge_budget(budget, pre_bridge, post_bridge)
+        {
+            // Leave `*input` UNCHANGED — never commit an oversized rewrite.
+            return ResponsesCompaction::OverBudgetAfterFence(exceeded);
+        }
+    }
+    *input = rebuilt_input;
+    ResponsesCompaction::Compacted
+}
+
 /// Hook recovering a hard context-window 400:
 /// `(error, model, today) → parsed full context window`. The loop composes the
 /// returned window with its percentage ceiling and generation output reserve;
@@ -6664,6 +6791,54 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // round (critical at max_tool_rounds == 1 or near the cap): the recovered
         // request is re-sent WITH tools, never demoted to the tools-disabled summary.
         let json = loop {
+            // #1528 B3: PROACTIVE pre-dispatch compaction — when the request is
+            // LOCALLY known to exceed the budget, compact BEFORE dispatch instead of
+            // paying a round-trip to learn it from a cw-400. Reuses the ONE
+            // `compact_responses_input` (the SAME path the reactive recovery uses).
+            // It fires at the TOP of the inner loop, BEFORE `build_body`, within the
+            // SAME iteration — so the outer `round` counter never advances
+            // (retry-in-place, the B2 P1 invariant). BEST-EFFORT + BOUNDED: a SINGLE
+            // compaction attempt that commits `input` only to a form which fits the
+            // post-bridge budget (BHV-BUDGET-004; otherwise `input` is untouched).
+            // The `preflight_responses_request` below is the ONE authoritative
+            // fail-closed gate: if the request still does not fit — an irreducible
+            // head or a fresh, un-summarizable newest tool output — it refuses THERE,
+            // with the precise "function outputs were not truncated" message. So this
+            // never spins compact→still-too-big→compact and never dispatches oversized.
+            // Tool schemas ride this request, so the target reserves their overhead.
+            if let Some(budget) = budget_state.actionable_input_budget() {
+                let before = estimate_responses_request_real_tokens(
+                    instructions.as_deref(),
+                    &input,
+                    tools_supported.then_some(tools.as_slice()),
+                    estimation,
+                    cal,
+                );
+                if before > budget {
+                    if let ResponsesCompaction::OverBudgetAfterFence(exceeded) =
+                        compact_responses_input(
+                            &mut input,
+                            instructions.as_deref(),
+                            tools_supported.then_some(tools.as_slice()),
+                            Some(budget),
+                            budget_state.compaction_budget(cal, true),
+                            cal,
+                            estimation,
+                            task,
+                            summary_input_cap_floor_chars,
+                            compaction_store,
+                            summarizer,
+                            compress_state,
+                            color,
+                        )
+                        .await
+                    {
+                        // Surface WHY the fenced request could not be sent; the
+                        // preflight below then refuses (zero dispatch, round intact).
+                        print_harness_notice(&exceeded.to_string(), color);
+                    }
+                }
+            }
             preflight_responses_request(
                 instructions.as_deref(),
                 &input,
@@ -6726,110 +6901,40 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             // the authoritative preflight bound — the endpoint's parsed
                             // hard limit is authoritative from here on.
                             budget_state.recover_from_cw400(recovered_budget);
-                            // #1528 B2: classify the Responses `input` into TYPED
-                            // provenance (fail-closed), render it to chat with the
-                            // instructions as a protected system head, compact, then
-                            // rebuild EXHAUSTIVELY — untrusted-derived items can never
-                            // acquire operator/model authority across the round trip.
-                            let messages =
-                                match responses_compaction::responses_input_to_compaction(&input) {
-                                    Ok(m) => m,
-                                    // A forbidden `system` item in `input` fails closed:
-                                    // refuse the recovery, surface the endpoint's 400.
-                                    Err(_) => return Err(e),
-                                };
-                            let mut chat: Vec<serde_json::Value> = Vec::new();
-                            if let Some(ins) = instructions.as_deref() {
-                                chat.push(serde_json::json!({ "role": "system", "content": ins }));
-                            }
-                            chat.extend(responses_compaction::compaction_to_chat(&messages));
-                            let outcome = compress(
-                                CompressRequest {
-                                    messages: &chat,
-                                    // Real-token cap minus real-token schema overhead
-                                    // → pipeline chars/4 currency (mirrors the Chat path).
-                                    budget: budget_state.compaction_budget(cal),
-                                    max_messages: None,
-                                    replay_protected_tail_len: 0,
-                                    task,
-                                    hard_budget: true,
-                                    authoritative: true,
-                                    focus: None,
-                                    est: estimation,
-                                    summary_input_cap_floor_chars,
-                                    compaction_store,
-                                },
+                            // #1528 B3: the compaction "dance" is the ONE shared
+                            // `compact_responses_input` — the SAME path the PROACTIVE
+                            // pre-dispatch guard uses. Reactive maps a refusal / bridge
+                            // error / post-fence overflow to the provider's ORIGINAL 400
+                            // (surface it, ZERO redispatch); a successful compaction (or
+                            // a no-op) falls through to the bounded redispatch below.
+                            // Tool schemas ride this request, so the compaction target
+                            // reserves their overhead (`with_tool_schemas = true`).
+                            match compact_responses_input(
+                                &mut input,
+                                instructions.as_deref(),
+                                tools_supported.then_some(tools.as_slice()),
+                                budget_state.actionable_input_budget(),
+                                budget_state.compaction_budget(cal, true),
+                                cal,
+                                estimation,
+                                task,
+                                summary_input_cap_floor_chars,
+                                compaction_store,
                                 summarizer,
                                 compress_state,
+                                color,
                             )
-                            .await;
-                            if let Some(notice) = outcome.notice {
-                                print_harness_notice(&notice, color);
-                            }
-                            if outcome.action == CompressAction::Refused {
-                                // Refuse the resend; surface the endpoint's 400.
-                                return Err(e);
-                            }
-                            if outcome.fired {
-                                // Drop the instructions system head we prepended for
-                                // head protection: `instructions` is re-sent ONCE via
-                                // its own field (BHV-PROVENANCE-005), never duplicated
-                                // into `input`. The compressor keeps the head verbatim
-                                // at index 0; the mid-list summary is never at 0.
-                                let compacted = &outcome.messages;
-                                let rebuilt_chat: &[serde_json::Value] = if instructions.is_some()
-                                    && compacted.first().and_then(|m| m["role"].as_str())
-                                        == Some("system")
-                                {
-                                    &compacted[1..]
-                                } else {
-                                    compacted
-                                };
-                                // Reclassify to typed provenance, then rebuild
-                                // exhaustively (untrusted-derived → fenced `user`).
-                                let rebuilt_msgs =
-                                    responses_compaction::chat_to_compaction(rebuilt_chat);
-                                input =
-                                    responses_compaction::compaction_to_responses(&rebuilt_msgs);
-                                // #1528 B2 (BHV-BUDGET-004): the provenance fences are
-                                // added AFTER the compressor fit its budget, so validate
-                                // the REBUILT request against the authoritative budget
-                                // (the SHARED B1 estimator, same real-token currency
-                                // dispatch enforces) BEFORE redispatch — never send an
-                                // oversized request, never consume another logical round.
-                                // `pre_bridge` estimates the SAME messages WITHOUT the
-                                // fences, so the typed error attributes the overflow to
-                                // the framing the compressor could not see.
-                                if let Some(budget) = budget_state.actionable_input_budget() {
-                                    let est_tokens = |items: &[serde_json::Value]| {
-                                        estimate_responses_request_real_tokens(
-                                            instructions.as_deref(),
-                                            items,
-                                            tools_supported.then_some(tools.as_slice()),
-                                            estimation,
-                                            cal,
-                                        )
-                                    };
-                                    let post_bridge = est_tokens(&input);
-                                    let pre_bridge = est_tokens(
-                                        &responses_compaction::rebuild_unfenced_for_estimate(
-                                            &rebuilt_msgs,
-                                        ),
-                                    );
-                                    if let Err(exceeded) =
-                                        responses_compaction::check_post_bridge_budget(
-                                            budget,
-                                            pre_bridge,
-                                            post_bridge,
-                                        )
-                                    {
-                                        // ZERO second inference: return before the
-                                        // `cw_retries += 1; continue` below — the logical
-                                        // round is NOT consumed.
-                                        print_harness_notice(&exceeded.to_string(), color);
-                                        return Err(e);
-                                    }
+                            .await
+                            {
+                                ResponsesCompaction::Refused | ResponsesCompaction::BridgeError => {
+                                    return Err(e)
                                 }
+                                ResponsesCompaction::OverBudgetAfterFence(exceeded) => {
+                                    // ZERO second inference: surface the original 400.
+                                    print_harness_notice(&exceeded.to_string(), color);
+                                    return Err(e);
+                                }
+                                ResponsesCompaction::Compacted | ResponsesCompaction::NotFired => {}
                             }
                             cw_retries += 1;
                             continue;
@@ -7102,6 +7207,44 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 // Step 26.3 (#584): see the Ollama path (Responses output shape).
                 "output": maybe_offload_tool_result(name, result, tool_offload, spill_store),
             }));
+        }
+    }
+
+    // #1528 B3: proactively compact the tools-DISABLED final summary if it is
+    // LOCALLY over budget. No round to protect (the loop is over), so it is a
+    // BEST-EFFORT, single-shot compaction; the `preflight_responses_request` below
+    // is the ONE authoritative fail-closed gate. Every tools argument is `None` —
+    // the summary sends NO tool schemas — so the estimate drops them AND the
+    // compaction target does NOT reserve their overhead (`with_tool_schemas =
+    // false`), avoiding over-compaction (req #7).
+    if let Some(budget) = budget_state.actionable_input_budget() {
+        let before = estimate_responses_request_real_tokens(
+            instructions.as_deref(),
+            &input,
+            None,
+            estimation,
+            cal,
+        );
+        if before > budget {
+            if let ResponsesCompaction::OverBudgetAfterFence(exceeded) = compact_responses_input(
+                &mut input,
+                instructions.as_deref(),
+                None,
+                Some(budget),
+                budget_state.compaction_budget(cal, false),
+                cal,
+                estimation,
+                task,
+                summary_input_cap_floor_chars,
+                compaction_store,
+                summarizer,
+                compress_state,
+                color,
+            )
+            .await
+            {
+                print_harness_notice(&exceeded.to_string(), color);
+            }
         }
     }
 
@@ -9959,6 +10102,154 @@ mod tool_round_cap_tests {
             4,
             "expected round0 tool, round1 400, round1 recovered tool, summary; a \
              3-request run means the 400 burned round 1 and jumped to the summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_proactively_compacts_before_the_first_dispatch() {
+        // #1528 B3 (req 1/2): when the FIRST request is LOCALLY known to exceed the
+        // input budget, the loop compacts BEFORE dispatching — no round-trip to learn
+        // it from a cw-400. The single request the server sees is already compacted
+        // (carries the reference-summary envelope) and STILL carries tools (a real
+        // tool round — the round counter is not consumed). Regression: before B3 the
+        // Responses loop only compacted REACTIVELY, after a provider 400 (so this
+        // request would have been dispatched over budget, or 400'd first).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "proactively compacted"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "PROACTIVE: compact before the first dispatch";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        // A LOCAL budget (no cw-400 needed): the raw history dwarfs it, the compacted
+        // form fits. recover_cw_400 stays None — proactive never learns from a 400.
+        ctx.safe_context = Some(12_000);
+        ctx.num_ctx = Some(12_000);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("proactive compaction fits the request and it dispatches once");
+        assert_eq!(reply, "proactively compacted");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            reqs.len(),
+            1,
+            "a single dispatch — proactively compacted, no cw-400 round-trip"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap_or_default();
+        assert!(
+            body["input"]
+                .to_string()
+                .contains("newt-compaction-summary"),
+            "the first request was compacted BEFORE dispatch (reference-summary envelope present)"
+        );
+        assert!(
+            body["tools"].is_array(),
+            "the compacted request is still a REAL tool round — the round is not consumed"
+        );
+        let n_items = body["input"].as_array().map_or(0, Vec::len);
+        assert!(n_items < 30, "compacted to {n_items} items (raw was ~121)");
+    }
+
+    #[tokio::test]
+    async fn responses_proactive_bounded_no_progress_fails_closed_with_zero_dispatch() {
+        // #1528 B3 (req 3/5): when even a SINGLE proactive compaction cannot bring the
+        // request under budget (an irreducible protected newest-user message), the
+        // loop FAILS CLOSED — it never dispatches an oversized request and never spins
+        // compact→still-too-big→compact. ZERO requests reach the server.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "UNREACHED"}]}]
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        // The newest user message (the task) alone dwarfs the budget and is protected
+        // (last-user anchor) — compaction cannot remove it, so the request stays over.
+        let task = format!("IRREDUCIBLE {}", "z".repeat(40_000));
+        let messages = vec![MemMessage::system("base policy"), MemMessage::user(&task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = Some(512);
+        ctx.num_ctx = Some(512);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 1;
+
+        let err = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("an irreducible over-budget request fails closed, never dispatched");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing") || msg.contains("budget"),
+            "expected a fail-closed budget refusal, got: {msg}"
+        );
+        // `.expect(0)` verified on MockServer drop: ZERO inference dispatches.
+    }
+
+    #[tokio::test]
+    async fn responses_final_summary_is_proactively_compacted() {
+        // #1528 B3 (req 6): the tools-DISABLED final summary is proactively compacted
+        // when it is locally over budget, before its dispatch. `max_tool_rounds == 0`
+        // skips the tool rounds so this exercises ONLY the final-summary guard.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "summarized"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "FINAL SUMMARY: compact the tools-disabled summary too";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = Some(12_000);
+        ctx.num_ctx = Some(12_000);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 0;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("the tools-disabled summary is proactively compacted and dispatches");
+        assert_eq!(reply, "summarized");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(reqs.len(), 1, "only the final summary dispatched");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap_or_default();
+        assert!(
+            body["tools"].is_null(),
+            "the final summary is tools-disabled"
+        );
+        assert!(
+            body["input"]
+                .to_string()
+                .contains("newt-compaction-summary"),
+            "the tools-disabled summary was proactively compacted before dispatch"
         );
     }
 
