@@ -603,21 +603,93 @@ impl ResponsesCompaction {
     }
 }
 
+/// A TRANSACTIONAL wrapper over the session compaction/spill store (#1528 B3,
+/// B3-CG-004). The compressor's progressive-disclosure spill (`store.store(...)`)
+/// is a shared, un-cloneable side effect with no delete API, so a candidate
+/// compaction that runs the compressor and is then REJECTED would otherwise leave
+/// an orphaned redacted span in the live store. This wrapper BUFFERS every
+/// `store` write and returns the same monotonic `s{n}` id the inner store would
+/// assign (nothing else writes to the inner store during a single compaction, so
+/// the ids match on flush). [`Self::commit`] flushes the buffer to the inner store;
+/// a rejected candidate is simply dropped, writing nothing — the spill joins the
+/// SAME commit boundary as `*input` / `*compress_state` / the notice.
+struct CandidateSpillStore<'a> {
+    inner: Option<&'a dyn crate::agentic::spill::SpillStore>,
+    base: u64,
+    buffered: std::sync::Mutex<Vec<String>>,
+}
+
+impl<'a> CandidateSpillStore<'a> {
+    fn new(inner: Option<&'a dyn crate::agentic::spill::SpillStore>) -> Self {
+        Self {
+            inner,
+            base: inner.map_or(0, crate::agentic::spill::SpillStore::spills),
+            buffered: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Flush buffered spills to the inner store (COMMIT). The inner store's counter
+    /// is still at `base` (nothing else wrote to it), so it re-assigns exactly the
+    /// ids this wrapper handed back during the candidate run.
+    fn commit(self) {
+        if let Some(inner) = self.inner {
+            for redacted in self.buffered.into_inner().unwrap_or_default() {
+                inner.store(redacted);
+            }
+        }
+    }
+}
+
+impl crate::agentic::spill::SpillStore for CandidateSpillStore<'_> {
+    fn store(&self, redacted: String) -> String {
+        let mut buf = self.buffered.lock().unwrap();
+        let id = format!("s{}", self.base + buf.len() as u64);
+        buf.push(redacted);
+        id
+    }
+    fn fetch(&self, id: &str) -> Option<String> {
+        if let Some(n) = id.strip_prefix('s').and_then(|d| d.parse::<u64>().ok()) {
+            let buf = self.buffered.lock().unwrap();
+            if n >= self.base && (n - self.base) < buf.len() as u64 {
+                return buf.get((n - self.base) as usize).cloned();
+            }
+        }
+        self.inner.and_then(|s| s.fetch(id))
+    }
+    fn spills(&self) -> u64 {
+        self.base + self.buffered.lock().unwrap().len() as u64
+    }
+    fn offloaded_chars(&self) -> u64 {
+        let inner = self
+            .inner
+            .map_or(0, crate::agentic::spill::SpillStore::offloaded_chars);
+        let buffered: u64 = self
+            .buffered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.chars().count() as u64)
+            .sum();
+        inner + buffered
+    }
+}
+
 /// Compact the Responses `input` toward `compaction_budget` via the B2 provenance
 /// bridge + the ONE `compress`, then validate the fenced rebuild against
 /// `actionable_budget` before committing.
 ///
 /// TRANSACTIONAL (#1528 B3, B3-CG-004): the compressor runs against a CLONE of
-/// `compress_state`, and the candidate is validated (provenance + post-bridge
-/// budget) BEFORE anything live is touched. On success — and only then — the
-/// helper commits ALL THREE effects together: it rewrites `*input`, writes the
-/// candidate anti-thrash state back into `*compress_state`, and emits the
+/// `compress_state` AND a buffering [`CandidateSpillStore`], and the candidate is
+/// validated (provenance + post-bridge budget) BEFORE anything live is touched. On
+/// success — and only then — the helper commits ALL FOUR effects together: it
+/// rewrites `*input`, writes the candidate anti-thrash state back into
+/// `*compress_state`, FLUSHES the buffered spills to the real store, and emits the
 /// compaction notice. On ANY reject/refuse/over-budget/bridge-error path, `*input`,
-/// `*compress_state`, and the notice stream are left UNTOUCHED, so no caller can
-/// dispatch a half-compacted request or believe an uncommitted compaction
-/// occurred. Single-shot (one attempt) — the caller decides whether to gate on an
-/// estimate (proactive) or always call (reactive), and how to map a non-`Compacted`
-/// outcome (see [`CompactionRejection`]).
+/// `*compress_state`, the spill store, and the notice stream are ALL left UNTOUCHED,
+/// so no caller can dispatch a half-compacted request or believe an uncommitted
+/// compaction occurred. Single-shot (one attempt) — the caller decides whether to
+/// gate on an estimate (proactive) or always call (reactive), and how to map a
+/// non-`Compacted` outcome (see [`CompactionRejection`]).
 #[allow(clippy::too_many_arguments)]
 async fn compact_responses_input(
     input: &mut Vec<serde_json::Value>,
@@ -646,9 +718,11 @@ async fn compact_responses_input(
         chat.push(serde_json::json!({ "role": "system", "content": ins }));
     }
     chat.extend(responses_compaction::compaction_to_chat(&messages));
-    // Run the compressor against a CANDIDATE state — the live anti-thrash counters
-    // / disabled latch are mutated only on commit (below).
+    // Run the compressor against a CANDIDATE state AND a buffering spill store — the
+    // live anti-thrash counters / disabled latch and the session compaction store
+    // are mutated only on commit (below).
     let mut candidate_state = compress_state.clone();
+    let candidate_store = CandidateSpillStore::new(compaction_store);
     let outcome = compress(
         CompressRequest {
             messages: &chat,
@@ -663,7 +737,7 @@ async fn compact_responses_input(
             focus: None,
             est: estimation,
             summary_input_cap_floor_chars,
-            compaction_store,
+            compaction_store: Some(&candidate_store),
         },
         summarizer,
         &mut candidate_state,
@@ -707,14 +781,16 @@ async fn compact_responses_input(
         if let Err(exceeded) =
             responses_compaction::check_post_bridge_budget(budget, pre_bridge, post_bridge)
         {
-            // REJECT: leave `*input`, `*compress_state`, and the notice stream
-            // UNCHANGED — the candidate is discarded.
+            // REJECT: `candidate_store` is dropped WITHOUT `commit`, so the buffered
+            // spills never reach the live store; `*input`, `*compress_state`, and the
+            // notice stream are likewise UNTOUCHED — the candidate is discarded whole.
             return ResponsesCompaction::OverBudgetAfterFence(exceeded);
         }
     }
-    // COMMIT — all three effects together, now that the candidate is accepted.
+    // COMMIT — all FOUR effects together, now that the candidate is accepted.
     *input = rebuilt_input;
     *compress_state = candidate_state;
+    candidate_store.commit();
     if let Some(notice) = outcome.notice {
         print_harness_notice(&notice, color);
     }
@@ -10546,6 +10622,89 @@ mod tool_round_cap_tests {
             1,
             "committed: the anti-thrash attempt IS recorded on the live state"
         );
+    }
+
+    /// B3-CG-004: the FOURTH effect — the session compaction/spill store — is also
+    /// transactional. A rejected candidate writes NOTHING to the live store; a
+    /// committed one flushes exactly its buffered span. Fails on `711c247`, where the
+    /// shared `store.store(...)` inside `compress` was not rolled back on reject
+    /// (leaking an orphaned redacted span per rejected proactive attempt).
+    #[tokio::test]
+    async fn compact_responses_input_spill_store_is_transactional() {
+        use crate::agentic::compress::{CompressState, Summarizer};
+        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        let make_input = || {
+            let mut v = vec![serde_json::json!({"role": "user", "content": "task"})];
+            for i in 0..6 {
+                v.push(assistant(i, 300));
+            }
+            v.push(serde_json::json!({"role": "user", "content": "recent turn"}));
+            v
+        };
+        let summarizer =
+            || -> Summarizer { Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) })) };
+
+        // REJECT (tiny actionable budget → post-fence overflow): store stays EMPTY.
+        {
+            let store = SessionSpillStore::default();
+            let s = summarizer();
+            let mut input = make_input();
+            let mut state = CompressState::new();
+            let outcome = compact_responses_input(
+                &mut input,
+                Some("you are newt"),
+                None,
+                Some(10),
+                400,
+                1.0,
+                crate::tokens::TokenEstimation::default(),
+                "task",
+                8_192,
+                Some(&store),
+                Some(&*s),
+                &mut state,
+                false,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                ResponsesCompaction::OverBudgetAfterFence(_)
+            ));
+            assert_eq!(
+                store.spills(),
+                0,
+                "TRANSACTIONAL: a rejected candidate writes NOTHING to the spill store"
+            );
+        }
+        // COMMIT (generous budget): the buffered span is flushed exactly once.
+        {
+            let store = SessionSpillStore::default();
+            let s = summarizer();
+            let mut input = make_input();
+            let mut state = CompressState::new();
+            let outcome = compact_responses_input(
+                &mut input,
+                Some("you are newt"),
+                None,
+                Some(100_000),
+                400,
+                1.0,
+                crate::tokens::TokenEstimation::default(),
+                "task",
+                8_192,
+                Some(&store),
+                Some(&*s),
+                &mut state,
+                false,
+            )
+            .await;
+            assert!(matches!(outcome, ResponsesCompaction::Compacted));
+            assert_eq!(
+                store.spills(),
+                1,
+                "committed: the compacted span is flushed to the store exactly once"
+            );
+        }
     }
 
     // --- #1528 B3 (item 6): pure lifecycle-invariant property tests ---
