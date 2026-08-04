@@ -34,6 +34,10 @@ pub(crate) mod experiential;
 // Step 26.6b (#586): scheduled per-step compiled view — the `scheduled` feature.
 pub(crate) mod scheduled;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
+/// Content-addressed spill identity (#1528 B3 follow-up): a spill handle is the
+/// BLAKE3 CIDv1 of a versioned, session-scoped record. Stands up alongside `spill`
+/// during the consumer migration that deletes the reservation machinery.
+pub(crate) mod content_spill;
 /// Drive an overseer-authored plan through a `CrewRunner` (#628 P2 execute side).
 pub(crate) mod plan_exec;
 pub(crate) mod spill;
