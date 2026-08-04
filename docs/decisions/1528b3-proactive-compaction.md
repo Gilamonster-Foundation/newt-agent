@@ -117,34 +117,49 @@ round-preservation theorems). TLA+ (B6) adds the `Dispatch → Completed | Faile
 tail — where `OnlyCompletedRoundAdvances` / `FailedDispatchDoesNotConsumeLogicalRound`
 are proved — that this B3 kernel deliberately leaves out (Problem C).
 
-### B6 TLA+ obligation — transactional spill (precise)
+### B6 TLA+ obligation — transactional spill capability (precise)
 
-The spill store's transactional reserve/commit is proven single-threaded in Lean
-(`formal/CompactionSpill/Basic.lean`: no-store⟹no-handle, rejected⟹no record, only
-commit increments the count, committed handle resolves to its own payload). Lean does
-NOT claim CONCURRENCY binding — that is a Rust behavioral test today
-(`candidate_spill_store_binds_reserved_ids_under_an_interleaved_external_write`) and a
-B6 temporal model:
+The spill store is now an UNFORGEABLE, STORE-BOUND, SINGLE-USE capability. Its
+single-thread capability algebra is proven in Lean
+(`formal/CompactionSpill/Basic.lean`, reservation-aware model): a reservation carries
+the `storeId` that issued it, `reserve` marks a store-bound id outstanding without
+counting it, `commit` is rejected for a FOREIGN store (`foreign_reservation_rejected`)
+or an UNRESERVED id (`unreserved_id_rejected`), installs under EXACTLY the reserved id
+(`commit_installs_exact_reserved_payload`) while PRESERVING existing payloads
+(`commit_preserves_existing_payloads`), CONSUMES the reservation so it cannot commit
+twice (`commit_consumes_reservation` / `committed_reservation_cannot_commit_again`),
+reject retires without a count bump (`reject_removes_reservation_without_commit`), and
+only a successful commit increments the count
+(`failed_commit_does_not_increment_counts` / `only_successful_commit_increments_counts`).
+
+Lean does NOT claim two things — deferred to this B6 temporal model plus the Rust
+behavioral tests that already ground them
+(`candidate_spill_store_binds_reserved_ids_under_an_interleaved_external_write` for
+concurrency, `candidate_commit_is_all_or_none_on_a_duplicate_id` for batch atomicity):
+(1) CONCURRENCY binding — an interleaved external write cannot rebind a reserved id;
+(2) BATCH all-or-none — a multi-spill candidate commits its whole batch or none of it.
 
 ```
-CandidateReserve
-  → CandidateSummarize
-  → ExternalStoreWrite
-  → CandidateValidate
-  → CandidateCommit | CandidateReject
-  → Fetch
+ReserveA            \* candidate reserves a store-bound id A (outstanding, uncounted)
+  → ReserveB        \* candidate reserves a store-bound id B
+  → ExternalCommit  \* an interleaved external writer commits its OWN reservation
+  → CandidateValidate  \* prevalidate: all store-matched, all outstanding, no dup, none already live
+  → CandidateBatchCommit | CandidateReject
+  → FetchAll        \* resolve every emitted handle
 ```
 
-Required TLA+ properties:
+Required TLA+ properties (9):
 
 ```
-EveryEmittedHandleResolves
-EveryHandleResolvesToItsOwnPayload
-NoStoreMeansNoHandle
-RejectedCandidateLeavesNoRecord
-ConcurrentWritesDoNotRebindReservedHandles
-CommittedCountsReflectCommittedPayloadsOnly
-NoLiveInputBeforeSpillCommit
+NoStoreMeansNoHandle                    \* a span with no store emits no handle
+EveryEmittedHandleResolves              \* after a batch commit, every emitted handle resolves
+EveryHandleResolvesToItsOwnPayload      \* no swap/alias across A / B / external
+ForeignReservationNeverCommits          \* store-binding: a wrong-storeId reservation is rejected
+ConcurrentWritesDoNotRebindReservedHandles  \* ExternalCommit gets a fresh id; A/B keep theirs
+CommittedIdIsImmutable                  \* a committed id is never overwritten (2nd commit rejected)
+RejectedCandidateLeavesNoRecord         \* reject installs nothing; committed count unchanged
+CandidateBatchCommitIsAllOrNone         \* any collision ⇒ the WHOLE batch installs nothing
+NoLiveInputBeforeSpillCommit            \* live input references a handle only after its batch commit
 ```
 
 ## Reuse discipline

@@ -27,64 +27,67 @@ pub const TOOL_RESULT_SPILL_CAP: usize = 16_000;
 const HEAD_CHARS: usize = 800;
 const TAIL_CHARS: usize = 800;
 
-/// A reserved-but-not-yet-committed spill id (#1528 B3). The STORE allocates it, so
-/// it is unique even under concurrent activity; the payload is installed later via
-/// [`SpillStore::commit_reserved`] under the SAME id. A reservation that is never
-/// committed leaves NO fetchable record and does NOT count as a committed spill —
-/// its allocated id is simply retired (an internal gap), never reused, never
-/// resolvable.
-#[derive(Debug)]
-pub struct ReservedSpill {
-    id: String,
+/// Why a spill commit failed (#1528 B3). A capability-level fault, surfaced so the
+/// compaction helper can fail CLOSED — never leaving a live retrieval handle
+/// unresolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpillCommitError {
+    /// The id is already committed. Commits are single-shot and committed payloads
+    /// are IMMUTABLE (BHV-SPILL-003/005) — this includes an intra-batch duplicate.
+    DuplicateCommit,
+    /// The candidate transaction log could not be recovered (a poisoned lock) — fail
+    /// CLOSED rather than commit an empty/partial transaction (BHV-SPILL-007).
+    PoisonedTransaction,
 }
 
-impl ReservedSpill {
-    /// Construct a reservation for a store-allocated `id`. For SpillStore
-    /// IMPLEMENTORS only — a store issues these from its OWN allocator inside
-    /// [`SpillStore::reserve`]; callers must never fabricate one to predict an id.
-    #[must_use]
-    pub fn new(id: String) -> Self {
-        Self { id }
-    }
-
-    /// The stable id to render into the candidate summary — the SAME id the payload
-    /// is installed under at commit. This is the ONLY id anything should embed; it
-    /// is issued by the store, never predicted.
-    #[must_use]
-    pub fn id(&self) -> &str {
-        &self.id
-    }
+/// An UNFORGEABLE, single-use spill CAPABILITY (#1528 B3, BHV-SPILL-002/003/004).
+/// Issued ONLY by [`SpillStore::reserve`] — there is no public constructor, so a
+/// caller cannot fabricate a reservation for an arbitrary id. It is BOUND to its
+/// issuing store (its [`Self::commit`] installs into THAT store; it cannot be handed
+/// to a different one) and CONSUMED by commit (`self: Box<Self>` — a reservation
+/// commits at most once; a second commit does not typecheck).
+pub trait SpillReservation: Send {
+    /// The store-issued id to render into the candidate summary — the SAME id the
+    /// payload is installed under at commit. Never predicted.
+    fn id(&self) -> &str;
+    /// Install `redacted` under this reservation's id, in its ISSUING store. Consumes
+    /// the capability. Fails CLOSED on a duplicate id (`DuplicateCommit`, preserving
+    /// the existing record) or a poisoned candidate log (`PoisonedTransaction`).
+    fn commit(self: Box<Self>, redacted: String) -> Result<(), SpillCommitError>;
 }
 
 /// A session store for offloaded / evicted (already-redacted) payloads. Methods take
 /// `&self` (interior mutability) so a single shared `&dyn SpillStore` serves BOTH the
 /// loop's write path and the `memory_fetch` read path without the `&mut dyn _`
-/// reborrow/invariance dance. #1528 B3 adds `reserve` / `commit_reserved` so a spill
-/// can be STAGED (id allocated) and committed transactionally.
+/// reborrow/invariance dance. #1528 B3 makes writes go through an UNFORGEABLE
+/// [`SpillReservation`] capability so a spill can be STAGED (id allocated by the
+/// store) and committed transactionally.
 pub trait SpillStore: Send + Sync {
-    /// Store an already-redacted payload immediately; returns its id. Equivalent to
-    /// [`Self::reserve`] then [`Self::commit_reserved`] in one atomic-enough call.
-    fn store(&self, redacted: String) -> String;
+    /// Issue a fresh, unforgeable reservation — the STORE owns id allocation. Commit
+    /// or drop the returned capability; a dropped reservation installs nothing.
+    fn reserve(&self) -> Box<dyn SpillReservation + '_>;
+    /// Reserve + commit in one; returns the committed id. A fresh reservation cannot
+    /// be a duplicate, and the direct (non-candidate) store path has no candidate log
+    /// to poison, so this is the id-returning convenience for the tool-offload path.
+    fn store(&self, redacted: String) -> String {
+        let reservation = self.reserve();
+        let id = reservation.id().to_string();
+        let _ = reservation.commit(redacted);
+        id
+    }
     /// Fetch a stored payload by id (`None` if unknown / uncommitted / expired).
     fn fetch(&self, id: &str) -> Option<String>;
     /// Number of COMMITTED payloads this session (reservations excluded).
     fn spills(&self) -> u64;
     /// Total chars of COMMITTED payloads elided from context.
     fn offloaded_chars(&self) -> u64;
-    /// Reserve a stable, unique id NOW for a payload committed later — the store owns
-    /// allocation (never predicted by a caller). A reservation is NOT fetchable and
-    /// does NOT count as a committed spill until [`Self::commit_reserved`].
-    fn reserve(&self) -> ReservedSpill;
-    /// Install a reserved payload under its reserved id (COMMIT). Infallible by
-    /// construction, so it can be the last step of a wider transaction.
-    fn commit_reserved(&self, reservation: ReservedSpill, redacted: String);
 }
 
 /// In-memory, session-scoped [`SpillStore`] — pure (no filesystem), discarded at
 /// session end / `/new`. Ids are monotonic (`s0`, `s1`, …) so injected handles
 /// are deterministic and unit-testable (no uuid, no clock). Allocation
 /// (`alloc_counter`, bumped by `reserve`) is split from the committed count
-/// (`committed`, bumped only by `commit_reserved`), so a reservation reserves a
+/// (`committed`, bumped only by a successful install), so a reservation reserves a
 /// unique id without counting as a spill.
 #[derive(Default)]
 pub struct SessionSpillStore {
@@ -94,32 +97,56 @@ pub struct SessionSpillStore {
     offloaded_chars: AtomicU64,
 }
 
-impl SpillStore for SessionSpillStore {
-    fn store(&self, redacted: String) -> String {
-        let reservation = self.reserve();
-        let id = reservation.id().to_string();
-        self.commit_reserved(reservation, redacted);
-        id
+impl SessionSpillStore {
+    /// Install a reserved payload IMMUTABLY (BHV-SPILL-005): a VACANT id installs and
+    /// bumps the counts ONCE; an OCCUPIED id returns `DuplicateCommit` and preserves
+    /// the existing payload AND the counts. Called ONLY by a [`SessionReservation`]
+    /// this store issued.
+    fn install(&self, id: String, redacted: String) -> Result<(), SpillCommitError> {
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| SpillCommitError::PoisonedTransaction)?;
+        if map.contains_key(&id) {
+            return Err(SpillCommitError::DuplicateCommit);
+        }
+        self.offloaded_chars
+            .fetch_add(redacted.chars().count() as u64, Ordering::Relaxed);
+        map.insert(id, redacted);
+        self.committed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
+}
 
-    fn reserve(&self) -> ReservedSpill {
+/// The store-issued reservation capability. Holds a reference to its issuing store,
+/// so [`SpillReservation::commit`] can only install THERE.
+struct SessionReservation<'a> {
+    store: &'a SessionSpillStore,
+    id: String,
+}
+
+impl SpillReservation for SessionReservation<'_> {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn commit(self: Box<Self>, redacted: String) -> Result<(), SpillCommitError> {
+        self.store.install(self.id, redacted)
+    }
+}
+
+impl SpillStore for SessionSpillStore {
+    fn reserve(&self) -> Box<dyn SpillReservation + '_> {
         // Atomic bump → a globally unique id even under concurrent reservations /
         // stores; NOT counted as a committed spill.
         let n = self.alloc_counter.fetch_add(1, Ordering::Relaxed);
-        ReservedSpill {
+        Box::new(SessionReservation {
+            store: self,
             id: format!("s{n}"),
-        }
-    }
-
-    fn commit_reserved(&self, reservation: ReservedSpill, redacted: String) {
-        self.offloaded_chars
-            .fetch_add(redacted.chars().count() as u64, Ordering::Relaxed);
-        self.map.lock().unwrap().insert(reservation.id, redacted);
-        self.committed.fetch_add(1, Ordering::Relaxed);
+        })
     }
 
     fn fetch(&self, id: &str) -> Option<String> {
-        self.map.lock().unwrap().get(id).cloned()
+        self.map.lock().ok().and_then(|m| m.get(id).cloned())
     }
 
     fn spills(&self) -> u64 {
@@ -208,8 +235,9 @@ mod tests {
             "reserve does NOT increment the committed count"
         );
         assert_eq!(s.fetch(&id0), None, "a reservation is not fetchable");
-        // Commit r0; reject (drop) r1.
-        s.commit_reserved(r0, "committed payload".to_string());
+        // Commit r0 (consumes the capability); reject (drop) r1.
+        r0.commit("committed payload".to_string())
+            .expect("a fresh reservation commits");
         drop(r1);
         assert_eq!(s.spills(), 1, "only commit increments the committed count");
         assert_eq!(s.fetch(&id0).as_deref(), Some("committed payload"));
@@ -221,6 +249,46 @@ mod tests {
         // A later store() must not reuse the retired id1 (allocator is monotonic).
         let id2 = s.store("later".to_string());
         assert_ne!(id2, id1, "a retired reservation id is never reused");
+    }
+
+    #[test]
+    fn committed_id_is_immutable_a_duplicate_install_is_rejected() {
+        // BHV-SPILL-005: a committed id can NOT be overwritten. Fails on 5975d64,
+        // whose commit blind-`insert`ed. White-box: `install` is the internal,
+        // id-checked commit path every reservation drives.
+        let s = SessionSpillStore::default();
+        let a = s.store("A".to_string()); // s0 = A
+        assert_eq!(
+            s.install(a.clone(), "B".to_string()),
+            Err(SpillCommitError::DuplicateCommit),
+            "a duplicate/forged install for a committed id is rejected"
+        );
+        assert_eq!(
+            s.fetch(&a).as_deref(),
+            Some("A"),
+            "existing payload preserved"
+        );
+        assert_eq!(s.spills(), 1, "committed count unchanged");
+        assert_eq!(s.offloaded_chars(), 1, "char count unchanged (only 'A')");
+    }
+
+    #[test]
+    fn a_reservation_commits_into_its_issuing_store_only() {
+        // BHV-SPILL-004: a reservation is BOUND to its issuing store — its commit
+        // installs THERE, and no other store gains a record. (Handing the token to a
+        // different store is UNREPRESENTABLE: `commit(self)` takes no store argument.)
+        let a = SessionSpillStore::default();
+        let b = SessionSpillStore::default();
+        let r = a.reserve();
+        let id = r.id().to_string();
+        r.commit("payload".to_string()).unwrap();
+        assert_eq!(
+            a.fetch(&id).as_deref(),
+            Some("payload"),
+            "installed in the ISSUING store"
+        );
+        assert_eq!(b.fetch(&id), None, "no foreign store gains a record");
+        assert_eq!(b.spills(), 0);
     }
 
     #[test]
