@@ -302,7 +302,8 @@ use display::{
 };
 use send_budget::{
     calibrate_down, calibrate_up, emit_accepted, emit_context_window_400, initial_send_budget,
-    num_ctx_input_ceiling, recovered_input_budget, sanitize_estimate_ratio,
+    num_ctx_input_ceiling, recovered_input_budget, resolve_responses_budget,
+    sanitize_estimate_ratio,
 };
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
@@ -421,18 +422,21 @@ fn preflight_full_message_request(
     Ok(())
 }
 
-fn preflight_responses_request(
+/// #1528: the ONE token-shape estimate of a Responses request — the
+/// `instructions` (as a protected system head), the running `input`, and the
+/// flattened Responses-WIRE tool schemas — that BOTH [`preflight_responses_request`]
+/// (which refuses when it exceeds the budget) and the `get_context_remaining`
+/// self-read (which reports it as `used`) call, so the self-read counts exactly
+/// what dispatch counts. `tools` is `None` for a tools-disabled request; pass the
+/// Responses-wire `tools` array actually sent, never the Chat-shaped catalog.
+/// Uncalibrated (chars/4) — the caller applies [`calibrate_up`] when it needs
+/// real-token currency.
+fn estimate_responses_request_tokens(
     instructions: Option<&str>,
     input: &[serde_json::Value],
     tools: Option<&[serde_json::Value]>,
-    authoritative_budget: Option<usize>,
-    calibration: f32,
     estimation: crate::tokens::TokenEstimation,
-    model: &str,
-) -> anyhow::Result<()> {
-    let Some(budget) = authoritative_budget else {
-        return Ok(());
-    };
+) -> usize {
     let instructions_tokens = instructions
         .map(|text| {
             estimate_value_tokens(
@@ -445,10 +449,70 @@ fn preflight_responses_request(
     let tool_tokens = tools
         .map(|tools| estimate_value_tokens(&serde_json::Value::Array(tools.to_vec()), estimation))
         .unwrap_or(0);
-    let required = calibrate_up(
-        instructions_tokens + input_tokens + tool_tokens,
+    instructions_tokens + input_tokens + tool_tokens
+}
+
+/// The CALIBRATED real-token estimate of a Responses request — the raw
+/// [`estimate_responses_request_tokens`] shape (chars/4) converted to the
+/// backend-token currency dispatch enforces in, via the model's `calibration`.
+/// Budget ceilings and remaining-token reports are real-token currency, so BOTH
+/// the dispatch preflight AND the `get_context_remaining` self-read subtract
+/// THIS, never the raw estimate (BHV-BUDGET-001/002/003: one currency, calibrated
+/// exactly once).
+fn estimate_responses_request_real_tokens(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    estimation: crate::tokens::TokenEstimation,
+    calibration: f32,
+) -> usize {
+    calibrate_up(
+        estimate_responses_request_tokens(instructions, input, tools, estimation),
         calibration,
-    );
+    )
+}
+
+/// The Responses `get_context_remaining` self-read report, extracted so it is
+/// unit-testable and shares ONE calibrated estimate with dispatch: `used` is the
+/// CALIBRATED estimate of the exact next request (the instructions, the running
+/// `input`, and the enabled Responses-wire tool schemas), subtracted from the
+/// SAME `actionable_input_budget` the preflight refuses against, in the SAME
+/// real-token currency — so the self-read's remaining and low-budget
+/// classification match what dispatch would accept or reject (BHV-BUDGET-002).
+fn responses_context_remaining_report(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    budget_state: &send_budget::ResponsesBudgetState,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    low_budget_pct: usize,
+) -> String {
+    let used_real =
+        estimate_responses_request_real_tokens(instructions, input, tools, estimation, calibration);
+    budget::render_context_budget(
+        used_real,
+        budget_state.actionable_input_budget(),
+        budget_state.num_ctx(),
+        budget_state.input_ceiling_pct(),
+        low_budget_pct,
+    )
+}
+
+fn preflight_responses_request(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
+    let required =
+        estimate_responses_request_real_tokens(instructions, input, tools, estimation, calibration);
     if required > budget {
         anyhow::bail!(
             "the Responses request needs ~{required} input tokens, which cannot fit model \
@@ -6502,38 +6566,46 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // refuses with no headroom. Reserve uses the cognition dial directly (opt-in:
     // `None` cognition reserves nothing), so a declared window now composes with
     // the output reserve exactly as the Chat Completions path does.
-    let output_reserve = generation_policy::cognition_output_reserve(cognition);
-    let responses_input_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct, output_reserve);
+    // #1526 (invariant #4) + #1528: ONE budget state is the single source of
+    // truth for this loop's context budget — the declared-window hard ceiling,
+    // the soft send budget, the monotone learned ceiling, and the authoritative
+    // preflight refusal budget all derive from it (see `ResponsesBudgetState`).
+    // It reserves local output headroom via the cognition dial (this wire sends
+    // no `max_output_tokens`) so a declared window composes with the reserve
+    // exactly as the Chat Completions path does; `None` num_ctx (the cloud
+    // default) stays ceiling-less, leaving hosted OpenAI unchanged.
+    //
+    // NOTE (out of #1528 B1 scope): the Ollama (~1363) and Chat Completions
+    // (~4887) loops rebuild this identical trio inline and differ ONLY in the
+    // output-reserve argument — the sibling duplication this state is designed to
+    // absorb next (one-issue-one-PR).
+    let mut budget_state = resolve_responses_budget(
+        num_ctx,
+        safe_context,
+        max_ok_input,
+        mid_loop_trim_tokens,
+        input_ceiling_pct,
+        cognition,
+    );
     let tools_chat = crate::agentic::tools::select_exposed(
         tools_chat,
         &exposure,
-        exposure_budget_tokens(
-            initial_send_budget(max_ok_input, safe_context, responses_input_ceiling),
-            safe_context,
-        ),
+        budget_state.exposure_budget(),
         &std::collections::BTreeSet::new(),
         estimation,
     );
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
     let cal = sanitize_estimate_ratio(estimate_ratio);
-    // #1528: real-token schema overhead — subtracted from a recovered input cap
-    // before the compaction budget is converted back to chars/4 currency, so the
-    // compacted history leaves room for the tool schemas that ride every request
-    // (mirrors the Chat Completions path's `tool_tokens_real`).
-    let tool_tokens_real =
-        calibrate_up(estimate_value_tokens(&tools_for_estimate, estimation), cal);
-    // #1528: mutable so a recovered cw-400 can tighten the send budget monotonically.
-    let mut send_budget = initial_send_budget(max_ok_input, safe_context, responses_input_ceiling);
-    // A declared window is authoritative just like a cached `safe_context`: both
-    // are local safety limits the preflight may refuse against.
-    let send_budget_authoritative = safe_context.is_some() || responses_input_ceiling.is_some();
-    // #1528: the monotone learned input ceiling (mirror of the Chat path's
-    // `effective_input_ceiling`). Seeded from the declared-window ceiling and only
-    // ever tightened by a recovered 400 — never raised.
-    let mut effective_input_ceiling = responses_input_ceiling;
-    let mut authoritative_budget =
-        authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens);
+    // #1528: real-token schema overhead of the EXPOSED tool set — subtracted from
+    // a recovered input cap before the compaction budget is converted back to
+    // chars/4 currency, so the compacted history leaves room for the tool schemas
+    // that ride every request. Known only after exposure, so it is set on the
+    // state here (mirrors the Chat Completions path's `tool_tokens_real`).
+    budget_state.set_tool_schema_tokens(calibrate_up(
+        estimate_value_tokens(&tools_for_estimate, estimation),
+        cal,
+    ));
     // #1528: hard context-window 400s recovered this turn (parse limit → tighten
     // → compact → redispatch), bounded to 2 (mirror of the Chat path). See #223.
     let mut cw_retries: u32 = 0;
@@ -6541,7 +6613,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     preflight_irreducible_request(
         &msgs_json,
         Some(&tools_for_estimate),
-        authoritative_budget,
+        budget_state.actionable_input_budget(),
         cal,
         estimation,
         model,
@@ -6596,7 +6668,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 instructions.as_deref(),
                 &input,
                 tools_supported.then_some(tools.as_slice()),
-                authoritative_budget,
+                budget_state.actionable_input_budget(),
                 cal,
                 estimation,
                 model,
@@ -6634,17 +6706,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
                         if let Some(recovered_budget) = recovered_window
                             .map(|context_window| {
-                                recovered_input_budget(
-                                    context_window,
-                                    input_ceiling_pct,
-                                    output_reserve,
-                                    effective_input_ceiling,
-                                )
+                                budget_state.recovered_budget_for_window(context_window)
                             })
                             .or_else(|| {
                                 cw_overflow::core_recover_overflow(
                                     &e.to_string(),
-                                    send_budget,
+                                    budget_state.soft_send_budget(),
                                     None,
                                 )
                                 .map(|cap| cap as usize)
@@ -6653,19 +6720,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             if let Some(context_window) = recovered_window {
                                 emit_context_window_400(&mut on_round_usage, context_window);
                             }
-                            // Retain any tighter learned ceiling — a recovery may only
-                            // tighten the input budget, never raise it.
-                            let new_budget = effective_input_ceiling
-                                .map_or(recovered_budget, |ceiling| recovered_budget.min(ceiling));
-                            send_budget = Some(new_budget);
-                            effective_input_ceiling = Some(new_budget);
-                            // The endpoint's parsed hard limit is authoritative from
-                            // here on; the next round's preflight refuses against it.
-                            authoritative_budget = authoritative_request_budget(
-                                send_budget,
-                                true,
-                                mid_loop_trim_tokens,
-                            );
+                            // Tighten the shared state MONOTONICALLY (a recovery may
+                            // only tighten the input budget, never raise it), collapse
+                            // the soft budget to the new hard ceiling, and recompute
+                            // the authoritative preflight bound — the endpoint's parsed
+                            // hard limit is authoritative from here on.
+                            budget_state.recover_from_cw400(recovered_budget);
                             // Bridge the Responses `input` into chat-shaped messages
                             // (instructions as a protected system head), compact, then
                             // bridge the result back into user/assistant `input` items.
@@ -6678,10 +6738,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                     messages: &chat,
                                     // Real-token cap minus real-token schema overhead
                                     // → pipeline chars/4 currency (mirrors the Chat path).
-                                    budget: calibrate_down(
-                                        new_budget.saturating_sub(tool_tokens_real),
-                                        cal,
-                                    ),
+                                    budget: budget_state.compaction_budget(cal),
                                     max_messages: None,
                                     replay_protected_tail_len: 0,
                                     task,
@@ -6875,14 +6932,28 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let tool_t0 = std::time::Instant::now();
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // The Responses loop has no PromptTracker, so `used` is the chars/4
-            // estimate of the running `input` plus tool schemas; num_ctx is normally
-            // unset here, so the report is honestly ceiling-less.
+            // estimate of the ACTUAL Responses request; num_ctx is normally unset
+            // here, so the report is honestly ceiling-less.
             let result = if tools::is_context_remaining_call(name) {
-                let report = budget::render_context_budget(
-                    estimate_request_tokens(&input, Some(&tools_chat), estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None),
-                    num_ctx,
-                    input_ceiling_pct,
+                // #1528: the self-read must describe the NEXT dispatch, so it reads
+                // the SAME derivation the preflight enforces against — the
+                // `actionable_input_budget` (hard ceiling / soft send / mid-loop
+                // trim, the value dispatch refuses at) as the ceiling, and the SAME
+                // CALIBRATED real-token estimate of the exact request (instructions
+                // + the running Responses `input` + the real Responses-wire tool
+                // schemas, respecting tools-disabled) as `used` — via the shared
+                // `responses_context_remaining_report`. Both operate in real-token
+                // currency (BHV-BUDGET-001/002/003). The pre-fix path subtracted the
+                // RAW chars/4 estimate from the calibrated ceiling — over-reporting
+                // remaining by the calibration factor — and, earlier, read
+                // `learned_hard_ceiling` and the Chat-shaped catalog.
+                let report = responses_context_remaining_report(
+                    instructions.as_deref(),
+                    &input,
+                    tools_supported.then_some(tools.as_slice()),
+                    &budget_state,
+                    cal,
+                    estimation,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -6987,7 +7058,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         instructions.as_deref(),
         &input,
         None,
-        authoritative_budget,
+        budget_state.actionable_input_budget(),
         cal,
         estimation,
         model,
