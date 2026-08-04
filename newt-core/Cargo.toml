@@ -185,6 +185,12 @@ serial_test = "3"
 # compile" — so it needs a test that asserts non-compilation, which only a UI
 # test harness can do.
 trybuild = "1"
+# #1528 B2: fuzz the untrusted-fence STRING boundary (arbitrary attacker-
+# controlled source/body → the fence cannot be broken and the encoding
+# round-trips). The provenance-classification / authority properties are proven
+# EXHAUSTIVELY instead (the CompactionProvenance set is finite, so enumeration is
+# stronger than random sampling). dev-only; never a runtime dep.
+proptest = "1"
 
 [lints]
 workspace = true

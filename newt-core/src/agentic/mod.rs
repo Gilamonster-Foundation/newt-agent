@@ -285,7 +285,7 @@ pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
 };
 pub use trim::trim_for_summary;
-pub use untrusted::wrap_untrusted;
+pub use untrusted::{wrap_internal_summary, wrap_untrusted};
 pub use warmup::warmup_if_cold;
 
 use crate::retry::{with_backoff_notify, RetryPolicy};
@@ -6726,13 +6726,23 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             // the authoritative preflight bound — the endpoint's parsed
                             // hard limit is authoritative from here on.
                             budget_state.recover_from_cw400(recovered_budget);
-                            // Bridge the Responses `input` into chat-shaped messages
-                            // (instructions as a protected system head), compact, then
-                            // bridge the result back into user/assistant `input` items.
-                            let chat = responses_compaction::responses_input_to_chat(
-                                instructions.as_deref(),
-                                &input,
-                            );
+                            // #1528 B2: classify the Responses `input` into TYPED
+                            // provenance (fail-closed), render it to chat with the
+                            // instructions as a protected system head, compact, then
+                            // rebuild EXHAUSTIVELY — untrusted-derived items can never
+                            // acquire operator/model authority across the round trip.
+                            let messages =
+                                match responses_compaction::responses_input_to_compaction(&input) {
+                                    Ok(m) => m,
+                                    // A forbidden `system` item in `input` fails closed:
+                                    // refuse the recovery, surface the endpoint's 400.
+                                    Err(_) => return Err(e),
+                                };
+                            let mut chat: Vec<serde_json::Value> = Vec::new();
+                            if let Some(ins) = instructions.as_deref() {
+                                chat.push(serde_json::json!({ "role": "system", "content": ins }));
+                            }
+                            chat.extend(responses_compaction::compaction_to_chat(&messages));
                             let outcome = compress(
                                 CompressRequest {
                                     messages: &chat,
@@ -6761,14 +6771,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 return Err(e);
                             }
                             if outcome.fired {
-                                // Drop the instructions system head we injected for
-                                // head-protection: `instructions` is re-sent ONCE via
-                                // its own field (unchanged), never duplicated into the
-                                // user `input` (which would re-trip the budget we just
-                                // reclaimed). The compressor keeps the head verbatim at
-                                // index 0, so this is the exact card we prepended.
+                                // Drop the instructions system head we prepended for
+                                // head protection: `instructions` is re-sent ONCE via
+                                // its own field (BHV-PROVENANCE-005), never duplicated
+                                // into `input`. The compressor keeps the head verbatim
+                                // at index 0; the mid-list summary is never at 0.
                                 let compacted = &outcome.messages;
-                                let rebuilt: &[serde_json::Value] = if instructions.is_some()
+                                let rebuilt_chat: &[serde_json::Value] = if instructions.is_some()
                                     && compacted.first().and_then(|m| m["role"].as_str())
                                         == Some("system")
                                 {
@@ -6776,7 +6785,51 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 } else {
                                     compacted
                                 };
-                                input = responses_compaction::chat_to_responses_input(rebuilt);
+                                // Reclassify to typed provenance, then rebuild
+                                // exhaustively (untrusted-derived → fenced `user`).
+                                let rebuilt_msgs =
+                                    responses_compaction::chat_to_compaction(rebuilt_chat);
+                                input =
+                                    responses_compaction::compaction_to_responses(&rebuilt_msgs);
+                                // #1528 B2 (BHV-BUDGET-004): the provenance fences are
+                                // added AFTER the compressor fit its budget, so validate
+                                // the REBUILT request against the authoritative budget
+                                // (the SHARED B1 estimator, same real-token currency
+                                // dispatch enforces) BEFORE redispatch — never send an
+                                // oversized request, never consume another logical round.
+                                // `pre_bridge` estimates the SAME messages WITHOUT the
+                                // fences, so the typed error attributes the overflow to
+                                // the framing the compressor could not see.
+                                if let Some(budget) = budget_state.actionable_input_budget() {
+                                    let est_tokens = |items: &[serde_json::Value]| {
+                                        estimate_responses_request_real_tokens(
+                                            instructions.as_deref(),
+                                            items,
+                                            tools_supported.then_some(tools.as_slice()),
+                                            estimation,
+                                            cal,
+                                        )
+                                    };
+                                    let post_bridge = est_tokens(&input);
+                                    let pre_bridge = est_tokens(
+                                        &responses_compaction::rebuild_unfenced_for_estimate(
+                                            &rebuilt_msgs,
+                                        ),
+                                    );
+                                    if let Err(exceeded) =
+                                        responses_compaction::check_post_bridge_budget(
+                                            budget,
+                                            pre_bridge,
+                                            post_bridge,
+                                        )
+                                    {
+                                        // ZERO second inference: return before the
+                                        // `cw_retries += 1; continue` below — the logical
+                                        // round is NOT consumed.
+                                        print_harness_notice(&exceeded.to_string(), color);
+                                        return Err(e);
+                                    }
+                                }
                             }
                             cw_retries += 1;
                             continue;
