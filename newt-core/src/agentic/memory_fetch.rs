@@ -727,7 +727,9 @@ pub(crate) mod tests {
         let notes = crate::notes::NoteStore::new(dir.path().join("NOTES.md"), 2_200);
         let store = test_store(&dir);
         let compaction = SessionSpillStore::default();
-        let id = compaction.store("the verbatim evicted middle".to_string());
+        let id = compaction
+            .store("the verbatim evicted middle".to_string())
+            .expect("commit succeeds in tests");
 
         let source = StoreMemorySource::new(&notes, &store).with_compaction_store(&compaction);
         let hit = execute_memory_fetch(
@@ -749,7 +751,9 @@ pub(crate) mod tests {
         // The compaction store is SEPARATE from the spill store (own id space):
         // a `compaction:` address never resolves against `with_spill_store`.
         let spill = SessionSpillStore::default();
-        spill.store("a tool payload".to_string()); // id s0 in the SPILL space
+        spill
+            .store("a tool payload".to_string())
+            .expect("commit succeeds in tests"); // id s0 in the SPILL space
         let wrong = StoreMemorySource::new(&notes, &store).with_spill_store(&spill);
         let none = execute_memory_fetch(
             &serde_json::json!({"address": "compaction:s0"}),
@@ -769,7 +773,9 @@ pub(crate) mod tests {
         let notes = crate::notes::NoteStore::new(dir.path().join("NOTES.md"), 2_200);
         let store = test_store(&dir);
         let spill = SessionSpillStore::default();
-        let id = spill.store("the full redacted payload".to_string());
+        let id = spill
+            .store("the full redacted payload".to_string())
+            .expect("commit succeeds in tests");
 
         let source = StoreMemorySource::new(&notes, &store).with_spill_store(&spill);
         let hit = execute_memory_fetch(
