@@ -166,7 +166,10 @@ pub use compress::{
     ManualCompressOutcome, SummarizeFn, SummarizeFuture, Summarizer, CONTINUATION_PREFIX,
     SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
-pub use content_spill::{SessionSpillStore, SpillStore};
+pub use content_spill::{
+    SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1, SpillScope,
+    SpillStore,
+};
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
 pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
