@@ -254,6 +254,7 @@ fn decode_output(json: &Value) -> (String, Vec<Value>, Vec<Value>, Option<String
     let mut tool_calls = Vec::new();
     let mut echo = Vec::new();
     let mut refusal = String::new();
+    let mut saw_refusal = false;
     if let Some(items) = json["output"].as_array() {
         for item in items {
             match item["type"].as_str() {
@@ -263,6 +264,11 @@ fn decode_output(json: &Value) -> (String, Vec<Value>, Vec<Value>, Option<String
                             // A `refusal` part carries a `refusal` field; an
                             // `output_text` part carries `text`. Capture both.
                             if p["type"] == "refusal" {
+                                // A refusal-typed part DECLINES the turn by its
+                                // presence — record that independently of the text,
+                                // so a degenerate refusal with an empty/absent
+                                // `refusal` field cannot fail open (#1526 review).
+                                saw_refusal = true;
                                 if let Some(r) = p["refusal"].as_str() {
                                     refusal.push_str(r);
                                 }
@@ -289,7 +295,17 @@ fn decode_output(json: &Value) -> (String, Vec<Value>, Vec<Value>, Option<String
             text.push_str(t);
         }
     }
-    let refusal = (!refusal.is_empty()).then_some(refusal);
+    // Key the refusal on the PRESENCE of a refusal-typed part, not on non-empty
+    // text: a refusal with an empty/absent message still declines the turn and
+    // must not fail open into executing tool calls (#1526 review). Supply a
+    // default message when the model refused without text.
+    let refusal = saw_refusal.then(|| {
+        if refusal.is_empty() {
+            "(the model refused without a message)".to_string()
+        } else {
+            refusal
+        }
+    });
     (text, tool_calls, echo, refusal)
 }
 
@@ -514,6 +530,35 @@ mod tests {
         assert!(matches!(
             decode_response(&body),
             Err(ResponseDecodeError::MixedRefusalAndToolCalls { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_text_refusal_part_with_a_tool_call_is_still_mixed_and_rejected() {
+        // #1526 review: a refusal-typed part with an EMPTY/absent `refusal` field
+        // still declines the turn — it must NOT fail open and execute the call.
+        let body = json!({
+            "output": [
+                {"type": "message", "content": [{"type": "refusal", "refusal": ""}]},
+                {"type": "function_call", "call_id": "c1", "name": "a", "arguments": "{}"}
+            ]
+        });
+        assert!(matches!(
+            decode_response(&body),
+            Err(ResponseDecodeError::MixedRefusalAndToolCalls { .. })
+        ));
+    }
+
+    #[test]
+    fn refusal_part_with_no_refusal_field_still_declines() {
+        // A refusal part missing the `refusal` field entirely is still a decline
+        // (Refused, not empty-success), with a default message.
+        let body = json!({
+            "output": [{"type": "message", "content": [{"type": "refusal"}]}]
+        });
+        assert!(matches!(
+            decode_response(&body),
+            Err(ResponseDecodeError::Refused { .. })
         ));
     }
 

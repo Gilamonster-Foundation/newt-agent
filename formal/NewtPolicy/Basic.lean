@@ -140,7 +140,9 @@ theorem validated_batch_ids_distinct (b : ValidatedBatch) :
     the only way to obtain the executable list is to project it from a
     `ValidatedBatch` — there is no `ValidatedBatch` inhabitant built from an
     unvalidated `List RawCall` without discharging the invariants above. The Rust
-    `fn execute_batch(_: ValidatedBatch)` is the refinement. -/
+    refinement is `validate_tool_call_batch` returning the validated calls the
+    agentic loop then executes; a compile-time `execute_batch(ValidatedBatch)`
+    type choke point is not yet implemented (future work, #1529). -/
 def executable (b : ValidatedBatch) : List ValidatedCall := b.calls
 
 end ToolBatch
