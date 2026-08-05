@@ -62,8 +62,12 @@ symbol = "backend_selection_tests::ollama_host_does_not_erase_an_explicitly_sele
 path = "newt-core/src/config.rs"
 symbol = "select_backend"
 
+# 002 and 003 SEPARATE selection failure (tested) from resolution failure
+# (a structural `?` property with no dedicated regression test) — the cited test
+# proves the former, so the latter must not borrow its `rust = "tested"`.
+
 [BHV-BACKEND-002]
-description = "A configuration-resolution failure never triggers backend discovery — it propagates."
+description = "An unknown or unselectable configured backend is a HARD ERROR, never a silent fallback to local discovery — a named backend that does not exist fails closed."
 [BHV-BACKEND-002.status]
 lean = "none"
 rust = "tested"
@@ -74,6 +78,18 @@ conformance = "partial"
 path = "newt-acp-worker/src/lib.rs"
 symbol = "backend_selection_tests::resolver_errors_on_an_unknown_named_backend"
 [[BHV-BACKEND-002.refs.production]]
+path = "newt-acp-worker/src/lib.rs"
+symbol = "resolve_configured_backend"
+
+[BHV-BACKEND-003]
+description = "A configuration-RESOLUTION failure (a malformed/unreadable config) propagates and never becomes a silent empty config or a discovery fallback. This is a structural `?` short-circuit in resolve_backend, asserted BY CONSTRUCTION — not yet covered by a regression test, so rust = none."
+[BHV-BACKEND-003.status]
+lean = "none"
+rust = "none"
+tla = "planned"
+trace = "none"
+conformance = "partial"
+[[BHV-BACKEND-003.refs.production]]
 path = "newt-acp-worker/src/lib.rs"
 symbol = "resolve_backend"
 
@@ -111,6 +127,9 @@ symbol = "tests::refusal_with_a_tool_call_is_mixed_and_rejected_never_executed"
 [[BHV-RESPONSE-002.refs.rust_tests]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "tests::status_less_mixed_refusal_and_tool_call_is_still_rejected"
+[[BHV-RESPONSE-002.refs.rust_tests]]
+path = "newt-core/src/responses_wire.rs"
+symbol = "tests::empty_text_refusal_part_with_a_tool_call_is_still_mixed_and_rejected"
 [[BHV-RESPONSE-002.refs.production]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "decode_response"
@@ -187,6 +206,9 @@ symbol = "tests::batch_missing_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "tests::batch_duplicate_id_is_correlation_impossible"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "tests::batch_blank_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::responses_missing_call_id_aborts_without_a_followup_request"
