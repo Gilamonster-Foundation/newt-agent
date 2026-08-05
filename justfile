@@ -200,8 +200,11 @@ bench-ingest RUN_DIR MODEL FAMILY VERSION WINDOW DATE:
 bench-gate MODEL SCORE:
     python3 scripts/eval/bench_scoreboard.py gate --model {{MODEL}} --score {{SCORE}}
 
+# The README carries MEASURED models only (`--no-queued`) — the scoreboard is
+# the bragging right, not the to-do list. The full roster-tracking table, with
+# queued models and per-run provenance, is published by gilamonster-bench.
 bench-publish:
-    python3 scripts/eval/bench_scoreboard.py render --readme README.md
+    python3 scripts/eval/bench_scoreboard.py render --readme README.md --no-queued
 
 bench-selftest:
     python3 scripts/eval/bench_scoreboard.py --self-test

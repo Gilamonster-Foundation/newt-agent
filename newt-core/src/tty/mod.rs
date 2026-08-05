@@ -39,6 +39,7 @@ use crossterm::style::Color as CtColor;
 pub mod arbiter;
 pub mod caps;
 pub mod frames;
+mod modal;
 /// Real-resource (PTY) proof that a notice emitted from outside the lease
 /// damages nothing. Unix-only: it needs a real pty pair.
 #[cfg(all(test, unix))]
@@ -53,8 +54,12 @@ pub use arbiter::{
 };
 pub use caps::{enter_protocol_mode, protocol_mode, LineCaps};
 pub use frames::{format_spinner, SPINNER_FRAMES};
+pub use modal::{
+    modal_prompt_controls, read_prompt_window_line, ControlReader, PromptControlReader, PromptLine,
+    MODAL_CONTROL_HINT,
+};
 pub use spinner::{with_spinner, Spinner};
-pub use widgets::{Level, Notice};
+pub use widgets::{Action, Level, Notice, Question};
 pub use width::{ch_width, str_width, wrap_line};
 
 /// The newt logo orange as a crossterm color (matches the TUI splash).

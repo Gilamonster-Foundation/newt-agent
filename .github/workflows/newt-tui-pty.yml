@@ -1,0 +1,80 @@
+name: newt-tui real-PTY tier (#1520)
+
+# Real-terminal integration tier for the prompt CONTROL-key regression test
+# (`newt-tui/src/prompt_visibility_test.rs::permission_prompt_controls_are_immediate_and_distinct`).
+# It drives a real PTY child and asserts that Esc→Back and Ctrl-C/Ctrl-D→Exit
+# take effect immediately and distinctly on both the local-tty prompt and the
+# web-wait prompt — a property only an actual terminal can exhibit (no mock can
+# observe raw control bytes racing a cooked-mode reader).
+#
+# Tiering (matches the CLAUDE.md testing strategy): this test types raw control
+# BYTES that only land once the child is in raw mode, so under the parallel
+# per-PR unit run it is CPU-starvation-flaky. It is therefore `#[ignore]`d (and
+# ci.yml's `cargo test --workspace` skips ignored tests) and runs HERE in the
+# WEEKLY tier (schedule) and the RELEASE tier (on v* tags), single-threaded
+# (`--test-threads=1`), never as a push gate. It GROUNDS the mocked control-key
+# unit tests in newt-tui/src/{permissions,tty/widgets/question}.rs.
+#
+# HOOK PARITY EXCEPTION: like eval-live.yml / nightly-eval.yml / mesh-
+# integration.yml / output-oracle-real.yml, this workflow is intentionally
+# OUTSIDE pre-push-hook parity. A real-PTY subprocess tier is too slow/flaky for
+# a local push gate; the pre-push hook mirrors ci.yml (the per-PR unit tier)
+# only. The path-filtered pull_request trigger below is a *scoped* PR gate — it
+# fires ONLY when terminal-control / permission / PTY code actually changes, so
+# a PR that alters that byte path proves the real terminal still delivers the
+# control keys, while every other PR stays on the fast unit tier. It is not a
+# fast changed-code hook and is not mirrored into .githooks/pre-push.
+
+on:
+  # Scoped PR gate: run the single-threaded real-PTY test when a PR touches the
+  # terminal-control / permission / reader byte path (Esc / Ctrl-C / Ctrl-D),
+  # since only a real terminal can prove those bytes reach the modal reader.
+  pull_request:
+    paths:
+      - "newt-tui/src/prompt_visibility_test.rs"
+      - "newt-tui/src/permissions.rs"
+      - "newt-core/src/tty/**"
+      - "newt-core/src/agentic/permissions.rs"
+      - ".github/workflows/newt-tui-pty.yml"
+  schedule:
+    # Weekly, Sunday 05:00 UTC — inside the low-cost window, off the
+    # output-oracle (04:00) and nightly slots.
+    - cron: "0 5 * * 0"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: newt-tui-pty-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-pty-tier:
+    name: prompt control-key real-PTY tier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: newt-tui-pty
+
+      # Single-threaded: the real-PTY child must not contend with sibling tests
+      # for CPU, or a nudged control byte is swallowed in cooked mode and the
+      # assertion races the child's setup. The `prompt_visibility_test` filter
+      # scopes the run to the ignored PTY tests (the control test + its child;
+      # the child no-ops when invoked directly without its env markers).
+      - name: Run prompt control-key real-PTY tests
+        run: |
+          cargo test -p newt-tui prompt_visibility_test \
+            -- --ignored --test-threads=1

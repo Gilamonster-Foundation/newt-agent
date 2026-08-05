@@ -4622,32 +4622,38 @@ pub(crate) fn run_chat(
                     // posture preset (meet-only), so `/posture` only tightens
                     // it when a permission floor is actually configured.
                     let exec_floor = exec_floor_from(&turn_caveats.exec, preset_clamp.is_some());
-                    // Prompted ocap grants (issue #263): only an interactive
-                    // session constructs a gate — headless paths (ACP worker,
-                    // newt-eval) never reach this code, so a denial there can
-                    // never block on a prompt. The gate's re-mint baseline is
-                    // the session's enforced caveats AT TURN START; session
-                    // grants/denials persist in `permission_state` across
-                    // turns and die with the process. #307: the baseline is the
-                    // already-clamped effective caveats, and `preset_clamp`
-                    // re-clamps the re-mint so a grant cannot pierce the floor.
-                    let mut permission_gate =
-                        prompt_permissions_enabled.then(|| PromptPermissionGate {
-                            state: &mut permission_state,
-                            base: turn_caveats.clone(),
-                            key_path: key_path.clone(),
-                            conversation_id: active_conversation_id.clone(),
-                            log_path: permission_log_path.clone(),
-                            denials_path: permission_denials_path.clone(),
-                            config_path: permission_config_path.clone(),
-                            preset_clamp: preset_clamp.clone(),
-                            danger: production_danger_table(),
-                            color,
-                            verbose,
-                            web_decision_timeout: std::time::Duration::from_secs(4 * 60),
-                            ask_human: prompt_permission_choice
-                                as fn(&newt_core::tty::PromptWindow, &str) -> PromptChoice,
-                        });
+                    let turn_cancel = std::sync::atomic::AtomicBool::new(false);
+                    let turn_exit = std::sync::atomic::AtomicBool::new(false);
+                    let turn_hard = std::sync::atomic::AtomicBool::new(false);
+                    // Build the gate whenever the session has a usable TTY — NOT
+                    // only when authorization prompting is on. `ask_question`
+                    // (request_user_input) needs a present operator; permission
+                    // prompting is a separate policy carried as
+                    // `authorization_prompts_enabled`. A truly headless session
+                    // (non-interactive) still gets `None` and the honest headless
+                    // response.
+                    let mut permission_gate = interactive.then(|| PromptPermissionGate {
+                        state: &mut permission_state,
+                        base: turn_caveats.clone(),
+                        key_path: key_path.clone(),
+                        conversation_id: active_conversation_id.clone(),
+                        log_path: permission_log_path.clone(),
+                        denials_path: permission_denials_path.clone(),
+                        config_path: permission_config_path.clone(),
+                        preset_clamp: preset_clamp.clone(),
+                        danger: production_danger_table(),
+                        color,
+                        verbose,
+                        authorization_prompts_enabled: prompt_permissions_enabled,
+                        web_decision_timeout: std::time::Duration::from_secs(4 * 60),
+                        cancel: Some(&turn_cancel),
+                        exit: Some(&turn_exit),
+                        ask_human: prompt_permission_choice
+                            as fn(
+                                &newt_core::tty::PromptWindow,
+                                &newt_core::Question<PromptChoice>,
+                            ) -> PromptChoice,
+                    });
                     // Per-round observation hook (Phase 20,
                     // docs/design/model-self-tuning.md §2.2): evidence is
                     // applied to the capability cache and saved AT THE MOMENT
@@ -4702,13 +4708,6 @@ pub(crate) fn run_chat(
                             .map(|_| {
                                 std::cell::RefCell::new(newt_core::verify_gate::WriteLedger::new())
                             });
-                    // Ctrl-C / Esc to interrupt: a sibling thread watches the
-                    // keyboard while the turn runs and trips `turn_cancel` (1st
-                    // press) / `turn_hard` (2nd Ctrl-C); the loop checks cancel
-                    // at its await checkpoints and abandons the turn, handing the
-                    // prompt back. Ctrl-D (EOF) is the exit, not Ctrl-C.
-                    let turn_cancel = std::sync::atomic::AtomicBool::new(false);
-                    let turn_hard = std::sync::atomic::AtomicBool::new(false);
                     let interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
                     // (tool_offload_on / scratchpad_on resolved at the turn head.)
                     // Prompt artifacts observe repository identity for every
@@ -5019,10 +5018,10 @@ pub(crate) fn run_chat(
                             );
                         }
                     }
-                    // Esc during the turn: the loop returned early with an empty
-                    // reply. Abandon it — print a notice and skip all post-turn
-                    // processing (no save, no gates, turn not counted).
-                    if turn_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    if turn_exit.load(std::sync::atomic::Ordering::Relaxed) {
+                        clean_exit = true;
+                        break;
+                    } else if turn_cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         let note = if turn_hard.load(std::sync::atomic::Ordering::Relaxed) {
                             "⊘ stopped — back to you"
                         } else {

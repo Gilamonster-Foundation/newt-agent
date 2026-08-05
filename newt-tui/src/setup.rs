@@ -30,47 +30,13 @@
 //! future setup-dialog step should call [`newt_core::AgentIdentity::save`]
 //! into that same path — do not open-code a second writer here.
 
+use crate::line_console::{is_yes, Console, StdinConsole};
 use newt_core::backend_probe::EndpointProbeResult;
 use newt_core::config::Discovery;
 use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, Tier};
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-
-// ---------------------------------------------------------------------------
-// Console abstraction (real stdin/stdout vs. scripted answers in tests)
-// ---------------------------------------------------------------------------
-
-/// Console I/O for the wizard. The real impl talks to stdin/stdout; tests feed
-/// a queue of answers and capture emitted lines.
-pub trait Console {
-    /// Print `prompt` (no trailing newline) and read one trimmed line of input.
-    fn ask(&mut self, prompt: &str) -> io::Result<String>;
-    /// Emit an informational line.
-    fn say(&mut self, line: &str);
-}
-
-/// Real console: prompts on stdout, reads a line from stdin.
-struct StdinConsole;
-
-impl Console for StdinConsole {
-    fn ask(&mut self, prompt: &str) -> io::Result<String> {
-        print!("{prompt}");
-        io::stdout().flush()?;
-        let mut buf = String::new();
-        let n = io::stdin().read_line(&mut buf)?;
-        if n == 0 {
-            // EOF (e.g. piped empty input): behave like an empty answer so the
-            // caller's default kicks in rather than looping forever.
-            return Ok(String::new());
-        }
-        Ok(buf.trim().to_string())
-    }
-
-    fn say(&mut self, line: &str) {
-        println!("{line}");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -692,15 +658,6 @@ fn parse_choice(input: &str, max: usize) -> Option<usize> {
         Some(n)
     } else {
         None
-    }
-}
-
-/// Interpret a yes/no answer. `default` is returned for empty input.
-fn is_yes(input: &str, default: bool) -> bool {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "" => default,
-        "y" | "yes" => true,
-        _ => false,
     }
 }
 
