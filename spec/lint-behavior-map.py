@@ -7,8 +7,12 @@ named string exists somewhere:
 
   * lean       {module, symbol}  -> a decl of that name inside that namespace,
                                      anywhere in formal/**.lean — every lake lib of
-                                     the Lean layer (`.lake` build copies excluded so
-                                     they cannot fabricate ambiguity) — exactly once.
+                                     the Lean layer, exactly once. `.lake` build
+                                     copies are excluded, files are de-duplicated by
+                                     REAL path, and a symlink whose target escapes the
+                                     repo is skipped — so neither a build copy, a
+                                     symlink alias, nor an external file can fabricate
+                                     ambiguity or import an out-of-tree declaration.
   * rust_tests {path, symbol}    -> a `fn <leaf>` at the in-file module path
                                      `<mod...>::<leaf>` inside <path>, exactly once,
                                      AND carrying a recognized test attribute
@@ -344,6 +348,8 @@ class Linter:
         if self._lean_cache is None:
             decls: list[str] = []
             if self.lean_dir.exists():
+                repo_real = self.repo.resolve()
+                seen_real: set[Path] = set()
                 for f in sorted(self.lean_dir.rglob("*.lean")):
                     # `.lake` holds build copies of the same source .lean files;
                     # scanning them would double-count decls and turn every ref
@@ -351,7 +357,21 @@ class Linter:
                     # scanning the rest of formal/ adds only distinct libs.
                     if ".lake" in f.parts:
                         continue
-                    decls += lean_decls(f.read_text(encoding="utf-8", errors="replace"))
+                    real = f.resolve()
+                    # Symlink-escape guard: a .lean whose REAL path is outside the
+                    # repo cannot satisfy a reference — a symlink must not import
+                    # external declarations into the trusted declset.
+                    try:
+                        real.relative_to(repo_real)
+                    except ValueError:
+                        continue
+                    # Dedup by REAL path: a symlink aliasing an in-repo file must
+                    # not double-count its decls (which would fabricate ambiguity
+                    # and fail an otherwise-exact reference).
+                    if real in seen_real:
+                        continue
+                    seen_real.add(real)
+                    decls += lean_decls(real.read_text(encoding="utf-8", errors="replace"))
             self._lean_cache = decls
         return self._lean_cache
 

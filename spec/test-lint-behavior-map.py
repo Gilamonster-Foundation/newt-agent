@@ -283,9 +283,17 @@ run_case("tla ref whose operator is inside a nested block comment fails",
 #    formal/ Lean layer (every lake lib), not just formal/NewtPolicy, while `.lake`
 #    build copies are excluded so they cannot fabricate ambiguity. ────────────────
 
-def run_multilean(name, *, files, ref_module, ref_symbol, want_exit, want_msg=None):
+def run_multilean(name, *, files, ref_module, ref_symbol, want_exit, want_msg=None,
+                  symlinks=None, use_default_lean_dir=False, external=None):
     """files: {relpath-under-repo: text}. One lean-only contract referencing
-    ref_module::ref_symbol, linted with --lean-dir <repo>/formal (the default)."""
+    ref_module::ref_symbol.
+
+    symlinks: {link-relpath-under-repo: target-path}. Target is joined to repo
+      unless it is absolute (used to point a symlink OUTSIDE the repo).
+    external: {abspath-fragment: text} written to a sibling temp dir OUTSIDE the
+      repo, so a symlink can be pointed at real out-of-tree content.
+    use_default_lean_dir: omit --lean-dir (exercise the default = <repo>/formal),
+      proving explicit and default behavior agree."""
     global _pass, _fail
     mapping = (
         "schema = 3\n"
@@ -301,15 +309,29 @@ def run_multilean(name, *, files, ref_module, ref_symbol, want_exit, want_msg=No
         f'module = "{ref_module}"\n'
         f'symbol = "{ref_symbol}"\n'
     )
-    with tempfile.TemporaryDirectory() as d:
-        repo = Path(d)
+    with tempfile.TemporaryDirectory() as outer:
+        repo = Path(outer) / "repo"
+        repo.mkdir()
+        ext_dir = Path(outer) / "outside"
+        ext_dir.mkdir()
+        for rel, text in (external or {}).items():
+            p = ext_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
         for rel, text in files.items():
             p = repo / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text)
+        for link_rel, target in (symlinks or {}).items():
+            link = repo / link_rel
+            link.parent.mkdir(parents=True, exist_ok=True)
+            tgt = Path(target)
+            link.symlink_to(tgt if tgt.is_absolute() else repo / target)
         (repo / "map.toml").write_text(mapping)
         cmd = [sys.executable, str(LINTER), "--map", str(repo / "map.toml"),
-               "--repo", str(repo), "--lean-dir", str(repo / "formal")]
+               "--repo", str(repo)]
+        if not use_default_lean_dir:
+            cmd += ["--lean-dir", str(repo / "formal")]
         r = subprocess.run(cmd, capture_output=True, text=True)
         out = r.stdout + r.stderr
         ok = (r.returncode == want_exit) and (want_msg is None or want_msg in out)
@@ -348,6 +370,47 @@ run_multilean("genuine duplicate across two real files is ambiguous",
               ref_module="NewtPolicy.CompactionSpill",
               ref_symbol="committed_handle_resolves",
               want_exit=1, want_msg="AMBIGUOUS")
+
+# 27. Explicit `--lean-dir <repo>/formal` and the DEFAULT (no flag) must agree:
+#     the nested lib resolves either way.
+run_multilean("default --lean-dir agrees with explicit (nested lib resolves)",
+              files={"formal/CompactionSpill/Basic.lean": _SPILL},
+              ref_module="NewtPolicy.CompactionSpill",
+              ref_symbol="committed_handle_resolves",
+              want_exit=0, use_default_lean_dir=True)
+
+# 28. Symlink-escape: a symlink under formal/ whose target is OUTSIDE the repo must
+#     NOT import that external file's declarations (else an out-of-tree file could
+#     satisfy a reference).
+_EXT = ("namespace NewtPolicy.External\n"
+        "theorem external_thm : True := trivial\n"
+        "end NewtPolicy.External\n")
+run_multilean("symlink escaping the repo cannot satisfy a reference",
+              files={"formal/keep.lean": "namespace NewtPolicy.Keep\nend NewtPolicy.Keep\n"},
+              external={"External.lean": _EXT},
+              symlinks={"formal/escape.lean": "../outside/External.lean"},
+              ref_module="NewtPolicy.External", ref_symbol="external_thm",
+              want_exit=1, want_msg="does not resolve")
+
+# 29. Symlink alias to an IN-REPO file must not double-count (dedup by real path) —
+#     the reference stays exact (count=1), not AMBIGUOUS.
+run_multilean("in-repo symlink alias does not fabricate ambiguity",
+              files={"formal/CompactionSpill/Basic.lean": _SPILL},
+              symlinks={"formal/alias.lean": "formal/CompactionSpill/Basic.lean"},
+              ref_module="NewtPolicy.CompactionSpill",
+              ref_symbol="committed_handle_resolves",
+              want_exit=0)
+
+# 30. A declaration name that appears ONLY inside a comment must not resolve
+#     (comments are stripped before decls are collected).
+_COMMENTED = ("namespace NewtPolicy.Commented\n"
+              "-- theorem only_in_comment : True := trivial\n"
+              "/- theorem also_commented : True := trivial -/\n"
+              "end NewtPolicy.Commented\n")
+run_multilean("a decl only in a comment does not resolve",
+              files={"formal/Commented/Basic.lean": _COMMENTED},
+              ref_module="NewtPolicy.Commented", ref_symbol="only_in_comment",
+              want_exit=1, want_msg="does not resolve")
 
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
