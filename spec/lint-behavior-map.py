@@ -6,7 +6,9 @@ that every reference resolves to its INTENDED artifact — not merely that a lik
 named string exists somewhere:
 
   * lean       {module, symbol}  -> a decl of that name inside that namespace,
-                                     in formal/NewtPolicy/**.lean, exactly once.
+                                     anywhere in formal/**.lean — every lake lib of
+                                     the Lean layer (`.lake` build copies excluded so
+                                     they cannot fabricate ambiguity) — exactly once.
   * rust_tests {path, symbol}    -> a `fn <leaf>` at the in-file module path
                                      `<mod...>::<leaf>` inside <path>, exactly once,
                                      AND carrying a recognized test attribute
@@ -24,7 +26,7 @@ carries explicit `pending_pr = <n>` (its artifact lives on an unmerged PR): thos
 WARN, naming the contract and the PR. `--strict` makes even pending refs fail (run
 it on `main` after the dependency merges; then delete the markers).
 
-Searches are scoped to the NAMED file (rust/production) or formal/NewtPolicy
+Searches are scoped to the NAMED file (rust/production) or the formal/ Lean layer
 (lean) — never the registry, the docs, or this linter — so a reference can never
 satisfy itself by matching a string in prose.
 
@@ -343,6 +345,12 @@ class Linter:
             decls: list[str] = []
             if self.lean_dir.exists():
                 for f in sorted(self.lean_dir.rglob("*.lean")):
+                    # `.lake` holds build copies of the same source .lean files;
+                    # scanning them would double-count decls and turn every ref
+                    # AMBIGUOUS. Skip them — decls are namespace-qualified, so
+                    # scanning the rest of formal/ adds only distinct libs.
+                    if ".lake" in f.parts:
+                        continue
                     decls += lean_decls(f.read_text(encoding="utf-8", errors="replace"))
             self._lean_cache = decls
         return self._lean_cache
@@ -505,7 +513,7 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
-    lean_dir = Path(a.lean_dir).resolve() if a.lean_dir else repo / "formal" / "NewtPolicy"
+    lean_dir = Path(a.lean_dir).resolve() if a.lean_dir else repo / "formal"
     return Linter(repo, lean_dir, a.strict).run(Path(a.map).resolve())
 
 

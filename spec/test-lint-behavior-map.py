@@ -279,5 +279,75 @@ run_case("tla ref whose operator is inside a nested block comment fails",
          tla={"Agent": ("---- MODULE Agent ----\n(* h: (* x *) Bounded == TRUE *)\n====", GOOD_CFG)},
          want_exit=1, want_msg="not defined as an operator")
 
+# ── Broadened Lean scope (#1528 B6): the linter validates refs against the WHOLE
+#    formal/ Lean layer (every lake lib), not just formal/NewtPolicy, while `.lake`
+#    build copies are excluded so they cannot fabricate ambiguity. ────────────────
+
+def run_multilean(name, *, files, ref_module, ref_symbol, want_exit, want_msg=None):
+    """files: {relpath-under-repo: text}. One lean-only contract referencing
+    ref_module::ref_symbol, linted with --lean-dir <repo>/formal (the default)."""
+    global _pass, _fail
+    mapping = (
+        "schema = 3\n"
+        "[BHV-Z-001]\n"
+        'description = "a lean-only contract"\n'
+        "[BHV-Z-001.status]\n"
+        'lean = "proven"\n'
+        'rust = "none"\n'
+        'tla = "none"\n'
+        'trace = "none"\n'
+        'conformance = "partial"\n'
+        "[[BHV-Z-001.refs.lean]]\n"
+        f'module = "{ref_module}"\n'
+        f'symbol = "{ref_symbol}"\n'
+    )
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        for rel, text in files.items():
+            p = repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
+        (repo / "map.toml").write_text(mapping)
+        cmd = [sys.executable, str(LINTER), "--map", str(repo / "map.toml"),
+               "--repo", str(repo), "--lean-dir", str(repo / "formal")]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        ok = (r.returncode == want_exit) and (want_msg is None or want_msg in out)
+        print(("ok   - " if ok else f"FAIL - ") + name
+              + ("" if ok else f": exit={r.returncode} (want {want_exit})"))
+        if not ok:
+            print("       " + out.replace("\n", "\n       ").strip())
+        _pass, _fail = (_pass + 1, _fail) if ok else (_pass, _fail + 1)
+
+
+_SPILL = ("namespace NewtPolicy.CompactionSpill\n"
+          "theorem committed_handle_resolves : True := trivial\n"
+          "end NewtPolicy.CompactionSpill\n")
+
+# 24. A ref into a nested non-NewtPolicy lib resolves under the broadened scan,
+#     AND the identical copy sitting under .lake is excluded (so it stays count=1,
+#     not an AMBIGUOUS count=2). One case proves both halves.
+run_multilean("nested formal/ lib resolves; .lake copy excluded",
+              files={"formal/CompactionSpill/Basic.lean": _SPILL,
+                     "formal/.lake/build/lib/CompactionSpill/Basic.lean": _SPILL},
+              ref_module="NewtPolicy.CompactionSpill",
+              ref_symbol="committed_handle_resolves",
+              want_exit=0)
+
+# 25. Fail-closed preserved: a renamed theorem in that same lib does NOT resolve.
+run_multilean("renamed decl in a nested lib fails closed",
+              files={"formal/CompactionSpill/Basic.lean": _SPILL},
+              ref_module="NewtPolicy.CompactionSpill", ref_symbol="renamed_theorem",
+              want_exit=1, want_msg="does not resolve")
+
+# 26. Fail-closed preserved: a GENUINE duplicate (same decl in two real, non-.lake
+#     files) is still AMBIGUOUS — the .lake skip must not swallow real duplicates.
+run_multilean("genuine duplicate across two real files is ambiguous",
+              files={"formal/CompactionSpill/Basic.lean": _SPILL,
+                     "formal/NewtPolicy/Dup.lean": _SPILL},
+              ref_module="NewtPolicy.CompactionSpill",
+              ref_symbol="committed_handle_resolves",
+              want_exit=1, want_msg="AMBIGUOUS")
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
