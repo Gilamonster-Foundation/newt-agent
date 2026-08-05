@@ -62,7 +62,13 @@ exclude = ["newt-mesh", "newt-web"]
 # which had silently rerouted sessions to a local ollama model; adds `--backend-*`
 # CLI flags to pin any backend setting). A stale 0.7.4 mistaken for a current one
 # wasted a live-drive measurement — this bump removes that ambiguity.
-version = "0.7.6"
+# 0.8.0: the reserved larger release. Production agent psyche (cognition / tenacity
+# / crew + personas + Responses transport), the #1528 Responses long-turn train
+# (B1–B6: shared budget state, provenance-safe compaction, CID spill identity,
+# accepted-round usage learning, strict typed wire validation, behavioral-registry
+# integration), the main↔production reconciliation, and the #1529 behavioral
+# constitution. Landed on main via #1526 + #1544.
+version = "0.8.0"
 edition = "2021"
 # MSRV 1.75 -> 1.88. The old "1.75" was already STALE: the current lock needs
 # 1.88 (darling 0.23 + instability 0.3.12, pulled in by the ratatui/rich-tui
@@ -244,23 +250,23 @@ tests-pty = { path = "tests/pty" }
 agent-mesh-protocol = "0.6"
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.7.6" }
-newt-data         = { path = "newt-data",         version = "=0.7.6" }
-newt-git          = { path = "newt-git",          version = "=0.7.6" }
-newt-inference    = { path = "newt-inference",    version = "=0.7.6" }
-newt-scheduler    = { path = "newt-scheduler",    version = "=0.7.6" }
-newt-tools        = { path = "newt-tools",        version = "=0.7.6" }
-newt-skills       = { path = "newt-skills",       version = "=0.7.6" }
-newt-tui          = { path = "newt-tui",          version = "=0.7.6" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.7.6" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.7.6" }
-newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.7.6" }
-newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.7.6" }
-newt-coder        = { path = "newt-coder",        version = "=0.7.6" }
-newt-identity     = { path = "newt-identity",     version = "=0.7.6" }
-newt-tuner        = { path = "crates/newt-tuner", version = "=0.7.6" }
-newt-eval         = { path = "newt-eval",         version = "=0.7.6" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.7.6" }
+newt-core         = { path = "newt-core",         version = "=0.8.0" }
+newt-data         = { path = "newt-data",         version = "=0.8.0" }
+newt-git          = { path = "newt-git",          version = "=0.8.0" }
+newt-inference    = { path = "newt-inference",    version = "=0.8.0" }
+newt-scheduler    = { path = "newt-scheduler",    version = "=0.8.0" }
+newt-tools        = { path = "newt-tools",        version = "=0.8.0" }
+newt-skills       = { path = "newt-skills",       version = "=0.8.0" }
+newt-tui          = { path = "newt-tui",          version = "=0.8.0" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.8.0" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.8.0" }
+newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.8.0" }
+newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.8.0" }
+newt-coder        = { path = "newt-coder",        version = "=0.8.0" }
+newt-identity     = { path = "newt-identity",     version = "=0.8.0" }
+newt-tuner        = { path = "crates/newt-tuner", version = "=0.8.0" }
+newt-eval         = { path = "newt-eval",         version = "=0.8.0" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.8.0" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level
