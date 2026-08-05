@@ -353,17 +353,24 @@ class Linter:
                 for f in sorted(self.lean_dir.rglob("*.lean")):
                     # `.lake` holds build copies of the same source .lean files;
                     # scanning them would double-count decls and turn every ref
-                    # AMBIGUOUS. Skip them — decls are namespace-qualified, so
-                    # scanning the rest of formal/ adds only distinct libs.
+                    # AMBIGUOUS. Skip them by the LITERAL path first.
                     if ".lake" in f.parts:
                         continue
                     real = f.resolve()
-                    # Symlink-escape guard: a .lean whose REAL path is outside the
-                    # repo cannot satisfy a reference — a symlink must not import
-                    # external declarations into the trusted declset.
+                    # Then by the RESOLVED, repo-relative path. This does two jobs:
+                    #  * symlink-escape guard — a target outside the repo has no
+                    #    repo-relative path, so it cannot import external decls; and
+                    #  * `.lake` re-check — a symlink aliasing a build copy
+                    #    (formal/X.lean -> formal/.lake/.../Gen.lean) has no `.lake`
+                    #    in its own parts but resolves INTO `.lake`, so a generated
+                    #    declaration can never satisfy a constitution reference.
+                    # Checking the repo-relative parts (not the absolute path) avoids
+                    # false matches from an unrelated `.lake`-named ancestor dir.
                     try:
-                        real.relative_to(repo_real)
+                        rel = real.relative_to(repo_real)
                     except ValueError:
+                        continue
+                    if ".lake" in rel.parts:
                         continue
                     # Dedup by REAL path: a symlink aliasing an in-repo file must
                     # not double-count its decls (which would fabricate ambiguity

@@ -412,5 +412,18 @@ run_multilean("a decl only in a comment does not resolve",
               ref_module="NewtPolicy.Commented", ref_symbol="only_in_comment",
               want_exit=1, want_msg="does not resolve")
 
+# 31. A symlink whose REAL target lives under `.lake` must NOT import that
+#     generated declaration — the alias path has no `.lake` in its own parts but
+#     resolves into `.lake`, so the resolved-path re-check must skip it.
+_GEN = ("namespace NewtPolicy.Generated\n"
+        "theorem generated_thm : True := trivial\n"
+        "end NewtPolicy.Generated\n")
+run_multilean("symlink aliasing a .lake build copy cannot satisfy a reference",
+              files={"formal/.lake/build/lib/Generated.lean": _GEN,
+                     "formal/keep.lean": "namespace NewtPolicy.Keep\nend NewtPolicy.Keep\n"},
+              symlinks={"formal/GeneratedAlias.lean": "formal/.lake/build/lib/Generated.lean"},
+              ref_module="NewtPolicy.Generated", ref_symbol="generated_thm",
+              want_exit=1, want_msg="does not resolve")
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
