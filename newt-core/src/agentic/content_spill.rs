@@ -89,10 +89,43 @@ impl ContentAddressable for SpillRecordV1 {
     }
 }
 
+/// Why a handle string is not an acceptable [`SpillCid`] under Newt's canonical
+/// input policy (STRICTER than the crate's profile check — see [`SpillCid::parse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpillCidError {
+    /// Leading or trailing whitespace around the handle.
+    SurroundingWhitespace,
+    /// A valid CID, but not spelled in the one canonical presentation Newt accepts
+    /// (an alternate multibase such as base32-UPPER or base58, a bare digest hex, …).
+    /// Only the exact base32-lower form the crate renders is accepted.
+    NonCanonicalPresentation,
+    /// Not a valid frozen-profile CID at all (wrong version/codec/hash/length, or
+    /// unparsable). Carries the crate's diagnostic string (`ContentError` is not
+    /// `Clone`/`Eq`, so it is captured as text — which is also all a caller needs).
+    Profile(String),
+}
+
+impl std::fmt::Display for SpillCidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SurroundingWhitespace => write!(f, "handle has surrounding whitespace"),
+            Self::NonCanonicalPresentation => {
+                write!(
+                    f,
+                    "handle is not the canonical base32-lower CID presentation"
+                )
+            }
+            Self::Profile(e) => write!(f, "handle is not a valid content-address: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SpillCidError {}
+
 /// A spill handle: a validated BLAKE3 CIDv1 wrapping [`ContentId`]. There is NO
 /// constructor from an arbitrary string — [`Self::parse`] goes through the crate's
-/// frozen `FromStr`, which rejects a malformed / foreign-codec handle (fail-closed).
-/// So "arbitrary strings never become a `SpillCid`".
+/// frozen `FromStr` AND Newt's canonical-input gate (fail-closed). So "arbitrary
+/// strings never become a `SpillCid`".
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SpillCid(ContentId);
 
@@ -101,10 +134,30 @@ impl SpillCid {
     pub fn of(record: &SpillRecordV1) -> Result<Self, ContentError> {
         Ok(Self(record.content_id()?))
     }
-    /// Parse a handle string, validating it is a well-formed CID (fail-closed on a
-    /// malformed / foreign string). The `Display`→`FromStr` round-trip is frozen.
-    pub fn parse(s: &str) -> Result<Self, ContentError> {
-        ContentId::from_str(s).map(Self)
+    /// Parse a handle string under Newt's **canonical-input policy**, which is
+    /// deliberately stricter than the crate's frozen profile check. Beyond CIDv1 /
+    /// dag-cbor / BLAKE3-256 / 32-byte digest (enforced by `ContentId::from_str`),
+    /// Newt requires the EXACT canonical presentation the crate emits — base32-lower,
+    /// no surrounding whitespace, no alternate multibase, no bare digest hex.
+    ///
+    /// This matters because the crate's `FromStr` accepts *any* multibase spelling of
+    /// a valid CID (base32-UPPER round-trips through `from_str` but re-renders
+    /// lowercase); a spill handle a model pastes back must be the one form Newt ever
+    /// emits, so an off-form or whitespace-padded handle is rejected here. (A
+    /// canonically-spelled *foreign* CID is still not authorization — that is
+    /// mediated by the session store's membership check, not by this parse.)
+    pub fn parse(s: &str) -> Result<Self, SpillCidError> {
+        if s != s.trim() {
+            return Err(SpillCidError::SurroundingWhitespace);
+        }
+        let cid = ContentId::from_str(s).map_err(|e| SpillCidError::Profile(e.to_string()))?;
+        // Canonical-presentation gate: only the exact base32-lower form the crate
+        // renders round-trips. Any other valid encoding decodes to the same CID but
+        // re-serializes differently ⇒ reject as non-canonical.
+        if cid.to_string() != s {
+            return Err(SpillCidError::NonCanonicalPresentation);
+        }
+        Ok(Self(cid))
     }
     /// The canonical handle text (`bafyr4i…`) rendered into a prompt marker.
     pub fn to_handle(self) -> String {
@@ -421,6 +474,41 @@ mod tests {
         // A real handle round-trips (Display → parse).
         let cid = SpillCid::of(&tool_record(NONCE_A, "round trip")).unwrap();
         assert_eq!(SpillCid::parse(&cid.to_handle()).unwrap(), cid);
+    }
+
+    #[test]
+    fn canonical_input_policy_rejects_noncanonical_and_padded_handles() {
+        // §2.2: Newt's canonical-input policy is STRICTER than the crate's profile
+        // check. The crate's `FromStr` accepts any multibase spelling of a valid CID
+        // (base32-UPPER parses and re-renders lowercase); a spill handle a model
+        // pastes back must be the exact form Newt emits.
+        let cid = SpillCid::of(&tool_record(NONCE_A, "canonical policy")).unwrap();
+        let h = cid.to_handle();
+        // The one canonical form parses and round-trips.
+        assert_eq!(SpillCid::parse(&h).unwrap(), cid);
+        // Surrounding whitespace → rejected explicitly, before profile parsing.
+        assert_eq!(
+            SpillCid::parse(&format!(" {h}")),
+            Err(SpillCidError::SurroundingWhitespace)
+        );
+        assert_eq!(
+            SpillCid::parse(&format!("{h}\n")),
+            Err(SpillCidError::SurroundingWhitespace)
+        );
+        // base32-UPPER is a VALID CID to the crate but NOT Newt's canonical form.
+        assert_eq!(
+            SpillCid::parse(&h.to_uppercase()),
+            Err(SpillCidError::NonCanonicalPresentation)
+        );
+        // A bare digest hex / gibberish is not a frozen-profile CID at all.
+        assert!(matches!(
+            SpillCid::parse(&"a".repeat(64)),
+            Err(SpillCidError::Profile(_))
+        ));
+        assert!(matches!(
+            SpillCid::parse("not-a-cid"),
+            Err(SpillCidError::Profile(_))
+        ));
     }
 
     #[test]
