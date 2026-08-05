@@ -52,3 +52,13 @@ Defect-injection guards remain live (a wrong resolution fails a test): reverting
 
 ## Out of scope
 B6 (the behavioral-conformance proof layer over the reconciled system) is the next slice, on `feat/1528b6-behavioral-conformance` off the reconciled production branch. The final #1526 review is the last step.
+
+## Known flake (not a reconciliation regression)
+Under the full parallel `cargo test --workspace`, two timing-sensitive terminal
+tests — `tty::spinner::tests::a_cancelled_covered_future_still_erases` and
+`::detail_buffers_partial_lines_and_counts_every_char` — intermittently fail.
+They pass **isolated + `--test-threads=1`** (6/0), pass on the untouched frozen
+production baseline (`54ed418`), and `tty/spinner.rs` is unchanged by this merge;
+the byte-identical tree at the reference resolution ran 4495/0. This is the
+CLAUDE.md-documented real-resource/timing class that must run single-threaded —
+a pre-existing repo flake, orthogonal to this reconciliation. CI re-runs handle it.
