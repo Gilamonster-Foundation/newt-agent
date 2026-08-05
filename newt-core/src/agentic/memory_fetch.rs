@@ -156,13 +156,13 @@ pub struct StoreMemorySource<'a> {
     /// Session spill store for `spill:` re-reads (Step 26.3, #584). `None` when
     /// the `tool_offload` feature is off / headless — `spill:` then resolves to
     /// a labelled absence, never a panic.
-    spill: Option<&'a dyn super::spill::SpillStore>,
+    spill: Option<&'a dyn super::content_spill::SpillStore>,
     /// Session store for `compaction:` re-reads (#661 group B): the verbatim
     /// (redacted) middle span the compressor evicted, retrievable losslessly.
     /// A SEPARATE store from `spill` (its own id space). `None` headless / when
     /// progressive disclosure is off — `compaction:` then resolves to a labelled
     /// absence.
-    compaction: Option<&'a dyn super::spill::SpillStore>,
+    compaction: Option<&'a dyn super::content_spill::SpillStore>,
     /// Optional compatibility route for `memory_fetch prompt:<uuid>`. The
     /// always-on `prompt_read` tool remains the primary prompt surface.
     prompt: Option<&'a dyn PromptSource>,
@@ -184,7 +184,7 @@ impl<'a> StoreMemorySource<'a> {
 
     /// Attach a session spill store so `spill:<id>` re-reads resolve (Step 26.3).
     #[must_use]
-    pub fn with_spill_store(mut self, spill: &'a dyn super::spill::SpillStore) -> Self {
+    pub fn with_spill_store(mut self, spill: &'a dyn super::content_spill::SpillStore) -> Self {
         self.spill = Some(spill);
         self
     }
@@ -192,7 +192,10 @@ impl<'a> StoreMemorySource<'a> {
     /// Attach the session compaction store so `compaction:<id>` re-reads resolve
     /// (#661 group B — lossless progressive disclosure of evicted spans).
     #[must_use]
-    pub fn with_compaction_store(mut self, compaction: &'a dyn super::spill::SpillStore) -> Self {
+    pub fn with_compaction_store(
+        mut self,
+        compaction: &'a dyn super::content_spill::SpillStore,
+    ) -> Self {
         self.compaction = Some(compaction);
         self
     }
@@ -204,6 +207,66 @@ impl<'a> StoreMemorySource<'a> {
         self.prompt = Some(prompt);
         self
     }
+}
+
+/// Which provenance a `spill:`/`compaction:` address must carry. The read path
+/// validates that a resolved record's provenance MATCHES its address prefix, so a
+/// tool-output CID pasted behind `compaction:` (or vice-versa) never resolves.
+#[derive(Clone, Copy)]
+enum SpillKind {
+    Spill,
+    Compaction,
+}
+
+impl SpillKind {
+    fn matches(self, provenance: &super::content_spill::SpillProvenance) -> bool {
+        use super::content_spill::SpillProvenance::{CompactionSpan, ToolOutput};
+        matches!(
+            (self, provenance),
+            (Self::Spill, ToolOutput { .. }) | (Self::Compaction, CompactionSpan)
+        )
+    }
+}
+
+/// Resolve a `spill:`/`compaction:` handle against a session store — FAIL-CLOSED and
+/// non-leaky (#1528 B3, §2.8). Every failure collapses to the SAME labelled
+/// `NotFound`, so cross-session existence is never revealed and a mismatched record
+/// is never returned: a malformed / non-canonical / whitespace-padded handle (an old
+/// `sN` string included), no store, a foreign-session or unknown CID, a
+/// schema/provenance mismatch, and an integrity mismatch are all indistinguishable
+/// from an unknown handle.
+fn resolve_content_spill(
+    store: Option<&dyn super::content_spill::SpillStore>,
+    id: &str,
+    kind: SpillKind,
+    reason: &str,
+) -> MemPayload {
+    let not_found = || MemPayload::NotFound {
+        reason: reason.to_string(),
+    };
+    // (a) Canonical-input policy: an `sN` legacy string, surrounding whitespace, or a
+    // non-canonical spelling fails to parse → the same NotFound as an unknown handle.
+    let Ok(cid) = super::content_spill::SpillCid::parse(id) else {
+        return not_found();
+    };
+    // (b) Session-membership + foreign-session check: `fetch` resolves only within
+    // THIS session's store; a `None` store or a CID minted elsewhere returns None.
+    let Some(store) = store else {
+        return not_found();
+    };
+    let Some(record) = store.fetch(&cid) else {
+        return not_found();
+    };
+    // (c) Validate the fetched record: schema tag, provenance-matches-prefix, and a
+    // RECOMPUTED CID (integrity) — never resolve a record whose bytes do not re-derive
+    // the requested address.
+    if record.schema != super::content_spill::SPILL_SCHEMA_V1
+        || !kind.matches(&record.provenance)
+        || super::content_spill::SpillCid::of(&record).ok() != Some(cid)
+    {
+        return not_found();
+    }
+    MemPayload::Found(record.redacted_text)
 }
 
 impl MemorySource for StoreMemorySource<'_> {
@@ -234,27 +297,27 @@ impl MemorySource for StoreMemorySource<'_> {
             // Prompt addresses are intercepted by `execute_memory_fetch`
             // before public `MemAddr` parsing to keep that enum exhaustive-
             // match compatible for embedders.
-            MemAddr::Compaction { id } => match self.compaction.and_then(|s| s.fetch(id)) {
-                Some(body) => Ok(MemPayload::Found(body)),
-                None => Ok(MemPayload::NotFound {
-                    reason: format!(
-                        "no compaction span with id {id:?} — spans are session-scoped \
-                         and may have expired; re-read the file the breadcrumb names, \
-                         or `recall` the topic"
-                    ),
-                }),
-            },
+            MemAddr::Compaction { id } => Ok(resolve_content_spill(
+                self.compaction,
+                id,
+                SpillKind::Compaction,
+                &format!(
+                    "no compaction span with id {id:?} — spans are session-scoped \
+                     and may have expired; re-read the file the breadcrumb names, \
+                     or `recall` the topic"
+                ),
+            )),
             // Step 26.3 (#584): the offloaded (redacted) tool payload, if the
             // session spill store still holds it.
-            MemAddr::Spill { id } => match self.spill.and_then(|s| s.fetch(id)) {
-                Some(body) => Ok(MemPayload::Found(body)),
-                None => Ok(MemPayload::NotFound {
-                    reason: format!(
-                        "no spilled payload with id {id:?} — spills are session-scoped \
-                         and may have expired (re-run the tool if you still need it)"
-                    ),
-                }),
-            },
+            MemAddr::Spill { id } => Ok(resolve_content_spill(
+                self.spill,
+                id,
+                SpillKind::Spill,
+                &format!(
+                    "no spilled payload with id {id:?} — spills are session-scoped \
+                     and may have expired (re-run the tool if you still need it)"
+                ),
+            )),
         }
     }
 
@@ -719,15 +782,22 @@ pub(crate) mod tests {
 
     #[test]
     fn compaction_address_resolves_via_the_session_compaction_store() {
-        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        use crate::agentic::content_spill::{SessionSpillStore, SpillProvenance, SpillStore};
         // #661 group B: a `compaction:` address returns the verbatim (redacted)
         // evicted span while the session store holds it; unknown / no-store →
         // labelled absence, never a malformed-address answer or a panic.
         let dir = tempfile::tempdir().unwrap();
         let notes = crate::notes::NoteStore::new(dir.path().join("NOTES.md"), 2_200);
         let store = test_store(&dir);
-        let compaction = SessionSpillStore::default();
-        let id = compaction.store("the verbatim evicted middle".to_string());
+        let compaction = SessionSpillStore::new([7u8; 16]);
+        let staged = compaction
+            .stage(
+                SpillProvenance::CompactionSpan,
+                "the verbatim evicted middle".to_string(),
+            )
+            .unwrap();
+        let id = staged.handle();
+        compaction.commit_batch(&[staged]).unwrap();
 
         let source = StoreMemorySource::new(&notes, &store).with_compaction_store(&compaction);
         let hit = execute_memory_fetch(
@@ -738,6 +808,8 @@ pub(crate) mod tests {
         );
         assert_eq!(hit, "the verbatim evicted middle");
 
+        // An old `sN` handle (or any non-CID) is not a valid address → the SAME
+        // labelled session-scoped absence, never a malformed-address answer.
         let miss = execute_memory_fetch(
             &serde_json::json!({"address": "compaction:s99"}),
             &source,
@@ -746,13 +818,20 @@ pub(crate) mod tests {
         );
         assert!(miss.contains("session-scoped"), "got: {miss}");
 
-        // The compaction store is SEPARATE from the spill store (own id space):
-        // a `compaction:` address never resolves against `with_spill_store`.
-        let spill = SessionSpillStore::default();
-        spill.store("a tool payload".to_string()); // id s0 in the SPILL space
+        // The compaction store is SEPARATE from the spill store (own provenance space):
+        // a `compaction:` address never resolves against a spill-only source.
+        let spill = SessionSpillStore::new([7u8; 16]);
+        let staged = spill
+            .stage(
+                SpillProvenance::ToolOutput { tool_name: None },
+                "a tool payload".to_string(),
+            )
+            .unwrap();
+        let spill_handle = staged.handle();
+        spill.commit_batch(&[staged]).unwrap();
         let wrong = StoreMemorySource::new(&notes, &store).with_spill_store(&spill);
         let none = execute_memory_fetch(
-            &serde_json::json!({"address": "compaction:s0"}),
+            &serde_json::json!({ "address": format!("compaction:{spill_handle}") }),
             &wrong,
             false,
             20,
@@ -762,14 +841,23 @@ pub(crate) mod tests {
 
     #[test]
     fn spill_address_resolves_via_the_session_spill_store() {
-        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        use crate::agentic::content_spill::{SessionSpillStore, SpillProvenance, SpillStore};
         // Step 26.3 (#584): a `spill:` address returns the offloaded (redacted)
         // payload while the session store holds it; unknown / no-store → NotFound.
         let dir = tempfile::tempdir().unwrap();
         let notes = crate::notes::NoteStore::new(dir.path().join("NOTES.md"), 2_200);
         let store = test_store(&dir);
-        let spill = SessionSpillStore::default();
-        let id = spill.store("the full redacted payload".to_string());
+        let spill = SessionSpillStore::new([7u8; 16]);
+        let staged = spill
+            .stage(
+                SpillProvenance::ToolOutput {
+                    tool_name: Some("read_file".to_string()),
+                },
+                "the full redacted payload".to_string(),
+            )
+            .unwrap();
+        let id = staged.handle();
+        spill.commit_batch(&[staged]).unwrap();
 
         let source = StoreMemorySource::new(&notes, &store).with_spill_store(&spill);
         let hit = execute_memory_fetch(
@@ -780,6 +868,8 @@ pub(crate) mod tests {
         );
         assert_eq!(hit, "the full redacted payload");
 
+        // An old `sN` handle (or any non-CID) → the SAME labelled session-scoped
+        // absence.
         let miss = execute_memory_fetch(
             &serde_json::json!({"address": "spill:s99"}),
             &source,
@@ -791,12 +881,76 @@ pub(crate) mod tests {
         // No spill store attached → labelled absence, never a panic.
         let no_store = StoreMemorySource::new(&notes, &store);
         let none = execute_memory_fetch(
-            &serde_json::json!({"address": "spill:s0"}),
+            &serde_json::json!({ "address": format!("spill:{id}") }),
             &no_store,
             false,
             20,
         );
         assert!(none.starts_with("no such memory item:"), "got: {none}");
+    }
+
+    #[test]
+    fn spill_resolution_is_fail_closed_on_provenance_mismatch_and_foreign_session() {
+        use crate::agentic::content_spill::{
+            SessionSpillStore, SpillCid, SpillProvenance, SpillRecordV1, SpillScope, SpillStore,
+        };
+        // §2.8: the read path validates provenance-matches-prefix and re-derives the
+        // CID, and never leaks cross-session existence — a mismatch is indistinguishable
+        // from an unknown handle.
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::notes::NoteStore::new(dir.path().join("NOTES.md"), 2_200);
+        let store = test_store(&dir);
+        // A tool-output CID in a store attached as BOTH spill and compaction.
+        let session = SessionSpillStore::new([7u8; 16]);
+        let staged = session
+            .stage(
+                SpillProvenance::ToolOutput { tool_name: None },
+                "tool body".to_string(),
+            )
+            .unwrap();
+        let tool_handle = staged.handle();
+        session.commit_batch(&[staged]).unwrap();
+        let source = StoreMemorySource::new(&notes, &store)
+            .with_spill_store(&session)
+            .with_compaction_store(&session);
+        // `spill:` resolves (provenance ToolOutput matches the prefix).
+        let hit = execute_memory_fetch(
+            &serde_json::json!({ "address": format!("spill:{tool_handle}") }),
+            &source,
+            false,
+            20,
+        );
+        assert_eq!(hit, "tool body");
+        // The SAME CID behind `compaction:` → NotFound: provenance is ToolOutput, not
+        // CompactionSpan. Never resolve a mismatched record.
+        let mismatch = execute_memory_fetch(
+            &serde_json::json!({ "address": format!("compaction:{tool_handle}") }),
+            &source,
+            false,
+            20,
+        );
+        assert!(
+            mismatch.starts_with("no such memory item:"),
+            "got: {mismatch}"
+        );
+        // A canonically-spelled FOREIGN-session CID (minted under a different nonce) is
+        // indistinguishable from unknown — it never resolves here.
+        let foreign = SpillCid::of(&SpillRecordV1::new(
+            SpillScope::Session([9u8; 16]),
+            SpillProvenance::ToolOutput { tool_name: None },
+            "tool body".to_string(),
+        ))
+        .unwrap();
+        let foreign_miss = execute_memory_fetch(
+            &serde_json::json!({ "address": format!("spill:{}", foreign.to_handle()) }),
+            &source,
+            false,
+            20,
+        );
+        assert!(
+            foreign_miss.contains("session-scoped"),
+            "got: {foreign_miss}"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use newt_core::agentic::print_newt;
 
-use crate::{render_help, VERSION};
+use crate::{render_help_for_tui, VERSION};
 
 /// Handle the lifecycle/info command family. `/exit`/`/quit` return `Ok(false)`
 /// to end the session; everything else returns `Ok(true)`.
@@ -14,14 +14,23 @@ pub(crate) fn dispatch(
     workspace: &str,
     color: bool,
     verbose: bool,
+    markdown: bool,
 ) -> anyhow::Result<bool> {
     match cmd {
         "exit" | "quit" => return Ok(false),
 
-        // Bare `/help` — the full command list. Shares its byte-source
-        // (`render_help`) with the startup-free `newt help` CLI path, so the
-        // interactive and non-interactive surfaces cannot diverge.
-        "help" => print!("{}", render_help(None, color, verbose)),
+        // Bare `/help` — the full command list. RichTUI presents the shared
+        // corpus as Markdown; plain mode stays byte-identical to `newt help`.
+        "help" => print!(
+            "{}",
+            render_help_for_tui(
+                None,
+                color,
+                verbose,
+                markdown,
+                newt_core::tty::term_cols(),
+            )
+        ),
 
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),
 

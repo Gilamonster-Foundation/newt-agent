@@ -1,5 +1,5 @@
 name = "caveat-lattice"
-defaultTargets = ["CaveatLattice", "ProjectModel", "NewtPolicy"]
+defaultTargets = ["CaveatLattice", "ProjectModel", "NewtPolicy", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage", "ResponsesWire"]
 
 # Machine-checked formal specs. Self-contained: no Mathlib, so it builds from a
 # bare Lean toolchain (see lean-toolchain). `lake build` checks every theorem; a
@@ -15,5 +15,39 @@ name = "CaveatLattice"
 [[lean_lib]]
 name = "ProjectModel"
 
+# NewtPolicy — the #1530 behavioral-constitution seed + #1536 prompt/action
+# contract: the first checked Lean proofs backing the BHV registry.
 [[lean_lib]]
 name = "NewtPolicy"
+
+# CompactionProvenance — the #1528 B2 compaction-bridge provenance kernel:
+# untrusted-derived provenance never rebuilds to operator/model authority, and an
+# unknown wire role never classifies as operator/assistant.
+[[lean_lib]]
+name = "CompactionProvenance"
+
+# CompactionLifecycle — the #1528 B3 proactive-compaction lifecycle kernel:
+# estimate → compact → rebuild → validate → (dispatch | abort). Proves no
+# over-budget dispatch, termination / bounded no-progress, and same-round retry.
+[[lean_lib]]
+name = "CompactionLifecycle"
+
+# CompactionSpill — the #1528 B3 spill-capability kernel: reserve/commit/fetch
+# laws (no-store⟹no-handle, rejected⟹no record, only commit increments the count).
+[[lean_lib]]
+name = "CompactionSpill"
+
+# ResponsesUsage — the #1528 B4 accepted-round usage-observation policy kernel:
+# the budget-learning laws (hard ceiling never increases, an accept cannot raise
+# the hard ceiling, soft ≤ hard is invariant under observe + cw-400, a rejected
+# response emits no Accepted, at most one Accepted per response).
+[[lean_lib]]
+name = "ResponsesUsage"
+
+# ResponsesWire — the #1528 B5 strict wire-validation kernel: the ONE typed gate
+# every Responses dispatch passes through. Proves a request failing ANY invariant
+# (no model / store mismatch / num_ctx present / not-exactly-one-instruction /
+# dangling output / foreign CID / over-budget / tools-on-final-summary) is not
+# dispatchable, and only a validated request is — the make-it-unrepresentable law.
+[[lean_lib]]
+name = "ResponsesWire"

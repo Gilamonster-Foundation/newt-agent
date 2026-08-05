@@ -114,7 +114,8 @@ pub async fn run_case(case: &TestCase, config: &RunnerConfig) -> anyhow::Result<
     copy_fixture(&case.workspace_fixture(), &baseline)?;
     init_baseline_git(&workspace)?;
 
-    let mut child = spawn_worker(config)?;
+    // `_home_guard` isolates the worker's `HOME`; it must outlive the child.
+    let (mut child, _home_guard) = spawn_worker(config)?;
 
     let result = tokio::time::timeout(
         config.timeout,
@@ -241,11 +242,32 @@ fn worker_command(config: &RunnerConfig) -> Command {
     cmd
 }
 
-/// Spawn `newt worker` with the configured Ollama endpoint.
-fn spawn_worker(config: &RunnerConfig) -> anyhow::Result<Child> {
-    worker_command(config)
+/// Spawn `newt worker` in an ISOLATED `HOME` so the eval never reads a
+/// developer's real `~/.newt/config.toml` — which would leak that machine's
+/// configured backend/model into the graded run. (The pre-#1526 worker made
+/// `$OLLAMA_HOST`'s mere presence force local discovery, which incidentally
+/// masked the dev config; #1526 made `$OLLAMA_HOST` a mere endpoint hint that no
+/// longer erases a configured backend, so the eval must isolate `HOME` itself.)
+/// Returns the tempdir guard the caller MUST keep alive until the worker exits.
+fn spawn_worker(config: &RunnerConfig) -> anyhow::Result<(Child, tempfile::TempDir)> {
+    let home = tempfile::tempdir()?;
+    std::fs::create_dir_all(home.path().join(".newt"))?;
+    std::fs::write(home.path().join(".newt/config.toml"), "")?;
+    let mut cmd = worker_command(config);
+    cmd.env("HOME", home.path())
+        .env_remove("NEWT_CONFIG")
+        .env_remove("NEWT_CONFIG_DIR")
+        // Config resolution ALSO walks up from the worker's cwd for a
+        // project-local `.newt/config.toml`; if cwd stays under the developer's
+        // home, that walk finds `~/.newt/config.toml` regardless of `HOME`. Root
+        // the worker in the isolated tempdir so the walk-up finds nothing. The
+        // worker edits the workspace via the absolute ACP `workspace_path`, not
+        // cwd, so this does not affect its file operations.
+        .current_dir(home.path());
+    let child = cmd
         .spawn()
-        .map_err(|e| anyhow::anyhow!("spawn {}: {e}", config.worker_bin.display()))
+        .map_err(|e| anyhow::anyhow!("spawn {}: {e}", config.worker_bin.display()))?;
+    Ok((child, home))
 }
 
 /// Send the ACP request sequence and return the parsed [`TaskReply`].

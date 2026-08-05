@@ -115,7 +115,7 @@ pub(crate) fn brand_active() -> bool {
 /// stays near the dark fill. Half-block art paints `▄` in every cell with the
 /// picture in the colors, so a blank row can't be detected by glyphs; we scan
 /// the `..;2;r;g;b` SGR triples instead. A bright component means ink.
-pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const VERSION: &str = newt_core::build_info::VERSION_WITH_COMMIT;
 
 pub(crate) const NEWT_ORANGE: Color = Color::Rgb(220, 60, 20);
 

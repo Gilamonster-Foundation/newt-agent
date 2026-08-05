@@ -237,10 +237,7 @@ async fn run_with(
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<()> {
-    console.say(&format!(
-        "newt v{} — interactive setup",
-        env!("CARGO_PKG_VERSION")
-    ));
+    console.say(&format!("newt v{} — interactive setup", crate::VERSION));
 
     if config_path.exists() {
         let ans = console.ask(&format!(
@@ -532,7 +529,7 @@ fn build_cloud_config(
         api_key_file,
         serving: Some(newt_core::Serving::Instance),
         provenance: Some(newt_core::config::BackendProvenance {
-            source: Some(format!("newt setup v{} (cloud)", env!("CARGO_PKG_VERSION"))),
+            source: Some(format!("newt setup v{} (cloud)", crate::VERSION)),
             probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
             derived_serving: Some(true),
         }),
@@ -885,7 +882,7 @@ fn backend_from_probe(
         provenance: Some(newt_core::config::BackendProvenance {
             source: Some(format!(
                 "newt setup v{} (auto-detected {:?})",
-                env!("CARGO_PKG_VERSION"),
+                crate::VERSION,
                 probe.kind
             )),
             probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
@@ -1396,10 +1393,7 @@ fn build_backend_pair(
         api_key_env,
         serving: Some(serving),
         provenance: Some(newt_core::config::BackendProvenance {
-            source: Some(format!(
-                "newt setup v{} ({source_note})",
-                env!("CARGO_PKG_VERSION")
-            )),
+            source: Some(format!("newt setup v{} ({source_note})", crate::VERSION)),
             probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
             derived_serving: Some(true),
         }),

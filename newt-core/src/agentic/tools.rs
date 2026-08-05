@@ -3,6 +3,7 @@
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 
 use super::artifact_read::{execute_artifact_read_silent, ArtifactReadContext};
+use super::content_spill::{self, SpillStore};
 use super::crew_tool::CrewRunner;
 use super::display::{ToolDisplay, ToolPresentation};
 use super::git_tool::GitTool;
@@ -16,7 +17,6 @@ use super::prompt_intake::PromptDisposition;
 use super::prompt_read::{execute_prompt_read_silent, PromptReadContext};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
-use super::spill::{self, SpillStore};
 use crate::caveats::CaveatsExt as _;
 use crate::{Action, PermissionAction, Question};
 #[cfg(test)]
@@ -66,6 +66,162 @@ pub use exposure::ExposureSettings;
 /// `NEWT_VENV` (set from `--venv` or auto-detected from `$VIRTUAL_ENV` by the
 /// CLI) takes precedence; falls back to `$VIRTUAL_ENV` if the TUI was invoked
 /// directly without going through the CLI's `dispatch`.
+/// Atomically validate a model-emitted tool call **before any side effect**
+/// (invariant #3: no malformed tool call reaches a tool). Both the name and the
+/// arguments are checked up front; the caller receives EITHER a ready-to-dispatch
+/// `(name, object-args)` pair OR a human-readable reason the call is malformed —
+/// and on the malformed branch it must echo the reason back to the model and
+/// execute nothing.
+///
+/// This replaces the `serde_json::from_str(s).unwrap_or(Value::Null)` coercion
+/// that used to sit at three separate dispatch sites (both chat loops + the
+/// Responses loop): a garbled or truncated `arguments` string was silently turned
+/// into `null` and the tool ran anyway with empty/wrong input. Routing every site
+/// through this one gate makes that class of bug unrepresentable — a malformed
+/// call cannot produce a `(name, args)` pair to execute.
+///
+/// Rules:
+/// - `name` must be a present, non-blank string.
+/// - `arguments` must resolve to a JSON **object**: an object passes through;
+///   `null`/absent and an empty/whitespace string mean "no arguments" (`{}`); a
+///   non-empty string is parsed and must yield an object; anything else (an
+///   unparseable string, or a JSON scalar/array) is malformed. A parse failure is
+///   NEVER coerced to `null`.
+pub(crate) fn validate_tool_call(
+    name: Option<&str>,
+    raw_args: &serde_json::Value,
+) -> Result<(String, serde_json::Value), String> {
+    let name = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| "tool call is missing a name".to_string())?;
+    let args = match raw_args {
+        serde_json::Value::Null => serde_json::json!({}),
+        serde_json::Value::Object(_) => raw_args.clone(),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(v @ serde_json::Value::Object(_)) => v,
+                    Ok(_) => {
+                        return Err(format!(
+                            "tool '{name}' arguments must be a JSON object, but the model sent a non-object JSON value"
+                        ))
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "tool '{name}' arguments are not valid JSON (call truncated or malformed): {e}"
+                        ))
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "tool '{name}' arguments must be a JSON object, got {other}"
+            ))
+        }
+    };
+    Ok((name.to_string(), args))
+}
+
+/// One validated tool call, ready to dispatch.
+pub(crate) struct ValidatedCall {
+    pub call_id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+/// Why a whole tool-call batch was rejected. The two classes call for DIFFERENT
+/// recovery — one is recoverable on the wire, one is not:
+#[derive(Debug)]
+pub(crate) enum BatchRejection {
+    /// A call's id is missing, blank, or duplicated — a tool result **cannot** be
+    /// correlated back to its call. There is no valid recovery message to send,
+    /// so the caller MUST abort the turn (no fabricated outputs, no follow-up).
+    /// Fabricating an empty/duplicate id only yields a provider 400 or a silent
+    /// mispairing.
+    CorrelationImpossible(String),
+    /// Correlation is intact (every id is present + unique, or the wire carries
+    /// no ids at all), but a call's name/arguments is invalid. The caller MAY
+    /// echo a synthetic rejection keyed by each (valid) id and re-dispatch, so
+    /// the model can retry with a well-formed call.
+    ContentInvalid(String),
+}
+
+impl BatchRejection {
+    /// The human-readable reason, whichever class.
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::CorrelationImpossible(r) | Self::ContentInvalid(r) => r,
+        }
+    }
+}
+
+/// Validate an ENTIRE batch of model-emitted tool calls **before any execution**
+/// (invariant #3, at the batch level). A single response can carry several calls;
+/// validating-then-executing one at a time lets a valid *mutating* call run
+/// before a later sibling is found malformed. This checks the whole batch up
+/// front and returns `Err` if ANY call is bad, so the caller executes ZERO calls
+/// from an unvalidated response — no sibling mutates the workspace ahead of the
+/// batch being known good.
+///
+/// Wire shapes differ (Responses vs the two chat forms), so each call is passed
+/// pre-extracted as `(call_id, name, raw_args)`. **Correlation is checked FIRST**
+/// — when `require_call_id` (the id-carrying wires: Responses `call_id`/`id`,
+/// chat `tool_call_id`), every call must have a **non-empty, unique** id, else
+/// [`BatchRejection::CorrelationImpossible`] (unrecoverable — the caller aborts).
+/// Only then is each call's name/arguments validated ([`validate_tool_call`]); a
+/// bad one yields [`BatchRejection::ContentInvalid`] (recoverable — ids are known
+/// good, so a rejection can be correctly correlated). Order is preserved.
+pub(crate) fn validate_tool_call_batch(
+    calls: &[(Option<&str>, Option<&str>, &serde_json::Value)],
+    require_call_id: bool,
+) -> Result<Vec<ValidatedCall>, BatchRejection> {
+    // 1. Correlation first: an id problem is unrecoverable and must abort before
+    //    we even consider content (a follow-up on a mis-keyed transcript is worse
+    //    than aborting the turn).
+    if require_call_id {
+        let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (i, &(call_id, _, _)) in calls.iter().enumerate() {
+            let n = i + 1;
+            let id = call_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    BatchRejection::CorrelationImpossible(format!(
+                        "tool call #{n} is missing a call id — its result cannot be correlated"
+                    ))
+                })?;
+            if !seen_ids.insert(id) {
+                return Err(BatchRejection::CorrelationImpossible(format!(
+                    "tool call #{n} repeats call id {id:?} — ambiguous result routing"
+                )));
+            }
+        }
+    }
+    // 2. Content: name + object arguments for every call (ids are now known good).
+    let mut validated = Vec::with_capacity(calls.len());
+    for (i, &(call_id, name, raw_args)) in calls.iter().enumerate() {
+        let n = i + 1;
+        let (name, args) = validate_tool_call(name, raw_args)
+            .map_err(|e| BatchRejection::ContentInvalid(format!("tool call #{n}: {e}")))?;
+        let call_id = call_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string();
+        validated.push(ValidatedCall {
+            call_id,
+            name,
+            args,
+        });
+    }
+    Ok(validated)
+}
+
 pub fn venv_cmd_prefix() -> Option<String> {
     let venv = std::env::var("NEWT_VENV")
         .or_else(|_| std::env::var("VIRTUAL_ENV"))
@@ -1412,15 +1568,26 @@ fn shell_envelope_output(
         let capped = if should_spill {
             match spill_store {
                 Some(store) => {
-                    let (id, redacted) = spill::store_redacted_full(&out, store);
-                    let teaser_tokens =
-                        est.tokens_for_chars(spill::TOOL_RESULT_SPILL_CAP.saturating_sub(512));
-                    cap_model_output_with_handle(
-                        &redacted,
-                        max_tokens.min(teaser_tokens),
-                        output_head_tokens(),
-                        Some(&id),
-                    )
+                    let (id, redacted) = content_spill::store_redacted_full(
+                        &out,
+                        Some("run_command".to_string()),
+                        store,
+                    );
+                    let teaser_tokens = est
+                        .tokens_for_chars(content_spill::TOOL_RESULT_SPILL_CAP.saturating_sub(512));
+                    match id {
+                        // Committed: cap with the `spill:<id>` retrieval handle.
+                        Some(id) => cap_model_output_with_handle(
+                            &redacted,
+                            max_tokens.min(teaser_tokens),
+                            output_head_tokens(),
+                            Some(&id),
+                        ),
+                        // Commit failed: fail closed — cap the redacted output with
+                        // NO handle rather than promise a `spill:<id>` that resolves
+                        // to nothing (BHV-SPILL-001).
+                        None => cap_model_output(&redacted, max_tokens),
+                    }
                 }
                 None => cap_model_output(&out, max_tokens),
             }
@@ -4339,6 +4506,241 @@ mod tests {
     use super::*;
     use crate::agentic::NoMcp;
 
+    // --- R1: BATCH-level atomic tool-call validation (invariant #3) ---
+
+    /// Run a batch through the gate and DISPATCH (count) only on Ok — the honest
+    /// invocation-counting model of the real loop's two phases. Returns the number
+    /// of tools that would run; a rejected batch runs ZERO.
+    fn dispatched_count(
+        calls: &[(Option<&str>, Option<&str>, &serde_json::Value)],
+        require_call_id: bool,
+    ) -> usize {
+        match validate_tool_call_batch(calls, require_call_id) {
+            Ok(validated) => validated.len(), // phase 2 executes each; count == invocations
+            Err(_) => 0,                      // phase 1 rejected → zero executes
+        }
+    }
+
+    #[test]
+    fn batch_valid_then_malformed_dispatches_zero() {
+        let a = serde_json::json!("{\"op\":\"status\"}");
+        let bad = serde_json::json!("{\"op\": "); // truncated JSON
+        let calls = [
+            (Some("id1"), Some("git"), &a),
+            (Some("id2"), Some("write_file"), &bad),
+        ];
+        assert_eq!(
+            dispatched_count(&calls, true),
+            0,
+            "a malformed sibling rejects the whole batch — the valid mutating call must NOT run first"
+        );
+    }
+
+    #[test]
+    fn batch_malformed_then_valid_dispatches_zero() {
+        let bad = serde_json::json!("not json");
+        let b = serde_json::json!("{}");
+        let calls = [
+            (Some("id1"), Some("git"), &bad),
+            (Some("id2"), Some("list_dir"), &b),
+        ];
+        assert_eq!(dispatched_count(&calls, true), 0);
+    }
+
+    #[test]
+    fn batch_missing_call_id_dispatches_zero_when_required() {
+        let a = serde_json::json!("{}");
+        let calls = [(None, Some("git"), &a)];
+        assert_eq!(dispatched_count(&calls, true), 0);
+        // ...but the id-less Ollama wire (require_call_id=false) accepts it.
+        assert_eq!(dispatched_count(&calls, false), 1);
+    }
+
+    #[test]
+    fn batch_duplicate_call_ids_dispatch_zero() {
+        let a = serde_json::json!("{}");
+        let calls = [
+            (Some("dup"), Some("git"), &a),
+            (Some("dup"), Some("list_dir"), &a),
+        ];
+        assert_eq!(
+            dispatched_count(&calls, true),
+            0,
+            "duplicate ids mis-correlate results — reject the batch"
+        );
+    }
+
+    #[test]
+    fn batch_malformed_argument_json_dispatches_zero() {
+        let bad = serde_json::json!("{\"path\": \"a"); // truncated
+        let calls = [(Some("id1"), Some("write_file"), &bad)];
+        assert_eq!(dispatched_count(&calls, true), 0);
+    }
+
+    #[test]
+    fn batch_all_valid_dispatches_every_call() {
+        let a = serde_json::json!("{\"op\":\"status\"}");
+        let b = serde_json::json!(serde_json::json!({"path": "x"})); // object value
+        let c = serde_json::Value::Null; // no-arg tool
+        let calls = [
+            (Some("id1"), Some("git"), &a),
+            (Some("id2"), Some("write_file"), &b),
+            (Some("id3"), Some("list_dir"), &c),
+        ];
+        let out = validate_tool_call_batch(&calls, true).expect("all valid");
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            vec!["git", "write_file", "list_dir"]
+        );
+        assert_eq!(out[0].call_id, "id1");
+    }
+
+    // The rejection CLASS decides recovery: a correlation problem is
+    // unrecoverable (caller aborts); a content problem is recoverable (caller may
+    // echo a keyed rejection and re-dispatch).
+
+    #[test]
+    fn batch_missing_id_is_correlation_impossible() {
+        let a = serde_json::json!("{}");
+        let calls = [(None, Some("git"), &a)];
+        assert!(matches!(
+            validate_tool_call_batch(&calls, true),
+            Err(BatchRejection::CorrelationImpossible(_))
+        ));
+    }
+
+    #[test]
+    fn batch_duplicate_id_is_correlation_impossible() {
+        let a = serde_json::json!("{}");
+        let calls = [
+            (Some("dup"), Some("git"), &a),
+            (Some("dup"), Some("list_dir"), &a),
+        ];
+        assert!(matches!(
+            validate_tool_call_batch(&calls, true),
+            Err(BatchRejection::CorrelationImpossible(_))
+        ));
+    }
+
+    #[test]
+    fn batch_bad_args_with_valid_ids_is_content_invalid() {
+        // ids are present + unique → correlation is fine; the failure is content.
+        let bad = serde_json::json!("not json");
+        let calls = [(Some("id1"), Some("git"), &bad)];
+        assert!(matches!(
+            validate_tool_call_batch(&calls, true),
+            Err(BatchRejection::ContentInvalid(_))
+        ));
+    }
+
+    // --- per-call validator (still used by the batch gate) ---
+
+    #[test]
+    fn validate_accepts_a_string_encoded_object() {
+        let (name, args) = validate_tool_call(
+            Some("write_file"),
+            &serde_json::json!("{\"path\":\"a.txt\"}"),
+        )
+        .expect("valid");
+        assert_eq!(name, "write_file");
+        assert_eq!(args["path"], "a.txt");
+    }
+
+    #[test]
+    fn validate_accepts_an_object_value_directly() {
+        let (name, args) =
+            validate_tool_call(Some("git"), &serde_json::json!({"op": "status"})).expect("valid");
+        assert_eq!(name, "git");
+        assert_eq!(args["op"], "status");
+    }
+
+    #[test]
+    fn validate_treats_absent_or_empty_arguments_as_no_args() {
+        // A no-arg tool: null, absent, and "" all mean an empty object — valid.
+        for raw in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+        ] {
+            let (_, args) = validate_tool_call(Some("list_dir"), &raw).expect("valid no-args");
+            assert_eq!(args, serde_json::json!({}), "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_arguments_instead_of_coercing_to_null() {
+        // The core bug this closes: a truncated/garbled args string used to become
+        // `null` and execute anyway. It must now be rejected.
+        let err = validate_tool_call(Some("write_file"), &serde_json::json!("{\"path\": \"a"))
+            .expect_err("truncated JSON must be rejected");
+        assert!(err.contains("not valid JSON"), "got: {err}");
+        assert!(err.contains("write_file"), "names the tool: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_non_object_json_arguments() {
+        // A JSON scalar or array is not a tool-args object.
+        for raw in [serde_json::json!("[1,2,3]"), serde_json::json!("\"bare\"")] {
+            let err = validate_tool_call(Some("git"), &raw)
+                .expect_err("non-object args must be rejected");
+            assert!(
+                err.contains("must be a JSON object"),
+                "raw={raw:?} got: {err}"
+            );
+        }
+        // ...and a live (already-parsed) non-object value is rejected too.
+        assert!(validate_tool_call(Some("git"), &serde_json::json!(42)).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_missing_or_blank_name() {
+        assert!(validate_tool_call(None, &serde_json::json!({})).is_err());
+        assert!(validate_tool_call(Some(""), &serde_json::json!({})).is_err());
+        assert!(validate_tool_call(Some("   "), &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn malformed_calls_are_never_dispatched_invocation_count_is_zero() {
+        // The atomic guarantee, as an invocation-counting proof: run a batch of
+        // calls through the ONE validation gate, dispatching (incrementing the
+        // counter) ONLY on a valid `(name, args)`. Every malformed call must yield
+        // ZERO dispatches — no tool is ever invoked on garbage.
+        let batch = vec![
+            // valid
+            serde_json::json!({"name": "git", "arguments": "{\"op\":\"status\"}"}),
+            // malformed: truncated JSON args (the historical null-coercion bug)
+            serde_json::json!({"name": "write_file", "arguments": "{\"path\": \"a"}),
+            // malformed: missing name
+            serde_json::json!({"arguments": "{}"}),
+            // valid: no-arg tool
+            serde_json::json!({"name": "list_dir"}),
+            // malformed: non-object args
+            serde_json::json!({"name": "git", "arguments": "[1,2]"}),
+        ];
+
+        let mut invocations = 0usize;
+        let mut dispatched_names = Vec::new();
+        for call in &batch {
+            match validate_tool_call(call["name"].as_str(), &call["arguments"]) {
+                Ok((name, _args)) => {
+                    // The ONLY path that reaches a tool.
+                    invocations += 1;
+                    dispatched_names.push(name);
+                }
+                Err(_reason) => {
+                    // Malformed → echoed back, never dispatched. No side effect.
+                }
+            }
+        }
+
+        assert_eq!(
+            invocations, 2,
+            "exactly the two well-formed calls dispatch; the three malformed ones invoke nothing"
+        );
+        assert_eq!(dispatched_names, vec!["git", "list_dir"]);
+    }
+
     #[test]
     fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it() {
         use crate::tenacity::Tenacity;
@@ -6299,7 +6701,7 @@ mod tests {
             "stdout": full,
             "stderr": "",
         });
-        let store = spill::SessionSpillStore::default();
+        let store = content_spill::SessionSpillStore::new([7u8; 16]);
         let mut display = ToolDisplay::new(Vec::new(), false, 80, 3);
         display.call("run_command", "large-output-command");
         let out =
@@ -6308,15 +6710,19 @@ mod tests {
 
         assert!(out.contains("HEAD_ONLY_MARKER"), "head dropped: {out}");
         assert!(out.contains("TAIL_ONLY_MARKER"), "tail dropped: {out}");
-        assert!(
-            out.contains("memory_fetch(\"spill:s0\")"),
-            "spill handle missing: {out}"
-        );
+        // The teaser now names a `spill:<cid>` content handle (not a literal s0); it
+        // must parse as a canonical CID and resolve in the store to the full payload.
+        let handle = out
+            .split("spill:")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("teaser names a spill handle");
+        let cid = content_spill::SpillCid::parse(handle).expect("handle is a canonical CID");
         assert!(
             out.contains("grep=\"<pattern>\""),
             "search affordance missing: {out}"
         );
-        let stored = store.fetch("s0").expect("full output stored");
+        let stored = store.fetch(&cid).expect("full output stored").redacted_text;
         assert!(
             stored.contains("MIDDLE_ONLY_MARKER"),
             "spilled payload was capped before storage"
@@ -6328,7 +6734,7 @@ mod tests {
             "operator spill lost the raw shell tail: {rendered}"
         );
         assert!(
-            !rendered.contains("memory_fetch(\"spill:s0\")"),
+            !rendered.contains("memory_fetch(\"spill:"),
             "operator saw the model teaser instead of raw shell output: {rendered}"
         );
     }

@@ -40,6 +40,10 @@ mod workspace_state;
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]
 mod rich_input;
+// The harness config panel (#14) — a severable, TTY-only overlay for the psyche
+// operator dials. Gated with the other rich TTY surfaces so wyvern/lean strip it.
+#[cfg(feature = "rich-tui")]
+mod config_panel;
 #[cfg(feature = "rich-tui")]
 mod vi;
 // The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
@@ -74,6 +78,7 @@ pub(crate) use chat::{InputSurface, ReadOutcome};
 pub use color::color_supported;
 use color::{color_enabled_for, resolve_color_mode};
 use newt_core::agentic::{newt_line, print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT};
+use newt_core::recover_context_window_400;
 #[cfg(test)]
 use prompt::expand_prompt_tokens;
 #[cfg(feature = "rich-tui")]
@@ -125,6 +130,47 @@ pub async fn run_setup_target(
 /// ratatui surface — `docs/decisions/plain_scroller_tui.md`).
 pub fn run_crew_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
     crew_form::run_edit(name, color)
+}
+
+/// Open the harness config panel (#14) for the psyche operator dials and return
+/// its [`config_panel::PanelOutcome`], or — when stdout is not a TTY (piped /
+/// headless) — print a short note pointing at the text `/psyche` view and return
+/// `Cancelled`. The panel applies (only the changed) dials through the same
+/// setters the flags / slash commands use; `persist` (the caller's closure, which
+/// owns the `PersonaStore`) is the ONLY filesystem I/O, so a failed save keeps the
+/// panel open without mutating the runtime (review-3 §1). The caller acts on the
+/// returned outcome — applying the persona action, rerouting, and reporting from
+/// fresh runtime state. **Rich-tui only** — the lean build has no ratatui surface,
+/// so the `/psyche edit` handler prints the fallback directly. See
+/// `harness_config_panel.md`.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn run_psyche_panel(
+    personas: Vec<config_panel::PersonaChoice>,
+    current_persona: Option<String>,
+    backend: Option<String>,
+    base_tenacity: newt_core::Tenacity,
+    persist: impl FnMut(&str, &str, bool) -> config_panel::SaveResult,
+    color: bool,
+    verbose: bool,
+) -> config_panel::PanelOutcome {
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        match config_panel::run(personas, current_persona, backend, base_tenacity, persist) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                print_newt(&format!("psyche panel error: {e}"), color, verbose);
+                config_panel::PanelOutcome::Cancelled
+            }
+        }
+    } else {
+        // rich-tui compiled but stdout is not a TTY (piped / headless): no overlay.
+        print_newt(
+            "the psyche panel needs an interactive rich terminal — use /psyche for the \
+             text view, or /cognition / /tenacity to change the dials.",
+            color,
+            verbose,
+        );
+        config_panel::PanelOutcome::Cancelled
+    }
 }
 
 /// Report auth status for every discovered HTTP MCP server, and optionally run
@@ -537,10 +583,11 @@ fn render_inline_header(workspace: &str, color: bool) -> String {
     let mid = n / 2;
     let header = format!("{}  ·  {}", brand_name(), brand_tagline());
     let plugins = brand_plugins();
+    let version = format!("v{VERSION}");
     let text: &[(&str, bool)] = &[
         (header.as_str(), false),
-        (std::concat!("v", env!("CARGO_PKG_VERSION")), true), // dim
-        (plugins.as_deref().unwrap_or(""), true),             // dim; empty row hides itself
+        (version.as_str(), true),                 // dim
+        (plugins.as_deref().unwrap_or(""), true), // dim; empty row hides itself
         (
             "ready — type a task, /help for commands, /exit to quit",
             true,
@@ -3157,6 +3204,8 @@ pub(crate) struct BackendChoice {
     /// instead of trusting a placeholder wire protocol.
     pub(crate) kind_needs_probe: bool,
     pub(crate) api_key: Option<String>,
+    pub(crate) chat_completions_capability: newt_core::model_card::ChatCompletionsCapability,
+    pub(crate) reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope,
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
     pub(crate) api: newt_core::OpenAiApi,
@@ -3605,6 +3654,8 @@ fn codex_env_backend(
         kind: newt_core::BackendKind::Openai,
         kind_needs_probe: false,
         api_key: api_key.map(str::to_string),
+        chat_completions_capability: Default::default(),
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: true,
         context_window: None,
@@ -3688,6 +3739,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: b.kind.unwrap_or(newt_core::BackendKind::Ollama),
         kind_needs_probe: b.needs_kind_probe(),
         api_key: b.resolve_api_key(),
+        chat_completions_capability: b.chat_completions_capability(),
+        reasoning_replay_scope: b.reasoning_replay_scope(),
         api: b.api.unwrap_or_default(),
         api_needs_probe: b.api.is_none(),
         context_window: None,
@@ -3754,6 +3807,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             kind_needs_probe: false,
             api_key: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
             api: newt_core::OpenAiApi::default(),
             api_needs_probe: false,
             context_window: None,
@@ -3798,6 +3853,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             kind_needs_probe: false,
             api_key: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
             api: newt_core::OpenAiApi::default(),
             api_needs_probe: false,
             context_window: None,
@@ -3823,6 +3880,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: false,
         api_key: None,
+        chat_completions_capability: Default::default(),
+        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -3830,10 +3889,15 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
 }
 
 /// Surface the resolved OpenAI API surface to the agent loop via
-/// `NEWT_OPENAI_API` (read by `chat_complete` to route to the Responses path).
+/// `NEWT_OPENAI_API` (read by the agent loop to route to the Responses path).
 /// Called whenever the session (re)resolves its backend, so a `/backends`
 /// switch to a `responses` backend takes effect on the next message.
-fn apply_openai_api_env(api: newt_core::OpenAiApi) {
+///
+/// Public so the headless surfaces (`newt solve` / worker) that reuse the same
+/// loop surface `api = "responses"` too — otherwise a responses-only model
+/// (gpt-5.6-sol, gpt-5-codex) is driven over `/v1/chat/completions` and 400s on
+/// function tools.
+pub fn apply_openai_api_env(api: newt_core::OpenAiApi) {
     // SAFETY: single-threaded session setup; the agent loop reads this between
     // turns, never concurrently.
     unsafe {
@@ -3841,6 +3905,272 @@ fn apply_openai_api_env(api: newt_core::OpenAiApi) {
             newt_core::OpenAiApi::Responses => std::env::set_var("NEWT_OPENAI_API", "responses"),
             newt_core::OpenAiApi::ChatCompletions => std::env::remove_var("NEWT_OPENAI_API"),
         }
+    }
+}
+
+/// Re-resolve the active backend from `cfg` + env into the session's live wire
+/// locals — adopting served reality when the endpoint or model changed, and
+/// republishing the OpenAI api surface. The single owner of "repoint the session
+/// to the current backend choice": shared by the post-slash-command refresh and
+/// by persona backend routing. Returns whether the endpoint URL changed, so the
+/// caller re-probes DGX telemetry only when it matters.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refresh_backend(
+    cfg: &newt_core::Config,
+    choice: &mut BackendChoice,
+    inf_url: &mut String,
+    inf_model: &mut String,
+    inf_kind: &mut newt_core::BackendKind,
+    inf_key: &mut Option<String>,
+    inf_context_window: &mut Option<u32>,
+    color: bool,
+    verbose: bool,
+) -> bool {
+    let prev_url = inf_url.clone();
+    *choice = resolve_backend_choice(cfg);
+    // Adopt served reality only when the endpoint or model actually changed (a
+    // plain slash command must not re-probe every time).
+    if choice.url != prev_url || choice.model != *inf_model {
+        for line in adopt_backend_choice(choice) {
+            print_newt(&line, color, verbose);
+        }
+    }
+    *inf_url = choice.url.clone();
+    *inf_model = choice.model.clone();
+    *inf_kind = choice.kind;
+    *inf_key = choice.api_key.clone();
+    *inf_context_window = choice.context_window;
+    apply_openai_api_env(choice.api);
+    // #1139: this is the ONE seam every mid-session model change flows through —
+    // `/backends`, `/model`, and persona routing (`apply_persona_backend`) all land
+    // here — so re-attribute the model's family in one place. Per-family `[tenacity]`
+    // defaults then track a live backend/persona switch, instead of going stale on
+    // the model the session happened to start with.
+    newt_core::tenacity::attribute_active_family(cfg.tenacity.as_ref(), inf_model.as_str());
+    *inf_url != prev_url
+}
+
+/// The `(NEWT_PROVIDER, NEWT_DGX_MODEL)` a persona's backend routing wants, or
+/// `None` when the persona declares no `backend:` (leave the session backend
+/// untouched). A persona's `backend` NAMES a `[[backends]]` entry — exactly what
+/// `NEWT_PROVIDER` selects; its `model` (if any) maps to the session-model
+/// override, else `None` so the backend's own default model applies (clearing
+/// the override, as `/backends` does). Pure — the env mutation + re-resolve is
+/// the caller's job.
+pub(crate) fn persona_provider_env(
+    profile: Option<&newt_core::RoleProfile>,
+) -> Option<(String, Option<String>)> {
+    let backend = profile.and_then(|p| p.backend.as_deref())?;
+    let model = profile.and_then(|p| p.model.as_deref()).map(str::to_string);
+    Some((backend.to_string(), model))
+}
+
+/// Decide a persona's backend route — the pure, validated core of
+/// [`apply_persona_backend`]:
+/// - `Ok(Some((provider, model)))` — the persona declares a `backend:` that IS in
+///   `configured`; set these env values.
+/// - `Ok(None)` — the persona declares no backend (or was cleared); revert to the
+///   pre-persona baseline.
+/// - `Err(name)` — the persona names a backend NOT in `configured`: refuse, so a
+///   typo'd / non-portable persona can't silently reroute the session to a
+///   fallback (the silent-cost-reroute class the resolver's `NEWT_PROVIDER` rung
+///   guards against — it validates before setting the env, and so must we).
+pub(crate) fn persona_backend_route(
+    profile: Option<&newt_core::RoleProfile>,
+    configured: &[&str],
+) -> Result<Option<(String, Option<String>)>, String> {
+    match persona_provider_env(profile) {
+        Some((backend, model)) if configured.contains(&backend.as_str()) => {
+            Ok(Some((backend, model)))
+        }
+        Some((backend, _)) => Err(backend),
+        None => Ok(None),
+    }
+}
+
+/// Persona backend auto-route: repoint the session's wire target to the active
+/// persona's `backend:` — validated against `cfg.backends`, exactly as
+/// `/backends <name>` would (an unknown name is refused, not silently rerouted).
+/// A persona that declares NO backend (or a cleared persona → `None`) REVERTS to
+/// the pre-persona `baseline` (`base_provider`, `base_model`), so routing is
+/// symmetric: loading a persona repoints, clearing it repoints back. Sets
+/// `NEWT_PROVIDER`/`NEWT_DGX_MODEL`, re-resolves via [`refresh_backend`], and
+/// prints a line. Returns whether the URL changed (caller re-probes DGX).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_persona_backend(
+    persona: Option<&Persona>,
+    base_provider: &Option<String>,
+    base_model: &Option<String>,
+    cfg: &newt_core::Config,
+    choice: &mut BackendChoice,
+    inf_url: &mut String,
+    inf_model: &mut String,
+    inf_kind: &mut newt_core::BackendKind,
+    inf_key: &mut Option<String>,
+    inf_context_window: &mut Option<u32>,
+    color: bool,
+    verbose: bool,
+) -> bool {
+    let configured: Vec<&str> = cfg.backends.iter().map(|b| b.name.as_str()).collect();
+    let has_backend = persona.and_then(|p| p.profile.backend.as_deref()).is_some();
+    let (provider, model) = match persona_backend_route(persona.map(|p| &p.profile), &configured) {
+        Ok(Some((backend, model))) => (Some(backend), model),
+        // Revert to the pre-persona baseline (persona declares no backend / cleared).
+        Ok(None) => (base_provider.clone(), base_model.clone()),
+        Err(unknown) => {
+            print_newt(
+                &format!(
+                    "persona names unknown backend '{unknown}' — leaving backend unchanged. configured: {}",
+                    if configured.is_empty() { "(none)".to_string() } else { configured.join(", ") }
+                ),
+                color,
+                verbose,
+            );
+            return false;
+        }
+    };
+    // SAFETY: single-threaded REPL; the next turn's ChatCtx reads these locals.
+    match &provider {
+        Some(p) => unsafe { std::env::set_var("NEWT_PROVIDER", p) },
+        None => unsafe { std::env::remove_var("NEWT_PROVIDER") },
+    }
+    match &model {
+        // SAFETY: single-threaded REPL.
+        Some(m) => unsafe { std::env::set_var("NEWT_DGX_MODEL", m) },
+        None => unsafe { std::env::remove_var("NEWT_DGX_MODEL") },
+    }
+    // Track the backend by NAME across the re-resolve: two backends can share an
+    // endpoint (e.g. `sol` and `openai` both on api.openai.com), so the URL alone
+    // can't tell a route/revert happened — the name can.
+    let prev_name = choice.name.clone();
+    let url_changed = refresh_backend(
+        cfg,
+        choice,
+        inf_url,
+        inf_model,
+        inf_kind,
+        inf_key,
+        inf_context_window,
+        color,
+        verbose,
+    );
+    if has_backend {
+        print_newt(
+            &format!(
+                "persona backend → {} (model {})",
+                choice.name,
+                inf_model.as_str()
+            ),
+            color,
+            verbose,
+        );
+    } else if choice.name != prev_name {
+        // A cleared persona reverted the session to its pre-persona backend.
+        print_newt(
+            &format!("backend reverted to {} (persona cleared)", choice.name),
+            color,
+            verbose,
+        );
+    }
+    url_changed
+}
+
+/// Whether `slash_body` is an operator command that explicitly sets the session
+/// backend (`/backends`, `/model`, `/backend`) — so a later `/persona clear`
+/// reverts to it, not the startup backend (review P1#2). A persona's own routing
+/// is a separate path that never updates this operator baseline.
+pub(crate) fn is_operator_backend_command(slash_body: &str) -> bool {
+    matches!(
+        slash_body.split_whitespace().next().unwrap_or(""),
+        "backends" | "model" | "backend"
+    )
+}
+
+#[cfg(test)]
+mod persona_backend_tests {
+    use super::*;
+
+    #[test]
+    fn operator_backend_commands_update_the_baseline_but_persona_paths_do_not() {
+        for cmd in [
+            "backends sol",
+            "backends",
+            "model gpt-5.6-sol",
+            "backend openai",
+        ] {
+            assert!(is_operator_backend_command(cmd), "operator cmd: {cmd:?}");
+        }
+        // Persona / non-backend commands must NOT be treated as an operator
+        // backend choice (so persona routing can't pollute the revert baseline).
+        for cmd in [
+            "persona set bob",
+            "psyche edit",
+            "tenacity relentless",
+            "vi",
+            "",
+        ] {
+            assert!(
+                !is_operator_backend_command(cmd),
+                "non-operator cmd: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn persona_provider_env_maps_backend_and_optional_model() {
+        // A persona naming a backend + model → both routing values.
+        let p = newt_core::RoleProfile::parse(
+            "+++\nrole = \"researcher\"\nbackend = \"sol\"\nmodel = \"gpt-5.6-sol\"\n+++\n\n# Bob\n",
+        )
+        .unwrap();
+        assert_eq!(
+            persona_provider_env(Some(&p)),
+            Some(("sol".to_string(), Some("gpt-5.6-sol".to_string())))
+        );
+        // A persona naming only a backend → clear the model override (None), so
+        // the backend's own default model applies (mirrors `/backends`).
+        let p2 = newt_core::RoleProfile::parse("+++\nbackend = \"sol\"\n+++\n\n# B\n").unwrap();
+        assert_eq!(
+            persona_provider_env(Some(&p2)),
+            Some(("sol".to_string(), None))
+        );
+        // No backend declared → no routing (leave the session backend untouched).
+        let p3 =
+            newt_core::RoleProfile::parse("+++\ncognition = \"pondering\"\n+++\n\n# T\n").unwrap();
+        assert_eq!(persona_provider_env(Some(&p3)), None);
+        assert_eq!(persona_provider_env(None), None);
+    }
+
+    #[test]
+    fn persona_backend_route_validates_known_reverts_none_and_refuses_unknown() {
+        let configured = ["sol", "openai"];
+        // A valid backend + model → route to it.
+        let p = newt_core::RoleProfile::parse(
+            "+++\nbackend = \"sol\"\nmodel = \"gpt-5.6-sol\"\n+++\n\n# B\n",
+        )
+        .unwrap();
+        assert_eq!(
+            persona_backend_route(Some(&p), &configured),
+            Ok(Some(("sol".to_string(), Some("gpt-5.6-sol".to_string()))))
+        );
+        // Valid backend, no model → route with the override cleared.
+        let p2 = newt_core::RoleProfile::parse("+++\nbackend = \"openai\"\n+++\n\n# B\n").unwrap();
+        assert_eq!(
+            persona_backend_route(Some(&p2), &configured),
+            Ok(Some(("openai".to_string(), None)))
+        );
+        // An UNKNOWN backend name is REFUSED (no silent fallback reroute) — the
+        // caller warns and leaves the env untouched.
+        let p3 = newt_core::RoleProfile::parse("+++\nbackend = \"ghost\"\n+++\n\n# B\n").unwrap();
+        assert_eq!(
+            persona_backend_route(Some(&p3), &configured),
+            Err("ghost".to_string())
+        );
+        // No backend (or a cleared persona) → Ok(None) = revert to the baseline.
+        let p4 =
+            newt_core::RoleProfile::parse("+++\ncognition = \"pondering\"\n+++\n\n# T\n").unwrap();
+        assert_eq!(persona_backend_route(Some(&p4), &configured), Ok(None));
+        assert_eq!(persona_backend_route(None, &configured), Ok(None));
     }
 }
 
@@ -3890,6 +4220,20 @@ struct PersonaStore {
     dir: std::path::PathBuf,
 }
 
+/// Why a [`PersonaStore::save`] did not write — mapped by the config-panel caller
+/// to `config_panel::SaveResult` for a visible status line. Rich-tui only (the
+/// panel is its only caller).
+#[cfg(feature = "rich-tui")]
+#[derive(Debug)]
+enum PersonaSaveError {
+    /// A persona with this name already exists and overwrite was not requested.
+    Exists,
+    /// The name is not a valid persona file stem.
+    InvalidName(String),
+    /// The filesystem write failed.
+    Io(String),
+}
+
 impl PersonaStore {
     const DEFAULT_NAME: &'static str = "coder";
 
@@ -3905,6 +4249,62 @@ impl PersonaStore {
 
     fn default() -> Self {
         Self::new(Self::default_dir())
+    }
+
+    /// Atomically write persona `<name>.md`. With `overwrite == false`, refuses an
+    /// existing persona ([`PersonaSaveError::Exists`]); with `true`, replaces it
+    /// atomically — writes to a temp file in the destination directory then renames
+    /// it over the target, so a failed or partial write never truncates or corrupts
+    /// the existing persona (review-3 §1). Used only by the config panel's save
+    /// action, so it is rich-tui-gated alongside the panel.
+    #[cfg(feature = "rich-tui")]
+    fn save(
+        &self,
+        name: &str,
+        content: &str,
+        overwrite: bool,
+    ) -> Result<std::path::PathBuf, PersonaSaveError> {
+        self.save_with(name, content, overwrite, |p, c| std::fs::write(p, c))
+    }
+
+    /// [`Self::save`] with an injectable byte-writer, so the atomicity guarantee
+    /// (a failed write preserves the original) is unit-testable without needing to
+    /// provoke a real I/O error.
+    #[cfg(feature = "rich-tui")]
+    fn save_with<W>(
+        &self,
+        name: &str,
+        content: &str,
+        overwrite: bool,
+        write_bytes: W,
+    ) -> Result<std::path::PathBuf, PersonaSaveError>
+    where
+        W: Fn(&std::path::Path, &str) -> std::io::Result<()>,
+    {
+        let name = normalize_persona_name(name)
+            .map_err(|e| PersonaSaveError::InvalidName(e.to_string()))?;
+        let path = self.dir.join(format!("{name}.md"));
+        if !overwrite && path.exists() {
+            return Err(PersonaSaveError::Exists);
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| PersonaSaveError::Io(e.to_string()))?;
+        // Atomic replace: write a temp file in the SAME dir, then rename over the
+        // target. If either step fails we remove the temp and leave the original
+        // untouched — never a truncating in-place write.
+        let tmp = self
+            .dir
+            .join(format!(".{name}.md.tmp.{}", std::process::id()));
+        if let Err(e) = write_bytes(&tmp, content) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(PersonaSaveError::Io(e.to_string()));
+        }
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => Ok(path),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(PersonaSaveError::Io(e.to_string()))
+            }
+        }
     }
 
     fn load(&self, name: &str) -> anyhow::Result<Persona> {
@@ -4576,6 +4976,29 @@ fn persona_status(active: Option<&Persona>) -> String {
         (Some(m), None) => out.push_str(&format!("\n  router: model={m}")),
         (None, Some(t)) => out.push_str(&format!("\n  router: tier={t:?}")),
         (None, None) => {}
+    }
+    // The psyche dials (backend + cognition/tenacity/crew), shown only when set.
+    if let Some(b) = &profile.backend {
+        out.push_str(&format!("\n  backend: {b}"));
+    }
+    if let Some(c) = profile.cognition {
+        out.push_str(&format!("\n  cognition: {}", c.label()));
+    }
+    if let Some(t) = profile.tenacity {
+        // P1#3: this is now an APPLIED resolution layer (set_persona_tenacity),
+        // not just rendered — it agrees with /psyche's effective_tenacity.
+        out.push_str(&format!("\n  tenacity: {}", t.label()));
+    }
+    if profile.crew == Some(true) {
+        // P1#3: crew is a startup gate (NEWT_TEAM builds the crew runner once at
+        // launch), so a declaration can't engage it live. Label it honestly so
+        // this status can't claim a control is active while the engine ignores it.
+        let runtime = if std::env::var("NEWT_TEAM").is_ok() {
+            "on"
+        } else {
+            "off — a launch gate; start with `newt --obsessive` / NEWT_TEAM to engage"
+        };
+        out.push_str(&format!("\n  crew: declared on · runtime {runtime}"));
     }
     if !profile.is_role_bound() {
         out.push_str("\n  (prompt-only persona — no role bindings)");
@@ -6632,6 +7055,9 @@ fn handle_persona_command(
         PersonaCommand::Show => Ok(persona_status(active_persona.as_ref())),
         PersonaCommand::Clear => {
             *active_persona = None;
+            // P1#3: no persona → no persona-declared tenacity / cognition layer.
+            newt_core::tenacity::set_persona_tenacity(None);
+            newt_core::cognition::set_persona_cognition(None);
             // Clearing the persona starts a new conversation → fresh id + plan.
             *ctx.conversation_id = newt_core::new_conversation_id();
             reset_conversation(workspace, active_persona.as_ref(), ctx);
@@ -6639,6 +7065,11 @@ fn handle_persona_command(
         }
         PersonaCommand::Set { name, keep_context } => {
             let persona = store.load(&name)?;
+            // P1#3 / review-2: install the persona's declared tenacity + cognition
+            // as real resolution layers, so `/persona show`, `/psyche`, and the
+            // panel all agree and the loop obeys them.
+            newt_core::tenacity::set_persona_tenacity(persona.profile.tenacity);
+            newt_core::cognition::set_persona_cognition(persona.profile.cognition);
             *active_persona = Some(persona);
             if keep_context {
                 // Persistent-actor swap: rebuild the system prompt for the new
@@ -6669,25 +7100,6 @@ fn persona_swap_kept_context_message(active_persona: Option<&Persona>) -> String
         ),
         None => "Switched persona (kept conversation context).".to_string(),
     }
-}
-
-/// Inspect a failed dispatch error for a recoverable context-window 400.
-///
-/// Hosted endpoints reject an over-long prompt with a non-retryable HTTP 400
-/// whose body names the model's real maximum (e.g. `prompt is too long:
-/// 5960028 tokens > 1000000 maximum`). On match this persists the discovered
-/// limit to `model-capabilities.json` (so future sessions start tightened) and
-/// returns the new pre-send budget in input tokens. Returns `None` for any
-/// other error, which the caller should propagate. See issue #223.
-fn recover_context_window_400(err: &anyhow::Error, model: &str, today: &str) -> Option<u32> {
-    let (_prompt, hard_limit) = probe::parse_context_window_error(&err.to_string())?;
-    let hard_limit = u32::try_from(hard_limit).unwrap_or(u32::MAX);
-    let mut cache = probe::load_cache();
-    let entry = cache.entry(model.to_string()).or_default();
-    entry.record_context_window_400(hard_limit, today);
-    let new_cap = entry.max_ok_input;
-    probe::save_cache(&cache);
-    new_cap
 }
 
 /// Resolve the token-based mid-loop trim trigger (issue #223): the per-model
@@ -9096,10 +9508,45 @@ the model works. Off: just the answer. Persist with [tui] thinking in config."
   /tenacity              show the active level and what it does
   /tenacity list         list every level, patient → forcing
   /tenacity <level>      set relaxed | standard | insistent | relentless
+  /tenacity auto         clear the override; inherit from persona / config / family
 
 Higher tenacity forces an edit after fewer read-only rounds and makes
 exit_plan_mode require a concrete edit. This session-scoped override wins over
-[tenacity] config and the --tenacity flag. Persist per-family in [tenacity]."
+the persona declaration and [tenacity] config; `/tenacity auto` (aliases
+`inherit` / `reset`) releases it. Persist per-family in [tenacity]."
+        }
+        "cognition" => {
+            "\
+/cognition [level|off|auto|list] — how much reasoning the model spends per call
+
+  /cognition             show the session setting
+  /cognition list        list every level, light → deep
+  /cognition <level>     set glancing | pondering | deliberating | contemplating
+  /cognition off         send no reasoning controls (override any persona)
+  /cognition auto        follow the active persona's cognition (default)
+
+Responses maps the level to OpenAI reasoning.effort (glancing=minimal …
+contemplating=high). Chat Completions maps it to local generation controls only
+when the endpoint explicitly advertises that capability; unknown endpoints are
+unchanged. This session override beats the active persona's cognition; a
+persona sets its own default via `cognition:`."
+        }
+        "psyche" => {
+            "\
+/psyche [edit|obsessive] — the agent's effort posture: cognition, tenacity, crew
+
+  /psyche                show the three dials and how to change each
+  /psyche edit           open the config panel to adjust the dials (TTY)
+  /psyche obsessive      engage the max-everything posture's live dials
+
+The three orthogonal psyche dials:
+  cognition   backend-specific reasoning depth per call      (/cognition)
+  tenacity    how hard the loop pushes read → act            (/tenacity)
+  crew        how many minds work the task                   (NEWT_TEAM / newt crew)
+
+obsessive = contemplating + relentless + crew on — newt's 'ultra'. In-session
+/psyche obsessive sets cognition + tenacity live; crew is a launch gate, so
+start with `newt --obsessive` to include the crew this session."
         }
         "probe" => {
             "\
@@ -9436,9 +9883,9 @@ Add --help (or -h) to any command for its page."
 /// page exists. Unknown topics render a one-line miss (so a typo doesn't fall
 /// through to the wrong handler) and return `false`.
 ///
-/// This is the single byte-source for a per-command page. Both the interactive
-/// REPL ([`print_command_help`]) and the startup-free CLI ([`render_help`])
-/// route through it, so the two surfaces cannot silently diverge.
+/// This is the single byte-source for a plain per-command page. The interactive
+/// TUI derives its Markdown document from the same [`command_help_page`]
+/// corpus, while the startup-free CLI routes through [`render_help`].
 fn command_help_output(cmd: &str, color: bool, verbose: bool) -> (String, bool) {
     match command_help_page(cmd) {
         Some(page) => {
@@ -9468,10 +9915,10 @@ fn command_help_output(cmd: &str, color: bool, verbose: bool) -> (String, bool) 
 
 /// Render the bare-`/help` command list to a `String`.
 ///
-/// The single byte-source for the top-level list: the `Available commands:`
-/// narrator line followed by every [`help_lines`] entry. Both the interactive
-/// REPL (`commands::meta::dispatch`) and the startup-free CLI ([`render_help`])
-/// route through it, so `/help` and `newt help` cannot diverge.
+/// The plain top-level list: the `Available commands:` narrator line followed
+/// by every [`help_lines`] entry. The interactive TUI derives its Markdown
+/// document from that same corpus; plain mode and the startup-free CLI
+/// ([`render_help`]) route through this function.
 fn help_list_output(color: bool, verbose: bool) -> String {
     let mut out = newt_line("Available commands:", color, verbose);
     out.push('\n');
@@ -9482,11 +9929,82 @@ fn help_list_output(color: bool, verbose: bool) -> String {
     out
 }
 
-/// Print one command's `--help` page; `true` when a page exists. Thin wrapper
-/// over [`command_help_output`] — the byte-identical REPL side of [`render_help`].
-fn print_command_help(cmd: &str, color: bool, verbose: bool) -> bool {
-    let (out, found) = command_help_output(cmd, color, verbose);
-    print!("{out}");
+/// Markdown source for RichTUI's bare command catalog. The long-standing
+/// [`help_lines`] corpus remains the single source of truth; this only gives
+/// each row Markdown structure so the renderer preserves command boundaries
+/// instead of folding their soft line breaks into one paragraph.
+fn help_list_markdown() -> String {
+    let mut out = String::from("## Available commands\n\n");
+    for line in help_lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            out.push('\n');
+        } else if let Some((usage, description)) = line.split_once(" - ") {
+            out.push_str(&format!("- `{usage}` — {description}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Markdown source for one command's detail page.
+fn command_help_markdown(cmd: &str) -> Option<String> {
+    let page = command_help_page(cmd)?;
+    let mut out = format!("## /{} help\n\n", canonical_help_topic(cmd));
+    for line in page.lines() {
+        if line.starts_with("  ") {
+            out.push_str("- ");
+            out.push_str(line.trim());
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Render help for the interactive TUI. Markdown mode is deliberately a
+/// presentation layer over the existing corpus: disabling it returns the
+/// byte-identical plain/startup-free output from [`render_help`].
+fn render_help_for_tui(
+    topic: Option<&str>,
+    color: bool,
+    verbose: bool,
+    markdown: bool,
+    cols: usize,
+) -> String {
+    if !markdown {
+        return render_help(topic, color, verbose);
+    }
+    let source = match topic {
+        None => help_list_markdown(),
+        Some(cmd) => match command_help_markdown(cmd) {
+            Some(source) => source,
+            None => return render_help(topic, color, verbose),
+        },
+    };
+    let rendered = newt_core::agentic::render_markdown(
+        &source,
+        newt_core::agentic::RenderOpts { color, cols },
+    );
+    format!("{}{rendered}\n", newt_line("", color, verbose))
+}
+
+/// Print one command's `--help` page; `true` when a page exists.
+fn print_command_help(cmd: &str, color: bool, verbose: bool, markdown: bool) -> bool {
+    let found = command_help_page(cmd).is_some();
+    print!(
+        "{}",
+        render_help_for_tui(
+            Some(cmd),
+            color,
+            verbose,
+            markdown,
+            newt_core::tty::term_cols(),
+        )
+    );
     found
 }
 
@@ -9494,12 +10012,11 @@ fn print_command_help(cmd: &str, color: bool, verbose: bool) -> bool {
 /// backend. `topic == None` is the bare-`/help` command list; `Some(cmd)` is
 /// that command's detail page (an unknown topic renders the one-line miss).
 ///
-/// This is the startup-free entry point behind `newt help [command]`. It emits
-/// bytes IDENTICAL to the interactive REPL's `/help` / `/<cmd> --help` output
-/// because both sides share [`help_list_output`] / [`command_help_output`];
-/// `help_lines` / `command_help_page` remain the single source of truth for
-/// WHAT help says (issue #548 measures that content). This path only changes
-/// WHEN and HOW it can be rendered — it never forks the corpus.
+/// This is the startup-free entry point behind `newt help [command]` and the
+/// interactive TUI's plain-render fallback. [`help_lines`] and
+/// [`command_help_page`] remain the single source of truth for WHAT help says
+/// (issue #548 measures that content); RichTUI only adds a Markdown
+/// presentation over those corpora.
 pub fn render_help(topic: Option<&str>, color: bool, verbose: bool) -> String {
     match topic {
         None => help_list_output(color, verbose),
@@ -9642,6 +10159,7 @@ fn dispatch_slash(
     workspace: &str,
     color: bool,
     verbose: bool,
+    markdown: bool,
 ) -> anyhow::Result<bool> {
     // Strip leading slash and split into at most 3 tokens.
     let body = input.trim_start_matches('/');
@@ -9652,9 +10170,10 @@ fn dispatch_slash(
 
     match cmd {
         "exit" | "quit" | "help" | "version" | "workspace" | "config" => {
-            commands::meta::dispatch(cmd, arg1, workspace, color, verbose)
+            commands::meta::dispatch(cmd, arg1, workspace, color, verbose, markdown)
         }
-        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" | "tenacity" => {
+        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" | "tenacity"
+        | "cognition" | "psyche" => {
             commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose)
         }
         "models" | "probe" | "model" | "backend" | "backends" | "summarizer" | "dgx" => {
@@ -12001,7 +12520,7 @@ mod posture_command_tests {
 // Context-window 400 recovery (issue #223) — the one agentic-loop test that
 // stays TUI-side after Step 9.7 moved the loop suites to newt-core::agentic:
 // it exercises the TUI's `recover_cw_400` hook (`recover_context_window_400`),
-// whose probe-cache persistence lives here and needs the HOME env guard.
+// plus the observation-owned probe-cache persistence that follows it.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tool_round_cap_tests {
@@ -12019,6 +12538,23 @@ mod tool_round_cap_tests {
             MemMessage::system("you are a test"),
             MemMessage::user("do the thing"),
         ]
+    }
+
+    /// Grounds the parse-only recovery callback contract: cache ownership
+    /// remains in the observation hook exercised by the integration below.
+    #[test]
+    fn context_window_400_hook_returns_the_full_window() {
+        let err = anyhow::anyhow!("prompt is too long: 42000 tokens > 32768 maximum");
+        let recovered = recover_context_window_400(&err, "cw-hook-model", "2026-08-01");
+        assert_eq!(recovered, Some(32_768));
+
+        let vllm = anyhow::anyhow!(
+            "This model's maximum context length is 32768 tokens. However, you requested 16000 output tokens and your prompt contains 20000 input tokens, for a total of 36000 tokens (20000 + 16000 = 36000 > 32768). Please reduce the length of the input prompt or the number of requested output tokens."
+        );
+        assert_eq!(
+            recover_context_window_400(&vllm, "cw-hook-model", "2026-08-01"),
+            Some(32_768),
+        );
     }
 
     /// Regression for issue #223: a hard context-window 400 must NOT kill the
@@ -12039,15 +12575,16 @@ mod tool_round_cap_tests {
             fn respond(&self, _req: &Request) -> ResponseTemplate {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
-                    // First dispatch overflows the context window (the real
-                    // litellm message shape from the issue).
+                    // First dispatch overflows the context window using the
+                    // exact vLLM 0.19 output-plus-prompt validation wording.
                     ResponseTemplate::new(400).set_body_string(
-                        "litellm.ContextWindowExceededError: prompt is too long: 5960028 tokens > 1000000 maximum",
+                        "This model's maximum context length is 1000000 tokens. However, you requested 16000 output tokens and your prompt contains 5960028 input tokens, for a total of 5976028 tokens (5960028 + 16000 = 5976028 > 1000000). Please reduce the length of the input prompt or the number of requested output tokens.",
                     )
                 } else {
                     // After trim+retry, answer with no tool calls so the loop ends.
                     ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "choices": [{ "message": { "content": self.final_answer } }]
+                        "choices": [{ "message": { "content": self.final_answer } }],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 2, "total_tokens": 102}
                     }))
                 }
             }
@@ -12066,99 +12603,135 @@ mod tool_round_cap_tests {
             .enable_all()
             .build()
             .unwrap();
-        let (result, calls_made, persisted_cap) = rt.block_on(async {
-            let server = MockServer::start().await;
-            let calls = Arc::new(AtomicUsize::new(0));
-            Mock::given(method("POST"))
-                .and(path("/v1/chat/completions"))
-                .respond_with(CwResponder {
-                    calls: calls.clone(),
-                    final_answer: "recovered answer".into(),
-                })
-                .mount(&server)
-                .await;
+        let (result, calls_made, recovered_window, accepted_observed, persisted) =
+            rt.block_on(async {
+                let server = MockServer::start().await;
+                let calls = Arc::new(AtomicUsize::new(0));
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .respond_with(CwResponder {
+                        calls: calls.clone(),
+                        final_answer: "recovered answer".into(),
+                    })
+                    .mount(&server)
+                    .await;
 
-            let messages = msgs();
-            let caveats = Caveats::top();
-            let out = openai_chat_complete(
-                ChatCtx {
-                    url: &server.uri(),
-                    model: "cw-test-model",
-                    kind: BackendKind::Openai,
-                    api_key: Some("sk-test"),
-                    messages: &messages,
-                    task: "do the thing",
-                    workspace: ".",
-                    color: false,
-                    markdown: false,
-                    tool_offload: false,
-                    spill_store: None,
-                    compaction_store: None,
-                    scratchpad: false,
-                    scratchpad_store: None,
-                    code_search: None,
-                    where_is: None,
-                    nav: None,
-                    exposure: Default::default(),
-                    experience_store: None,
-                    step_ledger: None,
-                    caveats: &caveats,
-                    persona_tools: None,
-                    max_tool_rounds: 5,
-                    narration_nudge_cap: 1,
-                    action_nudges: true,
-                    prompt_disposition: newt_core::agentic::PromptDisposition::Act,
-                    prompt_intake: None,
-                    workflow_grace_rounds: 0,
-                    tool_output_lines: 20,
-                    debug: false,
-                    trace: false,
-                    num_ctx: None,
-                    input_ceiling_pct: 80,
-                    low_budget_pct: 15,
-                    connect_timeout_secs: 5,
-                    inference_timeout_secs: 120,
-                    mid_loop_trim_threshold: 40,
-                    compaction_trigger_policy: newt_core::CompactionTriggerPolicy::HeadroomAware,
-                    mid_loop_trim_tokens: None,
-                    max_ok_input: None,
-                    build_check_cmd: None,
-                    safe_context: None,
-                    // The hook under test: the TUI's probe-cache-backed recovery.
-                    recover_cw_400: Some(recover_context_window_400),
-                    note_sink: None,
-                    note_nudge: None,
-                    recall_source: None,
-                    memory_source: None,
-                    summarizer: None,
-                    compress_state: None,
-                    tool_events: None,
-                    phantom_reaches: None,
-                    end_reason: None,
-                    solve_obs: None,
-                    permission_gate: None,
-                    on_round_usage: None,
-                    estimate_ratio: None,
-                    estimation: newt_core::TokenEstimation::default(),
-                    summary_input_cap_floor_chars: 8_192,
-                    exec_floor: None,
-                    write_ledger: None,
-                    cancel: None,
-                    live_tool_output: None,
-                    git_tool: None,
-                    crew_runner: None,
-                    operating_mode_control: None,
-                    plan_mode_control: None,
-                },
-                &mut Mcp::empty(),
-            )
-            .await;
-            // Read the persisted cap while HOME still points at the temp dir.
-            let persisted = probe::load_cache()
-                .get("cw-test-model")
-                .and_then(|e| e.max_ok_input);
-            (out, calls.load(Ordering::SeqCst), persisted)
-        });
+                let messages = msgs();
+                let caveats = Caveats::top();
+                let today = "2026-08-01";
+                let mut cap_cache = probe::load_cache();
+                let mut recovered_window = None;
+                let mut accepted_observed = false;
+                let out = {
+                    let mut on_obs = |obs: newt_core::RoundObservation| {
+                        if matches!(obs, newt_core::RoundObservation::Accepted { .. }) {
+                            accepted_observed = true;
+                        }
+                        if let newt_core::RoundObservation::ContextWindow400 { context_window } =
+                            obs
+                        {
+                            recovered_window = Some(context_window);
+                        }
+                        let dirty = {
+                            let entry = cap_cache.entry("cw-test-model".to_string()).or_default();
+                            probe::apply_observation(entry, &obs, today)
+                        };
+                        if dirty {
+                            probe::save_cache(&cap_cache);
+                        }
+                    };
+                    openai_chat_complete(
+                        ChatCtx {
+                            url: &server.uri(),
+                            model: "cw-test-model",
+                            kind: BackendKind::Openai,
+                            api_key: Some("sk-test"),
+                            messages: &messages,
+                            task: "do the thing",
+                            workspace: ".",
+                            color: false,
+                            markdown: false,
+                            tool_offload: false,
+                            spill_store: None,
+                            compaction_store: None,
+                            scratchpad: false,
+                            scratchpad_store: None,
+                            code_search: None,
+                            where_is: None,
+                            nav: None,
+                            exposure: Default::default(),
+                            experience_store: None,
+                            step_ledger: None,
+                            caveats: &caveats,
+                            persona_tools: None,
+                            cognition: None,
+                            chat_completions_capability: Default::default(),
+                            reasoning_replay_scope:
+                                newt_core::model_card::ReasoningReplayScope::Never,
+                            max_tool_rounds: 5,
+                            narration_nudge_cap: 1,
+                            action_nudges: true,
+                            prompt_disposition: newt_core::agentic::PromptDisposition::Act,
+                            prompt_intake: None,
+                            workflow_grace_rounds: 0,
+                            tool_output_lines: 20,
+                            debug: false,
+                            trace: false,
+                            num_ctx: None,
+                            input_ceiling_pct: 80,
+                            low_budget_pct: 15,
+                            connect_timeout_secs: 5,
+                            inference_timeout_secs: 120,
+                            mid_loop_trim_threshold: 40,
+                            compaction_trigger_policy:
+                                newt_core::CompactionTriggerPolicy::HeadroomAware,
+                            mid_loop_trim_tokens: None,
+                            max_ok_input: None,
+                            build_check_cmd: None,
+                            safe_context: None,
+                            // Parse-only recovery reports the hard window through the
+                            // same observation owner as the successful retry.
+                            recover_cw_400: Some(recover_context_window_400),
+                            note_sink: None,
+                            note_nudge: None,
+                            recall_source: None,
+                            memory_source: None,
+                            summarizer: None,
+                            compress_state: None,
+                            tool_events: None,
+                            phantom_reaches: None,
+                            end_reason: None,
+                            solve_obs: None,
+                            permission_gate: None,
+                            on_round_usage: Some(&mut on_obs),
+                            estimate_ratio: None,
+                            estimation: newt_core::TokenEstimation::default(),
+                            summary_input_cap_floor_chars: 8_192,
+                            exec_floor: None,
+                            write_ledger: None,
+                            cancel: None,
+                            live_tool_output: None,
+                            git_tool: None,
+                            crew_runner: None,
+                            operating_mode_control: None,
+                            plan_mode_control: None,
+                        },
+                        &mut Mcp::empty(),
+                    )
+                    .await
+                };
+                // Read the persisted facts after both the 400 and accepted retry.
+                let persisted = probe::load_cache()
+                    .get("cw-test-model")
+                    .map(|e| (e.context_window, e.max_ok_input, e.safe_context));
+                (
+                    out,
+                    calls.load(Ordering::SeqCst),
+                    recovered_window,
+                    accepted_observed,
+                    persisted,
+                )
+            });
 
         // Clear the thread-local cache override before any assertion can unwind.
         probe::set_cache_dir_override(None);
@@ -12170,8 +12743,14 @@ mod tool_round_cap_tests {
             calls_made >= 2,
             "expected at least one retry after the 400, got {calls_made} call(s)"
         );
-        // Persistence (issue #223 req 4): 1_000_000 * 80% = 800_000.
-        assert_eq!(persisted_cap, Some(800_000));
+        assert_eq!(recovered_window, Some(1_000_000));
+        assert!(accepted_observed, "the successful retry must emit Accepted");
+        // Persistence (issue #223 req 4): the full window and its generic 80%
+        // caps survive the Accepted observation emitted by the retry.
+        assert_eq!(
+            persisted,
+            Some((Some(1_000_000), Some(800_000), Some(800_000)))
+        );
     }
 }
 
@@ -12346,6 +12925,72 @@ mod persona_helper_tests {
         assert!(normalize_persona_name("").is_err());
         assert!(normalize_persona_name("bad name").is_err());
         assert!(normalize_persona_name("näme").is_err());
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn persona_save_is_atomic_and_refuses_existing_without_overwrite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonaStore::new(tmp.path().join("personas"));
+        // First write creates the file.
+        let path = store
+            .save("bob", "+++\nrole = \"bob\"\n+++\n\nbody\n", false)
+            .unwrap();
+        assert!(path.exists());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("role = \"bob\""));
+        // Second write WITHOUT overwrite → Exists, original untouched.
+        assert!(matches!(
+            store.save("bob", "NEW", false),
+            Err(PersonaSaveError::Exists)
+        ));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("role = \"bob\""));
+        // WITH overwrite → replaces atomically, no stray temp files.
+        store.save("bob", "REPLACED", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "REPLACED");
+        let stray = std::fs::read_dir(tmp.path().join("personas"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!stray, "no temp files remain after saves");
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn persona_save_returns_the_normalized_on_disk_name() {
+        // review-3 follow-up: the caller reports the returned path stem, which is
+        // the NORMALIZED (lowercased) on-disk name — so the "saved persona 'x'"
+        // confirmation matches the file, not the raw typed name.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonaStore::new(tmp.path().join("personas"));
+        let path = store.save("MixedCase", "body", false).unwrap();
+        assert_eq!(path.file_stem().unwrap().to_string_lossy(), "mixedcase");
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn persona_overwrite_failure_preserves_the_original() {
+        // review-3 §1: a failed replacement write leaves the original persona intact
+        // (temp+rename never truncates in place). Failure injected via save_with.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonaStore::new(tmp.path().join("personas"));
+        let path = store.save("bob", "ORIGINAL", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ORIGINAL");
+        let r = store.save_with("bob", "NEW", true, |_p, _c| {
+            Err(std::io::Error::other("boom"))
+        });
+        assert!(
+            matches!(r, Err(PersonaSaveError::Io(_))),
+            "the write failure surfaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ORIGINAL",
+            "original persona intact after a failed overwrite"
+        );
     }
 
     #[test]

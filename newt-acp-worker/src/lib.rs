@@ -111,106 +111,184 @@ where
     server.run(reader, writer).await
 }
 
-/// Pick the inference backend the worker runs against.
-///
-/// If the resolved config (`~/.newt/config.toml` et al.) declares an
-/// OpenAI-compatible backend, the first such entry is used — with bearer
-/// auth resolved from its `api_key_env` / `api_key_file`. This is how
-/// Newt targets a hosted OpenAI-compatible endpoint.
-///
-/// Otherwise the worker falls back to local Ollama auto-discovery using
-/// `$NEWT_DEFAULT_MODEL` (default `llama3.1:8b`) — the historical
-/// behavior, unchanged when no OpenAI backend is configured.
-/// Choose the configured OpenAI-compatible backend to run against, if any.
-///
-/// An explicit `OLLAMA_HOST` is an unambiguous "use this Ollama" override and
-/// wins over a configured OpenAI backend (explicit env > config file), so it
-/// forces the Ollama path by returning `None`. This also keeps the mock-mode
-/// e2e test — which points `OLLAMA_HOST` at a wiremock — hermetic against a
-/// developer's real `~/.newt/config.toml`.
-fn select_openai_backend(
-    cfg: &newt_core::Config,
-    ollama_override: bool,
-) -> Option<&newt_core::BackendConfig> {
-    if ollama_override {
-        return None;
+/// Instantiate EXACTLY the selected configured backend, by its declared kind.
+/// An explicitly selected backend is authoritative — an unsupported kind is a
+/// deterministic error, never a silent fallback to a different backend.
+/// `ollama_host` is the `$OLLAMA_HOST` override, applied ONLY to a selected
+/// Ollama backend's endpoint (it must never erase or redirect an explicitly
+/// selected OpenAI/provider backend). The selected Ollama backend keeps its own
+/// configured model.
+fn instantiate_configured_backend(
+    backend: &newt_core::BackendConfig,
+    ollama_host: Option<&str>,
+) -> anyhow::Result<Arc<dyn newt_inference::InferenceBackend>> {
+    use newt_core::BackendKind;
+    match backend.kind.unwrap_or_default() {
+        // API-aware transport: `api = "responses"` → /v1/responses, else Chat
+        // Completions. Both the flat and coder ACP paths consume this backend.
+        // `$OLLAMA_HOST` does NOT apply here — it is an Ollama endpoint hint and
+        // must not redirect an explicitly selected OpenAI backend.
+        BackendKind::Openai => {
+            tracing::info!(
+                name = %backend.name,
+                endpoint = %backend.endpoint,
+                model = %backend.effective_model().unwrap_or("(server decides)"),
+                api = ?backend.api.unwrap_or_default(),
+                authenticated = backend.resolve_api_key().is_some(),
+                "worker: selected OpenAI-compatible backend"
+            );
+            Ok(newt_inference::openai_inference_backend(backend))
+        }
+        BackendKind::Ollama => {
+            let model = backend.effective_model().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "worker: Ollama backend '{}' has no configured model",
+                    backend.name
+                )
+            })?;
+            // `$OLLAMA_HOST` supplies the endpoint for a SELECTED Ollama backend,
+            // keeping its selected model. Absent → the configured endpoint.
+            let endpoint = ollama_host
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| backend.endpoint.clone());
+            tracing::info!(
+                name = %backend.name, %endpoint, %model,
+                ollama_host_override = ollama_host.is_some(),
+                "worker: selected configured Ollama backend"
+            );
+            Ok(Arc::new(newt_inference::local::LocalOllamaBackend::new(
+                endpoint, model,
+            )))
+        }
+        other => anyhow::bail!(
+            "worker: backend '{}' has unsupported kind {other:?} — the ACP worker \
+             supports `openai` and `ollama` backends",
+            backend.name
+        ),
     }
-    cfg.backends
-        .iter()
-        .find(|b| b.kind == Some(newt_core::BackendKind::Openai))
 }
 
-fn select_provider_config(
-    cfg: &newt_core::Config,
-    ollama_override: bool,
-) -> Option<&newt_core::config::ProviderConfig> {
-    if ollama_override {
-        return None;
-    }
-    cfg.providers.first()
+/// The resolved worker backend, or a request to fall back to local Ollama
+/// discovery. Split from [`resolve_backend`] so the selection contract (which is
+/// pure over a [`Config`] + the `$OLLAMA_HOST` override) is unit-testable without
+/// touching the environment or the network.
+enum ResolvedBackend {
+    Ready(Arc<dyn newt_inference::InferenceBackend>),
+    /// Nothing configured — the caller may discover a local Ollama.
+    DiscoverLocalOllama,
 }
 
+/// Resolve exactly ONE backend from the shared selection contract, applying the
+/// `$OLLAMA_HOST` override ONLY as an Ollama endpoint hint. An explicitly named
+/// unknown backend is a hard error; nothing configured yields
+/// [`ResolvedBackend::DiscoverLocalOllama`]. `$OLLAMA_HOST` never erases an
+/// explicit `$NEWT_PROVIDER` / `default_backend` selection.
+fn resolve_configured_backend(
+    cfg: &newt_core::Config,
+    ollama_host: Option<&str>,
+) -> anyhow::Result<ResolvedBackend> {
+    use newt_core::config::{SelectedBackend, SelectionOutcome};
+    match cfg.select_backend() {
+        SelectionOutcome::Selected(SelectedBackend::Provider(provider)) => {
+            tracing::info!(
+                name = %provider.name,
+                command = %provider.command,
+                model = %provider.model.as_deref().unwrap_or("(missing)"),
+                "worker: selected provider-plugin backend"
+            );
+            Ok(ResolvedBackend::Ready(Arc::new(
+                newt_inference::provider_plugin::ProviderPluginBackend::from_config(provider)?,
+            )))
+        }
+        SelectionOutcome::Selected(SelectedBackend::Configured(backend)) => Ok(
+            ResolvedBackend::Ready(instantiate_configured_backend(backend, ollama_host)?),
+        ),
+        SelectionOutcome::UnknownNamed(name) => anyhow::bail!(
+            "worker: selected backend '{name}' is not defined in any \
+             [[backends]] or [[providers]] entry — fix the \
+             $NEWT_PROVIDER / default_backend selector (no silent fallback)"
+        ),
+        SelectionOutcome::Unset => Ok(ResolvedBackend::DiscoverLocalOllama),
+    }
+}
+
+/// Resolve exactly ONE backend through the shared selection contract
+/// ([`Config::select_backend`]) and instantiate it. An explicitly selected
+/// backend is authoritative — never replaced by the first OpenAI entry or a bare
+/// `providers.first()`, and NEVER erased by `$OLLAMA_HOST`: that env var is only
+/// an Ollama endpoint hint (applied to a selected Ollama backend, or to local
+/// discovery), so a `$NEWT_PROVIDER` / `default_backend` that names an OpenAI or
+/// provider backend still wins even when `$OLLAMA_HOST` is set. Local discovery
+/// is a fallback ONLY when the selection is
+/// [`SelectionOutcome::Unset`](newt_core::config::SelectionOutcome) — nothing is
+/// configured. A [`SelectionOutcome::UnknownNamed`] selector is a hard error.
+///
+/// A configuration RESOLUTION error propagates (it is not swallowed into an empty
+/// config): a malformed or unreadable config must not silently become a different
+/// backend choice.
 async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBackend>> {
-    use newt_core::Config;
+    use anyhow::Context as _;
 
-    let ollama_override = std::env::var_os("OLLAMA_HOST").is_some();
-    let cfg = Config::resolve().unwrap_or_default();
-    if let Some(provider) = select_provider_config(&cfg, ollama_override) {
-        tracing::info!(
-            name = %provider.name,
-            command = %provider.command,
-            model = %provider.model.as_deref().unwrap_or("(missing)"),
-            "worker: using configured provider plugin"
-        );
-        return Ok(Arc::new(
-            newt_inference::provider_plugin::ProviderPluginBackend::from_config(provider)?,
-        ));
-    }
-    if let Some(openai) = select_openai_backend(&cfg, ollama_override) {
-        tracing::info!(
-            name = %openai.name,
-            endpoint = %openai.endpoint,
-            model = %openai.effective_model().unwrap_or("(server decides)"),
-            authenticated = openai.resolve_api_key().is_some(),
-            "worker: using configured OpenAI-compatible backend"
-        );
-        return Ok(Arc::new(
-            newt_inference::local::LocalVllmBackend::from_config(openai),
-        ));
-    }
+    let cfg =
+        newt_core::Config::resolve().context("worker: failed to resolve Newt configuration")?;
+    let ollama_host = std::env::var("OLLAMA_HOST").ok().filter(|h| !h.is_empty());
 
-    let default_model =
-        std::env::var("NEWT_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
-    let backend = newt_inference::local::LocalOllamaBackend::discover(&default_model).await?;
-    Ok(Arc::new(backend))
+    match resolve_configured_backend(&cfg, ollama_host.as_deref())? {
+        ResolvedBackend::Ready(backend) => Ok(backend),
+        ResolvedBackend::DiscoverLocalOllama => {
+            let default_model =
+                std::env::var("NEWT_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
+            tracing::info!(
+                model = %default_model,
+                "worker: no configured backend selected — falling back to local Ollama discovery"
+            );
+            let backend =
+                newt_inference::local::LocalOllamaBackend::discover(&default_model).await?;
+            Ok(Arc::new(backend))
+        }
+    }
 }
 
 #[cfg(test)]
 mod backend_selection_tests {
-    use super::select_openai_backend;
-    use newt_core::config::ProviderConfig;
+    //! W1 (unified backend resolution) — the worker-layer half.
+    //!
+    //! These assert the **destination** the shared contract instantiates: which
+    //! transport (`ollama-local` / `vllm-local` / `openai-responses`) and which
+    //! URL a selected backend resolves to — not merely the returned Rust type.
+    //! The *selection precedence* itself (including the `$NEWT_PROVIDER` cases,
+    //! which need a serialized env guard) is proved in
+    //! `newt_core::config`'s `select_backend_tests`.
+    use super::{instantiate_configured_backend, resolve_configured_backend, ResolvedBackend};
+    use newt_core::config::{ProviderConfig, SelectedBackend, SelectionOutcome};
     use newt_core::router::Tier;
-    use newt_core::{BackendConfig, BackendKind, Config};
+    use newt_core::{BackendConfig, BackendKind, Config, OpenAiApi};
+    use std::sync::Arc;
+    // `.name()` / `.endpoint()` are trait methods — bring the trait into scope so
+    // the tests can assert the concrete destination each backend instantiates to.
+    use newt_inference::InferenceBackend;
 
-    fn backend(name: &str, kind: BackendKind) -> BackendConfig {
+    fn openai(name: &str, api: OpenAiApi, endpoint: &str) -> BackendConfig {
         BackendConfig {
             name: name.into(),
-            endpoint: "http://e".into(),
+            endpoint: endpoint.into(),
             model: Some("m".into()),
-            model_path: None,
             tiers: vec![Tier::Fast],
-            kind: Some(kind),
-            api: Default::default(),
-            api_key_file: None,
-            api_key_env: None,
+            kind: Some(BackendKind::Openai),
+            api: Some(api),
             ..Default::default()
         }
     }
 
-    fn cfg(backends: Vec<BackendConfig>) -> Config {
-        Config {
-            backends,
-            ..Config::default()
+    fn ollama(name: &str, endpoint: &str) -> BackendConfig {
+        BackendConfig {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            model: Some("llama3.1:8b".into()),
+            tiers: vec![Tier::Fast],
+            kind: Some(BackendKind::Ollama),
+            ..Default::default()
         }
     }
 
@@ -224,69 +302,231 @@ mod backend_selection_tests {
         }
     }
 
-    #[test]
-    fn picks_openai_backend_when_present_and_no_override() {
-        let c = cfg(vec![
-            backend("local", BackendKind::Ollama),
-            backend("remote", BackendKind::Openai),
-        ]);
-        let chosen = select_openai_backend(&c, false).expect("openai backend");
-        assert_eq!(chosen.name, "remote");
-        assert_eq!(chosen.kind, Some(BackendKind::Openai));
-    }
-
-    #[test]
-    fn ollama_host_override_forces_ollama_path_even_with_openai_config() {
-        // The OLLAMA_HOST override must win over a configured OpenAI backend.
-        let c = cfg(vec![backend("remote", BackendKind::Openai)]);
-        assert!(select_openai_backend(&c, true).is_none());
-    }
-
-    #[test]
-    fn no_openai_backend_yields_none() {
-        let c = cfg(vec![backend("local", BackendKind::Ollama)]);
-        assert!(select_openai_backend(&c, false).is_none());
-    }
-
-    #[test]
-    fn empty_backend_list_yields_none() {
-        let c = cfg(vec![]);
-        assert!(select_openai_backend(&c, false).is_none());
-        assert!(select_openai_backend(&c, true).is_none());
-    }
-
-    #[test]
-    fn first_openai_backend_wins_when_several() {
-        let mut first = backend("remote-a", BackendKind::Openai);
-        first.endpoint = "http://a".into();
-        let mut second = backend("remote-b", BackendKind::Openai);
-        second.endpoint = "http://b".into();
-        let c = cfg(vec![backend("local", BackendKind::Ollama), first, second]);
-        let chosen = select_openai_backend(&c, false).expect("openai backend");
-        assert_eq!(chosen.name, "remote-a");
-        assert_eq!(chosen.endpoint, "http://a");
-    }
-
-    #[test]
-    fn provider_config_wins_before_openai_compatible_backend() {
-        let c = Config {
-            providers: vec![provider("openai-provider")],
-            backends: vec![backend("remote", BackendKind::Openai)],
+    fn cfg(backends: Vec<BackendConfig>, providers: Vec<ProviderConfig>) -> Config {
+        Config {
+            backends,
+            providers,
+            default_backend: None,
             ..Config::default()
-        };
+        }
+    }
 
-        let chosen = super::select_provider_config(&c, false).expect("provider");
+    // --- Destination: the selected backend instantiates to the right transport
+    // and URL (invariant 1: the explicitly selected backend is authoritative). ---
 
-        assert_eq!(chosen.name, "openai-provider");
+    #[test]
+    fn ollama_backend_instantiates_ollama_transport_at_its_endpoint() {
+        let b = ollama("local", "http://ollama.host:11434/");
+        let backend = instantiate_configured_backend(&b, None).expect("instantiate");
+        assert_eq!(backend.name(), "ollama-local");
+        assert_eq!(backend.endpoint(), Some("http://ollama.host:11434/"));
     }
 
     #[test]
-    fn ollama_host_override_forces_ollama_path_even_with_provider_config() {
-        let c = Config {
-            providers: vec![provider("openai-provider")],
-            ..Config::default()
-        };
+    fn openai_chat_completions_instantiates_vllm_transport_at_its_endpoint() {
+        let b = openai(
+            "cloud",
+            OpenAiApi::ChatCompletions,
+            "http://vllm.host:8000/",
+        );
+        let backend = instantiate_configured_backend(&b, None).expect("instantiate");
+        // Chat Completions → the vLLM (POST /v1/chat/completions) transport.
+        assert_eq!(backend.name(), "vllm-local");
+        assert_eq!(backend.endpoint(), Some("http://vllm.host:8000/"));
+    }
 
-        assert!(super::select_provider_config(&c, true).is_none());
+    #[test]
+    fn openai_responses_instantiates_responses_transport_at_its_endpoint() {
+        let b = openai("sol", OpenAiApi::Responses, "http://sol.host:8000/");
+        let backend = instantiate_configured_backend(&b, None).expect("instantiate");
+        // Responses → the POST /v1/responses transport, NOT chat/completions.
+        assert_eq!(backend.name(), "openai-responses");
+        assert_eq!(backend.endpoint(), Some("http://sol.host:8000/"));
+    }
+
+    #[test]
+    fn explicitly_selected_unsupported_kind_is_a_deterministic_error() {
+        // An `embedded` backend is not an ACP-worker transport: a hard error,
+        // never a silent fallback to Ollama discovery.
+        let b = BackendConfig {
+            name: "in-proc".into(),
+            kind: Some(BackendKind::Embedded),
+            model_path: Some("~/models/tiny.gguf".into()),
+            ..Default::default()
+        };
+        let err = instantiate_configured_backend(&b, None)
+            .map(|_| ())
+            .expect_err("unsupported kind must error");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported kind"), "got: {msg}");
+        assert!(msg.contains("in-proc"), "error names the backend: {msg}");
+    }
+
+    #[test]
+    fn ollama_backend_without_a_model_is_a_deterministic_error() {
+        // Regression: an Ollama backend with no configured model must error
+        // (the worker cannot invent a model), not panic or silently discover.
+        let b = BackendConfig {
+            name: "modelless".into(),
+            endpoint: "http://ollama.host:11434/".into(),
+            kind: Some(BackendKind::Ollama),
+            model: None,
+            ..Default::default()
+        };
+        let err = instantiate_configured_backend(&b, None)
+            .map(|_| ())
+            .expect_err("no-model must error");
+        assert!(
+            err.to_string().contains("no configured model"),
+            "got: {err}"
+        );
+    }
+
+    // --- Selection: the unified contract picks the RIGHT entry (env-free cases;
+    // the `$NEWT_PROVIDER` cases live in newt-core's serialized guard). ---
+
+    #[test]
+    fn default_backend_selects_ollama_even_when_openai_is_also_configured() {
+        // The bug this closes: "mixed Ollama + OpenAI ⇒ OpenAI wins" is WRONG
+        // when Ollama was explicitly selected. default_backend = the Ollama
+        // entry ⇒ that Ollama backend is authoritative and instantiates to its
+        // own endpoint, not the OpenAI one.
+        let mut c = cfg(
+            vec![
+                ollama("local", "http://ollama.host:11434/"),
+                openai(
+                    "cloud",
+                    OpenAiApi::ChatCompletions,
+                    "http://vllm.host:8000/",
+                ),
+            ],
+            vec![],
+        );
+        c.default_backend = Some("local".into());
+
+        let SelectionOutcome::Selected(SelectedBackend::Configured(sel)) = c.select_backend()
+        else {
+            panic!("expected the configured Ollama backend to be selected");
+        };
+        assert_eq!(sel.name, "local");
+        let backend = instantiate_configured_backend(sel, None).expect("instantiate");
+        assert_eq!(backend.name(), "ollama-local");
+        assert_eq!(backend.endpoint(), Some("http://ollama.host:11434/"));
+    }
+
+    #[test]
+    fn provider_plugin_is_selected_and_instantiated_when_named() {
+        let mut c = cfg(vec![], vec![provider("myplugin")]);
+        c.default_backend = Some("myplugin".into());
+
+        let SelectionOutcome::Selected(SelectedBackend::Provider(p)) = c.select_backend() else {
+            panic!("expected the named provider plugin to be selected");
+        };
+        assert_eq!(p.name, "myplugin");
+        let backend =
+            newt_inference::provider_plugin::ProviderPluginBackend::from_config(p).expect("build");
+        assert_eq!(backend.name(), "myplugin");
+        // A subprocess plugin bridges inference in-process → no HTTP endpoint.
+        assert_eq!(backend.endpoint(), None);
+    }
+
+    #[test]
+    fn unknown_named_backend_is_an_error_not_a_silent_fallback() {
+        // default_backend names an entry that matches no backend AND no provider,
+        // while an OpenAI backend is present. The contract must NOT silently run
+        // the OpenAI backend — it reports the unknown selector.
+        let mut c = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm.host:8000/",
+            )],
+            vec![],
+        );
+        c.default_backend = Some("ghost".into());
+
+        match c.select_backend() {
+            SelectionOutcome::UnknownNamed(name) => assert_eq!(name, "ghost"),
+            other => panic!("expected UnknownNamed(\"ghost\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_configured_is_unset_permitting_local_discovery() {
+        let c = cfg(vec![], vec![]);
+        assert!(matches!(c.select_backend(), SelectionOutcome::Unset));
+    }
+
+    // --- R3: the worker resolver — $OLLAMA_HOST is an Ollama endpoint hint that
+    // NEVER erases an explicit selection; config-error propagation is in
+    // resolve_backend's `?` (a malformed config cannot become a silent empty one). ---
+
+    fn ready(r: anyhow::Result<ResolvedBackend>) -> Arc<dyn InferenceBackend> {
+        match r.expect("resolved") {
+            ResolvedBackend::Ready(b) => b,
+            ResolvedBackend::DiscoverLocalOllama => panic!("expected a configured backend"),
+        }
+    }
+
+    #[test]
+    fn ollama_host_supplies_the_endpoint_of_a_selected_ollama_backend() {
+        // An explicit Ollama backend + $OLLAMA_HOST → the SELECTED model at the
+        // OLLAMA_HOST endpoint (the override supplies the endpoint, not the model).
+        let mut c = cfg(vec![ollama("local", "http://configured:11434/")], vec![]);
+        c.default_backend = Some("local".into());
+        let backend = ready(resolve_configured_backend(&c, Some("http://mock:9/")));
+        assert_eq!(backend.name(), "ollama-local");
+        assert_eq!(backend.endpoint(), Some("http://mock:9/"));
+        assert_eq!(backend.model_id(), "llama3.1:8b");
+    }
+
+    #[test]
+    fn ollama_host_does_not_erase_an_explicitly_selected_openai_backend() {
+        // The bug this closes: $OLLAMA_HOST's mere presence used to skip selection
+        // entirely and discover local Ollama, silently ignoring an explicit
+        // OpenAI selector. Now the selected OpenAI backend wins and keeps its own
+        // endpoint — $OLLAMA_HOST is inert for it.
+        let mut c = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm:8000/",
+            )],
+            vec![],
+        );
+        c.default_backend = Some("cloud".into());
+        let backend = ready(resolve_configured_backend(&c, Some("http://mock:9/")));
+        assert_eq!(backend.name(), "vllm-local");
+        assert_eq!(
+            backend.endpoint(),
+            Some("http://vllm:8000/"),
+            "$OLLAMA_HOST must not redirect a selected OpenAI backend"
+        );
+    }
+
+    #[test]
+    fn unset_selection_requests_local_discovery_even_with_ollama_host() {
+        let c = cfg(vec![], vec![]);
+        assert!(matches!(
+            resolve_configured_backend(&c, Some("http://mock:9/")).expect("ok"),
+            ResolvedBackend::DiscoverLocalOllama
+        ));
+    }
+
+    #[test]
+    fn resolver_errors_on_an_unknown_named_backend() {
+        let mut c = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm:8000/",
+            )],
+            vec![],
+        );
+        c.default_backend = Some("ghost".into());
+        let err = resolve_configured_backend(&c, None)
+            .map(|_| ())
+            .expect_err("unknown named backend is a hard error");
+        assert!(err.to_string().contains("ghost"), "got: {err}");
     }
 }

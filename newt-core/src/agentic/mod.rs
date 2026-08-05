@@ -22,6 +22,7 @@ mod crew_attest;
 mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
+mod generation_policy;
 mod git_tool;
 pub(crate) mod self_verify;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
@@ -33,9 +34,12 @@ pub(crate) mod experiential;
 // Step 26.6b (#586): scheduled per-step compiled view — the `scheduled` feature.
 pub(crate) mod scheduled;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
+/// Content-addressed spill identity (#1528 B3): a spill handle is the BLAKE3 CIDv1
+/// of a versioned, session-scoped record. This is the sole spill/compaction store;
+/// the old reservation/allocator store was deleted at cutover.
+pub(crate) mod content_spill;
 /// Drive an overseer-authored plan through a `CrewRunner` (#628 P2 execute side).
 pub(crate) mod plan_exec;
-pub(crate) mod spill;
 // W0 (#1511, epic #1506): typed dispatch-error classification + per-round
 // tool-call parse signals — the structural inputs of the observability
 // contract `newt solve` emits for the external evaluator.
@@ -123,6 +127,13 @@ mod report;
 // #714: the `resume_context` tool — a self-scoped read of THIS conversation's
 // own pre-interrupt work (the affordance `recall` structurally cannot be).
 mod resume;
+// #1528: pure Value↔Value bridge letting the Responses `input` shape reuse the
+// chat-shaped `compress::compress` compactor on a context-window-400 recovery.
+mod responses_compaction;
+// #1528 B5: the ONE typed strict-wire validator — every Responses dispatch goes
+// through `validate_responses_request` and `dispatch_responses_json` accepts only a
+// `ValidatedResponsesRequest`, so a broken request cannot reach `POST /v1/responses`.
+mod responses_wire_validation;
 mod send_budget;
 // FR-3 (#998): the grant-independent absolute deny-list — a fixed exec veto
 // (ssh / rm / systemctl restart …) no capability, mode, or persona unlocks,
@@ -159,8 +170,13 @@ pub use compress::{
     ManualCompressOutcome, SummarizeFn, SummarizeFuture, Summarizer, CONTINUATION_PREFIX,
     SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
+pub use content_spill::{
+    SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1, SpillScope,
+    SpillStore,
+};
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
+pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, newt_line, print_harness_notice,
     print_list_item, print_newt, set_spill_lines, GaugeLevel, NEWT_ORANGE_CT,
@@ -176,8 +192,8 @@ pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use observability::{
-    classify_reqwest, error_class, round_parse_signal, DispatchError, ErrorClass, ParseSignal,
-    SolveObservation, ToolCallDialect,
+    classify_reqwest, error_class, round_parse_signal, BehaviorSignal, DispatchError, ErrorClass,
+    ParseSignal, SolveObservation, ToolCallDialect,
 };
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
@@ -203,7 +219,6 @@ pub use semantic::{
     GatherManifest, IndexStatus, RankedHit, RejectReason, RetrievalResult, RetrievalSteer,
     SemanticIndex, SessionSemanticIndex,
 };
-pub use spill::{SessionSpillStore, SpillStore};
 
 /// Align GFM table pipes in Markdown **source** (Step 25.5, #568) — plain text,
 /// no ANSI. The headless **wyvern** tier keeps Markdown as source (no rendering),
@@ -268,6 +283,7 @@ pub use permissions::{
 pub use plan_mode::PlanModeControl;
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
+pub use send_budget::initial_context_input_budget;
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
@@ -279,7 +295,7 @@ pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
 };
 pub use trim::trim_for_summary;
-pub use untrusted::wrap_untrusted;
+pub use untrusted::{wrap_internal_summary, wrap_untrusted};
 pub use warmup::warmup_if_cold;
 
 use crate::retry::{with_backoff_notify, RetryPolicy};
@@ -295,7 +311,8 @@ use display::{
     emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator, print_trace,
 };
 use send_budget::{
-    calibrate_down, calibrate_up, emit_accepted, initial_send_budget, num_ctx_input_ceiling,
+    calibrate_down, calibrate_up, emit_accepted, emit_context_window_400, initial_send_budget,
+    num_ctx_input_ceiling, recovered_input_budget, resolve_responses_budget,
     sanitize_estimate_ratio,
 };
 use std::io::{self, Write as _};
@@ -332,14 +349,18 @@ fn authoritative_request_budget(
     send_budget_authoritative: bool,
     token_threshold: Option<usize>,
 ) -> Option<usize> {
-    let send = send_budget_authoritative
-        .then_some(send_budget)
-        .flatten()
-        .filter(|budget| *budget > 0);
+    let send = send_budget_authoritative.then_some(send_budget).flatten();
     match (send, token_threshold.filter(|budget| *budget > 0)) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     }
+}
+
+fn capped_accepted_prompt_tokens(
+    accepted_prompt_tokens: u32,
+    declared_ceiling: Option<usize>,
+) -> usize {
+    (accepted_prompt_tokens as usize).min(declared_ceiling.unwrap_or(usize::MAX))
 }
 
 /// Refuse before inference when the compression-immune system/card/exact-user
@@ -411,18 +432,21 @@ fn preflight_full_message_request(
     Ok(())
 }
 
-fn preflight_responses_request(
+/// #1528: the ONE token-shape estimate of a Responses request — the
+/// `instructions` (as a protected system head), the running `input`, and the
+/// flattened Responses-WIRE tool schemas — that BOTH [`preflight_responses_request`]
+/// (which refuses when it exceeds the budget) and the `get_context_remaining`
+/// self-read (which reports it as `used`) call, so the self-read counts exactly
+/// what dispatch counts. `tools` is `None` for a tools-disabled request; pass the
+/// Responses-wire `tools` array actually sent, never the Chat-shaped catalog.
+/// Uncalibrated (chars/4) — the caller applies [`calibrate_up`] when it needs
+/// real-token currency.
+fn estimate_responses_request_tokens(
     instructions: Option<&str>,
     input: &[serde_json::Value],
     tools: Option<&[serde_json::Value]>,
-    authoritative_budget: Option<usize>,
-    calibration: f32,
     estimation: crate::tokens::TokenEstimation,
-    model: &str,
-) -> anyhow::Result<()> {
-    let Some(budget) = authoritative_budget else {
-        return Ok(());
-    };
+) -> usize {
     let instructions_tokens = instructions
         .map(|text| {
             estimate_value_tokens(
@@ -435,10 +459,70 @@ fn preflight_responses_request(
     let tool_tokens = tools
         .map(|tools| estimate_value_tokens(&serde_json::Value::Array(tools.to_vec()), estimation))
         .unwrap_or(0);
-    let required = calibrate_up(
-        instructions_tokens + input_tokens + tool_tokens,
+    instructions_tokens + input_tokens + tool_tokens
+}
+
+/// The CALIBRATED real-token estimate of a Responses request — the raw
+/// [`estimate_responses_request_tokens`] shape (chars/4) converted to the
+/// backend-token currency dispatch enforces in, via the model's `calibration`.
+/// Budget ceilings and remaining-token reports are real-token currency, so BOTH
+/// the dispatch preflight AND the `get_context_remaining` self-read subtract
+/// THIS, never the raw estimate (BHV-BUDGET-001/002/003: one currency, calibrated
+/// exactly once).
+fn estimate_responses_request_real_tokens(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    estimation: crate::tokens::TokenEstimation,
+    calibration: f32,
+) -> usize {
+    calibrate_up(
+        estimate_responses_request_tokens(instructions, input, tools, estimation),
         calibration,
-    );
+    )
+}
+
+/// The Responses `get_context_remaining` self-read report, extracted so it is
+/// unit-testable and shares ONE calibrated estimate with dispatch: `used` is the
+/// CALIBRATED estimate of the exact next request (the instructions, the running
+/// `input`, and the enabled Responses-wire tool schemas), subtracted from the
+/// SAME `actionable_input_budget` the preflight refuses against, in the SAME
+/// real-token currency — so the self-read's remaining and low-budget
+/// classification match what dispatch would accept or reject (BHV-BUDGET-002).
+fn responses_context_remaining_report(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    budget_state: &send_budget::ResponsesBudgetState,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    low_budget_pct: usize,
+) -> String {
+    let used_real =
+        estimate_responses_request_real_tokens(instructions, input, tools, estimation, calibration);
+    budget::render_context_budget(
+        used_real,
+        budget_state.actionable_input_budget(),
+        budget_state.num_ctx(),
+        budget_state.input_ceiling_pct(),
+        low_budget_pct,
+    )
+}
+
+fn preflight_responses_request(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
+    let required =
+        estimate_responses_request_real_tokens(instructions, input, tools, estimation, calibration);
     if required > budget {
         anyhow::bail!(
             "the Responses request needs ~{required} input tokens, which cannot fit model \
@@ -449,8 +533,264 @@ fn preflight_responses_request(
     Ok(())
 }
 
+/// The outcome of the ONE Responses compaction path (#1528 B2/B3): classify the
+/// running `input` into typed provenance, compact via the ONE `compress`, rebuild
+/// EXHAUSTIVELY, and validate the fenced request against the budget. Both triggers
+/// — the REACTIVE cw-400 recovery and the PROACTIVE pre-dispatch guard — call the
+/// same [`compact_responses_input`]; they differ ONLY in how they MAP this outcome
+/// (reactive surfaces the provider's original 400; proactive fails closed with a
+/// fresh refusal). Making the compaction unrepresentable in two places is the
+/// point (reuse discipline): a fix or a guard added here can never be missed at
+/// one call site.
+enum ResponsesCompaction {
+    /// Compression fired and the rebuilt (fenced) request fits the budget — the
+    /// caller's `input` was rewritten to the compacted form.
+    Compacted,
+    /// Compression did not fire (nothing left to reclaim) — `input` unchanged.
+    NotFired,
+    /// The compressor refused: the protected head alone exceeds the budget.
+    Refused,
+    /// The rebuilt request still exceeds the budget AFTER fencing — `input` is left
+    /// UNCHANGED (BHV-BUDGET-004: never dispatch an oversized request).
+    OverBudgetAfterFence(responses_compaction::PostBridgeBudgetExceeded),
+    /// `input` could not be classified (a forbidden `system` item) — fail closed.
+    BridgeError,
+    /// The staged compaction spill batch could not be committed (a poisoned store or a
+    /// content-integrity violation) — fail CLOSED, committing NOTHING (BHV-SPILL-007).
+    SpillCommitFailed(crate::agentic::content_spill::SpillError),
+}
+
+/// Why a proactive / reactive compaction attempt did NOT yield a dispatchable
+/// request (#1528 B3, item 4). Carried into the fail-closed error CHAIN (as anyhow
+/// context on the authoritative preflight, or the provider error for reactive
+/// recovery) so headless / structured callers see the reason WITHOUT depending on
+/// terminal rendering. No user-facing notice is emitted for a rejected candidate;
+/// this reason IS the single diagnostic.
+#[derive(Debug, Clone)]
+enum CompactionRejection {
+    /// `input` could not be classified into typed provenance (a forbidden `system`
+    /// item) — BHV-PROVENANCE-002.
+    BridgeClassification,
+    /// The compressor refused: the protected head alone exceeds the budget.
+    CompressorRefused,
+    /// Compaction could not reduce the request further (nothing left to reclaim).
+    NoProgress,
+    /// The fenced rebuild still exceeds the budget after framing (BHV-BUDGET-004).
+    PostBridgeBudgetExceeded(responses_compaction::PostBridgeBudgetExceeded),
+    /// The compacted candidate fit, but its staged spill batch could not be committed
+    /// (a poisoned store or a content-integrity violation) — fail closed (BHV-SPILL-007).
+    SpillCommit(crate::agentic::content_spill::SpillError),
+}
+
+impl std::fmt::Display for CompactionRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BridgeClassification => write!(
+                f,
+                "proactive compaction could not classify the request (a forbidden system item)"
+            ),
+            Self::CompressorRefused => write!(
+                f,
+                "proactive compaction refused: the protected head alone exceeds the input budget"
+            ),
+            Self::NoProgress => write!(
+                f,
+                "proactive compaction made no progress: nothing left to reclaim under the budget"
+            ),
+            Self::PostBridgeBudgetExceeded(e) => {
+                write!(f, "proactive compaction fit the compressor budget but {e}")
+            }
+            Self::SpillCommit(e) => write!(
+                f,
+                "proactive compaction could not commit its staged spill batch \
+                 ({e:?}) — refusing to install a request that names an uncommitted spill"
+            ),
+        }
+    }
+}
+
+impl ResponsesCompaction {
+    /// The rejection reason when this outcome is NOT a committed compaction — for
+    /// the fail-closed error chain. `Compacted` → `None`; `NotFired` (compaction
+    /// made no reduction) → `NoProgress`.
+    fn rejection(self) -> Option<CompactionRejection> {
+        match self {
+            Self::Compacted => None,
+            Self::NotFired => Some(CompactionRejection::NoProgress),
+            Self::Refused => Some(CompactionRejection::CompressorRefused),
+            Self::BridgeError => Some(CompactionRejection::BridgeClassification),
+            Self::OverBudgetAfterFence(e) => Some(CompactionRejection::PostBridgeBudgetExceeded(e)),
+            Self::SpillCommitFailed(e) => Some(CompactionRejection::SpillCommit(e)),
+        }
+    }
+}
+
+/// A candidate-local staging buffer for the compaction spill(s) built while
+/// compressing a Responses candidate (#1528 B3, §2.6). The compressor STAGES each
+/// evicted middle span into this buffer PURELY (the CID is a pure function of the
+/// content, so its `compaction:<cid>` handle can ride the summary before any commit);
+/// nothing reaches the live store. [`compact_responses_input`] drains it and
+/// `commit_batch`es into the live store ONLY on the accept branch — a rejected
+/// candidate drops the buffer, leaving the live store untouched (BHV-SPILL-006/007).
+pub(crate) type CompactionStageBuffer =
+    std::sync::Mutex<Vec<crate::agentic::content_spill::StagedSpill>>;
+
+/// Compact the Responses `input` toward `compaction_budget` via the B2 provenance
+/// bridge + the ONE `compress`, then validate the fenced rebuild against
+/// `actionable_budget` before committing.
+///
+/// TRANSACTIONAL (#1528 B3, B3-CG-004 / §2.6): the compressor runs against a CLONE of
+/// `compress_state` AND a candidate-local [`CompactionStageBuffer`] — the evicted
+/// middle span(s) are STAGED PURELY (no live-store mutation) while the candidate is
+/// validated (provenance + post-bridge budget). On success — and only then — the
+/// helper commits ALL FOUR effects together: it rewrites `*input`, writes the
+/// candidate anti-thrash state back into `*compress_state`, `commit_batch`es the
+/// staged spills to the real store, and emits the compaction notice. On ANY
+/// reject/refuse/over-budget/bridge-error path, `*input`, `*compress_state`, the spill
+/// store, and the notice stream are ALL left UNTOUCHED — the staged buffer is dropped
+/// and no `compaction:<cid>` was committed — so no caller can dispatch a
+/// half-compacted request or believe an uncommitted compaction occurred. Single-shot
+/// (one attempt) — the caller decides whether to gate on an estimate (proactive) or
+/// always call (reactive), and how to map a non-`Compacted` outcome (see
+/// [`CompactionRejection`]).
+#[allow(clippy::too_many_arguments)]
+async fn compact_responses_input(
+    input: &mut Vec<serde_json::Value>,
+    instructions: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+    actionable_budget: Option<usize>,
+    compaction_budget: usize,
+    cal: f32,
+    estimation: crate::tokens::TokenEstimation,
+    task: &str,
+    summary_input_cap_floor_chars: usize,
+    compaction_store: Option<&dyn crate::agentic::content_spill::SpillStore>,
+    summarizer: Option<&SummarizeFn>,
+    compress_state: &mut CompressState,
+    color: bool,
+) -> ResponsesCompaction {
+    // Classify the Responses `input` into TYPED provenance (fail-closed) and render
+    // it to chat with `instructions` as a protected system head. A forbidden
+    // `system` item in `input` fails closed here (BHV-PROVENANCE-002).
+    let messages = match responses_compaction::responses_input_to_compaction(input) {
+        Ok(m) => m,
+        Err(_) => return ResponsesCompaction::BridgeError,
+    };
+    let mut chat: Vec<serde_json::Value> = Vec::new();
+    if let Some(ins) = instructions {
+        chat.push(serde_json::json!({ "role": "system", "content": ins }));
+    }
+    chat.extend(responses_compaction::compaction_to_chat(&messages));
+    // Run the compressor against a CANDIDATE state AND a candidate-local staging
+    // buffer — the live anti-thrash counters / disabled latch and the session
+    // compaction store are mutated only on commit (below). The live `compaction_store`
+    // is passed so the compressor can STAMP its session scope onto each span and render
+    // the pure `compaction:<cid>` handle; the buffer receives the staged span(s)
+    // instead of the live store, so nothing is committed until accept. A `None` store
+    // passes through as `None` (no buffer), so with no real store the compressor
+    // invents no retrieval handle (correction 1).
+    let mut candidate_state = compress_state.clone();
+    let stage_buffer: CompactionStageBuffer = std::sync::Mutex::new(Vec::new());
+    let outcome = compress(
+        CompressRequest {
+            messages: &chat,
+            // Real-token cap minus real-token schema overhead → pipeline chars/4
+            // currency (mirrors the Chat path).
+            budget: compaction_budget,
+            max_messages: None,
+            replay_protected_tail_len: 0,
+            task,
+            hard_budget: true,
+            authoritative: true,
+            focus: None,
+            est: estimation,
+            summary_input_cap_floor_chars,
+            compaction_store,
+            compaction_stage: compaction_store.map(|_| &stage_buffer),
+        },
+        summarizer,
+        &mut candidate_state,
+    )
+    .await;
+    // The notice is NOT emitted yet — only a committed compaction surfaces one.
+    if outcome.action == CompressAction::Refused {
+        return ResponsesCompaction::Refused;
+    }
+    if !outcome.fired {
+        return ResponsesCompaction::NotFired;
+    }
+    // Drop the instructions system head we prepended for head protection:
+    // `instructions` is re-sent ONCE via its own field (BHV-PROVENANCE-005), never
+    // duplicated into `input`. The compressor keeps the head verbatim at index 0.
+    let compacted = &outcome.messages;
+    let rebuilt_chat: &[serde_json::Value] = if instructions.is_some()
+        && compacted.first().and_then(|m| m["role"].as_str()) == Some("system")
+    {
+        &compacted[1..]
+    } else {
+        compacted
+    };
+    // Reclassify to typed provenance, then rebuild exhaustively (untrusted-derived
+    // → fenced `user`).
+    let rebuilt_msgs = responses_compaction::chat_to_compaction(rebuilt_chat);
+    let rebuilt_input = responses_compaction::compaction_to_responses(&rebuilt_msgs);
+    // #1528 B2 (BHV-BUDGET-004): the provenance fences are added AFTER the
+    // compressor fit its budget, so validate the REBUILT request against the
+    // authoritative budget (the SHARED B1 estimator, same real-token currency
+    // dispatch enforces) BEFORE committing. `pre_bridge` estimates the SAME
+    // messages WITHOUT the fences, attributing any overflow to the framing.
+    if let Some(budget) = actionable_budget {
+        let est_tokens = |items: &[serde_json::Value]| {
+            estimate_responses_request_real_tokens(instructions, items, tools, estimation, cal)
+        };
+        let post_bridge = est_tokens(&rebuilt_input);
+        let pre_bridge = est_tokens(&responses_compaction::rebuild_unfenced_for_estimate(
+            &rebuilt_msgs,
+        ));
+        if let Err(exceeded) =
+            responses_compaction::check_post_bridge_budget(budget, pre_bridge, post_bridge)
+        {
+            // REJECT: the staged buffer is dropped WITHOUT commit, so every staged span
+            // is retired unused — nothing is fetchable in the live store, its counts are
+            // unchanged; `*input`, `*compress_state`, and the notice stream are likewise
+            // UNTOUCHED — the candidate is discarded whole.
+            return ResponsesCompaction::OverBudgetAfterFence(exceeded);
+        }
+    }
+    // COMMIT — all FOUR effects, now that the candidate is accepted. Ordered so live
+    // input never references an uncommitted spill: install the staged spill batch
+    // FIRST — and if that batch commit fails (a poisoned buffer or a content-integrity
+    // violation), fail CLOSED, leaving `*input`, `*compress_state`, and the notice
+    // stream UNTOUCHED (BHV-SPILL-007). Then swap in the input that names those spills,
+    // the anti-thrash state, and the notice.
+    if let Some(store) = compaction_store {
+        let staged = match stage_buffer.into_inner() {
+            Ok(s) => s,
+            Err(_) => {
+                return ResponsesCompaction::SpillCommitFailed(
+                    content_spill::SpillError::PoisonedStore,
+                )
+            }
+        };
+        if !staged.is_empty() {
+            if let Err(e) = store.commit_batch(&staged) {
+                return ResponsesCompaction::SpillCommitFailed(e);
+            }
+        }
+    }
+    *input = rebuilt_input;
+    *compress_state = candidate_state;
+    if let Some(notice) = outcome.notice {
+        print_harness_notice(&notice, color);
+    }
+    ResponsesCompaction::Compacted
+}
+
 /// Hook recovering a hard context-window 400:
-/// `(error, model, today) → new input-token cap`. See [`ChatCtx::recover_cw_400`].
+/// `(error, model, today) → parsed full context window`. The loop composes the
+/// returned window with its percentage ceiling and generation output reserve;
+/// callbacks must not pre-discount it into an input cap. See
+/// [`ChatCtx::recover_cw_400`].
 pub type RecoverCw400 = fn(&anyhow::Error, &str, &str) -> Option<u32>;
 
 /// One per-round capability observation, reported through
@@ -474,6 +814,10 @@ pub enum RoundObservation {
     /// Persistent empty responses at `prompt_tokens` after retries (the
     /// 85%-of-safe-context silent-overflow exit).
     SuspectedOverflow { prompt_tokens: u32 },
+    /// A hard HTTP error reported the endpoint's full context window. The TUI
+    /// applies this through the same in-memory capability entry as subsequent
+    /// accepted-round evidence, avoiding stale whole-cache overwrites.
+    ContextWindow400 { context_window: u32 },
     /// Response carried only non-content fields (thinking/reasoning) with
     /// empty content.
     ThinkingOnly,
@@ -551,13 +895,13 @@ pub struct ChatCtx<'a> {
     /// Session spill store for `tool_offload` (Step 26.3). `None` = no offload
     /// (and `spill:` re-reads resolve to a labelled absence). Shared `&dyn`
     /// (interior mutability) so it serves both the write path and `memory_fetch`.
-    pub spill_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
+    pub spill_store: Option<&'a dyn crate::agentic::content_spill::SpillStore>,
     /// Session compaction store (#661 group B): the compressor stores each
     /// evicted (redacted) middle span here and names a `compaction:<id>` handle
     /// in the marker, so the model can losslessly recover a detail the summary
     /// dropped. SEPARATE store from `spill_store` (own id space). `None` =
     /// lossy-only compaction (headless / progressive disclosure off).
-    pub compaction_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
+    pub compaction_store: Option<&'a dyn crate::agentic::content_spill::SpillStore>,
     /// Inject the `<state>` scratchpad block + advertise the state tools (Step
     /// 26.4, #583). The resolved `scratchpad` feature; false for headless/eval.
     pub scratchpad: bool,
@@ -596,6 +940,21 @@ pub struct ChatCtx<'a> {
     /// axis-scoped `caveats` (which part 1, #1002, already meets in). Headless
     /// / driver / eval callers pass `None` (no persona surface).
     pub persona_tools: Option<&'a [String]>,
+    /// The psyche **cognition** dial for this turn — how much reasoning effort to
+    /// request. `Some(level)` emits OpenAI **Responses** `reasoning.effort` or,
+    /// for an explicitly capable Chat Completions endpoint, resolves a local
+    /// generation policy. `None` omits cognition-derived fields. The TUI
+    /// resolves this from the active persona's `cognition:` front-matter
+    /// alongside `persona_tools`; headless / eval callers pass `None`.
+    pub cognition: Option<crate::role_profile::Cognition>,
+    /// Chat Completions extensions explicitly accepted by this endpoint.
+    /// Unknown endpoints use the all-unset default and retain the historical
+    /// request body even when cognition is active.
+    pub chat_completions_capability: crate::model_card::ChatCompletionsCapability,
+    /// Whether assistant reasoning may be replayed to the active backend.
+    /// Unknown endpoints default to `Never`; local reasoning backends opt in via
+    /// their explicit capability profile.
+    pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 40).
     pub max_tool_rounds: usize,
@@ -639,7 +998,9 @@ pub struct ChatCtx<'a> {
     /// Also feeds the pre-send budget as a hard input ceiling for this turn's
     /// requests (issue #282): Ollama silently evaluates only the window's
     /// tail, so anything newt sends must already fit inside the `num_ctx` it
-    /// sends it with. Ignored on the OpenAI path (no such request field).
+    /// sends it with. OpenAI requests do not serialize `num_ctx`, but local
+    /// compatible endpoints still use it as an authoritative declared window
+    /// for preflight, compaction, reporting, and 400 recovery.
     pub num_ctx: Option<u32>,
     /// TCP connect timeout. Short (5 s default) so a down endpoint fails fast
     /// rather than blocking the full `inference_timeout_secs`.
@@ -675,11 +1036,12 @@ pub struct ChatCtx<'a> {
     /// `None` disables overflow detection.
     pub safe_context: Option<u32>,
     /// Hook invoked when a dispatch fails, to recover a hard context-window
-    /// 400: `(error, model, today) → new input-token cap`. The TUI wires its
-    /// `recover_context_window_400` (which parses the endpoint's real limit
-    /// and persists it to `model-capabilities.json` — that cache stays
-    /// TUI-side with the probe module). `None` disables recovery: the error
-    /// propagates exactly as it did when no limit could be parsed. See #223.
+    /// 400: `(error, model, today) → parsed full context window`. The loop
+    /// derives the effective input cap after reserving its configured maximum
+    /// output; callbacks must not return a pre-discounted input budget. The
+    /// loop emits [`RoundObservation::ContextWindow400`] so the TUI's existing
+    /// observation owner can persist the discovery. `None` disables numbered
+    /// recovery.
     pub recover_cw_400: Option<RecoverCw400>,
     /// Model-writable note store behind the `save_note` tool (Step 19.3,
     /// #248). `None` ⇒ the tool is not advertised and the loop never writes
@@ -775,10 +1137,11 @@ pub struct ChatCtx<'a> {
     /// `[context] summary_input_cap_floor_chars` — floor for the summarizer
     /// input cap so a tight budget never starves the summarizer of material.
     pub summary_input_cap_floor_chars: usize,
-    /// `[context] input_ceiling_pct` — percent of `num_ctx` usable as input
-    /// before the reply reserve. Historically hardcoded at 80 (20% headroom);
-    /// large-window models (e.g. Opus) can safely raise this to pack more
-    /// context per turn. Applied by `num_ctx_input_ceiling`.
+    /// `[context] input_ceiling_pct` — percentage-based input limit inside the
+    /// declared context window. The effective ceiling is the tighter of this
+    /// limit and the space left after the generation policy's maximum output.
+    /// Historically hardcoded at 80 (20% headroom). Applied by
+    /// `num_ctx_input_ceiling`.
     pub input_ceiling_pct: u32,
     /// `[context] low_budget_pct` — remaining-budget percent below which the
     /// loop treats the turn as "low budget" and nudges toward wrapping up.
@@ -1167,6 +1530,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        // Ollama has no Chat Completions capability projection. Bound these
+        // fields to `_` so its request body remains unchanged.
+        cognition: _,
+        chat_completions_capability: _,
+        reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
@@ -1319,16 +1687,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // so without the ceiling the first turn dispatched 10× over the real
     // window with zero events — B6). Mutable because a recovered 400 tightens
     // it mid-turn. See #223.
-    let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct);
+    let mut effective_input_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None);
     let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, num_ctx, input_ceiling_pct);
+        initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
     // does it rest on the proven-good high-water mark (`max_ok_input`) alone?
     // `safe_context` (a believed/declared window) and the per-request
     // `num_ctx` ceiling are authoritative; a cw-400 recovery flips this true
     // mid-turn. Cloud endpoints with no `/api/show` seed neither, so their
     // guard is non-authoritative and fails open instead of refusing.
-    let mut send_budget_authoritative = safe_context.is_some() || num_ctx_ceiling.is_some();
+    let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
@@ -1606,6 +1974,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 messages: &messages,
                                 budget: pipeline_budget,
                                 max_messages: trigger.max_messages,
+                                replay_protected_tail_len: 0,
                                 task: active_task,
                                 hard_budget: trigger.hard_budget,
                                 authoritative: token_fired || send_budget_authoritative,
@@ -1613,6 +1982,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 est: estimation,
                                 summary_input_cap_floor_chars,
                                 compaction_store,
+                                compaction_stage: None,
                             },
                             summarizer,
                             compress_state,
@@ -1864,28 +2234,44 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     // `/api/chat`) falls back to a cap derived from the current send
                     // budget / the `num_ctx` ceiling, so the turn self-heals.
                     if cw_retries < 2 {
-                        if let Some(new_cap) = recover_cw_400
-                            .and_then(|f| f(&e, model, &today))
+                        let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                        if let Some(recovered_budget) = recovered_window
+                            .map(|context_window| {
+                                recovered_input_budget(
+                                    context_window,
+                                    input_ceiling_pct,
+                                    None,
+                                    effective_input_ceiling,
+                                )
+                            })
                             .or_else(|| {
                                 cw_overflow::core_recover_overflow(
                                     &e.to_string(),
                                     send_budget,
-                                    num_ctx_ceiling,
+                                    effective_input_ceiling,
                                 )
+                                .map(|cap| cap as usize)
                             })
                         {
+                            if let Some(context_window) = recovered_window {
+                                emit_context_window_400(&mut on_round_usage, context_window);
+                            }
+                            // A recovered full window is composed through the same
+                            // effective-ceiling operation as the declared window;
+                            // numberless recovery already derives an input cap.
+                            let new_budget = effective_input_ceiling
+                                .map_or(recovered_budget, |c| recovered_budget.min(c));
                             emit_overflow_notice(
                                 color,
                                 accumulated_usage.as_ref(),
-                                Some(new_cap),
+                                Some(new_budget.min(u32::MAX as usize) as u32),
                                 model,
                                 cw_retries + 1,
                             );
                             // A recovered cap can only tighten — the request still
                             // carries the same `num_ctx`, so its ceiling holds (#282).
-                            let new_budget = num_ctx_ceiling
-                                .map_or(new_cap as usize, |c| (new_cap as usize).min(c));
                             send_budget = Some(new_budget);
+                            effective_input_ceiling = Some(new_budget);
                             // The endpoint's parsed hard limit is authoritative —
                             // a refuse on it is correct from here on (Step 20.3).
                             send_budget_authoritative = true;
@@ -1900,6 +2286,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                         cal,
                                     ),
                                     max_messages: None,
+                                    replay_protected_tail_len: 0,
                                     task: active_task,
                                     hard_budget: true,
                                     authoritative: true,
@@ -1907,6 +2294,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     est: estimation,
                                     summary_input_cap_floor_chars,
                                     compaction_store,
+                                    compaction_stage: None,
                                 },
                                 summarizer,
                                 compress_state,
@@ -1978,7 +2366,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // within the same turn (Phase 20 §2.2). Never lowers; stays under the
         // per-request input ceiling.
         if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
-            let raised = (u.input_tokens as usize).min(num_ctx_ceiling.unwrap_or(usize::MAX));
+            // #1528 B4: the accepted-side raise clamps to the hard ceiling and
+            // only ever moves UP — the SAME `capped_accepted_prompt_tokens` clamp
+            // the OpenAI chat loop uses (one owner, one unit test), so the soft
+            // send budget can never exceed `effective_input_ceiling` (the hard leg)
+            // and a success never lowers it.
+            let raised = capped_accepted_prompt_tokens(u.input_tokens, effective_input_ceiling);
             if raised > budget {
                 send_budget = Some(raised);
                 if debug {
@@ -2516,6 +2909,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 messages: &messages,
                                 budget: target,
                                 max_messages: None,
+                                replay_protected_tail_len: 0,
                                 task: active_task,
                                 hard_budget: true,
                                 // A suspected silent overflow is a real failure
@@ -2525,6 +2919,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 est: estimation,
                                 summary_input_cap_floor_chars,
                                 compaction_store,
+                                compaction_stage: None,
                             },
                             summarizer,
                             compress_state,
@@ -2677,36 +3072,83 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             ));
         }
 
-        // Has tool calls — add assistant turn and execute them.
-        // Phase 20 §2.2: tool calls are usable output — the dispatched prompt
-        // is proven accepted regardless of how the turn later ends.
-        emit_accepted(
-            &mut on_round_usage,
-            round_usage,
-            truncation_suspect,
-            round_est_raw,
-        );
+        // Has tool calls — add the assistant turn, then VALIDATE the whole batch
+        // before emitting acceptance or running any tool (#1528 B4). A tool-call
+        // batch is usable output only once it is fully validated; the accepted
+        // observation is emitted AFTER whole-batch validation and BEFORE the first
+        // tool side effect, below.
         messages.push(message.clone());
         let mut round_wrote = false;
         let mut round_modified_workspace = false;
         let mut round_progress = false;
-        for tc in tool_calls.unwrap() {
-            let anthropic_native = tc["function"].is_null();
-            let name = if anthropic_native {
-                tc["name"].as_str().unwrap_or("unknown")
-            } else {
-                tc["function"]["name"].as_str().unwrap_or("unknown")
-            };
-            let args = if anthropic_native {
-                tc["input"].clone()
-            } else {
-                match &tc["function"]["arguments"] {
-                    serde_json::Value::String(s) => {
-                        serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
-                    }
-                    v => v.clone(),
+        let tcs = tool_calls.unwrap();
+        // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch before
+        // any side effect. This Ollama/Anthropic-native wire carries no per-call
+        // ids, so ids are not required — but a malformed sibling still rejects the
+        // WHOLE batch: echo the reason for every call and execute nothing, so no
+        // valid call mutates the workspace ahead of an unvalidated batch.
+        let extracted: Vec<(Option<&str>, Option<&str>, &serde_json::Value)> = tcs
+            .iter()
+            .map(|tc| {
+                if tc["function"].is_null() {
+                    (None, tc["name"].as_str(), &tc["input"])
+                } else {
+                    (
+                        None,
+                        tc["function"]["name"].as_str(),
+                        &tc["function"]["arguments"],
+                    )
                 }
-            };
+            })
+            .collect();
+        let validated = match tools::validate_tool_call_batch(&extracted, false) {
+            Ok(v) => Some(v),
+            // This wire carries no ids (`require_call_id = false`), so the batch
+            // can only ever be `ContentInvalid`; `reason()` reads either class.
+            Err(rejection) => {
+                let reason = rejection.reason().to_string();
+                for _tc in tcs {
+                    print_synthetic_tool_result(
+                        "(rejected tool-call batch)",
+                        &serde_json::Value::Null,
+                        workspace,
+                        &reason,
+                        color,
+                    );
+                    if let Some(rec) = tool_events.as_deref_mut() {
+                        rec.push(crate::ToolEvent::from_call(
+                            "(rejected tool-call batch)",
+                            &serde_json::Value::Null,
+                            false,
+                            Some(0),
+                        ));
+                    }
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "content": format!("tool-call batch rejected before execution: {reason}"),
+                    }));
+                }
+                None
+            }
+        };
+        // #1528 B4: a FULLY-VALIDATED tool-call batch is usable output — emit the
+        // accepted-prompt observation now, AFTER whole-batch validation and BEFORE
+        // the first tool side effect below. A content-invalid batch leaves
+        // `validated == None`; it is NOT provider-accept evidence and must not
+        // ratchet the learned budget (RR1 fail-closed).
+        if validated.is_some() {
+            emit_accepted(
+                &mut on_round_usage,
+                round_usage,
+                truncation_suspect,
+                round_est_raw,
+            );
+        }
+        // Phase 2: every call in the batch is valid — execute in order. `flatten`
+        // yields nothing (so this runs zero tools) when the batch was rejected.
+        for (_tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
+            let name = vc.name.as_str();
+            let args = vc.args.clone();
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
@@ -2745,9 +3187,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
+                    effective_input_ceiling,
                     num_ctx,
-                    input_ceiling_pct as usize,
+                    input_ceiling_pct,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -3539,7 +3981,7 @@ fn maybe_offload_tool_result(
     name: &str,
     result: String,
     tool_offload: bool,
-    spill_store: Option<&dyn spill::SpillStore>,
+    spill_store: Option<&dyn content_spill::SpillStore>,
 ) -> String {
     if matches!(
         name,
@@ -3547,7 +3989,9 @@ fn maybe_offload_tool_result(
     ) {
         result
     } else {
-        spill::maybe_offload(result, tool_offload, spill_store)
+        // Thread the tool name into provenance so a tool output and an identical-looking
+        // compaction span never share an address (content_spill binds provenance).
+        content_spill::maybe_offload(result, tool_offload, Some(name.to_string()), spill_store)
     }
 }
 
@@ -4424,6 +4868,29 @@ fn openai_chat_wire_messages(
     Ok(wire)
 }
 
+fn prepare_openai_assistant_replay(
+    message: &serde_json::Value,
+    clean_content: &str,
+    replay_scope: crate::model_card::ReasoningReplayScope,
+    current_user_turn: bool,
+) -> serde_json::Value {
+    let mut assistant = message.clone();
+    if assistant["role"].as_str().is_none() {
+        assistant["role"] = serde_json::Value::String("assistant".into());
+    }
+
+    let keep_reasoning = replay_scope == crate::model_card::ReasoningReplayScope::FullHistory
+        || (replay_scope == crate::model_card::ReasoningReplayScope::CurrentUserTurn
+            && current_user_turn);
+    if !keep_reasoning {
+        assistant["content"] = serde_json::Value::String(clean_content.to_string());
+        if let Some(object) = assistant.as_object_mut() {
+            object.remove("reasoning_content");
+        }
+    }
+    assistant
+}
+
 /// Final tools-disabled completion for the OpenAI (`/v1/chat/completions`) path.
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
@@ -4434,6 +4901,7 @@ async fn final_summary_openai(
     model: &str,
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
+    generation_policy: generation_policy::GenerationPolicy,
     cap: CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     let CapExit {
@@ -4474,11 +4942,12 @@ async fn final_summary_openai(
         ));
     }
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": &messages,
         "stream": false,
     });
+    generation_policy.apply_to_chat_completions_body(&mut body);
     let retry = tui_retry_policy();
     let result = with_backoff_notify(
         &retry,
@@ -4621,6 +5090,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        // Chat Completions does not use the Responses-only `reasoning_effort`
+        // field. Explicit endpoint capability data may instead project cognition
+        // into a local generation policy.
+        cognition,
+        chat_completions_capability,
+        reasoning_replay_scope,
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
@@ -4670,6 +5145,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // execution-pressure nudges.
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
+    let generation_policy = generation_policy::GenerationPolicy::resolve(
+        cognition,
+        chat_completions_capability,
+        reasoning_replay_scope,
+    );
+    let reasoning_replay_scope = generation_policy.reasoning_replay_scope;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
     let compress_state = match compress_state {
@@ -4705,7 +5186,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
-        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .map(|m| {
+            let content = if m.role == crate::Role::Assistant
+                && reasoning_replay_scope != crate::model_card::ReasoningReplayScope::FullHistory
+            {
+                crate::reasoning::split_reasoning(&m.content).0
+            } else {
+                m.content.clone()
+            };
+            serde_json::json!({"role": m.role.as_str(), "content": content})
+        })
         .collect();
     let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
         crate::TurnPromptContext::ephemeral_operator(
@@ -4737,6 +5227,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // At most one reasoning-only length-stop continuation per user turn. The
+    // signal index lets the next response record whether that bounded recovery
+    // produced visible content or an executable call.
+    let mut reasoning_continuation_attempted = false;
+    let mut reasoning_overflow_signal_index: Option<usize> = None;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
     // No-tools recovery (mirrors the Ollama path): a model that rejects the
@@ -4744,17 +5239,18 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
     // Pre-send token budget gate; tightened mid-turn by a recovered 400
-    // (#223). Phase 20 §2.1 max(proven, believed) semantics — no `num_ctx`
-    // ceiling on this wire (limits are server-side, e.g. vLLM
-    // --max-model-len), so the ceiling leg is `None`.
+    // (#223). `num_ctx` is not sent on this wire, but an operator-declared
+    // local endpoint window still provides an authoritative input ceiling.
+    // Cloud endpoints leave it unset and continue to fail open on proven-good
+    // evidence alone.
+    let mut effective_input_ceiling = num_ctx_input_ceiling(
+        num_ctx,
+        input_ceiling_pct,
+        generation_policy.max_output_tokens,
+    );
     let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
-    // Step 20.3: on this wire there is no `num_ctx` ceiling, so the send
-    // budget is authoritative only when a believed window (`safe_context`)
-    // seeds it. Cloud OpenAI-compatible models have no `/api/show` to seed
-    // one, so their budget rests on the proven-good HWM alone — the guard
-    // fails open rather than refusing. A cw-400 flips this true mid-turn.
-    let mut send_budget_authoritative = safe_context.is_some();
+        initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
+    let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     let tools = merged_tool_definitions(
         mcp,
@@ -4925,8 +5421,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 mid_loop_trim_tokens,
             )
             .is_some();
+            let reasoning_tail_len =
+                compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
             if let Some(trigger) = compression_trigger(
-                messages.len(),
+                compress::compression_message_count(&messages, reasoning_tail_len),
                 current,
                 message_tokens,
                 CompressionTriggerLimits {
@@ -4953,7 +5451,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     CompressRequest {
                         messages: &messages,
                         budget: pipeline_budget,
-                        max_messages: trigger.max_messages,
+                        // A current-turn reasoning transcript is one atomic
+                        // logical item for count pressure. Token pressure still
+                        // applies to its real size, but a physical count cap
+                        // must not split away the plan the endpoint requires.
+                        max_messages: if reasoning_tail_len > 0 {
+                            None
+                        } else {
+                            trigger.max_messages
+                        },
+                        replay_protected_tail_len: reasoning_tail_len,
                         task: active_task,
                         hard_budget: trigger.hard_budget,
                         authoritative: token_fired || send_budget_authoritative,
@@ -4961,6 +5468,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         est: estimation,
                         summary_input_cap_floor_chars,
                         compaction_store,
+                        compaction_stage: None,
                     },
                     summarizer,
                     compress_state,
@@ -5075,6 +5583,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 "tool_choice": "auto",
                 "stream": false,
             });
+            generation_policy.apply_to_chat_completions_body(&mut body);
             // Drop tools (and the now-meaningless tool_choice) for a model that
             // rejected them on a prior "does not support tools" 400.
             if !tools_supported {
@@ -5083,12 +5592,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     o.remove("tool_choice");
                 }
             }
-            // No `num_ctx` is sent here, so #282's per-request input ceiling has
-            // no value to key on either — the pre-send guard stays on the cached
-            // `max_ok_input` ∥ `safe_context` numbers and the cw-400 recovery
-            // (these endpoints DO reject oversize requests with a parseable 400,
-            // unlike Ollama's silent truncation).
-            let _ = num_ctx; // not applicable for OpenAI-compatible endpoints
+            // OpenAI-compatible endpoints do not accept a `num_ctx` request field,
+            // but the operator-declared local window still bounds Newt's pre-send
+            // budget. These endpoints reject oversize requests rather than silently
+            // truncating them, so no wire field is needed to enforce the local cap.
             let dispatch = with_backoff_notify(
                 &retry,
                 || async {
@@ -5145,31 +5652,50 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     // real limit, tighten the budget, compress, and retry once (#223;
                     // compress-not-trim since Step 18.4). When the endpoint carries
                     // NO parseable limit — llama.cpp's numberless `500 "Context size
-                    // has been exceeded"`, which `recover_cw_400` (litellm-numbered)
-                    // can't read, and which headless has no `recover_cw_400` for at
-                    // all — fall back to deriving a tightened cap from the current
-                    // send budget so the turn self-heals instead of dying on a blind
-                    // resend of the same oversized prompt. No `num_ctx` ceiling on
-                    // this wire (limits are server-side), so derive from send_budget.
+                    // has been exceeded"` — fall back to deriving a tightened cap
+                    // from the current send budget. The shared parse-only hook reads
+                    // both LiteLLM and vLLM numbered forms in interactive and
+                    // headless drivers; this fallback is only for numberless errors.
+                    // It remains capped by the operator-declared local window even
+                    // though no `num_ctx` field rides on this wire.
                     if cw_retries < 2 {
-                        if let Some(new_cap) = recover_cw_400
-                            .and_then(|f| f(&e, model, &today))
+                        let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                        if let Some(recovered_budget) = recovered_window
+                            .map(|context_window| {
+                                recovered_input_budget(
+                                    context_window,
+                                    input_ceiling_pct,
+                                    generation_policy.max_output_tokens,
+                                    effective_input_ceiling,
+                                )
+                            })
                             .or_else(|| {
                                 cw_overflow::core_recover_overflow(
                                     &e.to_string(),
                                     send_budget,
                                     None,
                                 )
+                                .map(|cap| cap as usize)
                             })
                         {
+                            if let Some(context_window) = recovered_window {
+                                emit_context_window_400(&mut on_round_usage, context_window);
+                            }
+                            // The callback returns the endpoint's full hard window,
+                            // not an already-discounted input cap. Reserve this
+                            // request's maximum output against the actual window,
+                            // then retain any tighter declared-window ceiling.
+                            let new_budget = effective_input_ceiling
+                                .map_or(recovered_budget, |c| recovered_budget.min(c));
                             emit_overflow_notice(
                                 color,
                                 accumulated_usage.as_ref(),
-                                Some(new_cap),
+                                Some(new_budget.min(u32::MAX as usize) as u32),
                                 model,
                                 cw_retries + 1,
                             );
-                            send_budget = Some(new_cap as usize);
+                            send_budget = Some(new_budget);
+                            effective_input_ceiling = Some(new_budget);
                             // The endpoint's parsed hard limit is authoritative
                             // from here on (Step 20.3; mirrors the Ollama path).
                             send_budget_authoritative = true;
@@ -5180,10 +5706,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     // (Phase 20 §2.3; mirrors the Ollama path).
                                     messages: &messages,
                                     budget: calibrate_down(
-                                        (new_cap as usize).saturating_sub(tool_tokens_real),
+                                        new_budget.saturating_sub(tool_tokens_real),
                                         cal,
                                     ),
                                     max_messages: None,
+                                    replay_protected_tail_len:
+                                        compress::protected_reasoning_tail_len(
+                                            &messages,
+                                            reasoning_replay_scope,
+                                        ),
                                     task: active_task,
                                     hard_budget: true,
                                     authoritative: true,
@@ -5191,6 +5722,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     est: estimation,
                                     summary_input_cap_floor_chars,
                                     compaction_store,
+                                    compaction_stage: None,
                                 },
                                 summarizer,
                                 compress_state,
@@ -5222,7 +5754,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     outcome.tokens_before,
                                     outcome.tokens_after,
                                     calibrate_down(
-                                        (new_cap as usize).saturating_sub(tool_tokens_real),
+                                        new_budget.saturating_sub(tool_tokens_real),
                                         cal,
                                     ),
                                     round,
@@ -5250,10 +5782,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
         // Phase 20 §2.2: no `num_ctx` on this wire, so there is no silent
         // head-truncation mode to suspect (oversize requests get a parseable
-        // 400 instead) and no per-request ceiling on the mid-turn raise.
+        // 400 instead). The declared local `num_ctx` still caps Newt's input
+        // budget even though that field is not sent on this wire: accepting a
+        // prompt with a short reply does not prove the same prompt leaves room
+        // for the configured maximum output.
         let truncation_suspect = false;
         if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
-            let raised = u.input_tokens as usize;
+            let raised = capped_accepted_prompt_tokens(u.input_tokens, effective_input_ceiling);
             if raised > budget {
                 send_budget = Some(raised);
                 if debug {
@@ -5309,6 +5844,98 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             _ => None,
         };
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        let finish_reason = json["choices"][0]["finish_reason"].as_str();
+        if let Some(obs) = solve_obs.as_deref_mut() {
+            obs.behavior_signals
+                .push(observability::BehaviorSignal::ChatCompletionFinish {
+                    round,
+                    finish_reason: finish_reason.map(str::to_string),
+                });
+        }
+        let reasoning_text = separate_reasoning.or(inline_reasoning.as_deref());
+        let reasoning_overflow = observability::reasoning_overflow_signature(
+            finish_reason,
+            oa_content.is_empty(),
+            reasoning_text.is_some(),
+            has_tools,
+        );
+
+        // Resolve the pending telemetry record on the first response after a
+        // continuation. A tool call or visible answer is a successful recovery;
+        // another reasoning-only/empty response remains an honest failure.
+        if reasoning_continuation_attempted && !reasoning_overflow {
+            if has_tools || !oa_content.is_empty() {
+                if let (Some(obs), Some(index)) =
+                    (solve_obs.as_deref_mut(), reasoning_overflow_signal_index)
+                {
+                    if let Some(signal) = obs.behavior_signals.get_mut(index) {
+                        signal.mark_continuation_succeeded();
+                    }
+                }
+            }
+            reasoning_overflow_signal_index = None;
+        }
+
+        if reasoning_overflow {
+            let has_round_budget = round + 1 < current_tool_round_limit;
+            let can_continue = generation_policy
+                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget);
+
+            let resolving_existing_continuation =
+                reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
+            if !resolving_existing_continuation {
+                if let Some(obs) = solve_obs.as_deref_mut() {
+                    let index = obs.behavior_signals.len();
+                    obs.behavior_signals
+                        .push(observability::BehaviorSignal::ReasoningOverflow {
+                            round,
+                            reasoning_overflow_detected: true,
+                            continuation_attempted: can_continue,
+                            continuation_succeeded: false,
+                            finish_reason: "length".into(),
+                            reasoning_tokens_estimate: estimation.tokens_for_chars(
+                                reasoning_text
+                                    .map(|reasoning| reasoning.chars().count())
+                                    .unwrap_or(0),
+                            ),
+                        });
+                    reasoning_overflow_signal_index = Some(index);
+                }
+            }
+
+            if can_continue {
+                print_newt(
+                    "reasoning reached the output limit before an answer — continuing once",
+                    color,
+                    false,
+                );
+                messages.push(prepare_openai_assistant_replay(
+                    message,
+                    &oa_content,
+                    reasoning_replay_scope,
+                    true,
+                ));
+                reasoning_continuation_attempted = true;
+                continue 'round_loop;
+            }
+
+            let reason = if resolving_existing_continuation {
+                "the bounded continuation also reached the output limit"
+            } else if reasoning_continuation_attempted {
+                "the turn already used its bounded continuation"
+            } else if !generation_policy.one_bounded_reasoning_continuation {
+                "the endpoint does not advertise bounded continuation"
+            } else if reasoning_replay_scope == crate::model_card::ReasoningReplayScope::Never {
+                "the endpoint does not allow current-turn reasoning replay"
+            } else {
+                "the turn has no remaining round budget"
+            };
+            print_newt(
+                &format!("reasoning overflow detected — {reason}"),
+                color,
+                false,
+            );
+        }
         // W0 (#1511): served-model + parse-status observation for the solve
         // contract — mirror of the Ollama loop above.
         if let Some(obs) = solve_obs.as_deref_mut() {
@@ -5583,67 +6210,109 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             return Ok((out, false, accumulated_usage, hallucination_count));
         }
 
-        // Record the assistant turn (it carries the tool_calls), then run each call
-        // and feed the result back keyed by its tool_call_id.
-        // Phase 20 §2.2: tool calls are usable output (mirrors the Ollama path).
-        emit_accepted(
-            &mut on_round_usage,
-            round_usage,
-            truncation_suspect,
-            round_est_raw,
-        );
-        // #857: re-send a CLEAN assistant turn — stripped content (no inline
-        // <think>) and no prior-turn `reasoning_content` (the model must not be fed
-        // its own CoT back). The `tool_calls` are preserved.
-        let mut assistant_turn = message.clone();
-        // OpenAI-compatible proxies are not perfectly uniform: some omit the
-        // otherwise-required `role` field from a tool-calling response. Keep
-        // the transcript canonical before compression/repair so its matched
-        // `role="tool"` results are not mistaken for orphans and discarded.
-        if assistant_turn["role"].as_str().is_none() {
-            assistant_turn["role"] = serde_json::Value::String("assistant".into());
-        }
-        assistant_turn["content"] = serde_json::Value::String(oa_content.clone());
-        if let Some(obj) = assistant_turn.as_object_mut() {
-            obj.remove("reasoning_content");
-        }
+        // Record the assistant turn (it carries the tool_calls), then VALIDATE the
+        // whole batch before emitting acceptance or running any call (#1528 B4).
+        // The accepted observation is emitted AFTER whole-batch validation and
+        // BEFORE the first tool side effect, below.
+        // #857: unknown endpoints keep the historical clean replay (no inline
+        // <think> or reasoning_content). A capability-profiled reasoning backend
+        // may instead retain the assistant's current-turn plan across tool rounds.
+        // Some proxies omit the otherwise-required role; preparation also
+        // canonicalizes that field before compression can inspect tool pairs.
+        let assistant_turn =
+            prepare_openai_assistant_replay(message, &oa_content, reasoning_replay_scope, true);
         messages.push(assistant_turn);
         let mut round_modified_workspace = false;
         let mut round_progress = false;
-        for tc in tool_calls.unwrap() {
-            let id = tc["id"].as_str().unwrap_or("");
-            // Some API proxies (e.g. NVIDIA inference → Anthropic backend) wrap
-            // Anthropic-native tool-use blocks inside the OpenAI `tool_calls`
-            // array without converting the inner schema.  Fall back from the
-            // OpenAI path (`function.name` / `function.arguments`) to the
-            // Anthropic-native path (`name` / `input`) when the `function` key
-            // is absent, so both wire formats route correctly.
-            let anthropic_native = tc["function"].is_null();
-            if anthropic_native && debug {
-                let raw_name = tc["name"].as_str().unwrap_or("<missing>");
+        let tcs = tool_calls.unwrap();
+        // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch before
+        // any side effect. Every OpenAI `tool_call` must have a non-empty, UNIQUE
+        // `id` and a valid name/object-args; a bad sibling rejects the WHOLE batch
+        // — echo the reason for each call (keyed by its id) and execute nothing,
+        // so no valid call mutates the workspace ahead of an unvalidated batch.
+        //
+        // Some API proxies (NVIDIA inference → Anthropic backend) wrap
+        // Anthropic-native tool-use blocks in the OpenAI `tool_calls` array
+        // without converting the inner schema, so fall back to `name`/`input`
+        // when the `function` key is absent.
+        let extracted: Vec<(Option<&str>, Option<&str>, &serde_json::Value)> = tcs
+            .iter()
+            .map(|tc| {
+                if tc["function"].is_null() {
+                    (tc["id"].as_str(), tc["name"].as_str(), &tc["input"])
+                } else {
+                    (
+                        tc["id"].as_str(),
+                        tc["function"]["name"].as_str(),
+                        &tc["function"]["arguments"],
+                    )
+                }
+            })
+            .collect();
+        let validated = match tools::validate_tool_call_batch(&extracted, true) {
+            Ok(v) => Some(v),
+            Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
+                // A missing/blank/duplicate `tool_call_id`: a tool result cannot
+                // be correlated. Abort the turn — do not fabricate an id.
+                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+            }
+            Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                // ids are valid + unique → echo a correctly keyed rejection per
+                // call and re-dispatch so the model can retry.
+                for tc in tcs {
+                    let id = tc["id"].as_str().unwrap_or("");
+                    print_synthetic_tool_result(
+                        "(rejected tool-call batch)",
+                        &serde_json::Value::Null,
+                        workspace,
+                        &reason,
+                        color,
+                    );
+                    if let Some(rec) = tool_events.as_deref_mut() {
+                        rec.push(crate::ToolEvent::from_call(
+                            "(rejected tool-call batch)",
+                            &serde_json::Value::Null,
+                            false,
+                            Some(0),
+                        ));
+                    }
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": format!("tool-call batch rejected before execution: {reason}"),
+                    }));
+                }
+                None
+            }
+        };
+        // #1528 B4: a FULLY-VALIDATED tool-call batch is usable output — emit the
+        // accepted-prompt observation now, AFTER whole-batch validation and BEFORE
+        // the first tool side effect below. A correlation-impossible batch aborted
+        // above (early `Err`, RR2) and a content-invalid batch leaves
+        // `validated == None` (RR1); neither is provider-accept evidence, so
+        // neither ratchets the learned budget.
+        if validated.is_some() {
+            emit_accepted(
+                &mut on_round_usage,
+                round_usage,
+                truncation_suspect,
+                round_est_raw,
+            );
+        }
+        // Phase 2: every call is valid — execute in order (empty when rejected).
+        for (tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
+            let id = vc.call_id.as_str();
+            let name = vc.name.as_str();
+            let args = vc.args.clone();
+            if debug && tc["function"].is_null() {
                 print_debug(
                     &format!(
                         "tool call in Anthropic-native format inside tool_calls array \
-                         (no `function` key) — name={raw_name:?}"
+                         (no `function` key) — name={name:?}"
                     ),
                     color,
                 );
             }
-            let name = if anthropic_native {
-                tc["name"].as_str().unwrap_or("unknown")
-            } else {
-                tc["function"]["name"].as_str().unwrap_or("unknown")
-            };
-            let args = if anthropic_native {
-                tc["input"].clone()
-            } else {
-                match &tc["function"]["arguments"] {
-                    serde_json::Value::String(s) => {
-                        serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
-                    }
-                    v => v.clone(),
-                }
-            };
             if trace {
                 print_trace(
                     &format!(
@@ -5690,15 +6359,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             // #727: intercept the read-only budget self-read (see the Ollama path).
-            // num_ctx is not applicable on OpenAI-compatible endpoints (so the
-            // ceiling is usually None → an honest "no ceiling configured"), but the
-            // used-token figure is still reported.
+            // OpenAI-compatible endpoints do not receive `num_ctx`, but a local
+            // endpoint's operator-declared window still provides the displayed
+            // input ceiling. Cloud endpoints normally leave it unset.
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
+                    effective_input_ceiling,
                     num_ctx,
-                    input_ceiling_pct as usize,
+                    input_ceiling_pct,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -5814,7 +6483,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Reached the round cap. Trim the message list and make ONE final
     // tools-disabled completion (matches the Ollama path).
     let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
-    let trimmed = trim_for_summary(&messages, protected_head, 6);
+    let replay_protected_tail_len =
+        compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
+    let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     let (text, streamed, usage) = final_summary_openai(
@@ -5823,6 +6494,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         model,
         api_key,
         trimmed,
+        generation_policy,
         CapExit {
             max_tool_rounds,
             accumulated: accumulated_usage,
@@ -5863,8 +6535,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 // items vs `choices`, `input_tokens`/`output_tokens` usage), so this is a
 // parallel — deliberately leaner — loop. Selected per backend via
 // `api = "responses"` (surfaced to the loop as `NEWT_OPENAI_API`). Non-streaming
-// in v1 (matching the chat path's UX); the chat path's budget / cw-400 recovery
-// is intentionally not duplicated here yet (opt-in path) — tracked.
+// in v1 (matching the chat path's UX). Reactive context-window-400 recovery is
+// now present here too (#1528): a hard cw-400 learns the true window, tightens a
+// monotone input ceiling, compacts the running history through the shared
+// `compress::compress` (via `responses_compaction`), and re-dispatches — bounded
+// to 2 recoveries. The remaining #1528 follow-ups are PROACTIVE mid-loop
+// compaction (compact before overflow) and usage-learning ceiling raises.
 
 /// `true` when the active OpenAI backend selected the Responses API
 /// (`[backends].api = "responses"`, surfaced to the loop as `NEWT_OPENAI_API`).
@@ -5874,30 +6550,17 @@ fn responses_api_selected() -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("responses"))
 }
 
-/// Split chat-style messages into the Responses API's `(instructions, input)`:
-/// `system`/`developer` messages concatenate into top-level `instructions`;
-/// `user`/`assistant` become `input` message items (plain string content). Any
-/// item already shaped as a Responses item (carrying a `type` field, e.g.
-/// `function_call` / `function_call_output`) passes through untouched.
-fn build_responses_input(
-    messages: &[serde_json::Value],
-) -> (Option<String>, Vec<serde_json::Value>) {
-    let mut instructions: Vec<String> = Vec::new();
-    let mut input: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
-        if m.get("type").is_some() {
-            input.push(m.clone());
-            continue;
-        }
-        let role = m["role"].as_str().unwrap_or("user");
-        let content = m["content"].as_str().unwrap_or("");
-        match role {
-            "system" | "developer" => instructions.push(content.to_string()),
-            _ => input.push(serde_json::json!({ "role": role, "content": content })),
-        }
-    }
-    let ins = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
-    (ins, input)
+/// The Responses-wire `reasoning` object for a cognition level, or `None` to omit
+/// it. The **single owner** of how the psyche `cognition` dial becomes a wire
+/// field: the value mapping lives in [`Cognition::reasoning_effort`], the Responses
+/// *shape* (`{"effort": …}`) lives here, so the chat-shape projection
+/// (`reasoning_effort: …`, a follow-up once the chat bodies are consolidated)
+/// reuses the same value without duplicating the ladder. `None` → the field is
+/// never added, leaving the request bit-for-bit unchanged for non-opt-in callers.
+fn responses_reasoning_field(
+    cognition: Option<crate::role_profile::Cognition>,
+) -> Option<serde_json::Value> {
+    cognition.map(|c| serde_json::json!({ "effort": c.reasoning_effort() }))
 }
 
 /// Translate the chat/completions tool array (`{type:function,
@@ -5912,12 +6575,27 @@ fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
                 .map(|t| {
                     let f = &t["function"];
                     if f.is_object() {
-                        serde_json::json!({
+                        // `parameters` is copied wholesale, so `required` /
+                        // `additionalProperties` / nested schemas keep their exact
+                        // validation semantics.
+                        let mut tool = serde_json::json!({
                             "type": "function",
                             "name": f["name"],
                             "description": f["description"],
                             "parameters": f["parameters"],
-                        })
+                        });
+                        // #1526 (invariant #6): a schema conversion must not
+                        // silently change validation semantics. Chat Completions
+                        // puts `strict` on the `function` object; the Responses API
+                        // puts it at the tool's TOP level. Dropping it would
+                        // downgrade a strict schema (additionalProperties:false +
+                        // all-required enforced) to permissive — so the model could
+                        // send args the strict schema rejects. Carry it through
+                        // verbatim; absent stays absent (no spurious strictness).
+                        if let Some(strict) = f.get("strict").filter(|s| !s.is_null()) {
+                            tool["strict"] = strict.clone();
+                        }
+                        tool
                     } else {
                         t.clone()
                     }
@@ -5927,56 +6605,40 @@ fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// Extract `(assistant_text, function_call_items)` from a Responses reply's
-/// `output[]`: text is the concatenation of `output_text` parts inside
-/// `message` items; `function_call` items are returned verbatim (they carry
-/// `call_id` / `name` / `arguments` and are echoed back into the next request).
-/// Falls back to a flattened top-level `output_text` if the structured walk
-/// found no text.
-fn parse_responses_output(json: &serde_json::Value) -> (String, Vec<serde_json::Value>) {
-    let mut text = String::new();
-    let mut calls = Vec::new();
-    if let Some(items) = json["output"].as_array() {
-        for item in items {
-            match item["type"].as_str() {
-                Some("message") => {
-                    if let Some(parts) = item["content"].as_array() {
-                        for p in parts {
-                            if let Some(t) = p["text"].as_str() {
-                                text.push_str(t);
-                            }
-                        }
-                    }
-                }
-                Some("function_call") => calls.push(item.clone()),
-                _ => {}
-            }
-        }
-    }
-    if text.is_empty() {
-        if let Some(t) = json["output_text"].as_str() {
-            text.push_str(t);
-        }
-    }
-    (text, calls)
-}
-
-/// Responses API usage → `TokenUsage` (`input_tokens`/`output_tokens`, distinct
-/// from chat/completions' `prompt_tokens`/`completion_tokens`).
-fn responses_usage(v: &serde_json::Value) -> Option<crate::TokenUsage> {
-    let input = v["input_tokens"].as_u64().map(|n| n as u32);
-    let output = v["output_tokens"].as_u64().map(|n| n as u32);
-    input.zip(output).map(|(i, o)| crate::TokenUsage {
-        input_tokens: i,
-        output_tokens: o,
-    })
-}
-
+/// Extract `(assistant_text, function_call_items, echo_items)` from a Responses
+/// reply's `output[]`. `text` is the concatenation of `output_text` parts inside
+/// `message` items. `function_call_items` are the calls the loop executes.
+/// `echo_items` is the ordered subsequence of `reasoning` AND `function_call`
+/// items that must be echoed VERBATIM into the next request's `input`: a
+/// reasoning model (gpt-5.6-sol, gpt-5-codex) pairs each `function_call` with a
+/// preceding `reasoning` item (`rs_…`) and 400s ("function_call … without its
+/// required 'reasoning' item") if the call is sent back without it. Preserving
+/// original order keeps each reasoning item adjacent to its call. Falls back to a
+/// flattened top-level `output_text` if the structured walk found no text.
 /// The OpenAI **Responses API** agentic loop (`POST {endpoint}/v1/responses`).
 /// Parallel to [`openai_chat_complete`] but over the Responses shapes, for
 /// models served only there (`gpt-5-codex`). Non-streaming; selected via
-/// `api = "responses"`. The chat path's budget / cw-400 recovery is not yet
-/// mirrored here (opt-in path) — tracked as a follow-up.
+/// `api = "responses"`.
+///
+/// ## Long-turn budgeting: fail-closed ceiling + reactive cw-400 recovery
+///
+/// This loop enforces a configured context window as a local ceiling and
+/// reserves output headroom (`BHV-CONTEXT-001`), refusing an over-budget request
+/// **before** dispatch. On top of that (#1528 slice 1) it now mirrors the Chat
+/// Completions path's **reactive** context-limit survival: a hard context-window
+/// 400 learns the endpoint's true window (`recover_cw_400`), tightens a
+/// **monotonically** shrinking learned input ceiling, **compacts** the running
+/// history to fit through the shared [`compress`] pipeline (bridged in/out of the
+/// Responses `input` shape by [`responses_compaction`], and reported through
+/// `on_round_usage` / `compress_state`), and **re-dispatches** — bounded to 2
+/// recoveries, after which the raw 400 surfaces. A numberless overflow falls back
+/// to a derived cap. So a long tool turn that overflows now compacts and
+/// continues instead of failing (still never a silent truncation).
+///
+/// Remaining #1528 follow-ups (NOT in this slice): **proactive** mid-loop
+/// compaction (compact *before* the overflow, driven by the mid-loop trim
+/// threshold) and **usage-learning** acceptance-side ceiling *raises* (an
+/// `on_round_usage` `Accepted` widening the budget on proven-good rounds).
 pub async fn openai_responses_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -5997,6 +6659,56 @@ pub async fn openai_responses_complete_with_prompt(
         None,
         None,
         mcp,
+    )
+    .await
+}
+
+/// One retrying Responses dispatch: POST the VALIDATED body, classify + retry
+/// transient transport failures via [`with_backoff_notify`], surface a typed
+/// HTTP-status error, and parse the JSON body. BOTH the per-round loop and the final
+/// tools-disabled summary go through this, so a transient 500 / timeout /
+/// connection reset on the LAST request no longer discards the turn after every
+/// tool round was already spent — the summary retries like any other round.
+///
+/// #1528 B5: this takes a [`ValidatedResponsesRequest`] — a newtype with no public
+/// constructor other than a successful [`validate_responses_request`] — so an
+/// unvalidated `serde_json::Value` body cannot compile its way to `POST /v1/responses`.
+async fn dispatch_responses_json(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    validated: &responses_wire_validation::ValidatedResponsesRequest,
+    retry: &RetryPolicy,
+    color: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let body = validated.body();
+    with_backoff_notify(
+        retry,
+        || async {
+            let mut req = client.post(url).json(body);
+            if let Some(key) = api_key {
+                req = req.bearer_auth(key);
+            }
+            // Typed classification at the source (W0 #1511).
+            let resp = req.send().await.map_err(|e| {
+                anyhow::Error::new(observability::DispatchError::from_reqwest(
+                    "request failed",
+                    e,
+                ))
+            })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(observability::DispatchError::http_status(format!(
+                    "inference endpoint {status}: {text}"
+                ))
+                .into());
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(anyhow::Error::from)
+        },
+        |attempt, delay| print_retry_indicator(attempt, delay, color),
     )
     .await
 }
@@ -6032,6 +6744,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         step_ledger,
         caveats,
         persona_tools,
+        cognition,
+        chat_completions_capability: _,
+        reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,
         narration_nudge_cap: _,
@@ -6053,23 +6768,26 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
-        recover_cw_400: _,
+        // #1528: activated — the Responses loop now recovers a hard cw-400 by
+        // learning the window, tightening a monotone ceiling, compacting via the
+        // shared `compress::compress`, and re-dispatching (bounded to 2).
+        recover_cw_400,
         mut note_sink,
         mut note_nudge,
         recall_source,
         memory_source,
-        summarizer: _,
-        compress_state: _,
+        summarizer,
+        compress_state,
         mut tool_events,
         mut phantom_reaches,
         end_reason: _,
         solve_obs: _,
         mut permission_gate,
-        on_round_usage: _,
+        mut on_round_usage,
         estimate_ratio,
         // #727: bound for the get_context_remaining used-token estimate.
         estimation,
-        summary_input_cap_floor_chars: _,
+        summary_input_cap_floor_chars,
         input_ceiling_pct,
         low_budget_pct,
         exec_floor,
@@ -6082,9 +6800,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         plan_mode_control,
     } = ctx;
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
-    // The OpenAI-Responses loop offloads tool output (spill_store) but does not
-    // run the compressor, so it never stores compaction spans.
-    let _ = compaction_store;
+    // #1528: headless callers may pass no session state — fall back to a local
+    // one so the cw-400 recovery's `compress::compress` always has anti-thrash
+    // state to consult (mirrors the Chat Completions path).
+    let mut local_compress_state = CompressState::new();
+    let compress_state = match compress_state {
+        Some(s) => s,
+        None => &mut local_compress_state,
+    };
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -6131,7 +6854,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     } else {
         prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
     }
-    let (instructions, mut input) = build_responses_input(&msgs_json);
+    let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
         mcp,
         advertise_save_note,
@@ -6155,31 +6878,68 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // projected to Responses tools, so the estimate and the wire agree.
     // Identity under `ExposureProfile::Full`. The send budget is computed just
     // below on this wire, so derive the live budget inline here.
+    // #1526 (invariant #4): the configured context window is a LOCAL safety
+    // limit even though the Responses wire never carries `num_ctx` (provider-side
+    // limits). Derive its input ceiling here and thread it through every local
+    // budget below, so a request that would overflow a declared window is refused
+    // pre-dispatch instead of relying solely on a reactive 400 / silent
+    // truncation. `None` num_ctx (the cloud default) resolves to `None` and
+    // leaves the prior behaviour unchanged.
+    //
+    // R4: RESERVE local output headroom in the ceiling. This wire sends no
+    // `max_output_tokens`, but a configured window must still leave room for the
+    // model's generation — else the input ceiling over-counts and a long turn
+    // refuses with no headroom. Reserve uses the cognition dial directly (opt-in:
+    // `None` cognition reserves nothing), so a declared window now composes with
+    // the output reserve exactly as the Chat Completions path does.
+    // #1526 (invariant #4) + #1528: ONE budget state is the single source of
+    // truth for this loop's context budget — the declared-window hard ceiling,
+    // the soft send budget, the monotone learned ceiling, and the authoritative
+    // preflight refusal budget all derive from it (see `ResponsesBudgetState`).
+    // It reserves local output headroom via the cognition dial (this wire sends
+    // no `max_output_tokens`) so a declared window composes with the reserve
+    // exactly as the Chat Completions path does; `None` num_ctx (the cloud
+    // default) stays ceiling-less, leaving hosted OpenAI unchanged.
+    //
+    // NOTE (out of #1528 B1 scope): the Ollama (~1363) and Chat Completions
+    // (~4887) loops rebuild this identical trio inline and differ ONLY in the
+    // output-reserve argument — the sibling duplication this state is designed to
+    // absorb next (one-issue-one-PR).
+    let mut budget_state = resolve_responses_budget(
+        num_ctx,
+        safe_context,
+        max_ok_input,
+        mid_loop_trim_tokens,
+        input_ceiling_pct,
+        cognition,
+    );
     let tools_chat = crate::agentic::tools::select_exposed(
         tools_chat,
         &exposure,
-        exposure_budget_tokens(
-            initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct),
-            safe_context,
-        ),
+        budget_state.exposure_budget(),
         &std::collections::BTreeSet::new(),
         estimation,
     );
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
     let cal = sanitize_estimate_ratio(estimate_ratio);
-    // Responses, like Chat Completions, has no client-sent `num_ctx`: model
-    // limits are provider-side. Retain ChatCtx.num_ctx only for the
-    // get_context_remaining display seam above; it must not become a local
-    // authoritative refusal threshold for a value absent from this wire.
-    let send_budget = initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
-    let send_budget_authoritative = safe_context.is_some();
-    let authoritative_budget =
-        authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens);
+    // #1528: real-token schema overhead of the EXPOSED tool set — subtracted from
+    // a recovered input cap before the compaction budget is converted back to
+    // chars/4 currency, so the compacted history leaves room for the tool schemas
+    // that ride every request. Known only after exposure, so it is set on the
+    // state here (mirrors the Chat Completions path's `tool_tokens_real`).
+    budget_state.set_tool_schema_tokens(calibrate_up(
+        estimate_value_tokens(&tools_for_estimate, estimation),
+        cal,
+    ));
+    // #1528: hard context-window 400s recovered this turn (parse limit → tighten
+    // → compact → redispatch), bounded to 2 (mirror of the Chat path). See #223.
+    let mut cw_retries: u32 = 0;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     preflight_irreducible_request(
         &msgs_json,
         Some(&tools_for_estimate),
-        authoritative_budget,
+        budget_state.actionable_input_budget(),
         cal,
         estimation,
         model,
@@ -6192,10 +6952,26 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
 
+    let reasoning = responses_reasoning_field(cognition);
     let build_body = |input: &[serde_json::Value], with_tools: bool| {
-        let mut body = serde_json::json!({ "model": model, "input": input, "stream": false });
+        // `store` is set EXPLICITLY (#1526, invariant #5): the Responses API
+        // defaults it to `true` (server-side retention). Newt is stateless — it
+        // replays the full history here and never uses `previous_response_id` —
+        // so retention buys nothing and would leave an unaudited copy of the
+        // operator's prompts/source/reasoning on the provider. Policy lives in
+        // one place (`responses_wire::STORE_RESPONSE_SERVER_SIDE`).
+        let mut body = serde_json::json!({
+            "model": model,
+            "input": input,
+            "stream": false,
+            "store": crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+        });
         if let Some(ins) = &instructions {
             body["instructions"] = serde_json::json!(ins);
+        }
+        // Psyche cognition → `reasoning.effort` (omitted entirely when unset).
+        if let Some(reasoning) = &reasoning {
+            body["reasoning"] = reasoning.clone();
         }
         if with_tools && !tools.is_empty() {
             body["tools"] = serde_json::json!(tools);
@@ -6208,70 +6984,211 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
-        preflight_responses_request(
-            instructions.as_deref(),
-            &input,
-            tools_supported.then_some(tools.as_slice()),
-            authoritative_budget,
-            cal,
-            estimation,
-            model,
-        )?;
-        let body = build_body(&input, tools_supported);
-        let dispatch = with_backoff_notify(
-            &retry,
-            || async {
-                let mut req = client.post(&responses_url).json(&body);
-                if let Some(key) = api_key {
-                    req = req.bearer_auth(key);
-                }
-                // Typed classification at the source (W0 #1511).
-                let resp = req.send().await.map_err(|e| {
-                    anyhow::Error::new(observability::DispatchError::from_reqwest(
-                        "request failed",
-                        e,
-                    ))
-                })?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(observability::DispatchError::http_status(format!(
-                        "inference endpoint {status}: {text}"
-                    ))
-                    .into());
-                }
-                resp.json::<serde_json::Value>()
+        // #1528: inner recovery loop — a cw-400 (or a tools-unsupported error)
+        // retries THIS logical round IN PLACE. Only a COMPLETED dispatch `break`s
+        // out and lets `round` advance, so recovery never consumes a tool-capable
+        // round (critical at max_tool_rounds == 1 or near the cap): the recovered
+        // request is re-sent WITH tools, never demoted to the tools-disabled summary.
+        let json = loop {
+            // #1528 B3: PROACTIVE pre-dispatch compaction — when the request is
+            // LOCALLY known to exceed the budget, compact BEFORE dispatch instead of
+            // paying a round-trip to learn it from a cw-400. Reuses the ONE
+            // `compact_responses_input` (the SAME path the reactive recovery uses).
+            // It fires at the TOP of the inner loop, BEFORE `build_body`, within the
+            // SAME iteration — so the outer `round` counter never advances
+            // (retry-in-place, the B2 P1 invariant). BEST-EFFORT + BOUNDED: a SINGLE
+            // compaction attempt that commits `input` only to a form which fits the
+            // post-bridge budget (BHV-BUDGET-004; otherwise `input` is untouched).
+            // The `preflight_responses_request` below is the ONE authoritative
+            // fail-closed gate: if the request still does not fit — an irreducible
+            // head or a fresh, un-summarizable newest tool output — it refuses THERE,
+            // with the precise "function outputs were not truncated" message. So this
+            // never spins compact→still-too-big→compact and never dispatches oversized.
+            // B3-CG-003: the compaction target reserves tool-schema overhead ONLY if
+            // THIS request actually carries tools (`tools_supported`) — an
+            // unsupported-tools retry sends none, so it must not subtract them.
+            // B3-CG-004: `compact_responses_input` is TRANSACTIONAL — on any reject it
+            // leaves `input` / `compress_state` / the notice stream untouched; the
+            // rejection REASON rides the preflight error chain (item 4), not a notice.
+            let mut proactive_rejection: Option<CompactionRejection> = None;
+            if let Some(budget) = budget_state.actionable_input_budget() {
+                let before = estimate_responses_request_real_tokens(
+                    instructions.as_deref(),
+                    &input,
+                    tools_supported.then_some(tools.as_slice()),
+                    estimation,
+                    cal,
+                );
+                if before > budget {
+                    proactive_rejection = compact_responses_input(
+                        &mut input,
+                        instructions.as_deref(),
+                        tools_supported.then_some(tools.as_slice()),
+                        Some(budget),
+                        budget_state.compaction_budget(cal, tools_supported),
+                        cal,
+                        estimation,
+                        task,
+                        summary_input_cap_floor_chars,
+                        compaction_store,
+                        summarizer,
+                        compress_state,
+                        color,
+                    )
                     .await
-                    .map_err(anyhow::Error::from)
-            },
-            |attempt, delay| print_retry_indicator(attempt, delay, color),
-        )
-        .await;
+                    .rejection();
+                }
+            }
+            // #1528 B5: the ONE typed strict-wire gate. Build the EXACT body, then
+            // validate it — the budget-fit refusal is the same `preflight_responses_request`
+            // primitive, now wrapped by the full wire-invariant set (store policy,
+            // no num_ctx, one instruction source, supported input shapes, correlation,
+            // flattened+strict tools, in-session CID markers). A failure dispatches
+            // NOTHING and does not advance the round; if compaction could not fit the
+            // request, the local reason is attached so the headless error chain
+            // explains WHY. Only a `ValidatedResponsesRequest` reaches the dispatcher.
+            let body = build_body(&input, tools_supported);
+            let policy = responses_wire_validation::ResponsesWirePolicy {
+                store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+                tools_permitted: true,
+                model,
+                authoritative_budget: budget_state.actionable_input_budget(),
+                calibration: cal,
+                estimation,
+                spill: spill_store,
+                compaction: compaction_store,
+            };
+            let validated = responses_wire_validation::validate_responses_request(&body, &policy)
+                .map_err(|e| match proactive_rejection.take() {
+                Some(reason) => anyhow::Error::new(e).context(reason.to_string()),
+                None => anyhow::Error::new(e),
+            })?;
+            let dispatch = dispatch_responses_json(
+                &client,
+                &responses_url,
+                api_key,
+                &validated,
+                &retry,
+                color,
+            )
+            .await;
 
-        let json = match dispatch {
-            Ok(j) => j,
-            Err(e) => {
-                if tools_supported && is_tools_unsupported_error(&e) {
-                    tools_supported = false;
-                    if !tools_unsupported_notified {
-                        tools_unsupported_notified = true;
-                        print_newt(
-                            &format!(
+            match dispatch {
+                Ok(j) => break j,
+                Err(e) => {
+                    if tools_supported && is_tools_unsupported_error(&e) {
+                        tools_supported = false;
+                        if !tools_unsupported_notified {
+                            tools_unsupported_notified = true;
+                            print_newt(
+                                &format!(
                                 "{model} does not support tools — tools disabled for this session"
                             ),
-                            color,
-                            false,
-                        );
+                                color,
+                                false,
+                            );
+                        }
+                        continue;
                     }
-                    continue;
+                    // #1528: graceful context-window overflow recovery on the
+                    // Responses wire — parse the model's real limit, tighten the input
+                    // ceiling MONOTONICALLY, compact the running history via the shared
+                    // `compress::compress` (bridged in/out of the Responses `input`
+                    // shape), and re-dispatch. Bounded to 2 recoveries; a numberless
+                    // overflow falls back to a derived cap. Mirrors the Chat
+                    // Completions path (see #223 + the block above `chat_url`).
+                    if cw_retries < 2 {
+                        let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                        if let Some(recovered_budget) = recovered_window
+                            .map(|context_window| {
+                                budget_state.recovered_budget_for_window(context_window)
+                            })
+                            .or_else(|| {
+                                cw_overflow::core_recover_overflow(
+                                    &e.to_string(),
+                                    budget_state.soft_send_budget(),
+                                    None,
+                                )
+                                .map(|cap| cap as usize)
+                            })
+                        {
+                            if let Some(context_window) = recovered_window {
+                                emit_context_window_400(&mut on_round_usage, context_window);
+                            }
+                            // Tighten the shared state MONOTONICALLY (a recovery may
+                            // only tighten the input budget, never raise it), collapse
+                            // the soft budget to the new hard ceiling, and recompute
+                            // the authoritative preflight bound — the endpoint's parsed
+                            // hard limit is authoritative from here on.
+                            budget_state.recover_from_cw400(recovered_budget);
+                            // #1528 B3: the compaction "dance" is the ONE shared
+                            // `compact_responses_input` — the SAME path the PROACTIVE
+                            // pre-dispatch guard uses. A successful compaction (or a
+                            // no-op that keeps the round eligible) falls through to the
+                            // bounded redispatch below; a refusal / bridge error /
+                            // post-fence overflow surfaces the provider's ORIGINAL 400
+                            // (ZERO redispatch) with the local compaction reason attached
+                            // to the error chain (item 4) — no separate notice.
+                            // B3-CG-003: the compaction target reserves tool-schema
+                            // overhead ONLY if this recovered request actually carries
+                            // tools (`tools_supported`) — after a tools-unsupported error
+                            // it does not, so it must not subtract them.
+                            match compact_responses_input(
+                                &mut input,
+                                instructions.as_deref(),
+                                tools_supported.then_some(tools.as_slice()),
+                                budget_state.actionable_input_budget(),
+                                budget_state.compaction_budget(cal, tools_supported),
+                                cal,
+                                estimation,
+                                task,
+                                summary_input_cap_floor_chars,
+                                compaction_store,
+                                summarizer,
+                                compress_state,
+                                color,
+                            )
+                            .await
+                            {
+                                ResponsesCompaction::Compacted | ResponsesCompaction::NotFired => {}
+                                // ZERO second inference: surface the original 400 with the
+                                // local compaction context attached for headless callers.
+                                other => {
+                                    return Err(match other.rejection() {
+                                        Some(reason) => e.context(reason.to_string()),
+                                        None => e,
+                                    });
+                                }
+                            }
+                            cw_retries += 1;
+                            continue;
+                        }
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
 
-        let round_usage = responses_usage(&json["usage"]);
-        accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
-        let (text, calls) = parse_responses_output(&json);
+        // Fail-closed decode (invariant #2). A `200 OK` is NOT a completed turn:
+        // only affirmative success output decodes to `Ok`. A refusal is the
+        // model's final answer for this turn; every other error (provider error,
+        // failed / incomplete / non-terminal status, malformed/empty body) is
+        // surfaced — never mistaken for a benign empty reply.
+        let decoded = match crate::responses_wire::decode_response(&json) {
+            Ok(d) => d,
+            Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
+                accumulated_usage = merge_round_usage(accumulated_usage, usage);
+                return Ok((
+                    format!("(the model refused the request) {message}"),
+                    false,
+                    accumulated_usage,
+                    hallucination_count,
+                ));
+            }
+            Err(e) => return Err(anyhow::anyhow!("Responses turn not usable: {e}")),
+        };
+        accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
+        let (text, calls, echo) = (decoded.text, decoded.tool_calls, decoded.echo);
 
         if debug {
             let excerpt: String = text.chars().take(80).collect();
@@ -6285,31 +7202,82 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
 
         if calls.is_empty() {
-            let out = if text.is_empty() {
-                "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
-            } else {
-                text
-            };
-            return Ok((out, false, accumulated_usage, hallucination_count));
+            // The decoder guarantees affirmative output here (text or calls); with
+            // no calls, `text` is non-empty — return it as the turn's answer.
+            return Ok((text, false, accumulated_usage, hallucination_count));
         }
 
-        // Echo the model's function_call items back into the running input,
-        // then run each and append its function_call_output.
-        for call in &calls {
-            input.push(call.clone());
-        }
-        for call in &calls {
-            let call_id = call["call_id"]
-                .as_str()
-                .or_else(|| call["id"].as_str())
-                .unwrap_or("");
-            let name = call["name"].as_str().unwrap_or("unknown");
-            let args = match &call["arguments"] {
-                serde_json::Value::String(s) => {
-                    serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+        // Echo the model's reasoning + function_call items back into the running
+        // input (in output order, so each call keeps its required reasoning item),
+        // then run each call and append its function_call_output.
+        // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch BEFORE
+        // echoing anything into `input` and before any side effect. Nothing is
+        // echoed until validation decides, so a correlation-impossible batch
+        // leaves `input` untouched and no follow-up request is issued.
+        let extracted: Vec<(Option<&str>, Option<&str>, &serde_json::Value)> = calls
+            .iter()
+            .map(|c| {
+                (
+                    c["call_id"].as_str().or_else(|| c["id"].as_str()),
+                    c["name"].as_str(),
+                    &c["arguments"],
+                )
+            })
+            .collect();
+        let validated = match tools::validate_tool_call_batch(&extracted, true) {
+            Ok(v) => v,
+            Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
+                // A missing/blank/duplicate call id: a `function_call_output`
+                // cannot be correlated. Abort the turn — fabricating an id only
+                // produces a provider 400 or a silent mispairing. Nothing was
+                // echoed, so no malformed follow-up is dispatched.
+                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+            }
+            Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                // ids are valid + unique → echo the calls and a correctly keyed
+                // rejection per call, then re-dispatch so the model can retry.
+                for item in &echo {
+                    input.push(item.clone());
                 }
-                v => v.clone(),
-            };
+                for call in &calls {
+                    let call_id = call["call_id"]
+                        .as_str()
+                        .or_else(|| call["id"].as_str())
+                        .unwrap_or("");
+                    print_synthetic_tool_result(
+                        "(rejected tool-call batch)",
+                        &serde_json::Value::Null,
+                        workspace,
+                        &reason,
+                        color,
+                    );
+                    if let Some(rec) = tool_events.as_deref_mut() {
+                        rec.push(crate::ToolEvent::from_call(
+                            "(rejected tool-call batch)",
+                            &serde_json::Value::Null,
+                            false,
+                            Some(0),
+                        ));
+                    }
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": format!("tool-call batch rejected before execution: {reason}"),
+                    }));
+                }
+                continue;
+            }
+        };
+        // Every call is valid: echo the reasoning + function_call items (in output
+        // order, so each call keeps its required reasoning item), then execute.
+        for item in &echo {
+            input.push(item.clone());
+        }
+        // Phase 2: execute in order.
+        for (call, vc) in calls.iter().zip(validated.iter()) {
+            let call_id = vc.call_id.as_str();
+            let name = vc.name.as_str();
+            let args = vc.args.clone();
             if trace {
                 print_trace(
                     &format!(
@@ -6346,14 +7314,28 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let tool_t0 = std::time::Instant::now();
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // The Responses loop has no PromptTracker, so `used` is the chars/4
-            // estimate of the running `input` plus tool schemas; num_ctx is normally
-            // unset here, so the report is honestly ceiling-less.
+            // estimate of the ACTUAL Responses request; num_ctx is normally unset
+            // here, so the report is honestly ceiling-less.
             let result = if tools::is_context_remaining_call(name) {
-                let report = budget::render_context_budget(
-                    estimate_request_tokens(&input, Some(&tools_chat), estimation),
-                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
-                    num_ctx,
-                    input_ceiling_pct as usize,
+                // #1528: the self-read must describe the NEXT dispatch, so it reads
+                // the SAME derivation the preflight enforces against — the
+                // `actionable_input_budget` (hard ceiling / soft send / mid-loop
+                // trim, the value dispatch refuses at) as the ceiling, and the SAME
+                // CALIBRATED real-token estimate of the exact request (instructions
+                // + the running Responses `input` + the real Responses-wire tool
+                // schemas, respecting tools-disabled) as `used` — via the shared
+                // `responses_context_remaining_report`. Both operate in real-token
+                // currency (BHV-BUDGET-001/002/003). The pre-fix path subtracted the
+                // RAW chars/4 estimate from the calibrated ceiling — over-reporting
+                // remaining by the calibration factor — and, earlier, read
+                // `learned_hard_ceiling` and the Chat-shaped catalog.
+                let report = responses_context_remaining_report(
+                    instructions.as_deref(),
+                    &input,
+                    tools_supported.then_some(tools.as_slice()),
+                    &budget_state,
+                    cal,
+                    estimation,
                     low_budget_pct,
                 );
                 print_synthetic_tool_result(name, &args, workspace, &report, color);
@@ -6452,37 +7434,90 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
     }
 
+    // #1528 B3: proactively compact the tools-DISABLED final summary if it is
+    // LOCALLY over budget. No round to protect (the loop is over), so it is a
+    // BEST-EFFORT, single-shot compaction; the `preflight_responses_request` below
+    // is the ONE authoritative fail-closed gate. Every tools argument is `None` —
+    // the summary sends NO tool schemas — so the estimate drops them AND the
+    // compaction target does NOT reserve their overhead (`with_tool_schemas =
+    // false`), avoiding over-compaction (req #7).
+    let mut summary_rejection: Option<CompactionRejection> = None;
+    if let Some(budget) = budget_state.actionable_input_budget() {
+        let before = estimate_responses_request_real_tokens(
+            instructions.as_deref(),
+            &input,
+            None,
+            estimation,
+            cal,
+        );
+        if before > budget {
+            summary_rejection = compact_responses_input(
+                &mut input,
+                instructions.as_deref(),
+                None,
+                Some(budget),
+                budget_state.compaction_budget(cal, false),
+                cal,
+                estimation,
+                task,
+                summary_input_cap_floor_chars,
+                compaction_store,
+                summarizer,
+                compress_state,
+                color,
+            )
+            .await
+            .rejection();
+        }
+    }
+
     // Round cap: one final tools-disabled call for a summary answer (mirrors
-    // the chat path's final_summary, in the Responses shape).
-    preflight_responses_request(
-        instructions.as_deref(),
-        &input,
-        None,
-        authoritative_budget,
-        cal,
-        estimation,
-        model,
-    )?;
+    // the chat path's final_summary, in the Responses shape). #1528 B5: the SAME
+    // typed strict-wire gate the rounds use, with `tools_permitted = false` so the
+    // final summary can carry NO tools; a proactive-compaction reason (if any) rides
+    // its error chain. Only a `ValidatedResponsesRequest` reaches the dispatcher.
     let body = build_body(&input, false);
-    let mut req = client.post(&responses_url).json(&body);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-    // Bare `?` keeps the raw typed reqwest error in the chain (the boundary's
-    // `error_class` classifies it as a fallback); the status bail is typed.
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(observability::DispatchError::http_status(format!(
-            "inference endpoint {status}: {text}"
-        ))
-        .into());
-    }
-    let json: serde_json::Value = resp.json().await?;
-    accumulated_usage = merge_round_usage(accumulated_usage, responses_usage(&json["usage"]));
-    let (text, _) = parse_responses_output(&json);
-    Ok((text, false, accumulated_usage, hallucination_count))
+    let policy = responses_wire_validation::ResponsesWirePolicy {
+        store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+        tools_permitted: false,
+        model,
+        authoritative_budget: budget_state.actionable_input_budget(),
+        calibration: cal,
+        estimation,
+        spill: spill_store,
+        compaction: compaction_store,
+    };
+    let validated =
+        responses_wire_validation::validate_responses_request(&body, &policy).map_err(|e| {
+            match summary_rejection.take() {
+                Some(reason) => anyhow::Error::new(e).context(reason.to_string()),
+                None => anyhow::Error::new(e),
+            }
+        })?;
+    // Shared retrying dispatch (R5): the tools-disabled final summary retries
+    // transient transport failures exactly like every round, so a 500 / timeout /
+    // reset on the LAST request no longer discards the turn after all tool rounds
+    // were spent.
+    let json = dispatch_responses_json(&client, &responses_url, api_key, &validated, &retry, color)
+        .await?;
+    // Fail-closed decode (invariant #2): this text-only follow-up must not return
+    // a failed, truncated, or empty body's text as a successful reply. A refusal
+    // is the model's final answer; every other error is surfaced.
+    let decoded = match crate::responses_wire::decode_response(&json) {
+        Ok(d) => d,
+        Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
+            accumulated_usage = merge_round_usage(accumulated_usage, usage);
+            return Ok((
+                format!("(the model refused the request) {message}"),
+                false,
+                accumulated_usage,
+                hallucination_count,
+            ));
+        }
+        Err(e) => return Err(anyhow::anyhow!("Responses turn not usable: {e}")),
+    };
+    accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
+    Ok((decoded.text, false, accumulated_usage, hallucination_count))
 }
 
 /// Whether the reasoning spinner is enabled: `NEWT_THINKING` (set by
@@ -7320,11 +8355,11 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn prompt_read_exact_recovery_is_never_spilled() {
-        let store = spill::SessionSpillStore::default();
-        let exact = "x".repeat(spill::TOOL_RESULT_SPILL_CAP + 1);
+        let store = content_spill::SessionSpillStore::new([7u8; 16]);
+        let exact = "x".repeat(content_spill::TOOL_RESULT_SPILL_CAP + 1);
         let output = maybe_offload_tool_result("prompt_read", exact.clone(), true, Some(&store));
         assert_eq!(output, exact);
-        assert_eq!(spill::SpillStore::spills(&store), 0);
+        assert_eq!(content_spill::SpillStore::unique_objects(&store), 0);
     }
 
     #[test]
@@ -7524,9 +8559,8 @@ mod cap_exit_unit_tests {
 //   (2) on hitting the cap newt issues ONE final tools-disabled completion and
 //       returns its text (NOT the `(reached tool-call limit)` placeholder).
 //
-// (The companion test that recovers a hard context-window 400 via the
-// `recover_cw_400` hook lives in newt-tui — it exercises the TUI-side probe
-// cache persistence under a HOME env guard.)
+// Hard context-window recovery is covered both by the headless driver tests
+// and by a TUI-side integration test that grounds capability-cache persistence.
 
 /// Token weight of the builtin tool catalog the loop advertises at
 /// `disposition` (default advertise flags, no MCP) — the same
@@ -7706,6 +8740,54 @@ mod tool_round_cap_tests {
         }
     }
 
+    struct OpenAiReasoningCapResponder {
+        round: AtomicUsize,
+        first_plan_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
+        policy_seen_on_final: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Respond for OpenAiReasoningCapResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if request_has_tools(req) {
+                let round = self.round.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {
+                        "content": null,
+                        "reasoning_content": format!("persistent plan round {round}"),
+                        "tool_calls": [{
+                            "id": "call_cap",
+                            "type": "function",
+                            "function": {
+                                "name": "definitely_not_a_real_tool",
+                                "arguments": "{}"
+                            }
+                        }]
+                    }}]
+                }));
+            }
+
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let first_plan_seen = body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["reasoning_content"].as_str() == Some("persistent plan round 0")
+                })
+            });
+            self.first_plan_seen_on_final
+                .store(first_plan_seen, Ordering::SeqCst);
+            self.policy_seen_on_final.store(
+                body["max_tokens"] == 10_000
+                    && body["temperature"] == 0.6
+                    && body["top_p"] == 0.95
+                    && body["chat_template_kwargs"]["enable_thinking"] == true
+                    && body.get("parallel_tool_calls").is_none(),
+                Ordering::SeqCst,
+            );
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "cap summary"}}]
+            }))
+        }
+    }
+
     fn msgs() -> Vec<MemMessage> {
         vec![
             MemMessage::system("you are a test"),
@@ -7743,6 +8825,9 @@ mod tool_round_cap_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 1,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -7878,6 +8963,50 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
+    async fn openai_cap_exit_preserves_the_full_current_turn_reasoning_tail() {
+        let server = MockServer::start().await;
+        let first_plan_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let policy_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiReasoningCapResponder {
+                round: AtomicUsize::new(0),
+                first_plan_seen_on_final: first_plan_seen.clone(),
+                policy_seen_on_final: policy_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+        let task = "keep the active plan through cap exit";
+        let messages = vec![MemMessage::system("base"), MemMessage::user(task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        context.safe_context = None;
+        context.max_tool_rounds = 4;
+        context.reasoning_replay_scope = crate::model_card::ReasoningReplayScope::CurrentUserTurn;
+        context.cognition = Some(crate::role_profile::Cognition::Deliberating);
+        context.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            chat_template_kwargs: Some(true),
+            parallel_tool_calls: Some(false),
+            bounded_reasoning_continuation: Some(true),
+        };
+
+        let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
+            .await
+            .expect("cap exit succeeds");
+        assert_eq!(reply, "cap summary");
+        assert!(
+            first_plan_seen.load(Ordering::SeqCst),
+            "the tools-disabled cap-exit request must retain the first current-turn plan"
+        );
+        assert!(
+            policy_seen.load(Ordering::SeqCst),
+            "the cap-exit request must retain cognition policy and omit tool-only fields"
+        );
+    }
+
+    #[tokio::test]
     async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
         let server = MockServer::start().await;
         let served = Arc::new(AtomicUsize::new(0));
@@ -7918,6 +9047,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8127,6 +9259,7 @@ mod tool_round_cap_tests {
             "tiny-model",
             None,
             messages,
+            generation_policy::GenerationPolicy::default(),
             CapExit {
                 max_tool_rounds: 1,
                 accumulated: None,
@@ -8223,6 +9356,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8319,6 +9455,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -8375,23 +9514,6 @@ mod tool_round_cap_tests {
     }
 
     #[test]
-    fn responses_input_splits_system_to_instructions_and_passes_typed_items() {
-        let msgs = vec![
-            serde_json::json!({"role": "system", "content": "be terse"}),
-            serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({"role": "assistant", "content": "hello"}),
-            // an already-typed Responses item passes through untouched
-            serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
-        ];
-        let (instructions, input) = build_responses_input(&msgs);
-        assert_eq!(instructions.as_deref(), Some("be terse"));
-        assert_eq!(input.len(), 3);
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "hi");
-        assert_eq!(input[2]["type"], "function_call_output");
-    }
-
-    #[test]
     fn responses_keeps_exact_active_prompt_at_user_priority() {
         let exact = "operator text must remain user data";
         let mut messages = vec![
@@ -8403,7 +9525,7 @@ mod tool_round_cap_tests {
             prompt_read::PromptReadContext::new(None, exact, None),
         );
 
-        let (instructions, input) = build_responses_input(&messages);
+        let (instructions, input) = crate::responses_wire::build_responses_input(&messages);
         let instructions = instructions.expect("base and metadata instructions");
         assert!(instructions.contains(prompt_read::ACTIVE_PROMPT_PREFIX));
         assert!(
@@ -8434,11 +9556,75 @@ mod tool_round_cap_tests {
         );
         assert_eq!(out[0]["description"], "run git");
         assert!(out[0]["function"].is_null(), "no nested function wrapper");
+        // A non-strict tool stays non-strict — no strictness is invented.
+        assert!(
+            out[0].get("strict").is_none(),
+            "absent strict must not become present"
+        );
     }
 
     #[test]
-    fn parse_responses_output_extracts_text_calls_and_usage() {
+    fn tools_to_responses_preserves_strictness_semantics() {
+        // #1526 (invariant #6): a strict Chat Completions schema must stay strict
+        // after conversion. `strict` moves from the `function` object to the
+        // Responses tool's TOP level, and the parameters' `additionalProperties` /
+        // `required` are carried through wholesale (not silently relaxed).
+        let chat = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "write a file",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }]);
+        let out = tools_to_responses(&chat);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]["strict"], true,
+            "strict must survive at the Responses tool's top level"
+        );
+        // Validation-semantic fields inside `parameters` are unchanged.
+        assert_eq!(
+            out[0]["parameters"]["required"],
+            serde_json::json!(["path"])
+        );
+        assert_eq!(out[0]["parameters"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn cognition_maps_to_the_responses_reasoning_field_or_is_omitted() {
+        use crate::role_profile::Cognition;
+        // Opt-in: each level projects to the Responses `reasoning.effort` value.
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Contemplating)),
+            Some(serde_json::json!({ "effort": "high" }))
+        );
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Glancing)),
+            Some(serde_json::json!({ "effort": "minimal" }))
+        );
+        assert_eq!(
+            responses_reasoning_field(Some(Cognition::Deliberating)),
+            Some(serde_json::json!({ "effort": "medium" }))
+        );
+        // Not opted in → the field is omitted entirely (request unchanged).
+        assert_eq!(responses_reasoning_field(None), None);
+    }
+
+    #[test]
+    fn responses_loop_consumes_the_shared_decoder_for_text_calls_and_usage() {
+        // The agentic loop now shares ONE decoder with the inference transport
+        // (`crate::responses_wire`). This grounds that the loop's consumption
+        // path gets text, calls, echo (reasoning + function_call in order), and
+        // usage from that single decoder — no second hand-rolled parser.
         let json = serde_json::json!({
+            "status": "completed",
             "output": [
                 {"type": "reasoning", "summary": "…"},
                 {"type": "message", "role": "assistant",
@@ -8448,11 +9634,18 @@ mod tool_round_cap_tests {
             ],
             "usage": {"input_tokens": 100, "output_tokens": 20}
         });
-        let (text, calls) = parse_responses_output(&json);
-        assert_eq!(text, "the answer");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["call_id"], "call_1");
-        let usage = responses_usage(&json["usage"]).unwrap();
+        let d = crate::responses_wire::decode_response(&json).expect("a completed tool-call turn");
+        assert_eq!(d.text, "the answer");
+        assert_eq!(d.tool_calls.len(), 1);
+        assert_eq!(d.tool_calls[0]["call_id"], "call_1");
+        // The echo re-sends the reasoning item AND the function_call in output
+        // order, so a reasoning model (gpt-5.6-sol) does not 400 on the follow-up
+        // turn for a function_call missing its required reasoning item.
+        assert_eq!(d.echo.len(), 2, "reasoning + function_call are echoed");
+        assert_eq!(d.echo[0]["type"], "reasoning");
+        assert_eq!(d.echo[1]["type"], "function_call");
+        assert_eq!(d.echo[1]["call_id"], "call_1");
+        let usage = d.usage.unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 20);
     }
@@ -8463,6 +9656,18 @@ mod tool_round_cap_tests {
 
     fn mid_sized_pair_task(label: &str) -> String {
         format!("{label} {}", "x".repeat(6_000))
+    }
+
+    #[test]
+    fn accepted_prompt_cannot_raise_budget_past_declared_ceiling() {
+        assert_eq!(capped_accepted_prompt_tokens(61_221, Some(54_394)), 54_394);
+        assert_eq!(capped_accepted_prompt_tokens(8_734, None), 8_734);
+    }
+
+    #[test]
+    fn authoritative_zero_input_budget_is_not_erased() {
+        assert_eq!(authoritative_request_budget(Some(0), true, None), Some(0));
+        assert_eq!(authoritative_request_budget(Some(0), false, None), None);
     }
 
     /// Prove the regression fixture isolates the live-tail duplicate — the
@@ -8627,6 +9832,56 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
+    async fn openai_chat_declared_num_ctx_is_a_local_refusal_budget() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("OPENAI-CHAT-NUM-CTX");
+        let budget = mid_sized_pair_budget(&task, false);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.num_ctx = Some(((budget * 100).div_ceil(80)) as u32);
+
+        let error = openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the declared local window must refuse the irreducible request");
+
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn openai_chat_output_reserve_tightens_declared_window_before_dispatch() {
+        let server = MockServer::start().await;
+        let task = mid_sized_pair_task("OPENAI-CHAT-OUTPUT-RESERVE");
+        let budget = mid_sized_pair_budget(&task, false);
+        let messages = giant_prompt_messages(&task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+        ctx.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            ..Default::default()
+        };
+        let context_window = budget + 16_000;
+        assert!(
+            context_window * ctx.input_ceiling_pct as usize / 100 > budget,
+            "fixture must be tightened by output reserve, not percentage"
+        );
+        ctx.num_ctx = Some(context_window as u32);
+
+        let error = openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the 16K output reserve must refuse the irreducible input");
+
+        assert_irreducible_refusal(&error);
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
     async fn responses_mid_sized_irreducible_prompt_pair_refuses_before_dispatch() {
         let server = MockServer::start().await;
         let task = mid_sized_pair_task("RESPONSES-MID-PAIR");
@@ -8644,7 +9899,11 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
-    async fn responses_ignores_unsent_num_ctx_as_a_local_refusal_budget() {
+    async fn responses_never_sends_num_ctx_on_the_wire() {
+        // A configured window is a LOCAL limit (see the refusal test below), but
+        // it must NEVER be sent on the Responses wire (limits are provider-side).
+        // Here the window is large enough to fit the small request, so it
+        // succeeds AND the body carries no `num_ctx`.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -8666,11 +9925,13 @@ mod tool_round_cap_tests {
         let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
         ctx.safe_context = None;
         ctx.max_ok_input = None;
-        ctx.num_ctx = Some(1);
+        // A generous configured window: a local ceiling, but the small request
+        // fits well under it, so nothing is refused.
+        ctx.num_ctx = Some(1_000_000);
 
         let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
             .await
-            .expect("an unsent num_ctx must not block the provider request");
+            .expect("the request fits the configured window");
         assert_eq!(reply, "provider accepted");
         let requests = server
             .received_requests()
@@ -8681,6 +9942,1382 @@ mod tool_round_cap_tests {
         assert!(
             body.get("num_ctx").is_none(),
             "Responses must not send the ChatCtx num_ctx display hint"
+        );
+        assert!(
+            body.get("reasoning").is_none(),
+            "no cognition set → no reasoning.effort on the wire (request unchanged)"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_request_sets_store_false() {
+        // BHV-STORAGE-001: the AGENTIC-loop Responses request explicitly opts out
+        // of server-side retention (`store: false`), not by inheriting the API's
+        // `store: true` default. A dedicated, correctly-scoped assertion (the
+        // storage contract must not lean on an unrelated num_ctx test).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "store policy";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000); // fits → the request dispatches
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("request succeeds");
+
+        let requests = server.received_requests().await.expect("journal");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body.get("store"),
+            Some(&serde_json::Value::Bool(false)),
+            "the agentic Responses request must set store:false explicitly"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_refuses_locally_when_a_configured_window_cannot_fit() {
+        // #1526 (invariant #4): a CONFIGURED context window is a local safety
+        // limit even though it is never sent on the Responses wire. A window too
+        // small to hold the irreducible request must be refused PRE-DISPATCH —
+        // no request reaches the provider — rather than relying on a reactive
+        // 400 or a silent truncation. (The previous contract wrongly let this
+        // sail through; that assertion is now reversed.)
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0) // nothing may be dispatched
+            .mount(&server)
+            .await;
+
+        let task = "a normal Responses request";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        // A 1-token window leaves zero input capacity → local refusal.
+        ctx.num_ctx = Some(1);
+
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a 1-token configured window cannot fit the request");
+        assert_no_requests(&server).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_responses_json_retries_transient_transport_failures() {
+        // R5: the ONE shared Responses dispatch (used by BOTH the per-round loop
+        // and the final tools-disabled summary) retries a transient status. A
+        // persistent 503 exhausts the retries — the mock's `.expect(3)` (initial
+        // + 2 retries) proves the summary path is no longer a bare, un-retried
+        // `send()` that a transient blip could discard after all rounds were spent.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503)) // retryable transport failure
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let retry = crate::retry::RetryPolicy {
+            max_retries: 2,
+            base: std::time::Duration::from_millis(0),
+            max: std::time::Duration::from_millis(0),
+            jitter: false,
+        };
+        let client = reqwest::Client::new();
+        let url = format!("{}/v1/responses", server.uri());
+        // B5: the dispatcher accepts only a ValidatedResponsesRequest. This test
+        // exercises transport backoff, not the wire invariants, so it uses the
+        // test-only constructor to stand up a validated body directly.
+        let validated = responses_wire_validation::ValidatedResponsesRequest::from_body_for_test(
+            serde_json::json!({"model": "m", "input": []}),
+        );
+        let err = super::dispatch_responses_json(&client, &url, None, &validated, &retry, false)
+            .await
+            .expect_err("a persistent 503 exhausts retries");
+        assert!(err.to_string().contains("503"), "got: {err}");
+        // `.expect(3)` is verified on server drop — it retried, not sent once.
+    }
+
+    /// Build a history (~36k estimated tokens) far larger than the recovered
+    /// cw-400 budget, so the recovery's compaction is forced to FIRE (not merely
+    /// fit) even after the always-advertised tool schemas (~5k tokens) claim their
+    /// share of the recovered 40k-token window.
+    fn overflowing_responses_history(task: &str) -> Vec<MemMessage> {
+        let mut messages = vec![MemMessage::system("base policy")];
+        for i in 0..60 {
+            messages.push(MemMessage::user(format!(
+                "historical step {i} {}",
+                "x".repeat(1_200)
+            )));
+            messages.push(MemMessage::assistant(format!(
+                "did step {i} {}",
+                "y".repeat(1_200)
+            )));
+        }
+        messages.push(MemMessage::user(task));
+        messages
+    }
+
+    #[tokio::test]
+    async fn responses_recovers_from_a_context_window_400_by_compacting_and_redispatching() {
+        // #1528: a hard context-window 400 on the Responses wire must be
+        // RECOVERED — learn the true window, tighten the input ceiling, compact
+        // the running history to fit, and re-dispatch — never surfaced as a raw
+        // 400. Regression: before this slice the Responses loop returned the 400
+        // directly (no compaction, no redispatch).
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct OverflowThenOk {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for OverflowThenOk {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                if self.served.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // A numbered LiteLLM/vLLM overflow cw_overflow recognizes.
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "recovered and done"}]}]
+                    }))
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(OverflowThenOk {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "RECOVER: keep going after the window shrinks";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        // Cloud default: no local window → the first (over-window) request
+        // dispatches and the provider's 400 drives recovery.
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        ctx.max_tool_rounds = 4;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("cw-400 recovery compacts and redispatches to success");
+        assert_eq!(reply, "recovered and done");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "exactly one 400 then one recovered 200 — the raw 400 never surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_context_window_400_recovery_is_bounded() {
+        // #1528: recovery is capped at 2 retries. A server that 400s every time
+        // must ultimately surface the error after at most 1 + 2 dispatches, never
+        // looping forever.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+            })))
+            .expect(3) // initial + exactly 2 bounded recoveries
+            .mount(&server)
+            .await;
+
+        let task = "BOUNDED: never loop forever on a persistent 400";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        // max_tool_rounds == 1 so the bound proven is the INNER `cw_retries` cap
+        // (recovery retries in place), not the outer round cap: a single logical
+        // round still dispatches at most initial + 2 recoveries before surfacing.
+        ctx.max_tool_rounds = 1;
+
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a persistent cw-400 surfaces after the bounded retries");
+        // `.expect(3)` verified on drop: initial + exactly 2 recoveries.
+    }
+
+    #[test]
+    fn responses_cw_recovery_ceiling_is_monotone_non_increasing() {
+        // #1528: each recovery composes the freshly-learned window with the
+        // previously-tightened ceiling via `min` (the same `recovered_input_budget`
+        // declared-ceiling composition the recovery branch uses), so the effective
+        // input ceiling can only shrink — never rebound — across successive 400s.
+        let pct = 80;
+        // First 400 learns a 6000-token window → 4800 input ceiling.
+        let first = recovered_input_budget(6000, pct, None, None);
+        assert_eq!(first, 4800);
+        // A later 400 reporting a LARGER window must NOT raise the ceiling: the
+        // retained tighter ceiling wins.
+        let second = recovered_input_budget(100_000, pct, None, Some(first));
+        assert!(second <= first, "ceiling rose: {second} > {first}");
+        assert_eq!(second, first);
+        // A later 400 reporting a SMALLER window tightens further.
+        let third = recovered_input_budget(2_000, pct, None, Some(second));
+        assert!(
+            third < second,
+            "ceiling failed to tighten: {third} !< {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_cw_400_recovery_retries_the_same_logical_round_with_tools() {
+        // #1528 (review P1): a cw-400 must retry the SAME logical tool round in
+        // place, not advance the round counter. With max_tool_rounds == 1 the buggy
+        // loop consumed the only round on recovery and demoted the recovered request
+        // to the tools-disabled summary — 2 requests: [400, summary]. The fix
+        // dispatches a real recovered TOOL round (still carrying tools); only a
+        // COMPLETED round then advances to the summary — 3 requests:
+        // [400, recovered tool round, summary].
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct OverflowThenToolThenDone {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for OverflowThenToolThenDone {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                match self.served.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                    })),
+                    // The recovered request: a real tool round (get_context_remaining
+                    // is executed synthetically in-loop — no external side effect).
+                    1 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "function_call", "name": "get_context_remaining",
+                            "arguments": "{}", "call_id": "c1"}]
+                    })),
+                    _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "done"}]}]
+                    })),
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(OverflowThenToolThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "SAME ROUND: recovery must not burn the only tool round";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("recovery retries the round in place and the turn completes");
+        assert_eq!(reply, "done");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            reqs.len(),
+            3,
+            "expected [400, recovered tool round, summary]; a 2-request run means \
+             recovery burned the only round and demoted to the tools-disabled summary"
+        );
+        let body = |i: usize| -> serde_json::Value {
+            serde_json::from_slice(&reqs[i].body).unwrap_or_default()
+        };
+        assert!(
+            body(1)["tools"].is_array(),
+            "the RECOVERED request must still carry tools — a real tool round, not the summary"
+        );
+        assert!(
+            body(2)["tools"].is_null(),
+            "only the final summary (after the completed round) is tools-disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_cw_400_on_the_final_round_recovers_in_place() {
+        // #1528 (review P1): a cw-400 on the LAST logical round retries THAT round
+        // rather than jumping to the summary. max_tool_rounds == 2: round 0 completes
+        // a tool call; round 1 400s, recovers IN PLACE and does another tool call,
+        // then the completed round advances to the summary — 4 requests. The buggy
+        // loop would `continue` past round 1 straight into the summary — 3 requests.
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct ToolThen400ThenToolThenDone {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for ToolThen400ThenToolThenDone {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                let tool = serde_json::json!({
+                    "model": "mock",
+                    "output": [{"type": "function_call", "name": "get_context_remaining",
+                        "arguments": "{}", "call_id": "c1"}]
+                });
+                match self.served.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(200).set_body_json(tool),
+                    1 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                    })),
+                    2 => ResponseTemplate::new(200).set_body_json(tool),
+                    _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "finished"}]}]
+                    })),
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ToolThen400ThenToolThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "FINAL ROUND: a 400 on the last round retries it, not the summary";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        ctx.max_tool_rounds = 2;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("the final round recovers in place and completes");
+        assert_eq!(reply, "finished");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            reqs.len(),
+            4,
+            "expected round0 tool, round1 400, round1 recovered tool, summary; a \
+             3-request run means the 400 burned round 1 and jumped to the summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_proactively_compacts_before_the_first_dispatch() {
+        // #1528 B3 (req 1/2): when the FIRST request is LOCALLY known to exceed the
+        // input budget, the loop compacts BEFORE dispatching — no round-trip to learn
+        // it from a cw-400. The single request the server sees is already compacted
+        // (carries the reference-summary envelope) and STILL carries tools (a real
+        // tool round — the round counter is not consumed). Regression: before B3 the
+        // Responses loop only compacted REACTIVELY, after a provider 400 (so this
+        // request would have been dispatched over budget, or 400'd first).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "proactively compacted"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "PROACTIVE: compact before the first dispatch";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        // A LOCAL budget (no cw-400 needed): the raw history dwarfs it, the compacted
+        // form fits. recover_cw_400 stays None — proactive never learns from a 400.
+        ctx.safe_context = Some(12_000);
+        ctx.num_ctx = Some(12_000);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("proactive compaction fits the request and it dispatches once");
+        assert_eq!(reply, "proactively compacted");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            reqs.len(),
+            1,
+            "a single dispatch — proactively compacted, no cw-400 round-trip"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap_or_default();
+        assert!(
+            body["input"]
+                .to_string()
+                .contains("newt-compaction-summary"),
+            "the first request was compacted BEFORE dispatch (reference-summary envelope present)"
+        );
+        assert!(
+            body["tools"].is_array(),
+            "the compacted request is still a REAL tool round — the round is not consumed"
+        );
+        let n_items = body["input"].as_array().map_or(0, Vec::len);
+        assert!(n_items < 30, "compacted to {n_items} items (raw was ~121)");
+    }
+
+    #[tokio::test]
+    async fn responses_irreducible_request_refuses_before_the_proactive_guard() {
+        // The B3 proactive guard sits BEHIND the pre-loop irreducible preflight: a
+        // request whose protected head + newest live user alone dwarf the budget can
+        // never be helped by compaction (the newest user is protected), so it is
+        // refused BEFORE the round loop — the guard never runs. This pins that
+        // fail-closed path to its DISTINGUISHING pre-loop message ("the operator
+        // prompt was not truncated"), distinct from the in-loop preflight's "function
+        // outputs were not truncated". (Honesty note per adversarial review: this
+        // exercises the pre-existing irreducible gate, NOT B3's proactive path — B3's
+        // guard is best-effort and DELEGATES the refusal to the authoritative
+        // preflight, so there is no B3-specific fail-closed behavior to assert here.
+        // B3's own new behavior — proactive compaction that lets an over-budget
+        // request SUCCEED — is covered by responses_proactively_compacts_* /
+        // responses_final_summary_is_proactively_compacted.)
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "UNREACHED"}]}]
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let task = format!("IRREDUCIBLE {}", "z".repeat(40_000));
+        let messages = vec![MemMessage::system("base policy"), MemMessage::user(&task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = Some(512);
+        ctx.num_ctx = Some(512);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 1;
+
+        let err = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("an irreducible over-budget request fails closed, never dispatched");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("operator prompt was not truncated"),
+            "expected the PRE-LOOP irreducible refusal (distinct from the in-loop \
+             preflight message), got: {msg}"
+        );
+        // `.expect(0)` verified on MockServer drop: ZERO inference dispatches.
+    }
+
+    #[tokio::test]
+    async fn responses_final_summary_is_proactively_compacted() {
+        // #1528 B3 (req 6): the tools-DISABLED final summary is proactively compacted
+        // when it is locally over budget, before its dispatch. `max_tool_rounds == 0`
+        // skips the tool rounds so this exercises ONLY the final-summary guard.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "summarized"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "FINAL SUMMARY: compact the tools-disabled summary too";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = Some(12_000);
+        ctx.num_ctx = Some(12_000);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 0;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("the tools-disabled summary is proactively compacted and dispatches");
+        assert_eq!(reply, "summarized");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        assert_eq!(reqs.len(), 1, "only the final summary dispatched");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap_or_default();
+        assert!(
+            body["tools"].is_null(),
+            "the final summary is tools-disabled"
+        );
+        assert!(
+            body["input"]
+                .to_string()
+                .contains("newt-compaction-summary"),
+            "the tools-disabled summary was proactively compacted before dispatch"
+        );
+    }
+
+    // --- #1528 B3 transactional helper unit tests (B3-CG-004/005) ---
+
+    fn assistant(i: usize, chars: usize) -> serde_json::Value {
+        serde_json::json!({"role": "assistant", "content": format!("step {i}: {}", "w ".repeat(chars))})
+    }
+
+    /// B3-CG-004: a candidate compaction REJECTED by the post-bridge budget guard
+    /// commits NOTHING — the live `input` and `CompressState` are untouched and no
+    /// committed notice is emitted (the helper returns before the commit block). The
+    /// typed `OverBudgetAfterFence` carries the reason for the caller's error chain.
+    /// Fails on `711c247` (non-transactional: notice + state mutated before the check).
+    #[tokio::test]
+    async fn compact_responses_input_post_fence_overflow_is_transactional() {
+        use crate::agentic::compress::{CompressState, Summarizer};
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let summ: Summarizer = Box::new(move |_r: String| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok("a short summary".to_string()) })
+        });
+        let mut input = vec![serde_json::json!({"role": "user", "content": "the task"})];
+        for i in 0..6 {
+            input.push(assistant(i, 300));
+        }
+        input.push(serde_json::json!({"role": "user", "content": "recent turn"}));
+        let original = input.clone();
+        let mut state = CompressState::new();
+
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(10), // actionable_budget: tiny → the fenced rebuild overflows it
+            400,      // compaction_budget: generous enough that compress FIRES
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "the task",
+            8_192,
+            None,
+            Some(&*summ),
+            &mut state,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ResponsesCompaction::OverBudgetAfterFence(_)),
+            "expected a post-fence overflow rejection"
+        );
+        assert_eq!(
+            input, original,
+            "TRANSACTIONAL: a rejected candidate leaves input UNCHANGED"
+        );
+        assert_eq!(
+            state.counters().compressions,
+            0,
+            "TRANSACTIONAL: live CompressState attempts UNCHANGED (compaction ran on a clone)"
+        );
+        assert!(
+            !state.is_disabled(),
+            "TRANSACTIONAL: disabled latch UNCHANGED"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the candidate compaction actually ran (summarizer invoked)"
+        );
+    }
+
+    /// B3-CG-004: a forbidden `system` item fails classification (BridgeError) with no
+    /// compaction and no side effects.
+    #[tokio::test]
+    async fn compact_responses_input_bridge_error_is_transactional() {
+        use crate::agentic::compress::CompressState;
+        let mut input = vec![
+            serde_json::json!({"role": "user", "content": "task"}),
+            serde_json::json!({"role": "system", "content": "smuggled"}),
+        ];
+        let original = input.clone();
+        let mut state = CompressState::new();
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(5),
+            5,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            None,
+            None,
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, ResponsesCompaction::BridgeError));
+        assert_eq!(
+            input, original,
+            "transactional: input unchanged on bridge error"
+        );
+        assert_eq!(state.counters().compressions, 0, "no compaction ran");
+    }
+
+    /// B3-CG-004: a compressor refusal (protected head alone exceeds the target)
+    /// commits nothing.
+    #[tokio::test]
+    async fn compact_responses_input_refusal_is_transactional() {
+        use crate::agentic::compress::CompressState;
+        let mut input = vec![serde_json::json!({"role": "user", "content": "x".repeat(4_000)})];
+        for i in 0..3 {
+            input.push(assistant(i, 10));
+        }
+        let original = input.clone();
+        let mut state = CompressState::new();
+        // compaction_budget = 1 → the protected head alone exceeds it → refuse.
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt with a large protected head that cannot shrink"),
+            None,
+            Some(1),
+            1,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            None,
+            None,
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                ResponsesCompaction::Refused | ResponsesCompaction::NotFired
+            ),
+            "an irreducible tiny budget refuses / makes no progress"
+        );
+        assert_eq!(input, original, "transactional: input unchanged on refusal");
+        assert_eq!(
+            state.counters().compressions,
+            0,
+            "transactional: state unchanged"
+        );
+    }
+
+    /// B3-CG-004: a candidate that fits COMMITS all three effects — input rewritten
+    /// to the compacted form, the anti-thrash attempt recorded, and (structurally,
+    /// after this point) the notice emitted.
+    #[tokio::test]
+    async fn compact_responses_input_commits_only_on_success() {
+        use crate::agentic::compress::{CompressState, Summarizer};
+        let summ: Summarizer =
+            Box::new(|_r: String| Box::pin(async { Ok("brief summary".to_string()) }));
+        let mut input = vec![serde_json::json!({"role": "user", "content": "task"})];
+        for i in 0..6 {
+            input.push(assistant(i, 300));
+        }
+        input.push(serde_json::json!({"role": "user", "content": "recent turn"}));
+        let before_len = input.len();
+        let mut state = CompressState::new();
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(100_000), // generous actionable budget → the compacted form fits
+            400,           // tight compaction target → compress fires
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            None,
+            Some(&*summ),
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, ResponsesCompaction::Compacted),
+            "a fitting compaction commits"
+        );
+        assert!(
+            input.len() < before_len,
+            "committed: input rewritten to fewer items ({} < {before_len})",
+            input.len()
+        );
+        assert!(
+            input.iter().any(|m| m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("newt-compaction-summary")),
+            "committed: the reference-summary envelope is present"
+        );
+        assert_eq!(
+            state.counters().compressions,
+            1,
+            "committed: the anti-thrash attempt IS recorded on the live state"
+        );
+    }
+
+    /// B3-CG-004 / §2.6: the FOURTH effect — the session compaction/spill store — is
+    /// also transactional. A rejected candidate writes NOTHING to the live store
+    /// (rejected-candidate-publishes-nothing); a committed one flushes exactly its
+    /// staged span. Fails on `711c247`, where the shared `store.store(...)` inside
+    /// `compress` was not rolled back on reject (leaking an orphaned redacted span per
+    /// rejected proactive attempt).
+    #[tokio::test]
+    async fn compact_responses_input_spill_store_is_transactional() {
+        use crate::agentic::compress::{CompressState, Summarizer};
+        use crate::agentic::content_spill::{SessionSpillStore, SpillStore};
+        let make_input = || {
+            let mut v = vec![serde_json::json!({"role": "user", "content": "task"})];
+            for i in 0..6 {
+                v.push(assistant(i, 300));
+            }
+            v.push(serde_json::json!({"role": "user", "content": "recent turn"}));
+            v
+        };
+        let summarizer =
+            || -> Summarizer { Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) })) };
+
+        // REJECT (tiny actionable budget → post-fence overflow): store stays EMPTY.
+        {
+            let store = SessionSpillStore::new([7u8; 16]);
+            let s = summarizer();
+            let mut input = make_input();
+            let mut state = CompressState::new();
+            let outcome = compact_responses_input(
+                &mut input,
+                Some("you are newt"),
+                None,
+                Some(10),
+                400,
+                1.0,
+                crate::tokens::TokenEstimation::default(),
+                "task",
+                8_192,
+                Some(&store),
+                Some(&*s),
+                &mut state,
+                false,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                ResponsesCompaction::OverBudgetAfterFence(_)
+            ));
+            assert_eq!(
+                store.unique_objects(),
+                0,
+                "TRANSACTIONAL: a rejected candidate writes NO committed spill"
+            );
+            assert_eq!(
+                store.logical_spill_refs(),
+                0,
+                "a rejected candidate installs no logical reference either"
+            );
+            assert_eq!(input, make_input(), "live input is UNCHANGED on reject");
+            assert!(
+                !serde_json::to_string(&input)
+                    .unwrap()
+                    .contains("compaction:"),
+                "no retrieval marker leaked into live input"
+            );
+        }
+        // COMMIT (generous budget): the staged span is flushed exactly once.
+        {
+            let store = SessionSpillStore::new([7u8; 16]);
+            let s = summarizer();
+            let mut input = make_input();
+            let mut state = CompressState::new();
+            let outcome = compact_responses_input(
+                &mut input,
+                Some("you are newt"),
+                None,
+                Some(100_000),
+                400,
+                1.0,
+                crate::tokens::TokenEstimation::default(),
+                "task",
+                8_192,
+                Some(&store),
+                Some(&*s),
+                &mut state,
+                false,
+            )
+            .await;
+            assert!(matches!(outcome, ResponsesCompaction::Compacted));
+            assert_eq!(
+                store.unique_objects(),
+                1,
+                "committed: the compacted span is flushed to the store exactly once"
+            );
+            // The live input names the committed span's `compaction:<cid>` handle.
+            assert!(
+                serde_json::to_string(&input)
+                    .unwrap()
+                    .contains("compaction:"),
+                "the committed candidate names its retrieval handle"
+            );
+        }
+    }
+
+    fn spill_middle_input() -> Vec<serde_json::Value> {
+        let mut v = vec![serde_json::json!({"role": "user", "content": "task"})];
+        for i in 0..6 {
+            v.push(assistant(i, 300));
+        }
+        v.push(serde_json::json!({"role": "user", "content": "recent turn"}));
+        v
+    }
+
+    /// Correction 1: with NO real compaction store, a successful compaction still
+    /// summarizes but promises NO retrieval — no `memory_fetch("compaction:...")`
+    /// handle. Fails on `8b3a1c8`, which wrapped a `None` store and invented
+    /// `compaction:s0` (a phantom, unresolvable handle).
+    #[tokio::test]
+    async fn compact_responses_input_no_store_emits_no_retrieval_handle() {
+        use crate::agentic::compress::Summarizer;
+        let summ: Summarizer = Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) }));
+        let mut input = spill_middle_input();
+        let mut state = crate::agentic::compress::CompressState::new();
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(100_000),
+            400,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            None, // NO real compaction store
+            Some(&*summ),
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, ResponsesCompaction::Compacted));
+        let text = serde_json::to_string(&input).unwrap();
+        assert!(
+            text.contains("newt-compaction-summary"),
+            "it still compacted"
+        );
+        assert!(
+            !text.contains("compaction:"),
+            "no retrieval handle promised without a store: {text:.200}"
+        );
+    }
+
+    /// §2.6 (replaces the obsolete "store-issued id" correction): a committed
+    /// compaction names a `compaction:<cid>` CONTENT handle — not a predicted or
+    /// allocated id — and that handle parses as a canonical CID AND resolves in the
+    /// live store to the committed verbatim span. Content addressing dissolved the
+    /// allocator, so there is no id to predict or steal.
+    #[tokio::test]
+    async fn compact_responses_input_names_a_resolvable_content_handle() {
+        use crate::agentic::compress::Summarizer;
+        use crate::agentic::content_spill::{SessionSpillStore, SpillCid, SpillStore};
+        let store = SessionSpillStore::new([7u8; 16]);
+        let summ: Summarizer = Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) }));
+        let mut input = spill_middle_input();
+        let mut state = crate::agentic::compress::CompressState::new();
+        let outcome = compact_responses_input(
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(100_000),
+            400,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8_192,
+            Some(&store),
+            Some(&*summ),
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, ResponsesCompaction::Compacted));
+        let text = serde_json::to_string(&input).unwrap();
+        // Extract the `compaction:<cid>` handle (a base32-lower CID — ascii
+        // alphanumeric, so read up to the first non-alphanumeric terminator).
+        let handle: String = text
+            .split("compaction:")
+            .nth(1)
+            .expect("the marker names a compaction handle")
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let cid = SpillCid::parse(&handle).expect("the handle is a canonical content CID");
+        assert!(!text.contains("compaction:s0"), "no predicted s0 marker");
+        assert!(
+            store
+                .fetch(&cid)
+                .is_some_and(|r| r.redacted_text.contains("step 0")),
+            "the emitted handle resolves to the committed verbatim span"
+        );
+        assert_eq!(store.unique_objects(), 1);
+    }
+
+    // --- #1528 B3 (item 6): pure lifecycle-invariant property tests ---
+
+    /// A pure, side-effect-free MODEL of one proactive pre-dispatch decision, mirroring
+    /// the guard + transactional `compact_responses_input` + the authoritative preflight
+    /// at the estimate level. `committed_post_estimate` is `Some(fenced estimate)` IFF
+    /// the transactional helper committed a candidate (which it does only when the
+    /// candidate passed `check_post_bridge_budget`, i.e. fits the budget). Corresponds to
+    /// `formal/CompactionLifecycle` (estimate → compact → validate → readyToDispatch |
+    /// abort).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProactiveDecision {
+        DispatchAsIs,
+        DispatchCompacted,
+        FailClosed,
+    }
+
+    fn proactive_decision(
+        actionable_budget: Option<usize>,
+        pre_estimate: usize,
+        committed_post_estimate: Option<usize>,
+    ) -> ProactiveDecision {
+        let Some(budget) = actionable_budget else {
+            return ProactiveDecision::DispatchAsIs; // no budget → no gate
+        };
+        if pre_estimate <= budget {
+            return ProactiveDecision::DispatchAsIs; // already fits → no compaction
+        }
+        match committed_post_estimate {
+            Some(post) if post <= budget => ProactiveDecision::DispatchCompacted,
+            _ => ProactiveDecision::FailClosed,
+        }
+    }
+
+    /// B3-CG-001/005: over the whole finite decision space, DISPATCH implies the
+    /// governing estimate is within budget, and a compaction FAILURE implies zero
+    /// dispatch. Also: no budget → dispatch as-is; a fitting request is never compacted.
+    #[test]
+    fn proactive_decision_never_dispatches_over_budget() {
+        for budget in [None, Some(0usize), Some(100), Some(1000)] {
+            for pre in [0usize, 100, 1000, 5000] {
+                for committed in [None, Some(0usize), Some(100), Some(1000), Some(5000)] {
+                    let d = proactive_decision(budget, pre, committed);
+                    match d {
+                        ProactiveDecision::DispatchAsIs => {
+                            // Only when there is no budget, or the request already fits.
+                            assert!(
+                                budget.is_none() || pre <= budget.unwrap(),
+                                "DispatchAsIs must mean no-budget or already-fits: {budget:?} {pre}"
+                            );
+                        }
+                        ProactiveDecision::DispatchCompacted => {
+                            let b = budget.expect("compacted dispatch requires a budget");
+                            assert!(pre > b, "compaction only runs when over budget");
+                            assert!(
+                                committed.expect("committed implies Some") <= b,
+                                "DISPATCH ⟹ post-fence estimate ≤ actionable budget"
+                            );
+                        }
+                        ProactiveDecision::FailClosed => {
+                            // Failure ⟹ zero dispatch: either no committed candidate, or
+                            // the committed candidate did not fit (never emitted here).
+                            let b = budget.expect("fail-closed only under a budget");
+                            assert!(pre > b);
+                            assert!(committed.is_none_or(|p| p > b));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// B3-CG-003: the tools-disabled compaction target NEVER subtracts schema overhead,
+    /// the tools-enabled one always does, and dropping schemas can only RAISE the target
+    /// — across a sweep of ceilings / schema sizes / calibrations.
+    #[test]
+    fn compaction_target_schema_subtraction_follows_tools() {
+        use super::send_budget::ResponsesBudgetState;
+        for window in [4_096u32, 32_768, 131_072] {
+            for schema in [0usize, 500, 4_000] {
+                for cal in [0.5f32, 1.0, 2.0] {
+                    let mut s = ResponsesBudgetState::new(Some(window), 80, None, None, None, None);
+                    let recovered = s.recovered_budget_for_window(window);
+                    s.recover_from_cw400(recovered);
+                    s.set_tool_schema_tokens(schema);
+                    let with = s.compaction_budget(cal, true);
+                    let without = s.compaction_budget(cal, false);
+                    assert!(
+                        without >= with,
+                        "dropping schemas never lowers the target: {without} >= {with} \
+                         (window={window} schema={schema} cal={cal})"
+                    );
+                    if schema == 0 {
+                        assert_eq!(with, without, "no schemas → the flag is a no-op");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #1528 B3 (item 3, B3-CG-005): the IN-LOOP no-progress path — a tool round
+    /// yields an OVERSIZED fresh result, the next request exceeds the local budget,
+    /// and the proactive guard invokes the compactor EXACTLY ONCE (a counting
+    /// summarizer proves it). The protected newest tool output cannot be reduced, so
+    /// the authoritative preflight refuses: ONE dispatch, ZERO second dispatch, the
+    /// logical round intact. This FAILS if the proactive helper call is deleted — the
+    /// summarizer is never invoked on round 1 (`calls == 0`), which the pre-existing
+    /// preflight-refusal path does not do.
+    #[tokio::test]
+    async fn responses_proactive_no_progress_invokes_the_compactor_exactly_once() {
+        use crate::agentic::compress::Summarizer;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "mock",
+                "output": [{"type": "function_call", "name": "read_file",
+                    "arguments": "{\"path\":\"huge.txt\"}", "call_id": "c1"}]
+            })))
+            .mount(&server)
+            .await;
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("huge.txt"), "x".repeat(64_000)).unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let summ: Summarizer = Box::new(move |_r: String| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok("brief".to_string()) })
+        });
+
+        let task = "read the huge fixture then summarize";
+        // A SMALL reducible history — round 0 fits, and it survives as a summarizable
+        // MIDDLE on round 1 (after the giant tool output becomes the protected tail).
+        let mut messages = vec![MemMessage::system("base policy")];
+        for i in 0..4 {
+            messages.push(MemMessage::user(format!("earlier ask {i}")));
+            messages.push(MemMessage::assistant(format!("earlier reply {i}")));
+        }
+        messages.push(MemMessage::user(task));
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.workspace = workspace.path().to_str().unwrap();
+        ctx.summarizer = Some(&*summ);
+        ctx.safe_context = Some(8_000);
+        ctx.num_ctx = Some(8_000);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 2;
+
+        let error = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("the fresh giant tool output cannot be compacted → fail closed");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("function outputs were not truncated"),
+            "in-loop preflight refusal expected: {chain}"
+        );
+        assert!(
+            chain.contains("proactive compaction"),
+            "the B3 compaction reason is attached to the chain: {chain}"
+        );
+        let requests = server.received_requests().await.expect("request journal");
+        assert_eq!(
+            requests.len(),
+            1,
+            "round 0 dispatched; the oversized round 1 never did (zero second dispatch)"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the proactive guard invoked the compactor EXACTLY once on round 1"
+        );
+    }
+
+    /// #1528 B3 (B3-CG-003, item 1): after the provider rejects tools, the SAME round
+    /// retries TOOLS-DISABLED; when that retry is locally over budget the PROACTIVE
+    /// guard compacts it with a target that does NOT subtract tool-schema overhead
+    /// (the request sends none). The HTTP journal shows req1 WITH tools, req2 WITHOUT
+    /// tools and proactively compacted, and the turn completes in the same round.
+    /// (The exact "no schema subtraction" arithmetic is pinned deterministically by
+    /// `compaction_target_schema_subtraction_follows_tools` and the budget unit test.)
+    #[tokio::test]
+    async fn responses_unsupported_tools_retry_is_proactively_compacted_without_schema_overhead() {
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct UnsupportedThenDone {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for UnsupportedThenDone {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                if self.served.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "this model does not support tools"}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "done tools-disabled"}]}]
+                    }))
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(UnsupportedThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "summarize the history";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = Some(12_000);
+        ctx.num_ctx = Some(12_000);
+        ctx.max_ok_input = None;
+        ctx.recover_cw_400 = None;
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp).await.expect(
+            "tools-disabled retry is proactively compacted and completes in the same round",
+        );
+        assert_eq!(reply, "done tools-disabled");
+        let reqs = server.received_requests().await.expect("request journal");
+        assert_eq!(
+            reqs.len(),
+            2,
+            "req1 (tools) rejected, req2 (tools-disabled) retried IN THE SAME round"
+        );
+        let b1: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap_or_default();
+        assert!(b1["tools"].is_array(), "req1 advertised tools");
+        let b2: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap_or_default();
+        assert!(
+            b2["tools"].is_null(),
+            "req2 is tools-disabled (the schema overhead it must not reserve)"
+        );
+        assert!(
+            b2["input"].to_string().contains("newt-compaction-summary"),
+            "req2 was proactively compacted before dispatch"
+        );
+    }
+
+    /// #1528 B3 (B3-CG-003, item 1, reactive): tools rejected → tools-disabled retry
+    /// → a context-window 400 → REACTIVE recovery compacts the tools-disabled request
+    /// (no schema overhead reserved) and redispatches IN THE SAME round. req3 carries
+    /// no tools, is compacted, and completes.
+    #[tokio::test]
+    async fn responses_unsupported_tools_then_cw400_reactive_recovery_no_schema_overhead() {
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct UnsupportedThen400ThenDone {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for UnsupportedThen400ThenDone {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                match self.served.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "this model does not support tools"}
+                    })),
+                    1 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+                    })),
+                    _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "mock",
+                        "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "recovered tools-disabled"}]}]
+                    })),
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(UnsupportedThen400ThenDone {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let task = "summarize the history";
+        let messages = overflowing_responses_history(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_context_window_400);
+        ctx.max_tool_rounds = 1;
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("tools-disabled cw-400 recovers in the same round and completes");
+        assert_eq!(reply, "recovered tools-disabled");
+        let reqs = server.received_requests().await.expect("request journal");
+        assert_eq!(
+            reqs.len(),
+            3,
+            "req1 tools rejected, req2 tools-disabled 400, req3 tools-disabled recovered"
+        );
+        let b3: serde_json::Value = serde_json::from_slice(&reqs[2].body).unwrap_or_default();
+        assert!(
+            b3["tools"].is_null(),
+            "the recovered request is tools-disabled"
+        );
+        assert!(
+            b3["input"].to_string().contains("newt-compaction-summary"),
+            "the recovered tools-disabled request was compacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_missing_call_id_aborts_without_a_followup_request() {
+        // RR2: a `function_call` with no `call_id` cannot be correlated to its
+        // output. The turn ABORTS — no fabricated id, no follow-up request. The
+        // mock's `.expect(1)` proves only the initial dispatch reached the server.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "completed",
+                "output": [{"type": "function_call", "name": "run_command", "arguments": "{}"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let task = "do a thing";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000); // fits → dispatches, then aborts on validation
+
+        let err = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a call with no id cannot be correlated");
+        assert!(
+            err.to_string().contains("malformed provider output"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_duplicate_call_ids_abort_without_a_followup_request() {
+        // RR2: duplicate `call_id`s mis-route results — abort, no follow-up.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "completed",
+                "output": [
+                    {"type": "function_call", "call_id": "dup", "name": "a", "arguments": "{}"},
+                    {"type": "function_call", "call_id": "dup", "name": "b", "arguments": "{}"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let task = "do a thing";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000);
+
+        let err = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("duplicate ids cannot be correlated");
+        assert!(
+            err.to_string().contains("malformed provider output"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_emits_cognition_as_reasoning_effort_on_the_wire() {
+        // The psyche cognition dial must reach the real /v1/responses request as
+        // `reasoning.effort` — grounds the pure mapping test against the full loop.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "considered"}]
+                }],
+                "usage": {"input_tokens": 20, "output_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+
+        let task = "think hard about this";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+
+        let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("the request should dispatch");
+        assert_eq!(reply, "considered");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["reasoning"]["effort"], "high",
+            "cognition=contemplating must ride the wire as reasoning.effort=high"
         );
     }
 
@@ -8844,11 +11481,21 @@ mod tool_round_cap_tests {
         let error = openai_responses_complete(ctx, &mut NoMcp)
             .await
             .expect_err("giant function output must block the next request");
-        let message = error.to_string();
-        assert!(message.contains("Responses request needs"), "{message}");
+        // #1528 B3: the fresh giant tool output is the newest protected item, so the
+        // proactive guard's best-effort compaction cannot reduce it; the authoritative
+        // preflight then refuses. The headless error CHAIN (`{:#}`) carries BOTH the
+        // preflight refusal (root) AND the attached proactive-compaction reason
+        // (item 4) — so structured callers see the refusal was preceded by a real,
+        // failed compaction attempt, not a naive over-budget send.
+        let chain = format!("{error:#}");
+        assert!(chain.contains("Responses request needs"), "{chain}");
         assert!(
-            message.contains("function outputs were not truncated"),
-            "{message}"
+            chain.contains("function outputs were not truncated"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("proactive compaction"),
+            "the fail-closed error chain must attach the B3 compaction reason: {chain}"
         );
         let requests = server
             .received_requests()
@@ -8924,6 +11571,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9032,6 +11682,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9149,6 +11802,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9278,6 +11934,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9399,6 +12058,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9562,6 +12224,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9734,6 +12399,9 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 persona_tools: None,
+                cognition: None,
+                chat_completions_capability: Default::default(),
+                reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -9792,6 +12460,275 @@ mod tool_round_cap_tests {
             reply, "nudge received, writing file now",
             "model should have responded to the nudge with a final answer"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1528 B5 — strict Responses wire validation. Every dispatch goes through
+    // `validate_responses_request`; a violation dispatches NOTHING. The loop-level
+    // tests induce a violation through the request the loop actually builds and
+    // assert `.expect(0)`; the seam-guard tests prove the same for the structural
+    // violations `build_body` can never emit, by driving the real validate→dispatch
+    // guard against a wiremock server that must stay untouched.
+    // -----------------------------------------------------------------------
+
+    /// A tool-role message in history must never reach the wire as a raw `tool`
+    /// input item — the validator refuses it BEFORE dispatch (ZERO requests).
+    #[tokio::test]
+    async fn responses_raw_tool_role_in_input_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let task = "B5 raw tool role";
+        let messages = vec![
+            MemMessage::system("base policy"),
+            MemMessage::user(task),
+            MemMessage {
+                role: crate::memory::Role::Tool,
+                content: "smuggled privileged content".into(),
+            },
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000); // budget is not the failure — the role is
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a raw tool role in input must fail closed before dispatch");
+        assert_no_requests(&server).await;
+    }
+
+    /// A malformed `spill:` content handle in history is refused before dispatch.
+    #[tokio::test]
+    async fn responses_malformed_cid_marker_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // A long alnum run after `spill:` that is not a canonical CID.
+        let bogus = "b".to_string() + &"z".repeat(58);
+        let task = format!("recall memory_fetch(\"spill:{bogus}\") please");
+        let messages = vec![MemMessage::system("base policy"), MemMessage::user(&task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000);
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a malformed CID marker must fail closed before dispatch");
+        assert_no_requests(&server).await;
+    }
+
+    /// A canonically-spelled but FOREIGN-session `spill:` handle is refused before
+    /// dispatch — parses, but does not resolve in this session's store.
+    #[tokio::test]
+    async fn responses_foreign_session_cid_marker_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let foreign = SpillCid::of(&SpillRecordV1::new(
+            SpillScope::Session([2u8; 16]),
+            SpillProvenance::ToolOutput { tool_name: None },
+            "someone else's secret".to_string(),
+        ))
+        .unwrap();
+        let task = format!("memory_fetch(\"spill:{}\")", foreign.to_handle());
+        let messages = vec![MemMessage::system("base policy"), MemMessage::user(&task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        // THIS session's store is a DIFFERENT nonce, so the foreign handle is absent.
+        let store = SessionSpillStore::new([1u8; 16]);
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000);
+        ctx.spill_store = Some(&store);
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a foreign-session CID marker must fail closed before dispatch");
+        assert_no_requests(&server).await;
+    }
+
+    /// Seam guard: send `body` through the REAL validate→dispatch path against a
+    /// wiremock server that must stay untouched. A `Some(budget)` drives the
+    /// over-budget refusal; `tools_permitted=false` models the final summary.
+    async fn assert_validation_blocks_dispatch(
+        body: serde_json::Value,
+        tools_permitted: bool,
+        authoritative_budget: Option<usize>,
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let url = format!("{}/v1/responses", server.uri());
+        let policy = responses_wire_validation::ResponsesWirePolicy {
+            store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+            tools_permitted,
+            model: "m",
+            authoritative_budget,
+            calibration: 1.0,
+            estimation: crate::tokens::TokenEstimation::default(),
+            spill: None,
+            compaction: None,
+        };
+        let client = reqwest::Client::new();
+        // The type system requires a ValidatedResponsesRequest to dispatch; a
+        // rejected validation can never construct one, so dispatch is unreachable.
+        if let Ok(validated) = responses_wire_validation::validate_responses_request(&body, &policy)
+        {
+            let _ = super::dispatch_responses_json(
+                &client,
+                &url,
+                None,
+                &validated,
+                &tui_retry_policy(),
+                false,
+            )
+            .await;
+        }
+        assert_no_requests(&server).await;
+    }
+
+    fn b5_valid_body() -> serde_json::Value {
+        serde_json::json!({
+            "model": "m",
+            "store": crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+            "instructions": "be terse",
+            "input": [{"role": "user", "content": "hello"}],
+        })
+    }
+
+    #[tokio::test]
+    async fn responses_store_policy_mismatch_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["store"] = serde_json::json!(true);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_num_ctx_present_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["num_ctx"] = serde_json::json!(4096);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_duplicate_instructions_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([
+            {"role": "system", "content": "laundered second instruction source"},
+            {"role": "user", "content": "hello"},
+        ]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_invalid_input_item_type_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([{"type": "web_search_call", "id": "ws_1"}]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_dangling_function_output_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        ]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_missing_correlation_id_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([
+            {"type": "function_call", "name": "x", "arguments": "{}"},
+        ]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_tools_on_final_summary_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["tools"] = serde_json::json!([
+            {"type": "function", "name": "x", "parameters": {"type": "object"}},
+        ]);
+        // tools_permitted=false ⇒ the final tools-disabled summary rejects any tools.
+        assert_validation_blocks_dispatch(body, false, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_strict_schema_loss_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["tools"] = serde_json::json!([{
+            "type": "function",
+            "name": "write_file",
+            "parameters": {"type": "object", "additionalProperties": false},
+        }]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_over_budget_rebuilt_request_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([{"role": "user", "content": "x ".repeat(4_000)}]);
+        // A 1-token budget cannot fit the rebuilt request.
+        assert_validation_blocks_dispatch(body, true, Some(1)).await;
+    }
+
+    /// Positive control: a valid body passes validation and dispatches EXACTLY once
+    /// through the real dispatcher — proving the guard blocks only violations.
+    #[tokio::test]
+    async fn responses_valid_request_dispatches_exactly_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url = format!("{}/v1/responses", server.uri());
+        let policy = responses_wire_validation::ResponsesWirePolicy {
+            store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+            tools_permitted: true,
+            model: "m",
+            authoritative_budget: None,
+            calibration: 1.0,
+            estimation: crate::tokens::TokenEstimation::default(),
+            spill: None,
+            compaction: None,
+        };
+        let validated =
+            responses_wire_validation::validate_responses_request(&b5_valid_body(), &policy)
+                .expect("a well-formed body validates");
+        let client = reqwest::Client::new();
+        super::dispatch_responses_json(&client, &url, None, &validated, &tui_retry_policy(), false)
+            .await
+            .expect("the validated request dispatches");
+        let reqs = server.received_requests().await.expect("journal");
+        assert_eq!(reqs.len(), 1, "a validated request dispatches exactly once");
     }
 
     /// A `recover_cw_400` hook for the chat-path cw-400 recovery tests. It
@@ -10331,6 +13268,9 @@ mod save_note_loop_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -10832,6 +13772,9 @@ mod compression_loop_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -12122,6 +15065,9 @@ mod observation_hook_tests {
             step_ledger: None,
             caveats,
             persona_tools: None,
+            cognition: None,
+            chat_completions_capability: Default::default(),
+            reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -12707,6 +15653,447 @@ mod observation_hook_tests {
                 .iter()
                 .any(|o| matches!(o, RoundObservation::Accepted { .. })),
             "empty rounds are not Accepted evidence: {observations:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1528 B4 — accepted-round usage observations (Phase 3). The emit rules:
+    // an `Accepted` observation is reported ONLY for (a) completed usable text
+    // or (b) a FULLY-VALIDATED tool-call batch (after whole-batch validation,
+    // before the first tool side effect); NEVER for a content-invalid or
+    // correlation-impossible batch, an empty response, or a round the backend
+    // reported no usage for. A collecting hook records every observation.
+    // ---------------------------------------------------------------------
+
+    fn accepted_prompts(observations: &[RoundObservation]) -> Vec<u32> {
+        observations
+            .iter()
+            .filter_map(|o| match o {
+                RoundObservation::Accepted { prompt_tokens, .. } => Some(*prompt_tokens),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// B4 rule (a): a single completed-usable-text round emits EXACTLY one
+    /// `Accepted`, carrying the backend's reported prompt size.
+    struct OllamaTextOnce {
+        prompt: u32,
+    }
+    impl Respond for OllamaTextOnce {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let p = self.prompt;
+            if is_stream(req) {
+                return ndjson(&[serde_json::json!({
+                    "message": {"content": "final answer ready"}, "done": true,
+                    "prompt_eval_count": p, "eval_count": 4
+                })]);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": "final answer ready"},
+                "prompt_eval_count": p, "eval_count": 4,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_text_emits_exactly_one_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaTextOnce { prompt: 5_000 })
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("a usable-text turn completes");
+
+        assert_eq!(reply, "final answer ready");
+        assert_eq!(
+            accepted_prompts(&observations),
+            vec![5_000],
+            "exactly one Accepted for one usable-text response: {observations:?}"
+        );
+    }
+
+    /// B4 rules (b) + "a later tool-execution FAILURE does not erase the
+    /// provider-accept evidence": a WELL-FORMED tool batch (valid name + object
+    /// args) is validated, so exactly one `Accepted` is emitted for that round —
+    /// and it STILL stands after the tool call then fails at execution (the tool
+    /// does not exist). The following round's final text emits its own single
+    /// `Accepted`, proving at-most-one per response across the two rounds.
+    struct OllamaValidToolThenText {
+        probes: Arc<AtomicUsize>,
+    }
+    impl Respond for OllamaValidToolThenText {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                return ndjson(&[serde_json::json!({
+                    "message": {"content": "all done"}, "done": true,
+                    "prompt_eval_count": 5_200, "eval_count": 3
+                })]);
+            }
+            let n = self.probes.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // A structurally VALID call to a tool that does not exist: the
+                // batch validates (name present, object args), so it is accept
+                // evidence; execution then fails with an unknown-tool result.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "", "tool_calls": [{
+                        "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
+                    }]},
+                    "prompt_eval_count": 6_000, "eval_count": 5,
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "all done"},
+                    "prompt_eval_count": 5_200, "eval_count": 3,
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validated_tool_calls_emit_one_accepted_and_survive_execution_failure() {
+        let server = MockServer::start().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaValidToolThenText {
+                probes: probes.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the tool round then the final answer complete the turn");
+
+        assert_eq!(reply, "all done");
+        // One Accepted for the validated tool round (6_000) and one for the
+        // final text (5_200) — at most one per response, and the tool round's
+        // Accepted survives the unknown-tool execution failure.
+        assert_eq!(
+            accepted_prompts(&observations),
+            vec![6_000, 5_200],
+            "validated tool round + final text each emit exactly one Accepted: {observations:?}"
+        );
+    }
+
+    /// B4 rule: a CONTENT-INVALID tool batch (RR1) — here a call with no name —
+    /// is NOT usable output, so NO `Accepted` is emitted for that round; the
+    /// loop echoes the rejection and re-dispatches, and only the following valid
+    /// text round is accepted. FAILS on the pre-fix code, which emitted
+    /// `Accepted` BEFORE validating the batch.
+    struct OllamaMalformedThenText {
+        probes: Arc<AtomicUsize>,
+    }
+    impl Respond for OllamaMalformedThenText {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                return ndjson(&[serde_json::json!({
+                    "message": {"content": "recovered answer"}, "done": true,
+                    "prompt_eval_count": 5_200, "eval_count": 3
+                })]);
+            }
+            let n = self.probes.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Malformed: a tool call with NO name → BatchRejection::ContentInvalid.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "", "tool_calls": [{
+                        "function": {"arguments": {}}
+                    }]},
+                    "prompt_eval_count": 6_000, "eval_count": 5,
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "recovered answer"},
+                    "prompt_eval_count": 5_200, "eval_count": 3,
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn content_invalid_tool_batch_emits_no_accepted() {
+        let server = MockServer::start().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaMalformedThenText {
+                probes: probes.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the rejected batch re-dispatches to a valid answer");
+
+        assert_eq!(reply, "recovered answer");
+        let accepted = accepted_prompts(&observations);
+        assert!(
+            !accepted.contains(&6_000),
+            "a content-invalid batch is NOT accept evidence (would fire pre-fix): {observations:?}"
+        );
+        assert_eq!(
+            accepted,
+            vec![5_200],
+            "only the re-dispatched valid text round is accepted: {observations:?}"
+        );
+    }
+
+    /// OpenAI mirror: a CONTENT-INVALID batch (valid unique id, missing name →
+    /// RR1) emits NO `Accepted`; the loop echoes a keyed rejection and
+    /// re-dispatches. FAILS on the pre-fix code.
+    struct OpenAiMalformedThenText;
+    impl Respond for OpenAiMalformedThenText {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let has_tool_result = body_json(req)["messages"]
+                .as_array()
+                .map(|m| m.iter().any(|x| x["role"] == "tool"))
+                .unwrap_or(false);
+            if has_tool_result {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "recovered answer"}}],
+                    "usage": {"prompt_tokens": 5_200, "completion_tokens": 4},
+                }))
+            } else {
+                // Valid unique id, but the call has no name → ContentInvalid.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1", "type": "function",
+                            "function": {"arguments": "{}"}
+                        }]
+                    }}],
+                    "usage": {"prompt_tokens": 6_000, "completion_tokens": 5},
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_content_invalid_tool_batch_emits_no_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiMalformedThenText)
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.api_key = Some("sk-test");
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the rejected batch re-dispatches to a valid answer");
+
+        assert_eq!(reply, "recovered answer");
+        let accepted = accepted_prompts(&observations);
+        assert!(
+            !accepted.contains(&6_000),
+            "a content-invalid batch is NOT accept evidence (would fire pre-fix): {observations:?}"
+        );
+        assert_eq!(
+            accepted,
+            vec![5_200],
+            "only the valid round is accepted: {observations:?}"
+        );
+    }
+
+    /// OpenAI RR2: a CORRELATION-IMPOSSIBLE batch (duplicate `tool_call_id`)
+    /// aborts the turn with an error and emits NO `Accepted` — a mis-routable
+    /// batch is never provider-accept evidence. FAILS on the pre-fix code, which
+    /// emitted `Accepted` before the correlation check.
+    struct OpenAiDuplicateId;
+    impl Respond for OpenAiDuplicateId {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": null,
+                    "tool_calls": [
+                        {"id": "dup", "type": "function",
+                         "function": {"name": "definitely_not_a_real_tool", "arguments": "{}"}},
+                        {"id": "dup", "type": "function",
+                         "function": {"name": "definitely_not_a_real_tool", "arguments": "{}"}}
+                    ]
+                }}],
+                "usage": {"prompt_tokens": 6_000, "completion_tokens": 5},
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_correlation_impossible_duplicate_id_emits_no_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiDuplicateId)
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.api_key = Some("sk-test");
+        c.on_round_usage = Some(&mut hook);
+        let err = chat_complete(c, &mut NoMcp)
+            .await
+            .expect_err("a duplicate call id aborts the turn");
+        assert!(
+            err.to_string().contains("malformed provider output"),
+            "{err}"
+        );
+        assert!(
+            accepted_prompts(&observations).is_empty(),
+            "a correlation-impossible batch is never accept evidence (would fire pre-fix): {observations:?}"
+        );
+    }
+
+    /// OpenAI RR2: a CORRELATION-IMPOSSIBLE batch (missing `tool_call_id`) aborts
+    /// the turn and emits NO `Accepted`. FAILS on the pre-fix code.
+    struct OpenAiMissingId;
+    impl Respond for OpenAiMissingId {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {"name": "definitely_not_a_real_tool", "arguments": "{}"}
+                    }]
+                }}],
+                "usage": {"prompt_tokens": 6_000, "completion_tokens": 5},
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_correlation_impossible_missing_id_emits_no_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiMissingId)
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.api_key = Some("sk-test");
+        c.on_round_usage = Some(&mut hook);
+        let err = chat_complete(c, &mut NoMcp)
+            .await
+            .expect_err("a missing call id aborts the turn");
+        assert!(
+            err.to_string().contains("malformed provider output"),
+            "{err}"
+        );
+        assert!(
+            accepted_prompts(&observations).is_empty(),
+            "a correlation-impossible batch is never accept evidence (would fire pre-fix): {observations:?}"
+        );
+    }
+
+    /// B4 rule: unknown/absent usage must not invent an exact measurement — a
+    /// round the backend reported NO usage for emits NO `Accepted`, even though
+    /// the text itself is usable.
+    struct OllamaTextNoUsage;
+    impl Respond for OllamaTextNoUsage {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                return ndjson(&[serde_json::json!({
+                    "message": {"content": "answer"}, "done": true
+                })]);
+            }
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"message": {"content": "answer"}}))
+        }
+    }
+
+    #[tokio::test]
+    async fn none_usage_round_emits_no_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaTextNoUsage)
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("a usable-text turn with no usage still completes");
+
+        assert_eq!(reply, "answer");
+        assert!(
+            accepted_prompts(&observations).is_empty(),
+            "no usage → no invented measurement, hence no Accepted: {observations:?}"
         );
     }
 }

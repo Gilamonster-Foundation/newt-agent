@@ -30,8 +30,9 @@ pub(super) const DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN: usize = 3;
 
 /// Process-wide model-facing output budget, in tokens. Defaults to
 /// [`DEFAULT_MAX_OUTPUT_TOKENS`]; the resolved `[tools] max_output_tokens`
-/// config value is pushed here once at the config-resolution entry
-/// (`Config::resolve`) so the tool loop never re-reads config from disk. This is
+/// config value is pushed here at the runtime-application entry
+/// (`Config::apply_runtime_settings`) so the tool loop never re-reads config
+/// from disk. This is
 /// the v1 (three-Cs "working code first") seam: a const default with the config
 /// override wired at the entry, rather than threading a new `usize` through
 /// `ChatCtx` + `execute_tool` + every call site (≈60, mostly tests). Follow-up:
@@ -41,9 +42,10 @@ static OUTPUT_HEAD_TOKENS: AtomicUsize = AtomicUsize::new(DEFAULT_OUTPUT_HEAD_TO
 static OUTPUT_CAP_CHARS_PER_TOKEN: AtomicUsize =
     AtomicUsize::new(DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN);
 
-/// Set the process-wide model-facing output budget (tokens). Called once from
-/// `Config::resolve` with the resolved `[tools] max_output_tokens`. `0` means
-/// "no cap" — see [`cap_model_output`] / [`paginate_read`].
+/// Set the process-wide model-facing output budget (tokens). Called from
+/// `Config::apply_runtime_settings` with the resolved `[tools]
+/// `max_output_tokens`. `0` means "no cap" — see [`cap_model_output`] /
+/// [`paginate_read`].
 pub fn set_max_output_tokens(max_tokens: usize) {
     MAX_OUTPUT_TOKENS.store(max_tokens, Ordering::Relaxed);
 }
@@ -65,9 +67,10 @@ pub(super) fn output_head_tokens() -> usize {
     OUTPUT_HEAD_TOKENS.load(Ordering::Relaxed)
 }
 
-/// Set the conservative chars/token used to size the output cap. Called once
-/// from `Config::resolve` with `[tools] output_cap_chars_per_token`. Clamped to
-/// a minimum of 1 by [`crate::tokens::TokenEstimation::new`] at the use site.
+/// Set the conservative chars/token used to size the output cap. Called from
+/// `Config::apply_runtime_settings` with `[tools]
+/// `output_cap_chars_per_token`. Clamped to a minimum of 1 by
+/// [`crate::tokens::TokenEstimation::new`] at the use site.
 pub fn set_output_cap_chars_per_token(chars_per_token: usize) {
     OUTPUT_CAP_CHARS_PER_TOKEN.store(chars_per_token, Ordering::Relaxed);
 }
@@ -97,7 +100,7 @@ pub(super) fn cap_estimator() -> crate::tokens::TokenEstimation {
 ///   ratio the cap uses, so anything the cap will truncate is spilled first (they
 ///   can never diverge and silently drop the elided middle).
 /// - **over spill budget** — the raw output already exceeds
-///   [`crate::agentic::spill::TOOL_RESULT_SPILL_CAP`] chars.
+///   [`crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP`] chars.
 pub(super) fn should_spill_full_output(
     out_bytes: usize,
     out_chars: usize,
@@ -108,7 +111,7 @@ pub(super) fn should_spill_full_output(
         return false;
     }
     let over_model_budget = cap_estimator().tokens_for_chars(out_bytes) > max_tokens;
-    let over_spill_budget = out_chars > crate::agentic::spill::TOOL_RESULT_SPILL_CAP;
+    let over_spill_budget = out_chars > crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP;
     over_model_budget || over_spill_budget
 }
 
@@ -253,7 +256,7 @@ mod tests {
         let out_bytes = 3_500;
         let out_chars = 3_500; // ASCII ⇒ bytes == chars, and < TOOL_RESULT_SPILL_CAP
         assert!(
-            out_chars < crate::agentic::spill::TOOL_RESULT_SPILL_CAP,
+            out_chars < crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP,
             "isolate over_model_budget: stay under the raw spill cap"
         );
         // The fix: conservative gate spills (over model budget).
@@ -277,7 +280,7 @@ mod tests {
     fn spill_gate_fires_on_raw_size_even_when_under_token_budget() {
         // The raw-size trigger is independent of the token budget: output past
         // TOOL_RESULT_SPILL_CAP spills even with a generous budget.
-        let big = crate::agentic::spill::TOOL_RESULT_SPILL_CAP + 1;
+        let big = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP + 1;
         assert!(should_spill_full_output(big, big, usize::MAX, true));
     }
 }

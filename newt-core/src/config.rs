@@ -83,7 +83,7 @@ pub struct Config {
     /// target, per-session plans) lives (#844). `dir` may be relative (under the
     /// repo, default `.scratch`) or absolute (`/tmp`, a k8s PVC mount) for
     /// read-only checkouts. `NEWT_SCRATCH_DIR` overrides it. Applied in
-    /// [`Config::resolve`] via [`crate::scratch::set_scratch_dir`].
+    /// [`Config::apply_runtime_settings`] via [`crate::scratch::set_scratch_dir`].
     #[serde(default)]
     pub scratch: Option<ScratchConfig>,
 
@@ -784,9 +784,11 @@ impl ColorMode {
 }
 
 /// Markdown rendering mode — the `[tui] markdown` key and the `/markdown`
-/// command (Step 25.4, #568). `Auto` renders Markdown whenever color is active;
-/// `On`/`Off` force the choice (`On` still needs color to emit ANSI). The
-/// effective decision is `mode.forced().unwrap_or(color_on) && color_on`.
+/// command (Step 25.4, #568). This controls RichTUI text output, including
+/// assistant replies and built-in Markdown documents such as `/help`. `Auto`
+/// renders Markdown whenever color is active; `On`/`Off` force the choice
+/// (`On` still needs color to emit ANSI). The effective decision is
+/// `mode.forced().unwrap_or(color_on) && color_on`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MarkdownMode {
@@ -1185,13 +1187,17 @@ pub struct ContextConfig {
     #[serde(default)]
     pub api_surface: ApiSurfaceConfig,
 
-    /// Percent of a request's `num_ctx` window usable as INPUT before the
-    /// pre-send budget gate trims (the rest is reply headroom). The historical
-    /// hardcoded value was 80 (reserve 20% for the reply). Large-window models
-    /// (e.g. Opus) can safely run this higher — raising it lets more context
-    /// ride each turn before trimming kicks in. Clamped to `1..=99`; anything
-    /// outside falls back to 80. See `num_ctx_input_ceiling` (#282).
-    #[serde(default = "default_input_ceiling_pct")]
+    /// Percentage bound on how much of a request's `num_ctx` window may be
+    /// input before the pre-send gate trims. The effective input ceiling is
+    /// the tighter of this bound and the room left by the active maximum
+    /// output. The historical hardcoded value was 80. Large-window models can
+    /// safely run this higher to pack more input when the output reserve is not
+    /// already tighter. Normalized to `1..=99`; anything outside falls back to
+    /// 80. See `num_ctx_input_ceiling` (#282).
+    #[serde(
+        default = "default_input_ceiling_pct",
+        deserialize_with = "deserialize_input_ceiling_pct"
+    )]
     pub input_ceiling_pct: u32,
 
     /// Percent-of-ceiling below which the loop emits the low-remaining-budget
@@ -1208,6 +1214,35 @@ fn default_summary_input_cap_floor_chars() -> usize {
 
 fn default_input_ceiling_pct() -> u32 {
     80
+}
+
+/// Normalize a configured input-ceiling percentage to its documented safe
+/// domain. Invalid values fall back to the historical 80% default: zero must
+/// not erase an authoritative ceiling, and 100%+ must not permit over-window
+/// input budgets.
+#[must_use]
+pub fn normalize_input_ceiling_pct(value: u32) -> u32 {
+    if (1..=99).contains(&value) {
+        value
+    } else {
+        default_input_ceiling_pct()
+    }
+}
+
+/// Resolve only the configured percentage bound for a full context window.
+/// Generation-policy output reserves compose with this value in the agentic
+/// loop; callers that hold an already-derived input cap must not apply it again.
+#[must_use]
+pub fn input_percentage_ceiling(context_window: u32, input_ceiling_pct: u32) -> u32 {
+    let pct = normalize_input_ceiling_pct(input_ceiling_pct);
+    (u64::from(context_window) * u64::from(pct) / 100) as u32
+}
+
+fn deserialize_input_ceiling_pct<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u32::deserialize(deserializer).map(normalize_input_ceiling_pct)
 }
 
 fn default_low_budget_pct() -> usize {
@@ -1697,7 +1732,8 @@ pub struct TuiConfig {
     // (#559), so the summarizer can run on its own backend. Old `[tui]` keys
     // (`summarizer_timeout_secs` / `summarizer_retries` / `summarizer_model`)
     // are no longer read — `#[serde(default)]` ignores them in stale configs.
-    /// Markdown rendering of assistant output (Step 25.4, #568). `auto`
+    /// Markdown rendering of RichTUI text output (Step 25.4, #568), including
+    /// assistant replies and built-in documents such as `/help`. `auto`
     /// (default) renders whenever color is active; `on`/`off` force it. The
     /// `/markdown [on|off]` command overrides this for the session.
     #[serde(default)]
@@ -2844,6 +2880,25 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// Resolve explicitly accepted Chat Completions request extensions.
+    #[must_use]
+    pub fn chat_completions_capability(&self) -> crate::model_card::ChatCompletionsCapability {
+        self.capability
+            .as_ref()
+            .and_then(|capability| capability.chat_completions)
+            .unwrap_or_default()
+    }
+
+    /// Resolve the backend's reasoning replay contract. Unknown or legacy
+    /// endpoints remain conservative and never receive replayed reasoning.
+    #[must_use]
+    pub fn reasoning_replay_scope(&self) -> crate::model_card::ReasoningReplayScope {
+        self.capability
+            .as_ref()
+            .and_then(|capability| capability.reasoning_replay_scope)
+            .unwrap_or_default()
+    }
+
     /// The declared model, if any — empty strings count as unset. This is the
     /// ONLY sanctioned way to read `model`; when it returns `None` the backend
     /// expects the served model to be adopted from the endpoint (Phase B).
@@ -3015,15 +3070,15 @@ impl BackendOverride {
 }
 
 /// Process-global CLI backend override, set once from the CLI before any config
-/// resolution. Mirrors the other single-canonical-entry publishes in
-/// [`Config::resolve`] (max_output_tokens, scratch dir): the CLI can't thread a
-/// value through every `Config::resolve()` call site, so it stashes it here and
-/// `resolve` applies it.
+/// application. Mirrors the other publishes in
+/// [`Config::apply_runtime_settings`] (max_output_tokens, scratch dir): the CLI
+/// can't thread a value through every runtime consumer, so it stashes it here
+/// and the canonical apply operation installs it last.
 static CLI_BACKEND_OVERRIDE: std::sync::Mutex<Option<BackendOverride>> =
     std::sync::Mutex::new(None);
 
 /// Install the CLI backend override (see [`BackendOverride`]). Call once, before
-/// the first [`Config::resolve`].
+/// the first [`Config::apply_runtime_settings`] call.
 pub fn set_cli_backend_override(over: BackendOverride) {
     if let Ok(mut slot) = CLI_BACKEND_OVERRIDE.lock() {
         *slot = Some(over);
@@ -3172,6 +3227,49 @@ pub struct ProviderConfig {
     pub tiers: Vec<Tier>,
 }
 
+/// The backend the shared precedence selected — a configured `[[backends]]`
+/// entry or a `[[providers]]` plugin. Returned inside [`SelectionOutcome`] by
+/// [`Config::select_backend`] so every surface resolves ONE backend, then
+/// instantiates exactly that one.
+///
+/// Not `PartialEq`/`Eq`: it borrows [`BackendConfig`] (which carries an `f64`
+/// field, so it cannot be `Eq`) and [`ProviderConfig`]. Compare on an owned
+/// projection (a name/endpoint), not on the borrow.
+#[derive(Debug, Clone)]
+pub enum SelectedBackend<'a> {
+    Configured(&'a BackendConfig),
+    Provider(&'a ProviderConfig),
+}
+
+/// The outcome of the shared backend-selection contract
+/// ([`Config::select_backend`]). Three cases — kept distinct so the caller
+/// cannot collapse an operator error into a silent fallback:
+///
+/// - [`Selected`](Self::Selected): the precedence picked a concrete backend
+///   or provider — instantiate exactly that one.
+/// - [`UnknownNamed`](Self::UnknownNamed): an *explicit* selector
+///   (`$NEWT_PROVIDER` or `default_backend`) named an entry that matches **no**
+///   configured backend or provider. This is an operator error (a typo in the
+///   selector), NOT a cue to run some other backend. The caller MUST surface it
+///   rather than fall back — otherwise a mistyped `$NEWT_PROVIDER` silently
+///   runs the wrong model (invariant: an explicitly selected backend is
+///   authoritative; no silent fallback).
+/// - [`Unset`](Self::Unset): nothing was explicitly selected and nothing
+///   configured qualified. Only here may the caller fall back to local
+///   discovery.
+///
+/// Not `PartialEq`/`Eq` for the same reason as [`SelectedBackend`]; match on it
+/// or compare an owned projection.
+#[derive(Debug, Clone)]
+pub enum SelectionOutcome<'a> {
+    /// The precedence selected this backend/provider.
+    Selected(SelectedBackend<'a>),
+    /// An explicit selector named something that matches no configured entry.
+    UnknownNamed(String),
+    /// Nothing explicitly selected and nothing configured qualified.
+    Unset,
+}
+
 // ---------------------------------------------------------------------------
 // Default
 // ---------------------------------------------------------------------------
@@ -3252,7 +3350,7 @@ pub fn writeback_probed_backend(
     merged.provenance = Some(BackendProvenance {
         source: Some(format!(
             "newt adopt v{} (probed; delete this file to reset)",
-            env!("CARGO_PKG_VERSION")
+            crate::build_info::VERSION_WITH_COMMIT
         )),
         probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
         derived_serving: patch
@@ -3354,9 +3452,10 @@ impl Config {
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
         // root — `cd repo && newt` → same host-RCE class as the walk-up) rather
-        // than an operator-explicit base? Only `$NEWT_CONFIG` can pin a base here
-        // (the `--config` flag routes through `Config::load`, never `resolve`);
-        // if it points AT `./newt.toml` that is the operator's explicit choice
+        // than an operator-explicit base? `$NEWT_CONFIG` pins a base at this
+        // resolution layer (interactive `--config` publishes that env;
+        // explicit-profile consumers may instead call `Config::load`). If it
+        // points AT `./newt.toml`, that is the operator's explicit choice
         // (Trusted). Every other `./newt.toml` base is ambient → Untrusted.
         let base_ambient = base_is_ambient_newt_toml(base_path.as_deref());
         // A project-local config that *is* the base (e.g. cwd is the project and
@@ -3428,15 +3527,6 @@ impl Config {
         if cfg.backends.is_empty() {
             cfg.backends.push(fallback_localhost_backend());
         }
-        // CLI `--backend-*` flags win over disk drop-ins and localhost
-        // discovery: apply the process-global override LAST so an operator who
-        // pins a backend on the command line gets exactly it, and no probe
-        // write-back can silently reroute the session (the ollama-fallback
-        // incident). Applied here — the single canonical config-application
-        // entry — so every consumer (TUI, cowork, eval) honors it.
-        if let Some(over) = cli_backend_override() {
-            over.apply(&mut cfg);
-        }
         // Per-file bundles (the model-support-kit control surface): drop a
         // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
         cfg.merge_disk_bundles();
@@ -3453,30 +3543,45 @@ impl Config {
         // own file, no inline `[[dgx.nodes]]`. The active selection
         // (active_node/active_endpoint/active_model) stays in `[dgx]`.
         cfg.merge_disk_dgx_nodes();
+        cfg.apply_runtime_settings();
+        Ok(cfg)
+    }
+
+    /// Apply one final resolved configuration to the runtime.
+    ///
+    /// Configuration loading stays pure. Runtime consumers that use
+    /// [`Config::load`] for an explicit profile must invoke this once after
+    /// loading; normal discovery via [`Config::resolve`] invokes it before
+    /// returning. This is also the single owner for process-global
+    /// `--backend-*` precedence, so an explicit config file cannot defeat a
+    /// higher-precedence per-invocation backend pin.
+    pub fn apply_runtime_settings(&mut self) {
+        // CLI `--backend-*` flags win over every configuration source. Apply
+        // them here, after both explicit loading and normal discovery have
+        // finished, so all runtime entry points receive the same backend.
+        if let Some(over) = cli_backend_override() {
+            over.apply(self);
+        }
         // #726: push the resolved `[tools] max_output_tokens` into the
-        // process-wide model-facing output budget. `Config::resolve` is the
-        // single canonical config-application entry, so every consumer (TUI,
-        // cowork driver, eval) gets the override here without threading a new
-        // `usize` through `ChatCtx` + `execute_tool` + every call site. Idempotent.
-        crate::agentic::set_max_output_tokens(cfg.max_output_tokens());
-        crate::agentic::set_output_head_tokens(cfg.output_head_tokens());
-        crate::agentic::set_output_cap_chars_per_token(cfg.output_cap_chars_per_token());
-        // #tenacity: publish the resolved `[tenacity]` config so `effective_tenacity`
-        // can pick the per-family default for the active model. An explicit
-        // `--tenacity` still supersedes it (resolved in `effective_tenacity`).
-        crate::tenacity::set_tenacity_config(cfg.tenacity.clone().unwrap_or_default());
-        // #880: publish the repo `[lifecycle]` overrides the same way — the single
-        // canonical config-application entry — so the crew's normalize (and future
-        // phase consumers) honor `.newt/config.toml`.
-        if let Some(lc) = &cfg.lifecycle {
+        // process-wide model-facing output budget without threading a new
+        // `usize` through `ChatCtx` + `execute_tool` + every call site.
+        crate::agentic::set_max_output_tokens(self.max_output_tokens());
+        crate::agentic::set_output_head_tokens(self.output_head_tokens());
+        crate::agentic::set_output_cap_chars_per_token(self.output_cap_chars_per_token());
+        // #tenacity: publish the resolved `[tenacity]` config so
+        // `effective_tenacity` can pick the per-family default for the active
+        // model. An explicit `--tenacity` still supersedes it.
+        crate::tenacity::set_tenacity_config(self.tenacity.clone().unwrap_or_default());
+        // #880: publish the repo `[lifecycle]` overrides so the crew's normalize
+        // (and future phase consumers) honor them.
+        if let Some(lc) = &self.lifecycle {
             crate::tooling::set_lifecycle_override(lc.clone());
         }
-        // #844: publish `[scratch] dir` the same way — so crew worktrees / the crew
-        // target / session plans honor it. `NEWT_SCRATCH_DIR` still overrides.
-        if let Some(dir) = cfg.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
+        // #844: publish `[scratch] dir` so crew worktrees / the crew target /
+        // session plans honor it. `NEWT_SCRATCH_DIR` still overrides.
+        if let Some(dir) = self.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
             crate::scratch::set_scratch_dir(dir);
         }
-        Ok(cfg)
     }
 
     /// The configured model-facing output token budget (`[tools]
@@ -3826,6 +3931,105 @@ impl Config {
     /// This is the first path `resolve()` reads and the target for `save()`.
     pub fn user_config_path() -> Option<PathBuf> {
         Self::user_config_dir().map(|dir| dir.join("config.toml"))
+    }
+
+    /// The shared config-based backend-selection precedence (#1320, PR-3) — the
+    /// single definition used by chat's `resolve_backend_choice` config rungs, by
+    /// `solve`, and by the ACP worker, so every entry point agrees on which
+    /// configured backend the operator named. Most-specific first: `$NEWT_PROVIDER`
+    /// names a backend > `default_backend` (usable) > a sole backend > prefer an
+    /// OpenAI-kind entry, else the first endpoint-bearing one. `None` only when no
+    /// backend has an endpoint. Env-synthesized fallbacks (codex, legacy dgx,
+    /// localhost) stay in chat's `resolve_backend_choice`, layered around this.
+    #[must_use]
+    pub fn select_configured_backend(&self) -> Option<&BackendConfig> {
+        // 1. Operator / live override: $NEWT_PROVIDER names a backend.
+        if let Ok(name) = std::env::var("NEWT_PROVIDER") {
+            if !name.is_empty() {
+                if let Some(b) = self.backends.iter().find(|b| b.name == name) {
+                    return Some(b);
+                }
+            }
+        }
+        // 2. The configured default (usable — skip an endpointless one).
+        if let Some(name) = &self.default_backend {
+            if let Some(b) = self
+                .backends
+                .iter()
+                .find(|b| b.name == *name && !b.endpoint.is_empty())
+            {
+                return Some(b);
+            }
+        }
+        // 3. A sole backend is the obvious choice.
+        if self.backends.len() == 1 {
+            return self.backends.first().filter(|b| !b.endpoint.is_empty());
+        }
+        // 4. Prefer an OpenAI-kind entry, else the first endpoint-bearing one.
+        self.backends
+            .iter()
+            .find(|b| b.kind == Some(BackendKind::Openai) && !b.endpoint.is_empty())
+            .or_else(|| self.backends.iter().find(|b| !b.endpoint.is_empty()))
+    }
+
+    /// The ONE backend-selection contract, unified across `[[backends]]` and
+    /// `[[providers]]`, so an explicitly named backend is authoritative on every
+    /// surface (chat / solve / worker). Precedence, most-specific first:
+    /// `$NEWT_PROVIDER` (names a backend OR a provider) > `default_backend`
+    /// (either) > a sole configured backend > the preference rules of
+    /// [`Self::select_configured_backend`] > a sole/first provider.
+    ///
+    /// Returns a [`SelectionOutcome`]: `Selected` when the precedence picks a
+    /// concrete backend/provider; `UnknownNamed` when an *explicit* selector
+    /// names something that matches nothing configured (an operator error — the
+    /// caller must NOT fall back to a different backend); `Unset` only when
+    /// nothing is explicitly selected and nothing configured qualifies, at which
+    /// point the caller may fall back to local discovery.
+    ///
+    /// A provider is chosen only when the precedence selects it: a bare
+    /// `providers.first()` never bypasses `$NEWT_PROVIDER` / `default_backend`
+    /// (the ACP-worker bug this closes).
+    pub fn select_backend(&self) -> SelectionOutcome<'_> {
+        // The most-specific PRESENT selector decides — `$NEWT_PROVIDER` if set,
+        // else `default_backend`. Only that one selector is consulted: if it is
+        // set but names nothing, we must NOT fall through to the next selector or
+        // to preference (either would be a silent fallback). A mistyped
+        // `$NEWT_PROVIDER` is an error, not permission to run `default_backend`.
+        let explicit_selector = std::env::var("NEWT_PROVIDER")
+            .ok()
+            .filter(|n| !n.is_empty())
+            .or_else(|| self.default_backend.clone().filter(|n| !n.is_empty()));
+        if let Some(name) = explicit_selector {
+            // A usable backend claims this name → fall through to the shared
+            // precedence below (which re-checks `$NEWT_PROVIDER` / `default_backend`
+            // and selects exactly that backend). Backends win a name tie.
+            let usable_backend = self
+                .backends
+                .iter()
+                .any(|b| b.name == name && !b.endpoint.is_empty());
+            if !usable_backend {
+                // A provider claims this name → select it.
+                if let Some(provider) = self.providers.iter().find(|p| p.name == name) {
+                    return SelectionOutcome::Selected(SelectedBackend::Provider(provider));
+                }
+                // The name matches nothing configured — neither a backend (even an
+                // endpointless one) nor a provider — so it is an operator error.
+                // (A name matching only an endpointless backend is "configured but
+                // unusable", not "unknown": fall through to the preference rules.)
+                if !self.backends.iter().any(|b| b.name == name) {
+                    return SelectionOutcome::UnknownNamed(name);
+                }
+            }
+        }
+        // The shared backend precedence (sole > prefer-openai > first usable).
+        if let Some(backend) = self.select_configured_backend() {
+            return SelectionOutcome::Selected(SelectedBackend::Configured(backend));
+        }
+        // Nothing in [[backends]] qualified: a sole/first provider, else Unset.
+        match self.providers.first() {
+            Some(provider) => SelectionOutcome::Selected(SelectedBackend::Provider(provider)),
+            None => SelectionOutcome::Unset,
+        }
     }
 
     /// Serialize the config to pretty TOML for **audit**, with inline secret
@@ -4743,6 +4947,32 @@ mod tests {
     }
 
     #[test]
+    fn context_input_ceiling_pct_normalizes_at_deserialization_boundary() {
+        for value in [1, 80, 99] {
+            let parsed: ContextConfig =
+                toml::from_str(&format!("input_ceiling_pct = {value}")).unwrap();
+            assert_eq!(parsed.input_ceiling_pct, value);
+        }
+
+        for value in [0, 100, 101, u32::MAX] {
+            let parsed: ContextConfig =
+                toml::from_str(&format!("input_ceiling_pct = {value}")).unwrap();
+            assert_eq!(
+                parsed.input_ceiling_pct,
+                default_input_ceiling_pct(),
+                "out-of-range value {value} must fall back to the documented safe default"
+            );
+        }
+
+        assert_eq!(input_percentage_ceiling(32_768, 90), 29_491);
+        assert_eq!(
+            input_percentage_ceiling(32_768, 0),
+            26_214,
+            "programmatic callers share the same invalid-value fallback",
+        );
+    }
+
+    #[test]
     fn scratch_section_defaults_and_parses() {
         // #844: `[scratch] dir` parses onto Config; absent → None (the `.scratch`
         // default applies at resolution). Uses `from_str` (not `resolve`) so this
@@ -5455,6 +5685,47 @@ mod tests {
         let out = toml::to_string(&legacy).unwrap();
         assert!(!out.contains("serving"), "unset fields are skipped: {out}");
         assert!(!out.contains("provenance"));
+    }
+
+    #[test]
+    fn backend_reasoning_replay_scope_is_explicit_and_defaults_never() {
+        let default_backend: BackendConfig =
+            toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\n").unwrap();
+        assert_eq!(
+            default_backend.reasoning_replay_scope(),
+            crate::model_card::ReasoningReplayScope::Never
+        );
+
+        let replay_backend: BackendConfig = toml::from_str(
+            "endpoint=\"http://h:1\"\nmodel=\"m\"\n\
+             [capability]\nreasoning_replay_scope=\"current_user_turn\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            replay_backend.reasoning_replay_scope(),
+            crate::model_card::ReasoningReplayScope::CurrentUserTurn
+        );
+    }
+
+    #[test]
+    fn backend_chat_completions_generation_policy_is_explicit_capability_data() {
+        let backend: BackendConfig = toml::from_str(
+            "endpoint=\"http://h:1\"\nmodel=\"m\"\nkind=\"openai\"\n\
+             [capability.chat_completions]\ncognition=true\n\
+             chat_template_kwargs=true\nparallel_tool_calls=false\n\
+             bounded_reasoning_continuation=true\n",
+        )
+        .expect("chat-completions policy is valid capability data");
+
+        let capability = serde_json::to_value(backend.capability.expect("capability present"))
+            .expect("capability serializes");
+        assert_eq!(capability["chat_completions"]["cognition"], true);
+        assert_eq!(capability["chat_completions"]["chat_template_kwargs"], true);
+        assert_eq!(capability["chat_completions"]["parallel_tool_calls"], false);
+        assert_eq!(
+            capability["chat_completions"]["bounded_reasoning_continuation"],
+            true
+        );
     }
 
     #[test]
@@ -7677,5 +7948,291 @@ net = [\"already.example.com\"]
         assert_eq!(resolved.profile, ExposureProfile::Minimal);
         // Omitted keys fall back to the shared defaults.
         assert_eq!(resolved.schema_budget_pct, 15);
+    }
+}
+
+/// W1 (unified backend resolution) — the authoritative selection suite for
+/// [`Config::select_backend`], covering all eight precedence scenarios the
+/// corrective spec names. The companion `newt-acp-worker` suite proves the
+/// *destination* (transport + URL) each selected backend instantiates to; this
+/// suite proves *which* entry the ONE contract selects.
+///
+/// Every test is serialized on `newt_provider_env`: `select_backend` reads the
+/// process-global `$NEWT_PROVIDER`, so these must never run concurrently with
+/// one another (the env-mutating cases would otherwise leak into the env-free
+/// ones). Each `$NEWT_PROVIDER` case restores the prior value *before* asserting
+/// so a failed assert cannot pollute the next test in the lane.
+#[cfg(test)]
+mod select_backend_tests {
+    use super::*;
+
+    fn openai(name: &str, api: OpenAiApi, endpoint: &str) -> BackendConfig {
+        BackendConfig {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            model: Some("m".into()),
+            tiers: vec![Tier::Fast],
+            kind: Some(BackendKind::Openai),
+            api: Some(api),
+            ..Default::default()
+        }
+    }
+
+    fn ollama(name: &str, endpoint: &str) -> BackendConfig {
+        BackendConfig {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            model: Some("llama3.1:8b".into()),
+            tiers: vec![Tier::Fast],
+            kind: Some(BackendKind::Ollama),
+            ..Default::default()
+        }
+    }
+
+    fn plugin(name: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            command: "newt-provider-openai".into(),
+            model: Some("gpt-test".into()),
+            env_pass: vec![],
+            tiers: vec![Tier::Complex],
+        }
+    }
+
+    fn cfg(
+        backends: Vec<BackendConfig>,
+        providers: Vec<ProviderConfig>,
+        default: Option<&str>,
+    ) -> Config {
+        Config {
+            backends,
+            providers,
+            default_backend: default.map(str::to_string),
+            ..Config::default()
+        }
+    }
+
+    /// An owned, comparable summary of a [`SelectionOutcome`] so a test can drop
+    /// the borrow on `Config` before asserting (keeps env-restore panic-safe).
+    fn summary(c: &Config) -> String {
+        match c.select_backend() {
+            SelectionOutcome::Selected(SelectedBackend::Configured(b)) => {
+                format!("configured:{}:{}", b.name, b.endpoint)
+            }
+            SelectionOutcome::Selected(SelectedBackend::Provider(p)) => {
+                format!("provider:{}", p.name)
+            }
+            SelectionOutcome::UnknownNamed(n) => format!("unknown:{n}"),
+            SelectionOutcome::Unset => "unset".to_string(),
+        }
+    }
+
+    /// Run `f` with `$NEWT_PROVIDER=value`, restoring the prior value afterwards.
+    /// The closure returns an OWNED value so no borrow escapes the restore.
+    fn with_newt_provider<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("NEWT_PROVIDER").ok();
+        unsafe { std::env::set_var("NEWT_PROVIDER", value) };
+        let out = f();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("NEWT_PROVIDER", p) },
+            None => unsafe { std::env::remove_var("NEWT_PROVIDER") },
+        }
+        out
+    }
+
+    /// Guarantee `$NEWT_PROVIDER` is unset for an env-free scenario (so the lane
+    /// is deterministic regardless of a stray ambient value), restoring after.
+    fn without_newt_provider<T>(f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("NEWT_PROVIDER").ok();
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let out = f();
+        if let Some(p) = prev {
+            unsafe { std::env::set_var("NEWT_PROVIDER", p) };
+        }
+        out
+    }
+
+    // 1. default_backend selects Ollama while OpenAI is ALSO configured.
+    //    "mixed ⇒ OpenAI wins" is WRONG when Ollama was explicitly selected.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn default_backend_selects_ollama_over_configured_openai() {
+        let c = cfg(
+            vec![
+                ollama("local", "http://ollama:11434/"),
+                openai("cloud", OpenAiApi::ChatCompletions, "http://vllm:8000/"),
+            ],
+            vec![],
+            Some("local"),
+        );
+        assert_eq!(
+            without_newt_provider(|| summary(&c)),
+            "configured:local:http://ollama:11434/"
+        );
+    }
+
+    // 2. $NEWT_PROVIDER selects Ollama (over an also-configured OpenAI backend).
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn newt_provider_selects_ollama() {
+        let c = cfg(
+            vec![
+                ollama("local", "http://ollama:11434/"),
+                openai("cloud", OpenAiApi::ChatCompletions, "http://vllm:8000/"),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            with_newt_provider("local", || summary(&c)),
+            "configured:local:http://ollama:11434/"
+        );
+    }
+
+    // 3. $NEWT_PROVIDER selects the OpenAI *Chat Completions* backend by name.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn newt_provider_selects_openai_chat_completions() {
+        let c = cfg(
+            vec![
+                openai(
+                    "cloud-chat",
+                    OpenAiApi::ChatCompletions,
+                    "http://chat:8000/",
+                ),
+                openai("cloud-resp", OpenAiApi::Responses, "http://resp:8000/"),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            with_newt_provider("cloud-chat", || summary(&c)),
+            "configured:cloud-chat:http://chat:8000/"
+        );
+    }
+
+    // 4. $NEWT_PROVIDER selects the OpenAI *Responses* backend by name — the same
+    //    config as (3), a different selector, a different destination.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn newt_provider_selects_openai_responses() {
+        let c = cfg(
+            vec![
+                openai(
+                    "cloud-chat",
+                    OpenAiApi::ChatCompletions,
+                    "http://chat:8000/",
+                ),
+                openai("cloud-resp", OpenAiApi::Responses, "http://resp:8000/"),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            with_newt_provider("cloud-resp", || summary(&c)),
+            "configured:cloud-resp:http://resp:8000/"
+        );
+    }
+
+    // 5. A selected provider-plugin backend (named via default_backend), even
+    //    with an OpenAI backend also present.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn selects_provider_plugin_when_named() {
+        let c = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm:8000/",
+            )],
+            vec![plugin("myplugin")],
+            Some("myplugin"),
+        );
+        assert_eq!(without_newt_provider(|| summary(&c)), "provider:myplugin");
+    }
+
+    // 6. An explicitly selected UNSUPPORTED backend still selects *that* entry —
+    //    the "unsupported" verdict is the instantiator's job (worker suite), not
+    //    a reason for the selector to pick a different backend.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn explicitly_selected_backend_is_returned_even_if_unusual_kind() {
+        let mut embedded = BackendConfig {
+            name: "in-proc".into(),
+            endpoint: "http://in-proc/".into(),
+            kind: Some(BackendKind::Embedded),
+            model: Some("tiny".into()),
+            ..Default::default()
+        };
+        embedded.tiers = vec![Tier::Fast];
+        let c = cfg(
+            vec![
+                embedded,
+                openai("cloud", OpenAiApi::ChatCompletions, "http://vllm:8000/"),
+            ],
+            vec![],
+            Some("in-proc"),
+        );
+        // The Embedded backend is what was selected — NOT the OpenAI one.
+        assert_eq!(
+            without_newt_provider(|| summary(&c)),
+            "configured:in-proc:http://in-proc/"
+        );
+    }
+
+    // 7. No configured backend ⇒ Unset, which alone permits local discovery.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn no_configured_backend_is_unset() {
+        let c = cfg(vec![], vec![], None);
+        assert_eq!(without_newt_provider(|| summary(&c)), "unset");
+    }
+
+    // 8. An explicit selector naming a nonexistent entry is UnknownNamed — an
+    //    operator error, NOT a silent fallback to the present OpenAI backend.
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn unknown_named_backend_is_an_error_not_a_fallback() {
+        let c = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm:8000/",
+            )],
+            vec![],
+            Some("ghost"),
+        );
+        assert_eq!(without_newt_provider(|| summary(&c)), "unknown:ghost");
+        // And the same via $NEWT_PROVIDER (the live override), which must not
+        // silently defer to default_backend or to preference.
+        let c2 = cfg(
+            vec![openai(
+                "cloud",
+                OpenAiApi::ChatCompletions,
+                "http://vllm:8000/",
+            )],
+            vec![],
+            None,
+        );
+        assert_eq!(with_newt_provider("typo", || summary(&c2)), "unknown:typo");
+    }
+
+    // Guard: preference still prefers OpenAI when NOTHING is explicitly selected
+    // (the historical default is preserved — only explicit selection overrides it).
+    #[test]
+    #[serial_test::serial(newt_provider_env)]
+    fn prefers_openai_when_nothing_is_explicitly_selected() {
+        let c = cfg(
+            vec![
+                ollama("local", "http://ollama:11434/"),
+                openai("cloud", OpenAiApi::ChatCompletions, "http://vllm:8000/"),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            without_newt_provider(|| summary(&c)),
+            "configured:cloud:http://vllm:8000/"
+        );
     }
 }

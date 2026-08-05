@@ -4,6 +4,39 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::io::Write;
 
+/// Ground-truth build provenance: the real binary must report the package
+/// version and the commit checked out in the real repository. This guards the
+/// shared build-info value against drifting back to Cargo's version alone.
+#[test]
+fn version_reports_package_and_source_commit() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let git = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(git.status.success(), "git rev-parse failed: {git:?}");
+    let commit = String::from_utf8(git.stdout).unwrap();
+    let commit = commit.trim();
+
+    assert!(
+        newt_core::build_info::VERSION_WITH_COMMIT.contains(commit),
+        "build version {:?} does not identify checked-out commit {commit}",
+        newt_core::build_info::VERSION_WITH_COMMIT
+    );
+    Command::cargo_bin("newt")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(format!(
+            "newt {}\n",
+            newt_core::build_info::VERSION_WITH_COMMIT
+        ));
+}
+
 #[test]
 fn binary_help_surfaces_start_on_the_guarded_cli_stack() {
     // Regression for PR #746 / issue #747: on Windows, the expanded clap tree
@@ -83,15 +116,13 @@ fn help_subcommand_renders_without_a_backend() {
 }
 
 /// ANTI-DRIFT (process tier): the `newt help` BINARY must emit bytes IDENTICAL
-/// to the library renderer `newt_tui::render_help` — the same function the
-/// interactive REPL prints for `/help` and `/<cmd> --help`. Pairs with the
-/// newt-tui unit test `render_help_is_byte_identical_to_the_repl_help_corpus`
-/// (which pins `render_help` to the help_lines / command_help_page corpora): the
-/// two together prove `newt help` == the REPL `/help`, byte for byte, so the
-/// startup-free path can never silently fork from the interactive one. `NO_COLOR`
-/// pins `color_supported()` to `false` in both the binary and this expectation.
+/// to the stable plain library renderer `newt_tui::render_help`. Pairs with the
+/// newt-tui unit test `render_help_is_byte_identical_to_the_plain_help_corpus`,
+/// which pins the startup-free CLI and interactive Markdown-off fallback to
+/// the same help_lines / command_help_page corpora. `NO_COLOR` pins
+/// `color_supported()` to `false` in both the binary and this expectation.
 #[test]
-fn help_subcommand_is_byte_identical_to_the_repl_renderer() {
+fn help_subcommand_is_byte_identical_to_the_plain_renderer() {
     let cases: [(&[&str], Option<&str>); 3] = [
         (&["help"], None),
         (&["help", "dgx"], Some("dgx")),

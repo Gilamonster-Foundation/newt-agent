@@ -308,7 +308,7 @@ fn retry_step_reprompts_until_the_budget_is_spent() {
 fn inline_header_color_contains_brand_and_ready_lines() {
     let s = render_inline_header("/w", true);
     assert!(s.contains("Free, friendly, local agentic coder"));
-    assert!(s.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+    assert!(s.contains(&format!("v{VERSION}")));
     assert!(s.contains("ready — type a task, /help for commands, /exit to quit"));
     // Text is placed just past the 20-col logo via absolute column moves.
     assert!(s.contains("\x1b[23G"));
@@ -358,7 +358,7 @@ fn resolve_workspace_falls_back_gracefully() {
 #[test]
 fn slash_exit_returns_false() {
     for cmd in ["/exit", "/quit"] {
-        let result = dispatch_slash(cmd, "/ws", false, false).unwrap();
+        let result = dispatch_slash(cmd, "/ws", false, false, false).unwrap();
         assert!(!result, "{cmd} should return false (exit)");
     }
 }
@@ -850,7 +850,7 @@ fn mouse_viewport_optin_reads_from_config_default_off() {
 
 #[test]
 fn slash_help_returns_true() {
-    assert!(dispatch_slash("/help", "/ws", false, false).unwrap());
+    assert!(dispatch_slash("/help", "/ws", false, false, false).unwrap());
 }
 
 #[test]
@@ -943,20 +943,16 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
     assert!(spill_help.contains("⧉"));
     assert!(spill_help.contains("▣"));
     // The unknown-topic miss is reported (returns false).
-    assert!(!print_command_help("bogus", false, false));
+    assert!(!print_command_help("bogus", false, false, false));
 }
 
-/// ANTI-DRIFT: the startup-free `render_help` path (behind `newt help`) must
-/// emit bytes IDENTICAL to what the interactive REPL prints for `/help` and
-/// `/<cmd> --help`. Both surfaces route through `render_help`, so this pins the
-/// output against the single-source-of-truth corpora (`help_lines` /
-/// `command_help_page`) reconstructed the way the REPL printed them before the
-/// decouple: `print_newt` == `println!(newt_line(...))` (a `newt_line` + `\n`),
-/// then one corpus line per `\n`-terminated row. If `render_help` ever reshapes,
-/// drops, or reorders a line relative to the corpus, this fails — the exact
-/// plausible-but-unwired divergence a forked second help path would introduce.
+/// ANTI-DRIFT: the startup-free `render_help` path (behind `newt help`) and the
+/// interactive TUI's Markdown-off fallback must stay pinned to the
+/// single-source-of-truth corpora (`help_lines` / `command_help_page`):
+/// `print_newt` == `println!(newt_line(...))` (a `newt_line` + `\n`), then one
+/// corpus line per `\n`-terminated row.
 #[test]
-fn render_help_is_byte_identical_to_the_repl_help_corpus() {
+fn render_help_is_byte_identical_to_the_plain_help_corpus() {
     for &(color, verbose) in &[(false, false), (true, false), (false, true), (true, true)] {
         // Bare `/help` — the full command list.
         let mut expected = newt_line("Available commands:", color, verbose);
@@ -1003,14 +999,48 @@ fn render_help_is_byte_identical_to_the_repl_help_corpus() {
     }
 }
 
+/// RichTUI help is a Markdown document, governed by the same `[tui].markdown`
+/// policy as assistant output. The plain/startup-free corpus remains available
+/// when rendering is disabled.
+#[test]
+fn rich_help_uses_the_default_markdown_policy_and_honors_off() {
+    let default_cfg = newt_core::Config::default();
+    let markdown = markdown_enabled(&default_cfg, true, None);
+    assert!(markdown, "RichTUI defaults to rendered Markdown");
+
+    let rendered = render_help_for_tui(None, true, false, markdown, 100);
+    assert!(
+        rendered.starts_with("▸  \x1b[1m\x1b[38;2;220;60;20mAvailable"),
+        "the narrator prefix must stay outside the Markdown parser: {rendered:?}"
+    );
+    assert!(!rendered.contains("## Available commands"));
+    assert!(rendered.contains("commands"));
+    assert!(rendered.contains("• "));
+    assert!(rendered.contains("/models"));
+
+    let cfg_off = newt_core::Config {
+        tui: Some(newt_core::TuiConfig {
+            markdown: newt_core::MarkdownMode::Off,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let markdown = markdown_enabled(&cfg_off, true, None);
+    assert!(!markdown);
+    assert_eq!(
+        render_help_for_tui(None, true, false, markdown, 100),
+        render_help(None, true, false)
+    );
+}
+
 #[test]
 fn slash_version_returns_true() {
-    assert!(dispatch_slash("/version", "/ws", false, false).unwrap());
+    assert!(dispatch_slash("/version", "/ws", false, false, false).unwrap());
 }
 
 #[test]
 fn slash_workspace_returns_true() {
-    assert!(dispatch_slash("/workspace", "/ws", false, false).unwrap());
+    assert!(dispatch_slash("/workspace", "/ws", false, false, false).unwrap());
 }
 
 #[test]
@@ -1118,7 +1148,7 @@ fn loadout_view_renders_when_none_active() {
 #[test]
 fn slash_config_returns_true() {
     // Dumps the resolved config (secrets redacted) and keeps the session alive.
-    assert!(dispatch_slash("/config", "/ws", false, false).unwrap());
+    assert!(dispatch_slash("/config", "/ws", false, false, false).unwrap());
 }
 
 #[test]
@@ -1128,10 +1158,10 @@ fn help_lists_config_command() {
 
 #[test]
 fn slash_unknown_returns_true() {
-    assert!(dispatch_slash("/notacommand", "/ws", false, false).unwrap());
+    assert!(dispatch_slash("/notacommand", "/ws", false, false, false).unwrap());
 }
 
 #[test]
 fn slash_dgx_no_subcmd_returns_true() {
-    assert!(dispatch_slash("/dgx", "/ws", false, false).unwrap());
+    assert!(dispatch_slash("/dgx", "/ws", false, false, false).unwrap());
 }

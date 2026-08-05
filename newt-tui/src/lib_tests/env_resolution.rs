@@ -282,6 +282,47 @@ fn backend(
 }
 
 #[test]
+fn backend_choice_carries_chat_generation_capabilities() {
+    let mut configured = backend(
+        "nemotron",
+        "http://local:8000",
+        "nemotron-3-nano",
+        newt_core::BackendKind::Openai,
+    );
+    configured.capability = Some(newt_core::model_card::Capability {
+        reasoning_replay_scope: Some(newt_core::model_card::ReasoningReplayScope::CurrentUserTurn),
+        chat_completions: Some(newt_core::model_card::ChatCompletionsCapability {
+            cognition: Some(true),
+            chat_template_kwargs: Some(true),
+            parallel_tool_calls: Some(false),
+            bounded_reasoning_continuation: Some(true),
+        }),
+        ..Default::default()
+    });
+    let cfg = newt_core::Config {
+        backends: vec![configured],
+        ..Default::default()
+    };
+
+    with_env_vars(
+        &[],
+        &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
+        || {
+            let choice = resolve_backend_choice(&cfg);
+            assert_eq!(
+                choice.reasoning_replay_scope,
+                newt_core::model_card::ReasoningReplayScope::CurrentUserTurn
+            );
+            assert_eq!(choice.chat_completions_capability.cognition, Some(true));
+            assert_eq!(
+                choice.chat_completions_capability.parallel_tool_calls,
+                Some(false)
+            );
+        },
+    );
+}
+
+#[test]
 fn resolve_backend_choice_honors_named_provider() {
     let cfg = newt_core::Config {
         backends: vec![
@@ -492,9 +533,9 @@ fn slash_backends_list_and_switch_keep_session_alive() {
     let _ = cfg; // dispatch_slash re-resolves real config; this just documents intent.
                  // Listing returns true (session continues) regardless of configured set.
     with_env_vars(&[], &["NEWT_PROVIDER", "NEWT_DGX_MODEL"], || {
-        assert!(dispatch_slash("/backends", "/ws", false, false).unwrap());
+        assert!(dispatch_slash("/backends", "/ws", false, false, false).unwrap());
         // An unknown name reports the miss but still keeps the session alive.
-        assert!(dispatch_slash("/backends nope-xyz", "/ws", false, false).unwrap());
+        assert!(dispatch_slash("/backends nope-xyz", "/ws", false, false, false).unwrap());
     });
 }
 
@@ -509,8 +550,8 @@ fn slash_crew_usage_and_unknown_keep_session_alive() {
     // (`/crew edit` is exercised by crew_form's own tests — invoking it here
     // would read real stdin and write to ~/.newt, so it's deliberately not
     // dispatched in a unit test.)
-    assert!(dispatch_slash("/crew", "/ws", false, false).unwrap());
-    assert!(dispatch_slash("/crew bogus", "/ws", false, false).unwrap());
+    assert!(dispatch_slash("/crew", "/ws", false, false, false).unwrap());
+    assert!(dispatch_slash("/crew bogus", "/ws", false, false, false).unwrap());
 }
 
 #[test]
@@ -792,8 +833,8 @@ fn prompt_str_expands_newt_prompt_template() {
     // it, and the model/rich args don't interfere with an explicit template.
     with_env_vars(&[("NEWT_PROMPT", "\\w \\M \\v> ")], &[], || {
         let vi = prompt_str("/tmp/proj", true, "gpt-4.1", true);
-        assert_eq!(vi, format!("proj vi {}> ", env!("CARGO_PKG_VERSION")));
+        assert_eq!(vi, format!("proj vi {VERSION}> "));
         let em = prompt_str("/tmp/proj", false, "gpt-4.1", false);
-        assert_eq!(em, format!("proj emacs {}> ", env!("CARGO_PKG_VERSION")));
+        assert_eq!(em, format!("proj emacs {VERSION}> "));
     });
 }

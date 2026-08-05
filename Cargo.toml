@@ -89,6 +89,12 @@ serde_yaml = "0.9" # model cards (#853) accept YAML as well as TOML (already in 
 base64 = "0.22"
 sha2 = "0.10"
 getrandom = "0.2"
+# Content addressing for spill identity (#1528 B3 follow-up): a spill handle is a
+# BLAKE3 CIDv1 over the canonical dag-cbor of a versioned, session-scoped spill
+# record — self-verifying identity that dissolves the allocator/reservation bug
+# class. Depend on the PUBLISHED crates.io release (never a git/path pin); the
+# frozen 0.1.x core (ContentId + ContentAddressable + canonical) is all we use.
+content-addressable = "0.1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }

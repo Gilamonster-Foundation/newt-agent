@@ -43,13 +43,14 @@ pub fn get_context_remaining_tool_definition() -> Value {
 ///   (real-token) currency the `ceiling` is in (the loop passes
 ///   `PromptTracker::current`, which anchors on the backend-reported prompt size
 ///   and calibrates the chars/4 tail up to real tokens).
-/// * `ceiling` — the input-token ceiling implied by `num_ctx`
-///   ([`super::num_ctx_input_ceiling`] = `input_ceiling_pct`% of `num_ctx`), or
-///   `None` when no `num_ctx` is configured this session.
+/// * `ceiling` — the effective input-token ceiling implied by a known context
+///   window, the configured percentage, and any reserved output budget. It is
+///   `None` while the window is unknown; numbered 400 recovery can establish a
+///   ceiling mid-turn even when the session began without `num_ctx`.
 /// * `num_ctx` — reported verbatim so the model can see the window it derives
 ///   from.
-/// * `input_ceiling_pct` — `[context] input_ceiling_pct`; shown in the report so
-///   the ceiling's derivation is legible.
+/// * `input_ceiling_pct` — `[context] input_ceiling_pct`; shown as the configured
+///   percentage bound without claiming it alone produced the effective ceiling.
 /// * `low_budget_pct` — `[context] low_budget_pct`; at or below this fraction of
 ///   the ceiling *remaining*, the report appends the "compact or wrap up" hint.
 ///
@@ -59,9 +60,10 @@ pub(crate) fn render_context_budget(
     used: usize,
     ceiling: Option<usize>,
     num_ctx: Option<u32>,
-    input_ceiling_pct: usize,
+    input_ceiling_pct: u32,
     low_budget_pct: usize,
 ) -> String {
+    let input_ceiling_pct = crate::config::normalize_input_ceiling_pct(input_ceiling_pct);
     match ceiling {
         Some(ceiling) => {
             let remaining = ceiling.saturating_sub(used);
@@ -70,12 +72,15 @@ pub(crate) fn render_context_budget(
                 .unwrap_or_else(|| "unset".to_string());
             let mut out = format!(
                 "Context budget: ~{used} tokens used of an input ceiling of ~{ceiling} \
-                 ({input_ceiling_pct}% of num_ctx {nc}). ~{remaining} tokens remaining."
+                 (configured num_ctx {nc}; percentage bound {input_ceiling_pct}%; output \
+                 and recovery reserves may tighten it). ~{remaining} tokens remaining."
             );
             // Integer form of `remaining / ceiling < low_budget_pct / 100`,
-            // so no float and no division-by-zero (ceiling is always > 0 here:
-            // num_ctx_input_ceiling filters out zero).
-            if remaining.saturating_mul(100) < ceiling.saturating_mul(low_budget_pct) {
+            // with an explicit zero-ceiling arm so an impossible request is
+            // reported as low instead of looking healthy.
+            if ceiling == 0
+                || remaining.saturating_mul(100) < ceiling.saturating_mul(low_budget_pct)
+            {
                 out.push_str(
                     " Budget is LOW — compact or wrap up soon: read in pages \
                      (read_file with offset+limit), avoid large reads, and finish with \
@@ -120,7 +125,7 @@ mod tests {
         assert!(out.contains("ceiling of ~8000"), "{out}");
         assert!(out.contains("7000 tokens remaining"), "{out}");
         assert!(out.contains("num_ctx 10000"), "{out}");
-        assert!(out.contains("80% of num_ctx"), "{out}");
+        assert!(out.contains("percentage bound 80%"), "{out}");
     }
 
     #[test]
@@ -155,6 +160,14 @@ mod tests {
     }
 
     #[test]
+    fn zero_effective_ceiling_reports_low_instead_of_failing_open() {
+        let out = render_context_budget(0, Some(0), Some(8_000), 80, 15);
+        assert!(out.contains("ceiling of ~0"), "{out}");
+        assert!(out.contains("0 tokens remaining"), "{out}");
+        assert!(out.contains("LOW"), "{out}");
+    }
+
+    #[test]
     fn tunable_low_budget_pct_shifts_the_nudge_threshold() {
         // 8000/10000 used → 2000 (20%) remaining. Default 15% would NOT nudge,
         // but a tuned 25% threshold DOES — proving the knob is live.
@@ -166,10 +179,31 @@ mod tests {
 
     #[test]
     fn tunable_input_ceiling_pct_shows_in_report() {
-        // The ceiling-derivation percentage is echoed verbatim so the model
-        // can see how its ceiling was derived (90% here, not the default 80%).
+        // The configured percentage bound is echoed verbatim (90% here, not
+        // the default 80%) without claiming it is necessarily the active bound.
         let out = render_context_budget(1000, Some(9000), Some(10_000), 90, 15);
-        assert!(out.contains("90% of num_ctx"), "{out}");
+        assert!(out.contains("percentage bound 90%"), "{out}");
+    }
+
+    #[test]
+    fn programmatic_invalid_percentage_is_normalized_in_the_report() {
+        let out = render_context_budget(1000, Some(8000), Some(10_000), 0, 15);
+        assert!(out.contains("percentage bound 80%"), "{out}");
+        assert!(!out.contains("percentage bound 0%"), "{out}");
+    }
+
+    #[test]
+    fn output_reserve_ceiling_is_not_misreported_as_percentage_derived() {
+        // Contemplating at 32K reserves 16K for output, so the effective input
+        // ceiling (16,768) is tighter than the configured 80% ceiling (26,214).
+        let out = render_context_budget(1000, Some(16_768), Some(32_768), 80, 15);
+        assert!(out.contains("configured num_ctx 32768"), "{out}");
+        assert!(out.contains("percentage bound 80%"), "{out}");
+        assert!(
+            out.contains("output and recovery reserves may tighten it"),
+            "{out}"
+        );
+        assert!(!out.contains("80% of num_ctx"), "{out}");
     }
 
     #[test]

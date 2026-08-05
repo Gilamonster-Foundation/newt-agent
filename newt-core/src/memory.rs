@@ -1154,6 +1154,7 @@ impl Summarizing {
                 messages: &protected,
                 budget: self.budget() as usize,
                 max_messages: None,
+                replay_protected_tail_len: 0,
                 task: active_task,
                 hard_budget: true,
                 // The memory budget is config-derived — authoritative, so
@@ -1163,6 +1164,7 @@ impl Summarizing {
                 est: self.est,
                 summary_input_cap_floor_chars: self.summary_input_cap_floor_chars,
                 compaction_store: None,
+                compaction_stage: None,
             },
             self.summarizer.as_deref(),
             &mut self.state,
