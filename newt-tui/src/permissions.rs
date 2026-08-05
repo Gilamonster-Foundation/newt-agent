@@ -1,46 +1,23 @@
-//! **Interactive permission prompting** — the `--prompt-for-permissions` (#263)
-//! OCAP grant UI and its supporting state machine.
-//!
-//! When a session is allowed to ask, this is what turns a would-be denial into
-//! an operator question: it renders the request ([`permission_prompt_text`]),
-//! reads a single keystroke choice ([`parse_permission_choice`] →
-//! [`PromptChoice`]), and threads the answer back through
-//! [`PromptPermissionGate`] (the [`newt_core::PermissionGate`] impl the run loop
-//! installs) and [`PermissionPromptState`] (session/one-shot/durable grants,
-//! including the #904 permanent-deny ledger).
-//!
-//! **Terminal ownership is not decided here.** Stdin exclusion and raw-mode
-//! line handling used to live in this file (`PromptStdinGuard`,
-//! `enter_prompt_line_mode`); they moved into `newt_core::tty`, which now
-//! arbitrates BOTH halves of the terminal. Every function below that can block
-//! on a human takes a [`newt_core::tty::PromptWindow`] — an unforgeable
-//! capability whose only constructor,
-//! [`newt_core::tty::Terminal::suspend_for_prompt`], erases every live
-//! ephemeral writer before it returns. A question printed onto a live spinner
-//! is therefore not a bug that can be written: it does not typecheck.
-//!
-//! Extracted from `lib.rs` in the #1096 functional-cohesion pass. The
-//! *default-deny invariant* is the load-bearing rule: a session that cannot
-//! answer a TTY prompt never silently allows — see [`should_prompt_permissions`].
-//!
-//! The `/posture` named-preset clamp (issue #307) is a *sibling* concern and
-//! deliberately stays in `lib.rs` next to the session state it floors.
+//! Interactive OCAP decisions. One typed [`newt_core::Question`] supplies both
+//! terminal and web rendering, parsing, and the set of actions that may pass.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::danger;
 use crate::mint_operating_key;
 use newt_core::agentic::{newt_line, print_newt};
-use newt_core::tty::{PromptWindow, Terminal};
+use newt_core::tty::{
+    modal_prompt_controls, read_prompt_window_line, ControlReader, PromptLine as ModalLine,
+    PromptWindow, Terminal, MODAL_CONTROL_HINT,
+};
+pub(crate) use newt_core::PermissionAction as PromptChoice;
+use newt_core::{Action, HumanQuestionOutcome, Question};
 
 // ---------------------------------------------------------------------------
 
-/// Is prompted-permission mode explicitly configured for this session? Pure in
-/// its inputs so it's unit-testable. This is the EXPLICIT-ON signal only
-/// (`--prompt-for-permissions` / `[tui.permissions] prompt`); whether the
-/// session actually prompts is decided by [`should_prompt_permissions`], which
-/// adds the #721 interactive default and the headless / explicit-off guards.
+/// Whether prompted permissions were explicitly enabled for this session.
 pub(crate) fn permission_prompting_configured(
     env_flag: bool,
     tui: Option<&newt_core::TuiConfig>,
@@ -48,143 +25,56 @@ pub(crate) fn permission_prompting_configured(
     env_flag || tui.is_some_and(|t| t.permissions.prompt)
 }
 
-/// #721: the named default for whether an INTERACTIVE session prompts on a
-/// capability denial. Flipped ON — a human at a real terminal now gets the
-/// allow/deny prompt by default, because a denial that ASKS the operator beats a
-/// dead-end denial the model can't recover from. Convention-as-data: flip this
-/// one knob to change the default without touching the predicate.
 const INTERACTIVE_PROMPT_DEFAULT: bool = true;
 
-/// #721: should this session prompt the human on a capability denial?
-///
-/// Pure predicate (unit-tested; the caller supplies the resolved TTY / tier
-/// signals — never a real TTY in a test). The default flipped for INTERACTIVE
-/// sessions (see [`INTERACTIVE_PROMPT_DEFAULT`]); HEADLESS / piped / eval / ACP
-/// stay DEFAULT-DENY — they must NEVER block on a prompt no one can answer.
-///
-/// - `configured_on` — prompting explicitly enabled (`--prompt-for-permissions`
-///   / `NEWT_PROMPT_FOR_PERMISSIONS` / `[tui.permissions] prompt = true`).
-///   Honored, but with the new default no longer REQUIRED for interactive.
-/// - `explicit_off`  — explicitly disabled (`--no-prompt-for-permissions` /
-///   `NEWT_NO_PROMPT_FOR_PERMISSIONS`). Wins over both the default AND
-///   `configured_on` — fail-closed honors the human's stated choice.
-/// - `interactive`   — stdin AND stdout are real terminals.
-/// - `headless`      — a non-interactive tier (worker / eval / ACP) that must
-///   never block on a TTY prompt regardless of any ON signal.
-///
-/// Precedence: headless / non-TTY → never (the default-deny invariant the issue
-/// requires); else explicit OFF → never; else ON (explicitly configured, or the
-/// interactive default).
+/// Headless/non-TTY and explicit-off are fail-closed; interactive defaults on.
 pub(crate) fn should_prompt_permissions(
     configured_on: bool,
     explicit_off: bool,
     interactive: bool,
     headless: bool,
 ) -> bool {
-    // Default-deny invariant: a session that cannot answer a TTY prompt never
-    // prompts, no matter what was configured. Load-bearing for headless safety.
     if headless || !interactive {
         return false;
     }
-    // An explicit OFF beats the interactive default and an explicit ON.
     if explicit_off {
         return false;
     }
-    // Interactive and not disabled: prompt — either explicitly on, or the #721
-    // default. Both land here as ON.
     configured_on || INTERACTIVE_PROMPT_DEFAULT
 }
-
-/// One human choice at the permission prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PromptChoice {
-    AllowOnce,
-    AllowSession,
-    Deny,
-    DenyAlways,
-    /// #904: deny PERMANENTLY — persisted to `~/.newt/permission-denials.jsonl`
-    /// so the gate refuses this `(kind, target)` without re-prompting, across
-    /// restarts. `[D]eny always` is the session-scoped sibling.
-    DenyPermanent,
-    /// #904: allow PERMANENTLY — for a NET host, durably grant it by appending
-    /// it to `[tui.permissions] net` in the config (comment-preserving), so the
-    /// next session reads it as an ambient allow and never prompts. Only offered
-    /// for net denials; a durable widen of any axis is an explicit human keypress
-    /// and is still re-minted `⊑` the user root (attenuation-only).
-    AllowPermanent,
-}
-
-/// Map a typed answer to a choice. Case-significant on purpose — `[d]eny`
-/// is the default, `[D]eny always` the session escalation, `[P]ermanently
-/// deny` the durable deny (#904), and `[A]llow permanently` the durable net
-/// grant (#904). Anything unrecognized (including empty / EOF) is the safe
-/// default: deny.
-pub(crate) fn parse_permission_choice(input: &str) -> PromptChoice {
-    match input.trim() {
-        "a" => PromptChoice::AllowOnce,
-        "s" => PromptChoice::AllowSession,
-        "A" => PromptChoice::AllowPermanent,
-        "D" => PromptChoice::DenyAlways,
-        "P" => PromptChoice::DenyPermanent,
-        _ => PromptChoice::Deny,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stdin ownership moved to `newt_core::tty`.
-//
-// It used to live here as a private `OnceLock<(Mutex<StdinOwnership>,
-// Condvar)>` plus `PromptStdinGuard` / `WatcherStdinGuard` /
-// `enter_prompt_line_mode`. That machinery was correct — and it was HALF the
-// terminal. It modelled who may READ stdin with real rigor while nothing at all
-// modelled who may WRITE the bottom line, which is exactly how a question came
-// to be printed onto a live spinner and then scribbled out by it.
-//
-// One arbiter now owns both directions, so "I am about to block on a human"
-// and "I own the bottom line" are mutually exclusive by construction. These
-// re-exports keep the turn watcher's call sites unchanged.
-//
-// unix-gated to match its only consumer — the turn watcher's stdin interlock
-// at `lib.rs` is `#[cfg(unix)]`, so on Windows this re-export would be an
-// unused import and `-D warnings` fails the build.
 #[cfg(unix)]
 pub(crate) use newt_core::tty::try_watch_stdin;
 
-/// #721 / facade P1b: is this request's `reason` MODEL-authored? Only the
-/// proactive `request_permissions` tool lets the model write the `reason`
-/// (`tools.rs` `execute_request_permissions`); a denial-driven request carries
-/// harness denial text instead. Named so the untrusted-text policy (§7-F4) is
-/// decided in one place.
 pub(crate) fn reason_is_model_authored(req: &newt_core::PermissionRequest) -> bool {
     req.tool == "request_permissions"
 }
 
-/// Build the prompt shown for one denied capability (the #263 sketch shape),
-/// hardened by facade **P1b** (§7-F3/F4):
-///
-/// 1. A high-danger grant (interpreter exec / broad fs root) carries a
-///    **system-computed blast-radius line** ([`danger::DangerTable::blast_radius`])
-///    that the model cannot author — a fact the lay operator can't be expected to
-///    derive unaided (§1.1).
-/// 2. A **model-authored** `reason` (from `request_permissions`) is labelled as
-///    untrusted model text, never rendered as a harness fact (§7-F4). Harness
-///    denial text (denial-driven requests) is shown plainly as context.
-/// 3. A high-danger grant's menu **omits `[s]ession allow`** — it is not
-///    session-allowable (the refusal is enforced in [`PermissionGate::ask`]);
-///    `[k]ey allow` (step-up, P3, unbuilt) is noted as the future standing path.
-pub(crate) fn permission_prompt_text(
+#[derive(Clone, Copy)]
+enum PromptSurface {
+    Terminal,
+    Web,
+}
+
+/// Build the one typed form consumed by terminal and HTMX renderers.
+pub(crate) fn permission_question(
     req: &newt_core::PermissionRequest,
     danger: &danger::DangerTable,
-) -> String {
+) -> Question<PromptChoice> {
+    permission_question_for(req, danger, PromptSurface::Terminal)
+}
+
+fn permission_question_for(
+    req: &newt_core::PermissionRequest,
+    danger: &danger::DangerTable,
+    surface: PromptSurface,
+) -> Question<PromptChoice> {
     use newt_core::DenialKind;
     let (verb, axis) = match req.kind {
         DenialKind::Exec => ("run", "outside the granted exec allowlist"),
         DenialKind::FsRead => ("read", "outside the granted fs_read scope"),
         DenialKind::FsWrite => ("write", "outside the granted fs_write scope"),
         DenialKind::Net => ("reach", "outside the granted net allowlist"),
-        // FR-2 (#1001): a remote MCP tool the active persona does not grant.
         DenialKind::RemoteTool => ("call", "not in the active persona's tool allow-list"),
-        // #1056: a local git write the session's projected git authority denies.
         DenialKind::GitWrite => (
             "commit/stage via git",
             "outside the granted git-write authority",
@@ -192,17 +82,10 @@ pub(crate) fn permission_prompt_text(
     };
     let tier = danger.classify(req.kind, &req.target);
 
-    // (1) §7-F4: a system-computed blast-radius line for high-danger grants — a
-    // fact derived from (capability, target), NOT from any model-supplied text.
     let blast = match danger.blast_radius(req.kind, &req.target) {
         Some(line) => format!("{line}\n"),
         None => String::new(),
     };
-
-    // (2) §7-F4: the model's `reason` is UNTRUSTED. When it is model-authored
-    // (`request_permissions`), label it as such so the operator never reads it
-    // as a harness fact; a denial-driven request's reason is harness text and is
-    // shown plainly as context.
     let reason = if req.reason.is_empty() {
         String::new()
     } else if reason_is_model_authored(req) {
@@ -214,32 +97,52 @@ pub(crate) fn permission_prompt_text(
         format!("  ({})\n", req.reason)
     };
 
-    // (3) §7-F3/F4: a high-danger target is NOT session-allowable — omit `[s]`
-    // and point at the future step-up path. Low-danger keeps the full menu.
-    // #904: a low-danger NET host also gets `[A]llow permanently` — a durable
-    // grant written to `[tui.permissions] net`. Not offered for other axes (no
-    // per-target config allowlist) nor for high-danger (never durably widened).
-    let menu = match tier {
-        danger::DangerTier::High => {
-            "[a]llow once   [d]eny (default)   [D]eny always   [P]ermanently deny   \
-             (high-danger: [s]ession allow refused — [k]ey allow / step-up is the future path, P3) > "
-                .to_string()
+    let mut actions = vec![Action::new(PromptChoice::AllowOnce, "a", "allow once")];
+    if tier == danger::DangerTier::Low {
+        actions.push(Action::new(
+            PromptChoice::AllowSession,
+            "s",
+            "session allow",
+        ));
+        if req.kind == DenialKind::Net && matches!(surface, PromptSurface::Terminal) {
+            actions.push(Action::new(
+                PromptChoice::AllowPermanent,
+                "A",
+                "Allow permanently (adds host to config)",
+            ));
         }
-        danger::DangerTier::Low if req.kind == DenialKind::Net => {
-            "[a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   \
-             [d]eny (default)   [D]eny always   [P]ermanently deny > "
-                .to_string()
+    }
+    actions.push(Action::new(PromptChoice::Deny, "d", "deny (default)"));
+    if matches!(surface, PromptSurface::Terminal) {
+        actions.extend([
+            Action::new(PromptChoice::DenyAlways, "D", "Deny always"),
+            Action::new(PromptChoice::DenyPermanent, "P", "Permanently deny"),
+        ]);
+    }
+    let note = match (tier, surface) {
+        (danger::DangerTier::High, PromptSurface::Terminal) => Some(
+            format!(
+                "high-danger: session allow refused; key allow / step-up is the future path, P3\n{MODAL_CONTROL_HINT}"
+            ),
+        ),
+        (danger::DangerTier::High, PromptSurface::Web) => {
+            Some(format!(
+                "High danger: session authorization is unavailable.\n{MODAL_CONTROL_HINT}"
+            ))
         }
-        danger::DangerTier::Low => {
-            "[a]llow once   [s]ession allow   [d]eny (default)   [D]eny always   [P]ermanently deny > "
-                .to_string()
-        }
+        (_, PromptSurface::Terminal) => Some(MODAL_CONTROL_HINT.into()),
+        (_, PromptSurface::Web) => Some(MODAL_CONTROL_HINT.into()),
     };
-
-    format!(
-        "⊘ {} wants to {verb} `{}` — {axis}.\n{blast}{reason}  {menu}",
-        req.tool, req.target
-    )
+    Question {
+        markdown: format!(
+            "⊘ {} wants to {verb} `{}` — {axis}.\n{blast}{reason}",
+            req.tool, req.target
+        )
+        .trim_end()
+        .into(),
+        actions,
+        note,
+    }
 }
 
 /// Facade P1b: the production [`danger::DangerTable`] — the built-in
@@ -280,66 +183,62 @@ pub fn ocap_high_danger_predicate() -> impl Fn(newt_core::ocap_store::Capability
     }
 }
 
-/// Production prompt: ask the question, read one line back. Any read error is a
-/// deny (never a hang, never an allow).
-///
-/// The `&PromptWindow` is the whole fix. Obtaining one requires having called
-/// [`Terminal::suspend_for_prompt`], which erases every live ephemeral writer
-/// and holds the shared ticker still for the window's lifetime — so the
-/// question lands on a clean row and stays there while the operator reads it.
-/// The parameter is not advisory: without it this function does not compile,
-/// which is why the same mistake cannot be reintroduced at a seventh call site.
-pub(crate) fn prompt_permission_choice(w: &PromptWindow, prompt_text: &str) -> PromptChoice {
-    w.ask(prompt_text).ok();
-    match w.read_line() {
-        Ok(answer) => parse_permission_choice(&answer),
-        Err(_) => PromptChoice::Deny,
+/// Read a terminal form. Unknown input and I/O failure fail closed.
+pub(crate) fn prompt_permission_choice(
+    w: &PromptWindow,
+    question: &Question<PromptChoice>,
+) -> PromptChoice {
+    let prompt = format!("{}\n> ", question.terminal_text());
+    match read_prompt_window_line(w, &prompt) {
+        Ok(ModalLine::Line(answer)) => question.parse(&answer).unwrap_or(PromptChoice::Deny),
+        Ok(ModalLine::Back) => PromptChoice::Back,
+        Ok(ModalLine::Exit) => PromptChoice::Exit,
+        Ok(ModalLine::Eof) | Err(_) => PromptChoice::Deny,
     }
 }
 
-/// #728/#783 (Bug C): pure interpreter for one line of free-text human input
-/// (the `request_user_input` tool's answer). EOF (`Ok(0)`, e.g. the operator
-/// pressing Ctrl-D) is treated exactly like the permission path
-/// ([`prompt_permission_choice`] maps the same EOF to a valid response): it is
-/// an empty, *deliberate* answer → `Some("")`, NOT "no human available". Only a
-/// genuine read error → `None`, so the tool reports "no human available" only
-/// when stdin truly cannot be read. Pure — unit-tested like
-/// [`parse_permission_choice`].
-pub(crate) fn interpret_user_line(read: io::Result<usize>, buf: &str) -> Option<String> {
-    match read {
-        // NOTE: when a TTY *is* present, a spontaneous EOF here implies stdin
-        // contention with the chat loop's own reader; the deeper cure (a
-        // separate stdin owner) is a follow-up — this is the consistency fix.
-        Err(_) => None,                        // genuine read error → no human
-        Ok(_) => Some(buf.trim().to_string()), // EOF (Ok(0)) → Some("")
+fn decision_scope(choice: PromptChoice) -> &'static str {
+    match choice {
+        PromptChoice::AllowOnce => "once",
+        PromptChoice::AllowSession => "session",
+        PromptChoice::AllowPermanent => "permanent",
+        PromptChoice::Deny => "once",
+        PromptChoice::DenyAlways => "session",
+        PromptChoice::DenyPermanent => "permanent",
+        PromptChoice::Back | PromptChoice::Exit => "control",
     }
 }
 
-/// #728: production reader for `request_user_input` — print the question, read
-/// one line from stdin (the same blocking shape as the permission prompt) and
-/// interpret it via [`interpret_user_line`]. Closed stdin / read error → `None`
-/// (no human to answer), never a hang.
-pub(crate) fn prompt_user_input(w: &PromptWindow, question: &str) -> Option<String> {
-    w.ask(&format!("? {question}\n> ")).ok();
-    let mut answer = String::new();
-    // `read_line_into`, not `read_line`: the BYTE COUNT is load-bearing here —
-    // `interpret_user_line` distinguishes EOF (`Ok(0)`, a deliberate empty
-    // answer from Ctrl-D) from a genuine read error (no human available).
-    let read = w.read_line_into(&mut answer);
-    let line = interpret_user_line(read, &answer)?;
-    if is_slash_command_at_prompt(&line) {
-        // A leading-slash answer is a TUI command intent, NOT an answer for the
-        // model — never hand it over. A small model will try to *run* it (e.g.
-        // `/exit` -> `run_command exit`), which OCAP then denies. Refuse here;
-        // Ctrl-C returns to the main prompt where slash commands work.
+fn verdict_scope(verdict: newt_core::store::Verdict) -> &'static str {
+    match verdict {
+        newt_core::store::Verdict::AllowOnce => "once",
+        newt_core::store::Verdict::AllowSession => "session",
+        newt_core::store::Verdict::Deny => "once",
+    }
+}
+
+pub(crate) fn prompt_user_input(w: &PromptWindow, question: &str) -> io::Result<ModalLine> {
+    let form = Question::<PromptChoice> {
+        markdown: format!("? {question}"),
+        actions: Vec::new(),
+        note: Some(MODAL_CONTROL_HINT.into()),
+    };
+    let result = read_prompt_window_line(w, &format!("{}\n> ", form.terminal_text()))?;
+    let ModalLine::Line(line) = &result else {
+        return Ok(result);
+    };
+    // The answer is returned VERBATIM — leading/trailing whitespace can be
+    // meaningful (an indented code line, a spacing-sensitive value, an
+    // intentionally blank-but-submitted answer). Slash-command detection reads a
+    // trim_start VIEW below without mutating the answer.
+    if is_slash_command_at_prompt(line) {
         w.notice(
-            "(slash commands aren't answers to this question - Ctrl-C to return \
-             to the prompt, then use /exit, /model, ...)",
+            "(slash commands aren't answers; press Esc, then use the command at the chat prompt)",
         )
         .ok();
-        return None;
+        return Ok(ModalLine::Back);
     }
-    Some(line)
+    Ok(result)
 }
 
 /// A leading-slash answer at a `request_user_input` prompt is a TUI command
@@ -363,72 +262,39 @@ mod slash_prompt_tests {
         assert!(!is_slash_command_at_prompt("qwen2.5-coder:7b"));
         assert!(!is_slash_command_at_prompt("use a/b testing"));
         assert!(!is_slash_command_at_prompt(""));
+        // A whitespace-padded non-slash answer is NOT a command, so
+        // `prompt_user_input` returns it verbatim (whitespace preserved) rather
+        // than backing out. Detection reads a trim_start view; it never trims the
+        // answer itself.
+        assert!(!is_slash_command_at_prompt("  indented answer  "));
+        assert!(!is_slash_command_at_prompt("   "));
     }
 }
 
-/// Session-owned prompted-permission state, lent to the gate each turn (the
-/// `note_nudge` ownership pattern). Session grants/denials live HERE — not
-/// in the session's operating key, which is never widened — and evaporate
-/// with the process: a restart starts from the configured policy again.
+/// Session decisions remain separate from the never-widened operating key.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
-    /// A4/W6 (opt-in, `NEWT_WEB_DECISIONS`): when set, a permission decision is
-    /// PUBLISHED to this store and answered from an attach surface (the web)
-    /// rather than the TTY — the gate polls [`ConversationStore::take_permission_decision`]
-    /// for the operator's verdict. `None` (the default) keeps the canonical TTY
-    /// prompt bit-for-bit, so a normal session is unaffected. The simultaneous
-    /// TTY-vs-web race is a follow-up (it needs a pollable single-key read on
-    /// the #1312-sensitive terminal arbiter; validated on a real PTY).
+    /// Opt-in attach-surface decision channel; `None` uses the terminal.
     pub(crate) web_store: Option<newt_core::ConversationStore>,
-    /// `(kind, target)` pairs the human allowed for the rest of the session.
     session_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
-    /// `(kind, target)` pairs the human denied for the rest of the session
-    /// (`[D]eny always`) — auto-denied without re-prompting.
     session_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
-    /// #904: `(kind, target)` pairs the human denied PERMANENTLY
-    /// (`[P]ermanently deny`) — loaded from `~/.newt/permission-denials.jsonl`
-    /// at session start and auto-denied without re-prompting, across restarts.
-    /// Deny-only, so reading it back can never widen authority.
+    /// Durable deny-only entries loaded at session start.
     persistent_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
-    /// #1057: one-shot exec grants left by a model-driven `request_permissions`
-    /// allow-once. That grant authorizes the model's UPCOMING retry (a separate
-    /// tool call), but the consult that recorded it executes nothing and its
-    /// widened caveats are discarded — so without carrying it the retry
-    /// re-denies. Each entry is consumed by the NEXT matching `run_command`
-    /// (exactly once, so allow-once semantics hold). Exec targets are stored by
-    /// basename so a `python3` grant covers `/usr/bin/python3`, consistent with
-    /// the enforcement leash. Grant-only, and folded through `mint` (⊑ root), so
-    /// the attenuation-only invariant holds.
+    /// One-shot grants carried from `request_permissions` to its retry.
     pending_once_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
-    /// Every prompted decision this session, in prompt order — what
-    /// `/permissions` lists. Also appended to the durable log as made.
     pub(crate) decisions: Vec<newt_core::PermissionRecord>,
-    /// Track O (#1131): the durable OCAP policy loaded from `~/.newt/ocap/*.toml`
-    /// at session start (empty when the store is absent). Consulted by the gate
-    /// BEFORE prompting — a durable `deny` refuses, a durable `approve`
-    /// pre-answers (danger-gated) — so the accumulation loop loosens the leash
-    /// with use. Read-only this session; never widens the default-deny floor.
+    /// Durable approve/deny policy, read-only during the session.
     pub(crate) ocap_policy: newt_core::ocap_store::PolicySet,
 }
 
-/// The exec program basename — mirrors `newt_core` `exec_allowlist_name` (splits
-/// on `/` and `\`) so a grant of `python3` reconciles with a run of
-/// `/usr/bin/python3`. Used ONLY for the prompt-skip memo and the one-shot
-/// pending-grant match; the authority check itself (`permits_exec`) stays EXACT
-/// — that method is the sole *unconfined* gate for model-authored `verify`
-/// strings, and basename-matching it would be an ACE primitive (#1057 review).
+/// Normalize only prompt memos; the authority check itself stays exact.
 pub(crate) fn exec_grant_basename(cmd: &str) -> &str {
     cmd.rsplit(['/', '\\'])
         .find(|p| !p.is_empty())
         .unwrap_or(cmd)
 }
 
-/// Does a durable session grant cover `req`? Exact for every axis; for exec the
-/// set is consulted the way the enforcement leash matches — the target verbatim
-/// OR its basename in the set — so a `python3` grant covers `/usr/bin/python3`,
-/// while a full-path grant does NOT widen to a bare or different-path program
-/// (pin-exact preserved). This mirrors agent-bridle `exec_scope_allows`, so the
-/// prompt is never skipped for something the leash would then deny.
+/// Match exact grants, plus a basename-normalized exec request.
 pub(crate) fn session_grant_covers(
     grants: &std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     req: &newt_core::PermissionRequest,
@@ -443,10 +309,7 @@ pub(crate) fn session_grant_covers(
         ))
 }
 
-/// Consume a one-shot pending grant matching `req`, returning the grant key to
-/// fold into the minted caveats so the retry actually runs. Exec entries are
-/// basename-keyed, and the query is basename-normalized to match. One-shot:
-/// removed on hit, so the next identical op re-prompts (allow-once preserved).
+/// Consume an exact or basename-normalized one-shot grant.
 pub(crate) fn take_pending_once(
     pending: &mut std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     req: &newt_core::PermissionRequest,
@@ -481,64 +344,39 @@ impl PermissionPromptState {
     }
 }
 
-/// The TUI's [`newt_core::PermissionGate`]: prompts the human on a denial,
-/// records each decision, and — on allow — RE-MINTS a fresh operating
-/// authority from the user root as (session baseline ∪ grants), per the
-/// #263 design. Attenuation-only is preserved: the session's live key and
-/// enforced baseline are never touched; the minted caveats exist only for
-/// the re-executed call (and are re-minted on demand for session grants).
-///
-/// `ask_human` is the interaction seam: production wires
-/// [`prompt_permission_choice`]; tests inject a scripted closure.
-///
-/// It takes a [`PromptWindow`] because every blocking prompt does. The token is
-/// constructed at the ONE site inside [`PromptPermissionGate::ask`] below, not
-/// threaded in from callers — so this type's shape changes while all six
-/// `gate.ask` call sites in `newt-core`'s tool dispatcher stay untouched.
-pub(crate) struct PromptPermissionGate<'a, F: FnMut(&PromptWindow, &str) -> PromptChoice> {
+/// Prompts, records, and re-mints from the user root without widening the live key.
+pub(crate) struct PromptPermissionGate<
+    'a,
+    F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice,
+> {
     pub(crate) state: &'a mut PermissionPromptState,
-    /// The session's enforced caveats at turn start — the re-mint baseline.
-    /// When a `/posture` preset is active this is ALREADY the clamped (base ∩
-    /// preset) value, so `widen_caveats` starts below the preset ceiling.
+    /// Enforced caveats at turn start.
     pub(crate) base: newt_core::Caveats,
-    /// Per-user root key path; `None` degrades the re-mint to a plain
-    /// caveats value (the same degradation as `SessionCapability`).
     pub(crate) key_path: Option<std::path::PathBuf>,
-    /// Conversation id the decisions are recorded under.
     pub(crate) conversation_id: String,
-    /// Durable decision log (`~/.newt/permission-log.jsonl`); `None` keeps
-    /// the in-session list only.
     pub(crate) log_path: Option<std::path::PathBuf>,
-    /// #904: durable denylist (`~/.newt/permission-denials.jsonl`) appended on
-    /// `[P]ermanently deny`. `None` degrades that choice to session-scoped (like
-    /// `[D]eny always`) — the deny still holds, it just won't survive a restart.
     pub(crate) denials_path: Option<std::path::PathBuf>,
-    /// #904: user config path (`~/.newt/config.toml`) that `[A]llow permanently`
-    /// appends a net host to (`[tui.permissions] net`, comment-preserving).
-    /// `None` degrades that choice to a session grant (durable widen unavailable).
     pub(crate) config_path: Option<std::path::PathBuf>,
-    /// #307 FLOOR: the active named-permission-preset clamp, if any. The minted
-    /// authority is re-`meet`-ed with this ceiling so a session-grant can NEVER
-    /// re-add a target the preset denied — `widen_caveats` adds to `Only` sets,
-    /// including ones the preset emptied, so the post-mint clamp is the
-    /// load-bearing point that keeps the floor honest against grants. `None`
-    /// (no active preset) leaves the #263 mint bit-for-bit.
+    /// Re-applied after widening so grants cannot pierce a named preset.
     pub(crate) preset_clamp: Option<newt_core::Caveats>,
-    /// Facade P1b (§7-F3/F4): the pure-DATA danger-tier table. Used to render
-    /// the prompt's system-computed blast-radius line and to refuse a plain
-    /// `[s]ession allow` of a high-danger target (interpreter exec / broad fs
-    /// root). See [`danger`].
     pub(crate) danger: danger::DangerTable,
     pub(crate) color: bool,
     pub(crate) verbose: bool,
-    /// Bound the web-decision wait below the store's five-minute TTL. Tests
-    /// inject a short duration so the timeout path is exercised without a
-    /// multi-minute test.
+    /// Whether interactive AUTHORIZATION prompting is enabled this session. This
+    /// is ORTHOGONAL to whether a human is present: the gate is built whenever
+    /// the session has a usable TTY, so `ask_question` (the human-question seam)
+    /// stays available even when this is false. When false, [`Self::ask`] denies
+    /// every request immediately WITHOUT opening a prompt — disabling permission
+    /// prompts must never erase the operator from `request_user_input`.
+    pub(crate) authorization_prompts_enabled: bool,
     pub(crate) web_decision_timeout: Duration,
+    /// Nested-form controls feed the same turn cancellation path as the watcher.
+    pub(crate) cancel: Option<&'a AtomicBool>,
+    pub(crate) exit: Option<&'a AtomicBool>,
     pub(crate) ask_human: F,
 }
 
-impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> PromptPermissionGate<'_, F> {
+impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPermissionGate<'_, F> {
     /// Record one decision: into the session list (for `/permissions`) and
     /// appended to the durable log. A log-write failure is reported but
     /// never blocks the decision — the record is a review artifact, not a
@@ -564,23 +402,13 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> PromptPermissionGate<'_, F> 
         self.state.decisions.push(rec);
     }
 
-    /// Mint the widened authority for an allow: policy = baseline ∪ every
-    /// session grant ∪ the once-grants of this consult, re-rooted from the
-    /// per-user key when available. The live operating key is NEVER widened
-    /// — this is a fresh, narrower-than-root delegation (issue #263's
-    /// "re-mint from root" rule). Without a usable key the value degrades
-    /// to the plain policy, mirroring `SessionCapability::establish`.
+    /// Re-mint baseline plus grants from the root; never widen the live key.
     fn mint(&self, once_grants: &[(newt_core::DenialKind, String)]) -> newt_core::Caveats {
         let mut grants: Vec<(newt_core::DenialKind, String)> =
             self.state.session_grants.iter().cloned().collect();
         grants.extend(once_grants.iter().cloned());
         let mut policy = newt_core::widen_caveats(&self.base, &grants);
-        // #307 FLOOR: re-clamp the widened policy under the active preset. This
-        // is the load-bearing intersection — `widen_caveats` can re-populate an
-        // `Only` set the preset emptied (e.g. add `rm` to an exec scope the
-        // readonly preset pinned to none), so without this `meet` a session
-        // grant would silently raise authority above the preset. With it, a
-        // grant can never exceed the preset ceiling.
+        // Re-clamping is load-bearing: widening may repopulate an emptied scope.
         if let Some(clamp) = &self.preset_clamp {
             policy = policy.meet(clamp);
         }
@@ -594,81 +422,251 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> PromptPermissionGate<'_, F> 
         }
     }
 
-    /// A4/W6: publish the pending decision to the store and poll for the
-    /// operator's WEB verdict (opt-in). The web NAMES a verdict; this maps it to
-    /// the same `PromptChoice` a TTY key would, so every downstream arm — the
-    /// high-danger `[s]ession` refusal, the mint, the re-exec — is reused
-    /// unchanged. Fails closed (`Deny`) if the store can't publish/read. The
-    /// danger tier is GATE-STAMPED here (the web renders it, never classifies).
-    /// Blocks polling like the TTY read would (no auto-deny); it runs on the
-    /// turn's own thread, so the UI never hangs.
+    /// Publish the same typed form the web renders and poll for its answer.
     fn await_web_decision(
         &self,
         store: &newt_core::ConversationStore,
         w: &newt_core::tty::PromptWindow,
         req: &newt_core::PermissionRequest,
-    ) -> PromptChoice {
-        let requests_json = serde_json::to_string(req).unwrap_or_default();
+    ) -> (PromptChoice, &'static str) {
+        let question = permission_question_for(req, &self.danger, PromptSurface::Web);
         let tier = if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
             "\"high\""
         } else {
             "\"low\""
         };
         let request_id =
-            match store.publish_permission_request(&self.conversation_id, &requests_json, tier) {
+            match store.publish_permission_question(&self.conversation_id, &question, tier) {
                 Ok(id) => id,
-                Err(_) => return PromptChoice::Deny,
+                Err(_) => return (PromptChoice::Deny, "web-unavailable"),
             };
+        let note = question
+            .note
+            .as_deref()
+            .map_or(MODAL_CONTROL_HINT.to_string(), |note| {
+                if note.contains(MODAL_CONTROL_HINT) {
+                    note.to_string()
+                } else {
+                    format!("{note}\n{MODAL_CONTROL_HINT}")
+                }
+            });
         w.notice(&newt_line(
-            &format!("awaiting a decision from the web for `{}`…", req.target),
+            &format!(
+                "awaiting a decision from the web for `{}`…\n{note}",
+                req.target
+            ),
             self.color,
             self.verbose,
         ))
         .ok();
-        let deadline = Instant::now() + self.web_decision_timeout;
+        // Delegate the wait loop to the injectable core so reader-recovery is
+        // unit-testable with a scripted reader, a fake clock, and a no-op sleep.
+        self.run_web_wait(
+            store,
+            &request_id,
+            w,
+            move || modal_prompt_controls(w).map(|r| Box::new(r) as Box<dyn ControlReader + '_>),
+            Instant::now,
+            std::thread::sleep,
+        )
+    }
+
+    /// The web-decision wait loop with an INJECTABLE control-reader lifecycle.
+    ///
+    /// A transient terminal read error must never permanently disable local
+    /// controls (the defect this replaces set `controls = None` forever after a
+    /// single error). Here the reader runs a small state machine:
+    /// `Live` → poll it; an [`io::ErrorKind::Interrupted`] error is transient and
+    /// retries the SAME reader; any other error drops it and moves to `Retrying`
+    /// (emitting at most one concise warning), which re-arms via `reacquire` at a
+    /// bounded `reacquire_backoff` cadence — never busy-spinning. The gate is
+    /// only built for an interactive session, so ANY acquisition failure —
+    /// including `Unsupported` (a terminal-loss race between session setup and
+    /// the first prompt) — also enters paced `Retrying`, never a permanent dead
+    /// end; there is no "genuinely headless" path here to latch off.
+    ///
+    /// Through every reader state the web store poll and the fail-closed
+    /// `deadline` keep running, and a recovered `Back`/`Exit` still resolves
+    /// through [`Self::web_abort_choice`]'s exactly-once CAS — so a local abort
+    /// and a web verdict can never both win. `reacquire`/`now`/`sleep` are
+    /// injected so tests drive the loop deterministically without a real
+    /// terminal or wall clock.
+    fn run_web_wait<'w>(
+        &self,
+        store: &newt_core::ConversationStore,
+        request_id: &str,
+        w: &'w newt_core::tty::PromptWindow,
+        mut reacquire: impl FnMut() -> io::Result<Box<dyn ControlReader + 'w>>,
+        now: impl Fn() -> Instant,
+        mut sleep: impl FnMut(Duration),
+    ) -> (PromptChoice, &'static str) {
+        enum ReaderState<'a> {
+            Live(Box<dyn ControlReader + 'a>),
+            Retrying { next_attempt: Instant },
+        }
+
+        let control_poll_timeout = Duration::from_millis(200);
+        let reacquire_backoff = Duration::from_millis(200);
+        let deadline = now() + self.web_decision_timeout;
+
+        let mut warned = false;
+        let mut state: ReaderState<'w> = match reacquire() {
+            Ok(reader) => ReaderState::Live(reader),
+            // ANY acquisition failure — including `Unsupported`, which here is a
+            // terminal-loss race between the interactive session's setup and the
+            // first prompt, NOT a genuinely headless session — enters paced retry
+            // rather than permanently disabling the local controls. Warn once.
+            Err(_) => {
+                warned = true;
+                self.notice_control_warning(w);
+                ReaderState::Retrying {
+                    next_attempt: now() + reacquire_backoff,
+                }
+            }
+        };
+
         loop {
-            match store.take_permission_decision(&self.conversation_id, &request_id) {
-                Ok(Some(verdict)) => return verdict_to_choice(verdict),
-                Ok(None) if Instant::now() >= deadline => {
+            // Advance the reader. `blocked` = we spent ~one poll timeout blocking,
+            // so we should NOT also sleep this tick.
+            let poll_result = match &mut state {
+                ReaderState::Live(reader) => Some(reader.poll(control_poll_timeout)),
+                _ => None,
+            };
+            let mut blocked = false;
+            match poll_result {
+                Some(Ok(Some(ModalLine::Back))) => {
+                    return self
+                        .web_abort_choice(
+                            store,
+                            &self.conversation_id,
+                            request_id,
+                            PromptChoice::Back,
+                        )
+                        .unwrap_or((PromptChoice::Back, "web-aborted"));
+                }
+                Some(Ok(Some(ModalLine::Exit))) => {
+                    return self
+                        .web_abort_choice(
+                            store,
+                            &self.conversation_id,
+                            request_id,
+                            PromptChoice::Exit,
+                        )
+                        .unwrap_or((PromptChoice::Exit, "web-aborted"));
+                }
+                // A typed line or EOF at a web prompt is ignored; we polled.
+                Some(Ok(_)) => blocked = true,
+                Some(Err(e)) => {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        // Transient (EINTR): keep the SAME reader and retry. This
+                        // error returns IMMEDIATELY (it does not consume the poll
+                        // timeout), so leave `blocked` false and let the paced
+                        // sleep below run — otherwise repeated EINTR busy-spins.
+                    } else {
+                        // Broken reader: drop it, re-arm at a bounded cadence.
+                        if !warned {
+                            warned = true;
+                            self.notice_control_warning(w);
+                        }
+                        state = ReaderState::Retrying {
+                            next_attempt: now() + reacquire_backoff,
+                        };
+                    }
+                }
+                None => {
+                    // Not live: try to re-arm when the backoff elapses. This gate
+                    // was built for an interactive session, so a reader that once
+                    // worked may return again (detach/reattach, PTY swap) — an
+                    // `Unsupported` reacquire here is NOT terminal; keep retrying
+                    // (bounded) until the deadline. There is no permanent
+                    // "no terminal" state to latch: one reader-state transition
+                    // must never permanently remove the escape hatch.
+                    if let ReaderState::Retrying { next_attempt } = &mut state {
+                        if now() >= *next_attempt {
+                            match reacquire() {
+                                Ok(reader) => state = ReaderState::Live(reader),
+                                Err(_) => *next_attempt = now() + reacquire_backoff,
+                            }
+                        }
+                    }
+                }
+            }
+
+            match store.take_permission_decision(&self.conversation_id, request_id) {
+                Ok(Some(verdict)) => return (verdict.into(), verdict_scope(verdict)),
+                Ok(None) if now() >= deadline => {
                     // Resolve through the same CAS as a TTY answer. If a web
                     // answer won the race, consume that verdict; otherwise
                     // the timeout is a fail-closed denial.
-                    match store.resolve_permission_request(
+                    return match store.resolve_permission_request(
                         &self.conversation_id,
-                        &request_id,
+                        request_id,
                         "expired",
                     ) {
-                        Ok(true) => return PromptChoice::Deny,
+                        Ok(true) => (PromptChoice::Deny, "web-timeout"),
                         Ok(false) => match store
-                            .take_permission_decision(&self.conversation_id, &request_id)
+                            .take_permission_decision(&self.conversation_id, request_id)
                         {
-                            Ok(Some(verdict)) => return verdict_to_choice(verdict),
-                            Ok(None) | Err(_) => return PromptChoice::Deny,
+                            Ok(Some(verdict)) => (verdict.into(), verdict_scope(verdict)),
+                            Ok(None) | Err(_) => (PromptChoice::Deny, "web-timeout"),
                         },
-                        Err(_) => return PromptChoice::Deny,
-                    }
+                        Err(_) => (PromptChoice::Deny, "web-timeout"),
+                    };
                 }
-                Ok(None) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    std::thread::sleep(remaining.min(Duration::from_millis(200)));
-                }
-                Err(_) => return PromptChoice::Deny,
+                Ok(None) => {}
+                Err(_) => return (PromptChoice::Deny, "web-store-error"),
+            }
+
+            if !blocked {
+                let remaining = deadline.saturating_duration_since(now());
+                sleep(remaining.min(Duration::from_millis(200)));
+            }
+        }
+    }
+
+    /// Emit the single, concise "controls interrupted, retrying" warning used by
+    /// [`Self::run_web_wait`] when a live control reader breaks mid-wait.
+    fn notice_control_warning(&self, w: &newt_core::tty::PromptWindow) {
+        w.notice(&newt_line(
+            "terminal controls temporarily unavailable — retrying; the web decision and timeout still apply",
+            self.color,
+            self.verbose,
+        ))
+        .ok();
+    }
+
+    fn web_abort_choice(
+        &self,
+        store: &newt_core::ConversationStore,
+        conversation_id: &str,
+        request_id: &str,
+        fallback: PromptChoice,
+    ) -> Option<(PromptChoice, &'static str)> {
+        if store
+            .resolve_permission_request(conversation_id, request_id, "tty")
+            .ok()?
+        {
+            return Some((fallback, decision_scope(fallback)));
+        }
+        store
+            .take_permission_decision(conversation_id, request_id)
+            .ok()
+            .and_then(|verdict| verdict.map(|v| (v.into(), verdict_scope(v))))
+    }
+
+    fn apply_control(&self, action: PromptChoice) {
+        if let Some(cancel) = self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if action == PromptChoice::Exit {
+            if let Some(exit) = self.exit {
+                exit.store(true, Ordering::Relaxed);
             }
         }
     }
 }
 
-/// Map a web-named [`newt_core::Verdict`] to the [`PromptChoice`] a TTY key
-/// would produce, so a web answer flows through the exact same gate arms.
-fn verdict_to_choice(v: newt_core::Verdict) -> PromptChoice {
-    match v {
-        newt_core::Verdict::AllowOnce => PromptChoice::AllowOnce,
-        newt_core::Verdict::AllowSession => PromptChoice::AllowSession,
-        newt_core::Verdict::Deny => PromptChoice::Deny,
-    }
-}
-
-impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
+impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> newt_core::PermissionGate
     for PromptPermissionGate<'_, F>
 {
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
@@ -676,15 +674,17 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
         if requests.is_empty() {
             return Deny;
         }
-        // `[D]eny always` (session) and `[P]ermanently deny` (#904, durable)
-        // both short-circuit without re-prompting and without re-recording —
-        // the deny was recorded when chosen. The persistent set was loaded from
-        // disk at session start, so a permanent deny survives restarts.
-        // A durable OCAP `deny` (`~/.newt/ocap/deny.toml`) refuses before any
-        // prompt, exactly like a session/permanent deny — same short-circuit,
-        // no re-record (the policy file IS the audit record). The store applies
-        // the contract precedence (deny > passkey > ask > approve), so a target
-        // that is both denied and approved returns `Deny` here.
+        // Authorization prompting disabled (`--no-prompt-for-permissions`): fail
+        // closed WITHOUT opening a prompt. This gate still exists (the session is
+        // interactive) so `ask_question` keeps working — disabling permission
+        // prompts must not turn a present operator into "headless".
+        if !self.authorization_prompts_enabled {
+            for req in requests {
+                self.record(req, "deny", "authorization-prompts-disabled");
+            }
+            return Deny;
+        }
+        // Previously recorded session, permanent, and OCAP denials short-circuit.
         if requests.iter().any(|r| {
             let key = (r.kind, r.target.clone());
             self.state.session_denials.contains(&key)
@@ -698,17 +698,9 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
             return Deny;
         }
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
-        // A4/W6: a cheap clone of the opt-in web-decision store (None normally),
-        // taken once so the per-request `self.record`/grant mutations in the
-        // loop don't collide with the shared-borrow at the prompt seam below.
         let web = self.state.web_store.clone();
         for req in requests {
-            // #1056 FLOOR: a readonly `/posture` denies LOCAL git writes just as it
-            // denies fs writes. The git-write capability is non-axis, so `mint`'s
-            // preset re-clamp can't attenuate it (it widens nothing) — enforce the
-            // floor HERE: if a preset is active and projects no git commit
-            // authority, refuse the grant outright (even `[a]llow once`), so a git
-            // write can never pierce the readonly clamp.
+            // GitWrite is non-axis, so enforce the readonly preset before minting.
             if req.kind == newt_core::DenialKind::GitWrite {
                 if let Some(clamp) = &self.preset_clamp {
                     if !newt_core::git_caveats::GitCaveats::from_session(clamp).permits_commit() {
@@ -717,23 +709,10 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                     }
                 }
             }
-            // A session grant covers this target: no re-prompt, no new
-            // record — the decision was recorded when the human made it.
-            // (Exec matches by basename so a `python3` grant covers
-            // `/usr/bin/python3`, consistent with the enforcement leash.)
             if session_grant_covers(&self.state.session_grants, req) {
                 continue;
             }
-            // Track O (#1131): a durable OCAP `approve` pre-answers the prompt —
-            // the "Always allow" the accumulation loop earns. It is folded into
-            // the minted authority via `once_grants` (like an allow-once), so the
-            // enforcement leash actually permits the op, not merely skips the
-            // ask. Danger-gated: a high-danger target (interpreter exec / broad
-            // fs root) is NEVER auto-allowed from the store — it fails closed to
-            // the prompt, the same P1b ceiling that refuses a plain `[s]ession
-            // allow` for high-danger. (`validate_approve` keeps such targets out
-            // of approve.toml in the first place; this is the belt-and-suspenders
-            // enforcement.)
+            // Durable approval pre-answers only a low-danger request.
             if newt_core::ocap_store::evaluate_request(
                 &self.state.ocap_policy,
                 req.kind,
@@ -745,12 +724,7 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                 once_grants.push((req.kind, req.target.clone()));
                 continue;
             }
-            // #1057: a one-shot pending grant left by a prior request_permissions
-            // allow-once covers this retry — consume it (exactly once) and fold
-            // it into the minted caveats so the command actually runs. Only an
-            // actual operation (a `run_command` retry) consumes it, never another
-            // request_permissions ask (which would burn the grant before the
-            // retry and re-deny it).
+            // Only the eventual operation consumes a request_permissions grant.
             if req.tool != "request_permissions" {
                 if let Some(key) = take_pending_once(&mut self.state.pending_once_grants, req) {
                     self.record(req, "allow", "once");
@@ -758,38 +732,20 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                     continue;
                 }
             }
-            // ---------------- THE seam ----------------
-            // The ONE place in the workspace that constructs a `PromptWindow`.
-            // `suspend_for_prompt()` takes stdin AND erases every registered
-            // ephemeral writer before it returns, then holds the shared ticker
-            // still until `w` drops — so the question lands on a clean row and
-            // survives for as long as the operator is reading it.
-            //
-            // Constructed HERE rather than threaded in from callers: that is
-            // what lets all six `gate.ask` sites in `newt-core`'s tool
-            // dispatcher inherit the guarantee without a single line changing
-            // at any of them, and what makes a seventh site safe by default.
+            // The sole prompt seam suspends every competing terminal writer.
             let w = Terminal::suspend_for_prompt();
-            // A4/W6: when a web-decision store is configured (opt-in), publish
-            // the decision and poll for the operator's web verdict instead of
-            // reading the TTY. Off by default → the canonical prompt is
-            // unchanged. `web` is a cheap clone taken before the loop so the
-            // per-request `self.record`/grant mutations below don't conflict.
-            let choice = match &web {
+            let (choice, scope) = match &web {
                 Some(store) => self.await_web_decision(store, &w, req),
-                None => (self.ask_human)(&w, &permission_prompt_text(req, &self.danger)),
+                None => {
+                    let choice = (self.ask_human)(&w, &permission_question(req, &self.danger));
+                    (choice, decision_scope(choice))
+                }
             };
             match choice {
                 PromptChoice::AllowOnce => {
-                    self.record(req, "allow", "once");
+                    self.record(req, "allow", scope);
                     once_grants.push((req.kind, req.target.clone()));
-                    // #1057: a model-driven `request_permissions` allow-once is
-                    // authorizing the model's UPCOMING retry — a separate tool
-                    // call whose caveats are re-derived from scratch, so the
-                    // widening above is discarded. Carry it as a ONE-SHOT pending
-                    // grant (exec keyed by basename) the retry consumes exactly
-                    // once. A denial-driven allow-once re-execs in place and
-                    // needs no carry, so this is scoped to request_permissions.
+                    // Carry proactive allow-once to the model's separate retry.
                     if req.tool == "request_permissions" {
                         let key = if req.kind == newt_core::DenialKind::Exec {
                             (req.kind, exec_grant_basename(&req.target).to_string())
@@ -800,22 +756,9 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                     }
                 }
                 PromptChoice::AllowSession => {
-                    // Facade P1b (§7-F3/F4): a high-danger target (interpreter
-                    // exec / broad fs root) is NOT session-allowable. A standing
-                    // grant of arbitrary execution or the whole tree is exactly
-                    // the catastrophic over-grant P1b closes — the interpreter's
-                    // children fork outside the per-spawn interceptor, and a
-                    // prefix grant of `/` is a whole-tree permit. Refuse:
-                    // fail-closed to a deny so the operator must `[a]llow once`
-                    // per op. `[k]ey allow` (step-up, P3, unbuilt) is the
-                    // intended standing path for these. The prompt menu already
-                    // omits `[s]` for high-danger; this is the enforcement that
-                    // makes a muscle-memory `s` safe.
+                    // The form omits this action for high danger; enforce it too.
                     if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
                         self.record(req, "deny", "session-allow-refused-high-danger");
-                        // Through the window, not `println!`: the refusal is
-                        // printed while a question is still on screen, so it
-                        // must go through the arbiter or it races the ticker.
                         w.notice(&newt_line(
                             &format!(
                                 "session allow refused for high-danger `{}` — \
@@ -828,25 +771,15 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                         .ok();
                         return Deny;
                     }
-                    self.record(req, "allow", "session");
+                    self.record(req, "allow", scope);
                     self.state
                         .session_grants
                         .insert((req.kind, req.target.clone()));
                 }
                 PromptChoice::AllowPermanent => {
-                    // #904: durably grant a NET host by appending it to
-                    // `[tui.permissions] net` (comment-preserving). It is ALSO
-                    // added to session_grants so it holds immediately this
-                    // session — the durable grant only takes effect on the next
-                    // config load. The grant still flows through `mint()`
-                    // (re-minted ⊑ root), so the attenuation-only invariant holds.
-                    //
-                    // Only net is durably grantable (the only per-target config
-                    // allowlist). A non-net `[A]` (not offered in the menu, but a
-                    // muscle-memory keypress) degrades to a session grant, and a
-                    // high-danger net host is refused like `[s]ession allow`.
+                    // Only net has a durable per-target config allowlist.
                     if req.kind != newt_core::DenialKind::Net {
-                        self.record(req, "allow", "session");
+                        self.record(req, "allow", scope);
                         self.state
                             .session_grants
                             .insert((req.kind, req.target.clone()));
@@ -862,32 +795,22 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                         .ok();
                         return Deny;
                     }
-                    self.record(req, "allow", "permanent");
-                    match self.config_path.as_deref() {
+                    let persistent_scope = match self.config_path.as_deref() {
                         Some(path) => {
-                            if let Err(e) =
-                                newt_core::Config::append_permission_net_host(path, &req.target)
-                            {
-                                w.notice(&newt_line(
-                                    &format!(
-                                        "warning: could not persist net grant to config: {e} \
-                                         (granted for this session only)"
-                                    ),
-                                    self.color,
-                                    self.verbose,
-                                ))
-                                .ok();
-                            } else {
-                                w.notice(&newt_line(
-                                    &format!(
-                                        "added `{}` to [tui.permissions] net — future sessions \
-                                         will not prompt for it",
-                                        req.target
-                                    ),
-                                    self.color,
-                                    self.verbose,
-                                ))
-                                .ok();
+                            match newt_core::Config::append_permission_net_host(path, &req.target) {
+                                Ok(()) => "permanent",
+                                Err(e) => {
+                                    w.notice(&newt_line(
+                                        &format!(
+                                            "warning: could not persist net grant to config: {e} \
+                                             (granted for this session only)"
+                                        ),
+                                        self.color,
+                                        self.verbose,
+                                    ))
+                                    .ok();
+                                    "permanent-persist-failed"
+                                }
                             }
                         }
                         None => {
@@ -897,14 +820,28 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                                 self.verbose,
                             ))
                             .ok();
+                            "session"
                         }
+                    };
+                    self.record(req, "allow", persistent_scope);
+                    if persistent_scope == "permanent" {
+                        w.notice(&newt_line(
+                            &format!(
+                                "added `{}` to [tui.permissions] net — future sessions \
+                                 will not prompt for it",
+                                req.target
+                            ),
+                            self.color,
+                            self.verbose,
+                        ))
+                        .ok();
                     }
                     self.state
                         .session_grants
                         .insert((req.kind, req.target.clone()));
                 }
                 PromptChoice::Deny => {
-                    self.record(req, "deny", "once");
+                    self.record(req, "deny", scope);
                     return Deny;
                 }
                 PromptChoice::DenyAlways => {
@@ -915,11 +852,6 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                     return Deny;
                 }
                 PromptChoice::DenyPermanent => {
-                    // #904: record + persist so this (kind, target) is denied
-                    // across restarts. A persist-write failure is reported but
-                    // never blocks the decision, and the in-memory set is still
-                    // updated so it holds for the rest of THIS session even if
-                    // the disk write failed.
                     self.record(req, "deny", "permanent");
                     if let Some(path) = self.denials_path.as_deref() {
                         if let Err(e) = newt_core::append_denial(path, req.kind, &req.target) {
@@ -935,22 +867,37 @@ impl<F: FnMut(&PromptWindow, &str) -> PromptChoice> newt_core::PermissionGate
                         .insert((req.kind, req.target.clone()));
                     return Deny;
                 }
+                control @ (PromptChoice::Back | PromptChoice::Exit) => {
+                    self.apply_control(control);
+                    return Deny;
+                }
             }
         }
         Allow(self.mint(&once_grants))
     }
 
-    /// #728: ask the human a free-text question and read back the answer. This
-    /// is the same operator-present gate the permission prompt uses, so it is
-    /// only constructed for an interactive session (`prompt_permissions_enabled`);
-    /// headless callers hold `None` and never reach here. A closed stdin returns
-    /// `None`, which the `request_user_input` tool renders as "no human
-    /// available" — never a hang.
-    fn ask_question(&mut self, question: &str) -> Option<String> {
-        // Same seam as `ask`: suspend first, then ask. `prompt_user_input`
-        // cannot be called any other way.
+    fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
         let w = Terminal::suspend_for_prompt();
-        prompt_user_input(&w, question)
+        match prompt_user_input(&w, question) {
+            // A submitted line (including an explicitly empty one) is an answer.
+            Ok(ModalLine::Line(answer)) => HumanQuestionOutcome::Answer(answer),
+            // EOF is the input stream closing — NOT an empty human answer.
+            Ok(ModalLine::Eof) => HumanQuestionOutcome::InputClosed,
+            // Esc / slash-command back-out: cancel the turn, report Cancelled
+            // (never "headless"). `prompt_user_input` rewrites a slash command
+            // into `Back`, so a typed `/cmd` also lands here and backs out.
+            Ok(ModalLine::Back) => {
+                self.apply_control(PromptChoice::Back);
+                HumanQuestionOutcome::Cancelled
+            }
+            // Ctrl-C / Ctrl-D: cancel the turn AND request exit.
+            Ok(ModalLine::Exit) => {
+                self.apply_control(PromptChoice::Exit);
+                HumanQuestionOutcome::ExitRequested
+            }
+            // A read error is distinct from a missing operator.
+            Err(_) => HumanQuestionOutcome::InputFailed,
+        }
     }
 }
 
@@ -1003,10 +950,10 @@ mod permission_prompt_tests {
             for _ in 0..500 {
                 if let Ok(Some(p)) = answerer_store.pending_permission_request(&answer_conv) {
                     answerer_store
-                        .answer_permission_request(
+                        .answer_permission_action(
                             &answer_conv,
                             &p.request_id,
-                            newt_core::Verdict::AllowOnce,
+                            PromptChoice::AllowOnce,
                         )
                         .unwrap();
                     return;
@@ -1032,9 +979,12 @@ mod permission_prompt_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            authorization_prompts_enabled: true,
             web_decision_timeout: Duration::from_secs(2),
+            cancel: None,
+            exit: None,
             // Proof the TTY is bypassed when web decisions are on.
-            ask_human: |_w: &PromptWindow, _p: &str| {
+            ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
                 panic!("the TTY must not be read when web decisions are enabled")
             },
         };
@@ -1068,8 +1018,11 @@ mod permission_prompt_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            authorization_prompts_enabled: true,
             web_decision_timeout: Duration::from_millis(50),
-            ask_human: |_w: &PromptWindow, _p: &str| {
+            cancel: None,
+            exit: None,
+            ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
                 panic!("the TTY must not be read when web decisions are enabled")
             },
         };
@@ -1077,7 +1030,634 @@ mod permission_prompt_tests {
         let decision = gate.ask(&[exec_request("bash")]);
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.decisions[0].scope, "web-timeout");
         assert_eq!(store.pending_permission_request(&conv).unwrap(), None);
+    }
+
+    #[test]
+    fn web_publish_failure_records_web_unavailable_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let mut state = PermissionPromptState {
+            web_store: Some(store),
+            ..Default::default()
+        };
+        let mut gate = PromptPermissionGate {
+            state: &mut state,
+            base: Caveats::default(),
+            key_path: None,
+            conversation_id: "does-not-exist".to_string(),
+            log_path: None,
+            denials_path: None,
+            config_path: None,
+            preset_clamp: None,
+            danger: danger::DangerTable::builtin(),
+            color: false,
+            verbose: false,
+            authorization_prompts_enabled: true,
+            web_decision_timeout: Duration::from_millis(50),
+            cancel: None,
+            exit: None,
+            ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+                panic!("the TTY must not be read when web decisions are enabled");
+            },
+        };
+        let decision = gate.ask(&[exec_request("bash")]);
+        assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.decisions[0].scope, "web-unavailable");
+    }
+
+    // ---- defect 1: recoverable web-wait control reader --------------------
+    //
+    // These drive `run_web_wait` directly with a SCRIPTED control reader, a fake
+    // stepping clock, and a no-op sleep, so the recovery behaviour is fully
+    // mocked (no real terminal or wall clock). They ground the invariant that a
+    // transient reader error never permanently strands the operator, while
+    // preserving the exactly-once TTY-vs-web CAS and the fail-closed deadline.
+
+    use std::collections::VecDeque;
+    use std::io;
+
+    /// A control reader that replays a scripted sequence of poll results, then
+    /// idles (`Ok(None)`). `io::Result` lets a test inject transient/broken errors.
+    struct ScriptedReader(VecDeque<io::Result<Option<ModalLine>>>);
+    impl newt_core::tty::ControlReader for ScriptedReader {
+        fn poll(&mut self, _timeout: Duration) -> io::Result<Option<ModalLine>> {
+            self.0.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    fn broken() -> io::Error {
+        io::Error::other("reader broke")
+    }
+
+    /// A clock that advances a fixed `step` on each call — deterministic time
+    /// without sleeping, so the deadline path terminates in bounded iterations.
+    fn stepping_clock(step: Duration) -> impl Fn() -> Instant {
+        let base = Instant::now();
+        let n = std::cell::Cell::new(0u32);
+        move || {
+            let t = base + step * n.get();
+            n.set(n.get().saturating_add(1));
+            t
+        }
+    }
+
+    /// Publish a low-danger exec question and return its `request_id`.
+    fn publish_low_danger(store: &newt_core::ConversationStore, conv: &str) -> String {
+        let req = exec_request("bash");
+        let question =
+            permission_question_for(&req, &danger::DangerTable::builtin(), PromptSurface::Web);
+        store
+            .publish_permission_question(conv, &question, "\"low\"")
+            .unwrap()
+    }
+
+    fn store_and_conv() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        newt_core::ConversationStore,
+        String,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("s", None).unwrap();
+        (root, ws, store, conv)
+    }
+
+    /// Build a web gate with an explicit timeout and optional cancel/exit flags.
+    macro_rules! web_gate {
+        ($state:expr, $conv:expr, $timeout:expr, $cancel:expr, $exit:expr) => {
+            PromptPermissionGate {
+                state: $state,
+                base: Caveats::default(),
+                key_path: None,
+                conversation_id: $conv,
+                log_path: None,
+                denials_path: None,
+                config_path: None,
+                preset_clamp: None,
+                danger: danger::DangerTable::builtin(),
+                color: false,
+                verbose: false,
+                authorization_prompts_enabled: true,
+                web_decision_timeout: $timeout,
+                cancel: $cancel,
+                exit: $exit,
+                ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+                    panic!("run_web_wait must not read the TTY answer path")
+                },
+            }
+        };
+    }
+
+    #[test]
+    fn transient_reader_error_recovers_and_esc_resolves_through_the_tty_path() {
+        // Reader #1 errors (non-Interrupted); after re-arm, reader #2 yields Esc.
+        // The local abort wins the CAS and the gate returns Back.
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        let mut readers: VecDeque<ScriptedReader> = VecDeque::from([
+            ScriptedReader(VecDeque::from([Err(broken())])),
+            ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Back))])),
+        ]);
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let gate = web_gate!(
+            &mut state,
+            conv.clone(),
+            Duration::from_secs(3600),
+            None,
+            None
+        );
+        let win = Terminal::suspend_for_prompt();
+        let (choice, scope) = gate.run_web_wait(
+            &store,
+            &request_id,
+            &win,
+            || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            stepping_clock(Duration::from_millis(50)),
+            |_d| {},
+        );
+        assert_eq!(choice, PromptChoice::Back);
+        assert_eq!(scope, "control");
+        // The local abort resolved the request (nothing left pending).
+        assert!(store.pending_permission_request(&conv).unwrap().is_none());
+    }
+
+    #[test]
+    fn transient_reader_error_does_not_deny_when_a_web_verdict_arrives() {
+        // Reader errors, but a web ALLOW is already recorded: the temporary reader
+        // failure must not force a denial — the web verdict is honored.
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        store
+            .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+            .unwrap();
+        let mut readers: VecDeque<ScriptedReader> =
+            VecDeque::from([ScriptedReader(VecDeque::from([Err(broken())]))]);
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let gate = web_gate!(
+            &mut state,
+            conv.clone(),
+            Duration::from_secs(3600),
+            None,
+            None
+        );
+        let win = Terminal::suspend_for_prompt();
+        let (choice, _scope) = gate.run_web_wait(
+            &store,
+            &request_id,
+            &win,
+            || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            stepping_clock(Duration::from_millis(50)),
+            |_d| {},
+        );
+        assert_eq!(
+            choice,
+            PromptChoice::AllowOnce,
+            "web allow must survive a reader error"
+        );
+    }
+
+    #[test]
+    fn reader_failing_until_deadline_denies_without_busy_spin() {
+        // The reader can never be re-armed; the loop must NOT busy-spin (it paces
+        // via sleep) and must resolve as the fail-closed timeout denial.
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let gate = web_gate!(
+            &mut state,
+            conv.clone(),
+            Duration::from_millis(500),
+            None,
+            None
+        );
+        let win = Terminal::suspend_for_prompt();
+        let sleeps = std::cell::Cell::new(0u32);
+        let (choice, scope) = gate.run_web_wait(
+            &store,
+            &request_id,
+            &win,
+            || Err::<Box<dyn newt_core::tty::ControlReader>, _>(broken()),
+            stepping_clock(Duration::from_millis(20)),
+            |_d| sleeps.set(sleeps.get() + 1),
+        );
+        assert_eq!(choice, PromptChoice::Deny);
+        assert_eq!(scope, "web-timeout");
+        // Paced (slept at least once) and bounded (nowhere near a busy-spin).
+        assert!(sleeps.get() >= 1, "must pace via sleep, not spin");
+        assert!(
+            sleeps.get() < 10_000,
+            "bounded iterations: {}",
+            sleeps.get()
+        );
+    }
+
+    #[test]
+    fn web_verdict_and_local_control_resolve_exactly_once() {
+        // (a) Web verdict already recorded → a concurrent local Back consumes THAT
+        //     verdict instead of overwriting it.
+        let (_r1, _w1, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        store
+            .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+            .unwrap();
+        let mut readers: VecDeque<ScriptedReader> =
+            VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Back))]))]);
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let gate = web_gate!(
+            &mut state,
+            conv.clone(),
+            Duration::from_secs(3600),
+            None,
+            None
+        );
+        let win = Terminal::suspend_for_prompt();
+        let (choice, _s) = gate.run_web_wait(
+            &store,
+            &request_id,
+            &win,
+            || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            stepping_clock(Duration::from_millis(50)),
+            |_d| {},
+        );
+        assert_eq!(
+            choice,
+            PromptChoice::AllowOnce,
+            "web verdict already won; local consumes it"
+        );
+
+        // (b) Local Back wins first → a later web answer cannot authorize.
+        let (_r2, _w2, store2, conv2) = store_and_conv();
+        let request_id2 = publish_low_danger(&store2, &conv2);
+        let mut readers2: VecDeque<ScriptedReader> =
+            VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Back))]))]);
+        let mut state2 = PermissionPromptState {
+            web_store: Some(store2.clone()),
+            ..Default::default()
+        };
+        let gate2 = web_gate!(
+            &mut state2,
+            conv2.clone(),
+            Duration::from_secs(3600),
+            None,
+            None
+        );
+        let win2 = Terminal::suspend_for_prompt();
+        let (choice2, _s2) = gate2.run_web_wait(
+            &store2,
+            &request_id2,
+            &win2,
+            || {
+                readers2
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            stepping_clock(Duration::from_millis(50)),
+            |_d| {},
+        );
+        assert_eq!(choice2, PromptChoice::Back, "local abort won the race");
+        // The request is resolved: a later web POST finds nothing to answer.
+        assert!(store2.pending_permission_request(&conv2).unwrap().is_none());
+        let late = store2
+            .answer_permission_action(&conv2, &request_id2, PromptChoice::AllowOnce)
+            .unwrap();
+        assert!(
+            !matches!(late, newt_core::store::AnswerOutcome::Answered),
+            "a late web answer must not authorize an already-resolved request: {late:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit() {
+        // A reader error, then re-arm, then Ctrl-C/Ctrl-D → run_web_wait returns
+        // Exit and (as ask() then applies) both the cancel AND exit flags set.
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        let mut readers: VecDeque<ScriptedReader> = VecDeque::from([
+            ScriptedReader(VecDeque::from([Err(broken())])),
+            ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Exit))])),
+        ]);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let exit = std::sync::atomic::AtomicBool::new(false);
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let gate = web_gate!(
+            &mut state,
+            conv.clone(),
+            Duration::from_secs(3600),
+            Some(&cancel),
+            Some(&exit)
+        );
+        let win = Terminal::suspend_for_prompt();
+        let (choice, _s) = gate.run_web_wait(
+            &store,
+            &request_id,
+            &win,
+            || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            stepping_clock(Duration::from_millis(50)),
+            |_d| {},
+        );
+        assert_eq!(choice, PromptChoice::Exit);
+        // ask() applies the control on Back|Exit; Exit sets both signals.
+        gate.apply_control(choice);
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "cancel must be set"
+        );
+        assert!(
+            exit.load(std::sync::atomic::Ordering::Relaxed),
+            "exit must be set"
+        );
+    }
+
+    #[test]
+    fn repeated_interrupted_keeps_the_reader_and_paces_without_spinning() {
+        // EINTR returns immediately; the SAME reader is retried (not dropped) and
+        // the loop paces via sleep rather than busy-spinning. After several
+        // Interrupted errors the same reader yields Esc, which still resolves.
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        let mut readers: VecDeque<ScriptedReader> =
+            VecDeque::from([ScriptedReader(VecDeque::from([
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(Some(ModalLine::Back)),
+            ]))]);
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let gate = web_gate!(
+            &mut state,
+            conv.clone(),
+            Duration::from_secs(3600),
+            None,
+            None
+        );
+        let win = Terminal::suspend_for_prompt();
+        let reacquired = std::cell::Cell::new(0u32);
+        let sleeps = std::cell::Cell::new(0u32);
+        let (choice, _s) = gate.run_web_wait(
+            &store,
+            &request_id,
+            &win,
+            || {
+                reacquired.set(reacquired.get() + 1);
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            stepping_clock(Duration::from_millis(50)),
+            |_d| sleeps.set(sleeps.get() + 1),
+        );
+        assert_eq!(
+            choice,
+            PromptChoice::Back,
+            "same reader survives EINTR and yields Esc"
+        );
+        assert_eq!(
+            reacquired.get(),
+            1,
+            "an Interrupted error must NOT drop/recreate the reader"
+        );
+        // Paced (slept between EINTR retries) and bounded (no busy-spin).
+        assert!(
+            sleeps.get() >= 3,
+            "must pace between EINTR retries: {}",
+            sleeps.get()
+        );
+        assert!(sleeps.get() < 10_000, "bounded: {}", sleeps.get());
+    }
+
+    #[test]
+    fn an_initial_unsupported_still_retries_and_recovers() {
+        // A terminal-loss race at the FIRST acquisition (Unsupported) must NOT
+        // permanently disable controls — the gate is only built for an
+        // interactive session, so this is a race, not a headless session. Keep
+        // retrying, re-arm when the terminal returns, and Esc still resolves.
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        let mut outcomes: VecDeque<io::Result<ScriptedReader>> = VecDeque::from([
+            Err(io::Error::from(io::ErrorKind::Unsupported)), // INITIAL acquisition fails
+            Ok(ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Back))]))), // terminal returns
+        ]);
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let gate = web_gate!(
+            &mut state,
+            conv.clone(),
+            Duration::from_secs(3600),
+            None,
+            None
+        );
+        let win = Terminal::suspend_for_prompt();
+        let (choice, _s) = gate.run_web_wait(
+            &store,
+            &request_id,
+            &win,
+            || {
+                outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| Err(broken()))
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+            },
+            stepping_clock(Duration::from_millis(50)),
+            |_d| {},
+        );
+        assert_eq!(
+            choice,
+            PromptChoice::Back,
+            "an initial Unsupported must not permanently disable controls"
+        );
+    }
+
+    #[test]
+    fn a_post_live_unsupported_keeps_retrying_and_recovers() {
+        // A gate built for an interactive session that momentarily loses its
+        // terminal (reacquire → Unsupported) keeps retrying (bounded) and re-arms
+        // when the terminal returns, then Esc still resolves. Guards against
+        // recreating the original permanent-disable defect shape.
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        let mut outcomes: VecDeque<io::Result<ScriptedReader>> = VecDeque::from([
+            Ok(ScriptedReader(VecDeque::from([Err(broken())]))), // Live, then breaks
+            Err(io::Error::from(io::ErrorKind::Unsupported)),    // terminal "gone"
+            Err(io::Error::from(io::ErrorKind::Unsupported)),    // still gone
+            Ok(ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Back))]))), // back
+        ]);
+        let mut state = PermissionPromptState {
+            web_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let gate = web_gate!(
+            &mut state,
+            conv.clone(),
+            Duration::from_secs(3600),
+            None,
+            None
+        );
+        let win = Terminal::suspend_for_prompt();
+        let (choice, _s) = gate.run_web_wait(
+            &store,
+            &request_id,
+            &win,
+            || {
+                outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| Err(broken()))
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+            },
+            stepping_clock(Duration::from_millis(50)),
+            |_d| {},
+        );
+        assert_eq!(
+            choice,
+            PromptChoice::Back,
+            "a transient Unsupported must not permanently disable controls"
+        );
+    }
+
+    // ---- defect: authorization-prompt policy is separate from human presence -
+    // The gate is built whenever the session has a usable TTY; permission
+    // prompting is a separate policy (`authorization_prompts_enabled`). Disabling
+    // it must deny authorization WITHOUT prompting, and must NOT erase the
+    // operator from `request_user_input` (proven in newt-core's
+    // `request_user_input_reaches_the_operator_even_when_permissions_are_denied`).
+
+    #[test]
+    fn authorization_prompts_disabled_denies_without_opening_a_prompt() {
+        // TTY + permissions DISABLED: ask() denies and never consults the human
+        // (the empty script would panic on any prompt).
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0usize));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![],
+            prompts.clone(),
+        );
+        gate.authorization_prompts_enabled = false;
+        let decision = gate.ask(&[exec_request("bash")]);
+        assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+        assert_eq!(prompts.get(), 0, "disabled prompts must not open a prompt");
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.decisions[0].scope, "authorization-prompts-disabled");
+    }
+
+    #[test]
+    fn authorization_prompts_enabled_consults_the_operator() {
+        // TTY + permissions ENABLED: ask() DOES prompt (scripted allow-once).
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0usize));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        let decision = gate.ask(&[exec_request("bash")]);
+        assert!(matches!(decision, newt_core::PermissionDecision::Allow(_)));
+        assert_eq!(
+            prompts.get(),
+            1,
+            "enabled prompts consult the operator once"
+        );
+    }
+
+    #[test]
+    fn allow_permanent_records_session_scope_when_net_persist_fails() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = root.path().join("blocked-config-dir");
+        std::fs::create_dir_all(&config).unwrap();
+        let base = base_caveats("/ws");
+        let net_req = newt_core::PermissionRequest {
+            tool: "web_fetch".to_string(),
+            kind: DenialKind::Net,
+            target: "github.com".to_string(),
+            reason: "net does not permit 'github.com'".to_string(),
+        };
+
+        let mut state = PermissionPromptState::default();
+        {
+            let mut gate = PromptPermissionGate {
+                state: &mut state,
+                base,
+                key_path: None,
+                conversation_id: "conv-config-fail".to_string(),
+                log_path: None,
+                denials_path: None,
+                config_path: Some(config.clone()),
+                preset_clamp: None,
+                danger: danger::DangerTable::builtin(),
+                color: false,
+                verbose: false,
+                authorization_prompts_enabled: true,
+                web_decision_timeout: Duration::from_secs(2),
+                cancel: None,
+                exit: None,
+                ask_human: move |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+                    PromptChoice::AllowPermanent
+                },
+            };
+            assert!(matches!(
+                gate.ask(std::slice::from_ref(&net_req)),
+                newt_core::PermissionDecision::Allow(_)
+            ));
+        }
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(
+            state.decisions[0].scope, "permanent-persist-failed",
+            "failed net persistence should not be logged as durable"
+        );
     }
 
     /// A gate whose "human" is a script of choices; counts every prompt.
@@ -1088,7 +1668,8 @@ mod permission_prompt_tests {
         log_path: Option<std::path::PathBuf>,
         script: Vec<PromptChoice>,
         prompts: Rc<Cell<usize>>,
-    ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &str) -> PromptChoice> {
+    ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice>
+    {
         let mut script = script.into_iter();
         PromptPermissionGate {
             state,
@@ -1102,41 +1683,11 @@ mod permission_prompt_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            authorization_prompts_enabled: true,
             web_decision_timeout: Duration::from_secs(2),
-            ask_human: move |_w: &PromptWindow, _prompt: &str| {
-                prompts.set(prompts.get() + 1);
-                script.next().expect("script exhausted — unexpected prompt")
-            },
-        }
-    }
-
-    /// #307: a scripted gate carrying an active preset clamp (the floor). Same
-    /// as [`scripted_gate`] but with `preset_clamp` set, for the floor tests.
-    #[allow(clippy::too_many_arguments)]
-    fn scripted_gate_with_clamp<'a>(
-        state: &'a mut PermissionPromptState,
-        base: Caveats,
-        key_path: Option<std::path::PathBuf>,
-        log_path: Option<std::path::PathBuf>,
-        preset_clamp: Caveats,
-        script: Vec<PromptChoice>,
-        prompts: Rc<Cell<usize>>,
-    ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &str) -> PromptChoice> {
-        let mut script = script.into_iter();
-        PromptPermissionGate {
-            state,
-            base,
-            key_path,
-            conversation_id: "conv-test".to_string(),
-            log_path,
-            denials_path: None,
-            config_path: None,
-            preset_clamp: Some(preset_clamp),
-            danger: danger::DangerTable::builtin(),
-            color: false,
-            verbose: false,
-            web_decision_timeout: Duration::from_secs(2),
-            ask_human: move |_w: &PromptWindow, _prompt: &str| {
+            cancel: None,
+            exit: None,
+            ask_human: move |_w: &PromptWindow, _question: &Question<PromptChoice>| {
                 prompts.set(prompts.get() + 1);
                 script.next().expect("script exhausted — unexpected prompt")
             },
@@ -1144,174 +1695,128 @@ mod permission_prompt_tests {
     }
 
     #[test]
-    fn parse_choice_maps_the_sketch_keys_and_defaults_to_deny() {
-        assert_eq!(parse_permission_choice("a"), PromptChoice::AllowOnce);
-        assert_eq!(parse_permission_choice(" a \n"), PromptChoice::AllowOnce);
-        assert_eq!(parse_permission_choice("s"), PromptChoice::AllowSession);
-        assert_eq!(parse_permission_choice("d"), PromptChoice::Deny);
-        assert_eq!(parse_permission_choice("D"), PromptChoice::DenyAlways);
-        // #904: the durable tiers.
-        assert_eq!(parse_permission_choice("P"), PromptChoice::DenyPermanent);
-        assert_eq!(parse_permission_choice("A"), PromptChoice::AllowPermanent);
-        // Default = deny: empty (just Enter / EOF), garbage, near-misses.
-        assert_eq!(parse_permission_choice(""), PromptChoice::Deny);
-        assert_eq!(parse_permission_choice("yes"), PromptChoice::Deny);
-        // Case-significant: capital `S` is not a choice (session is lowercase `s`).
-        assert_eq!(parse_permission_choice("S"), PromptChoice::Deny);
+    fn nested_controls_cancel_without_recording_a_permission_decision() {
+        for (choice, exits) in [(PromptChoice::Back, false), (PromptChoice::Exit, true)] {
+            let cancel = AtomicBool::new(false);
+            let exit = AtomicBool::new(false);
+            let mut state = PermissionPromptState::default();
+            let prompts = Rc::new(Cell::new(0));
+            let mut gate = scripted_gate(
+                &mut state,
+                base_caveats("/ws"),
+                None,
+                None,
+                vec![choice],
+                prompts,
+            );
+            gate.cancel = Some(&cancel);
+            gate.exit = Some(&exit);
+            assert!(matches!(
+                gate.ask(&[exec_request("npm")]),
+                newt_core::PermissionDecision::Deny
+            ));
+            drop(gate);
+            assert!(cancel.load(Ordering::Relaxed));
+            assert_eq!(exit.load(Ordering::Relaxed), exits);
+            assert!(state.decisions.is_empty());
+        }
     }
 
     #[test]
-    fn interpret_user_line_maps_eof_to_empty_and_errors_to_none() {
-        // #783 (Bug C): EOF (Ok(0)) is now mapped to Some("") — an empty,
-        // deliberate answer — consistent with prompt_permission_choice, which
-        // treats the same EOF as a valid response. Only a genuine read error →
-        // None ("no human available"). The Ok(0) == Some("") assertion is RED on
-        // the old `Ok(0) | Err(_) => None`.
-        assert_eq!(interpret_user_line(Ok(0), ""), Some(String::new()));
-        assert_eq!(
-            interpret_user_line(Err(io::Error::from(io::ErrorKind::Other)), ""),
-            None
-        );
-        assert_eq!(interpret_user_line(Ok(5), "hi\n"), Some("hi".to_string()));
-    }
-
-    // NOTE: `prompt_stdin_guard_marks_prompt_ownership_and_clears_on_drop` and
-    // `watcher_read_token_blocks_prompt_entry_until_the_read_finishes` moved to
-    // `newt_core::tty::arbiter` with the mechanism they test. Stdin ownership
-    // is no longer this module's concern — one arbiter owns both halves of the
-    // terminal.
-
-    #[test]
-    fn prompt_text_names_tool_target_axis_and_choices() {
+    fn question_policy_and_markdown_cover_each_axis_and_danger_tier() {
         let danger = danger::DangerTable::builtin();
-        let text = permission_prompt_text(&exec_request("npm"), &danger);
-        assert!(
-            text.contains("run_command wants to run `npm`"),
-            "got: {text}"
-        );
-        assert!(
-            text.contains("outside the granted exec allowlist"),
-            "got: {text}"
-        );
-        assert!(
-            text.contains("not within the granted authority"),
-            "reason shown: {text}"
-        );
-        // `npm` is a narrow command → low-danger → the full menu (incl. session).
-        assert!(
-            text.contains("[a]llow once   [s]ession allow   [d]eny (default)   [D]eny always"),
-            "got: {text}"
-        );
-        // Axis wording follows the kind; an empty reason adds no parens.
-        let read = permission_prompt_text(
+        for (kind, target, wording) in [
+            (DenialKind::FsRead, "/etc/hosts", "read"),
+            (DenialKind::FsWrite, "/ws/f", "write"),
+            (DenialKind::Net, "docs.rs", "reach"),
+            (DenialKind::RemoteTool, "remote__tool", "call"),
+            (DenialKind::GitWrite, "commit", "commit/stage via git"),
+        ] {
+            let q = permission_question(
+                &PermissionRequest {
+                    tool: "tool".into(),
+                    kind,
+                    target: target.into(),
+                    reason: String::new(),
+                },
+                &danger,
+            );
+            assert!(q.markdown.contains(&format!("{wording} `{target}`")));
+        }
+
+        let low = permission_question(&exec_request("npm"), &danger);
+        assert!(low
+            .actions
+            .iter()
+            .any(|a| a.value == PromptChoice::AllowSession));
+        assert!(low.markdown.contains("outside the granted exec allowlist"));
+
+        let high = permission_question(
             &PermissionRequest {
-                tool: "read_file".to_string(),
-                kind: DenialKind::FsRead,
-                target: "/etc/hosts".to_string(),
-                reason: String::new(),
+                tool: "request_permissions".into(),
+                kind: DenialKind::Exec,
+                target: "bash".into(),
+                reason: "list the files".into(),
             },
             &danger,
         );
-        assert!(read.contains("wants to read `/etc/hosts`"), "got: {read}");
-        assert!(read.contains("fs_read scope"), "got: {read}");
-        assert!(!read.contains("()"), "no empty reason parens: {read}");
-        let net = permission_prompt_text(
+        assert!(!high
+            .actions
+            .iter()
+            .any(|a| a.value == PromptChoice::AllowSession));
+        let text = high.terminal_text();
+        for expected in [
+            "interpreter",
+            "arbitrary command execution",
+            "model-authored, unverified",
+            "list the files",
+            "session allow refused",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+
+        let root = permission_question(
             &PermissionRequest {
-                tool: "web_fetch".to_string(),
-                kind: DenialKind::Net,
-                target: "docs.rs".to_string(),
-                reason: String::new(),
-            },
-            &danger,
-        );
-        assert!(net.contains("wants to reach `docs.rs`"), "got: {net}");
-        let write = permission_prompt_text(
-            &PermissionRequest {
-                tool: "edit_file".to_string(),
+                tool: "request_permissions".into(),
                 kind: DenialKind::FsWrite,
-                target: "/ws/f".to_string(),
+                target: "/".into(),
                 reason: String::new(),
             },
             &danger,
         );
-        assert!(write.contains("wants to write `/ws/f`"), "got: {write}");
-    }
+        assert!(root.markdown.contains("filesystem root"));
+        assert!(!root
+            .actions
+            .iter()
+            .any(|a| a.value == PromptChoice::AllowSession));
 
-    /// Facade P1b (§7-F4) — the confused-deputy-through-the-operator fix. A
-    /// `request_permissions{capability:"exec", target:"bash", reason:"…benign…"}`
-    /// must show a SYSTEM-computed blast-radius line the model cannot forge, and
-    /// the benign model `reason` must NOT suppress it (it is labelled untrusted,
-    /// not rendered as harness fact). RED on today's code: the pre-P1b prompt
-    /// shows only the verbatim `reason` and no danger annotation.
-    #[test]
-    fn high_danger_prompt_shows_blast_radius_and_labels_reason_untrusted() {
-        let danger = danger::DangerTable::builtin();
-        // The exact attack from §7-F4: a catastrophic grant under a benign cover.
-        let req = PermissionRequest {
-            tool: "request_permissions".to_string(),
-            kind: DenialKind::Exec,
-            target: "bash".to_string(),
-            reason: "list the files in this directory".to_string(),
-        };
-        let text = permission_prompt_text(&req, &danger);
-
-        // (1) the system blast-radius line is present — a fact, not model text.
-        assert!(
-            text.contains("⚠") && text.contains("interpreter"),
-            "expected a blast-radius warning, got: {text}"
+        let web_low = permission_question_for(&exec_request("npm"), &danger, PromptSurface::Web);
+        assert_eq!(
+            web_low.actions.iter().map(|a| a.value).collect::<Vec<_>>(),
+            [
+                PromptChoice::AllowOnce,
+                PromptChoice::AllowSession,
+                PromptChoice::Deny
+            ]
         );
-        assert!(
-            text.contains("arbitrary command execution"),
-            "expected the exec blast radius, got: {text}"
+        assert_eq!(
+            serde_json::from_str::<Question<PromptChoice>>(
+                &serde_json::to_string(&web_low).unwrap()
+            )
+            .unwrap(),
+            web_low
         );
-        // The benign reason did NOT suppress the warning — both are present.
-        assert!(
-            text.contains("list the files in this directory"),
-            "the model reason is still shown (as context), got: {text}"
-        );
-        // (2) the model `reason` is labelled UNTRUSTED, never as harness fact.
-        assert!(
-            text.contains("model-authored, unverified"),
-            "the reason must be labelled untrusted model text, got: {text}"
-        );
-        // (3) the menu OMITS a plain `[s]ession allow` and notes the refusal.
-        assert!(
-            !text.contains("[a]llow once   [s]ession allow   [d]eny"),
-            "a high-danger grant must NOT offer the plain session-allow menu, got: {text}"
-        );
-        assert!(
-            text.contains("[s]ession allow refused"),
-            "the prompt must explain the session-allow refusal, got: {text}"
-        );
-
-        // A broad fs root gets the same treatment (root `/`, FsWrite).
-        let fs_req = PermissionRequest {
-            tool: "request_permissions".to_string(),
-            kind: DenialKind::FsWrite,
-            target: "/".to_string(),
-            reason: "just save one small file".to_string(),
-        };
-        let fs_text = permission_prompt_text(&fs_req, &danger);
-        assert!(
-            fs_text.contains("filesystem root") && fs_text.contains("write access to everything"),
-            "expected the fs-root blast radius, got: {fs_text}"
-        );
-        assert!(
-            !fs_text.contains("[s]ession allow   [d]eny"),
-            "fs-root grant must not offer plain session-allow, got: {fs_text}"
+        let web_high = permission_question_for(&exec_request("bash"), &danger, PromptSurface::Web);
+        assert_eq!(
+            web_high.actions.iter().map(|a| a.value).collect::<Vec<_>>(),
+            [PromptChoice::AllowOnce, PromptChoice::Deny]
         );
     }
 
-    /// Facade P1b (§7-F3/F4) — a high-danger target is NOT session-allowable.
-    /// Choosing `[s]ession allow` for an interpreter is refused (fail-closed to a
-    /// deny, no session grant remembered); `[a]llow once` still works. RED on
-    /// today's code: the pre-P1b `AllowSession` arm inserts ANY target into
-    /// `session_grants` unconditionally — a standing arbitrary-code permit.
     #[test]
     fn high_danger_target_is_not_session_allowable_but_allow_once_works() {
         let base = base_caveats("/ws");
 
-        // `[s]ession allow` of `bash` (an interpreter) is REFUSED.
         let mut state = PermissionPromptState::default();
         let prompts = Rc::new(Cell::new(0));
         {
@@ -1337,7 +1842,6 @@ mod permission_prompt_tests {
                 .contains(&(DenialKind::Exec, "bash".to_string())),
             "a refused session-allow must leave NO standing grant"
         );
-        // The refusal is recorded as a deny, not an allow.
         assert_eq!(state.decisions.len(), 1);
         assert_eq!(state.decisions[0].decision, "deny");
         assert!(
@@ -1346,7 +1850,6 @@ mod permission_prompt_tests {
             state.decisions[0].scope
         );
 
-        // `[a]llow once` of the SAME high-danger target still works (per-op).
         let mut once_state = PermissionPromptState::default();
         let once_prompts = Rc::new(Cell::new(0));
         let mut once_gate = scripted_gate(
@@ -1369,12 +1872,9 @@ mod permission_prompt_tests {
             }
         }
         drop(once_gate);
-        // Allow-once leaves no standing grant — the per-op nature is preserved.
         assert!(once_state.session_grants.is_empty());
     }
 
-    /// Track O (#1131): build a `PolicySet` for the given verdict + inline TOML,
-    /// the way the store loads `~/.newt/ocap/<verdict>.toml`.
     fn ocap(
         verdict: newt_core::ocap_store::Verdict,
         toml: &str,
@@ -1382,13 +1882,8 @@ mod permission_prompt_tests {
         newt_core::ocap_store::build_store(&[(verdict, Some(toml.to_string()))]).0
     }
 
-    /// Track O (#1131): a durable OCAP `approve` pre-answers the prompt — no ask,
-    /// and the target is folded into the minted authority so the op actually
-    /// runs (not merely prompt-skipped). This is the "Always allow" the
-    /// accumulation loop earns.
     #[test]
     fn durable_ocap_approve_allows_without_prompting_and_grants_authority() {
-        // `git` is not in base exec (only `cargo`) — normally this prompts.
         let mut state = PermissionPromptState {
             ocap_policy: ocap(
                 newt_core::ocap_store::Verdict::Approve,
@@ -1417,13 +1912,9 @@ mod permission_prompt_tests {
         assert_eq!(state.decisions.len(), 1);
         assert_eq!(state.decisions[0].decision, "allow");
         assert_eq!(state.decisions[0].scope, "ocap-approve");
-        // Durable, not session: the store answers again next time; no standing
-        // session grant is minted.
         assert!(state.session_grants.is_empty());
     }
 
-    /// Track O (#1131): a durable OCAP `deny` refuses before any prompt — the
-    /// durable sibling of `[D]eny always`, sourced from `deny.toml`.
     #[test]
     fn durable_ocap_deny_refuses_without_prompting() {
         let mut state = PermissionPromptState {
@@ -1452,11 +1943,6 @@ mod permission_prompt_tests {
         assert_eq!(prompts.get(), 0, "durable deny must NOT prompt");
     }
 
-    /// Track O (#1131) danger-gate: a durable `approve` of a HIGH-danger target
-    /// (an interpreter) is NOT honored as auto-allow — it fails closed to the
-    /// prompt, the same P1b ceiling that refuses a plain `[s]ession allow` for
-    /// high-danger. `validate_approve` keeps such targets out of approve.toml;
-    /// this is the belt-and-suspenders enforcement at the gate.
     #[test]
     fn durable_ocap_approve_of_high_danger_still_prompts() {
         let mut state = PermissionPromptState {
@@ -1489,10 +1975,6 @@ mod permission_prompt_tests {
         );
     }
 
-    /// #904: `[P]ermanently deny` persists the `(kind, target)` to disk and, in a
-    /// FRESH session that reloads it, auto-denies the same target WITHOUT ever
-    /// prompting — the durable sibling of `[D]eny always`. Exercised on a net
-    /// host (the motivating axis), but the mechanism is axis-agnostic.
     #[test]
     fn permanently_deny_persists_and_reloads_without_reprompting() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1505,7 +1987,6 @@ mod permission_prompt_tests {
             reason: "net does not permit 'evil.example.com'".to_string(),
         };
 
-        // Session 1 — the human picks [P]ermanently deny.
         let mut state = PermissionPromptState::default();
         {
             let mut script = vec![PromptChoice::DenyPermanent].into_iter();
@@ -1521,8 +2002,11 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
+                authorization_prompts_enabled: true,
                 web_decision_timeout: Duration::from_secs(2),
-                ask_human: move |_w: &PromptWindow, _p: &str| {
+                cancel: None,
+                exit: None,
+                ask_human: move |_w: &PromptWindow, _q: &Question<PromptChoice>| {
                     script.next().expect("script exhausted")
                 },
             };
@@ -1540,8 +2024,6 @@ mod permission_prompt_tests {
             "the permanent deny was written to disk"
         );
 
-        // Session 2 (fresh) — the denylist is loaded, so the SAME target is
-        // denied WITHOUT prompting (the scripted human panics if consulted).
         let mut fresh = PermissionPromptState::with_persistent_denials(Some(&denials));
         {
             let mut gate = PromptPermissionGate {
@@ -1556,8 +2038,11 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
+                authorization_prompts_enabled: true,
                 web_decision_timeout: Duration::from_secs(2),
-                ask_human: |_w: &PromptWindow, _p: &str| {
+                cancel: None,
+                exit: None,
+                ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
                     panic!("must NOT prompt: target was permanently denied")
                 },
             };
@@ -1566,30 +2051,13 @@ mod permission_prompt_tests {
                 newt_core::PermissionDecision::Deny
             ));
         }
-        // No prompt ⇒ no new decision recorded in the fresh session.
         assert!(fresh.decisions.is_empty());
     }
 
-    /// #904: the choice parser maps `P` to the permanent deny and leaves the
-    /// existing keys (incl. the session `D`) intact; unknown/empty stays deny.
-    #[test]
-    fn parse_permission_choice_maps_permanent_deny() {
-        assert_eq!(parse_permission_choice("P"), PromptChoice::DenyPermanent);
-        assert_eq!(parse_permission_choice("D"), PromptChoice::DenyAlways);
-        assert_eq!(parse_permission_choice("a"), PromptChoice::AllowOnce);
-        assert_eq!(parse_permission_choice("s"), PromptChoice::AllowSession);
-        // Case-significant + safe default: lowercase p / unknown / empty → deny.
-        assert_eq!(parse_permission_choice("p"), PromptChoice::Deny);
-        assert_eq!(parse_permission_choice(""), PromptChoice::Deny);
-    }
-
-    /// #904: the `[A]llow permanently` option is offered ONLY for net denials
-    /// (the only axis with a per-target config allowlist); every axis still
-    /// offers `[P]ermanently deny`.
     #[test]
     fn permanent_allow_offered_for_net_only() {
         let danger = danger::DangerTable::builtin();
-        let net = permission_prompt_text(
+        let net = permission_question(
             &PermissionRequest {
                 tool: "web_fetch".to_string(),
                 kind: DenialKind::Net,
@@ -1597,8 +2065,9 @@ mod permission_prompt_tests {
                 reason: String::new(),
             },
             &danger,
-        );
-        let exec = permission_prompt_text(&exec_request("npm"), &danger);
+        )
+        .terminal_text();
+        let exec = permission_question(&exec_request("npm"), &danger).terminal_text();
         assert!(
             net.contains("[A]llow permanently"),
             "net must offer it: {net}"
@@ -1610,15 +2079,10 @@ mod permission_prompt_tests {
         assert!(net.contains("[P]ermanently deny") && exec.contains("[P]ermanently deny"));
     }
 
-    /// #904: `[A]llow permanently` for a net host grants it this session AND
-    /// durably appends it to `[tui.permissions] net` in the config, so a fresh
-    /// session reads it as an ambient allow (net scope permits it → no denial →
-    /// no prompt). The written config is valid TOML that round-trips.
     #[test]
     fn allow_permanently_grants_now_and_persists_host_to_config() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("config.toml");
-        // Start from a hand-authored config with a comment (proves preservation).
         std::fs::write(&config, "# my config\n[tui.permissions]\nnet = []\n").unwrap();
         let base = base_caveats("/ws");
         let net_req = newt_core::PermissionRequest {
@@ -1643,8 +2107,11 @@ mod permission_prompt_tests {
                 danger: danger::DangerTable::builtin(),
                 color: false,
                 verbose: false,
+                authorization_prompts_enabled: true,
                 web_decision_timeout: Duration::from_secs(2),
-                ask_human: move |_w: &PromptWindow, _p: &str| {
+                cancel: None,
+                exit: None,
+                ask_human: move |_w: &PromptWindow, _q: &Question<PromptChoice>| {
                     script.next().expect("script exhausted")
                 },
             };
@@ -1657,13 +2124,10 @@ mod permission_prompt_tests {
                 }
             }
         }
-        // Holds this session.
         assert!(state
             .session_grants
             .contains(&(DenialKind::Net, "github.com".to_string())));
         assert_eq!(state.decisions[0].scope, "permanent");
-        // Durably written: the config parses back and its net scope permits it,
-        // and the hand-authored comment survived (comment-preserving write).
         let written = std::fs::read_to_string(&config).unwrap();
         assert!(written.contains("# my config"), "comment lost: {written}");
         assert!(
@@ -1682,8 +2146,6 @@ mod permission_prompt_tests {
         );
     }
 
-    /// Allow-once: the minted caveats cover the target for THIS consult, but
-    /// nothing is remembered — the next identical ask prompts again.
     #[test]
     fn allow_once_grants_one_call_and_reprompts_next_time() {
         let mut state = PermissionPromptState::default();
@@ -1707,7 +2169,6 @@ mod permission_prompt_tests {
             newt_core::PermissionDecision::Deny => panic!("expected allow"),
         }
         assert_eq!(prompts.get(), 1);
-        // The same request again: allow-once left no session grant behind.
         assert!(matches!(
             gate.ask(&req),
             newt_core::PermissionDecision::Allow(_)
@@ -1720,11 +2181,6 @@ mod permission_prompt_tests {
         assert_eq!(state.decisions[0].scope, "once");
     }
 
-    /// #1057: a model-driven `request_permissions` allow-once must cover the
-    /// model's SEPARATE `run_command` retry — its widened caveats are otherwise
-    /// discarded by `execute_request_permissions`, so the retry re-denied and
-    /// wasted a round (the live Ornith repro: grant `python3`, then
-    /// `/usr/bin/python3` re-prompts). It must also be ONE-SHOT.
     #[test]
     fn request_permissions_allow_once_carries_to_the_run_command_retry() {
         let mut state = PermissionPromptState::default();
@@ -1738,7 +2194,6 @@ mod permission_prompt_tests {
             vec![PromptChoice::AllowOnce, PromptChoice::AllowOnce],
             prompts.clone(),
         );
-        // The model pre-asks via request_permissions for `python3` (bare name).
         let ask = PermissionRequest {
             tool: "request_permissions".to_string(),
             kind: DenialKind::Exec,
@@ -1750,7 +2205,6 @@ mod permission_prompt_tests {
             newt_core::PermissionDecision::Allow(_)
         ));
         assert_eq!(prompts.get(), 1);
-        // The retry arrives as a run_command denial, path-resolved to /usr/bin/python3.
         match gate.ask(&[exec_request("/usr/bin/python3")]) {
             newt_core::PermissionDecision::Allow(c) => {
                 assert!(
@@ -1765,7 +2219,6 @@ mod permission_prompt_tests {
             1,
             "no second prompt — the pending grant covered the /usr/bin/python3 retry"
         );
-        // One-shot: another python3 op must re-prompt (allow-once preserved).
         assert!(matches!(
             gate.ask(&[exec_request("/usr/bin/python3")]),
             newt_core::PermissionDecision::Allow(_)
@@ -1777,9 +2230,6 @@ mod permission_prompt_tests {
         );
     }
 
-    /// #1057: a durable exec session grant matches by basename, so granting a
-    /// bare `mytool` covers a later path-resolved `/opt/bin/mytool` — but a
-    /// different program is still not covered (no over-grant).
     #[test]
     fn session_grant_exec_matches_by_basename() {
         let mut state = PermissionPromptState::default();
@@ -1797,13 +2247,11 @@ mod permission_prompt_tests {
             newt_core::PermissionDecision::Allow(_)
         ));
         assert_eq!(prompts.get(), 1);
-        // Same program, path-resolved: covered — no re-prompt.
         assert!(matches!(
             gate.ask(&[exec_request("/opt/bin/mytool")]),
             newt_core::PermissionDecision::Allow(_)
         ));
         assert_eq!(prompts.get(), 1, "basename covers the resolved path");
-        // A DIFFERENT program still prompts.
         assert!(matches!(
             gate.ask(&[exec_request("othertool")]),
             newt_core::PermissionDecision::Allow(_)
@@ -1811,9 +2259,6 @@ mod permission_prompt_tests {
         assert_eq!(prompts.get(), 2, "a different program is not covered");
     }
 
-    /// #1057 pin-exact: granting a FULL PATH must NOT widen to a bare name (which
-    /// could resolve to a different binary) — the basename relaxation is one-way,
-    /// bare-grant → resolved-run, never full-grant → bare-run.
     #[test]
     fn full_path_session_grant_does_not_cover_a_bare_name() {
         let mut state = PermissionPromptState::default();
@@ -1831,7 +2276,6 @@ mod permission_prompt_tests {
             newt_core::PermissionDecision::Allow(_)
         ));
         assert_eq!(prompts.get(), 1);
-        // A bare `mytool` is NOT covered by the full-path grant — re-prompts.
         assert!(matches!(
             gate.ask(&[exec_request("mytool")]),
             newt_core::PermissionDecision::Allow(_)
@@ -1843,10 +2287,6 @@ mod permission_prompt_tests {
         );
     }
 
-    /// #1056 FLOOR: a readonly `/posture` projects no git-commit authority, so the
-    /// gate REFUSES a git-write grant outright — even `[a]llow once` cannot pierce
-    /// it, and it does not even prompt (the git-write capability is non-axis, so
-    /// `mint`'s re-clamp can't attenuate it — this explicit check is the floor).
     #[test]
     fn git_write_grant_refused_under_readonly_preset() {
         let mut state = PermissionPromptState::default();
@@ -1857,15 +2297,15 @@ mod permission_prompt_tests {
         }
         .clamp();
         let base = base_caveats("/ws").meet(&clamp);
-        let mut gate = scripted_gate_with_clamp(
+        let mut gate = scripted_gate(
             &mut state,
             base,
             None,
             None,
-            clamp,
             vec![PromptChoice::AllowOnce],
             prompts.clone(),
         );
+        gate.preset_clamp = Some(clamp);
         let req = PermissionRequest {
             tool: "git".to_string(),
             kind: DenialKind::GitWrite,
@@ -1879,8 +2319,6 @@ mod permission_prompt_tests {
         assert_eq!(prompts.get(), 0, "the floor refuses WITHOUT prompting");
     }
 
-    /// #1056: with NO preset active the floor doesn't bite — a git-write grant is
-    /// allowed (allow-once), so a coder can commit in a normal session.
     #[test]
     fn git_write_grant_allowed_without_a_preset() {
         let mut state = PermissionPromptState::default();
@@ -1906,39 +2344,30 @@ mod permission_prompt_tests {
         assert_eq!(prompts.get(), 1);
     }
 
-    /// #307 FLOOR TEST (b) — the security contract: a session-grant CANNOT
-    /// grant authority the active preset denies. The human answers "allow
-    /// once" (and "allow session") for `rm`, but the readonly-triage preset
-    /// clamps exec to none — so the minted caveats must NOT permit `rm`. The
-    /// re-mint is re-`meet`-ed under the preset clamp (the load-bearing point
-    /// in `mint`), so `widen_caveats` re-adding `rm` to the exec set is undone.
     #[test]
     fn session_grant_cannot_pierce_the_preset_floor() {
         let mut state = PermissionPromptState::default();
         let prompts = Rc::new(Cell::new(0));
-        // A readonly-triage preset: exec denied entirely.
         let clamp = newt_core::NamedPermissionPreset {
             readonly: true,
             ..Default::default()
         }
         .clamp();
-        // The effective (already-clamped) base the gate runs against.
         let base = base_caveats("/ws").meet(&clamp);
         assert!(
             !base.permits_exec("cargo"),
             "the preset clamped exec to none"
         );
 
-        // Allow-once for `rm`: the human says yes, the preset says no.
-        let mut gate = scripted_gate_with_clamp(
+        let mut gate = scripted_gate(
             &mut state,
             base.clone(),
             None,
             None,
-            clamp.clone(),
             vec![PromptChoice::AllowOnce, PromptChoice::AllowSession],
             prompts.clone(),
         );
+        gate.preset_clamp = Some(clamp.clone());
         match gate.ask(&[exec_request("rm")]) {
             newt_core::PermissionDecision::Allow(c) => {
                 assert!(
@@ -1949,8 +2378,6 @@ mod permission_prompt_tests {
             }
             newt_core::PermissionDecision::Deny => panic!("the gate allowed-once"),
         }
-        // Now "allow session" for `rm`: the grant is remembered, but the next
-        // re-mint is STILL re-clamped — the floor wins across the session.
         match gate.ask(&[exec_request("rm")]) {
             newt_core::PermissionDecision::Allow(c) => {
                 assert!(
@@ -1961,16 +2388,11 @@ mod permission_prompt_tests {
             newt_core::PermissionDecision::Deny => panic!("the gate allowed-session"),
         }
         drop(gate);
-        // The grant WAS remembered (the human's choice is recorded), but it is
-        // powerless against the clamp — proving the floor, not the prompt, is
-        // the authority ceiling.
         assert!(state
             .session_grants
             .contains(&(DenialKind::Exec, "rm".to_string())));
     }
 
-    /// Session allow: one prompt, then every later ask for the same target
-    /// is allowed silently — and a FRESH state (a new session) prompts anew.
     #[test]
     fn allow_session_never_reprompts_until_restart() {
         let prompts = Rc::new(Cell::new(0));
@@ -1991,14 +2413,12 @@ mod permission_prompt_tests {
                 newt_core::PermissionDecision::Allow(_)
             ));
             assert_eq!(prompts.get(), 1);
-            // Again within the same turn: no further prompt.
             assert!(matches!(
                 gate.ask(&req),
                 newt_core::PermissionDecision::Allow(_)
             ));
         }
         {
-            // A NEW gate over the same session state (a later turn).
             let mut gate = scripted_gate(
                 &mut state,
                 base.clone(),
@@ -2014,7 +2434,6 @@ mod permission_prompt_tests {
         }
         assert_eq!(prompts.get(), 1, "exactly one prompt for the whole session");
         assert_eq!(state.decisions.len(), 1, "re-uses are not re-recorded");
-        // "Restart": session state is gone — a fresh state prompts again.
         let mut fresh = PermissionPromptState::default();
         let mut gate = scripted_gate(
             &mut fresh,
@@ -2031,7 +2450,6 @@ mod permission_prompt_tests {
         assert_eq!(prompts.get(), 2, "the grant did not survive the restart");
     }
 
-    /// Deny-always auto-denies later asks without prompting or re-recording.
     #[test]
     fn deny_always_short_circuits_later_asks() {
         let prompts = Rc::new(Cell::new(0));
@@ -2060,8 +2478,6 @@ mod permission_prompt_tests {
         assert_eq!(state.decisions[0].scope, "session");
     }
 
-    /// A batch (compound command): the first deny aborts — the whole call
-    /// keeps the standard denial; an empty batch is a deny by construction.
     #[test]
     fn batch_deny_and_empty_requests_deny() {
         let prompts = Rc::new(Cell::new(0));
@@ -2084,9 +2500,6 @@ mod permission_prompt_tests {
         assert_eq!(prompts.get(), 2, "empty batch never prompts");
     }
 
-    /// Every prompted decision lands in the JSONL record, keyed by the
-    /// conversation id, with the issue's `(ts_claim, tool, kind, target,
-    /// decision, scope)` shape.
     #[serial_test::serial(real_fs)]
     #[test]
     fn decisions_are_recorded_to_the_session_log() {
@@ -2141,14 +2554,9 @@ mod permission_prompt_tests {
             (records[2].decision.as_str(), records[2].scope.as_str()),
             ("deny", "once")
         );
-        // The in-session list (the `/permissions` view) matches the file.
         assert_eq!(state.decisions, records);
     }
 
-    /// With a per-user key available, an allow re-mints THROUGH the signed
-    /// identity path: the returned caveats are the enforced caveats of a
-    /// fresh key rooted in the user key — and the baseline value the session
-    /// enforces is untouched (attenuation-only, #263).
     #[serial_test::serial(real_fs)]
     #[test]
     fn allow_remints_from_the_user_root_and_never_widens_the_baseline() {
@@ -2176,26 +2584,18 @@ mod permission_prompt_tests {
         assert!(minted.permits_exec("npm"));
         assert!(minted.permits_exec("cargo"));
         assert!(!minted.permits_exec("rm"));
-        // The gate's baseline (the session's enforced caveats) is unchanged:
-        // the grant lives in the minted value + session state only.
         drop(gate);
         assert_eq!(base, base_caveats("/ws"));
-        // And the mint provably round-trips the identity layer: minting the
-        // same policy from the same root yields the same enforced caveats.
         let policy = newt_core::widen_caveats(&base, &[(DenialKind::Exec, "npm".to_string())]);
         let key = mint_operating_key(&key_path, &policy).unwrap();
         assert_eq!(newt_identity::enforced_caveats(&key).unwrap(), minted);
     }
 
-    /// The full TUI seam: execute_tool consults the gate on an fs_read
-    /// denial. Allow-once reads the file exactly once and the next identical
-    /// call re-prompts; the decisions are in the session state.
     #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn execute_tool_with_tui_gate_allow_once_then_reprompt() {
         let ws = tempfile::TempDir::new().unwrap();
         std::fs::write(ws.path().join("outside.txt"), "gated contents").unwrap();
-        // fs_read scoped to a different root → reading in `ws` is denied.
         let caveats = base_caveats("/elsewhere");
         let prompts = Rc::new(Cell::new(0));
         let mut state = PermissionPromptState::default();
@@ -2233,8 +2633,6 @@ mod permission_prompt_tests {
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
         assert_eq!(prompts.get(), 1);
-        // The identical call again: no session grant — prompts again, and
-        // this scripted human now denies → the standard denial.
         let out = newt_core::agentic::execute_tool(
             "read_file",
             &args,
@@ -2262,16 +2660,12 @@ mod permission_prompt_tests {
             out.starts_with("capability denied: fs_read does not permit 'outside.txt'"),
             "got: {out}"
         );
-        // #721: the denial now also carries the model-actionable recovery path.
         assert!(out.contains("request_permissions"), "got: {out}");
         assert_eq!(prompts.get(), 2, "allow-once does not stick");
         drop(gate);
         assert_eq!(state.decisions.len(), 2);
     }
 
-    /// The full TUI seam, session scope: one prompt, then the same denial
-    /// auto-allows for the rest of the session (across gate rebuilds, i.e.
-    /// turns).
     #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn execute_tool_with_tui_gate_session_allow_holds_across_turns() {
@@ -2282,8 +2676,6 @@ mod permission_prompt_tests {
         let mut state = PermissionPromptState::default();
         let args = serde_json::json!({"path": "outside.txt"});
         for _turn in 0..2 {
-            // A fresh gate per turn over the SAME session state — exactly
-            // how the TUI loop builds it.
             let mut gate = scripted_gate(
                 &mut state,
                 caveats.clone(),
@@ -2355,20 +2747,7 @@ mod permission_prompt_tests {
         assert!(!should_prompt_permissions(true, true, true, false));
     }
 
-    /// §6.10 — **the default-deny invariant is not weakened by the arbiter.**
-    ///
-    /// A session that cannot answer a TTY prompt must reach a denial without
-    /// ever asking. Now that asking means constructing a `PromptWindow` — which
-    /// takes stdin and suspends every ephemeral writer — "without ever asking"
-    /// has a mechanical witness: the process-wide construction counter must not
-    /// move.
-    ///
-    /// The guard is `if headless || !interactive { return false; }`, and it must
-    /// short-circuit BEFORE anything consults the terminal. That it does is
-    /// visible in the predicate's purity (it takes four booleans and probes
-    /// nothing), and pinned here by exhausting the whole product: no combination
-    /// of the two ON signals can make a headless or non-interactive session
-    /// prompt.
+    /// Exhaust the boolean product: no headless/non-TTY case may open a prompt.
     #[serial_test::serial(prompt_stdin)]
     #[test]
     fn headless_and_piped_sessions_never_construct_a_prompt_window() {

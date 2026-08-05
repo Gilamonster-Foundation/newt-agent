@@ -1,0 +1,37 @@
+name: behavior-registry (constitution)
+
+# The ANTI-DRIFT gate for the BHV-* registry (epic #1529). It runs the exact
+# reference linter (`spec/lint-behavior-map.py`) + its self-tests, so a renamed or
+# deleted Rust test / production symbol, or a renamed Lean theorem, cannot silently
+# orphan a constitution reference.
+#
+# CRITICAL: this triggers on Rust source (and Cargo manifests) as well as spec/ and
+# formal/ — the drift this registry exists to catch is precisely a Rust-only PR that
+# moves a referenced symbol. The linter is pure Python (no Lean/JDK toolchain), so
+# running it on every Rust change is cheap; the expensive Lean+TLC checks live in
+# the separate `behavior-formal.yml`.
+
+on:
+  push:
+    paths: ['spec/**', 'formal/**', '**/*.rs', '**/Cargo.toml', 'Cargo.lock',
+            '.github/workflows/behavior-registry.yml']
+  pull_request:
+    paths: ['spec/**', 'formal/**', '**/*.rs', '**/Cargo.toml', 'Cargo.lock',
+            '.github/workflows/behavior-registry.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  behavior-registry:
+    name: Exact registry-reference linter
+    runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Registry — linter self-tests + exact reference validation
+        run: |
+          set -euo pipefail
+          python3 spec/test-lint-behavior-map.py
+          python3 spec/lint-behavior-map.py
+          echo "::notice title=Registry::behavior-map.toml validated — exact refs resolve (Lean namespace / Rust module+test-attr / production symbol / TLA invariant); pending_pr refs warn only"

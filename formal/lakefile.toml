@@ -1,5 +1,5 @@
 name = "caveat-lattice"
-defaultTargets = ["CaveatLattice", "ProjectModel", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage", "ResponsesWire"]
+defaultTargets = ["CaveatLattice", "ProjectModel", "NewtPolicy", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage", "ResponsesWire"]
 
 # Machine-checked formal specs. Self-contained: no Mathlib, so it builds from a
 # bare Lean toolchain (see lean-toolchain). `lake build` checks every theorem; a
@@ -14,6 +14,11 @@ name = "CaveatLattice"
 
 [[lean_lib]]
 name = "ProjectModel"
+
+# NewtPolicy — the #1530 behavioral-constitution seed + #1536 prompt/action
+# contract: the first checked Lean proofs backing the BHV registry.
+[[lean_lib]]
+name = "NewtPolicy"
 
 # CompactionProvenance — the #1528 B2 compaction-bridge provenance kernel:
 # untrusted-derived provenance never rebuilds to operator/model authority, and an

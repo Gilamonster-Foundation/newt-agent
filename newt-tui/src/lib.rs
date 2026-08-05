@@ -17,6 +17,7 @@ mod navigator_cmds;
 mod commands;
 mod danger;
 pub mod dgx_probe;
+mod line_console;
 #[cfg(feature = "live-spill")]
 mod live_spill;
 mod permissions;
@@ -11228,8 +11229,14 @@ mod disable_ocap_session_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            authorization_prompts_enabled: true,
             web_decision_timeout: std::time::Duration::from_secs(2),
-            ask_human: |_w: &newt_core::tty::PromptWindow, _prompt: &str| PromptChoice::AllowOnce,
+            cancel: None,
+            exit: None,
+            ask_human: |_w: &newt_core::tty::PromptWindow,
+                        _question: &newt_core::Question<PromptChoice>| {
+                PromptChoice::AllowOnce
+            },
         };
 
         let out = execute_tool(
@@ -11276,8 +11283,14 @@ mod disable_ocap_session_tests {
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
+            authorization_prompts_enabled: true,
             web_decision_timeout: std::time::Duration::from_secs(2),
-            ask_human: |_w: &newt_core::tty::PromptWindow, _prompt: &str| PromptChoice::AllowOnce,
+            cancel: None,
+            exit: None,
+            ask_human: |_w: &newt_core::tty::PromptWindow,
+                        _question: &newt_core::Question<PromptChoice>| {
+                PromptChoice::AllowOnce
+            },
         };
         let out = execute_tool(
             "read_file",

@@ -20,6 +20,9 @@ Four jobs, one durable record:
                                     more than T; exit 2 while a lane is unmeasured.
   render  --readme README.md        rewrite the scoreboard (each model's off/on
                                     champions + parity Δ) between the README markers.
+                                    ``--no-queued`` trims never-run roster rows for
+                                    the README; the full roster-tracking table is
+                                    published by gilamonster-bench.
 
 The manifest is the source of truth (one JSON object per line, git-tracked).
 Records with no ``ocap`` field are OCAP-off (they predate the lane split). The
@@ -220,19 +223,28 @@ def load_roster(path: str) -> list[dict]:
         return []
 
 
-def render_table(records: list[dict], roster: list[dict] | None = None) -> str:
+def render_table(
+    records: list[dict], roster: list[dict] | None = None, *, queued: bool = True
+) -> str:
     """The parity scoreboard: one row per model with its OCAP-off and OCAP-on
     champions side by side and the parity delta (on − off) between them. Each
     lane is a monotonic ratchet; the release gate for 0.7.6 is per-model on≈off
     (delta ≥ 0). Roster models with no run yet render as queued rows, so the
-    table doubles as the whole-matrix parity tracker."""
+    table doubles as the whole-matrix parity tracker.
+
+    ``queued=False`` is the README profile: it drops rows that have never run on
+    either lane, because an unrun model is a to-do list rather than a result.
+    It never suppresses a ``_pending_`` cell — a half-measured model keeps its
+    row, since a blank cell would read as a zero where a label reads as a gap.
+    The full roster-tracking table is published by gilamonster-bench."""
     champs = champions(records)
-    # Every model that appears in the data or the roster gets one row.
+    # Every model that appears in the data — plus, unless trimmed for the README,
+    # every model the roster still owes a run.
     families: dict[str, str] = {}
     for (m, _lane), r in champs.items():
         families.setdefault(m, r.get("family", "?"))
     for e in roster or []:
-        if e.get("model"):
+        if queued and e.get("model"):
             families.setdefault(e["model"], e.get("family", "?"))
 
     def sort_key(m: str) -> tuple[float, str]:
@@ -243,10 +255,17 @@ def render_table(records: list[dict], roster: list[dict] | None = None) -> str:
         )
         return (-best, m)
 
+    scope = (
+        "Measured models only; the roster's unrun models are in the full table."
+        if not queued
+        else "0.7.6 establishes the honesty-classified, digest-pinned confined "
+        "(OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued "
+        "forward via pre-granted permissions, not gated here."
+    )
     header = (
         "_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a "
-        "monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do "
-        "not edit by hand._\n\n"
+        f"monotonic ratchet (a score never goes down). {scope} "
+        "Auto-generated; do not edit by hand._\n\n"
         "| Model | OCAP off | OCAP on |\n"
         "|-------|----------|---------|\n"
     )
@@ -357,7 +376,7 @@ def _cmd_parity(a: argparse.Namespace) -> int:
 
 def _cmd_render(a: argparse.Namespace) -> int:
     records = load_manifest(a.manifest)
-    table = render_table(records, load_roster(a.roster))
+    table = render_table(records, load_roster(a.roster), queued=a.queued)
     text = open(a.readme).read()
     new = inject(text, table)
     if new != text:
@@ -426,7 +445,14 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--readme", default="README.md")
     pr.add_argument("--manifest", default=MANIFEST_DEFAULT)
     pr.add_argument("--roster", default=ROSTER_DEFAULT)
-    pr.set_defaults(fn=_cmd_render)
+    pr.add_argument(
+        "--no-queued",
+        dest="queued",
+        action="store_false",
+        help="drop never-run roster rows (the README profile); the full "
+        "roster-tracking table is published by gilamonster-bench",
+    )
+    pr.set_defaults(fn=_cmd_render, queued=True)
 
     args = p.parse_args(argv)
     if args.self_test:
@@ -547,6 +573,22 @@ def _self_test() -> int:
     assert "_queued_" in only and "no runs recorded" not in only
     # missing roster file → empty list, never a crash.
     assert load_roster("/nonexistent/roster.json") == []
+
+    # queued=False (the README profile): rows with no run on EITHER lane are
+    # dropped — a never-run model is a to-do list, not a result. Measured rows
+    # survive untouched.
+    trimmed = render_table(recs, roster, queued=False)
+    assert "`nemotron`<br>" not in trimmed, trimmed
+    assert trimmed.count("`qwen`<br>") == 1, trimmed
+    # ...but a half-measured model KEEPS its row and its _pending_ cell. A blank
+    # would read as a zero; a labelled absence routes the reader to the gap.
+    half = [{"model": "solo", "family": "f", "ocap": "on", "mean_reward": 0.5}]
+    ht = render_table(half, [{"model": "unrun", "family": "f"}], queued=False)
+    assert "`solo`<br>" in ht and "_pending_" in ht, ht
+    assert "`unrun`<br>" not in ht, ht
+    # dropping every row still yields the honest placeholder, never a bare header.
+    empty = render_table([], [{"model": "unrun", "family": "f"}], queued=False)
+    assert "no runs recorded" in empty, empty
 
     # tie on score → later date wins (within a lane).
     tie = [

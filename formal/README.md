@@ -45,6 +45,11 @@ rescan is a performance CHEAT; these theorems make it SOUND:
 Self-contained (no Mathlib), `sorry`-free. PO-D (no LLM authoring the model) is a
 dep-graph/map lint, not a theorem.
 
+`NewtPolicy/PromptForm.lean` — the prompt/action authorization kernel
+(`BHV-PROMPT-001` in `../spec/behavior-map.toml`): `authorize` grants only a
+*displayed* action (`authorization_sound`, `hidden_action_rejected`). Its
+temporal counterpart is `../spec/tla/PromptControls.tla`.
+
 ## How to check it
 
 Needs a Lean toolchain (via [`elan`](https://github.com/leanprover/elan); the
