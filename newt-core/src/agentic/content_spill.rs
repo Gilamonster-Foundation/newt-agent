@@ -263,8 +263,14 @@ pub trait SpillStore: Send + Sync {
     /// Count of committed handle REFERENCES emitted into transcripts (a re-commit of
     /// an already-present CID still counts as a logical reference).
     fn logical_spill_refs(&self) -> u64;
-    /// Total chars of UNIQUE committed payloads elided from context.
-    fn offloaded_chars(&self) -> u64;
+    /// Chars of UNIQUE committed payloads elided from context — counted ONCE per
+    /// physical object; a dedup hit does not re-count (§2.10).
+    fn unique_offloaded_chars(&self) -> u64;
+    /// Chars counted once per logical REFERENCE — a dedup re-commit RE-counts, so this
+    /// is the total context pressure the offload relieved across all references. For a
+    /// batch of unique payloads it equals [`Self::unique_offloaded_chars`]; identical
+    /// content committed twice makes them diverge (§2.10).
+    fn logical_offloaded_chars(&self) -> u64;
 }
 
 /// In-memory, session-scoped content-addressed store. Keyed by CID text; dedup by
@@ -276,7 +282,8 @@ pub struct SessionSpillStore {
     map: Mutex<HashMap<String, SpillRecordV1>>,
     unique_objects: AtomicU64,
     logical_refs: AtomicU64,
-    offloaded_chars: AtomicU64,
+    unique_offloaded_chars: AtomicU64,
+    logical_offloaded_chars: AtomicU64,
 }
 
 impl SessionSpillStore {
@@ -288,7 +295,8 @@ impl SessionSpillStore {
             map: Mutex::new(HashMap::new()),
             unique_objects: AtomicU64::new(0),
             logical_refs: AtomicU64::new(0),
-            offloaded_chars: AtomicU64::new(0),
+            unique_offloaded_chars: AtomicU64::new(0),
+            logical_offloaded_chars: AtomicU64::new(0),
         }
     }
 
@@ -322,15 +330,18 @@ impl SpillStore for SessionSpillStore {
         }
         let mut out = Vec::with_capacity(staged.len());
         for s in staged {
-            // A vacant CID is a NEW physical object (bump unique/chars once); an
-            // occupied one is an idempotent dedup hit. Either way it is a logical ref.
+            // A vacant CID is a NEW physical object (bump UNIQUE object + chars once);
+            // an occupied one is an idempotent dedup hit. Either way it is a logical
+            // ref, and its chars count toward the LOGICAL total every time (§2.10).
             if let std::collections::hash_map::Entry::Vacant(e) = map.entry(s.handle()) {
                 self.unique_objects.fetch_add(1, Ordering::Relaxed);
-                self.offloaded_chars
+                self.unique_offloaded_chars
                     .fetch_add(s.redacted_chars as u64, Ordering::Relaxed);
                 e.insert(s.record.clone());
             }
             self.logical_refs.fetch_add(1, Ordering::Relaxed);
+            self.logical_offloaded_chars
+                .fetch_add(s.redacted_chars as u64, Ordering::Relaxed);
             out.push(CommittedSpill { cid: s.cid });
         }
         Ok(out)
@@ -348,8 +359,12 @@ impl SpillStore for SessionSpillStore {
         self.logical_refs.load(Ordering::Relaxed)
     }
 
-    fn offloaded_chars(&self) -> u64 {
-        self.offloaded_chars.load(Ordering::Relaxed)
+    fn unique_offloaded_chars(&self) -> u64 {
+        self.unique_offloaded_chars.load(Ordering::Relaxed)
+    }
+
+    fn logical_offloaded_chars(&self) -> u64 {
+        self.logical_offloaded_chars.load(Ordering::Relaxed)
     }
 }
 
@@ -574,6 +589,76 @@ mod tests {
             store.commit_batch(&[staged]),
             Err(SpillError::PoisonedStore),
             "a poisoned store fails closed"
+        );
+    }
+
+    #[test]
+    fn metrics_distinguish_unique_from_logical_chars() {
+        // §2.10: identical content committed twice → one physical object but two
+        // logical references; UNIQUE chars count once, LOGICAL chars re-count the
+        // dedup ref.
+        let store = SessionSpillStore::new(NONCE_A);
+        let text = "twelve chars"; // 12 chars
+        let a = StagedSpill::from_record(tool_record(NONCE_A, text)).unwrap();
+        let b = StagedSpill::from_record(tool_record(NONCE_A, text)).unwrap();
+        store.commit_batch(&[a, b]).unwrap();
+        assert_eq!(store.unique_objects(), 1);
+        assert_eq!(store.logical_spill_refs(), 2);
+        assert_eq!(
+            store.unique_offloaded_chars(),
+            12,
+            "unique chars counted once"
+        );
+        assert_eq!(
+            store.logical_offloaded_chars(),
+            24,
+            "logical chars re-count the dedup ref"
+        );
+    }
+
+    #[test]
+    fn a_foreign_session_cid_is_indistinguishable_from_unknown() {
+        // §2.4: a CID minted under ANOTHER session's nonce is not fetchable here — it
+        // returns the SAME None as a never-committed CID, so cross-session existence
+        // is never leaked.
+        let mine = SessionSpillStore::new(NONCE_A);
+        let foreign = SpillCid::of(&tool_record(NONCE_B, "foreign secret")).unwrap();
+        let unknown = SpillCid::of(&tool_record(NONCE_A, "never committed")).unwrap();
+        assert_eq!(mine.fetch(&foreign), None, "foreign-session CID: not found");
+        assert_eq!(mine.fetch(&unknown), None, "unknown CID: not found");
+        assert_eq!(
+            mine.fetch(&foreign),
+            mine.fetch(&unknown),
+            "identical externally-visible result — no existence leak"
+        );
+    }
+
+    #[test]
+    fn a_planted_secret_never_appears_in_canonical_bytes_or_stored_record() {
+        // §2.3: redaction happens BEFORE a record is built (the type only ever holds
+        // redacted_text), so a raw secret never reaches the canonical bytes, the CID
+        // input, the stored record, or a fetched record. Grounds redact-on-store at
+        // the record boundary; the raw→redact→record pipeline is wired at the producer
+        // sites (§2.7).
+        const SECRET: &str = "sk-PLANTEDsecret0123456789";
+        let redacted = "head [REDACTED] tail".to_string();
+        assert!(!redacted.contains(SECRET));
+        let record = tool_record(NONCE_A, &redacted);
+        let bytes = record.canonical_form().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(SECRET),
+            "raw secret absent from canonical CID input bytes"
+        );
+        let store = SessionSpillStore::new(NONCE_A);
+        let cid = store.store(record).unwrap();
+        let got = store.fetch(&cid).unwrap();
+        assert!(
+            !got.redacted_text.contains(SECRET),
+            "raw secret absent from the stored record"
+        );
+        assert!(
+            !cid.to_handle().contains(SECRET),
+            "raw secret absent from the handle"
         );
     }
 }
