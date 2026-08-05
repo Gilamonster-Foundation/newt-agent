@@ -21,10 +21,12 @@
 #   trace : none | planned | validated
 #   conformance : partial | full   (full ⇒ proven+tested+checked+validated)
 #
-# `pending_pr = <n>` marks a reference whose artifact lands on an unmerged PR
-# (this seed is stacked on the #1526 psyche PR). Only pending refs may WARN
-# instead of fail; everything else is fail-closed. Run the linter with
-# `--strict` on `main` once #1526 merges, then delete every `pending_pr` marker.
+# `pending_pr = <n>` marks a reference whose artifact lands on an unmerged PR.
+# Only pending refs may WARN instead of fail; everything else is fail-closed, and
+# `--strict` fails even pending refs. The #1528/#1526 artifacts have LANDED on the
+# `feat/agent-psyche-production` base (the main↔production reconciliation, #1542),
+# so their `pending_pr = 1526` markers are cleared: this registry now passes
+# `--strict` with zero pending references.
 
 schema = 3
 
@@ -50,19 +52,15 @@ symbol = "selection_is_position_independent"
 [[BHV-BACKEND-001.refs.rust_tests]]
 path = "newt-core/src/config.rs"
 symbol = "select_backend_tests::default_backend_selects_ollama_over_configured_openai"
-pending_pr = 1526
 [[BHV-BACKEND-001.refs.rust_tests]]
 path = "newt-core/src/config.rs"
 symbol = "select_backend_tests::newt_provider_selects_openai_responses"
-pending_pr = 1526
 [[BHV-BACKEND-001.refs.rust_tests]]
 path = "newt-acp-worker/src/lib.rs"
 symbol = "backend_selection_tests::ollama_host_does_not_erase_an_explicitly_selected_openai_backend"
-pending_pr = 1526
 [[BHV-BACKEND-001.refs.production]]
 path = "newt-core/src/config.rs"
 symbol = "select_backend"
-pending_pr = 1526
 
 [BHV-BACKEND-002]
 description = "A configuration-resolution failure never triggers backend discovery — it propagates."
@@ -75,11 +73,9 @@ conformance = "partial"
 [[BHV-BACKEND-002.refs.rust_tests]]
 path = "newt-acp-worker/src/lib.rs"
 symbol = "backend_selection_tests::resolver_errors_on_an_unknown_named_backend"
-pending_pr = 1526
 [[BHV-BACKEND-002.refs.production]]
 path = "newt-acp-worker/src/lib.rs"
 symbol = "resolve_backend"
-pending_pr = 1526
 
 # ─────────────────────────────── Responses decode ────────────────────────────
 
@@ -94,15 +90,12 @@ conformance = "partial"
 [[BHV-RESPONSE-001.refs.rust_tests]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "tests::missing_status_with_top_level_error_fails"
-pending_pr = 1526
 [[BHV-RESPONSE-001.refs.rust_tests]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "tests::top_level_error_wins_over_a_completed_status"
-pending_pr = 1526
 [[BHV-RESPONSE-001.refs.production]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "decode_response"
-pending_pr = 1526
 
 [BHV-RESPONSE-002]
 description = "A refusal plus tool calls never causes a tool effect; a refusal is never silently dropped."
@@ -115,15 +108,12 @@ conformance = "partial"
 [[BHV-RESPONSE-002.refs.rust_tests]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "tests::refusal_with_a_tool_call_is_mixed_and_rejected_never_executed"
-pending_pr = 1526
 [[BHV-RESPONSE-002.refs.rust_tests]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "tests::status_less_mixed_refusal_and_tool_call_is_still_rejected"
-pending_pr = 1526
 [[BHV-RESPONSE-002.refs.production]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "decode_response"
-pending_pr = 1526
 
 [BHV-RESPONSE-003]
 description = "Empty or ambiguous output is not a successful completion (fail-closed)."
@@ -136,19 +126,15 @@ conformance = "partial"
 [[BHV-RESPONSE-003.refs.rust_tests]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "tests::empty_object_body_is_malformed"
-pending_pr = 1526
 [[BHV-RESPONSE-003.refs.rust_tests]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "tests::completed_but_empty_body_is_malformed_not_empty_success"
-pending_pr = 1526
 [[BHV-RESPONSE-003.refs.rust_tests]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "tests::unknown_output_item_with_no_usable_content_is_malformed"
-pending_pr = 1526
 [[BHV-RESPONSE-003.refs.production]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "decode_response"
-pending_pr = 1526
 
 # ─────────────────────────────── Tool batch ──────────────────────────────────
 
@@ -174,15 +160,12 @@ symbol = "executable"
 [[BHV-TOOLS-001.refs.rust_tests]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "tests::batch_valid_then_malformed_dispatches_zero"
-pending_pr = 1526
 [[BHV-TOOLS-001.refs.rust_tests]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "tests::batch_all_valid_dispatches_every_call"
-pending_pr = 1526
 [[BHV-TOOLS-001.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "validate_tool_call_batch"
-pending_pr = 1526
 
 [BHV-TOOLS-002]
 description = "Missing or duplicate correlation ids terminate the turn (no fabricated outputs, no follow-up); a validated batch has non-empty, pairwise-distinct ids."
@@ -201,19 +184,15 @@ symbol = "validated_batch_ids_distinct"
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "tests::batch_missing_id_is_correlation_impossible"
-pending_pr = 1526
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "tests::batch_duplicate_id_is_correlation_impossible"
-pending_pr = 1526
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::responses_missing_call_id_aborts_without_a_followup_request"
-pending_pr = 1526
 [[BHV-TOOLS-002.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "validate_tool_call_batch"
-pending_pr = 1526
 
 [BHV-TOOLS-003]
 description = "Every executed call produces at most one correlated output (exactly-once result routing)."
@@ -237,19 +216,15 @@ conformance = "partial"
 [[BHV-CONTEXT-001.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::responses_refuses_locally_when_a_configured_window_cannot_fit"
-pending_pr = 1526
 [[BHV-CONTEXT-001.refs.rust_tests]]
 path = "newt-core/src/agentic/generation_policy.rs"
 symbol = "tests::cognition_output_reserve_is_the_one_source_of_the_output_budget"
-pending_pr = 1526
 [[BHV-CONTEXT-001.refs.production]]
 path = "newt-core/src/agentic/send_budget.rs"
 symbol = "num_ctx_input_ceiling"
-pending_pr = 1526
 [[BHV-CONTEXT-001.refs.production]]
 path = "newt-core/src/agentic/generation_policy.rs"
 symbol = "cognition_output_reserve"
-pending_pr = 1526
 
 [BHV-CONTEXT-002]
 description = "A learned context ceiling never increases during a turn (monotone tightening)."
@@ -276,7 +251,6 @@ conformance = "partial"
 [[BHV-CONTEXT-003A.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::dispatch_responses_json_retries_transient_transport_failures"
-pending_pr = 1526
 
 [BHV-CONTEXT-003B]
 description = "Compaction and context-window-recovery attempts within a turn are bounded (no unbounded compact/redispatch loop)."
@@ -303,11 +277,9 @@ conformance = "partial"
 [[BHV-REPLAY-001.refs.rust_tests]]
 path = "newt-core/src/agentic/compress.rs"
 symbol = "tests::never_scope_protects_no_reasoning_tail"
-pending_pr = 1526
 [[BHV-REPLAY-001.refs.production]]
 path = "newt-core/src/agentic/compress.rs"
 symbol = "protected_reasoning_tail_len"
-pending_pr = 1526
 
 [BHV-STORAGE-001]
 description = "Remote (server-side) storage is an explicit policy, never inherited from the API default."
@@ -320,15 +292,12 @@ conformance = "partial"
 [[BHV-STORAGE-001.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::responses_request_sets_store_false"
-pending_pr = 1526
 [[BHV-STORAGE-001.refs.rust_tests]]
 path = "newt-inference/src/responses.rs"
 symbol = "tests::transport_sets_store_false_for_stateless_no_retention"
-pending_pr = 1526
 [[BHV-STORAGE-001.refs.production]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "STORE_RESPONSE_SERVER_SIDE"
-pending_pr = 1526
 
 # ─────────────────────── Chat-loop dispatch recovery (#1533) ──────────────────
 # The temporal contract for the chat loops' dispatch recovery, machine-checked by
@@ -731,23 +700,26 @@ symbol = "SpillStore"
 path = "newt-core/src/agentic/content_spill.rs"
 symbol = "tests::a_batch_with_one_integrity_violation_installs_nothing"
 
+# SPILL-003 and SPILL-004 deliberately SEPARATE session authorization from
+# cryptographic identity. Lean does NOT prove BLAKE3 collision resistance; the
+# non-aliasing theorems are stated under an explicit injectivity HYPOTHESIS.
+
 [BHV-SPILL-003]
-description = "Spill handles are session-scoped and content-addressed: a foreign-session handle is indistinguishable from unknown, and distinct content yields distinct, injective addresses."
+description = "Session membership controls fetch: a store holds only records scoped to its own session, and a foreign-session CID behaves like an unknown CID — not fetchable here. (Ruling out a foreign record that collides to an in-session CID additionally rests on the collision-resistance assumption of BHV-SPILL-004.)"
 [BHV-SPILL-003.status]
 lean = "proven"
 rust = "tested"
 tla = "none"
 trace = "none"
 conformance = "partial"
+# a store holds only session-scoped records (unconditional, from the Valid invariant)…
+[[BHV-SPILL-003.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "published_handle_has_matching_session"
+# …and a foreign-nonce record is not fetchable here (uses the injectivity assumption).
 [[BHV-SPILL-003.refs.lean]]
 module = "NewtPolicy.CompactionSpill"
 symbol = "foreign_session_record_not_fetchable"
-[[BHV-SPILL-003.refs.lean]]
-module = "NewtPolicy.CompactionSpill"
-symbol = "distinct_records_distinct_cid"
-[[BHV-SPILL-003.refs.lean]]
-module = "NewtPolicy.CompactionSpill"
-symbol = "cid_injective"
 [[BHV-SPILL-003.refs.production]]
 path = "newt-core/src/agentic/content_spill.rs"
 symbol = "SessionSpillStore"
@@ -755,11 +727,46 @@ symbol = "SessionSpillStore"
 path = "newt-core/src/agentic/content_spill.rs"
 symbol = "tests::a_foreign_session_cid_is_indistinguishable_from_unknown"
 [[BHV-SPILL-003.refs.rust_tests]]
-path = "newt-core/src/agentic/content_spill.rs"
-symbol = "tests::different_content_yields_different_cid"
-[[BHV-SPILL-003.refs.rust_tests]]
 path = "newt-core/src/agentic/memory_fetch.rs"
 symbol = "tests::spill_resolution_is_fail_closed_on_provenance_mismatch_and_foreign_session"
+
+[BHV-SPILL-004]
+description = "CID identity is deterministic and self-verifying: equal records yield equal CIDs, and any handle that resolves IS the content-CID of the record it resolves to. Distinct-record NON-ALIASING is CONDITIONAL on the BLAKE3 collision-resistance assumption — Lean proves the store protocol under an explicit injectivity hypothesis and does NOT prove BLAKE3 non-collision. The concrete CIDv1 dag-cbor BLAKE3-256 profile and encoding are pinned by Rust golden-vector tests."
+[BHV-SPILL-004.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+# determinism (unconditional): equal records ⇒ equal CID.
+[[BHV-SPILL-004.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "same_record_same_cid"
+# self-verifying (unconditional): a resolvable handle IS its content's CID.
+[[BHV-SPILL-004.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "published_handle_is_committed"
+# non-aliasing — CONDITIONAL: injectivity is a HYPOTHESIS, not a BLAKE3 proof.
+[[BHV-SPILL-004.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "cid_injective"
+[[BHV-SPILL-004.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "distinct_records_distinct_cid"
+[[BHV-SPILL-004.refs.production]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "SpillCid"
+# determinism + non-aliasing under the concrete profile.
+[[BHV-SPILL-004.refs.rust_tests]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "tests::same_content_and_nonce_converge_on_one_cid"
+[[BHV-SPILL-004.refs.rust_tests]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "tests::different_content_yields_different_cid"
+# the concrete CIDv1 dag-cbor BLAKE3-256 bytes are pinned by golden vectors.
+[[BHV-SPILL-004.refs.rust_tests]]
+path = "newt-core/tests/spill_cid_vectors.rs"
+symbol = "spill_cid_vectors_pin_canonical_bytes_cid_and_cid_bytes"
 
 # ────────────────────── Accepted-round usage observations (B4) ────────────────
 
@@ -797,22 +804,33 @@ path = "newt-core/src/agentic/mod.rs"
 symbol = "observation_hook_tests::truncation_suspect_rounds_emit_nothing"
 
 [BHV-USAGE-002]
-description = "Observing usage never raises the hard context ceiling and never lets the soft budget exceed the hard ceiling — an Accepted observation can only tighten the budget."
+description = "Accepted usage evidence may raise only the SOFT send budget, never the hard ceiling, and the soft budget remains bounded by the current hard ceiling. Context-window recovery may TIGHTEN the hard ceiling but never raise it — so the hard ceiling never increases during a turn."
 [BHV-USAGE-002.status]
 lean = "proven"
 rust = "tested"
 tla = "none"
 trace = "none"
 conformance = "partial"
+# observe leaves the hard ceiling untouched (it moves only the soft budget)…
+[[BHV-USAGE-002.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "observe_preserves_hard"
+# …and specifically an Accepted observation cannot raise the hard ceiling.
 [[BHV-USAGE-002.refs.lean]]
 module = "NewtPolicy.ResponsesUsage"
 symbol = "accepted_observation_cannot_raise_hard_ceiling"
-[[BHV-USAGE-002.refs.lean]]
-module = "NewtPolicy.ResponsesUsage"
-symbol = "hard_ceiling_never_increases"
+# the soft budget is invariantly bounded by the hard ceiling.
 [[BHV-USAGE-002.refs.lean]]
 module = "NewtPolicy.ResponsesUsage"
 symbol = "soft_budget_never_exceeds_hard_ceiling"
+# cw-400 recovery tightens the hard ceiling — never raises it…
+[[BHV-USAGE-002.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "tighten_hard_never_increases"
+# …so across observe + cw-400 the hard ceiling is monotone non-increasing.
+[[BHV-USAGE-002.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "hard_ceiling_never_increases"
 [[BHV-USAGE-002.refs.production]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "RoundObservation"
@@ -859,7 +877,7 @@ path = "newt-core/src/agentic/responses_wire_validation.rs"
 symbol = "tests::missing_correlation_id_is_rejected"
 
 [BHV-WIRE-002]
-description = "A validated Responses request has exactly one instruction source, carries no num_ctx, puts no tools on a final summary, admits no raw tool role, and has no dangling function call/output — each is rejected at the wire."
+description = "A validated Responses request satisfies four structural invariants proven by construction — exactly one instruction source, no num_ctx, no tools on a final summary, no dangling function call/output — and the wire validator rejects any request violating them. It also rejects other malformed input shapes (e.g. a raw tool/system role) at the wire; those rejections are Rust-tested rather than Lean-proven."
 [BHV-WIRE-002.status]
 lean = "proven"
 rust = "tested"
