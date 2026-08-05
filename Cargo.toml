@@ -94,7 +94,7 @@ getrandom = "0.2"
 # record — self-verifying identity that dissolves the allocator/reservation bug
 # class. Depend on the PUBLISHED crates.io release (never a git/path pin); the
 # frozen 0.1.x core (ContentId + ContentAddressable + canonical) is all we use.
-content-addressable = "0.1.0-alpha.1"
+content-addressable = "0.1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }

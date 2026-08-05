@@ -1106,9 +1106,9 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "content-addressable"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46e2dcd5ad41fb2f30dc4ddf2fe59c17d4ec35c61b4c0ae956ddeb8996417a55"
+checksum = "e8957229022f9bc41238340101b0b9c061b0e5881359139d35ae59f49133d8e9"
 dependencies = [
  "blake3",
  "ipld-core",
