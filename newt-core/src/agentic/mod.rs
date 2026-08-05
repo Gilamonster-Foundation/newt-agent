@@ -130,6 +130,10 @@ mod resume;
 // #1528: pure Value↔Value bridge letting the Responses `input` shape reuse the
 // chat-shaped `compress::compress` compactor on a context-window-400 recovery.
 mod responses_compaction;
+// #1528 B5: the ONE typed strict-wire validator — every Responses dispatch goes
+// through `validate_responses_request` and `dispatch_responses_json` accepts only a
+// `ValidatedResponsesRequest`, so a broken request cannot reach `POST /v1/responses`.
+mod responses_wire_validation;
 mod send_budget;
 // FR-3 (#998): the grant-independent absolute deny-list — a fixed exec veto
 // (ssh / rm / systemctl restart …) no capability, mode, or persona unlocks,
@@ -6630,20 +6634,25 @@ pub async fn openai_responses_complete_with_prompt(
     .await
 }
 
-/// One retrying Responses dispatch: POST `body`, classify + retry transient
-/// transport failures via [`with_backoff_notify`], surface a typed HTTP-status
-/// error, and parse the JSON body. BOTH the per-round loop and the final
+/// One retrying Responses dispatch: POST the VALIDATED body, classify + retry
+/// transient transport failures via [`with_backoff_notify`], surface a typed
+/// HTTP-status error, and parse the JSON body. BOTH the per-round loop and the final
 /// tools-disabled summary go through this, so a transient 500 / timeout /
 /// connection reset on the LAST request no longer discards the turn after every
 /// tool round was already spent — the summary retries like any other round.
+///
+/// #1528 B5: this takes a [`ValidatedResponsesRequest`] — a newtype with no public
+/// constructor other than a successful [`validate_responses_request`] — so an
+/// unvalidated `serde_json::Value` body cannot compile its way to `POST /v1/responses`.
 async fn dispatch_responses_json(
     client: &reqwest::Client,
     url: &str,
     api_key: Option<&str>,
-    body: &serde_json::Value,
+    validated: &responses_wire_validation::ValidatedResponsesRequest,
     retry: &RetryPolicy,
     color: bool,
 ) -> anyhow::Result<serde_json::Value> {
+    let body = validated.body();
     with_backoff_notify(
         retry,
         || async {
@@ -7001,26 +7010,39 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     .rejection();
                 }
             }
-            // The ONE authoritative fail-closed gate. If compaction could not fit the
-            // request, attach the local reason so the headless error chain explains
-            // WHY (no oversized dispatch, round intact).
-            preflight_responses_request(
-                instructions.as_deref(),
-                &input,
-                tools_supported.then_some(tools.as_slice()),
-                budget_state.actionable_input_budget(),
-                cal,
-                estimation,
-                model,
-            )
-            .map_err(|e| match proactive_rejection.take() {
-                Some(reason) => e.context(reason.to_string()),
-                None => e,
-            })?;
+            // #1528 B5: the ONE typed strict-wire gate. Build the EXACT body, then
+            // validate it — the budget-fit refusal is the same `preflight_responses_request`
+            // primitive, now wrapped by the full wire-invariant set (store policy,
+            // no num_ctx, one instruction source, supported input shapes, correlation,
+            // flattened+strict tools, in-session CID markers). A failure dispatches
+            // NOTHING and does not advance the round; if compaction could not fit the
+            // request, the local reason is attached so the headless error chain
+            // explains WHY. Only a `ValidatedResponsesRequest` reaches the dispatcher.
             let body = build_body(&input, tools_supported);
-            let dispatch =
-                dispatch_responses_json(&client, &responses_url, api_key, &body, &retry, color)
-                    .await;
+            let policy = responses_wire_validation::ResponsesWirePolicy {
+                store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+                tools_permitted: true,
+                model,
+                authoritative_budget: budget_state.actionable_input_budget(),
+                calibration: cal,
+                estimation,
+                spill: spill_store,
+                compaction: compaction_store,
+            };
+            let validated = responses_wire_validation::validate_responses_request(&body, &policy)
+                .map_err(|e| match proactive_rejection.take() {
+                Some(reason) => anyhow::Error::new(e).context(reason.to_string()),
+                None => anyhow::Error::new(e),
+            })?;
+            let dispatch = dispatch_responses_json(
+                &client,
+                &responses_url,
+                api_key,
+                &validated,
+                &retry,
+                color,
+            )
+            .await;
 
             match dispatch {
                 Ok(j) => break j,
@@ -7421,28 +7443,34 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     }
 
     // Round cap: one final tools-disabled call for a summary answer (mirrors
-    // the chat path's final_summary, in the Responses shape). The authoritative
-    // fail-closed gate; a proactive-compaction reason (if any) rides its error chain.
-    preflight_responses_request(
-        instructions.as_deref(),
-        &input,
-        None,
-        budget_state.actionable_input_budget(),
-        cal,
-        estimation,
-        model,
-    )
-    .map_err(|e| match summary_rejection.take() {
-        Some(reason) => e.context(reason.to_string()),
-        None => e,
-    })?;
+    // the chat path's final_summary, in the Responses shape). #1528 B5: the SAME
+    // typed strict-wire gate the rounds use, with `tools_permitted = false` so the
+    // final summary can carry NO tools; a proactive-compaction reason (if any) rides
+    // its error chain. Only a `ValidatedResponsesRequest` reaches the dispatcher.
     let body = build_body(&input, false);
+    let policy = responses_wire_validation::ResponsesWirePolicy {
+        store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+        tools_permitted: false,
+        model,
+        authoritative_budget: budget_state.actionable_input_budget(),
+        calibration: cal,
+        estimation,
+        spill: spill_store,
+        compaction: compaction_store,
+    };
+    let validated =
+        responses_wire_validation::validate_responses_request(&body, &policy).map_err(|e| {
+            match summary_rejection.take() {
+                Some(reason) => anyhow::Error::new(e).context(reason.to_string()),
+                None => anyhow::Error::new(e),
+            }
+        })?;
     // Shared retrying dispatch (R5): the tools-disabled final summary retries
     // transient transport failures exactly like every round, so a 500 / timeout /
     // reset on the LAST request no longer discards the turn after all tool rounds
     // were spent.
-    let json =
-        dispatch_responses_json(&client, &responses_url, api_key, &body, &retry, color).await?;
+    let json = dispatch_responses_json(&client, &responses_url, api_key, &validated, &retry, color)
+        .await?;
     // Fail-closed decode (invariant #2): this text-only follow-up must not return
     // a failed, truncated, or empty body's text as a successful reply. A refusal
     // is the model's final answer; every other error is surfaced.
@@ -9985,16 +10013,15 @@ mod tool_round_cap_tests {
         };
         let client = reqwest::Client::new();
         let url = format!("{}/v1/responses", server.uri());
-        let err = super::dispatch_responses_json(
-            &client,
-            &url,
-            None,
-            &serde_json::json!({"model": "m", "input": []}),
-            &retry,
-            false,
-        )
-        .await
-        .expect_err("a persistent 503 exhausts retries");
+        // B5: the dispatcher accepts only a ValidatedResponsesRequest. This test
+        // exercises transport backoff, not the wire invariants, so it uses the
+        // test-only constructor to stand up a validated body directly.
+        let validated = responses_wire_validation::ValidatedResponsesRequest::from_body_for_test(
+            serde_json::json!({"model": "m", "input": []}),
+        );
+        let err = super::dispatch_responses_json(&client, &url, None, &validated, &retry, false)
+            .await
+            .expect_err("a persistent 503 exhausts retries");
         assert!(err.to_string().contains("503"), "got: {err}");
         // `.expect(3)` is verified on server drop — it retried, not sent once.
     }
@@ -12404,6 +12431,275 @@ mod tool_round_cap_tests {
             reply, "nudge received, writing file now",
             "model should have responded to the nudge with a final answer"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1528 B5 — strict Responses wire validation. Every dispatch goes through
+    // `validate_responses_request`; a violation dispatches NOTHING. The loop-level
+    // tests induce a violation through the request the loop actually builds and
+    // assert `.expect(0)`; the seam-guard tests prove the same for the structural
+    // violations `build_body` can never emit, by driving the real validate→dispatch
+    // guard against a wiremock server that must stay untouched.
+    // -----------------------------------------------------------------------
+
+    /// A tool-role message in history must never reach the wire as a raw `tool`
+    /// input item — the validator refuses it BEFORE dispatch (ZERO requests).
+    #[tokio::test]
+    async fn responses_raw_tool_role_in_input_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let task = "B5 raw tool role";
+        let messages = vec![
+            MemMessage::system("base policy"),
+            MemMessage::user(task),
+            MemMessage {
+                role: crate::memory::Role::Tool,
+                content: "smuggled privileged content".into(),
+            },
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000); // budget is not the failure — the role is
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a raw tool role in input must fail closed before dispatch");
+        assert_no_requests(&server).await;
+    }
+
+    /// A malformed `spill:` content handle in history is refused before dispatch.
+    #[tokio::test]
+    async fn responses_malformed_cid_marker_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // A long alnum run after `spill:` that is not a canonical CID.
+        let bogus = "b".to_string() + &"z".repeat(58);
+        let task = format!("recall memory_fetch(\"spill:{bogus}\") please");
+        let messages = vec![MemMessage::system("base policy"), MemMessage::user(&task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000);
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a malformed CID marker must fail closed before dispatch");
+        assert_no_requests(&server).await;
+    }
+
+    /// A canonically-spelled but FOREIGN-session `spill:` handle is refused before
+    /// dispatch — parses, but does not resolve in this session's store.
+    #[tokio::test]
+    async fn responses_foreign_session_cid_marker_refuses_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let foreign = SpillCid::of(&SpillRecordV1::new(
+            SpillScope::Session([2u8; 16]),
+            SpillProvenance::ToolOutput { tool_name: None },
+            "someone else's secret".to_string(),
+        ))
+        .unwrap();
+        let task = format!("memory_fetch(\"spill:{}\")", foreign.to_handle());
+        let messages = vec![MemMessage::system("base policy"), MemMessage::user(&task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        // THIS session's store is a DIFFERENT nonce, so the foreign handle is absent.
+        let store = SessionSpillStore::new([1u8; 16]);
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = Some(1_000_000);
+        ctx.spill_store = Some(&store);
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a foreign-session CID marker must fail closed before dispatch");
+        assert_no_requests(&server).await;
+    }
+
+    /// Seam guard: send `body` through the REAL validate→dispatch path against a
+    /// wiremock server that must stay untouched. A `Some(budget)` drives the
+    /// over-budget refusal; `tools_permitted=false` models the final summary.
+    async fn assert_validation_blocks_dispatch(
+        body: serde_json::Value,
+        tools_permitted: bool,
+        authoritative_budget: Option<usize>,
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let url = format!("{}/v1/responses", server.uri());
+        let policy = responses_wire_validation::ResponsesWirePolicy {
+            store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+            tools_permitted,
+            model: "m",
+            authoritative_budget,
+            calibration: 1.0,
+            estimation: crate::tokens::TokenEstimation::default(),
+            spill: None,
+            compaction: None,
+        };
+        let client = reqwest::Client::new();
+        // The type system requires a ValidatedResponsesRequest to dispatch; a
+        // rejected validation can never construct one, so dispatch is unreachable.
+        if let Ok(validated) = responses_wire_validation::validate_responses_request(&body, &policy)
+        {
+            let _ = super::dispatch_responses_json(
+                &client,
+                &url,
+                None,
+                &validated,
+                &tui_retry_policy(),
+                false,
+            )
+            .await;
+        }
+        assert_no_requests(&server).await;
+    }
+
+    fn b5_valid_body() -> serde_json::Value {
+        serde_json::json!({
+            "model": "m",
+            "store": crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+            "instructions": "be terse",
+            "input": [{"role": "user", "content": "hello"}],
+        })
+    }
+
+    #[tokio::test]
+    async fn responses_store_policy_mismatch_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["store"] = serde_json::json!(true);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_num_ctx_present_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["num_ctx"] = serde_json::json!(4096);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_duplicate_instructions_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([
+            {"role": "system", "content": "laundered second instruction source"},
+            {"role": "user", "content": "hello"},
+        ]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_invalid_input_item_type_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([{"type": "web_search_call", "id": "ws_1"}]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_dangling_function_output_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        ]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_missing_correlation_id_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([
+            {"type": "function_call", "name": "x", "arguments": "{}"},
+        ]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_tools_on_final_summary_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["tools"] = serde_json::json!([
+            {"type": "function", "name": "x", "parameters": {"type": "object"}},
+        ]);
+        // tools_permitted=false ⇒ the final tools-disabled summary rejects any tools.
+        assert_validation_blocks_dispatch(body, false, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_strict_schema_loss_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["tools"] = serde_json::json!([{
+            "type": "function",
+            "name": "write_file",
+            "parameters": {"type": "object", "additionalProperties": false},
+        }]);
+        assert_validation_blocks_dispatch(body, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn responses_over_budget_rebuilt_request_blocks_dispatch() {
+        let mut body = b5_valid_body();
+        body["input"] = serde_json::json!([{"role": "user", "content": "x ".repeat(4_000)}]);
+        // A 1-token budget cannot fit the rebuilt request.
+        assert_validation_blocks_dispatch(body, true, Some(1)).await;
+    }
+
+    /// Positive control: a valid body passes validation and dispatches EXACTLY once
+    /// through the real dispatcher — proving the guard blocks only violations.
+    #[tokio::test]
+    async fn responses_valid_request_dispatches_exactly_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url = format!("{}/v1/responses", server.uri());
+        let policy = responses_wire_validation::ResponsesWirePolicy {
+            store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+            tools_permitted: true,
+            model: "m",
+            authoritative_budget: None,
+            calibration: 1.0,
+            estimation: crate::tokens::TokenEstimation::default(),
+            spill: None,
+            compaction: None,
+        };
+        let validated =
+            responses_wire_validation::validate_responses_request(&b5_valid_body(), &policy)
+                .expect("a well-formed body validates");
+        let client = reqwest::Client::new();
+        super::dispatch_responses_json(&client, &url, None, &validated, &tui_retry_policy(), false)
+            .await
+            .expect("the validated request dispatches");
+        let reqs = server.received_requests().await.expect("journal");
+        assert_eq!(reqs.len(), 1, "a validated request dispatches exactly once");
     }
 }
 
