@@ -409,8 +409,9 @@ pub fn memory_fetch_tool_definition() -> serde_json::Value {
                     "address": {
                         "type": "string",
                         "description": "The tagged address to fetch, e.g. \
-                                        'note:3', 'turn:174856320012#7', \
-                                        'prompt:<uuid>', 'spill:s3', or 'compaction:s1' — copy it exactly as the \
+                                        'note:3', 'turn:174856320012#7', or \
+                                        'prompt:<uuid>' — or a content-addressed \
+                                        spill/compaction handle; copy it exactly as the \
                                         index, a recall hit, a truncation marker, or \
                                         a compaction summary showed it"
                     },

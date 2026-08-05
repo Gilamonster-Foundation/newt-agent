@@ -12830,6 +12830,45 @@ mod tool_round_cap_tests {
         );
     }
 
+    #[tokio::test]
+    async fn openai_chat_cw_400_recovery_is_bounded() {
+        // #1526 review: the chat-transport cw-400 bound (`cw_retries < 2`) has the
+        // same exhaustion guarantee the Responses loop proves — a server that 400s
+        // every time surfaces the error after at most initial + 2 recoveries, never
+        // looping forever. max_tool_rounds == 1 so the bound proven is the INNER
+        // `cw_retries` cap (recovery retries in place), not the outer round cap.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": "prompt is too long: 999999 tokens > 40000 maximum"}
+            })))
+            .expect(3) // initial + exactly 2 bounded recoveries
+            .mount(&server)
+            .await;
+
+        let task = "BOUNDED (chat): never loop forever on a persistent 400";
+        let messages = vec![
+            MemMessage::system("base policy"),
+            MemMessage::user("historical A"),
+            MemMessage::assistant("A done"),
+            MemMessage::user(task),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.num_ctx = None;
+        ctx.recover_cw_400 = Some(recover_cw_400_to_40k);
+        ctx.max_tool_rounds = 1;
+
+        openai_chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect_err("a persistent chat cw-400 surfaces after the bounded retries");
+        // `.expect(3)` verified on drop: initial + exactly 2 recoveries.
+    }
+
     /// Ollama `message` shape of [`OpenAiOverflowThenToolThenDone`]: a numbered
     /// context-window 400, then a `get_context_remaining` tool round, then a
     /// plain-text final answer.

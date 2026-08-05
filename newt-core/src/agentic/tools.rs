@@ -4611,6 +4611,18 @@ mod tests {
     }
 
     #[test]
+    fn batch_blank_id_is_correlation_impossible() {
+        // #1526 review: a present-but-blank/whitespace id cannot correlate a
+        // function_call_output any more than a missing one — reject the batch.
+        let a = serde_json::json!("{}");
+        let calls = [(Some("   "), Some("git"), &a)];
+        assert!(matches!(
+            validate_tool_call_batch(&calls, true),
+            Err(BatchRejection::CorrelationImpossible(_))
+        ));
+    }
+
+    #[test]
     fn batch_duplicate_id_is_correlation_impossible() {
         let a = serde_json::json!("{}");
         let calls = [
