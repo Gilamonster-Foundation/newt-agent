@@ -1,5 +1,5 @@
 name = "caveat-lattice"
-defaultTargets = ["CaveatLattice", "ProjectModel", "CompactionProvenance"]
+defaultTargets = ["CaveatLattice", "ProjectModel", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill"]
 
 # Machine-checked formal specs. Self-contained: no Mathlib, so it builds from a
 # bare Lean toolchain (see lean-toolchain). `lake build` checks every theorem; a
@@ -20,3 +20,14 @@ name = "ProjectModel"
 # unknown wire role never classifies as operator/assistant.
 [[lean_lib]]
 name = "CompactionProvenance"
+
+# CompactionLifecycle — the #1528 B3 proactive-compaction lifecycle kernel:
+# estimate → compact → rebuild → validate → (dispatch | abort). Proves no
+# over-budget dispatch, termination / bounded no-progress, and same-round retry.
+[[lean_lib]]
+name = "CompactionLifecycle"
+
+# CompactionSpill — the #1528 B3 spill-capability kernel: reserve/commit/fetch
+# laws (no-store⟹no-handle, rejected⟹no record, only commit increments the count).
+[[lean_lib]]
+name = "CompactionSpill"

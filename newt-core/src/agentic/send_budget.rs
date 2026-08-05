@@ -426,9 +426,21 @@ impl ResponsesBudgetState {
     /// targeting the ceiling would let the compactor report success on a request
     /// the next preflight then rejects. `recover_from_cw400` guarantees
     /// `preflight_budget` is `Some` before this is called.
-    pub(super) fn compaction_budget(&self, calibration: f32) -> usize {
+    ///
+    /// #1528 B3: `with_tool_schemas` controls the schema-overhead subtraction. A
+    /// tool-capable request carries the exposed tool schemas, so their real-token
+    /// overhead is reserved (`true`). The tools-DISABLED final summary sends no
+    /// schemas, so subtracting them would make the target needlessly tight and
+    /// OVER-compact (`false`) — the estimate side already drops them by passing
+    /// `tools = None` to the estimator.
+    pub(super) fn compaction_budget(&self, calibration: f32, with_tool_schemas: bool) -> usize {
         let ceiling = self.preflight_budget.unwrap_or(0);
-        calibrate_down(ceiling.saturating_sub(self.tool_schema_tokens), calibration)
+        let overhead = if with_tool_schemas {
+            self.tool_schema_tokens
+        } else {
+            0
+        };
+        calibrate_down(ceiling.saturating_sub(overhead), calibration)
     }
 }
 
@@ -826,7 +838,36 @@ mod send_budget_tests {
         // chars/4 target (identity calibration, no schema overhead) is 16,768.
         let recovered = state.recovered_budget_for_window(32_768);
         state.recover_from_cw400(recovered);
-        assert_eq!(state.compaction_budget(1.0), 16_768, "compaction target");
+        assert_eq!(
+            state.compaction_budget(1.0, true),
+            16_768,
+            "compaction target"
+        );
+    }
+
+    #[test]
+    fn compaction_budget_drops_schema_overhead_for_the_tools_disabled_summary() {
+        // #1528 B3 (req 7): a tool-capable request reserves the exposed schemas'
+        // real-token overhead in its compaction target; the tools-DISABLED final
+        // summary must NOT — subtracting schemas that are never sent makes the target
+        // needlessly tight and over-compacts. At identity calibration the difference
+        // between the two targets is EXACTLY the schema overhead.
+        use super::ResponsesBudgetState;
+        let mut state = ResponsesBudgetState::new(Some(32_768), 80, None, None, None, None);
+        let recovered = state.recovered_budget_for_window(32_768);
+        state.recover_from_cw400(recovered);
+        state.set_tool_schema_tokens(1_000);
+        let with_schemas = state.compaction_budget(1.0, true);
+        let without_schemas = state.compaction_budget(1.0, false);
+        assert!(
+            without_schemas > with_schemas,
+            "dropping the un-sent schemas RAISES the target: {without_schemas} !> {with_schemas}"
+        );
+        assert_eq!(
+            without_schemas - with_schemas,
+            1_000,
+            "the tools-disabled target reclaims exactly the un-sent schema overhead"
+        );
     }
 
     /// The `get_context_remaining` REGRESSION (#1528): the reported ceiling is
@@ -1575,7 +1616,7 @@ mod send_budget_tests {
         a.recover_from_cw400(8_000);
         assert_eq!(a.actionable_input_budget(), Some(8_000));
         assert_eq!(
-            a.compaction_budget(1.0),
+            a.compaction_budget(1.0, true),
             8_000,
             "targets the 8,000 preflight enforces"
         );
@@ -1587,12 +1628,12 @@ mod send_budget_tests {
         b.recover_from_cw400(16_000);
         assert_eq!(b.actionable_input_budget(), Some(6_000));
         assert_eq!(
-            b.compaction_budget(1.0),
+            b.compaction_budget(1.0, true),
             6_000,
             "targets the 6,000 preflight enforces"
         );
         assert_ne!(
-            b.compaction_budget(1.0),
+            b.compaction_budget(1.0, true),
             16_000,
             "must not target the looser hard ceiling"
         );
@@ -1604,7 +1645,7 @@ mod send_budget_tests {
         c.recover_from_cw400(20_000);
         let actionable_c = c.actionable_input_budget().unwrap();
         for ratio in [1.3f32, 2.0, 3.0] {
-            let target_raw = c.compaction_budget(ratio); // chars/4 input budget
+            let target_raw = c.compaction_budget(ratio, true); // chars/4 input budget
             let calibrated_input = super::calibrate_up(target_raw, ratio);
             assert!(
                 calibrated_input + 1_000 <= actionable_c,
@@ -1626,7 +1667,7 @@ mod send_budget_tests {
         );
         assert_eq!(d.actionable_input_budget(), Some(0));
         assert_eq!(
-            d.compaction_budget(1.5),
+            d.compaction_budget(1.5, true),
             0,
             "zero budget → zero compaction target"
         );

@@ -187,7 +187,13 @@ const ABS_MIN_RECLAIM_TOKENS: usize = 200;
 /// across turns (the TUI keeps one per session, like `NoteNudge`) and lent
 /// to the loop per call; headless callers may pass `None` and get a fresh
 /// per-turn state.
-#[derive(Debug)]
+///
+/// `Clone` exists for TRANSACTIONAL compaction (#1528 B3): a candidate compaction
+/// runs against a clone, and the caller commits it back to the live state ONLY if
+/// the candidate is accepted — so a rejected compaction never mutates the live
+/// anti-thrash counters / disabled latch. All fields are `Copy`, so the clone is a
+/// cheap value snapshot (not a serialization trick).
+#[derive(Debug, Clone)]
 pub struct CompressState {
     /// Reclaim fractions of the last two attempted compressions (for display).
     last_savings: [f32; 2],
@@ -909,12 +915,16 @@ pub(crate) async fn compress(
                 .map(render_message_raw)
                 .collect::<Vec<_>>()
                 .join("\n");
-            let id = store.store(redact_secrets(&verbatim));
-            body.push_str(&format!(
-                "\n\n[the full verbatim text of this compacted span is retrievable with \
-                 memory_fetch(\"compaction:{id}\") — use it to recover an exact detail \
-                 this summary dropped, instead of guessing]"
-            ));
+            // Only advertise a `compaction:<id>` handle if the span actually
+            // committed. A failed store must not name a handle that resolves to
+            // nothing (BHV-SPILL-001); on failure the lossy summary stands alone.
+            if let Some(id) = store.store(redact_secrets(&verbatim)) {
+                body.push_str(&format!(
+                    "\n\n[the full verbatim text of this compacted span is retrievable with \
+                     memory_fetch(\"compaction:{id}\") — use it to recover an exact detail \
+                     this summary dropped, instead of guessing]"
+                ));
+            }
         }
         // (4) Assembly with the REFERENCE-ONLY prefix + end marker.
         let mut out = Vec::with_capacity(boundary.head + 1 + (pruned.len() - boundary.tail_start));
