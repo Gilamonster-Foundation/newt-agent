@@ -632,3 +632,299 @@ symbol = "question"
 [[BHV-PROMPT-005.refs.production]]
 path = "newt-core/src/tty/widgets/question.rs"
 symbol = "terminal_text"
+
+# ══════════════════ Responses long-turn parity — #1528 (B2–B5) ════════════════
+# These contracts bind the merged #1528 Responses work to its machine-checked Lean
+# kernels (namespace NewtPolicy.CompactionProvenance / CompactionSpill /
+# ResponsesUsage / ResponsesWire / CompactionLifecycle, all under formal/). Unlike
+# the psyche seed above, their artifacts are LANDED on this branch — the refs
+# resolve with no `pending_pr`.
+
+# ───────────────────────── Compaction provenance (B2) ────────────────────────
+
+[BHV-PROVENANCE-001]
+description = "After a compaction round-trip every rebuilt message carries a fail-closed provenance class: a tool result or an internal summary can never be promoted to operator/user authority, and an unknown or malformed source is never trusted."
+[BHV-PROVENANCE-001.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-PROVENANCE-001.refs.lean]]
+module = "NewtPolicy.CompactionProvenance"
+symbol = "tool_output_never_operator"
+[[BHV-PROVENANCE-001.refs.lean]]
+module = "NewtPolicy.CompactionProvenance"
+symbol = "summary_never_operator"
+[[BHV-PROVENANCE-001.refs.lean]]
+module = "NewtPolicy.CompactionProvenance"
+symbol = "untrusted_source_never_trusted_authority"
+[[BHV-PROVENANCE-001.refs.lean]]
+module = "NewtPolicy.CompactionProvenance"
+symbol = "operator_only_from_user"
+[[BHV-PROVENANCE-001.refs.production]]
+path = "newt-core/src/agentic/responses_compaction.rs"
+symbol = "CompactionProvenance"
+[[BHV-PROVENANCE-001.refs.production]]
+path = "newt-core/src/agentic/responses_compaction.rs"
+symbol = "responses_input_to_compaction"
+[[BHV-PROVENANCE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_compaction.rs"
+symbol = "tests::repeated_compaction_preserves_provenance_and_is_deterministic"
+
+# ─────────────────────────── Content-addressed spill (B3) ─────────────────────
+
+[BHV-SPILL-001]
+description = "Spilled content is committed to its content address BEFORE any handle referencing it is published; a rejected or failed commit publishes nothing (fail-closed)."
+[BHV-SPILL-001.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-SPILL-001.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "committed_handle_resolves"
+[[BHV-SPILL-001.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "published_handle_is_committed"
+[[BHV-SPILL-001.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "rejected_candidate_not_published"
+[[BHV-SPILL-001.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "failed_commit_preserves_store"
+[[BHV-SPILL-001.refs.production]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "SpillCid"
+[[BHV-SPILL-001.refs.production]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "maybe_offload"
+[[BHV-SPILL-001.refs.rust_tests]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "tests::a_committed_cid_resolves_to_its_own_record"
+[[BHV-SPILL-001.refs.rust_tests]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "tests::maybe_offload_fails_closed_on_commit_failure"
+[[BHV-SPILL-001.refs.rust_tests]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "tests::maybe_offload_over_cap_emits_a_content_handle_that_resolves"
+
+[BHV-SPILL-002]
+description = "A spill batch commits all-or-none: a single integrity violation installs nothing and leaves the store unchanged."
+[BHV-SPILL-002.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-SPILL-002.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "commit_batch_all_or_none"
+[[BHV-SPILL-002.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "failed_commit_preserves_store"
+[[BHV-SPILL-002.refs.production]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "SpillStore"
+[[BHV-SPILL-002.refs.rust_tests]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "tests::a_batch_with_one_integrity_violation_installs_nothing"
+
+[BHV-SPILL-003]
+description = "Spill handles are session-scoped and content-addressed: a foreign-session handle is indistinguishable from unknown, and distinct content yields distinct, injective addresses."
+[BHV-SPILL-003.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-SPILL-003.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "foreign_session_record_not_fetchable"
+[[BHV-SPILL-003.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "distinct_records_distinct_cid"
+[[BHV-SPILL-003.refs.lean]]
+module = "NewtPolicy.CompactionSpill"
+symbol = "cid_injective"
+[[BHV-SPILL-003.refs.production]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "SessionSpillStore"
+[[BHV-SPILL-003.refs.rust_tests]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "tests::a_foreign_session_cid_is_indistinguishable_from_unknown"
+[[BHV-SPILL-003.refs.rust_tests]]
+path = "newt-core/src/agentic/content_spill.rs"
+symbol = "tests::different_content_yields_different_cid"
+[[BHV-SPILL-003.refs.rust_tests]]
+path = "newt-core/src/agentic/memory_fetch.rs"
+symbol = "tests::spill_resolution_is_fail_closed_on_provenance_mismatch_and_foreign_session"
+
+# ────────────────────── Accepted-round usage observations (B4) ────────────────
+
+[BHV-USAGE-001]
+description = "A usage observation is emitted only for a validated, Accepted round; an invalid, refused, or truncation-suspect round emits none, and a round emits at most one Accepted observation."
+[BHV-USAGE-001.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-USAGE-001.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "invalid_response_emits_no_accepted_observation"
+[[BHV-USAGE-001.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "validated_calls_emit_at_most_one_accepted_observation"
+[[BHV-USAGE-001.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "accepted_emitted_le_one"
+[[BHV-USAGE-001.refs.production]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "RoundObservation"
+[[BHV-USAGE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "observation_hook_tests::accepted_text_emits_exactly_one_accepted"
+[[BHV-USAGE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "observation_hook_tests::validated_tool_calls_emit_one_accepted_and_survive_execution_failure"
+[[BHV-USAGE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "observation_hook_tests::content_invalid_tool_batch_emits_no_accepted"
+[[BHV-USAGE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "observation_hook_tests::truncation_suspect_rounds_emit_nothing"
+
+[BHV-USAGE-002]
+description = "Observing usage never raises the hard context ceiling and never lets the soft budget exceed the hard ceiling — an Accepted observation can only tighten the budget."
+[BHV-USAGE-002.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-USAGE-002.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "accepted_observation_cannot_raise_hard_ceiling"
+[[BHV-USAGE-002.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "hard_ceiling_never_increases"
+[[BHV-USAGE-002.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "soft_budget_never_exceeds_hard_ceiling"
+[[BHV-USAGE-002.refs.production]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "RoundObservation"
+[[BHV-USAGE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "observation_hook_tests::poisoned_low_budget_recovers_via_accepted_observation_and_raise"
+[[BHV-USAGE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "observation_hook_tests::openai_loop_reports_accepted_rounds"
+
+# ─────────────────────── Strict Responses wire validation (B5) ────────────────
+
+[BHV-WIRE-001]
+description = "Only a typed ValidatedResponsesRequest may be dispatched; validation is fail-closed — a validation failure cannot produce a validated request, and the dispatch entry accepts nothing else."
+[BHV-WIRE-001.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-WIRE-001.refs.lean]]
+module = "NewtPolicy.ResponsesWire"
+symbol = "only_validated_request_is_dispatchable"
+[[BHV-WIRE-001.refs.lean]]
+module = "NewtPolicy.ResponsesWire"
+symbol = "validation_failure_cannot_produce_validated_request"
+[[BHV-WIRE-001.refs.lean]]
+module = "NewtPolicy.ResponsesWire"
+symbol = "dispatchable_iff_valid"
+[[BHV-WIRE-001.refs.production]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "validate_responses_request"
+[[BHV-WIRE-001.refs.production]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "ValidatedResponsesRequest"
+[[BHV-WIRE-001.refs.production]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "dispatch_responses_json"
+[[BHV-WIRE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "tests::a_well_formed_request_validates"
+[[BHV-WIRE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "tests::missing_correlation_id_is_rejected"
+
+[BHV-WIRE-002]
+description = "A validated Responses request has exactly one instruction source, carries no num_ctx, puts no tools on a final summary, admits no raw tool role, and has no dangling function call/output — each is rejected at the wire."
+[BHV-WIRE-002.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-WIRE-002.refs.lean]]
+module = "NewtPolicy.ResponsesWire"
+symbol = "validated_request_has_exactly_one_instruction_source"
+[[BHV-WIRE-002.refs.lean]]
+module = "NewtPolicy.ResponsesWire"
+symbol = "validated_request_has_no_num_ctx"
+[[BHV-WIRE-002.refs.lean]]
+module = "NewtPolicy.ResponsesWire"
+symbol = "validated_final_summary_has_no_tools"
+[[BHV-WIRE-002.refs.lean]]
+module = "NewtPolicy.ResponsesWire"
+symbol = "validated_request_has_no_dangling_output"
+[[BHV-WIRE-002.refs.production]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "validate_responses_request"
+[[BHV-WIRE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "tests::duplicate_instructions_is_rejected"
+[[BHV-WIRE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "tests::num_ctx_present_is_rejected"
+[[BHV-WIRE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "tests::tools_on_final_summary_is_rejected"
+[[BHV-WIRE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "tests::raw_tool_role_in_input_is_rejected"
+[[BHV-WIRE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_wire_validation.rs"
+symbol = "tests::dangling_function_output_is_rejected"
+
+# ─────────────────── Proactive compaction lifecycle (B3, round machine) ───────
+
+[BHV-CONTEXT-004]
+description = "Proactive Responses compaction is a bounded, same-round lifecycle: from any reachable state it terminates either ready-to-dispatch within budget or aborts, an irreducible request is refused before dispatch, and NO compaction step advances the logical round."
+[BHV-CONTEXT-004.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-CONTEXT-004.refs.lean]]
+module = "NewtPolicy.CompactionLifecycle"
+symbol = "reachable_ready_to_dispatch_within_budget"
+[[BHV-CONTEXT-004.refs.lean]]
+module = "NewtPolicy.CompactionLifecycle"
+symbol = "eventually_ready_or_abort"
+[[BHV-CONTEXT-004.refs.lean]]
+module = "NewtPolicy.CompactionLifecycle"
+symbol = "exhausted_validation_aborts"
+[[BHV-CONTEXT-004.refs.lean]]
+module = "NewtPolicy.CompactionLifecycle"
+symbol = "no_lifecycle_step_advances_round"
+[[BHV-CONTEXT-004.refs.production]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "compact_responses_input"
+[[BHV-CONTEXT-004.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_compaction.rs"
+symbol = "tests::post_bridge_budget_admits_a_fitting_fenced_request"
+[[BHV-CONTEXT-004.refs.rust_tests]]
+path = "newt-core/src/agentic/responses_compaction.rs"
+symbol = "tests::post_bridge_budget_rejects_a_fence_inflated_request_with_attribution"

@@ -34,12 +34,17 @@ behaviors the constitution admits.
   recognized **test attribute** (`#[test]`, `#[tokio::test]`, …) — deleting the
   attribute orphans the ref even though the fn remains. A `tla` ref must name an
   invariant that is both **defined** as an operator in `<spec>.tla` and
-  **declared** in an `INVARIANT` line of `<spec>.cfg`. Fail-closed: an unresolved
-  reference is an ERROR unless it carries an explicit `pending_pr = <n>` (its
-  artifact lives on an unmerged PR — this seed is stacked on #1526), in which case
-  it WARNS, naming the PR. `--strict` fails even those; run it on `main` after
-  #1526 merges, then delete the markers. Self-tests: `test-lint-behavior-map.py`
-  (24 cases incl. the required negatives). The linter is pure Python (no Lean/JDK),
+  **declared** in an `INVARIANT` line of `<spec>.cfg`. Lean refs are resolved
+  against the **whole `formal/` layer** — every lake lib, not just `NewtPolicy/` —
+  by namespace-qualified decl name (`.lake` build copies are excluded so they
+  cannot fabricate ambiguity); this is what lets the registry cite the #1528
+  kernels below. Fail-closed: an unresolved reference is an ERROR unless it carries
+  an explicit `pending_pr = <n>` (its artifact lives on an unmerged PR — the psyche
+  seed is stacked on #1526), in which case it WARNS, naming the PR. `--strict` fails
+  even those; run it on `main` after #1526 merges, then delete the markers.
+  Self-tests: `test-lint-behavior-map.py` (incl. the required negatives + the
+  broadened-scope / `.lake`-exclusion / genuine-ambiguity cases). The linter is pure
+  Python (no Lean/JDK),
   so CI runs it on **every Rust-source change** — `behavior-registry.yml` (paths:
   `spec/**`, `formal/**`, `**/*.rs`, Cargo manifests) — precisely so a Rust-only PR
   cannot silently orphan a reference. The expensive Lean+TLC checks run only on
@@ -54,7 +59,14 @@ behaviors the constitution admits.
   (`spec → proven`): a `validateBatch : RawBatch → Except _ ValidatedBatch` and
   its soundness, and a real `IsObject` predicate for `args_object` (today a
   `True` placeholder) — landing with the two-stage `CorrelatedBatch` /
-  `ValidatedBatch` capability types (#1529 §3).
+  `ValidatedBatch` capability types (#1529 §3). The **#1528 Responses long-turn
+  kernels** are additional lake libs under `../formal/` (`lean = proven`, namespace
+  `NewtPolicy.{CompactionProvenance, CompactionSpill, ResponsesUsage, ResponsesWire,
+  CompactionLifecycle}`), registered as `BHV-{PROVENANCE,SPILL,USAGE,WIRE}-*` and
+  `BHV-CONTEXT-004` — the first contracts whose artifacts are landed (no
+  `pending_pr`). `CompactionLifecycle.no_lifecycle_step_advances_round` is the Lean
+  counterpart of the reconciliation's combined round machine: compaction never
+  advances the logical round.
 - **`tla/`** — the TLA+ layer (turn lifecycle, recovery). **Harness only**: the
   fail-closed, checksum-pinned `tla2tools` (1.7.4) TLC runner (`check.sh`) + a
   *checked* smoke spec prove the toolchain works in CI. Only **TLC** is pinned and
