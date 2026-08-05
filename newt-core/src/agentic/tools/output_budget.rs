@@ -100,7 +100,7 @@ pub(super) fn cap_estimator() -> crate::tokens::TokenEstimation {
 ///   ratio the cap uses, so anything the cap will truncate is spilled first (they
 ///   can never diverge and silently drop the elided middle).
 /// - **over spill budget** — the raw output already exceeds
-///   [`crate::agentic::spill::TOOL_RESULT_SPILL_CAP`] chars.
+///   [`crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP`] chars.
 pub(super) fn should_spill_full_output(
     out_bytes: usize,
     out_chars: usize,
@@ -111,7 +111,7 @@ pub(super) fn should_spill_full_output(
         return false;
     }
     let over_model_budget = cap_estimator().tokens_for_chars(out_bytes) > max_tokens;
-    let over_spill_budget = out_chars > crate::agentic::spill::TOOL_RESULT_SPILL_CAP;
+    let over_spill_budget = out_chars > crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP;
     over_model_budget || over_spill_budget
 }
 
@@ -256,7 +256,7 @@ mod tests {
         let out_bytes = 3_500;
         let out_chars = 3_500; // ASCII ⇒ bytes == chars, and < TOOL_RESULT_SPILL_CAP
         assert!(
-            out_chars < crate::agentic::spill::TOOL_RESULT_SPILL_CAP,
+            out_chars < crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP,
             "isolate over_model_budget: stay under the raw spill cap"
         );
         // The fix: conservative gate spills (over model budget).
@@ -280,7 +280,7 @@ mod tests {
     fn spill_gate_fires_on_raw_size_even_when_under_token_budget() {
         // The raw-size trigger is independent of the token budget: output past
         // TOOL_RESULT_SPILL_CAP spills even with a generous budget.
-        let big = crate::agentic::spill::TOOL_RESULT_SPILL_CAP + 1;
+        let big = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP + 1;
         assert!(should_spill_full_output(big, big, usize::MAX, true));
     }
 }

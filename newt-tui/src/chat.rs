@@ -1360,15 +1360,28 @@ pub(crate) fn run_chat(
     // lent to the loop each turn (same pattern as `note_nudge`). Two
     // consecutive <10% reclaims disable auto-compression until restart.
     let mut compress_state = newt_core::CompressState::new();
+    // #1528 B3: mint ONE per-session nonce (16 CSPRNG bytes) at session start and
+    // bind BOTH content-addressed stores to it. The spill handle is the BLAKE3 CID of
+    // a session-scoped record, so the nonce seals the equality-leak (identical
+    // plaintext addresses differently across sessions). Provenance (ToolOutput vs
+    // CompactionSpan) separates the two stores' address spaces, so one nonce is safe
+    // for both. `getrandom` is the OS CSPRNG already used for MCP tokens.
+    let session_spill_nonce: [u8; 16] = {
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|e| anyhow::anyhow!("failed to read OS randomness for spill nonce: {e}"))?;
+        nonce
+    };
     // Step 26.3 (#584): session-scoped store for offloaded tool payloads (the
     // `tool_offload` feature). Session-lived so `spill:` re-reads work across
     // rounds; pure in-memory, discarded at session end / `/new`.
-    let spill_store = newt_core::SessionSpillStore::default();
+    let spill_store = newt_core::SessionSpillStore::new(session_spill_nonce);
     // #661 group B: session-scoped compaction store — the compressor stores each
-    // evicted (redacted) middle span here and names a `compaction:<id>` handle so
+    // evicted (redacted) middle span here and names a `compaction:<cid>` handle so
     // the model can losslessly recover a dropped detail via memory_fetch. A
-    // SEPARATE store from `spill_store` (own id space). Discarded at `/new`.
-    let compaction_store = newt_core::SessionSpillStore::default();
+    // SEPARATE address space from `spill_store` (separated by provenance, not nonce).
+    // Discarded at `/new`.
+    let compaction_store = newt_core::SessionSpillStore::new(session_spill_nonce);
     // Ephemeral sessions still need durable-within-the-process prompt
     // provenance. This is the receipt minting authority and exact-text source
     // for the session; it never opens SQLite. Reads are bound to the current
@@ -2802,7 +2815,10 @@ pub(crate) fn run_chat(
                             // Step 26.3: surface tool_offload's measured impact.
                             let impact = features.tool_offload.then(|| {
                                 use newt_core::SpillStore;
-                                (spill_store.spills(), spill_store.offloaded_chars())
+                                (
+                                    spill_store.unique_objects(),
+                                    spill_store.unique_offloaded_chars(),
+                                )
                             });
                             let scratch_impact = features.scratchpad.then(|| {
                                 use newt_core::ScratchpadStore;

@@ -30,6 +30,10 @@ libc.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Content-addressed spill identity (#1528 B3 follow-up): a spill handle is the
+# BLAKE3 CIDv1 of a versioned, session-scoped record — self-verifying, so the
+# allocator/reservation bug class is unrepresentable. Frozen 0.1.x core only.
+content-addressable.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 # #904: comment/format-preserving TOML edits for the interactive "allow

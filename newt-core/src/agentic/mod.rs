@@ -34,9 +34,12 @@ pub(crate) mod experiential;
 // Step 26.6b (#586): scheduled per-step compiled view — the `scheduled` feature.
 pub(crate) mod scheduled;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
+/// Content-addressed spill identity (#1528 B3): a spill handle is the BLAKE3 CIDv1
+/// of a versioned, session-scoped record. This is the sole spill/compaction store;
+/// the old reservation/allocator store was deleted at cutover.
+pub(crate) mod content_spill;
 /// Drive an overseer-authored plan through a `CrewRunner` (#628 P2 execute side).
 pub(crate) mod plan_exec;
-pub(crate) mod spill;
 // W0 (#1511, epic #1506): typed dispatch-error classification + per-round
 // tool-call parse signals — the structural inputs of the observability
 // contract `newt solve` emits for the external evaluator.
@@ -163,6 +166,10 @@ pub use compress::{
     ManualCompressOutcome, SummarizeFn, SummarizeFuture, Summarizer, CONTINUATION_PREFIX,
     SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
+pub use content_spill::{
+    SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1, SpillScope,
+    SpillStore,
+};
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
 pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
@@ -208,7 +215,6 @@ pub use semantic::{
     GatherManifest, IndexStatus, RankedHit, RejectReason, RetrievalResult, RetrievalSteer,
     SemanticIndex, SessionSemanticIndex,
 };
-pub use spill::{SessionSpillStore, SpillStore};
 
 /// Align GFM table pipes in Markdown **source** (Step 25.5, #568) — plain text,
 /// no ANSI. The headless **wyvern** tier keeps Markdown as source (no rendering),
@@ -545,9 +551,9 @@ enum ResponsesCompaction {
     OverBudgetAfterFence(responses_compaction::PostBridgeBudgetExceeded),
     /// `input` could not be classified (a forbidden `system` item) — fail closed.
     BridgeError,
-    /// The staged spill batch could not be committed (a poisoned candidate log or a
-    /// duplicate id) — fail CLOSED, committing NOTHING (BHV-SPILL-007).
-    SpillCommitFailed(crate::agentic::spill::SpillCommitError),
+    /// The staged compaction spill batch could not be committed (a poisoned store or a
+    /// content-integrity violation) — fail CLOSED, committing NOTHING (BHV-SPILL-007).
+    SpillCommitFailed(crate::agentic::content_spill::SpillError),
 }
 
 /// Why a proactive / reactive compaction attempt did NOT yield a dispatchable
@@ -568,8 +574,8 @@ enum CompactionRejection {
     /// The fenced rebuild still exceeds the budget after framing (BHV-BUDGET-004).
     PostBridgeBudgetExceeded(responses_compaction::PostBridgeBudgetExceeded),
     /// The compacted candidate fit, but its staged spill batch could not be committed
-    /// (a poisoned log or a duplicate id) — fail closed (BHV-SPILL-007).
-    SpillCommit(crate::agentic::spill::SpillCommitError),
+    /// (a poisoned store or a content-integrity violation) — fail closed (BHV-SPILL-007).
+    SpillCommit(crate::agentic::content_spill::SpillError),
 }
 
 impl std::fmt::Display for CompactionRejection {
@@ -615,141 +621,34 @@ impl ResponsesCompaction {
     }
 }
 
-type StagedSpills<'a> = std::sync::Mutex<
-    Vec<(
-        Box<dyn crate::agentic::spill::SpillReservation + 'a>,
-        String,
-    )>,
->;
-
-/// A TRANSACTIONAL staging wrapper over the session compaction/spill store (#1528
-/// B3, BHV-SPILL-006/007). The compressor's progressive-disclosure spill is a shared
-/// side effect with NO delete API, so a candidate compaction that summarizes and is
-/// then REJECTED would otherwise leave an orphaned span in the live store. Every
-/// operation through this store — `store` OR `reserve` then the reservation's
-/// `commit` — STAGES `(real reservation, payload)` into a candidate-local log; the
-/// REAL store still issues the (unique) id rendered into the summary, but NOTHING
-/// reaches the live store until [`Self::commit`] flushes the whole batch ALL-OR-NONE.
-/// A rejected candidate is dropped: every reservation is retired unused (no fetchable
-/// record, committed count unchanged). Created ONLY for a REAL inner store — a `None`
-/// store passes through as `None`, so no handle is ever invented.
-struct CandidateSpillStore<'a> {
-    inner: &'a dyn crate::agentic::spill::SpillStore,
-    staged: StagedSpills<'a>,
-}
-
-impl<'a> CandidateSpillStore<'a> {
-    fn new(inner: &'a dyn crate::agentic::spill::SpillStore) -> Self {
-        Self {
-            inner,
-            staged: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// COMMIT the staged batch ALL-OR-NONE. Fails CLOSED on a poisoned log
-    /// (`PoisonedTransaction`, BHV-SPILL-007) or a duplicate id (`DuplicateCommit`,
-    /// intra-batch or already committed) WITHOUT installing ANY record — so live
-    /// `input` can never reference a spill that failed to commit.
-    fn commit(self) -> Result<(), crate::agentic::spill::SpillCommitError> {
-        use crate::agentic::spill::SpillCommitError;
-        let staged = self
-            .staged
-            .into_inner()
-            .map_err(|_| SpillCommitError::PoisonedTransaction)?;
-        // Prevalidate: every id UNIQUE in the batch AND VACANT in the live store,
-        // before installing anything (all-or-none).
-        let mut seen = std::collections::HashSet::new();
-        for (reservation, _) in &staged {
-            if !seen.insert(reservation.id().to_string())
-                || self.inner.fetch(reservation.id()).is_some()
-            {
-                return Err(SpillCommitError::DuplicateCommit);
-            }
-        }
-        for (reservation, payload) in staged {
-            reservation.commit(payload)?;
-        }
-        Ok(())
-    }
-
-    /// Test seam: poison the staging log deterministically (a caught panic while the
-    /// lock is held), to exercise the fail-closed commit path.
-    #[cfg(test)]
-    fn poison_staging_for_test(&self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = self.staged.lock().unwrap();
-            panic!("intentional poison");
-        }));
-    }
-}
-
-/// A candidate reservation: its `commit` STAGES `(real reservation, payload)` into the
-/// candidate log rather than touching the live store (BHV-SPILL-006).
-struct CandidateReservation<'store, 'res> {
-    staged: &'res StagedSpills<'store>,
-    real: Option<Box<dyn crate::agentic::spill::SpillReservation + 'store>>,
-}
-
-impl crate::agentic::spill::SpillReservation for CandidateReservation<'_, '_> {
-    fn id(&self) -> &str {
-        self.real.as_ref().map_or("", |r| r.id())
-    }
-    fn commit(
-        mut self: Box<Self>,
-        redacted: String,
-    ) -> Result<(), crate::agentic::spill::SpillCommitError> {
-        use crate::agentic::spill::SpillCommitError;
-        let real = self.real.take().ok_or(SpillCommitError::DuplicateCommit)?;
-        self.staged
-            .lock()
-            .map_err(|_| SpillCommitError::PoisonedTransaction)?
-            .push((real, redacted));
-        Ok(())
-    }
-}
-
-impl crate::agentic::spill::SpillStore for CandidateSpillStore<'_> {
-    fn reserve(&self) -> Box<dyn crate::agentic::spill::SpillReservation + '_> {
-        Box::new(CandidateReservation {
-            staged: &self.staged,
-            real: Some(self.inner.reserve()),
-        })
-    }
-    fn fetch(&self, id: &str) -> Option<String> {
-        // A staged (candidate-local, uncommitted) payload is visible to THIS candidate
-        // only; everything else falls through to the committed store.
-        if let Ok(staged) = self.staged.lock() {
-            if let Some((_, payload)) = staged.iter().find(|(r, _)| r.id() == id) {
-                return Some(payload.clone());
-            }
-        }
-        self.inner.fetch(id)
-    }
-    fn spills(&self) -> u64 {
-        // Staged reservations are NOT committed spills.
-        self.inner.spills()
-    }
-    fn offloaded_chars(&self) -> u64 {
-        self.inner.offloaded_chars()
-    }
-}
+/// A candidate-local staging buffer for the compaction spill(s) built while
+/// compressing a Responses candidate (#1528 B3, §2.6). The compressor STAGES each
+/// evicted middle span into this buffer PURELY (the CID is a pure function of the
+/// content, so its `compaction:<cid>` handle can ride the summary before any commit);
+/// nothing reaches the live store. [`compact_responses_input`] drains it and
+/// `commit_batch`es into the live store ONLY on the accept branch — a rejected
+/// candidate drops the buffer, leaving the live store untouched (BHV-SPILL-006/007).
+pub(crate) type CompactionStageBuffer =
+    std::sync::Mutex<Vec<crate::agentic::content_spill::StagedSpill>>;
 
 /// Compact the Responses `input` toward `compaction_budget` via the B2 provenance
 /// bridge + the ONE `compress`, then validate the fenced rebuild against
 /// `actionable_budget` before committing.
 ///
-/// TRANSACTIONAL (#1528 B3, B3-CG-004): the compressor runs against a CLONE of
-/// `compress_state` AND a buffering [`CandidateSpillStore`], and the candidate is
-/// validated (provenance + post-bridge budget) BEFORE anything live is touched. On
-/// success — and only then — the helper commits ALL FOUR effects together: it
-/// rewrites `*input`, writes the candidate anti-thrash state back into
-/// `*compress_state`, FLUSHES the buffered spills to the real store, and emits the
-/// compaction notice. On ANY reject/refuse/over-budget/bridge-error path, `*input`,
-/// `*compress_state`, the spill store, and the notice stream are ALL left UNTOUCHED,
-/// so no caller can dispatch a half-compacted request or believe an uncommitted
-/// compaction occurred. Single-shot (one attempt) — the caller decides whether to
-/// gate on an estimate (proactive) or always call (reactive), and how to map a
-/// non-`Compacted` outcome (see [`CompactionRejection`]).
+/// TRANSACTIONAL (#1528 B3, B3-CG-004 / §2.6): the compressor runs against a CLONE of
+/// `compress_state` AND a candidate-local [`CompactionStageBuffer`] — the evicted
+/// middle span(s) are STAGED PURELY (no live-store mutation) while the candidate is
+/// validated (provenance + post-bridge budget). On success — and only then — the
+/// helper commits ALL FOUR effects together: it rewrites `*input`, writes the
+/// candidate anti-thrash state back into `*compress_state`, `commit_batch`es the
+/// staged spills to the real store, and emits the compaction notice. On ANY
+/// reject/refuse/over-budget/bridge-error path, `*input`, `*compress_state`, the spill
+/// store, and the notice stream are ALL left UNTOUCHED — the staged buffer is dropped
+/// and no `compaction:<cid>` was committed — so no caller can dispatch a
+/// half-compacted request or believe an uncommitted compaction occurred. Single-shot
+/// (one attempt) — the caller decides whether to gate on an estimate (proactive) or
+/// always call (reactive), and how to map a non-`Compacted` outcome (see
+/// [`CompactionRejection`]).
 #[allow(clippy::too_many_arguments)]
 async fn compact_responses_input(
     input: &mut Vec<serde_json::Value>,
@@ -761,7 +660,7 @@ async fn compact_responses_input(
     estimation: crate::tokens::TokenEstimation,
     task: &str,
     summary_input_cap_floor_chars: usize,
-    compaction_store: Option<&dyn crate::agentic::spill::SpillStore>,
+    compaction_store: Option<&dyn crate::agentic::content_spill::SpillStore>,
     summarizer: Option<&SummarizeFn>,
     compress_state: &mut CompressState,
     color: bool,
@@ -778,13 +677,16 @@ async fn compact_responses_input(
         chat.push(serde_json::json!({ "role": "system", "content": ins }));
     }
     chat.extend(responses_compaction::compaction_to_chat(&messages));
-    // Run the compressor against a CANDIDATE state AND a staging spill store — the
-    // live anti-thrash counters / disabled latch and the session compaction store
-    // are mutated only on commit (below). A `None` store is passed straight through
-    // as `None`, so with no real store the compressor invents no retrieval handle
-    // (correction 1); a real store is wrapped so its spill writes are staged.
+    // Run the compressor against a CANDIDATE state AND a candidate-local staging
+    // buffer — the live anti-thrash counters / disabled latch and the session
+    // compaction store are mutated only on commit (below). The live `compaction_store`
+    // is passed so the compressor can STAMP its session scope onto each span and render
+    // the pure `compaction:<cid>` handle; the buffer receives the staged span(s)
+    // instead of the live store, so nothing is committed until accept. A `None` store
+    // passes through as `None` (no buffer), so with no real store the compressor
+    // invents no retrieval handle (correction 1).
     let mut candidate_state = compress_state.clone();
-    let candidate_store = compaction_store.map(CandidateSpillStore::new);
+    let stage_buffer: CompactionStageBuffer = std::sync::Mutex::new(Vec::new());
     let outcome = compress(
         CompressRequest {
             messages: &chat,
@@ -799,9 +701,8 @@ async fn compact_responses_input(
             focus: None,
             est: estimation,
             summary_input_cap_floor_chars,
-            compaction_store: candidate_store
-                .as_ref()
-                .map(|c| c as &dyn crate::agentic::spill::SpillStore),
+            compaction_store,
+            compaction_stage: compaction_store.map(|_| &stage_buffer),
         },
         summarizer,
         &mut candidate_state,
@@ -845,22 +746,32 @@ async fn compact_responses_input(
         if let Err(exceeded) =
             responses_compaction::check_post_bridge_budget(budget, pre_bridge, post_bridge)
         {
-            // REJECT: `candidate_store` is dropped WITHOUT `commit`, so every staged
-            // reservation is retired unused — nothing is fetchable, the committed
-            // count is unchanged; `*input`, `*compress_state`, and the notice stream
-            // are likewise UNTOUCHED — the candidate is discarded whole.
+            // REJECT: the staged buffer is dropped WITHOUT commit, so every staged span
+            // is retired unused — nothing is fetchable in the live store, its counts are
+            // unchanged; `*input`, `*compress_state`, and the notice stream are likewise
+            // UNTOUCHED — the candidate is discarded whole.
             return ResponsesCompaction::OverBudgetAfterFence(exceeded);
         }
     }
     // COMMIT — all FOUR effects, now that the candidate is accepted. Ordered so live
     // input never references an uncommitted spill: install the staged spill batch
-    // FIRST — and if that batch commit fails (a poisoned log or a duplicate id), fail
-    // CLOSED, leaving `*input`, `*compress_state`, and the notice stream UNTOUCHED
-    // (BHV-SPILL-007). Then swap in the input that names those spills, the anti-thrash
-    // state, and the notice.
-    if let Some(cs) = candidate_store {
-        if let Err(e) = cs.commit() {
-            return ResponsesCompaction::SpillCommitFailed(e);
+    // FIRST — and if that batch commit fails (a poisoned buffer or a content-integrity
+    // violation), fail CLOSED, leaving `*input`, `*compress_state`, and the notice
+    // stream UNTOUCHED (BHV-SPILL-007). Then swap in the input that names those spills,
+    // the anti-thrash state, and the notice.
+    if let Some(store) = compaction_store {
+        let staged = match stage_buffer.into_inner() {
+            Ok(s) => s,
+            Err(_) => {
+                return ResponsesCompaction::SpillCommitFailed(
+                    content_spill::SpillError::PoisonedStore,
+                )
+            }
+        };
+        if !staged.is_empty() {
+            if let Err(e) = store.commit_batch(&staged) {
+                return ResponsesCompaction::SpillCommitFailed(e);
+            }
         }
     }
     *input = rebuilt_input;
@@ -980,13 +891,13 @@ pub struct ChatCtx<'a> {
     /// Session spill store for `tool_offload` (Step 26.3). `None` = no offload
     /// (and `spill:` re-reads resolve to a labelled absence). Shared `&dyn`
     /// (interior mutability) so it serves both the write path and `memory_fetch`.
-    pub spill_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
+    pub spill_store: Option<&'a dyn crate::agentic::content_spill::SpillStore>,
     /// Session compaction store (#661 group B): the compressor stores each
     /// evicted (redacted) middle span here and names a `compaction:<id>` handle
     /// in the marker, so the model can losslessly recover a detail the summary
     /// dropped. SEPARATE store from `spill_store` (own id space). `None` =
     /// lossy-only compaction (headless / progressive disclosure off).
-    pub compaction_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
+    pub compaction_store: Option<&'a dyn crate::agentic::content_spill::SpillStore>,
     /// Inject the `<state>` scratchpad block + advertise the state tools (Step
     /// 26.4, #583). The resolved `scratchpad` feature; false for headless/eval.
     pub scratchpad: bool,
@@ -2067,6 +1978,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 est: estimation,
                                 summary_input_cap_floor_chars,
                                 compaction_store,
+                                compaction_stage: None,
                             },
                             summarizer,
                             compress_state,
@@ -2368,6 +2280,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 est: estimation,
                                 summary_input_cap_floor_chars,
                                 compaction_store,
+                                compaction_stage: None,
                             },
                             summarizer,
                             compress_state,
@@ -2984,6 +2897,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 est: estimation,
                                 summary_input_cap_floor_chars,
                                 compaction_store,
+                                compaction_stage: None,
                             },
                             summarizer,
                             compress_state,
@@ -4036,7 +3950,7 @@ fn maybe_offload_tool_result(
     name: &str,
     result: String,
     tool_offload: bool,
-    spill_store: Option<&dyn spill::SpillStore>,
+    spill_store: Option<&dyn content_spill::SpillStore>,
 ) -> String {
     if matches!(
         name,
@@ -4044,7 +3958,9 @@ fn maybe_offload_tool_result(
     ) {
         result
     } else {
-        spill::maybe_offload(result, tool_offload, spill_store)
+        // Thread the tool name into provenance so a tool output and an identical-looking
+        // compaction span never share an address (content_spill binds provenance).
+        content_spill::maybe_offload(result, tool_offload, Some(name.to_string()), spill_store)
     }
 }
 
@@ -5521,6 +5437,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         est: estimation,
                         summary_input_cap_floor_chars,
                         compaction_store,
+                        compaction_stage: None,
                     },
                     summarizer,
                     compress_state,
@@ -5763,6 +5680,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 est: estimation,
                                 summary_input_cap_floor_chars,
                                 compaction_store,
+                                compaction_stage: None,
                             },
                             summarizer,
                             compress_state,
@@ -8358,11 +8276,11 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn prompt_read_exact_recovery_is_never_spilled() {
-        let store = spill::SessionSpillStore::default();
-        let exact = "x".repeat(spill::TOOL_RESULT_SPILL_CAP + 1);
+        let store = content_spill::SessionSpillStore::new([7u8; 16]);
+        let exact = "x".repeat(content_spill::TOOL_RESULT_SPILL_CAP + 1);
         let output = maybe_offload_tool_result("prompt_read", exact.clone(), true, Some(&store));
         assert_eq!(output, exact);
-        assert_eq!(spill::SpillStore::spills(&store), 0);
+        assert_eq!(content_spill::SpillStore::unique_objects(&store), 0);
     }
 
     #[test]
@@ -10698,15 +10616,16 @@ mod tool_round_cap_tests {
         );
     }
 
-    /// B3-CG-004: the FOURTH effect — the session compaction/spill store — is also
-    /// transactional. A rejected candidate writes NOTHING to the live store; a
-    /// committed one flushes exactly its buffered span. Fails on `711c247`, where the
-    /// shared `store.store(...)` inside `compress` was not rolled back on reject
-    /// (leaking an orphaned redacted span per rejected proactive attempt).
+    /// B3-CG-004 / §2.6: the FOURTH effect — the session compaction/spill store — is
+    /// also transactional. A rejected candidate writes NOTHING to the live store
+    /// (rejected-candidate-publishes-nothing); a committed one flushes exactly its
+    /// staged span. Fails on `711c247`, where the shared `store.store(...)` inside
+    /// `compress` was not rolled back on reject (leaking an orphaned redacted span per
+    /// rejected proactive attempt).
     #[tokio::test]
     async fn compact_responses_input_spill_store_is_transactional() {
         use crate::agentic::compress::{CompressState, Summarizer};
-        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        use crate::agentic::content_spill::{SessionSpillStore, SpillStore};
         let make_input = || {
             let mut v = vec![serde_json::json!({"role": "user", "content": "task"})];
             for i in 0..6 {
@@ -10720,7 +10639,7 @@ mod tool_round_cap_tests {
 
         // REJECT (tiny actionable budget → post-fence overflow): store stays EMPTY.
         {
-            let store = SessionSpillStore::default();
+            let store = SessionSpillStore::new([7u8; 16]);
             let s = summarizer();
             let mut input = make_input();
             let mut state = CompressState::new();
@@ -10745,14 +10664,14 @@ mod tool_round_cap_tests {
                 ResponsesCompaction::OverBudgetAfterFence(_)
             ));
             assert_eq!(
-                store.spills(),
+                store.unique_objects(),
                 0,
                 "TRANSACTIONAL: a rejected candidate writes NO committed spill"
             );
             assert_eq!(
-                store.fetch("s0"),
-                None,
-                "a rejected candidate's staged payload is NOT fetchable"
+                store.logical_spill_refs(),
+                0,
+                "a rejected candidate installs no logical reference either"
             );
             assert_eq!(input, make_input(), "live input is UNCHANGED on reject");
             assert!(
@@ -10764,7 +10683,7 @@ mod tool_round_cap_tests {
         }
         // COMMIT (generous budget): the staged span is flushed exactly once.
         {
-            let store = SessionSpillStore::default();
+            let store = SessionSpillStore::new([7u8; 16]);
             let s = summarizer();
             let mut input = make_input();
             let mut state = CompressState::new();
@@ -10786,9 +10705,16 @@ mod tool_round_cap_tests {
             .await;
             assert!(matches!(outcome, ResponsesCompaction::Compacted));
             assert_eq!(
-                store.spills(),
+                store.unique_objects(),
                 1,
                 "committed: the compacted span is flushed to the store exactly once"
+            );
+            // The live input names the committed span's `compaction:<cid>` handle.
+            assert!(
+                serde_json::to_string(&input)
+                    .unwrap()
+                    .contains("compaction:"),
+                "the committed candidate names its retrieval handle"
             );
         }
     }
@@ -10840,70 +10766,16 @@ mod tool_round_cap_tests {
         );
     }
 
-    /// Correction 4: the emitted retrieval marker uses the STORE-issued id (here a
-    /// non-`s{count}` scheme), and fetching that id returns the exact payload — the
-    /// helper never predicts an id. Fails on `8b3a1c8`, which emitted a predicted
-    /// `compaction:s0`.
+    /// §2.6 (replaces the obsolete "store-issued id" correction): a committed
+    /// compaction names a `compaction:<cid>` CONTENT handle — not a predicted or
+    /// allocated id — and that handle parses as a canonical CID AND resolves in the
+    /// live store to the committed verbatim span. Content addressing dissolved the
+    /// allocator, so there is no id to predict or steal.
     #[tokio::test]
-    async fn compact_responses_input_uses_store_issued_ids_not_predicted() {
+    async fn compact_responses_input_names_a_resolvable_content_handle() {
         use crate::agentic::compress::Summarizer;
-        use crate::agentic::spill::{SpillCommitError, SpillReservation, SpillStore};
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Mutex;
-        #[derive(Default)]
-        struct UuidishSpillStore {
-            map: Mutex<std::collections::HashMap<String, String>>,
-            next: AtomicU64,
-            committed: AtomicU64,
-            chars: AtomicU64,
-        }
-        // A store-issued reservation carrying a NON-`s{n}` id; commit is id-checked so
-        // a committed id is immutable (BHV-SPILL-005) and the id is store-bound
-        // (BHV-SPILL-004: `commit` takes no store argument).
-        struct UuidishReservation<'a> {
-            store: &'a UuidishSpillStore,
-            id: String,
-        }
-        impl SpillReservation for UuidishReservation<'_> {
-            fn id(&self) -> &str {
-                &self.id
-            }
-            fn commit(self: Box<Self>, redacted: String) -> Result<(), SpillCommitError> {
-                let mut map = self
-                    .store
-                    .map
-                    .lock()
-                    .map_err(|_| SpillCommitError::PoisonedTransaction)?;
-                if map.contains_key(&self.id) {
-                    return Err(SpillCommitError::DuplicateCommit);
-                }
-                self.store
-                    .chars
-                    .fetch_add(redacted.chars().count() as u64, Ordering::Relaxed);
-                map.insert(self.id.clone(), redacted);
-                self.store.committed.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-        }
-        impl SpillStore for UuidishSpillStore {
-            fn reserve(&self) -> Box<dyn SpillReservation + '_> {
-                let n = self.next.fetch_add(1, Ordering::Relaxed);
-                Box::new(UuidishReservation {
-                    store: self,
-                    id: format!("spill-uuid-{}", 17 + n * 25),
-                })
-            }
-            fn fetch(&self, id: &str) -> Option<String> {
-                self.map.lock().unwrap().get(id).cloned()
-            }
-            fn spills(&self) -> u64 {
-                self.committed.load(Ordering::Relaxed)
-            }
-            fn offloaded_chars(&self) -> u64 {
-                self.chars.load(Ordering::Relaxed)
-            }
-        }
-        let store = UuidishSpillStore::default();
+        use crate::agentic::content_spill::{SessionSpillStore, SpillCid, SpillStore};
+        let store = SessionSpillStore::new([7u8; 16]);
         let summ: Summarizer = Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) }));
         let mut input = spill_middle_input();
         let mut state = crate::agentic::compress::CompressState::new();
@@ -10925,266 +10797,24 @@ mod tool_round_cap_tests {
         .await;
         assert!(matches!(outcome, ResponsesCompaction::Compacted));
         let text = serde_json::to_string(&input).unwrap();
-        assert!(
-            text.contains("compaction:spill-uuid-17"),
-            "the marker uses the STORE-issued id: {text:.200}"
-        );
+        // Extract the `compaction:<cid>` handle (a base32-lower CID — ascii
+        // alphanumeric, so read up to the first non-alphanumeric terminator).
+        let handle: String = text
+            .split("compaction:")
+            .nth(1)
+            .expect("the marker names a compaction handle")
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let cid = SpillCid::parse(&handle).expect("the handle is a canonical content CID");
         assert!(!text.contains("compaction:s0"), "no predicted s0 marker");
         assert!(
             store
-                .fetch("spill-uuid-17")
-                .is_some_and(|p| p.contains("step 0")),
+                .fetch(&cid)
+                .is_some_and(|r| r.redacted_text.contains("step 0")),
             "the emitted handle resolves to the committed verbatim span"
         );
-        assert_eq!(store.spills(), 1);
-    }
-
-    /// Correction 3: the STORE owns id allocation, so an external write that lands
-    /// BETWEEN a candidate reservation and its commit gets its OWN unique id — it
-    /// cannot claim or rebind the candidate's reserved id. Deterministic (channels
-    /// sequence the events; no sleeps). Fails on `8b3a1c8`, whose predicted `s{base}`
-    /// is claimed by the interleaved external writer.
-    #[test]
-    fn candidate_spill_store_binds_reserved_ids_under_an_interleaved_external_write() {
-        use crate::agentic::spill::{SessionSpillStore, SpillStore};
-        use std::sync::mpsc;
-        let store = SessionSpillStore::default();
-        let candidate = CandidateSpillStore::new(&store);
-        let (reserved_tx, reserved_rx) = mpsc::channel::<()>();
-        let (ext_done_tx, ext_done_rx) = mpsc::channel::<String>();
-        let store_ref = &store;
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                reserved_rx.recv().unwrap(); // 2. after the candidate reserved A
-                let id_b = store_ref
-                    .store("payload B".to_string())
-                    .expect("commit succeeds in tests"); // 3. external commits B
-                ext_done_tx.send(id_b).unwrap();
-            });
-            let id_a = candidate
-                .store("payload A".to_string())
-                .expect("commit succeeds in tests"); // 1. candidate reserves A (staged)
-            reserved_tx.send(()).unwrap();
-            let id_b = ext_done_rx.recv().unwrap();
-            candidate.commit().expect("all-or-none commit succeeds"); // 4. candidate commits A
-            assert_ne!(
-                id_a, id_b,
-                "the interleaved external write got its OWN id (no collision)"
-            );
-            assert_eq!(
-                store.fetch(&id_a).as_deref(),
-                Some("payload A"),
-                "candidate handle → its OWN payload (no rebind)"
-            );
-            assert_eq!(
-                store.fetch(&id_b).as_deref(),
-                Some("payload B"),
-                "external handle → its own payload"
-            );
-        });
-    }
-
-    /// Correction 6: multiple staged spills plus an interleaved external write — every
-    /// handle is unique and resolves to its OWN payload (no swap/alias), and the
-    /// committed count reflects only committed payloads.
-    #[test]
-    fn candidate_spill_store_stages_multiple_payloads_without_swap_or_alias() {
-        use crate::agentic::spill::{SessionSpillStore, SpillStore};
-        let store = SessionSpillStore::default();
-        let ext_before = store
-            .store("external before".to_string())
-            .expect("commit succeeds in tests");
-        let candidate = CandidateSpillStore::new(&store);
-        let a = candidate
-            .store("payload A".to_string())
-            .expect("commit succeeds in tests");
-        let b = candidate
-            .store("payload B".to_string())
-            .expect("commit succeeds in tests");
-        let ext_during = store
-            .store("external during".to_string())
-            .expect("commit succeeds in tests");
-        assert_eq!(store.fetch(&a), None, "staged A not committed yet");
-        assert_eq!(store.fetch(&b), None, "staged B not committed yet");
-        assert_eq!(
-            store.spills(),
-            2,
-            "only the two external stores are committed so far"
-        );
-        candidate.commit().expect("all-or-none commit succeeds");
-        let ids = [
-            ext_before.as_str(),
-            a.as_str(),
-            b.as_str(),
-            ext_during.as_str(),
-        ];
-        assert_eq!(
-            ids.iter().collect::<std::collections::HashSet<_>>().len(),
-            4,
-            "all four ids are unique"
-        );
-        assert_eq!(
-            store.fetch(&a).as_deref(),
-            Some("payload A"),
-            "A → A (no swap)"
-        );
-        assert_eq!(
-            store.fetch(&b).as_deref(),
-            Some("payload B"),
-            "B → B (no swap)"
-        );
-        assert_eq!(store.fetch(&ext_before).as_deref(), Some("external before"));
-        assert_eq!(store.fetch(&ext_during).as_deref(), Some("external during"));
-        assert_eq!(
-            store.spills(),
-            4,
-            "committed count reflects only committed payloads"
-        );
-    }
-
-    /// P1-C: the SPLIT path — `reserve()` then the reservation's own `commit` — STAGES
-    /// into the candidate log exactly like `store()`; it does NOT bypass the transaction.
-    /// Until the candidate itself commits, the live store has NO record and its committed
-    /// count is unchanged; the staged payload is visible only THROUGH the candidate.
-    /// Fails on `5975d64`, whose candidate `commit_reserved` wrote straight to the live
-    /// store, bypassing the all-or-none batch.
-    #[test]
-    fn candidate_split_path_reserve_then_commit_stages_not_bypasses() {
-        use crate::agentic::spill::{SessionSpillStore, SpillStore};
-        let store = SessionSpillStore::default();
-        let candidate = CandidateSpillStore::new(&store);
-        // Drive the split path directly: reserve, then commit the reservation.
-        let reservation = candidate.reserve();
-        let id = reservation.id().to_string();
-        reservation
-            .commit("staged via split path".to_string())
-            .expect("staging a reservation succeeds");
-        // STAGED, not committed: the live store is untouched and its count unchanged.
-        assert_eq!(
-            store.fetch(&id),
-            None,
-            "a split-path commit does NOT reach the live store"
-        );
-        assert_eq!(
-            store.spills(),
-            0,
-            "live committed count unchanged while staged"
-        );
-        assert_eq!(
-            candidate.fetch(&id).as_deref(),
-            Some("staged via split path"),
-            "the staged payload is visible only through the candidate"
-        );
-        // The candidate's own commit flushes the batch all-or-none.
-        candidate.commit().expect("all-or-none commit succeeds");
-        assert_eq!(store.fetch(&id).as_deref(), Some("staged via split path"));
-        assert_eq!(store.spills(), 1);
-    }
-
-    /// P1-D / BHV-SPILL-007: a POISONED candidate staging log fails CLOSED — the batch
-    /// commit returns `PoisonedTransaction` and installs NOTHING, so the live store keeps
-    /// its prior committed record and count. A poisoned candidate can never leak a partial
-    /// or orphaned spill into the live store. Fails on `5975d64`, which unwrapped-or-
-    /// defaulted the poisoned log and committed as if it were empty (fail-open).
-    #[test]
-    fn candidate_commit_fails_closed_on_a_poisoned_staging_log() {
-        use crate::agentic::spill::{SessionSpillStore, SpillCommitError, SpillStore};
-        let store = SessionSpillStore::default();
-        let ext = store
-            .store("external".to_string())
-            .expect("commit succeeds in tests");
-        let candidate = CandidateSpillStore::new(&store);
-        let _staged = candidate
-            .store("staged payload".to_string())
-            .expect("commit succeeds in tests");
-        candidate.poison_staging_for_test();
-        assert_eq!(
-            candidate.commit(),
-            Err(SpillCommitError::PoisonedTransaction),
-            "a poisoned staging log fails closed"
-        );
-        assert_eq!(
-            store.spills(),
-            1,
-            "only the pre-existing external commit remains"
-        );
-        assert_eq!(store.fetch(&ext).as_deref(), Some("external"));
-    }
-
-    /// Correction 6 / BHV-SPILL-008: the batch commit is ALL-OR-NONE. If ANY staged id
-    /// collides — here a deliberately broken store that issues a constant id — the whole
-    /// commit returns `DuplicateCommit` and installs NOTHING. Prevalidation runs before
-    /// any install, so no partial batch reaches the live store.
-    #[test]
-    fn candidate_commit_is_all_or_none_on_a_duplicate_id() {
-        use crate::agentic::spill::{SpillCommitError, SpillReservation, SpillStore};
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Mutex;
-        // A deliberately BROKEN store handing out a CONSTANT id — two reservations
-        // collide, exercising the intra-batch duplicate guard.
-        #[derive(Default)]
-        struct CollidingStore {
-            map: Mutex<std::collections::HashMap<String, String>>,
-            committed: AtomicU64,
-        }
-        struct CollidingReservation<'a> {
-            store: &'a CollidingStore,
-        }
-        impl SpillReservation for CollidingReservation<'_> {
-            fn id(&self) -> &str {
-                "dup"
-            }
-            fn commit(self: Box<Self>, redacted: String) -> Result<(), SpillCommitError> {
-                let mut map = self
-                    .store
-                    .map
-                    .lock()
-                    .map_err(|_| SpillCommitError::PoisonedTransaction)?;
-                if map.contains_key("dup") {
-                    return Err(SpillCommitError::DuplicateCommit);
-                }
-                map.insert("dup".to_string(), redacted);
-                self.store.committed.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-        }
-        impl SpillStore for CollidingStore {
-            fn reserve(&self) -> Box<dyn SpillReservation + '_> {
-                Box::new(CollidingReservation { store: self })
-            }
-            fn fetch(&self, id: &str) -> Option<String> {
-                self.map.lock().unwrap().get(id).cloned()
-            }
-            fn spills(&self) -> u64 {
-                self.committed.load(Ordering::Relaxed)
-            }
-            fn offloaded_chars(&self) -> u64 {
-                0
-            }
-        }
-        let store = CollidingStore::default();
-        let candidate = CandidateSpillStore::new(&store);
-        let _a = candidate
-            .store("A".to_string())
-            .expect("commit succeeds in tests");
-        let _b = candidate
-            .store("B".to_string())
-            .expect("commit succeeds in tests"); // same id "dup"
-        assert_eq!(
-            candidate.commit(),
-            Err(SpillCommitError::DuplicateCommit),
-            "a colliding batch fails all-or-none"
-        );
-        assert_eq!(
-            store.spills(),
-            0,
-            "NOTHING installed on an all-or-none failure"
-        );
-        assert_eq!(
-            store.fetch("dup"),
-            None,
-            "no partial batch reached the live store"
-        );
+        assert_eq!(store.unique_objects(), 1);
     }
 
     // --- #1528 B3 (item 6): pure lifecycle-invariant property tests ---

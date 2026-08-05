@@ -1,0 +1,83 @@
+{
+  "_comment": "Golden vectors for the content-addressed spill record (newt_core::agentic::content_spill). For a FIXED session nonce [7u8;16], each case pins the canonical dag-cbor bytes, the CID handle text (SpillCid::to_handle), the full CID envelope bytes (ContentId::to_bytes), and every field needed to rebuild the SpillRecordV1. These are the cross-version / drift gate: a change to the SPILL_SCHEMA_V1 tag, the dag-cbor encoding, or the frozen CID profile breaks these vectors. Changing any pinned value requires an EXPLICIT spill-record schema-version decision (bump SPILL_SCHEMA_V1) — never a silent regen. Regenerate deliberately via tests/spill_cid_vectors.rs.",
+  "scope_session_nonce_hex": "07070707070707070707070707070707",
+  "schema": "newt.spill/v1",
+  "cases": [
+    {
+      "name": "tool output read_file",
+      "provenance": {
+        "kind": "tool_output",
+        "tool_name": "read_file"
+      },
+      "redacted_text": "line one\nline two\n",
+      "canonical_dagcbor_hex": "a46573636f7065a16753657373696f6e900707070707070707070707070707070766736368656d616d6e6577742e7370696c6c2f76316a70726f76656e616e6365a16a546f6f6c4f7574707574a169746f6f6c5f6e616d6569726561645f66696c656d72656461637465645f74657874726c696e65206f6e650a6c696e652074776f0a",
+      "cid": "bafyr4iddrfhg7z75p6c42qpxe6expa4ok7hybp7e5jfxbxdj2v2tzp4lc4",
+      "cid_bytes_hex": "01711e2063894e6fe7fd7f85cd41f7278977838e57cf80bfe4ea4b70dc69d5753cbf8b17"
+    },
+    {
+      "name": "compaction span summary",
+      "provenance": {
+        "kind": "compaction_span"
+      },
+      "redacted_text": "summary: user asked for X\n- did A\n- did B\n",
+      "canonical_dagcbor_hex": "a46573636f7065a16753657373696f6e900707070707070707070707070707070766736368656d616d6e6577742e7370696c6c2f76316a70726f76656e616e63656e436f6d70616374696f6e5370616e6d72656461637465645f74657874782a73756d6d6172793a20757365722061736b656420666f7220580a2d2064696420410a2d2064696420420a",
+      "cid": "bafyr4ie5qa2avsuolr5cbairtr42b3m23u7bpvj4xk4ufk5kbz4k5ngcnu",
+      "cid_bytes_hex": "01711e209d80340aca8e5c7a2081119c79a0ed9add3e17d53cbab942abaa0e78aeb4c26d"
+    },
+    {
+      "name": "unicode multibyte",
+      "provenance": {
+        "kind": "tool_output",
+        "tool_name": "read_file"
+      },
+      "redacted_text": "héllo — 日本語 — 🌱",
+      "canonical_dagcbor_hex": "a46573636f7065a16753657373696f6e900707070707070707070707070707070766736368656d616d6e6577742e7370696c6c2f76316a70726f76656e616e6365a16a546f6f6c4f7574707574a169746f6f6c5f6e616d6569726561645f66696c656d72656461637465645f74657874781d68c3a96c6c6f20e2809420e697a5e69cace8aa9e20e2809420f09f8cb1",
+      "cid": "bafyr4ihmhps3fhytat4qp3xihxziys6tsm4e42d6x64p3acbfq4rmuaz3i",
+      "cid_bytes_hex": "01711e20ec3be5b29f1304f907eee83df28c4bd393384e687ebfb8fd80412c39165019da"
+    },
+    {
+      "name": "multiline rust code",
+      "provenance": {
+        "kind": "tool_output",
+        "tool_name": "read_file"
+      },
+      "redacted_text": "fn add(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    sum\n}\n",
+      "canonical_dagcbor_hex": "a46573636f7065a16753657373696f6e900707070707070707070707070707070766736368656d616d6e6577742e7370696c6c2f76316a70726f76656e616e6365a16a546f6f6c4f7574707574a169746f6f6c5f6e616d6569726561645f66696c656d72656461637465645f74657874783f666e2061646428613a206933322c20623a2069333229202d3e20693332207b0a202020206c65742073756d203d2061202b20623b0a2020202073756d0a7d0a",
+      "cid": "bafyr4iehlarhpbjovizj4is4tfmbvlzxoydk7s5o5bbfcr7r627rx2h65a",
+      "cid_bytes_hex": "01711e2087582277852eaa329e225c99581aaf377606afcbaee8425147f1f6bf1be8fee8"
+    },
+    {
+      "name": "empty content",
+      "provenance": {
+        "kind": "tool_output",
+        "tool_name": "read_file"
+      },
+      "redacted_text": "",
+      "canonical_dagcbor_hex": "a46573636f7065a16753657373696f6e900707070707070707070707070707070766736368656d616d6e6577742e7370696c6c2f76316a70726f76656e616e6365a16a546f6f6c4f7574707574a169746f6f6c5f6e616d6569726561645f66696c656d72656461637465645f7465787460",
+      "cid": "bafyr4idf4eop522fg7yqi33whnultgh4jxewlszusm7gdf7wz3lwfnvc4m",
+      "cid_bytes_hex": "01711e2065e11cfeeb4537f1046f763b68b998fc4dc965cb34933e6197f6ced762b6a2e3"
+    },
+    {
+      "name": "redacted secret",
+      "provenance": {
+        "kind": "tool_output",
+        "tool_name": "run_command"
+      },
+      "redacted_text": "token=[REDACTED] rest",
+      "canonical_dagcbor_hex": "a46573636f7065a16753657373696f6e900707070707070707070707070707070766736368656d616d6e6577742e7370696c6c2f76316a70726f76656e616e6365a16a546f6f6c4f7574707574a169746f6f6c5f6e616d656b72756e5f636f6d6d616e646d72656461637465645f7465787475746f6b656e3d5b52454441435445445d2072657374",
+      "cid": "bafyr4ibezgwbypceoqokahnqchjkdz5b2kv3qigyciyo3pzf7dilulruve",
+      "cid_bytes_hex": "01711e2024c9ac1c3c44741ca01db011d2a1e7a1d2abb820d81230edbf25f8d0ba2e34a9"
+    },
+    {
+      "name": "tool output none tool name",
+      "provenance": {
+        "kind": "tool_output",
+        "tool_name": null
+      },
+      "redacted_text": "orphan tool output with no tool name\n",
+      "canonical_dagcbor_hex": "a46573636f7065a16753657373696f6e900707070707070707070707070707070766736368656d616d6e6577742e7370696c6c2f76316a70726f76656e616e6365a16a546f6f6c4f7574707574a169746f6f6c5f6e616d65f66d72656461637465645f7465787478256f727068616e20746f6f6c206f75747075742077697468206e6f20746f6f6c206e616d650a",
+      "cid": "bafyr4ieg7stqxfif3jhhvd5sc3xgea5xgaiu3nma5yqsyfhtezldw6jn6q",
+      "cid_bytes_hex": "01711e2086fca70b9505da4e7a8fb216ee6203b730114db580ee212c14f326563b792df4"
+    }
+  ]
+}
