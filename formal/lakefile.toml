@@ -1,5 +1,5 @@
 name = "caveat-lattice"
-defaultTargets = ["CaveatLattice", "ProjectModel", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill"]
+defaultTargets = ["CaveatLattice", "ProjectModel", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage"]
 
 # Machine-checked formal specs. Self-contained: no Mathlib, so it builds from a
 # bare Lean toolchain (see lean-toolchain). `lake build` checks every theorem; a
@@ -31,3 +31,10 @@ name = "CompactionLifecycle"
 # laws (no-store⟹no-handle, rejected⟹no record, only commit increments the count).
 [[lean_lib]]
 name = "CompactionSpill"
+
+# ResponsesUsage — the #1528 B4 accepted-round usage-observation policy kernel:
+# the budget-learning laws (hard ceiling never increases, an accept cannot raise
+# the hard ceiling, soft ≤ hard is invariant under observe + cw-400, a rejected
+# response emits no Accepted, at most one Accepted per response).
+[[lean_lib]]
+name = "ResponsesUsage"
