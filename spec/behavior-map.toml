@@ -227,13 +227,24 @@ path = "newt-core/src/agentic/generation_policy.rs"
 symbol = "cognition_output_reserve"
 
 [BHV-CONTEXT-002]
-description = "A learned context ceiling never increases during a turn (monotone tightening)."
+description = "A learned context ceiling never increases during a turn (monotone tightening) — an accepted observation cannot raise it and a cw-400 recovery only tightens it."
+# Landed with #1528 B4/B3: the ResponsesUsage kernel proves the hard-ceiling
+# monotonicity, and the reconciled Responses loop has the cw-400 regression.
 [BHV-CONTEXT-002.status]
-lean = "none"
-rust = "none"
+lean = "proven"
+rust = "tested"
 tla = "planned"
 trace = "none"
 conformance = "partial"
+[[BHV-CONTEXT-002.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "hard_ceiling_never_increases"
+[[BHV-CONTEXT-002.refs.lean]]
+module = "NewtPolicy.ResponsesUsage"
+symbol = "tighten_hard_never_increases"
+[[BHV-CONTEXT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_cw_recovery_ceiling_is_monotone_non_increasing"
 
 # 003 was split: transport-level dispatch retries and mid-turn compaction/recovery
 # are DIFFERENT bounds with different state machines (and likely different TLA+
@@ -253,16 +264,22 @@ path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::dispatch_responses_json_retries_transient_transport_failures"
 
 [BHV-CONTEXT-003B]
-description = "Compaction and context-window-recovery attempts within a turn are bounded (no unbounded compact/redispatch loop)."
-# Compaction/recovery for the Responses loop is #1528; no bounding test exists yet,
-# so rust = "none" (nothing claims tested coverage). Promote when #1528 lands the
-# bounded-redispatch machinery + its regression test.
+description = "Compaction and context-window-recovery attempts within a turn are bounded (no unbounded compact/redispatch loop): a single proactive no-progress compaction attempt, and a bounded cw-400 redispatch."
+# Landed with #1528 B3 + the reconciled Responses loop: proactive compaction fires
+# the compactor at most once when it makes no progress, and cw-400 recovery is
+# bounded. tla stays "planned" — no checked temporal model covers both mechanisms.
 [BHV-CONTEXT-003B.status]
 lean = "none"
-rust = "none"
+rust = "tested"
 tla = "planned"
 trace = "none"
 conformance = "partial"
+[[BHV-CONTEXT-003B.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_proactive_no_progress_invokes_the_compactor_exactly_once"
+[[BHV-CONTEXT-003B.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_context_window_400_recovery_is_bounded"
 
 # ─────────────────────────────── Replay / storage ────────────────────────────
 
@@ -940,9 +957,21 @@ symbol = "no_lifecycle_step_advances_round"
 [[BHV-CONTEXT-004.refs.production]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "compact_responses_input"
+# Pure post-bridge budget admission/rejection (fence-budget unit level)…
 [[BHV-CONTEXT-004.refs.rust_tests]]
 path = "newt-core/src/agentic/responses_compaction.rs"
 symbol = "tests::post_bridge_budget_admits_a_fitting_fenced_request"
 [[BHV-CONTEXT-004.refs.rust_tests]]
 path = "newt-core/src/agentic/responses_compaction.rs"
 symbol = "tests::post_bridge_budget_rejects_a_fence_inflated_request_with_attribution"
+# …and the AGENT-LOOP lifecycle: proactive same-round compaction before the first
+# dispatch, a single no-progress compaction attempt, and final-summary compaction.
+[[BHV-CONTEXT-004.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_proactively_compacts_before_the_first_dispatch"
+[[BHV-CONTEXT-004.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_proactive_no_progress_invokes_the_compactor_exactly_once"
+[[BHV-CONTEXT-004.refs.rust_tests]]
+path = "newt-core/src/agentic/mod.rs"
+symbol = "tool_round_cap_tests::responses_final_summary_is_proactively_compacted"
