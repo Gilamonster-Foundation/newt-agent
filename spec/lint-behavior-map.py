@@ -6,7 +6,13 @@ that every reference resolves to its INTENDED artifact — not merely that a lik
 named string exists somewhere:
 
   * lean       {module, symbol}  -> a decl of that name inside that namespace,
-                                     in formal/NewtPolicy/**.lean, exactly once.
+                                     anywhere in formal/**.lean — every lake lib of
+                                     the Lean layer, exactly once. `.lake` build
+                                     copies are excluded, files are de-duplicated by
+                                     REAL path, and a symlink whose target escapes the
+                                     repo is skipped — so neither a build copy, a
+                                     symlink alias, nor an external file can fabricate
+                                     ambiguity or import an out-of-tree declaration.
   * rust_tests {path, symbol}    -> a `fn <leaf>` at the in-file module path
                                      `<mod...>::<leaf>` inside <path>, exactly once,
                                      AND carrying a recognized test attribute
@@ -24,7 +30,7 @@ carries explicit `pending_pr = <n>` (its artifact lives on an unmerged PR): thos
 WARN, naming the contract and the PR. `--strict` makes even pending refs fail (run
 it on `main` after the dependency merges; then delete the markers).
 
-Searches are scoped to the NAMED file (rust/production) or formal/NewtPolicy
+Searches are scoped to the NAMED file (rust/production) or the formal/ Lean layer
 (lean) — never the registry, the docs, or this linter — so a reference can never
 satisfy itself by matching a string in prose.
 
@@ -342,8 +348,37 @@ class Linter:
         if self._lean_cache is None:
             decls: list[str] = []
             if self.lean_dir.exists():
+                repo_real = self.repo.resolve()
+                seen_real: set[Path] = set()
                 for f in sorted(self.lean_dir.rglob("*.lean")):
-                    decls += lean_decls(f.read_text(encoding="utf-8", errors="replace"))
+                    # `.lake` holds build copies of the same source .lean files;
+                    # scanning them would double-count decls and turn every ref
+                    # AMBIGUOUS. Skip them by the LITERAL path first.
+                    if ".lake" in f.parts:
+                        continue
+                    real = f.resolve()
+                    # Then by the RESOLVED, repo-relative path. This does two jobs:
+                    #  * symlink-escape guard — a target outside the repo has no
+                    #    repo-relative path, so it cannot import external decls; and
+                    #  * `.lake` re-check — a symlink aliasing a build copy
+                    #    (formal/X.lean -> formal/.lake/.../Gen.lean) has no `.lake`
+                    #    in its own parts but resolves INTO `.lake`, so a generated
+                    #    declaration can never satisfy a constitution reference.
+                    # Checking the repo-relative parts (not the absolute path) avoids
+                    # false matches from an unrelated `.lake`-named ancestor dir.
+                    try:
+                        rel = real.relative_to(repo_real)
+                    except ValueError:
+                        continue
+                    if ".lake" in rel.parts:
+                        continue
+                    # Dedup by REAL path: a symlink aliasing an in-repo file must
+                    # not double-count its decls (which would fabricate ambiguity
+                    # and fail an otherwise-exact reference).
+                    if real in seen_real:
+                        continue
+                    seen_real.add(real)
+                    decls += lean_decls(real.read_text(encoding="utf-8", errors="replace"))
             self._lean_cache = decls
         return self._lean_cache
 
@@ -505,7 +540,7 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
-    lean_dir = Path(a.lean_dir).resolve() if a.lean_dir else repo / "formal" / "NewtPolicy"
+    lean_dir = Path(a.lean_dir).resolve() if a.lean_dir else repo / "formal"
     return Linter(repo, lean_dir, a.strict).run(Path(a.map).resolve())
 
 
