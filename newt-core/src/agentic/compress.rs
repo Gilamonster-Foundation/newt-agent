@@ -915,12 +915,16 @@ pub(crate) async fn compress(
                 .map(render_message_raw)
                 .collect::<Vec<_>>()
                 .join("\n");
-            let id = store.store(redact_secrets(&verbatim));
-            body.push_str(&format!(
-                "\n\n[the full verbatim text of this compacted span is retrievable with \
-                 memory_fetch(\"compaction:{id}\") — use it to recover an exact detail \
-                 this summary dropped, instead of guessing]"
-            ));
+            // Only advertise a `compaction:<id>` handle if the span actually
+            // committed. A failed store must not name a handle that resolves to
+            // nothing (BHV-SPILL-001); on failure the lossy summary stands alone.
+            if let Some(id) = store.store(redact_secrets(&verbatim)) {
+                body.push_str(&format!(
+                    "\n\n[the full verbatim text of this compacted span is retrievable with \
+                     memory_fetch(\"compaction:{id}\") — use it to recover an exact detail \
+                     this summary dropped, instead of guessing]"
+                ));
+            }
         }
         // (4) Assembly with the REFERENCE-ONLY prefix + end marker.
         let mut out = Vec::with_capacity(boundary.head + 1 + (pruned.len() - boundary.tail_start));

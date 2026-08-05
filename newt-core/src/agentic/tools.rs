@@ -1550,12 +1550,19 @@ fn shell_envelope_output(
                     let (id, redacted) = spill::store_redacted_full(&out, store);
                     let teaser_tokens =
                         est.tokens_for_chars(spill::TOOL_RESULT_SPILL_CAP.saturating_sub(512));
-                    cap_model_output_with_handle(
-                        &redacted,
-                        max_tokens.min(teaser_tokens),
-                        output_head_tokens(),
-                        Some(&id),
-                    )
+                    match id {
+                        // Committed: cap with the `spill:<id>` retrieval handle.
+                        Some(id) => cap_model_output_with_handle(
+                            &redacted,
+                            max_tokens.min(teaser_tokens),
+                            output_head_tokens(),
+                            Some(&id),
+                        ),
+                        // Commit failed: fail closed — cap the redacted output with
+                        // NO handle rather than promise a `spill:<id>` that resolves
+                        // to nothing (BHV-SPILL-001).
+                        None => cap_model_output(&redacted, max_tokens),
+                    }
                 }
                 None => cap_model_output(&out, max_tokens),
             }

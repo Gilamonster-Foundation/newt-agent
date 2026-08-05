@@ -10956,10 +10956,14 @@ mod tool_round_cap_tests {
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 reserved_rx.recv().unwrap(); // 2. after the candidate reserved A
-                let id_b = store_ref.store("payload B".to_string()); // 3. external commits B
+                let id_b = store_ref
+                    .store("payload B".to_string())
+                    .expect("commit succeeds in tests"); // 3. external commits B
                 ext_done_tx.send(id_b).unwrap();
             });
-            let id_a = candidate.store("payload A".to_string()); // 1. candidate reserves A (staged)
+            let id_a = candidate
+                .store("payload A".to_string())
+                .expect("commit succeeds in tests"); // 1. candidate reserves A (staged)
             reserved_tx.send(()).unwrap();
             let id_b = ext_done_rx.recv().unwrap();
             candidate.commit().expect("all-or-none commit succeeds"); // 4. candidate commits A
@@ -10987,11 +10991,19 @@ mod tool_round_cap_tests {
     fn candidate_spill_store_stages_multiple_payloads_without_swap_or_alias() {
         use crate::agentic::spill::{SessionSpillStore, SpillStore};
         let store = SessionSpillStore::default();
-        let ext_before = store.store("external before".to_string());
+        let ext_before = store
+            .store("external before".to_string())
+            .expect("commit succeeds in tests");
         let candidate = CandidateSpillStore::new(&store);
-        let a = candidate.store("payload A".to_string());
-        let b = candidate.store("payload B".to_string());
-        let ext_during = store.store("external during".to_string());
+        let a = candidate
+            .store("payload A".to_string())
+            .expect("commit succeeds in tests");
+        let b = candidate
+            .store("payload B".to_string())
+            .expect("commit succeeds in tests");
+        let ext_during = store
+            .store("external during".to_string())
+            .expect("commit succeeds in tests");
         assert_eq!(store.fetch(&a), None, "staged A not committed yet");
         assert_eq!(store.fetch(&b), None, "staged B not committed yet");
         assert_eq!(
@@ -11078,9 +11090,13 @@ mod tool_round_cap_tests {
     fn candidate_commit_fails_closed_on_a_poisoned_staging_log() {
         use crate::agentic::spill::{SessionSpillStore, SpillCommitError, SpillStore};
         let store = SessionSpillStore::default();
-        let ext = store.store("external".to_string());
+        let ext = store
+            .store("external".to_string())
+            .expect("commit succeeds in tests");
         let candidate = CandidateSpillStore::new(&store);
-        let _staged = candidate.store("staged payload".to_string());
+        let _staged = candidate
+            .store("staged payload".to_string())
+            .expect("commit succeeds in tests");
         candidate.poison_staging_for_test();
         assert_eq!(
             candidate.commit(),
@@ -11148,8 +11164,12 @@ mod tool_round_cap_tests {
         }
         let store = CollidingStore::default();
         let candidate = CandidateSpillStore::new(&store);
-        let _a = candidate.store("A".to_string());
-        let _b = candidate.store("B".to_string()); // same id "dup"
+        let _a = candidate
+            .store("A".to_string())
+            .expect("commit succeeds in tests");
+        let _b = candidate
+            .store("B".to_string())
+            .expect("commit succeeds in tests"); // same id "dup"
         assert_eq!(
             candidate.commit(),
             Err(SpillCommitError::DuplicateCommit),

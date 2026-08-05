@@ -66,14 +66,16 @@ pub trait SpillStore: Send + Sync {
     /// Issue a fresh, unforgeable reservation — the STORE owns id allocation. Commit
     /// or drop the returned capability; a dropped reservation installs nothing.
     fn reserve(&self) -> Box<dyn SpillReservation + '_>;
-    /// Reserve + commit in one; returns the committed id. A fresh reservation cannot
-    /// be a duplicate, and the direct (non-candidate) store path has no candidate log
-    /// to poison, so this is the id-returning convenience for the tool-offload path.
-    fn store(&self, redacted: String) -> String {
+    /// Reserve + commit in one. Returns `Some(id)` ONLY when the payload was
+    /// actually installed; returns `None` if the commit failed (e.g. a poisoned
+    /// store). A failed commit MUST NOT yield a usable handle — a handle the store
+    /// cannot resolve would violate BHV-SPILL-001/002 ("every published handle was
+    /// committed and resolves to matching content"). Callers fail closed on `None`
+    /// (no handle, no retrieval marker, no offload notice).
+    fn store(&self, redacted: String) -> Option<String> {
         let reservation = self.reserve();
         let id = reservation.id().to_string();
-        let _ = reservation.commit(redacted);
-        id
+        reservation.commit(redacted).ok().map(|()| id)
     }
     /// Fetch a stored payload by id (`None` if unknown / uncommitted / expired).
     fn fetch(&self, id: &str) -> Option<String>;
@@ -187,16 +189,25 @@ pub fn maybe_offload(result: String, tool_offload: bool, spill: Option<&dyn Spil
         return result;
     }
     let redacted = redact_secrets(&result);
-    let id = store.store(redacted.clone());
-    head_tail_excerpt(&redacted, &id)
+    match store.store(redacted.clone()) {
+        // Committed: head+tail teaser carrying the `spill:<id>` handle.
+        Some(id) => head_tail_excerpt(&redacted, &id),
+        // Commit FAILED (e.g. a poisoned store): fail closed. Emit NO handle and
+        // NO retrieval marker — a `spill:<id>` teaser here would resolve to nothing.
+        // Return the redacted payload (secrets already removed) so the offload
+        // degrades to "not offloaded" rather than "broken handle" (BHV-SPILL-001).
+        None => redacted,
+    }
 }
 
 /// Redact and store a full payload, returning `(id, redacted_payload)` so a
 /// caller can build its own model-facing teaser from the exact bytes that were
 /// stored. Used by `run_command` before its model-facing cap, so the spill store
 /// sees the true tail instead of an already-truncated result.
-pub fn store_redacted_full(result: &str, spill: &dyn SpillStore) -> (String, String) {
+pub fn store_redacted_full(result: &str, spill: &dyn SpillStore) -> (Option<String>, String) {
     let redacted = redact_secrets(result);
+    // `Some(id)` only when actually committed; `None` on commit failure — the
+    // caller must not build a `spill:<id>` handle from a failed store.
     let id = spill.store(redacted.clone());
     (id, redacted)
 }
@@ -208,8 +219,12 @@ mod tests {
     #[test]
     fn session_store_round_trips_with_monotonic_ids() {
         let s = SessionSpillStore::default();
-        let id0 = s.store("alpha".to_string());
-        let id1 = s.store("beta".to_string());
+        let id0 = s
+            .store("alpha".to_string())
+            .expect("commit succeeds in tests");
+        let id1 = s
+            .store("beta".to_string())
+            .expect("commit succeeds in tests");
         assert_eq!(id0, "s0");
         assert_eq!(id1, "s1");
         assert_eq!(s.fetch("s0").as_deref(), Some("alpha"));
@@ -247,7 +262,9 @@ mod tests {
             "a rejected reservation leaves no record"
         );
         // A later store() must not reuse the retired id1 (allocator is monotonic).
-        let id2 = s.store("later".to_string());
+        let id2 = s
+            .store("later".to_string())
+            .expect("commit succeeds in tests");
         assert_ne!(id2, id1, "a retired reservation id is never reused");
     }
 
@@ -257,7 +274,7 @@ mod tests {
         // whose commit blind-`insert`ed. White-box: `install` is the internal,
         // id-checked commit path every reservation drives.
         let s = SessionSpillStore::default();
-        let a = s.store("A".to_string()); // s0 = A
+        let a = s.store("A".to_string()).expect("commit succeeds in tests"); // s0 = A
         assert_eq!(
             s.install(a.clone(), "B".to_string()),
             Err(SpillCommitError::DuplicateCommit),
@@ -347,6 +364,54 @@ mod tests {
         assert!(
             !teaser.contains(secret),
             "raw secret NOT shown in the teaser"
+        );
+    }
+
+    /// Regression (#1528 B3, BHV-SPILL-001): a FAILED commit must fail CLOSED — it
+    /// must not fabricate a usable handle. Fails on the pre-fix
+    /// `let _ = reservation.commit(redacted); id`, which returned `s0` (a handle
+    /// resolving to nothing) and made `maybe_offload` emit a broken
+    /// `memory_fetch("spill:s0")` marker even though nothing was stored.
+    #[test]
+    fn a_failed_commit_yields_no_handle_and_no_retrieval_marker() {
+        struct FailingStore;
+        struct FailingReservation;
+        impl SpillReservation for FailingReservation {
+            fn id(&self) -> &str {
+                "s0"
+            }
+            fn commit(self: Box<Self>, _redacted: String) -> Result<(), SpillCommitError> {
+                Err(SpillCommitError::PoisonedTransaction)
+            }
+        }
+        impl SpillStore for FailingStore {
+            fn reserve(&self) -> Box<dyn SpillReservation + '_> {
+                Box::new(FailingReservation)
+            }
+            fn fetch(&self, _id: &str) -> Option<String> {
+                None
+            }
+            fn spills(&self) -> u64 {
+                0
+            }
+            fn offloaded_chars(&self) -> u64 {
+                0
+            }
+        }
+
+        // store(): a failed commit returns None — no fabricated id.
+        assert_eq!(FailingStore.store("payload".to_string()), None);
+
+        // maybe_offload(): fail closed — no `spill:` handle, no retrieval marker.
+        let big = "x".repeat(TOOL_RESULT_SPILL_CAP + 1);
+        let out = maybe_offload(big.clone(), true, Some(&FailingStore));
+        assert!(
+            !out.contains("spill:"),
+            "a failed store must not emit a spill:<id> handle"
+        );
+        assert!(
+            !out.contains("memory_fetch"),
+            "a failed store must not emit a retrieval marker"
         );
     }
 }
