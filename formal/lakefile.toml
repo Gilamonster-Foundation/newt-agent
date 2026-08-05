@@ -1,5 +1,5 @@
 name = "caveat-lattice"
-defaultTargets = ["CaveatLattice", "ProjectModel", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage"]
+defaultTargets = ["CaveatLattice", "ProjectModel", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage", "ResponsesWire"]
 
 # Machine-checked formal specs. Self-contained: no Mathlib, so it builds from a
 # bare Lean toolchain (see lean-toolchain). `lake build` checks every theorem; a
@@ -38,3 +38,11 @@ name = "CompactionSpill"
 # response emits no Accepted, at most one Accepted per response).
 [[lean_lib]]
 name = "ResponsesUsage"
+
+# ResponsesWire — the #1528 B5 strict wire-validation kernel: the ONE typed gate
+# every Responses dispatch passes through. Proves a request failing ANY invariant
+# (no model / store mismatch / num_ctx present / not-exactly-one-instruction /
+# dangling output / foreign CID / over-budget / tools-on-final-summary) is not
+# dispatchable, and only a validated request is — the make-it-unrepresentable law.
+[[lean_lib]]
+name = "ResponsesWire"
