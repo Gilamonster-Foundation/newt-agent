@@ -21,14 +21,20 @@
 //! foreign CID and retrieve it: it neither belongs to this session's store nor
 //! re-derives under this session's nonce.
 //!
-//! This is the identity CORE. Wiring the tool-offload (`spill:`) and compaction
-//! (`compaction:`) paths onto it — deleting the reservation machinery — is the
-//! consumer-migration stage.
+//! This is the identity CORE. The tool-offload (`spill:`) and compaction
+//! (`compaction:`) producers + the `memory_fetch` reader are wired onto it here;
+//! the old reservation/allocator store (`spill.rs`) is deleted.
 //!
-//! TRANSITIONAL: until that migration wires these in, the surface has no non-test
-//! caller, so the module allows `dead_code`. The allow is removed at cutover.
-#![allow(dead_code)]
+//! **§2.9 — the legacy `sN` break is DELIBERATE.** The old store was in-memory,
+//! session-scoped, and discarded at `/new`; it was NEVER persisted, so an old
+//! `s0`/`s1` handle could not survive a process/session restart and no resumed or
+//! persisted session ever held a live one. After this cutover every new write emits
+//! a content CID (`bafyr4i…`), and there is nothing persisted to reinterpret — so
+//! there is intentionally NO `sN` reader. An `sN` string is not silently treated as
+//! a CID either: it fails [`SpillCid::parse`] and resolves to the SAME labelled
+//! NotFound as any unknown handle, which is the correct answer.
 
+use crate::agentic::compress::redact_secrets;
 use content_addressable::{canonical, ContentAddressable, ContentError, ContentId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -242,6 +248,16 @@ pub enum SpillError {
 /// and all-or-none; `fetch` resolves a CID only if it is present in THIS session's
 /// store (membership = the read-authorization boundary).
 pub trait SpillStore: Send + Sync {
+    /// Stamp THIS store's session scope onto a record and stage it — PURE (no store
+    /// mutation, no allocation): the CID is a pure function of `(scope, provenance,
+    /// text)`. The scope is owned by the store so a producer holding only a
+    /// `&dyn SpillStore` cannot forget or forge it. Nothing is live until
+    /// [`Self::commit_batch`] installs the returned [`StagedSpill`].
+    fn stage(
+        &self,
+        provenance: SpillProvenance,
+        redacted_text: String,
+    ) -> Result<StagedSpill, SpillError>;
     /// Idempotently install every staged object. Identical bytes under a present CID
     /// are SUCCESS (dedup); DIFFERENT bytes under a present CID are an
     /// [`SpillError::IntegrityViolation`] (fail-closed, no overwrite). ALL-OR-NONE:
@@ -299,10 +315,10 @@ impl SessionSpillStore {
             logical_offloaded_chars: AtomicU64::new(0),
         }
     }
+}
 
-    /// Stamp THIS session's scope onto a record and stage it — the nonce cannot be
-    /// forgotten because the store owns it.
-    pub fn stage(
+impl SpillStore for SessionSpillStore {
+    fn stage(
         &self,
         provenance: SpillProvenance,
         redacted_text: String,
@@ -310,9 +326,7 @@ impl SessionSpillStore {
         let record = SpillRecordV1::new(self.scope.clone(), provenance, redacted_text);
         StagedSpill::from_record(record).map_err(|e| SpillError::Encoding(e.to_string()))
     }
-}
 
-impl SpillStore for SessionSpillStore {
     fn commit_batch(&self, staged: &[StagedSpill]) -> Result<Vec<CommittedSpill>, SpillError> {
         let mut map = self.map.lock().map_err(|_| SpillError::PoisonedStore)?;
         // Prevalidate integrity for the WHOLE batch before installing anything: a CID
@@ -366,6 +380,93 @@ impl SpillStore for SessionSpillStore {
     fn logical_offloaded_chars(&self) -> u64 {
         self.logical_offloaded_chars.load(Ordering::Relaxed)
     }
+}
+
+// --- Tool-output offloading (the `tool_offload` context feature, Step 26.3 / #584),
+// re-homed here from the deleted reservation store and rewired onto the content-
+// addressed store. `pub(crate)` — not re-exported; the producers live in this crate.
+
+/// Offload trigger: a tool result longer than this many chars spills. ~4k tokens
+/// at the codebase's chars/4 heuristic (cf. `SUMMARY_INPUT_MSG_CAP` = 2_000).
+pub(crate) const TOOL_RESULT_SPILL_CAP: usize = 16_000;
+
+/// Chars kept from the head / tail of an offloaded payload in the teaser. Kept
+/// well under [`TOOL_RESULT_SPILL_CAP`] so the teaser can never re-overflow.
+const HEAD_CHARS: usize = 800;
+const TAIL_CHARS: usize = 800;
+
+/// The teaser injected in place of an offloaded payload: head + a re-read marker +
+/// tail. Already-redacted input; kept short so it cannot re-overflow. `handle` is the
+/// content CID (`bafyr4i…`) the model pastes back into `memory_fetch`.
+fn head_tail_excerpt(redacted: &str, handle: &str) -> String {
+    let chars: Vec<char> = redacted.chars().collect();
+    let total = chars.len();
+    let head: String = chars.iter().take(HEAD_CHARS).collect();
+    let tail: String = chars
+        .iter()
+        .skip(total.saturating_sub(TAIL_CHARS))
+        .collect();
+    format!(
+        "{head}\n\n[… tool output truncated: {total} chars offloaded. Use \
+         memory_fetch(\"spill:{handle}\") to read the full (secret-redacted) payload …]\n\n{tail}"
+    )
+}
+
+/// Offload an oversized tool result (Step 26.3). Returns `result` UNCHANGED when
+/// the feature is off, no spill store is provided, or the result is under the cap
+/// (the bit-for-bit OFF path). Otherwise redacts → stages → commits → returns a
+/// head+tail teaser carrying the content-addressed `spill:<cid>` handle. The raw
+/// `result` is consumed and dropped; only its redacted form is retained or shown.
+/// FAIL CLOSED: if staging or the commit fails, emit NO handle and NO retrieval
+/// marker — return the redacted payload so the offload degrades to "not offloaded"
+/// rather than "broken handle" (BHV-SPILL-001).
+pub(crate) fn maybe_offload(
+    result: String,
+    tool_offload: bool,
+    tool_name: Option<String>,
+    spill: Option<&dyn SpillStore>,
+) -> String {
+    let Some(store) = spill else {
+        return result;
+    };
+    if !tool_offload || result.chars().count() <= TOOL_RESULT_SPILL_CAP {
+        return result;
+    }
+    let redacted = redact_secrets(&result);
+    match store.stage(SpillProvenance::ToolOutput { tool_name }, redacted.clone()) {
+        Ok(staged) => {
+            let handle = staged.handle();
+            match store.commit_batch(std::slice::from_ref(&staged)) {
+                Ok(_) => head_tail_excerpt(&redacted, &handle),
+                Err(_) => redacted,
+            }
+        }
+        Err(_) => redacted,
+    }
+}
+
+/// Redact + stage + commit a full tool payload, returning `(Some(handle), redacted)`
+/// ONLY when actually committed; `(None, redacted)` on a stage/commit failure so the
+/// caller must not build a `spill:<handle>` from a failed store. Used by
+/// `run_command` before its model-facing cap, so the store sees the true tail
+/// instead of an already-truncated result.
+pub(crate) fn store_redacted_full(
+    result: &str,
+    tool_name: Option<String>,
+    spill: &dyn SpillStore,
+) -> (Option<String>, String) {
+    let redacted = redact_secrets(result);
+    let handle = match spill.stage(SpillProvenance::ToolOutput { tool_name }, redacted.clone()) {
+        Ok(staged) => {
+            let handle = staged.handle();
+            spill
+                .commit_batch(std::slice::from_ref(&staged))
+                .ok()
+                .map(|_| handle)
+        }
+        Err(_) => None,
+    };
+    (handle, redacted)
 }
 
 #[cfg(test)]
@@ -660,5 +761,116 @@ mod tests {
             !cid.to_handle().contains(SECRET),
             "raw secret absent from the handle"
         );
+    }
+
+    // --- Tool-output offload helpers (re-homed from the deleted reservation store) ---
+
+    #[test]
+    fn maybe_offload_off_path_is_bit_for_bit() {
+        // §2.7 OFF path: feature off / no store / under cap all return the input
+        // UNCHANGED and touch no store.
+        let big = "x".repeat(TOOL_RESULT_SPILL_CAP + 1);
+        // (a) feature OFF + over-cap → unchanged, store untouched.
+        let store = SessionSpillStore::new(NONCE_A);
+        assert_eq!(maybe_offload(big.clone(), false, None, Some(&store)), big);
+        assert_eq!(store.unique_objects(), 0);
+        // (b) no store + over-cap → unchanged, no panic.
+        assert_eq!(maybe_offload(big.clone(), true, None, None), big);
+        // (c) ON + Some + at/under cap → unchanged, store untouched.
+        let small = "x".repeat(TOOL_RESULT_SPILL_CAP); // == cap is NOT over
+        assert_eq!(
+            maybe_offload(small.clone(), true, None, Some(&store)),
+            small
+        );
+        assert_eq!(store.unique_objects(), 0);
+    }
+
+    #[test]
+    fn maybe_offload_over_cap_emits_a_content_handle_that_resolves() {
+        // ON + Some + over cap → a shorter teaser carrying a `spill:<cid>` handle that
+        // parses AND fetches the stored (redacted) payload. Asserts the round-trip /
+        // validity, not a literal id.
+        let store = SessionSpillStore::new(NONCE_A);
+        let big = "x".repeat(TOOL_RESULT_SPILL_CAP + 1);
+        let out = maybe_offload(big.clone(), true, Some("read_file".into()), Some(&store));
+        assert!(out.contains("spill:"), "teaser carries a handle: {out:.80}");
+        assert!(out.contains("memory_fetch"), "teaser coaches re-read");
+        assert!(
+            out.chars().count() < big.chars().count(),
+            "teaser is shorter"
+        );
+        assert_eq!(store.unique_objects(), 1);
+        // Recompute the deterministic CID from the same record and confirm the teaser
+        // names it and the store resolves it to the payload.
+        let cid = SpillCid::of(&SpillRecordV1::new(
+            SpillScope::Session(NONCE_A),
+            SpillProvenance::ToolOutput {
+                tool_name: Some("read_file".into()),
+            },
+            big.clone(),
+        ))
+        .unwrap();
+        assert!(out.contains(&format!("spill:{}", cid.to_handle())));
+        assert_eq!(store.fetch(&cid).unwrap().redacted_text, big);
+    }
+
+    #[test]
+    fn maybe_offload_redacts_before_store_and_in_teaser() {
+        // A planted secret in an over-cap payload must never survive raw — in the
+        // teaser OR the stored record.
+        let secret = "sk-ABCDEFGHIJKLMNOPQRST0123";
+        let payload = format!(
+            "{}\n{secret}\n{}",
+            "head ".repeat(2_000),
+            "tail ".repeat(2_000)
+        );
+        assert!(payload.chars().count() > TOOL_RESULT_SPILL_CAP);
+        let store = SessionSpillStore::new(NONCE_A);
+        let teaser = maybe_offload(payload, true, Some("run_command".into()), Some(&store));
+        assert!(
+            !teaser.contains(secret),
+            "raw secret NOT shown in the teaser"
+        );
+        // The one stored object is redacted and secret-free.
+        let stored = store.map.lock().unwrap();
+        let (_, record) = stored.iter().next().expect("one stored object");
+        assert!(record.redacted_text.contains("[REDACTED]"));
+        assert!(!record.redacted_text.contains(secret));
+    }
+
+    #[test]
+    fn maybe_offload_fails_closed_on_commit_failure() {
+        // A commit failure (here: a poisoned store) must fail CLOSED — no `spill:`
+        // handle, no `memory_fetch` marker; return the redacted payload so the offload
+        // degrades to "not offloaded" rather than "broken handle" (BHV-SPILL-001).
+        let store = SessionSpillStore::new(NONCE_A);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = store.map.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        let big = "x".repeat(TOOL_RESULT_SPILL_CAP + 1);
+        let out = maybe_offload(big, true, Some("read_file".into()), Some(&store));
+        assert!(!out.contains("spill:"), "no handle from a failed store");
+        assert!(!out.contains("memory_fetch"), "no retrieval marker");
+    }
+
+    #[test]
+    fn store_redacted_full_commits_and_fails_closed() {
+        // Commit path → `Some(handle)` that resolves; poisoned store → `None` (fail
+        // closed), never a handle to nothing.
+        let store = SessionSpillStore::new(NONCE_A);
+        let (handle, redacted) =
+            store_redacted_full("full output body", Some("run_command".into()), &store);
+        let handle = handle.expect("committed → Some(handle)");
+        let cid = SpillCid::parse(&handle).expect("handle is a canonical CID");
+        assert_eq!(store.fetch(&cid).unwrap().redacted_text, redacted);
+        // Poison → None, no handle.
+        let poisoned = SessionSpillStore::new(NONCE_A);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = poisoned.map.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        let (none, _) = store_redacted_full("x", Some("run_command".into()), &poisoned);
+        assert_eq!(none, None, "a failed store yields no handle");
     }
 }

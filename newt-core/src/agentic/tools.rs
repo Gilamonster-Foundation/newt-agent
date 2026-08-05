@@ -3,6 +3,7 @@
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 
 use super::artifact_read::{execute_artifact_read_silent, ArtifactReadContext};
+use super::content_spill::{self, SpillStore};
 use super::crew_tool::CrewRunner;
 use super::display::{ToolDisplay, ToolPresentation};
 use super::git_tool::GitTool;
@@ -14,7 +15,6 @@ use super::prompt_intake::PromptDisposition;
 use super::prompt_read::{execute_prompt_read_silent, PromptReadContext};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
-use super::spill::{self, SpillStore};
 use crate::caveats::CaveatsExt as _;
 #[cfg(test)]
 use output_budget::DEFAULT_MAX_OUTPUT_TOKENS;
@@ -1547,9 +1547,13 @@ fn shell_envelope_output(
         let capped = if should_spill {
             match spill_store {
                 Some(store) => {
-                    let (id, redacted) = spill::store_redacted_full(&out, store);
-                    let teaser_tokens =
-                        est.tokens_for_chars(spill::TOOL_RESULT_SPILL_CAP.saturating_sub(512));
+                    let (id, redacted) = content_spill::store_redacted_full(
+                        &out,
+                        Some("run_command".to_string()),
+                        store,
+                    );
+                    let teaser_tokens = est
+                        .tokens_for_chars(content_spill::TOOL_RESULT_SPILL_CAP.saturating_sub(512));
                     match id {
                         // Committed: cap with the `spill:<id>` retrieval handle.
                         Some(id) => cap_model_output_with_handle(
@@ -6650,7 +6654,7 @@ mod tests {
             "stdout": full,
             "stderr": "",
         });
-        let store = spill::SessionSpillStore::default();
+        let store = content_spill::SessionSpillStore::new([7u8; 16]);
         let mut display = ToolDisplay::new(Vec::new(), false, 80, 3);
         display.call("run_command", "large-output-command");
         let out =
@@ -6659,15 +6663,19 @@ mod tests {
 
         assert!(out.contains("HEAD_ONLY_MARKER"), "head dropped: {out}");
         assert!(out.contains("TAIL_ONLY_MARKER"), "tail dropped: {out}");
-        assert!(
-            out.contains("memory_fetch(\"spill:s0\")"),
-            "spill handle missing: {out}"
-        );
+        // The teaser now names a `spill:<cid>` content handle (not a literal s0); it
+        // must parse as a canonical CID and resolve in the store to the full payload.
+        let handle = out
+            .split("spill:")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("teaser names a spill handle");
+        let cid = content_spill::SpillCid::parse(handle).expect("handle is a canonical CID");
         assert!(
             out.contains("grep=\"<pattern>\""),
             "search affordance missing: {out}"
         );
-        let stored = store.fetch("s0").expect("full output stored");
+        let stored = store.fetch(&cid).expect("full output stored").redacted_text;
         assert!(
             stored.contains("MIDDLE_ONLY_MARKER"),
             "spilled payload was capped before storage"
@@ -6679,7 +6687,7 @@ mod tests {
             "operator spill lost the raw shell tail: {rendered}"
         );
         assert!(
-            !rendered.contains("memory_fetch(\"spill:s0\")"),
+            !rendered.contains("memory_fetch(\"spill:"),
             "operator saw the model teaser instead of raw shell output: {rendered}"
         );
     }

@@ -588,10 +588,18 @@ pub(crate) struct CompressRequest<'a> {
     /// summarizer of material.
     pub summary_input_cap_floor_chars: usize,
     /// Session compaction store (#661 group B). When `Some`, the evicted middle
-    /// span is stored (redacted) and a `compaction:<id>` retrieval handle is
+    /// span is stored (redacted) and a `compaction:<cid>` retrieval handle is
     /// named in the marker — progressive disclosure. `None` (headless / off)
-    /// keeps today's lossy-only behavior.
-    pub compaction_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
+    /// keeps today's lossy-only behavior. Used to STAMP the session scope onto the
+    /// span even in the transactional (staged) mode, so the pure CID is the one the
+    /// live store would resolve.
+    pub compaction_store: Option<&'a dyn crate::agentic::content_spill::SpillStore>,
+    /// Transactional staging seam (#1528 B3, §2.6). When `Some`, an evicted span is
+    /// STAGED into this candidate-local buffer PURELY — the live `compaction_store`
+    /// is NOT mutated here; the caller commits the batch on accept. When `None` (the
+    /// direct Chat path), the span is committed to `compaction_store` immediately and
+    /// its handle is advertised only on a successful commit (fail-closed).
+    pub compaction_stage: Option<&'a crate::agentic::CompactionStageBuffer>,
 }
 
 impl<'a> CompressRequest<'a> {
@@ -627,6 +635,7 @@ impl<'a> CompressRequest<'a> {
             // The manual `/compress` path stays lossy-only for the MVP; the
             // auto-loop is the progressive-disclosure surface (#661 group B).
             compaction_store: None,
+            compaction_stage: None,
         }
     }
 }
@@ -903,27 +912,49 @@ pub(crate) async fn compress(
             body.push_str(&crumb);
         }
         // #661 group B (progressive disclosure): store the verbatim (redacted)
-        // evicted middle in the session compaction store and name its handle, so
-        // the model can losslessly recover an exact detail the lossy summary
-        // dropped — `memory_fetch("compaction:<id>")`. Redact-on-store (the same
+        // evicted middle in the session compaction store and name its content handle,
+        // so the model can losslessly recover an exact detail the lossy summary
+        // dropped — `memory_fetch("compaction:<cid>")`. Redact-on-store (the same
         // closed `redact_secrets` table `spill:` uses): only the redacted span is
-        // ever retained. The summary is demoted from sole replacement to a
-        // catalog card over a retrievable span.
+        // ever retained. The summary is demoted from sole replacement to a catalog
+        // card over a retrievable span.
         if let Some(store) = req.compaction_store {
             let verbatim: String = middle
                 .iter()
                 .map(render_message_raw)
                 .collect::<Vec<_>>()
                 .join("\n");
-            // Only advertise a `compaction:<id>` handle if the span actually
-            // committed. A failed store must not name a handle that resolves to
-            // nothing (BHV-SPILL-001); on failure the lossy summary stands alone.
-            if let Some(id) = store.store(redact_secrets(&verbatim)) {
-                body.push_str(&format!(
-                    "\n\n[the full verbatim text of this compacted span is retrievable with \
-                     memory_fetch(\"compaction:{id}\") — use it to recover an exact detail \
-                     this summary dropped, instead of guessing]"
-                ));
+            // Stage PURELY (the CID is a pure function of the content, so the handle
+            // is known before any commit). Only a genuine stage is advertised.
+            if let Ok(staged) = store.stage(
+                crate::agentic::content_spill::SpillProvenance::CompactionSpan,
+                redact_secrets(&verbatim),
+            ) {
+                let handle = staged.handle();
+                // Advertise the `compaction:<cid>` handle iff the span is actually
+                // installed. In the DIRECT (Chat) path that means committing NOW and
+                // only advertising on success — a failed store must never name a
+                // handle that resolves to nothing (BHV-SPILL-001). In the TRANSACTIONAL
+                // (Responses) path the span is STAGED into the candidate buffer — the
+                // pure CID is valid before commit, and a rejected candidate is discarded
+                // whole, so nothing it named is ever committed.
+                let advertise = match req.compaction_stage {
+                    Some(buffer) => match buffer.lock() {
+                        Ok(mut buf) => {
+                            buf.push(staged);
+                            true
+                        }
+                        Err(_) => false, // poisoned candidate buffer: fail closed
+                    },
+                    None => store.commit_batch(std::slice::from_ref(&staged)).is_ok(),
+                };
+                if advertise {
+                    body.push_str(&format!(
+                        "\n\n[the full verbatim text of this compacted span is retrievable with \
+                         memory_fetch(\"compaction:{handle}\") — use it to recover an exact detail \
+                         this summary dropped, instead of guessing]"
+                    ));
+                }
             }
         }
         // (4) Assembly with the REFERENCE-ONLY prefix + end marker.
@@ -2170,6 +2201,7 @@ mod tests {
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
                 compaction_store: None,
+                compaction_stage: None,
             },
             summarizer,
             state,
@@ -2200,6 +2232,7 @@ mod tests {
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
                 compaction_store: None,
+                compaction_stage: None,
             },
             summarizer,
             state,
@@ -2229,6 +2262,7 @@ mod tests {
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
                 compaction_store: None,
+                compaction_stage: None,
             },
             summarizer,
             state,
@@ -2396,6 +2430,7 @@ mod tests {
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
                 compaction_store: None,
+                compaction_stage: None,
             },
             Some(&*s),
             &mut state,
@@ -2659,6 +2694,7 @@ mod tests {
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
                 compaction_store: None,
+                compaction_stage: None,
             },
             Some(&*s),
             &mut state,
@@ -3000,6 +3036,7 @@ mod tests {
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
                 compaction_store: None,
+                compaction_stage: None,
             },
             None,
             &mut state,
@@ -3854,6 +3891,7 @@ mod tests {
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
                 compaction_store: None,
+                compaction_stage: None,
             },
             Some(&*summarizer),
             &mut state,
@@ -3896,11 +3934,11 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_store_captures_redacted_span_and_names_the_handle() {
-        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        use crate::agentic::content_spill::{SessionSpillStore, SpillCid, SpillStore};
         // #661 group B: with a compaction store, the evicted middle is stored
-        // (redacted) and the marker names a `compaction:<id>` retrieval handle —
+        // (redacted) and the marker names a `compaction:<cid>` retrieval handle —
         // progressive disclosure. A secret in the middle is redacted on store.
-        let compaction = SessionSpillStore::default();
+        let compaction = SessionSpillStore::new([7u8; 16]);
         let mut msgs = vec![sys("sys"), user("task")];
         // An early-middle message carrying a secret — it will be evicted + stored.
         msgs.push(user("config api_key=9f8e7d6c5b4a32100ffee and more"));
@@ -3922,21 +3960,32 @@ mod tests {
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
                 compaction_store: Some(&compaction),
+                compaction_stage: None,
             },
             None, // no summarizer → static marker; the handle still rides
             &mut state,
         )
         .await;
         assert!(out.fired);
-        // The marker names compaction:s0 so the model can fault the span in.
-        assert!(
-            out.messages.iter().any(|m| m["content"]
-                .as_str()
-                .is_some_and(|c| c.contains("compaction:s0"))),
-            "the marker must name the compaction handle"
-        );
+        // The marker names a `compaction:<cid>` content handle (not a literal s0) so
+        // the model can fault the span in. Extract it, confirm it parses, and confirm
+        // it resolves in the store to the redacted verbatim span.
+        let marker = out
+            .messages
+            .iter()
+            .find_map(|m| m["content"].as_str().filter(|c| c.contains("compaction:")))
+            .expect("the marker must name the compaction handle");
+        let handle = marker
+            .split("compaction:")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("handle present in the marker");
+        let cid = SpillCid::parse(handle).expect("handle is a canonical CID");
         // The store holds the verbatim span — with the secret REDACTED on store.
-        let span = compaction.fetch("s0").expect("span must be stored");
+        let span = compaction
+            .fetch(&cid)
+            .expect("span must be stored")
+            .redacted_text;
         assert!(
             !span.contains("9f8e7d6c5b4a32100ffee"),
             "the secret must be redacted before store: {span}"

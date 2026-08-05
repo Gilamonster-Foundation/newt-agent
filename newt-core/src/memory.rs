@@ -1164,6 +1164,7 @@ impl Summarizing {
                 est: self.est,
                 summary_input_cap_floor_chars: self.summary_input_cap_floor_chars,
                 compaction_store: None,
+                compaction_stage: None,
             },
             self.summarizer.as_deref(),
             &mut self.state,
