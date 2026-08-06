@@ -52,6 +52,8 @@ impl Dispatcher for LocalDispatcher {
         match backend.kind {
             BackendKind::Ollama => {
                 LocalOllamaBackend::new(backend.endpoint.clone(), model)
+                    // Ollama Cloud bearer; LAN backends carry no key.
+                    .with_api_key(backend.api_key.clone())
                     .complete(req)
                     .await
             }
@@ -67,13 +69,10 @@ impl Dispatcher for LocalDispatcher {
             // Native Anthropic Messages API — the `/v1/messages` wire with the
             // `x-api-key` header, so a crew/team can run on hosted Claude.
             BackendKind::Anthropic => {
-                // TODO(unboxing bundle, slice 4): route through
-                // newt_inference::AnthropicBackend once it lands.
-                anyhow::bail!(
-                    "backend '{}' is kind=anthropic; the crew dispatcher's native \
-                     /v1/messages route lands later in this bundle",
-                    backend.name
-                )
+                newt_inference::AnthropicBackend::new(backend.endpoint.clone(), model)
+                    .with_api_key(backend.api_key.clone())
+                    .complete(req)
+                    .await
             }
             // The in-process embedded backend (#639): a first-class backend that
             // loads a local GGUF (no endpoint) and runs candle. Behind the
