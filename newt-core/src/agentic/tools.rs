@@ -1440,6 +1440,67 @@ fn object_bound_list(
     std_list_dir(full)
 }
 
+/// Unconfined write via `std::fs` (creating parents) — the `Scope::All` /
+/// non-Linux / #263-gate-approved path. One owner so the call sites don't drift.
+fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), String> {
+    if let Some(parent) = full.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(full, content).map_err(|e| format!("error writing {path}: {e}"))
+}
+
+/// Object-bound write of `content` to `full` (the workspace-joined model path)
+/// beneath the root that authorised it — the write analogue of
+/// [`object_bound_read`]. The file (and any missing parents) is created *beneath*
+/// the granted root's fd (`openat2 RESOLVE_BENEATH`), so a symlink / `..` /
+/// absolute escape the lexical gate admits is refused by the kernel: a
+/// containment escape becomes an `fs_write` denial, any other failure the
+/// ordinary write error. `Scope::All` (`--full-access`) writes via `std::fs`.
+/// Linux-only; the non-Linux fallback keeps the lexical-gate + `std::fs` path.
+#[cfg(target_os = "linux")]
+fn object_bound_write(
+    scope: &crate::caveats::Scope<String>,
+    path: &str,
+    full: &std::path::Path,
+    full_str: &str,
+    content: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    match object_bound_target(scope, full_str) {
+        None => Err(denied_fs_result("fs_write", path)),
+        Some(None) => std_write(full, path, content),
+        Some(Some((root, rel))) => {
+            let write = crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
+                .and_then(|dir| {
+                    if let Some(parent) = rel.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            dir.create_dir_all(parent)?;
+                        }
+                    }
+                    let mut f = dir.create(&rel)?;
+                    f.write_all(content.as_bytes())?;
+                    Ok(())
+                });
+            match write {
+                Ok(()) => Ok(()),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_write", path)),
+                Err(e) => Err(format!("error writing {path}: {e}")),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn object_bound_write(
+    _scope: &crate::caveats::Scope<String>,
+    path: &str,
+    full: &std::path::Path,
+    _full_str: &str,
+    content: &str,
+) -> Result<(), String> {
+    std_write(full, path, content)
+}
+
 /// Full-access/custom unrestricted writes keep the final y/N guard in ordinary
 /// interactive mode. Under --yolo the operator already chose an explicit
 /// auto-run mode, so do not let EOF on stdin become a fake human denial.
@@ -4079,7 +4140,10 @@ async fn execute_tool_inner(
             let content = args["content"].as_str().unwrap_or("");
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
-            if !tui_permits_path(&caveats.fs_write, &full_str) {
+            // Scope- vs #263-gate-authorised, same split as read_file (step-52.2):
+            // decides whether the write below is object-bound.
+            let scope_permits = tui_permits_path(&caveats.fs_write, &full_str);
+            if !scope_permits {
                 // #263: the gate may grant the write (the human's choice at
                 // the prompt is the consent — the y/N confirm below stays
                 // governed by the original scope shape, which a denial here
@@ -4154,12 +4218,19 @@ async fn execute_tool_inner(
             );
 
             if confirmed {
-                let full = std::path::Path::new(workspace).join(path);
-                if let Some(parent) = full.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                match std::fs::write(&full, content) {
-                    Ok(_) => {
+                // step-52.4: object-bound write when the SCOPE authorised it —
+                // create the file (and any missing parents) beneath the granted
+                // root's fd (openat2 RESOLVE_BENEATH), so a symlink / `..` /
+                // absolute escape the lexical gate admits is refused by the
+                // kernel. A gate-approved out-of-scope path was vouched for by the
+                // human (#263); `Scope::All` is unconfined inside the helper.
+                let write_result = if scope_permits {
+                    object_bound_write(&caveats.fs_write, path, &full, &full_str, content)
+                } else {
+                    std_write(&full, path, content)
+                };
+                match write_result {
+                    Ok(()) => {
                         let line_count = content.lines().count();
                         // Verify exactly the bytes this governed tool submitted
                         // before an arbitrary build-check command can touch the
@@ -4211,7 +4282,7 @@ async fn execute_tool_inner(
                             .unwrap_or_default();
                         format!("wrote {path} ({line_count} lines){artifact}{check}")
                     }
-                    Err(e) => format!("error writing {path}: {e}"),
+                    Err(tool_output) => tool_output,
                 }
             } else {
                 format!("user declined to write {path}")
@@ -9713,9 +9784,15 @@ mod execute_tool_branch_tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn physical_symlink_escape_mutates_under_existing_policy_but_emits_no_artifact() {
+    async fn physical_symlink_escape_write_is_denied_object_bound() {
+        // step-52.4 (#522 closure for write_file): a symlink UNDER the workspace
+        // pointing outside no longer lets a CONFINED write escape. Object-bound
+        // via openat2(RESOLVE_BENEATH), so the create is refused, the outside file
+        // is untouched, and no artifact is minted. BEFORE object-binding this
+        // mutated the outside file under the lexical policy — the named residual;
+        // this test is that residual, flipped from "mutates" to "denied".
         let ws = tempfile::TempDir::new().unwrap();
         let outside = tempfile::TempDir::new().unwrap();
         std::fs::write(outside.path().join("target.txt"), "outside before\n").unwrap();
@@ -9735,21 +9812,17 @@ mod execute_tool_branch_tests {
         )
         .await;
 
-        assert!(out.starts_with("wrote link/target.txt"), "got: {out}");
+        assert_eq!(
+            out,
+            denied_fs_result("fs_write", "link/target.txt"),
+            "the symlink-escape write must be denied by the object fence: {out}"
+        );
         assert_eq!(
             std::fs::read_to_string(outside.path().join("target.txt")).unwrap(),
-            "outside after\n",
-            "this pins the existing lexical mutation policy"
+            "outside before\n",
+            "the outside file must be UNCHANGED — the write never escaped"
         );
-        assert!(
-            out.contains("no file-change artifact was recorded")
-                && out.contains("physical path could not be proven inside the workspace"),
-            "the physical escape must be surfaced honestly: {out}"
-        );
-        assert!(
-            sink.is_empty(),
-            "an out-of-workspace mutation must not be claimed as a workspace artifact"
-        );
+        assert!(sink.is_empty(), "a denied write records no artifact");
     }
 
     #[tokio::test]

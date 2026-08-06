@@ -203,3 +203,37 @@ fn read_dir_denies_a_symlink_escape_directory() {
         "listing a symlink-escape directory must be denied"
     );
 }
+
+// ---- create_dir_all (step-52.4): object-bound `mkdir -p` ----
+
+#[test]
+#[serial]
+fn create_dir_all_makes_nested_dirs_beneath() {
+    let ws = tempdir().unwrap();
+    let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+    dir.create_dir_all(Path::new("a/b/c")).unwrap();
+    assert!(
+        ws.path().join("a/b/c").is_dir(),
+        "nested dirs created beneath the root"
+    );
+    // Idempotent: an existing prefix is fine.
+    dir.create_dir_all(Path::new("a/b")).unwrap();
+}
+
+#[test]
+#[serial]
+fn create_dir_all_denies_a_symlink_escape_component() {
+    let root = tempdir().unwrap();
+    let ws = root.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    symlink("../outside", ws.join("link")).unwrap();
+
+    let dir = WorkspaceDir::open_root(&ws).unwrap();
+    assert!(
+        dir.create_dir_all(Path::new("link/evil")).is_err(),
+        "mkdir -p must not create dirs outside the workspace via a symlink"
+    );
+    assert!(!outside.join("evil").exists(), "no dir created outside");
+}

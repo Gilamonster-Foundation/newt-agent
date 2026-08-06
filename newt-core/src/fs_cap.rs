@@ -49,9 +49,9 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::path::{Component, Path};
 
-use rustix::fs::{open, openat2, Mode, OFlags, ResolveFlags};
+use rustix::fs::{mkdirat, open, openat2, Mode, OFlags, ResolveFlags};
 
 /// A capability handle to a workspace root directory. Every method resolves its
 /// relative path argument *beneath* the held root fd; a path that would escape is
@@ -115,6 +115,38 @@ impl WorkspaceDir {
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             Mode::from_raw_mode(0o644),
         )?))
+    }
+
+    /// Create `rel` and any missing parent directories, each contained beneath
+    /// the root. The walk opens (or creates) one component at a time on a fd
+    /// resolved *beneath* the previous one, so a symlink or `..` in any component
+    /// is refused by the kernel — there is no `mkdir -p` over an un-resolved path.
+    /// An existing directory is fine; a non-directory in the path errors.
+    pub fn create_dir_all(&self, rel: &Path) -> io::Result<()> {
+        // `try_clone` so the walk owns its cursor without consuming `self.root`.
+        let mut cur: OwnedFd = self.root.try_clone()?;
+        let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS;
+        let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        for comp in rel.components() {
+            let name = match comp {
+                Component::Normal(n) => n,
+                Component::CurDir => continue,
+                // A beneath-safe relative path has no `..`, root, or prefix.
+                _ => return Err(io::Error::from_raw_os_error(libc::EXDEV)),
+            };
+            let step = Path::new(name);
+            let child = match openat2(&cur, step, dir_flags, Mode::empty(), resolve) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT) => {
+                    mkdirat(&cur, step, Mode::from_raw_mode(0o755)).map_err(io::Error::from)?;
+                    openat2(&cur, step, dir_flags, Mode::empty(), resolve)
+                        .map_err(io::Error::from)?
+                }
+                Err(e) => return Err(io::Error::from(e)),
+            };
+            cur = child;
+        }
+        Ok(())
     }
 
     /// Open a subdirectory as its own contained [`WorkspaceDir`]. Traversal stays
