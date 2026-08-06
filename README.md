@@ -32,7 +32,7 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 | `kimi-linear_48b`<br><sub>kimi · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 10.0% (3/30) |
 | `nemotron-3-nano_30b`<br><sub>nemotron · tb-30 · ctx 65536 · v0.7.5 · 2026-07-29</sub> | 6.7% (2/30) | _pending_ |
 | `glm-4.7-flash`<br><sub>glm · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 3.3% (1/30) |
-| `gpt-4.1-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | 0.0% (0/30) | 3.3% (1/30) |
+| `gpt-4.1-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 0.0% (0/30) | 3.3% (1/30) |
 | `deepseek-coder-v2_16b`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
 | `deepseek-r1_32b`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
 | `gemma4_31b`<br><sub>gemma · queued</sub> | _queued_ | _queued_ |
