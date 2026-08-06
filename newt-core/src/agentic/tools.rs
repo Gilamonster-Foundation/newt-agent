@@ -1271,6 +1271,106 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
     }
 }
 
+/// The root in `scope` that lexically authorises `full_path`, if any.
+///
+/// `Some(Some(root))` — permitted, and `root` is the granted directory the path
+/// must resolve *beneath* (the object-binding anchor). `Some(None)` — permitted
+/// with no containing root (`Scope::All`, e.g. `--full-access`), so there is no
+/// object fence. `None` — not permitted. Mirrors [`tui_permits_path`]'s matching
+/// exactly (same normalisation + `starts_with`), so the object-bound read
+/// resolves beneath the very root the gate approved.
+#[cfg(target_os = "linux")]
+fn authorizing_root<'a>(
+    scope: &'a crate::caveats::Scope<String>,
+    full_path: &str,
+) -> Option<Option<&'a str>> {
+    match scope {
+        crate::caveats::Scope::All => Some(None),
+        crate::caveats::Scope::Only(set) if set.is_empty() => None,
+        crate::caveats::Scope::Only(set) => {
+            let candidate = lexically_normalize(full_path);
+            set.iter()
+                .find(|root| candidate.starts_with(lexically_normalize(root)))
+                .map(|r| Some(r.as_str()))
+        }
+    }
+}
+
+/// The `..`-free path of `full_path` relative to its authorising `root`. The
+/// gate matched `starts_with` on the normalised forms, so this strip succeeds;
+/// the result is what [`crate::fs_cap::WorkspaceDir`] resolves beneath the root fd.
+#[cfg(target_os = "linux")]
+fn contained_relative(full_path: &str, root: &str) -> std::path::PathBuf {
+    let cand = lexically_normalize(full_path);
+    let nroot = lexically_normalize(root);
+    cand.strip_prefix(&nroot)
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(cand)
+}
+
+/// A `WorkspaceDir` open error that means "the object escaped the fence" (the
+/// kernel refused the resolve) rather than an ordinary I/O failure. `openat2`
+/// returns `EXDEV` for a `RESOLVE_BENEATH` violation and `ELOOP` for a
+/// `RESOLVE_NO_MAGICLINKS`/symlink-loop rejection; both are containment denials.
+#[cfg(target_os = "linux")]
+fn is_fs_containment_denied(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EXDEV) | Some(libc::ELOOP))
+}
+
+/// Object-bound read of `full` (the workspace-joined model path) beneath the
+/// root that authorised it. Returns the file contents, or a ready-to-return
+/// tool-output string on failure: a containment escape becomes an `fs_read`
+/// denial, any other failure the ordinary read error. Under `Scope::All`
+/// (`--full-access`) there is no object fence, so it reads via `std::fs` — the
+/// pre-existing unconfined behaviour. Linux-only (`openat2`); the non-Linux
+/// fallback keeps the lexical-gate + `std::fs` path.
+#[cfg(target_os = "linux")]
+fn object_bound_read(
+    scope: &crate::caveats::Scope<String>,
+    path: &str,
+    full: &std::path::Path,
+    full_str: &str,
+) -> Result<String, String> {
+    use std::io::Read;
+    match authorizing_root(scope, full_str) {
+        // The gate already permitted this read, so `None` here would be a logic
+        // error (the two matchers disagreeing); fail closed rather than read.
+        None => Err(denied_fs_result("fs_read", path)),
+        Some(None) => {
+            std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
+        }
+        Some(Some(root)) => {
+            let rel = contained_relative(full_str, root);
+            let read = crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root)).and_then(
+                |dir| {
+                    let mut f = dir.open(&rel)?;
+                    let mut s = String::new();
+                    f.read_to_string(&mut s)?;
+                    Ok(s)
+                },
+            );
+            match read {
+                Ok(s) => Ok(s),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_read", path)),
+                Err(e) => Err(format!("error reading {path}: {e}")),
+            }
+        }
+    }
+}
+
+/// Non-Linux fallback for [`object_bound_read`]: `openat2` is unavailable, so the
+/// read keeps the lexical-gate + `std::fs` behaviour (the symlink residual
+/// persists on non-Linux — see `fs-canonical-containment`; CI/prod is Linux).
+#[cfg(not(target_os = "linux"))]
+fn object_bound_read(
+    _scope: &crate::caveats::Scope<String>,
+    path: &str,
+    full: &std::path::Path,
+    _full_str: &str,
+) -> Result<String, String> {
+    std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
+}
+
 /// Full-access/custom unrestricted writes keep the final y/N guard in ordinary
 /// interactive mode. Under --yolo the operator already chose an explicit
 /// auto-run mode, so do not let EOF on stdin become a fake human denial.
@@ -3851,7 +3951,12 @@ async fn execute_tool_inner(
             let path = args["path"].as_str().unwrap_or("");
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
-            if !tui_permits_path(&caveats.fs_read, &full_str) {
+            // Did the fs_read SCOPE authorise this (the automatic, object-bound
+            // fence), or only a #263 permission-gate grant (the human approving
+            // this exact out-of-scope path)? That distinction decides whether the
+            // read is object-bound below.
+            let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
+            if !scope_permits {
                 // #263: the gate may grant the read; deny (or no gate) keeps
                 // the standard denial text bit-for-bit.
                 let allowed = permission_gate.is_some_and(|gate| {
@@ -3874,7 +3979,18 @@ async fn execute_tool_inner(
                     "read_file",
                 );
             }
-            match std::fs::read_to_string(&full) {
+            // step-52.2: object-bound read when the SCOPE authorised it — resolve
+            // `path` beneath the granted root (openat2 RESOLVE_BENEATH), so a
+            // symlink / `..` / absolute escape the lexical gate admits is refused
+            // by the kernel. A gate-approved out-of-scope path was explicitly
+            // vouched for by the human (#263), so it reads as-is; `Scope::All`
+            // (--full-access) is unconfined inside `object_bound_read`.
+            let read = if scope_permits {
+                object_bound_read(&caveats.fs_read, path, &full, &full_str)
+            } else {
+                std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
+            };
+            match read {
                 Ok(contents) => {
                     // #719: window + cap the MODEL-facing payload (the on-screen
                     // display is capped separately) so one read of a large file
@@ -3885,7 +4001,7 @@ async fn execute_tool_inner(
                     // budget so read_file and run_command share one cap.
                     paginate_read(&contents, offset, limit, max_output_tokens())
                 }
-                Err(e) => format!("error reading {path}: {e}"),
+                Err(tool_output) => tool_output,
             }
         }
 
@@ -9636,6 +9752,46 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert!(out.contains("error reading nope.txt"), "got: {out}");
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn read_file_symlink_under_workspace_escaping_is_denied() {
+        // step-52.2 (fs-canonical-containment / #522): under a CONFINED fs_read
+        // (Only{ws}, not All), a symlink UNDER the workspace whose target is
+        // outside it must not let read_file exfiltrate the outside file — even
+        // though the lexical gate admits the name `link/secret.txt`. The read is
+        // object-bound through `WorkspaceDir` (openat2 RESOLVE_BENEATH), so the
+        // escape is refused by the kernel. Before the rewire this returned the
+        // secret — the named residual. Real-fs tier (grounds the object gate);
+        // Linux-only (openat2).
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "TOP SECRET").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        let confined = Caveats {
+            fs_read: Scope::only([ws.path().to_string_lossy().into_owned()]),
+            ..caveats_rw(ws.path())
+        };
+        let out = run_tool(
+            "read_file",
+            serde_json::json!({"path": "link/secret.txt"}),
+            ws.path(),
+            &confined,
+            None,
+        )
+        .await;
+
+        assert!(
+            !out.contains("TOP SECRET"),
+            "object-bound read must not follow a symlink out of the workspace: {out}"
+        );
+        assert_eq!(
+            out,
+            denied_fs_result("fs_read", "link/secret.txt"),
+            "a contained-read escape must surface as an fs_read denial: {out}"
+        );
     }
 
     #[tokio::test]
