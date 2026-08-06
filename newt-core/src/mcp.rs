@@ -132,6 +132,74 @@ pub fn resolve_secret_under_trust(value: &SecretValue, trust: McpTrust) -> Resul
 }
 
 // ---------------------------------------------------------------------------
+// MCP admission gate (the single spawn/dial/expose decision)
+// ---------------------------------------------------------------------------
+
+/// Why an MCP server was refused admission (i.e. must not be spawned, dialed,
+/// or have its tools exposed to the model).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionDenied {
+    /// `enabled = false` — the operator turned it off. `enabled` is a
+    /// visibility switch, not a trust decision, but a disabled entry is never
+    /// admitted regardless of trust.
+    Disabled,
+    /// A discovered (untrusted) overlay — a repo `.mcp.json`, `~/.claude.json`,
+    /// or a walked-up project `config.toml` — with no approval recorded OUTSIDE
+    /// the repo. Untrusted config may not spawn a process, dial an endpoint, or
+    /// expose tools until it is explicitly approved; no such approval record
+    /// exists yet and headless has no interactive path, so it fails closed.
+    UntrustedNotApproved,
+}
+
+impl std::fmt::Display for AdmissionDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "disabled (`enabled = false`)"),
+            Self::UntrustedNotApproved => write!(
+                f,
+                "untrusted MCP config not approved — a discovered `.mcp.json` / \
+                 `~/.claude.json` / project overlay may not spawn or dial without an \
+                 approval recorded outside the repo; `newt mcp import` to adopt it as trusted"
+            ),
+        }
+    }
+}
+
+/// An MCP server that PASSED [`admit`] — the unforgeable witness the transport
+/// layer requires before it may spawn or dial. The inner reference is private,
+/// so the ONLY way to obtain an `AdmittedServer` is through [`admit`]: a
+/// spawn/dial of an un-admitted server does not type-check.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmittedServer<'a> {
+    entry: &'a McpServerEntry,
+}
+
+impl<'a> AdmittedServer<'a> {
+    /// The admitted entry, read-only, for the transport to spawn/dial against.
+    pub fn entry(&self) -> &'a McpServerEntry {
+        self.entry
+    }
+}
+
+/// The single MCP admission gate: decide whether a configured server may be
+/// connected — spawned, dialed, and its tools exposed — at all. This is where
+/// `enabled ≠ trusted ≠ approved` separate: a disabled entry is refused; an
+/// untrusted overlay fails closed (no approval-record type exists yet, and
+/// headless has no interactive approval path); only a trusted, enabled entry is
+/// admitted, returning an [`AdmittedServer`] witness the transport layer
+/// requires. Both the TUI and the headless connection planners route through
+/// here, so admission is decided in ONE place rather than two divergent loops.
+pub fn admit(entry: &McpServerEntry) -> std::result::Result<AdmittedServer<'_>, AdmissionDenied> {
+    if !entry.enabled {
+        return Err(AdmissionDenied::Disabled);
+    }
+    match entry.trust {
+        McpTrust::Trusted => Ok(AdmittedServer { entry }),
+        McpTrust::Untrusted => Err(AdmissionDenied::UntrustedNotApproved),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Secret-bearing MCP config values (`env` / `headers`)
 // ---------------------------------------------------------------------------
 
@@ -1162,6 +1230,47 @@ mod tests {
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
         }
+    }
+
+    #[test]
+    fn admit_denies_untrusted_and_disabled_admits_trusted() {
+        // step-1.1: enabled != trusted != approved, decided at ONE gate.
+        // A trusted, enabled server is admitted (its witness carries the entry).
+        let trusted = stdio("trusted", "/bin/echo");
+        let ok = admit(&trusted).unwrap();
+        assert_eq!(ok.entry().name, "trusted");
+
+        // A discovered (untrusted) STDIO overlay is refused — it may not spawn
+        // without approval outside the repo; headless has no interactive path.
+        let untrusted = McpServerEntry {
+            trust: McpTrust::Untrusted,
+            ..stdio("evil", "/bin/sh")
+        };
+        assert!(matches!(
+            admit(&untrusted),
+            Err(AdmissionDenied::UntrustedNotApproved)
+        ));
+
+        // Transport-agnostic: an untrusted HTTP overlay is refused too.
+        let untrusted_http = McpServerEntry {
+            trust: McpTrust::Untrusted,
+            transport: TransportKind::Http,
+            command: None,
+            url: Some("https://evil.example".into()),
+            ..stdio("evil-http", "")
+        };
+        assert!(matches!(
+            admit(&untrusted_http),
+            Err(AdmissionDenied::UntrustedNotApproved)
+        ));
+
+        // A disabled entry is never admitted, regardless of trust (enabled is a
+        // visibility switch, not a trust decision).
+        let disabled = McpServerEntry {
+            enabled: false,
+            ..stdio("off", "/bin/echo")
+        };
+        assert!(matches!(admit(&disabled), Err(AdmissionDenied::Disabled)));
     }
 
     #[test]
