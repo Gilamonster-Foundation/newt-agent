@@ -165,12 +165,17 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   8 (verified red→green). `read_file_symlink_under_workspace_escaping_is_denied` (`tools.rs`,
   step-52.2, real-fs tier) drives a confined `read_file` over a symlink-escape path and asserts the
   read is *denied* rather than exfiltrating the outside file (fails on the pre-rewire arm — verified
-  red→green). The existing `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) still
-  pins the *unrewired* arms (list_dir / find / write) so they can't silently widen before 52.3.
+  red→green). `list_dir_symlink_under_workspace_escaping_is_denied` (`tools.rs`, step-52.3, real-fs
+  tier) + `read_dir_lists_contained_entries` / `read_dir_denies_a_symlink_escape_directory`
+  (`fs_cap_object_bound.rs`) drive a confined `list_dir` (and the underlying `WorkspaceDir::read_dir`)
+  over a symlink-escape directory and assert it is *denied* rather than enumerated (verified
+  red→green — neutering the resolve flags re-fails them). The existing
+  `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) still pins the *unrewired* arms
+  (find / write) so they can't silently widen before 52.3's remaining slices.
 - **Status:** OPEN (lexical containment landed #502; object-bound `WorkspaceDir` resolver landed
-  step-52.1; **read_file arm rewired onto it — step-52.2**; the remaining read arms (list_dir, find)
-  + the write arms/primitives + the non-Linux fallback are pending — step-52.3, #522) ·
-  review-by: with `b1` OS-sandbox work (#84)
+  step-52.1; **read_file arm rewired — step-52.2; list_dir arm rewired — step-52.3**; the remaining
+  read arm (`find`) + the write arms/primitives + the non-Linux fallback are pending — step-52.3
+  cont'd, #522) · review-by: with `b1` OS-sandbox work (#84)
 
 ### acp-worker-fs-scope
 - **Invariant (ideal):** no production ACP/coder worker holds `fs_write = Scope::All`; every

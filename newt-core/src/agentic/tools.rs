@@ -1303,9 +1303,14 @@ fn authorizing_root<'a>(
 fn contained_relative(full_path: &str, root: &str) -> std::path::PathBuf {
     let cand = lexically_normalize(full_path);
     let nroot = lexically_normalize(root);
-    cand.strip_prefix(&nroot)
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or(cand)
+    let rel = cand.strip_prefix(&nroot).unwrap_or(&cand);
+    // An empty relative path means the target *is* the root (e.g. `list_dir "."`);
+    // resolve `.` so `openat2` opens the root dir itself, not an empty path.
+    if rel.as_os_str().is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        rel.to_path_buf()
+    }
 }
 
 /// A `WorkspaceDir` open error that means "the object escaped the fence" (the
@@ -1315,6 +1320,32 @@ fn contained_relative(full_path: &str, root: &str) -> std::path::PathBuf {
 #[cfg(target_os = "linux")]
 fn is_fs_containment_denied(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EXDEV) | Some(libc::ELOOP))
+}
+
+/// The object-binding target for a scope-authorised fs op: `Some(Some((root,
+/// rel)))` to resolve `rel` beneath `root`'s fd; `Some(None)` for `Scope::All`
+/// (no fence — the caller uses `std::fs`); `None` if the scope denies (a logic
+/// error at a call site that already gated — callers fail closed). One shared
+/// resolver behind the object-bound read/list arms.
+#[cfg(target_os = "linux")]
+fn object_bound_target<'a>(
+    scope: &'a crate::caveats::Scope<String>,
+    full_str: &str,
+) -> Option<Option<(&'a str, std::path::PathBuf)>> {
+    authorizing_root(scope, full_str)
+        .map(|opt| opt.map(|root| (root, contained_relative(full_str, root))))
+}
+
+/// Unconfined directory listing via `std::fs` — the `Scope::All` / non-Linux /
+/// #263-gate-approved path. One owner so the three call sites don't drift.
+fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, String> {
+    match std::fs::read_dir(full) {
+        Ok(entries) => Ok(entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()),
+        Err(e) => Err(format!("error: {e}")),
+    }
 }
 
 /// Object-bound read of `full` (the workspace-joined model path) beneath the
@@ -1332,15 +1363,14 @@ fn object_bound_read(
     full_str: &str,
 ) -> Result<String, String> {
     use std::io::Read;
-    match authorizing_root(scope, full_str) {
+    match object_bound_target(scope, full_str) {
         // The gate already permitted this read, so `None` here would be a logic
         // error (the two matchers disagreeing); fail closed rather than read.
         None => Err(denied_fs_result("fs_read", path)),
         Some(None) => {
             std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
         }
-        Some(Some(root)) => {
-            let rel = contained_relative(full_str, root);
+        Some(Some((root, rel))) => {
             let read = crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root)).and_then(
                 |dir| {
                     let mut f = dir.open(&rel)?;
@@ -1358,8 +1388,37 @@ fn object_bound_read(
     }
 }
 
-/// Non-Linux fallback for [`object_bound_read`]: `openat2` is unavailable, so the
-/// read keeps the lexical-gate + `std::fs` behaviour (the symlink residual
+/// Object-bound directory listing beneath the authorising root — the `list_dir`
+/// analogue of [`object_bound_read`]. A symlink-escape directory is refused by
+/// the kernel (an `fs_read` denial); the entries are read straight off the dir
+/// fd. `Scope::All` lists via `std::fs`. Linux-only.
+#[cfg(target_os = "linux")]
+fn object_bound_list(
+    scope: &crate::caveats::Scope<String>,
+    path: &str,
+    full: &std::path::Path,
+    full_str: &str,
+) -> Result<Vec<String>, String> {
+    match object_bound_target(scope, full_str) {
+        None => Err(denied_fs_result("fs_read", path)),
+        Some(None) => std_list_dir(full),
+        Some(Some((root, rel))) => {
+            match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
+                .and_then(|dir| dir.read_dir(&rel))
+            {
+                Ok(names) => Ok(names
+                    .into_iter()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .collect()),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_read", path)),
+                Err(e) => Err(format!("error: {e}")),
+            }
+        }
+    }
+}
+
+/// Non-Linux fallback for the object-bound fs arms: `openat2` is unavailable, so
+/// they keep the lexical-gate + `std::fs` behaviour (the symlink residual
 /// persists on non-Linux — see `fs-canonical-containment`; CI/prod is Linux).
 #[cfg(not(target_os = "linux"))]
 fn object_bound_read(
@@ -1369,6 +1428,16 @@ fn object_bound_read(
     _full_str: &str,
 ) -> Result<String, String> {
     std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn object_bound_list(
+    _scope: &crate::caveats::Scope<String>,
+    _path: &str,
+    full: &std::path::Path,
+    _full_str: &str,
+) -> Result<Vec<String>, String> {
+    std_list_dir(full)
 }
 
 /// Full-access/custom unrestricted writes keep the final y/N guard in ordinary
@@ -4403,7 +4472,9 @@ async fn execute_tool_inner(
             let path = args["path"].as_str().unwrap_or(".");
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
-            if !tui_permits_path(&caveats.fs_read, &full_str) {
+            // Scope- vs #263-gate-authorised, same split as read_file (step-52.2).
+            let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
+            if !scope_permits {
                 // #263: same prompted-grant path as read_file.
                 let allowed = permission_gate.is_some_and(|gate| {
                     fs_gate_allows(gate, "list_dir", DenialKind::FsRead, &full_str, |c| {
@@ -4422,16 +4493,20 @@ async fn execute_tool_inner(
                     "list_dir",
                 );
             }
-            match std::fs::read_dir(&full) {
-                Ok(entries) => {
-                    let mut names: Vec<String> = entries
-                        .flatten()
-                        .map(|e| e.file_name().to_string_lossy().into_owned())
-                        .collect();
+            // step-52.3: object-bound listing when the scope authorised it (a
+            // symlink-escape directory is refused by the kernel); a gate-approved
+            // out-of-scope path lists as-is.
+            let listing = if scope_permits {
+                object_bound_list(&caveats.fs_read, path, &full, &full_str)
+            } else {
+                std_list_dir(&full)
+            };
+            match listing {
+                Ok(mut names) => {
                     names.sort();
                     names.join("\n")
                 }
-                Err(e) => format!("error: {e}"),
+                Err(tool_output) => tool_output,
             }
         }
 
@@ -9821,6 +9896,39 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert!(out.starts_with("error:"), "got: {out}");
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn list_dir_symlink_under_workspace_escaping_is_denied() {
+        // step-52.3: object-bound listing. Under a CONFINED fs_read (Only{ws}), a
+        // symlink UNDER the workspace pointing to an outside directory must not
+        // let list_dir enumerate the outside dir — even though the lexical gate
+        // admits the name `link`. Before the rewire the outside entries were
+        // listed (the #522 residual). Real-fs tier; Linux-only.
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("outside_secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        let confined = Caveats {
+            fs_read: Scope::only([ws.path().to_string_lossy().into_owned()]),
+            ..caveats_rw(ws.path())
+        };
+        let out = run_tool(
+            "list_dir",
+            serde_json::json!({"path": "link"}),
+            ws.path(),
+            &confined,
+            None,
+        )
+        .await;
+
+        assert!(
+            !out.contains("outside_secret.txt"),
+            "object-bound list_dir must not enumerate a directory outside the workspace: {out}"
+        );
+        assert_eq!(out, denied_fs_result("fs_read", "link"), "got: {out}");
     }
 
     #[tokio::test]

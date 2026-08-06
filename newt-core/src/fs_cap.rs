@@ -124,4 +124,26 @@ impl WorkspaceDir {
             root: self.resolve(rel, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?,
         })
     }
+
+    /// List the entry names of a subdirectory, contained beneath the root. The
+    /// directory is resolved object-bound — a symlink-escape directory is refused
+    /// by the kernel — and its entries are read straight off the returned fd, so
+    /// there is no second path to re-resolve. `.` and `..` are filtered; the
+    /// order is filesystem order (the caller sorts). Names only, matching the
+    /// `list_dir` tool's output.
+    pub fn read_dir(&self, rel: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStringExt;
+        let dirfd = self.resolve(rel, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
+        let dir = rustix::fs::Dir::read_from(&dirfd).map_err(io::Error::from)?;
+        let mut names = Vec::new();
+        for entry in dir {
+            let entry = entry.map_err(io::Error::from)?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
+        Ok(names)
+    }
 }
