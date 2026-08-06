@@ -11,6 +11,69 @@ cd newt-agent
 just install          # release binaries → ~/bin/newt, ~/bin/newt-mcp-server
 ```
 
+## First run (unboxing)
+
+A fresh box — no `~/.newt` config file and no backend from any other source
+(drop-in, `--backend-*` flag) — opens the interactive wizard **immediately**
+when you launch `newt` at a terminal:
+
+```
+Where does your model run?
+  1) Ollama on this machine   (http://127.0.0.1:11434)
+  2) Another machine          (hostname or URL — newt probes for Ollama / llama.cpp / vLLM)
+  3) OpenAI                   (https://api.openai.com — API key)
+  4) Anthropic                (https://api.anthropic.com — API key)
+  5) Ollama Cloud             (https://ollama.com — API key)
+```
+
+Esc or Ctrl-C at any prompt skips setup: newt writes localhost defaults and
+starts anyway (`newt setup` re-opens the wizard later, and `/setup` does the
+same from inside a session). CI, image builds, and piped invocations never see
+a prompt — they take the silent probe-and-write path immediately, exactly as
+before.
+
+Choice 2 expands the host through `[discovery]`, probes every candidate port
+concurrently, tells the engines apart (Ollama, llama.cpp, vLLM — fingerprinted,
+not guessed from the port), and lists what each endpoint serves. The model that
+is **already loaded** on the endpoint is the Enter default, so accepting the
+defaults gets you the model that answers immediately.
+
+To rehearse the unboxing flow without touching your real config, point the
+config root somewhere disposable — never move directories aside:
+
+```bash
+NEWT_CONFIG_DIR=$(mktemp -d) newt
+```
+
+## Credentials — encrypted at rest
+
+Prefer an exported environment variable: the wizard records the *reference*
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_API_KEY`) and stores nothing.
+
+A key **pasted** into the wizard is typed with echo off and lands on disk as
+[age](https://age-encryption.org) ciphertext — never plaintext:
+
+```
+~/.newt/backends/<name>.token.age   the encrypted token (0600)
+~/.newt/secrets/identity.txt        the machine key (0600, dir 0700)
+```
+
+- **Enter at the passphrase prompt** encrypts to the machine-local identity
+  above; decryption is transparent. Be honest about what that buys: the key
+  sits beside the lock, so it protects backups, synced dotfiles, and casual
+  greps — an attacker who captures *both* files together can decrypt. It is an
+  upgrade over plaintext, not a vault.
+- **A passphrase** switches to age's scrypt mode; the key never touches disk.
+  Interactive sessions ask once at startup; headless runs read
+  `NEWT_TOKEN_PASSPHRASE` (which is excluded from every child-process
+  environment newt spawns). A locked token warns and resolves to nothing —
+  it never hangs a run.
+
+The files are standard age: `age -d -i ~/.newt/secrets/identity.txt
+~/.newt/backends/<name>.token.age` decrypts with the stock CLI. Legacy
+plaintext `.token` files keep working; `newt doctor` shows each backend's
+credential state and nudges plaintext files toward re-running setup.
+
 ## Discovery — a bare host
 
 A bare hostname is probed **anonymously** across the configured discovery ports
