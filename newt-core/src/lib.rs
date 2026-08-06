@@ -56,6 +56,9 @@ pub mod pricing;
 pub mod project_map;
 pub mod project_model;
 pub mod prompt;
+/// Hosted-provider presets (the wizard's roster; Hermes-compatible drop-ins) —
+/// distinct from `[[providers]]` subprocess plugins.
+pub mod provider_preset;
 pub mod prune;
 /// Psyche posture macros (e.g. `obsessive`) — named acts that move several
 /// psyche dials ([`cognition`] + [`tenacity`], + crew at the caller) at once.
