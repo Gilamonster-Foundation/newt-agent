@@ -910,9 +910,17 @@ async fn fetch_ollama_models(client: &reqwest::Client, base: &str) -> anyhow::Re
     fetch_names(client, base, "/api/tags").await
 }
 
-/// GET `{base}/api/ps` → running Ollama model names.
+/// GET `{base}/api/ps` → running Ollama model names. Routed through
+/// `newt_core::backend_probe::fetch_ollama_ps` — the ONE `/api/ps` home
+/// (#1312 discipline).
 async fn fetch_ollama_running(client: &reqwest::Client, base: &str) -> anyhow::Result<Vec<String>> {
-    fetch_names(client, base, "/api/ps").await
+    Ok(
+        newt_core::backend_probe::fetch_ollama_ps(client, base, None)
+            .await?
+            .into_iter()
+            .map(|m| m.name)
+            .collect(),
+    )
 }
 
 async fn fetch_names(
@@ -1348,37 +1356,19 @@ async fn ps(config_path: Option<&Path>) -> anyhow::Result<()> {
 }
 
 /// GET `{base}/api/ps` → `(name, size_bytes)` for each loaded model.
+/// Routed through `newt_core::backend_probe::fetch_ollama_ps` — the ONE
+/// `/api/ps` home (#1312 discipline) — projected onto the CLI table shape.
 async fn fetch_ollama_ps(
     client: &reqwest::Client,
     base: &str,
 ) -> anyhow::Result<Vec<(String, Option<u64>)>> {
-    let url = format!("{}/api/ps", base.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {}", resp.status());
-    }
-    let json: serde_json::Value = resp.json().await?;
-    Ok(extract_ps(&json["models"]))
-}
-
-/// Pull `(name, size)` pairs out of an `/api/ps` `models` array.
-fn extract_ps(models: &serde_json::Value) -> Vec<(String, Option<u64>)> {
-    models
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| {
-                    let name = m["name"].as_str()?.to_string();
-                    let size = m["size"].as_u64();
-                    Some((name, size))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    Ok(
+        newt_core::backend_probe::fetch_ollama_ps(client, base, None)
+            .await?
+            .into_iter()
+            .map(|m| (m.name, m.size_bytes))
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3099,17 +3089,8 @@ tiers = ["FAST", "STANDARD"]
             .is_err());
     }
 
-    #[test]
-    fn extract_ps_reads_names_and_sizes() {
-        let v = serde_json::json!([
-            {"name": "a", "size": 1024u64},
-            {"x": 1},
-            {"name": "b"}
-        ]);
-        let out = extract_ps(&v);
-        assert_eq!(out, vec![("a".into(), Some(1024)), ("b".into(), None)]);
-        assert!(extract_ps(&serde_json::json!(null)).is_empty());
-    }
+    // extract_ps moved to newt_core::backend_probe::parse_ollama_ps (the ONE
+    // /api/ps home) together with its unit tests.
 
     #[tokio::test]
     async fn fetch_ollama_ps_parses_loaded() {

@@ -1648,6 +1648,8 @@ mod tests {
             kind: BackendKind::Openai,
             models: models.iter().map(|m| (*m).to_string()).collect(),
             serving: newt_core::backend_probe::api_for(BackendKind::Openai).serving(models.len()),
+            engine: None,
+            warm: Vec::new(),
         }
     }
 

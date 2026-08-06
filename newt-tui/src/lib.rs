@@ -3355,20 +3355,33 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
                         if choice.serving.is_none() {
                             choice.serving = Some(probe.serving);
                         }
-                        Ok((probe.models, Some(probe.kind)))
+                        Ok((probe.models, probe.warm, Some(probe.kind)))
                     }
                     Err(e) => Err(e),
                 }
             } else {
-                backend_probe::api_for(choice.kind)
+                let api = backend_probe::api_for(choice.kind);
+                match api
                     .list_models(&client, &choice.url, choice.api_key.as_deref())
                     .await
-                    .map(|models| (models, None))
+                {
+                    Ok(models) => {
+                        // Warmth refines the no-preference fallback in adopt():
+                        // a model already resident answers immediately, install
+                        // order says nothing. Fail-soft (None → empty).
+                        let warm = api
+                            .warm_models(&client, &choice.url, choice.api_key.as_deref())
+                            .await
+                            .unwrap_or_default();
+                        Ok((models, warm, None))
+                    }
+                    Err(e) => Err(e),
+                }
             }
         })
     });
     match fetched {
-        Ok((models, detected_kind)) => {
+        Ok((models, warm, detected_kind)) => {
             if let Some(kind) = detected_kind {
                 lines.push(format!(
                     "detected {} at {} — {} model(s)",
@@ -3390,7 +3403,8 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
             let requested = std::env::var("NEWT_DGX_MODEL")
                 .ok()
                 .filter(|s| !s.is_empty());
-            let adoption = backend_probe::adopt(&synth, &Served { models }, requested.as_deref());
+            let adoption =
+                backend_probe::adopt(&synth, &Served { models, warm }, requested.as_deref());
             choice.serving = Some(adoption.serving);
             if adoption.requested_unavailable {
                 // #1122 fail-soft: a restored/typo'd model must not brick the

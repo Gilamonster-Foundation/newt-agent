@@ -18,7 +18,7 @@
 //!   probe result; an unreachable endpoint is the caller's fallback path (file
 //!   hint + banner), not this module's.
 
-use crate::config::{BackendConfig, BackendKind, OpenAiApi as OpenAiApiSurface, Serving};
+use crate::config::{BackendConfig, BackendKind, Engine, OpenAiApi as OpenAiApiSurface, Serving};
 
 /// HTTP status returned by a model-list probe. Keeping the status typed lets
 /// endpoint detection distinguish authentication and unsupported APIs from a
@@ -72,6 +72,20 @@ pub trait BackendApi: Send + Sync {
 
     /// Derive the serving axis from how many models the endpoint reported.
     fn serving(&self, served_count: usize) -> Serving;
+
+    /// The models currently WARM (loaded in memory) at this endpoint, in
+    /// server order. `None` = this backend/engine cannot report warmth
+    /// (capability absent or unreachable) — callers fall back to served
+    /// order. `Some(vec![])` = authoritative "nothing loaded". Fail-soft
+    /// like [`BackendApi::context_window`].
+    async fn warm_models(
+        &self,
+        _client: &reqwest::Client,
+        _endpoint: &str,
+        _api_key: Option<&str>,
+    ) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// The `BackendApi` for a wire kind — a `&'static` ZST, so no allocation.
@@ -81,6 +95,18 @@ pub fn api_for(kind: BackendKind) -> &'static dyn BackendApi {
         BackendKind::Openai => &OpenAiApi,
         BackendKind::Embedded => &EmbeddedApi,
         BackendKind::Anthropic => &AnthropicApi,
+    }
+}
+
+/// The engine-refined `BackendApi`: same wire behavior as [`api_for`], plus
+/// the engine's warmth capability where one exists (llama.cpp's `/models`
+/// load states, vLLM's single resident model). Unknown/undetected engine ==
+/// `api_for(kind)`.
+pub fn api_for_engine(kind: BackendKind, engine: Option<Engine>) -> &'static dyn BackendApi {
+    match (kind, engine) {
+        (BackendKind::Openai, Some(Engine::LlamaCpp)) => &LlamaCppApi,
+        (BackendKind::Openai, Some(Engine::Vllm)) => &VllmApi,
+        _ => api_for(kind),
     }
 }
 
@@ -102,6 +128,25 @@ pub struct EmbeddedApi;
 /// `anthropic-version` headers (never a bearer), paginated via `after_id`;
 /// always a multiplexer (the hosted API fronts the whole Claude family).
 pub struct AnthropicApi;
+/// llama.cpp's `llama-server` behind the OpenAI wire: delegates the wire
+/// behavior to [`OpenAiApi`]; adds warmth from the non-`/v1` `/models`
+/// route, whose entries carry load states.
+pub struct LlamaCppApi;
+/// vLLM behind the OpenAI wire: delegates the wire behavior to
+/// [`OpenAiApi`]; its served model IS the resident model, so warmth is the
+/// served list itself.
+pub struct VllmApi;
+
+/// Attach `Authorization: Bearer <key>` when a non-empty key is supplied.
+/// Ollama Cloud (`https://ollama.com`) requires it on the native API; LAN
+/// Ollama ignores an unexpected auth header, and the key is only ever sent
+/// when the operator configured one.
+fn maybe_bearer(req: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwest::RequestBuilder {
+    match api_key.filter(|k| !k.trim().is_empty()) {
+        Some(key) => req.bearer_auth(key),
+        None => req,
+    }
+}
 
 #[async_trait::async_trait]
 impl BackendApi for OllamaApi {
@@ -109,10 +154,10 @@ impl BackendApi for OllamaApi {
         &self,
         client: &reqwest::Client,
         endpoint: &str,
-        _api_key: Option<&str>,
+        api_key: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
         let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
-        let resp = client.get(&url).send().await?;
+        let resp = maybe_bearer(client.get(&url), api_key).send().await?;
         if !resp.status().is_success() {
             return Err(ProbeHttpStatus(resp.status()).into());
         }
@@ -131,15 +176,18 @@ impl BackendApi for OllamaApi {
         client: &reqwest::Client,
         endpoint: &str,
         model: &str,
-        _api_key: Option<&str>,
+        api_key: Option<&str>,
     ) -> Option<u32> {
         let url = format!("{}/api/show", endpoint.trim_end_matches('/'));
-        let resp = client
-            .post(&url)
-            .json(&serde_json::json!({ "name": model }))
-            .send()
-            .await
-            .ok()?;
+        let resp = maybe_bearer(
+            client
+                .post(&url)
+                .json(&serde_json::json!({ "name": model })),
+            api_key,
+        )
+        .send()
+        .await
+        .ok()?;
         let json: serde_json::Value = resp.json().await.ok()?;
         parse_ollama_show_window(&json)
     }
@@ -148,6 +196,101 @@ impl BackendApi for OllamaApi {
         // Ollama loads models on demand — always a multiplexer, even if only
         // one model happens to be pulled today.
         Serving::Multiplexer
+    }
+
+    async fn warm_models(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        api_key: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let ps = fetch_ollama_ps(client, endpoint, api_key).await.ok()?;
+        Some(ps.into_iter().map(|m| m.name).collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendApi for LlamaCppApi {
+    async fn list_models(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        api_key: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        OpenAiApi.list_models(client, endpoint, api_key).await
+    }
+
+    async fn context_window(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> Option<u32> {
+        OpenAiApi
+            .context_window(client, endpoint, model, api_key)
+            .await
+    }
+
+    fn serving(&self, served_count: usize) -> Serving {
+        OpenAiApi.serving(served_count)
+    }
+
+    async fn warm_models(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        api_key: Option<&str>,
+    ) -> Option<Vec<String>> {
+        // llama-server's non-/v1 `/models` route carries per-entry load
+        // state (vLLM 404s here, so this is also engine-distinctive). No
+        // state fields at all → capability absent (`None`) — never guess.
+        let url = format!("{}/models", endpoint.trim_end_matches('/'));
+        let resp = maybe_bearer(client.get(&url), api_key).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let json: serde_json::Value = resp.json().await.ok()?;
+        parse_llamacpp_models_warm(&json)
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendApi for VllmApi {
+    async fn list_models(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        api_key: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        OpenAiApi.list_models(client, endpoint, api_key).await
+    }
+
+    async fn context_window(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> Option<u32> {
+        OpenAiApi
+            .context_window(client, endpoint, model, api_key)
+            .await
+    }
+
+    fn serving(&self, served_count: usize) -> Serving {
+        OpenAiApi.serving(served_count)
+    }
+
+    async fn warm_models(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        api_key: Option<&str>,
+    ) -> Option<Vec<String>> {
+        // A vLLM instance's served model IS resident (KV pre-allocated at
+        // startup) — the served list is the warm list.
+        self.list_models(client, endpoint, api_key).await.ok()
     }
 }
 
@@ -307,6 +450,189 @@ async fn anthropic_models_entries(
     Ok(entries)
 }
 
+// ---------------------------------------------------------------------------
+// Engine fingerprinting (which ENGINE is behind an OpenAI-wire endpoint?)
+// ---------------------------------------------------------------------------
+
+/// What a fingerprint probe expects to see in the JSON at its path. Pure data
+/// consumed by [`fingerprint_matches`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintMarker {
+    /// A top-level object key with this name exists.
+    HasKey(&'static str),
+    /// Any of these top-level keys exists (version drift tolerance).
+    HasAnyKey(&'static [&'static str]),
+    /// A `data` array (or top-level array) whose entries carry a load-state
+    /// field (`state`/`status`) — llama-server's non-`/v1` `/models` shape.
+    ModelsArrayWithState,
+}
+
+/// One engine fingerprint: GET `path` on the endpoint, expect `marker`.
+/// Pure data — the three-Cs table [`detect_engine`] consults. Row order is
+/// the fallback chain; first match in table order wins.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineFingerprint {
+    pub engine: Engine,
+    pub path: &'static str,
+    pub marker: FingerprintMarker,
+}
+
+/// The built-in fingerprint table for OpenAI-wire engines, in fallback-chain
+/// order: llama.cpp `/props` → vLLM `/version` → older llama.cpp builds via
+/// the non-`/v1` `/models` load-state shape. `/health` is deliberately NOT a
+/// fingerprint — both llama.cpp and vLLM serve it, so it distinguishes
+/// nothing. (A droppable-TOML overlay for this table is a flagged follow-up;
+/// the typed [`Engine`] enum is required for dispatch either way.)
+pub fn builtin_engine_fingerprints() -> &'static [EngineFingerprint] {
+    &[
+        EngineFingerprint {
+            engine: Engine::LlamaCpp,
+            path: "/props",
+            marker: FingerprintMarker::HasAnyKey(&["default_generation_settings", "model_path"]),
+        },
+        EngineFingerprint {
+            engine: Engine::Vllm,
+            path: "/version",
+            marker: FingerprintMarker::HasKey("version"),
+        },
+        EngineFingerprint {
+            engine: Engine::LlamaCpp,
+            path: "/models",
+            marker: FingerprintMarker::ModelsArrayWithState,
+        },
+    ]
+}
+
+/// Does `json` satisfy `marker`? Pure — unit-tested without a server.
+pub fn fingerprint_matches(marker: &FingerprintMarker, json: &serde_json::Value) -> bool {
+    match marker {
+        FingerprintMarker::HasKey(key) => json.get(key).is_some(),
+        FingerprintMarker::HasAnyKey(keys) => keys.iter().any(|k| json.get(k).is_some()),
+        FingerprintMarker::ModelsArrayWithState => {
+            let entries = json["data"].as_array().or_else(|| json.as_array());
+            entries.is_some_and(|arr| {
+                !arr.is_empty()
+                    && arr
+                        .iter()
+                        .all(|e| e.get("state").is_some() || e.get("status").is_some())
+            })
+        }
+    }
+}
+
+/// Fingerprint the ENGINE behind an endpoint.
+///
+/// `kind == Ollama` short-circuits to `Some(Engine::Ollama)` with zero HTTP
+/// (the `/api/tags` race already proved it); `kind == Openai` walks
+/// [`builtin_engine_fingerprints`] in order; every other kind (Embedded,
+/// Anthropic) has no engine axis and returns `None`. Fail-soft: every
+/// network error is just "no match" — an unfingerprintable endpoint stays a
+/// perfectly usable generic OpenAI backend, it merely reports no warmth.
+pub async fn detect_engine(
+    client: &reqwest::Client,
+    endpoint: &str,
+    kind: BackendKind,
+    api_key: Option<&str>,
+) -> Option<Engine> {
+    match kind {
+        BackendKind::Ollama => return Some(Engine::Ollama),
+        BackendKind::Openai => {}
+        BackendKind::Embedded | BackendKind::Anthropic => return None,
+    }
+    let base = endpoint.trim_end_matches('/');
+    for fp in builtin_engine_fingerprints() {
+        let url = format!("{base}{}", fp.path);
+        let Ok(resp) = maybe_bearer(client.get(&url), api_key).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(json) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        if fingerprint_matches(&fp.marker, &json) {
+            return Some(fp.engine);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Warm/loaded-model fetchers (the ONE home for /api/ps — #1312 discipline)
+// ---------------------------------------------------------------------------
+
+/// One Ollama `/api/ps` entry — the superset of what the dgx CLI table and
+/// the TUI residency probe each need, so both can route through here instead
+/// of keeping their own copies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PsModel {
+    pub name: String,
+    pub size_bytes: Option<u64>,
+    pub size_vram_bytes: Option<u64>,
+    pub expires_at: Option<String>,
+}
+
+/// Parse an Ollama `/api/ps` response body. Pure — unit-tested without a
+/// server. Entries without a `name` are skipped.
+pub fn parse_ollama_ps(json: &serde_json::Value) -> Vec<PsModel> {
+    json["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    Some(PsModel {
+                        name: m["name"].as_str()?.to_string(),
+                        size_bytes: m["size"].as_u64(),
+                        size_vram_bytes: m["size_vram"].as_u64(),
+                        expires_at: m["expires_at"].as_str().map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// GET `/api/ps` — the models Ollama currently holds in memory. Thin IO
+/// shell over [`parse_ollama_ps`]; bearer-aware for Ollama Cloud.
+pub async fn fetch_ollama_ps(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Vec<PsModel>> {
+    let url = format!("{}/api/ps", endpoint.trim_end_matches('/'));
+    let resp = maybe_bearer(client.get(&url), api_key).send().await?;
+    if !resp.status().is_success() {
+        return Err(ProbeHttpStatus(resp.status()).into());
+    }
+    let json: serde_json::Value = resp.json().await?;
+    Ok(parse_ollama_ps(&json))
+}
+
+/// Extract the WARM subset from llama-server's non-`/v1` `/models` response.
+/// Pure. `None` when no entry carries a load-state field at all (capability
+/// absent — adoption falls back to served order rather than guessing).
+pub fn parse_llamacpp_models_warm(json: &serde_json::Value) -> Option<Vec<String>> {
+    let entries = json["data"].as_array().or_else(|| json.as_array())?;
+    let state_of = |e: &serde_json::Value| {
+        e["state"]
+            .as_str()
+            .or_else(|| e["status"].as_str())
+            .map(str::to_ascii_lowercase)
+    };
+    if !entries.iter().any(|e| state_of(e).is_some()) {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .filter(|e| state_of(e).is_some_and(|s| s == "loaded"))
+            .filter_map(|e| e["id"].as_str().or_else(|| e["model"].as_str()))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// GET `/v1/models`, sending a bearer token when present (authenticated
 /// gateways 401 otherwise). Shared by [`OpenAiApi::list_models`] and
 /// [`OpenAiApi::context_window`] — one round-trip shape, one place.
@@ -338,6 +664,12 @@ pub struct EndpointProbeResult {
     pub kind: BackendKind,
     pub models: Vec<String>,
     pub serving: Serving,
+    /// The fingerprinted engine (ollama | llama.cpp | vllm), when one could
+    /// be told apart. `None` = generic/unknown — fully usable, no warmth.
+    pub engine: Option<Engine>,
+    /// The warm (loaded-in-memory) subset of `models`, in server order.
+    /// Empty = none reported or capability absent. Fail-soft.
+    pub warm: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -382,23 +714,41 @@ impl ProbeFailure {
         )
     }
 
-    fn authentication_error(&self, endpoint: &str, supplied_key: bool) -> Option<anyhow::Error> {
+    /// A typed auth error for this probe failure, worded per protocol
+    /// surface (`"OpenAI-compatible"` + `GET /v1/models`, or `"Ollama"` +
+    /// `GET /api/tags` for Ollama Cloud).
+    fn authentication_error_for(
+        &self,
+        endpoint: &str,
+        supplied_key: bool,
+        protocol: &str,
+        probe: &str,
+    ) -> Option<anyhow::Error> {
         if !self.is_auth_failure() {
             return None;
         }
         if supplied_key {
             Some(anyhow::anyhow!(
-                "authentication rejected by OpenAI-compatible inference endpoint {endpoint} \
-                 (GET /v1/models returned {}); check the bearer token",
+                "authentication rejected by {protocol} inference endpoint {endpoint} \
+                 ({probe} returned {}); check the bearer token",
                 self.detail
             ))
         } else {
             Some(anyhow::anyhow!(
-                "authentication required by OpenAI-compatible inference endpoint {endpoint} \
-                 (GET /v1/models returned {}); supply a bearer token",
+                "authentication required by {protocol} inference endpoint {endpoint} \
+                 ({probe} returned {}); supply a bearer token",
                 self.detail
             ))
         }
+    }
+
+    fn authentication_error(&self, endpoint: &str, supplied_key: bool) -> Option<anyhow::Error> {
+        self.authentication_error_for(
+            endpoint,
+            supplied_key,
+            "OpenAI-compatible",
+            "GET /v1/models",
+        )
     }
 }
 
@@ -406,8 +756,15 @@ impl ProbeFailure {
 ///
 /// Both cheap model-list probes run concurrently. Ollama wins when both APIs
 /// answer because Ollama's native surface carries more backend-specific
-/// behavior than its OpenAI compatibility shim. The optional bearer token is
-/// sent only to the OpenAI-compatible probe.
+/// behavior than its OpenAI compatibility shim — for Ollama Cloud
+/// (`https://ollama.com`, which serves both surfaces) that lands on the
+/// native protocol. The optional bearer token is sent to BOTH probes: Ollama
+/// Cloud 401s `/api/tags` without it, LAN Ollama ignores it, and it is only
+/// ever sent when the operator configured one.
+///
+/// The result also carries the fingerprinted [`Engine`] and the warm
+/// (loaded) model subset, both fail-soft — see [`detect_engine`] and
+/// [`BackendApi::warm_models`].
 pub async fn detect_endpoint(
     client: &reqwest::Client,
     endpoint: &str,
@@ -417,52 +774,48 @@ pub async fn detect_endpoint(
     let ollama_api = api_for(BackendKind::Ollama);
     let openai_api = api_for(BackendKind::Openai);
     let (ollama, openai) = tokio::join!(
-        ollama_api.list_models(client, endpoint, None),
+        ollama_api.list_models(client, endpoint, api_key),
         openai_api.list_models(client, endpoint, api_key),
     );
+    let supplied_key = api_key.is_some_and(|key| !key.trim().is_empty());
 
     match (ollama, openai) {
         (Ok(ollama_models), Ok(openai_models))
             if ollama_models.is_empty() && !openai_models.is_empty() =>
         {
-            Ok(EndpointProbeResult {
-                endpoint: endpoint.to_string(),
-                kind: BackendKind::Openai,
-                serving: openai_api.serving(openai_models.len()),
-                models: openai_models,
-            })
+            Ok(finish_probe(
+                client,
+                endpoint,
+                BackendKind::Openai,
+                openai_models,
+                api_key,
+            )
+            .await)
         }
         (Ok(models), Err(openai_error)) if models.is_empty() => {
             let openai = ProbeFailure::from_error(openai_error);
-            if let Some(error) = openai
-                .authentication_error(endpoint, api_key.is_some_and(|key| !key.trim().is_empty()))
-            {
+            if let Some(error) = openai.authentication_error(endpoint, supplied_key) {
                 return Err(error);
             }
-            Ok(EndpointProbeResult {
-                endpoint: endpoint.to_string(),
-                kind: BackendKind::Ollama,
-                serving: ollama_api.serving(models.len()),
-                models,
-            })
+            Ok(finish_probe(client, endpoint, BackendKind::Ollama, models, api_key).await)
         }
-        (Ok(models), _) => Ok(EndpointProbeResult {
-            endpoint: endpoint.to_string(),
-            kind: BackendKind::Ollama,
-            serving: ollama_api.serving(models.len()),
-            models,
-        }),
-        (Err(_), Ok(models)) => Ok(EndpointProbeResult {
-            endpoint: endpoint.to_string(),
-            kind: BackendKind::Openai,
-            serving: openai_api.serving(models.len()),
-            models,
-        }),
+        (Ok(models), _) => {
+            Ok(finish_probe(client, endpoint, BackendKind::Ollama, models, api_key).await)
+        }
+        (Err(_), Ok(models)) => {
+            Ok(finish_probe(client, endpoint, BackendKind::Openai, models, api_key).await)
+        }
         (Err(ollama_error), Err(openai_error)) => {
             let ollama = ProbeFailure::from_error(ollama_error);
             let openai = ProbeFailure::from_error(openai_error);
-            if let Some(error) = openai
-                .authentication_error(endpoint, api_key.is_some_and(|key| !key.trim().is_empty()))
+            if let Some(error) = openai.authentication_error(endpoint, supplied_key) {
+                return Err(error);
+            }
+            // Ollama Cloud with a wrong/missing token: /api/tags 401s while
+            // /v1/models fails some other way — name the bearer token rather
+            // than reporting "unsupported endpoint".
+            if let Some(error) =
+                ollama.authentication_error_for(endpoint, supplied_key, "Ollama", "GET /api/tags")
             {
                 return Err(error);
             }
@@ -484,6 +837,37 @@ pub async fn detect_endpoint(
                 openai.detail
             );
         }
+    }
+}
+
+/// Assemble the final probe result: derive serving from the served count,
+/// fingerprint the engine, and fetch the warm subset. Engine and warmth are
+/// fail-soft (≤2 extra bounded round-trips); a vLLM instance reuses the
+/// already-fetched served list as its warm list (zero extra HTTP).
+async fn finish_probe(
+    client: &reqwest::Client,
+    endpoint: &str,
+    kind: BackendKind,
+    models: Vec<String>,
+    api_key: Option<&str>,
+) -> EndpointProbeResult {
+    let serving = api_for(kind).serving(models.len());
+    let engine = detect_engine(client, endpoint, kind, api_key).await;
+    let warm = match engine {
+        // The vLLM served list IS the warm list — no second fetch.
+        Some(Engine::Vllm) => models.clone(),
+        _ => api_for_engine(kind, engine)
+            .warm_models(client, endpoint, api_key)
+            .await
+            .unwrap_or_default(),
+    };
+    EndpointProbeResult {
+        endpoint: endpoint.to_string(),
+        kind,
+        models,
+        serving,
+        engine,
+        warm,
     }
 }
 
@@ -617,6 +1001,22 @@ pub fn parse_openai_models_window(json: &serde_json::Value, model: &str) -> Opti
 pub struct Served {
     /// Model names/ids as the server listed them, in server order.
     pub models: Vec<String>,
+    /// The WARM (loaded-in-memory) subset, in server order. Empty = none
+    /// reported or capability absent. Entries not present in `models` are
+    /// ignored by [`adopt`] (a stale `/api/ps` race must not adopt a model
+    /// the server no longer lists).
+    pub warm: Vec<String>,
+}
+
+impl Served {
+    /// A served list with no warmth information — the shape every pre-warm
+    /// caller had.
+    pub fn from_models(models: Vec<String>) -> Self {
+        Self {
+            models,
+            warm: Vec::new(),
+        }
+    }
 }
 
 /// The adoption decision for one backend at session start / backend switch.
@@ -681,10 +1081,21 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
             let requested_ok =
                 requested.map(|r| served.models.is_empty() || served.models.iter().any(|m| m == r));
             let requested_unavailable = requested_ok == Some(false);
+            // Precedence: requested → declared → first WARM (a model already
+            // resident answers immediately; install order says nothing) →
+            // first served. Warmth never overrides an explicit choice, so
+            // there is nothing to warn about.
             let model = requested
                 .filter(|_| requested_ok == Some(true))
                 .map(str::to_string)
                 .or_else(|| backend.effective_model().map(str::to_string))
+                .or_else(|| {
+                    served
+                        .warm
+                        .iter()
+                        .find(|w| served.models.contains(w))
+                        .cloned()
+                })
                 .or_else(|| served.models.first().cloned());
             Adoption {
                 model,
@@ -744,8 +1155,13 @@ mod tests {
     }
 
     fn served(models: &[&str]) -> Served {
+        Served::from_models(models.iter().map(|m| m.to_string()).collect())
+    }
+
+    fn served_warm(models: &[&str], warm: &[&str]) -> Served {
         Served {
             models: models.iter().map(|m| m.to_string()).collect(),
+            warm: warm.iter().map(|m| m.to_string()).collect(),
         }
     }
 
@@ -931,27 +1347,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_endpoint_never_sends_the_openai_token_to_ollama() {
+    async fn detect_endpoint_sends_the_bearer_to_both_probes() {
+        // The Ollama Cloud contract (deliberate inversion of the former
+        // `detect_endpoint_never_sends_the_openai_token_to_ollama`):
+        // https://ollama.com 401s `/api/tags` without a bearer, so the key —
+        // sent only when the operator configured one — goes to BOTH probes.
+        // /api/tags answers ONLY with the bearer; both surfaces answering
+        // also proves the tie-break stays native-Ollama.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
             .and(header("authorization", "Bearer secret-token"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "gpt-oss:120b"}]
+            })))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [{"name": "ollama-model"}]
-            })))
+            .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .and(header("authorization", "Bearer secret-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{"id": "openai-model"}]
+                "data": [{"id": "gpt-oss:120b"}]
             })))
             .mount(&server)
             .await;
@@ -961,7 +1382,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.kind, BackendKind::Ollama);
+        assert_eq!(result.models, vec!["gpt-oss:120b"]);
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_reports_ollama_auth_rejected_with_token() {
+        // Ollama Cloud with a wrong token: /api/tags 401s while /v1/models
+        // 404s — the error must name the bearer token, not claim the endpoint
+        // is "unsupported".
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = detect_endpoint(&reqwest::Client::new(), &server.uri(), Some("wrong-token"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("authentication rejected by Ollama"),
+            "auth-classified, got: {err}"
+        );
+        assert!(err.contains("check the bearer token"), "actionable: {err}");
     }
 
     #[tokio::test]
@@ -1233,5 +1684,479 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(api, OpenAiApiSurface::Responses);
+    }
+
+    // --- engine fingerprinting ---
+
+    #[test]
+    fn fingerprint_matches_shapes() {
+        use FingerprintMarker::*;
+        let props = serde_json::json!({"default_generation_settings": {}, "total_slots": 4});
+        assert!(fingerprint_matches(
+            &HasAnyKey(&["default_generation_settings", "model_path"]),
+            &props
+        ));
+        let old_props = serde_json::json!({"model_path": "/models/x.gguf"});
+        assert!(fingerprint_matches(
+            &HasAnyKey(&["default_generation_settings", "model_path"]),
+            &old_props
+        ));
+        let version = serde_json::json!({"version": "0.6.3"});
+        assert!(fingerprint_matches(&HasKey("version"), &version));
+        assert!(!fingerprint_matches(&HasKey("version"), &props));
+        // llama-server /models: entries with load-state fields.
+        let models = serde_json::json!({"data": [
+            {"id": "a", "state": "loaded"},
+            {"id": "b", "status": "unloaded"}
+        ]});
+        assert!(fingerprint_matches(&ModelsArrayWithState, &models));
+        // OpenAI-shaped /models (no state fields) must NOT match.
+        let openai = serde_json::json!({"data": [{"id": "a"}, {"id": "b"}]});
+        assert!(!fingerprint_matches(&ModelsArrayWithState, &openai));
+        // Empty array proves nothing.
+        assert!(!fingerprint_matches(
+            &ModelsArrayWithState,
+            &serde_json::json!({"data": []})
+        ));
+    }
+
+    #[tokio::test]
+    async fn detect_engine_identifies_llamacpp_via_props() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/props"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "default_generation_settings": {}, "total_slots": 1
+            })))
+            .mount(&server)
+            .await;
+        let engine = detect_engine(
+            &reqwest::Client::new(),
+            &server.uri(),
+            BackendKind::Openai,
+            None,
+        )
+        .await;
+        assert_eq!(engine, Some(Engine::LlamaCpp));
+    }
+
+    #[tokio::test]
+    async fn detect_engine_identifies_vllm_via_version() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/props"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"version": "0.8.5.post1"})),
+            )
+            .mount(&server)
+            .await;
+        let engine = detect_engine(
+            &reqwest::Client::new(),
+            &server.uri(),
+            BackendKind::Openai,
+            None,
+        )
+        .await;
+        assert_eq!(engine, Some(Engine::Vllm));
+    }
+
+    #[tokio::test]
+    async fn detect_engine_old_llamacpp_falls_back_to_models_route() {
+        // Older llama.cpp builds lack /props — the non-/v1 /models route with
+        // load states is the terminal fingerprint in the fallback chain.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/props"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "qwen3-32b", "state": "loaded"}]
+            })))
+            .mount(&server)
+            .await;
+        let engine = detect_engine(
+            &reqwest::Client::new(),
+            &server.uri(),
+            BackendKind::Openai,
+            None,
+        )
+        .await;
+        assert_eq!(engine, Some(Engine::LlamaCpp));
+    }
+
+    #[tokio::test]
+    async fn detect_engine_unknown_for_generic_gateway() {
+        // No fingerprint answers → None: the endpoint stays a fully usable
+        // generic OpenAI backend, it merely reports no warmth.
+        let server = MockServer::start().await;
+        let engine = detect_engine(
+            &reqwest::Client::new(),
+            &server.uri(),
+            BackendKind::Openai,
+            None,
+        )
+        .await;
+        assert_eq!(engine, None);
+    }
+
+    #[tokio::test]
+    async fn detect_engine_short_circuits_for_ollama_kind() {
+        // kind=Ollama needs zero HTTP — the /api/tags race already proved it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let engine = detect_engine(
+            &reqwest::Client::new(),
+            &server.uri(),
+            BackendKind::Ollama,
+            None,
+        )
+        .await;
+        assert_eq!(engine, Some(Engine::Ollama));
+        server.verify().await;
+    }
+
+    // --- warm models ---
+
+    #[test]
+    fn parse_ollama_ps_reads_names_sizes_and_expiry() {
+        // Fixture ported from the retired newt-tui parse_loaded_models and
+        // newt-cli extract_ps copies — this parser is now the ONE home.
+        let json = serde_json::json!({
+            "models": [
+                {
+                    "name": "nemotron3:33b",
+                    "size": 35_000_000_000u64,
+                    "size_vram": 35_631_112_192u64,
+                    "expires_at": "2026-06-06T12:00:00Z"
+                },
+                {"name": "tiny:1b"},
+                {"x": 1}
+            ]
+        });
+        let ps = parse_ollama_ps(&json);
+        assert_eq!(ps.len(), 2, "nameless entries skipped");
+        assert_eq!(ps[0].name, "nemotron3:33b");
+        assert_eq!(ps[0].size_bytes, Some(35_000_000_000));
+        assert_eq!(ps[0].size_vram_bytes, Some(35_631_112_192));
+        assert!(ps[0].expires_at.is_some());
+        assert_eq!(ps[1].name, "tiny:1b");
+        assert_eq!(ps[1].size_bytes, None);
+        assert!(parse_ollama_ps(&serde_json::json!({"models": []})).is_empty());
+        assert!(parse_ollama_ps(&serde_json::json!(null)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ollama_warm_models_reads_api_ps_with_bearer() {
+        // The Ollama Cloud warmth contract: /api/ps carries the bearer when a
+        // key is supplied.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "warm-a"}, {"name": "warm-b"}]
+            })))
+            .mount(&server)
+            .await;
+        let warm = OllamaApi
+            .warm_models(&reqwest::Client::new(), &server.uri(), Some("tok"))
+            .await;
+        assert_eq!(warm, Some(vec!["warm-a".to_string(), "warm-b".to_string()]));
+    }
+
+    #[test]
+    fn parse_llamacpp_models_warm_filters_by_load_state() {
+        let json = serde_json::json!({"data": [
+            {"id": "cold-model", "state": "unloaded"},
+            {"id": "warm-model", "state": "loaded"},
+            {"id": "other-warm", "status": "LOADED"}
+        ]});
+        assert_eq!(
+            parse_llamacpp_models_warm(&json),
+            Some(vec!["warm-model".to_string(), "other-warm".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_llamacpp_models_warm_none_when_no_state_fields() {
+        // No entry carries a state field → capability absent (None), never a
+        // guessed empty-warm claim.
+        let json = serde_json::json!({"data": [{"id": "a"}, {"id": "b"}]});
+        assert_eq!(parse_llamacpp_models_warm(&json), None);
+    }
+
+    #[tokio::test]
+    async fn vllm_warm_models_is_the_served_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "resident-model"}]
+            })))
+            .mount(&server)
+            .await;
+        // /api/ps and /models must never be touched by the vLLM impl.
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let warm = VllmApi
+            .warm_models(&reqwest::Client::new(), &server.uri(), None)
+            .await;
+        assert_eq!(warm, Some(vec!["resident-model".to_string()]));
+        server.verify().await;
+    }
+
+    // --- adopt(): warm precedence ---
+
+    #[test]
+    fn multiplexer_prefers_warm_over_first_served() {
+        let backend = BackendConfig {
+            name: "b".into(),
+            endpoint: "http://h:11434".into(),
+            kind: Some(BackendKind::Ollama),
+            ..Default::default()
+        };
+        let adoption = adopt(&backend, &served_warm(&["a", "b", "c"], &["c"]), None);
+        assert_eq!(adoption.model.as_deref(), Some("c"));
+        assert!(!adoption.requested_unavailable);
+    }
+
+    #[test]
+    fn requested_and_declared_still_outrank_warm() {
+        let declared = BackendConfig {
+            name: "b".into(),
+            endpoint: "http://h:11434".into(),
+            model: Some("b".into()),
+            kind: Some(BackendKind::Ollama),
+            ..Default::default()
+        };
+        // Requested wins over everything.
+        let adoption = adopt(&declared, &served_warm(&["a", "b", "c"], &["c"]), Some("a"));
+        assert_eq!(adoption.model.as_deref(), Some("a"));
+        // Declared wins over warm.
+        let adoption = adopt(&declared, &served_warm(&["a", "b", "c"], &["c"]), None);
+        assert_eq!(adoption.model.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn stale_warm_entry_not_in_served_is_ignored() {
+        let backend = BackendConfig {
+            name: "b".into(),
+            endpoint: "http://h:11434".into(),
+            kind: Some(BackendKind::Ollama),
+            ..Default::default()
+        };
+        // /api/ps race: the warm model was just removed from /api/tags.
+        let adoption = adopt(&backend, &served_warm(&["a", "b"], &["gone"]), None);
+        assert_eq!(
+            adoption.model.as_deref(),
+            Some("a"),
+            "falls to first served"
+        );
+    }
+
+    #[test]
+    fn instance_adoption_unchanged_by_warm() {
+        let backend = openai_backend(Some("requested"), Some(Serving::Instance));
+        let adoption = adopt(&backend, &served_warm(&["served"], &["served"]), None);
+        assert_eq!(adoption.model.as_deref(), Some("served"));
+        assert!(adoption.requested_ignored);
+    }
+
+    // --- detect_endpoint: engine + warm population ---
+
+    #[tokio::test]
+    async fn detect_endpoint_populates_engine_and_warm() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "warm-model"}, {"id": "cold-model"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/props"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "default_generation_settings": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "warm-model", "state": "loaded"},
+                    {"id": "cold-model", "state": "unloaded"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_endpoint(&reqwest::Client::new(), &server.uri(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.kind, BackendKind::Openai);
+        assert_eq!(result.engine, Some(Engine::LlamaCpp));
+        assert_eq!(result.warm, vec!["warm-model"]);
+    }
+
+    #[tokio::test]
+    async fn detect_endpoint_engine_and_warm_fail_soft() {
+        // Fingerprints all 404 → engine None, warm empty, result still Ok.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "m1"}, {"id": "m2"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_endpoint(&reqwest::Client::new(), &server.uri(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.engine, None);
+        assert!(result.warm.is_empty());
+        assert_eq!(result.models, vec!["m1", "m2"]);
+    }
+
+    // --- AnthropicApi ---
+
+    #[tokio::test]
+    async fn anthropic_list_models_sends_required_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("x-api-key", "sk-ant-test"))
+            .and(header("anthropic-version", ANTHROPIC_VERSION))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5"},
+                    {"id": "claude-haiku-4-5", "display_name": "Claude Haiku 4.5"}
+                ],
+                "has_more": false
+            })))
+            .mount(&server)
+            .await;
+
+        let models = AnthropicApi
+            .list_models(&reqwest::Client::new(), &server.uri(), Some("sk-ant-test"))
+            .await
+            .unwrap();
+        assert_eq!(models, vec!["claude-sonnet-4-5", "claude-haiku-4-5"]);
+    }
+
+    #[tokio::test]
+    async fn anthropic_list_models_follows_pagination_capped() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::query_param("after_id", "claude-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "claude-b"}],
+                "has_more": false,
+                "last_id": "claude-b"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "claude-a"}],
+                "has_more": true,
+                "last_id": "claude-a"
+            })))
+            .mount(&server)
+            .await;
+
+        let models = AnthropicApi
+            .list_models(&reqwest::Client::new(), &server.uri(), Some("k"))
+            .await
+            .unwrap();
+        assert_eq!(models, vec!["claude-a", "claude-b"]);
+    }
+
+    #[tokio::test]
+    async fn anthropic_context_window_reads_max_input_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "claude-sonnet-4-5", "max_input_tokens": 200_000},
+                    {"id": "claude-legacy"}
+                ],
+                "has_more": false
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let window = AnthropicApi
+            .context_window(&client, &server.uri(), "claude-sonnet-4-5", Some("k"))
+            .await;
+        assert_eq!(window, Some(200_000));
+        // Absent field → None (caller keeps its default).
+        let none = AnthropicApi
+            .context_window(&client, &server.uri(), "claude-legacy", Some("k"))
+            .await;
+        assert_eq!(none, None);
+    }
+
+    #[tokio::test]
+    async fn anthropic_list_models_401_is_a_typed_probe_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let err = AnthropicApi
+            .list_models(&reqwest::Client::new(), &server.uri(), Some("bad-key"))
+            .await
+            .unwrap_err();
+        let failure = ProbeFailure::from_error(err);
+        assert!(failure.is_auth_failure(), "401 classifies as auth");
+    }
+
+    #[test]
+    fn anthropic_serving_is_always_multiplexer() {
+        assert_eq!(AnthropicApi.serving(1), Serving::Multiplexer);
+        assert_eq!(AnthropicApi.serving(30), Serving::Multiplexer);
     }
 }

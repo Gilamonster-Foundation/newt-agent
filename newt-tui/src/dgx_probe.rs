@@ -189,20 +189,6 @@ async fn fetch_text(url: &str, timeout_secs: u64) -> Option<String> {
         .ok()
 }
 
-async fn fetch_json(url: &str, timeout_secs: u64) -> Option<serde_json::Value> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .ok()?
-        .get(url)
-        .send()
-        .await
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()
-}
-
 // ---------------------------------------------------------------------------
 // DgxTelemetry — async client
 // ---------------------------------------------------------------------------
@@ -292,38 +278,36 @@ impl DgxTelemetry {
 
     /// List models currently loaded in Ollama's VRAM (`/api/ps`).
     ///
-    /// Returns an empty vec when the endpoint is unreachable.
+    /// Returns an empty vec when the endpoint is unreachable. Routed through
+    /// `newt_core::backend_probe::fetch_ollama_ps` — the ONE `/api/ps` home
+    /// (#1312 discipline) — and mapped onto the local UI type.
     pub fn loaded_models(&self) -> Vec<LoadedModel> {
-        let url = format!("{}/api/ps", self.ollama_base);
-        let json = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async { fetch_json(&url, 5).await })
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let ps = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                newt_core::backend_probe::fetch_ollama_ps(&client, &self.ollama_base, None).await
+            })
         });
-        parse_loaded_models(json.as_ref())
+        ps.unwrap_or_default()
+            .into_iter()
+            .map(|m| LoadedModel {
+                name: m.name,
+                size_vram_bytes: m.size_vram_bytes.unwrap_or(0),
+                expires_at: m.expires_at,
+            })
+            .collect()
     }
 
     /// The DCGM base URL this client is connected to.
     pub fn dcgm_base(&self) -> &str {
         &self.dcgm_base
     }
-}
-
-fn parse_loaded_models(json: Option<&serde_json::Value>) -> Vec<LoadedModel> {
-    json.and_then(|j| j["models"].as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| {
-                    let name = m["name"].as_str()?.to_string();
-                    let size_vram_bytes = m["size_vram"].as_u64().unwrap_or(0);
-                    let expires_at = m["expires_at"].as_str().map(str::to_string);
-                    Some(LoadedModel {
-                        name,
-                        size_vram_bytes,
-                        expires_at,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -511,45 +495,8 @@ mod tests {
         );
     }
 
-    // --- parse_loaded_models ---
-
-    #[test]
-    fn parse_loaded_models_happy_path() {
-        let json: serde_json::Value = serde_json::json!({
-            "models": [
-                {
-                    "name": "nemotron3:33b",
-                    "size_vram": 35_631_112_192u64,
-                    "expires_at": "2026-06-06T12:00:00Z"
-                }
-            ]
-        });
-        let models = parse_loaded_models(Some(&json));
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].name, "nemotron3:33b");
-        assert_eq!(models[0].size_vram_bytes, 35_631_112_192);
-        assert!(models[0].expires_at.is_some());
-    }
-
-    #[test]
-    fn parse_loaded_models_empty_list() {
-        let json = serde_json::json!({"models": []});
-        assert!(parse_loaded_models(Some(&json)).is_empty());
-    }
-
-    #[test]
-    fn parse_loaded_models_none_json() {
-        assert!(parse_loaded_models(None).is_empty());
-    }
-
-    #[test]
-    fn parse_loaded_models_missing_field() {
-        // size_vram absent — defaults to 0, model still included
-        let json = serde_json::json!({"models": [{"name": "tiny:1b"}]});
-        let models = parse_loaded_models(Some(&json));
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].size_vram_bytes, 0);
-    }
+    // parse_loaded_models' unit tests moved to newt-core::backend_probe
+    // (parse_ollama_ps) along with the parser — the ONE /api/ps home.
 
     // --- full round-trip with real DCGM sample ---
 
