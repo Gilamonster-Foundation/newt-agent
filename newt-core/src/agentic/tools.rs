@@ -1059,6 +1059,32 @@ async fn host_shell_output(
     host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout()).await
 }
 
+/// Build the host-shell child command, stripping the two authority-switch env
+/// vars so an inherited `NEWT_DISABLE_OCAP=1` / `NEWT_FULL_ACCESS=1` (from a
+/// wrapper/pod, or this process's own Yolo lane) cannot flow into the child and
+/// re-assert authority the session did not grant it (step-7.1a, invariant 9).
+/// The child inherits the rest of the environment by default; `env_remove`
+/// excises only these two switches. Own process group (setsid-equivalent) +
+/// `kill_on_drop` so a hung or tty-stealing child is reaped as a whole tree.
+#[cfg(not(windows))]
+fn host_shell_command(program: &str, cmd: &str, cwd: &str) -> tokio::process::Command {
+    use std::process::Stdio;
+    let mut c = tokio::process::Command::new(program);
+    c.arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .env_remove("NEWT_DISABLE_OCAP")
+        .env_remove("NEWT_FULL_ACCESS")
+        // A child that reads stdin gets EOF, never a blocking wait on a tty
+        // the agent cannot drive.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    c
+}
+
 #[cfg(not(windows))]
 async fn host_shell_output_with_timeout(
     cmd: &str,
@@ -1066,28 +1092,6 @@ async fn host_shell_output_with_timeout(
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     timeout: std::time::Duration,
 ) -> std::io::Result<HostShellRun> {
-    use std::process::Stdio;
-
-    fn shell(program: &str, cmd: &str, cwd: &str) -> tokio::process::Command {
-        let mut c = tokio::process::Command::new(program);
-        c.arg("-c")
-            .arg(cmd)
-            .current_dir(cwd)
-            // A child that reads stdin gets EOF, never a blocking wait on a tty
-            // the agent cannot drive.
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Own process group (setsid-equivalent, std-only since Rust 1.64):
-            // detaches the child from our controlling tty so it can't steal the
-            // interrupt byte, and gives the drop-kill a whole group to reap.
-            .process_group(0)
-            // Kill the child *tree* — not just `bash` — if we drop the handle
-            // (timeout, cancel, panic).
-            .kill_on_drop(true);
-        c
-    }
-
     async fn run_one(
         mut child: tokio::process::Child,
         live: Option<std::sync::Arc<LiveOutputRelay>>,
@@ -1134,10 +1138,10 @@ async fn host_shell_output_with_timeout(
         }
     }
 
-    match shell("bash", cmd, cwd).spawn() {
+    match host_shell_command("bash", cmd, cwd).spawn() {
         Ok(child) => run_one(child, live, timeout).await,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            run_one(shell("sh", cmd, cwd).spawn()?, live, timeout).await
+            run_one(host_shell_command("sh", cmd, cwd).spawn()?, live, timeout).await
         }
         Err(e) => Err(e),
     }
@@ -1167,6 +1171,11 @@ async fn host_shell_output_with_timeout(
     let mut child = tokio::process::Command::new("cmd")
         .args(["/C", cmd])
         .current_dir(cwd)
+        // step-7.1a / invariant 9: an inherited authority switch must not flow
+        // into the host-shell child and re-assert authority the session did not
+        // grant it.
+        .env_remove("NEWT_DISABLE_OCAP")
+        .env_remove("NEWT_FULL_ACCESS")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -6681,6 +6690,33 @@ mod tests {
         assert_eq!(
             pr_creation_url("see https://github.com/OWNER/REPO/issues/1"),
             None
+        );
+    }
+
+    /// step-7.1a / invariant 9: the host-shell child must NOT inherit the two
+    /// authority switches. An ambient `NEWT_DISABLE_OCAP=1` / `NEWT_FULL_ACCESS=1`
+    /// (from a wrapper/pod, or this process's own Yolo lane) would otherwise flow
+    /// into the child and let it re-assert authority the session did not grant.
+    /// `env_remove` marks the var absent in the child's env plan (`get_envs` →
+    /// `(key, None)`); this asserts both are so marked. Fails on any code path
+    /// that builds the child without the `env_remove` calls.
+    #[cfg(not(windows))]
+    #[test]
+    fn host_shell_command_strips_authority_env() {
+        let c = host_shell_command("bash", "true", "/tmp");
+        let removed: Vec<String> = c
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            removed.iter().any(|k| k == "NEWT_DISABLE_OCAP"),
+            "NEWT_DISABLE_OCAP not stripped from the child; env plan: {removed:?}"
+        );
+        assert!(
+            removed.iter().any(|k| k == "NEWT_FULL_ACCESS"),
+            "NEWT_FULL_ACCESS not stripped from the child; env plan: {removed:?}"
         );
     }
 
