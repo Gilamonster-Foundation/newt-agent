@@ -89,7 +89,8 @@ async fn http_json_response_lists_and_calls_tools() {
     );
     let entry = http_entry(format!("{}/mcp", server.uri()), headers);
 
-    let mut connected = connect_http(&entry, &newt_core::caveats::Caveats::top())
+    let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
+    let mut connected = connect_http(&admitted, &newt_core::caveats::Caveats::top())
         .await
         .expect("connect_http should succeed");
     assert_eq!(connected.name, "test-http");
@@ -126,7 +127,8 @@ async fn http_sse_response_is_parsed() {
         .await;
 
     let entry = http_entry(format!("{}/mcp", server.uri()), BTreeMap::new());
-    let connected = connect_http(&entry, &newt_core::caveats::Caveats::top())
+    let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
+    let connected = connect_http(&admitted, &newt_core::caveats::Caveats::top())
         .await
         .expect("connect_http (SSE) should succeed");
     assert_eq!(connected.tools.len(), 1);
@@ -144,7 +146,8 @@ async fn http_error_status_surfaces() {
         .await;
 
     let entry = http_entry(format!("{}/mcp", server.uri()), BTreeMap::new());
-    let err = connect_http(&entry, &newt_core::caveats::Caveats::top())
+    let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
+    let err = connect_http(&admitted, &newt_core::caveats::Caveats::top())
         .await
         .err()
         .expect("500 must surface as an error");

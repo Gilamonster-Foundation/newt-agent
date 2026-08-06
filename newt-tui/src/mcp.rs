@@ -331,7 +331,18 @@ impl Mcp {
             // GET event-stream + POST endpoint) is not implemented; modern
             // servers use streamable-HTTP (`type: "http"`).
             let result = match entry.transport {
-                TransportKind::Stdio => connect_stdio(entry, caveats).await,
+                // step-1.1: admission gate before spawn. An untrusted repo
+                // overlay (`.mcp.json` / project config) with no approval is
+                // refused here, not connected. (The interactive approval path
+                // is a follow-up; until then untrusted fails closed.)
+                TransportKind::Stdio => match newt_core::mcp::admit(entry) {
+                    Ok(admitted) => connect_stdio(&admitted, caveats).await,
+                    Err(denied) => {
+                        tracing::warn!("MCP server `{}` not admitted: {denied}", entry.name);
+                        statuses.push((entry.name.clone(), McpStatus::Skipped(denied.to_string())));
+                        continue;
+                    }
+                },
                 TransportKind::Http => {
                     // #1156: net-gate egress. A loopback host is the dev
                     // exception (never leaves the box); any other host must be
@@ -368,7 +379,17 @@ impl Mcp {
                     // #1243 Leg 4: route the HTTP client through the session's
                     // egress proxy so per-call traffic + redirects are net-gated,
                     // not just the connect-time host (#1156).
-                    connect_http(&enriched, caveats).await
+                    // step-1.1: admit the enriched clone (same trust as the
+                    // source entry) before dialing.
+                    match newt_core::mcp::admit(&enriched) {
+                        Ok(admitted) => connect_http(&admitted, caveats).await,
+                        Err(denied) => {
+                            tracing::warn!("MCP server `{}` not admitted: {denied}", entry.name);
+                            statuses
+                                .push((entry.name.clone(), McpStatus::Skipped(denied.to_string())));
+                            continue;
+                        }
+                    }
                 }
                 TransportKind::Sse => {
                     tracing::warn!(

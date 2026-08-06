@@ -963,7 +963,14 @@ async fn finish_connect(
 /// Connect to one discovered **stdio** server: spawn (confined by `caveats`),
 /// initialize, list tools. The child runs inside the session's OCAP boundary —
 /// see [`StdioTransport::spawn`].
-pub async fn connect_stdio(entry: &McpServerEntry, caveats: &Caveats) -> Result<ConnectedServer> {
+pub async fn connect_stdio(
+    admitted: &newt_core::mcp::AdmittedServer<'_>,
+    caveats: &Caveats,
+) -> Result<ConnectedServer> {
+    // step-1.1: the caller proved admission at the `admit()` gate — an
+    // un-admitted server cannot be spawned because there is no other way to
+    // obtain an `AdmittedServer`.
+    let entry = admitted.entry();
     if entry.transport != TransportKind::Stdio {
         return Err(anyhow!(
             "server `{}`: connect_stdio called for a non-stdio transport",
@@ -993,7 +1000,12 @@ pub async fn connect_stdio(entry: &McpServerEntry, caveats: &Caveats) -> Result<
 /// through the loopback egress proxy, so EVERY request and redirect is subject
 /// to the per-host allow-list — not just the one connect-time host check
 /// (#1156). A non-granted host is refused per-call.
-pub async fn connect_http(entry: &McpServerEntry, caveats: &Caveats) -> Result<ConnectedServer> {
+pub async fn connect_http(
+    admitted: &newt_core::mcp::AdmittedServer<'_>,
+    caveats: &Caveats,
+) -> Result<ConnectedServer> {
+    // step-1.1: admission proven at the gate (see `connect_stdio`).
+    let entry = admitted.entry();
     if entry.transport != TransportKind::Http {
         return Err(anyhow!(
             "server `{}`: connect_http called for a non-http transport",
@@ -1145,11 +1157,23 @@ impl McpToolset {
         );
         let mut servers = Vec::new();
         for entry in &entries {
+            // step-1.1: admission gate FIRST. Headless has no interactive
+            // approval path, so an untrusted (repo-shipped `.mcp.json` /
+            // `~/.claude.json` / project overlay) or disabled server is refused
+            // here — before any spawn or dial — closing the previous gap where
+            // this planner (unlike the TUI) connected every discovered entry.
+            let admitted = match newt_core::mcp::admit(entry) {
+                Ok(a) => a,
+                Err(denied) => {
+                    tracing::warn!("MCP server `{}` not admitted: {denied}", entry.name);
+                    continue;
+                }
+            };
             let result = match entry.transport {
-                TransportKind::Stdio => connect_stdio(entry, caveats).await,
+                TransportKind::Stdio => connect_stdio(&admitted, caveats).await,
                 TransportKind::Http => {
                     warn_on_insecure_transport(entry);
-                    connect_http(entry, caveats).await
+                    connect_http(&admitted, caveats).await
                 }
                 TransportKind::Sse => {
                     tracing::warn!(

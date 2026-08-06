@@ -40,6 +40,9 @@ wiremock.workspace = true
 # `test-util` (not in tokio's `full`) enables the paused virtual clock used to
 # test the per-request timeout deterministically, with no real wall-clock.
 tokio = { workspace = true, features = ["test-util"] }
+# Real-resource integration tier only (tests/headless_admission_gate.rs): a real
+# workspace dir + spawn-side-effect marker that grounds the mocked admit() gate.
+tempfile.workspace = true
 
 [lints]
 workspace = true
