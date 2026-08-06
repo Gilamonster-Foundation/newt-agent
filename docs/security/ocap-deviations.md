@@ -177,13 +177,20 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   (`fs_cap_object_bound.rs`) ground the object-bound `mkdir -p`. `edit_file_symlink_under_workspace_escaping_is_denied`
   (`tools.rs`, step-52.5) proves BOTH the read of `existing` (which could leak an outside file's head
   on a no-match) and the write are object-bound beneath the `fs_write` root — the escape is denied and
-  the outside file is left unchanged (verified red→green). The existing
-  `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) still pins the *unrewired* arms
-  (`find`, `delete_file`, `patch.rs`) so they can't silently widen.
+  the outside file is left unchanged (verified red→green). `delete_file_symlink_under_workspace_escaping_is_denied`
+  (`tools.rs`, step-52.6) proves the removal is object-bound via `unlinkat` on the resolved parent — a
+  symlink-escape delete is denied and the outside file survives (before the rewire `remove_file`
+  followed the intermediate symlink and deleted outside); `unlink_removes_a_contained_file` /
+  `unlink_denies_a_symlink_escape_parent` (`fs_cap_object_bound.rs`) ground the primitive. `find`'s
+  recursive-read root is now object-bound to the workspace (replacing its canonicalize-`starts_with`
+  TOCTOU; `find_refuses_root_outside_workspace` + `find_does_not_follow_symlinks_out_of_workspace`
+  pin it). The existing `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) still
+  pins the last unrewired primitive (`patch.rs`) so it can't silently widen.
 - **Status:** OPEN (lexical containment landed #502; object-bound `WorkspaceDir` resolver landed
-  step-52.1; **read_file — 52.2; list_dir — 52.3; write_file (+ `mkdir -p`) — 52.4; edit_file — 52.5**;
-  the remaining `find` + `delete_file` + `patch.rs` primitives + the non-Linux fallback are pending,
-  after which #522 closes) · review-by: with `b1` OS-sandbox work (#84)
+  step-52.1; **read_file — 52.2; list_dir — 52.3; write_file (+ `mkdir -p`) — 52.4; edit_file — 52.5;
+  delete_file (+ object-bound `unlink`) + find root — 52.6**; only the `newt-tools` `patch.rs` write
+  primitives + the non-Linux fallback remain, after which #522 closes) · review-by: with `b1`
+  OS-sandbox work (#84)
 
 ### acp-worker-fs-scope
 - **Invariant (ideal):** no production ACP/coder worker holds `fs_write = Scope::All`; every

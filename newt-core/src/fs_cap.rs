@@ -51,7 +51,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path};
 
-use rustix::fs::{mkdirat, open, openat2, Mode, OFlags, ResolveFlags};
+use rustix::fs::{mkdirat, open, openat2, unlinkat, AtFlags, Mode, OFlags, ResolveFlags};
 
 /// A capability handle to a workspace root directory. Every method resolves its
 /// relative path argument *beneath* the held root fd; a path that would escape is
@@ -147,6 +147,27 @@ impl WorkspaceDir {
             cur = child;
         }
         Ok(())
+    }
+
+    /// Remove a file entry, contained beneath the root. The **parent** directory
+    /// is resolved object-bound (a symlink / `..` in the parent path is refused),
+    /// then the final component is removed with `unlinkat` relative to the parent
+    /// fd — so the removal cannot be redirected outside the root, and a symlink at
+    /// the final component is removed *as the link* (its target is not followed).
+    /// Refuses directories (use a dedicated call if directory removal is needed).
+    pub fn unlink(&self, rel: &Path) -> io::Result<()> {
+        let name = rel
+            .file_name()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let parent = rel.parent().unwrap_or(Path::new(""));
+        // The directory the entry lives in — the root itself for a bare filename,
+        // else an object-bound resolve of the parent path.
+        let parent_dir: OwnedFd = if parent.as_os_str().is_empty() {
+            self.root.try_clone()?
+        } else {
+            self.resolve(parent, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?
+        };
+        unlinkat(&parent_dir, Path::new(name), AtFlags::empty()).map_err(io::Error::from)
     }
 
     /// Open a subdirectory as its own contained [`WorkspaceDir`]. Traversal stays
