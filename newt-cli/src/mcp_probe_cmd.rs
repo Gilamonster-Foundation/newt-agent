@@ -644,7 +644,16 @@ async fn probe_stdio(
         };
         let cmdline = render_cmdline(command, &candidate);
         eprintln!("probing `{cmdline}` …");
-        match newt_mcp_client::connect_stdio(&entry, caveats).await {
+        // step-1.1: even an explicit probe goes through the admission gate; an
+        // operator-typed entry is trusted, so this admits.
+        let admitted = match newt_core::mcp::admit(&entry) {
+            Ok(a) => a,
+            Err(d) => {
+                failures.push((cmdline, format!("not admitted: {d}")));
+                continue;
+            }
+        };
+        match newt_mcp_client::connect_stdio(&admitted, caveats).await {
             Ok(server) => {
                 return Ok(outcome_from_connection(
                     entry,
@@ -699,7 +708,10 @@ async fn probe_url(
         trust: McpTrust::Trusted,
     };
     eprintln!("probing {url} …");
-    match newt_mcp_client::connect_http(&entry, &caveats).await {
+    // step-1.1: admission gate (operator-typed entry is trusted → admits).
+    let admitted = newt_core::mcp::admit(&entry)
+        .map_err(|d| anyhow::anyhow!("MCP server not admitted: {d}"))?;
+    match newt_mcp_client::connect_http(&admitted, &caveats).await {
         Ok(server) => Ok(outcome_from_connection(
             entry,
             args.name.as_deref(),

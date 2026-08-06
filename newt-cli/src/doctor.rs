@@ -134,7 +134,16 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     for s in &servers {
         match s.transport {
             newt_core::mcp::TransportKind::Stdio => {
-                match newt_mcp_client::connect_stdio(s, &mcp_caveats).await {
+                // step-1.1: admission gate — doctor does not spawn an untrusted
+                // or disabled server; it reports the refusal instead.
+                let admitted = match newt_core::mcp::admit(s) {
+                    Ok(a) => a,
+                    Err(denied) => {
+                        println!("  · {} — not admitted: {denied}", s.name);
+                        continue;
+                    }
+                };
+                match newt_mcp_client::connect_stdio(&admitted, &mcp_caveats).await {
                     Ok(connected) => {
                         let names: Vec<&str> =
                             connected.tools.iter().map(|t| t.name.as_str()).collect();

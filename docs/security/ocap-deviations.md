@@ -71,6 +71,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `fs-canonical-containment` | canonicalize-then-contain (`openat2`) | 🟠 high | cross-voice shared-fs seeding |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
 | `mcp-under-leash` | MCP calls under the Caveats leash | 🟠 high | MCP tools holding/forwarding secrets |
+| `mcp-config-admission` | untrusted/disabled MCP config cannot spawn or dial | 🟢 closed (fail-closed) | admitting an untrusted server without out-of-repo approval |
 | `acp-worker-fs-scope` | model write target contained to the workspace (object-bound) | 🟠→🟡 | untrusted worker with write access on an unsandboxed host |
 
 ### b1-os-isolation
@@ -183,8 +184,51 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   and `is_workspace_contained_rejects_escapes` (`newt-tools/src/patch.rs`) drive real absolute/`..`
   targets through the primitives and assert denial + no outside write — a regression to a raw
   `join` fails them.
-- **Status:** PARTIAL (primitive containment landed — step-4.1) · owner: — · review-by: with
+- **Status:** OPEN — partial (primitive containment landed — step-4.1; full closure still needs
+  both the `Scope::All` caveat attenuation (step-4.2) and the object-bound `WorkspaceDir` resolve
+  (#522/step-52.x), so the invariant is not yet enforced end-to-end) · owner: — · review-by: with
   `fs-canonical-containment` (#522) + the ACP caveat fence (step-4.2)
+
+### mcp-config-admission
+- **Invariant (ideal):** repository-controlled configuration cannot cause a process spawn or a
+  network dial without an approval decision made *outside* the repository. An MCP server entry
+  discovered from an untrusted origin (a cloned repo's `.mcp.json`, `~/.claude.json`, or a
+  walked-up project `.newt/config.toml`, all stamped `McpTrust::Untrusted` by
+  `newt_core::mcp::discover`), or any entry with `enabled = false`, is refused **before** any
+  transport is constructed — never spawned, never dialled.
+- **Practical caveat (now):** there is no interactive "approve this untrusted server" path yet, so
+  an untrusted MCP entry is *always* refused (fail-closed) rather than promotable to admitted. The
+  only servers that connect are `McpTrust::Trusted` ones — a newt-owned `~/.newt/config.toml` /
+  `~/.newt/mcp.toml` the operator controls outside any cloned repo. This is the conservative end of
+  the invariant (invariant #9: unsupported enforcement fails closed for untrusted origins), not a
+  gap.
+- **Mechanism:** one gate, `newt_core::mcp::admit(&McpServerEntry) -> Result<AdmittedServer<'_>,
+  AdmissionDenied>`, decides `enabled && Trusted` at a single site and returns a witness
+  (`AdmittedServer`, private field — unconstructable except by a successful `admit`). The four
+  public transport entry points — `newt_mcp_client::{connect_stdio, connect_http}` and both
+  planners (`McpToolset::connect` headless, `newt_tui::mcp::Mcp::connect` interactive) — take
+  `&AdmittedServer`, so a `connect_*` on an un-admitted entry **does not compile**: the bug is
+  unrepresentable, not merely unhit. Previously the headless planner connected *every* discovered
+  entry (the interactive one already checked `enabled` but not trust), so a cloned repo shipping a
+  `.mcp.json` could spawn an arbitrary subprocess on first agent turn — the closed vector.
+- **Residual:** 🟢 closed for the spawn/dial vector. Remaining scope is *feature*, not exposure: no
+  path yet promotes an untrusted server to admitted via an out-of-repo approval (would need a
+  signed operator decision, per `sod-proposer-not-worker`'s spirit). Post-admission call-time
+  leashing of the connected server is the separate, still-open `mcp-under-leash`.
+- **Disabled while open:** admitting an untrusted server without an out-of-repo approval (there is
+  no such path — untrusted stays refused).
+- **Closure criterion:** met — the gate decides at one site, the witness type makes an un-admitted
+  `connect_*` uncompilable, and both the decision and the wired planner behaviour are proven by
+  executable tests.
+- **Ratchet guard:** `admit_denies_untrusted_and_disabled_admits_trusted`
+  (`newt-core/src/mcp.rs`, mocked unit tier) proves the gate *decides* deny for untrusted + disabled
+  and admit for trusted; `headless_planner_never_spawns_an_untrusted_server`
+  (`newt-mcp-client/tests/headless_admission_gate.rs`, real-resource tier, grounds the mocked gate)
+  drives `McpToolset::connect` over an untrusted stdio entry whose command would `touch` a marker
+  and asserts the marker never appears — proving the wired planner *acts* on the deny by never
+  launching the process. Neutering the gate re-creates the marker (verified red→green).
+- **Status:** CLOSED (fail-closed) — step-1.1 · owner: — · review-by: revisit if/when an
+  out-of-repo untrusted-server approval path is designed.
 
 > `exec-behavior-bound`, `mcp-under-leash` — full entries to be filled as those land; each is
 > **disabled-while-open bounded by `b1`** (the OS sandbox is the backstop for

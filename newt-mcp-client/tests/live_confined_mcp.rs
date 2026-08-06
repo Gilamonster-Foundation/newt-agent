@@ -55,7 +55,9 @@ async fn confined_stdio_server_connects_lists_and_calls() {
     // child tests; here the point is that the confined transport works E2E.
     let caveats = Caveats::top();
 
-    let mut connected = newt_mcp_client::connect_stdio(&entry, &caveats)
+    // step-1.1: connect through the admission gate (the test entry is trusted).
+    let admitted = newt_core::mcp::admit(&entry).expect("test entry is trusted → admitted");
+    let mut connected = newt_mcp_client::connect_stdio(&admitted, &caveats)
         .await
         .expect("confined connect_stdio should spawn + initialize + list tools");
 
