@@ -1,0 +1,12 @@
+# The same preset as Hermes-style YAML — both formats load from
+# ~/.newt/providers/. A full copied ~/.hermes/config.yaml also works: its
+# custom_providers blocks each become a preset (inline api_key values are
+# NEVER loaded — export the env var or paste at `newt setup`).
+display_name: Acme Inference
+description: Acme — OpenAI-compatible direct API
+signup_url: https://acme.example.com/keys
+env_vars: [ACME_API_KEY]
+base_url: https://api.acme.example.com/v1
+api_mode: chat_completions
+auth_type: api_key
+fallback_models: [acme-large-v3, acme-small-fast]

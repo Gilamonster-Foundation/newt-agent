@@ -1,0 +1,12 @@
+# Example provider preset (newt TOML). Copy to ~/.newt/providers/<name>.toml —
+# the filename stem becomes the preset name. Field names mirror Hermes Agent's
+# ProviderProfile, so a Hermes provider definition transposes field-for-field.
+# See docs/provider-presets.md (NOT the same thing as [[providers]] plugins).
+display_name = "Acme Inference"
+description = "Acme — OpenAI-compatible direct API"
+signup_url = "https://acme.example.com/keys"
+env_vars = ["ACME_API_KEY"]
+base_url = "https://api.acme.example.com/v1"
+api_mode = "chat_completions"
+auth_type = "api_key"
+fallback_models = ["acme-large-v3", "acme-small-fast"]

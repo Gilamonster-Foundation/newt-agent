@@ -457,21 +457,84 @@ pub fn builtin_presets() -> Vec<ProviderPreset> {
 // Drop-in loading (TOML + Hermes YAML) and merging
 // ---------------------------------------------------------------------------
 
-/// The `custom_providers:` block shape inside a Hermes `config.yaml`.
-/// Shared with the `newt providers import-hermes` CLI.
+/// One provider entry from a Hermes `config.yaml` — the field set Hermes'
+/// own `_normalize_custom_provider_entry` accepts (verified against the
+/// hermes-agent source), including its camelCase and alias spellings.
+/// Shared with the `newt providers import-hermes` CLI. Unknown fields are
+/// tolerated (Hermes carries many runtime knobs newt doesn't need).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct HermesCustomProvider {
+pub struct HermesProviderEntry {
+    /// Legacy list entries carry the name inline; map entries use the key.
+    pub name: Option<String>,
+    #[serde(alias = "url", alias = "baseUrl")]
     pub base_url: String,
     /// NEVER loaded into newt config — see [`expand_hermes_config`].
+    #[serde(alias = "apiKey")]
     pub api_key: Option<String>,
-    pub allowed_models: Vec<String>,
+    /// The env var holding the key — maps directly onto `env_vars`.
+    #[serde(alias = "api_key_env", alias = "keyEnv", alias = "apiKeyEnv")]
+    pub key_env: Option<String>,
+    #[serde(alias = "apiMode")]
+    pub api_mode: Option<ApiMode>,
+    /// A single pinned model.
+    #[serde(alias = "defaultModel", alias = "default_model")]
+    pub model: Option<String>,
+    /// A model whitelist (`models` in Hermes' schema; `allowed_models` in
+    /// some documentation) — becomes `fallback_models`.
+    #[serde(alias = "allowed_models")]
+    pub models: Vec<String>,
+    /// Carried onto `default_headers` (limitation L1 — not yet sent).
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+/// Both container shapes Hermes accepts: the legacy `custom_providers:`
+/// LIST of entries, and the v12+ `providers:` keyed MAP (some docs also
+/// show `custom_providers` as a map — accepted too).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum HermesProviderBlock {
+    List(Vec<HermesProviderEntry>),
+    Map(BTreeMap<String, HermesProviderEntry>),
+}
+
+impl Default for HermesProviderBlock {
+    fn default() -> Self {
+        Self::List(Vec::new())
+    }
+}
+
+impl HermesProviderBlock {
+    /// Normalize to (name, entry) pairs; a map key wins over an inline name,
+    /// mirroring Hermes' own `providers_dict_to_custom_providers`.
+    pub fn entries(&self) -> Vec<(String, HermesProviderEntry)> {
+        match self {
+            Self::List(list) => list
+                .iter()
+                .filter_map(|e| {
+                    let name = e.name.as_deref()?.trim().to_string();
+                    (!name.is_empty()).then(|| (name, e.clone()))
+                })
+                .collect(),
+            Self::Map(map) => map.iter().map(|(k, e)| (k.clone(), e.clone())).collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::List(l) => l.is_empty(),
+            Self::Map(m) => m.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct HermesConfigYaml {
-    custom_providers: BTreeMap<String, HermesCustomProvider>,
+    /// The legacy on-disk block.
+    custom_providers: HermesProviderBlock,
+    /// The v12+ keyed schema.
+    providers: HermesProviderBlock,
 }
 
 /// Synthesize the conventional env-var name for a provider id
@@ -491,34 +554,53 @@ pub fn synthesized_env_var(name: &str) -> String {
     var
 }
 
-/// Expand a Hermes `custom_providers:` map into presets. Hermes custom
-/// providers are OpenAI-compatible by definition (documented assumption).
-/// Inline `api_key` values are reported back (so callers can print the
-/// export-or-paste instruction) and NEVER placed anywhere in the output.
+/// Expand Hermes provider entries into presets. Hermes custom providers
+/// default to the OpenAI-compatible wire. Inline `api_key` values are
+/// reported back (so callers can print the export-or-paste instruction) and
+/// NEVER placed anywhere in the output; a `key_env` reference maps straight
+/// onto `env_vars`.
 pub fn expand_hermes_config(
-    custom_providers: &BTreeMap<String, HermesCustomProvider>,
+    entries: &[(String, HermesProviderEntry)],
 ) -> (
     Vec<ProviderPreset>,
     Vec<String /* names with inline keys */>,
 ) {
     let mut presets = Vec::new();
     let mut keyed = Vec::new();
-    for (id, cp) in custom_providers {
+    for (id, cp) in entries {
         if cp.base_url.trim().is_empty() {
-            tracing::warn!(provider = %id, "hermes custom_provider has no base_url — skipped");
+            tracing::warn!(provider = %id, "hermes provider entry has no base_url — skipped");
             continue;
         }
         if cp.api_key.as_deref().is_some_and(|k| !k.trim().is_empty()) {
             keyed.push(id.clone());
         }
+        let env_var = cp
+            .key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| synthesized_env_var(id));
+        // `model` (a single pin) leads; `models` (whitelist) follows.
+        let mut fallback_models: Vec<String> = Vec::new();
+        if let Some(model) = cp.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            fallback_models.push(model.to_string());
+        }
+        for m in &cp.models {
+            if !fallback_models.contains(m) {
+                fallback_models.push(m.clone());
+            }
+        }
         presets.push(ProviderPreset {
             name: id.clone(),
             display_name: Some(id.clone()),
-            description: Some("imported from Hermes custom_providers".to_string()),
+            description: Some("imported from Hermes providers config".to_string()),
             base_url: cp.base_url.trim().to_string(),
-            api_mode: ApiMode::ChatCompletions,
-            env_vars: vec![synthesized_env_var(id)],
-            fallback_models: cp.allowed_models.clone(),
+            api_mode: cp.api_mode.unwrap_or_default(),
+            env_vars: vec![env_var],
+            fallback_models,
+            default_headers: cp.extra_headers.clone(),
             ..Default::default()
         });
     }
@@ -544,8 +626,10 @@ pub fn parse_preset_file(stem: &str, ext: &str, body: &str) -> Result<Vec<Provid
             // A full copied Hermes config.yaml first (detected by its
             // custom_providers key), else a bare ProviderPreset mapping.
             if let Ok(hermes) = serde_yaml::from_str::<HermesConfigYaml>(body) {
-                if !hermes.custom_providers.is_empty() {
-                    let (presets, keyed) = expand_hermes_config(&hermes.custom_providers);
+                if !hermes.custom_providers.is_empty() || !hermes.providers.is_empty() {
+                    let mut entries = hermes.custom_providers.entries();
+                    entries.extend(hermes.providers.entries());
+                    let (presets, keyed) = expand_hermes_config(&entries);
                     for name in keyed {
                         tracing::warn!(
                             provider = %name,
@@ -905,6 +989,45 @@ custom_providers:
         // The key never lands anywhere in the parsed output.
         let dumped = format!("{presets:?}");
         assert!(!dumped.contains("SHOULD-NEVER-SURFACE"));
+    }
+
+    #[test]
+    fn hermes_legacy_list_and_v12_map_shapes_both_expand() {
+        // Verified against hermes-agent's own config normalizer: legacy
+        // `custom_providers` is a LIST of entries (inline `name`), v12+
+        // `providers` is a keyed MAP with `key_env`/`extra_headers`; both
+        // (plus camelCase aliases) must expand.
+        let body = r#"
+custom_providers:
+  - name: "legacy-one"
+    base_url: "http://box:8000/v1"
+    key_env: "LEGACY_ONE_KEY"
+    model: "pinned-model"
+    models: ["pinned-model", "second-model"]
+providers:
+  my-proxy:
+    baseUrl: "https://llm.internal.example.com/v1"
+    apiKeyEnv: "MY_PROXY_API_KEY"
+    extra_headers:
+      CF-Access-Client-Id: "xxxx.access"
+"#;
+        let presets = parse_preset_file("config", "yaml", body).unwrap();
+        assert_eq!(presets.len(), 2);
+        let legacy = presets.iter().find(|p| p.name == "legacy-one").unwrap();
+        assert_eq!(legacy.env_vars, vec!["LEGACY_ONE_KEY"], "key_env maps");
+        assert_eq!(
+            legacy.fallback_models,
+            vec!["pinned-model", "second-model"],
+            "model pin leads, whitelist follows, deduped"
+        );
+        let proxy = presets.iter().find(|p| p.name == "my-proxy").unwrap();
+        assert_eq!(proxy.base_url, "https://llm.internal.example.com/v1");
+        assert_eq!(proxy.env_vars, vec!["MY_PROXY_API_KEY"], "camelCase alias");
+        assert_eq!(
+            proxy.default_headers.get("CF-Access-Client-Id").unwrap(),
+            "xxxx.access",
+            "extra_headers carried (L1)"
+        );
     }
 
     #[test]
