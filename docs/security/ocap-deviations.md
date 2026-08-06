@@ -68,7 +68,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `b1-os-isolation` | OS isolation + egress proxy | 🔴 critical | live credentials, untrusted-remote voices |
 | `disclosure-gate-live-path` | output filtered before it reaches the model | 🔴 critical | seeding any secret-bearing file readable by the worker |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
-| `fs-canonical-containment` | canonicalize-then-contain (`openat2`) | 🟠 high | cross-voice shared-fs seeding |
+| `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`) | 🟢 closed (Linux) | (non-Linux lexical fallback) |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
 | `mcp-under-leash` | MCP calls under the Caveats leash | 🟠 high | MCP tools holding/forwarding secrets |
 | `mcp-config-admission` | untrusted/disabled MCP config cannot spawn or dial | 🟢 closed (fail-closed) | admitting an untrusted server without out-of-repo approval |
@@ -184,13 +184,18 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `unlink_denies_a_symlink_escape_parent` (`fs_cap_object_bound.rs`) ground the primitive. `find`'s
   recursive-read root is now object-bound to the workspace (replacing its canonicalize-`starts_with`
   TOCTOU; `find_refuses_root_outside_workspace` + `find_does_not_follow_symlinks_out_of_workspace`
-  pin it). The existing `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) still
-  pins the last unrewired primitive (`patch.rs`) so it can't silently widen.
-- **Status:** OPEN (lexical containment landed #502; object-bound `WorkspaceDir` resolver landed
-  step-52.1; **read_file — 52.2; list_dir — 52.3; write_file (+ `mkdir -p`) — 52.4; edit_file — 52.5;
-  delete_file (+ object-bound `unlink`) + find root — 52.6**; only the `newt-tools` `patch.rs` write
-  primitives + the non-Linux fallback remain, after which #522 closes) · review-by: with `b1`
-  OS-sandbox work (#84)
+  pin it). The `newt-tools` applier primitives (`apply_whole_files` / `fuzzy` / `diffy`) read AND
+  write object-bound through one shared owner (`read_contained_opt` / `write_contained` +
+  `WorkspaceDir::rename`), proven by `apply_whole_files_denies_symlink_escape_object_bound`
+  (step-52.7). `tui_permits_path` is now documented as a lexical *pre-filter* (renamed
+  `tui_permits_path_is_a_lexical_prefilter_not_the_fence`) — the object-bound arms are the fence.
+- **Status:** CLOSED on Linux (step-52.7) — every read arm, write arm, and write primitive resolves
+  through `WorkspaceDir` (`openat2 RESOLVE_BENEATH`), so a symlink / `..` / absolute escape is
+  refused by the kernel at the open, not adjudicated by a normalized pathname; the lexical residual
+  (#502→#522) is structurally unreachable. **Residual:** the non-Linux fallback keeps the lexical
+  `std::fs` path (`openat2` is Linux-only) — bounded (CI + prod are Linux; the whole `fs_cap` module
+  is `#[cfg(target_os = "linux")]`), documented, and a future hardening (fail-closed-for-untrusted
+  on kernels without `openat2`, invariant #9). · review-by: with `b1` OS-sandbox work (#84)
 
 ### acp-worker-fs-scope
 - **Invariant (ideal):** no production ACP/coder worker holds `fs_write = Scope::All`; every
@@ -203,9 +208,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   reject any target whose relative path has a non-`Normal` component (absolute / `..`) *before*
   the `join`, at their one shared owner.
 - **Residual:** 🟠 high → 🟡 medium — the primitive containment closes the lexical absolute/`..`
-  escape on the default write paths; a symlink *under* the workspace still resolves out (that
-  residual is `fs-canonical-containment`/#522, closed by the object-bound `WorkspaceDir` resolver
-  in step-52.x). The `Scope::All` caveat itself is not yet attenuated.
+  escape on the default write paths, and the symlink-*under*-the-workspace escape is now **closed
+  too** (`fs-canonical-containment`/#522 CLOSED on Linux, step-52.7: `apply_whole_files`/`apply_patch`
+  write object-bound through `WorkspaceDir`). The one part that remains is the `Scope::All` caveat
+  itself not yet being attenuated (step-4.2) — so an untrusted worker still *nominally* holds
+  `fs_write = All`, though it can no longer escape the workspace object-bound-wise.
 - **Disabled while open:** a genuinely-untrusted model/worker with write access on an unsandboxed
   host (bounded by `b1`'s OS sandbox as backstop).
 - **Compensating controls:** the primitive containment (step-4.1, this deviation); the crew/plan

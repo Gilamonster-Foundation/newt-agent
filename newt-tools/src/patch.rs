@@ -164,6 +164,90 @@ fn escape_error(rel: &Path) -> anyhow::Error {
     )
 }
 
+/// Object-bound atomic write of `content` to `rel` beneath `workspace` — the one
+/// owner of the applier backends' write step. On Linux the target is resolved
+/// through the workspace root fd (`openat2 RESOLVE_BENEATH`), so a symlink *under*
+/// the workspace cannot redirect the write outside it — closing the residual the
+/// lexical [`is_workspace_contained`] leaves open (#522). Missing parents are
+/// created; a sibling temp is written then renamed (partial-write safety). The
+/// non-Linux fallback keeps the lexical-gate + `std::fs` temp-then-rename path.
+#[cfg(target_os = "linux")]
+fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Result<()> {
+    use newt_core::fs_cap::WorkspaceDir;
+    use std::io::Write;
+    let rel_path = Path::new(rel);
+    let dir = WorkspaceDir::open_root(workspace)?;
+    if let Some(parent) = rel_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            dir.create_dir_all(parent)?;
+        }
+    }
+    let tmp_rel = sibling_tmp(rel_path);
+    {
+        let mut f = dir.create(&tmp_rel)?;
+        f.write_all(content)?;
+    }
+    dir.rename(&tmp_rel, rel_path)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Result<()> {
+    let abs = workspace.join(rel);
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = abs.with_extension("newt-tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, &abs)?;
+    Ok(())
+}
+
+/// Object-bound read of `rel`'s current contents beneath `workspace` for a
+/// patch/whole-file apply — `None` if the file does not exist (a fresh create).
+/// A symlink-escape path is refused (not silently read from outside). Linux-only
+/// object-binding; non-Linux keeps `std::fs`.
+#[cfg(target_os = "linux")]
+fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<String>> {
+    use newt_core::fs_cap::WorkspaceDir;
+    use std::io::Read;
+    let dir = WorkspaceDir::open_root(workspace)?;
+    match dir.open(Path::new(rel)) {
+        Ok(mut f) => {
+            let mut s = String::new();
+            f.read_to_string(&mut s)?;
+            Ok(Some(s))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<String>> {
+    let abs = workspace.join(rel);
+    if abs.exists() {
+        Ok(Some(std::fs::read_to_string(&abs)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// A sibling temp path in the *same* parent as `rel` (so the atomic rename stays
+/// within one contained directory): `<parent>/<name>.newt-tmp`.
+#[cfg(target_os = "linux")]
+fn sibling_tmp(rel: &Path) -> std::path::PathBuf {
+    let mut name = rel
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("newt"))
+        .to_os_string();
+    name.push(".newt-tmp");
+    match rel.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(name),
+        _ => std::path::PathBuf::from(name),
+    }
+}
+
 /// The in-house fuzzy applier implementation (the default backend).
 fn fuzzy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
     let patches = parse_unified_diff(diff)?;
@@ -173,31 +257,22 @@ fn fuzzy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
     }
 
     // Validate all patches first so we don't partially apply.
-    let mut results: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut results: Vec<(String, String)> = Vec::new();
 
     for patch in &patches {
         if !is_workspace_contained(Path::new(&patch.path)) {
             return Err(escape_error(Path::new(&patch.path)));
         }
-        let file_path = root.join(&patch.path);
-        let original = if file_path.exists() {
-            std::fs::read_to_string(&file_path)?
-        } else {
-            String::new()
-        };
-
+        // Object-bound read of the original (a symlink-escape path is refused,
+        // not read from outside); absent file → fresh create.
+        let original = read_contained_opt(root, &patch.path)?.unwrap_or_default();
         let result = apply_hunks(&original, &patch.hunks)?;
-        results.push((file_path, result));
+        results.push((patch.path.clone(), result));
     }
 
-    // All patches validated — now write atomically.
-    for (file_path, content) in &results {
-        let tmp_path = file_path.with_extension("newt-tmp");
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&tmp_path, content)?;
-        std::fs::rename(&tmp_path, file_path)?;
+    // All patches validated — now write atomically, object-bound.
+    for (rel, content) in &results {
+        write_contained(root, rel, content.as_bytes())?;
     }
 
     Ok(())
@@ -239,17 +314,12 @@ where
     let mut written = Vec::new();
     for (rel, contents) in files {
         let rel = rel.into();
-        // Contain the attacker-controlled path BEFORE the join (step-4.1).
+        // Contain the attacker-controlled path BEFORE the join (step-4.1); the
+        // object-bound write (step-52.7) then also refuses a symlink escape.
         if !is_workspace_contained(Path::new(&rel)) {
             return Err(escape_error(Path::new(&rel)));
         }
-        let abs = workspace.join(&rel);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = abs.with_extension("newt-coder-tmp");
-        std::fs::write(&tmp, contents.as_ref())?;
-        std::fs::rename(&tmp, &abs)?;
+        write_contained(workspace, &rel, contents.as_ref().as_bytes())?;
         written.push(rel);
     }
     Ok(written)
@@ -270,7 +340,7 @@ fn diffy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
         anyhow::bail!("no file patches found in diff");
     }
 
-    let mut results: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut results: Vec<(String, String)> = Vec::new();
     for section in &sections {
         let patch = diffy::Patch::from_str(section)
             .map_err(|e| anyhow::anyhow!("diffy parse error: {e}"))?;
@@ -282,24 +352,15 @@ fn diffy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
         if !is_workspace_contained(Path::new(&rel)) {
             return Err(escape_error(Path::new(&rel)));
         }
-        let file_path = root.join(&rel);
-        let original = if file_path.exists() {
-            std::fs::read_to_string(&file_path)?
-        } else {
-            String::new()
-        };
+        // Object-bound read (symlink-escape refused); absent file → fresh create.
+        let original = read_contained_opt(root, &rel)?.unwrap_or_default();
         let patched = diffy::apply(&original, &patch)
             .map_err(|e| anyhow::anyhow!("diffy rejected patch for {rel}: {e}"))?;
-        results.push((file_path, patched));
+        results.push((rel, patched));
     }
 
-    for (file_path, content) in &results {
-        let tmp_path = file_path.with_extension("newt-tmp");
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&tmp_path, content)?;
-        std::fs::rename(&tmp_path, file_path)?;
+    for (rel, content) in &results {
+        write_contained(root, rel, content.as_bytes())?;
     }
     Ok(())
 }
@@ -757,6 +818,33 @@ mod tests {
         let ok = apply_whole_files(&ws, [("sub/ok.rs", "fine")]).unwrap();
         assert_eq!(ok, vec!["sub/ok.rs".to_string()]);
         assert!(ws.join("sub/ok.rs").exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn apply_whole_files_denies_symlink_escape_object_bound() {
+        // step-52.7 (#522 CLOSURE): a symlink UNDER the workspace pointing outside
+        // must not let the applier write through it — even though the lexical
+        // `is_workspace_contained` admits the Normal-component path `link/evil.rs`.
+        // Object-bound via openat2(RESOLVE_BENEATH); the outside file is untouched.
+        // This is the escape `is_workspace_contained` cannot see (the #522 residual),
+        // now closed. Verified red→green (neuter the resolve flags → the write lands
+        // outside).
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("evil.rs"), "original\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        let result = apply_whole_files(ws.path(), [("link/evil.rs".to_string(), "PWNED\n")]);
+        assert!(
+            result.is_err(),
+            "a symlink-escape write must be refused: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("evil.rs")).unwrap(),
+            "original\n",
+            "the outside file must be UNCHANGED — the write never escaped"
+        );
     }
 
     #[test]
