@@ -6313,6 +6313,11 @@ mod tests {
         assert_eq!(cfg.disclosure, MemoryDisclosure::Frozen);
     }
 
+    /// Serial: reads `user_config_dir()`, which honors NEWT_CONFIG_DIR — a
+    /// parallel serial-lane test pinning that var to a tempdir makes the
+    /// `.newt` parent assertion observe the tempdir instead (caught by the
+    /// slower Windows CI runner).
+    #[serial_test::serial(real_fs)]
     #[test]
     fn skill_search_dirs_defaults_to_single_newt_dir() {
         let cfg = Config::default();
@@ -6329,6 +6334,7 @@ mod tests {
     /// #1021 PR 5.2: `personas_dir()` is the sibling-of-config default
     /// `PersonaStore::default_dir()` (newt-tui) also resolves to — a headless
     /// caller gets the exact same location without depending on newt-tui.
+    #[serial_test::serial(real_fs)] // same NEWT_CONFIG_DIR-reader race as above
     #[test]
     fn personas_dir_is_a_sibling_of_the_newt_config_dir() {
         let dir = Config::personas_dir();
