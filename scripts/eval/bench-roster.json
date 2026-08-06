@@ -1,7 +1,11 @@
 {
  "roster": [
   {
-   "model": "nemotron-mini_4b",
+   "model": "nemotron-3-super",
+   "family": "nemotron"
+  },
+  {
+   "model": "nemotron-3-ultra",
    "family": "nemotron"
   },
   {
@@ -9,12 +13,28 @@
    "family": "nemotron"
   },
   {
-   "model": "nemotron_70b-instruct-q8_0",
-   "family": "nemotron"
+   "model": "deepseek-v4-pro",
+   "family": "deepseek"
   },
   {
-   "model": "nemotron-3-super_120b",
-   "family": "nemotron"
+   "model": "kimi-k2.7-code",
+   "family": "kimi"
+  },
+  {
+   "model": "kimi-linear_48b",
+   "family": "kimi"
+  },
+  {
+   "model": "gpt-oss_120b",
+   "family": "openai"
+  },
+  {
+   "model": "o4-mini",
+   "family": "openai"
+  },
+  {
+   "model": "gpt-4.1-mini",
+   "family": "openai"
   },
   {
    "model": "ornith-1.0-35b-q8",
@@ -33,40 +53,8 @@
    "family": "qwen"
   },
   {
-   "model": "qwen3-coder-next_latest",
-   "family": "qwen"
-  },
-  {
-   "model": "qwen2.5-coder_32b",
-   "family": "qwen"
-  },
-  {
    "model": "glm-4.7-flash",
    "family": "glm"
-  },
-  {
-   "model": "deepseek-coder-v2_16b",
-   "family": "deepseek"
-  },
-  {
-   "model": "deepseek-r1_32b",
-   "family": "deepseek"
-  },
-  {
-   "model": "gemma4_31b",
-   "family": "gemma"
-  },
-  {
-   "model": "kimi-dev_72b",
-   "family": "kimi"
-  },
-  {
-   "model": "gpt-4.1-mini",
-   "family": "openai"
-  },
-  {
-   "model": "o4-mini",
-   "family": "openai"
   }
  ]
 }

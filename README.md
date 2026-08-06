@@ -34,16 +34,10 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 | `nemotron-3-nano_30b`<br><sub>nemotron · tb-30 · ctx 65536 · v0.7.5 · 2026-07-29</sub> | 6.7% (2/30) | _pending_ |
 | `glm-4.7-flash`<br><sub>glm · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 3.3% (1/30) |
 | `gpt-4.1-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 0.0% (0/30) | 3.3% (1/30) |
-| `deepseek-coder-v2_16b`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
-| `deepseek-r1_32b`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
-| `gemma4_31b`<br><sub>gemma · queued</sub> | _queued_ | _queued_ |
-| `kimi-dev_72b`<br><sub>kimi · queued</sub> | _queued_ | _queued_ |
-| `nemotron-3-super_120b`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
-| `nemotron-mini_4b`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
-| `nemotron_70b-instruct-q8_0`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
+| `deepseek-v4-pro`<br><sub>deepseek · queued</sub> | _queued_ | _queued_ |
+| `kimi-k2.7-code`<br><sub>kimi · queued</sub> | _queued_ | _queued_ |
+| `nemotron-3-ultra`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
 | `ornith-1.0-397b-iq1_m`<br><sub>ornith · queued</sub> | _queued_ | _queued_ |
-| `qwen2.5-coder_32b`<br><sub>qwen · queued</sub> | _queued_ | _queued_ |
-| `qwen3-coder-next_latest`<br><sub>qwen · queued</sub> | _queued_ | _queued_ |
 
 <!-- BENCH-SCOREBOARD:END -->
 
