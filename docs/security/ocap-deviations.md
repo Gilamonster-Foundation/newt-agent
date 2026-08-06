@@ -174,13 +174,16 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   the *flip* of the old `..._mutates_under_existing_policy...` test: a confined `write_file` through a
   symlink-escape path is denied and the outside file is left unchanged (verified red→green) — plus
   `create_dir_all_makes_nested_dirs_beneath` / `create_dir_all_denies_a_symlink_escape_component`
-  (`fs_cap_object_bound.rs`) ground the object-bound `mkdir -p`. The existing
+  (`fs_cap_object_bound.rs`) ground the object-bound `mkdir -p`. `edit_file_symlink_under_workspace_escaping_is_denied`
+  (`tools.rs`, step-52.5) proves BOTH the read of `existing` (which could leak an outside file's head
+  on a no-match) and the write are object-bound beneath the `fs_write` root — the escape is denied and
+  the outside file is left unchanged (verified red→green). The existing
   `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) still pins the *unrewired* arms
-  (`find`, `edit_file`, `delete_file`, `patch.rs`) so they can't silently widen.
+  (`find`, `delete_file`, `patch.rs`) so they can't silently widen.
 - **Status:** OPEN (lexical containment landed #502; object-bound `WorkspaceDir` resolver landed
-  step-52.1; **read_file — 52.2; list_dir — 52.3; write_file (+ object-bound `mkdir -p`) — 52.4**;
-  the remaining `find` + `edit_file` + `delete_file` + `patch.rs` primitives + the non-Linux fallback
-  are pending, after which #522 closes) · review-by: with `b1` OS-sandbox work (#84)
+  step-52.1; **read_file — 52.2; list_dir — 52.3; write_file (+ `mkdir -p`) — 52.4; edit_file — 52.5**;
+  the remaining `find` + `delete_file` + `patch.rs` primitives + the non-Linux fallback are pending,
+  after which #522 closes) · review-by: with `b1` OS-sandbox work (#84)
 
 ### acp-worker-fs-scope
 - **Invariant (ideal):** no production ACP/coder worker holds `fs_write = Scope::All`; every
