@@ -24,7 +24,7 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 
 | Model | OCAP off | OCAP on |
 |-------|----------|---------|
-| `deepseek-v4-pro`<br><sub>deepseek · tb-30 · ctx 65536 · v0.8.0 · 2026-08-06</sub> | 56.7% (17/30) | _pending_ |
+| `deepseek-v4-pro`<br><sub>deepseek · tb-30 · ctx 65536 · v0.8.0 · 2026-08-06</sub> | 56.7% (17/30) | 50.0% (15/30) |
 | `nemotron-3-super`<br><sub>nemotron · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 36.7% (11/30) | 26.7% (8/30) |
 | `ornith-1.0-35b-q8`<br><sub>ornith · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | _pending_ | 36.7% (11/30) |
 | `qwen3.6_35b`<br><sub>qwen · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | 20.0% (6/30) | 26.7% (8/30) |
