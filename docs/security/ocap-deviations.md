@@ -162,10 +162,14 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   real `..`, absolute, in-tree-relative-symlink-escape, and absolute-symlink-escape paths through
   `WorkspaceDir` and asserts denial, with an explicit contrast test proving the object resolver
   denies exactly what a lexical `starts_with` admits — neutering the resolve flags fails 5 of the
-  8 (verified red→green). The existing `tui_permits_path_symlink_escape_is_the_known_residual`
-  (`tools.rs`) still pins the *unrewired* gap so it can't silently widen before 52.2/52.3.
+  8 (verified red→green). `read_file_symlink_under_workspace_escaping_is_denied` (`tools.rs`,
+  step-52.2, real-fs tier) drives a confined `read_file` over a symlink-escape path and asserts the
+  read is *denied* rather than exfiltrating the outside file (fails on the pre-rewire arm — verified
+  red→green). The existing `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) still
+  pins the *unrewired* arms (list_dir / find / write) so they can't silently widen before 52.3.
 - **Status:** OPEN (lexical containment landed #502; object-bound `WorkspaceDir` resolver landed
-  step-52.1; consumer rewire of the fs arms + write primitives pending — step-52.2/52.3, #522) ·
+  step-52.1; **read_file arm rewired onto it — step-52.2**; the remaining read arms (list_dir, find)
+  + the write arms/primitives + the non-Linux fallback are pending — step-52.3, #522) ·
   review-by: with `b1` OS-sandbox work (#84)
 
 ### acp-worker-fs-scope
