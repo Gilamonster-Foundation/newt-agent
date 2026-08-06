@@ -71,6 +71,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `fs-canonical-containment` | canonicalize-then-contain (`openat2`) | 🟠 high | cross-voice shared-fs seeding |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
 | `mcp-under-leash` | MCP calls under the Caveats leash | 🟠 high | MCP tools holding/forwarding secrets |
+| `acp-worker-fs-scope` | model write target contained to the workspace (object-bound) | 🟠→🟡 | untrusted worker with write access on an unsandboxed host |
 
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
@@ -155,6 +156,35 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   can't silently widen and so closing it is a visible, test-driven flip.
 - **Status:** OPEN (lexical containment landed; symlink resolution pending — issue #522) ·
   review-by: with `b1` OS-sandbox work (#84)
+
+### acp-worker-fs-scope
+- **Invariant (ideal):** no production ACP/coder worker holds `fs_write = Scope::All`; every
+  model-supplied write target is object-bound to the session workspace before any `join`, so a
+  path with an absolute or `..` component cannot resolve outside the fence.
+- **Practical caveat (now):** the default operator worker's `fs_write` is `Scope::All`
+  (`newt-acp-worker/src/identity.rs`), so `permits_fs_write` admits any target; containment is
+  enforced at the two shared write primitives — `apply_whole_files` (the `Emission::WholeFiles`
+  landing) and `apply_patch` (the unified-diff path) in `newt-tools/src/patch.rs` — which now
+  reject any target whose relative path has a non-`Normal` component (absolute / `..`) *before*
+  the `join`, at their one shared owner.
+- **Residual:** 🟠 high → 🟡 medium — the primitive containment closes the lexical absolute/`..`
+  escape on the default write paths; a symlink *under* the workspace still resolves out (that
+  residual is `fs-canonical-containment`/#522, closed by the object-bound `WorkspaceDir` resolver
+  in step-52.x). The `Scope::All` caveat itself is not yet attenuated.
+- **Disabled while open:** a genuinely-untrusted model/worker with write access on an unsandboxed
+  host (bounded by `b1`'s OS sandbox as backstop).
+- **Compensating controls:** the primitive containment (step-4.1, this deviation); the crew/plan
+  write path was already contained (`is_safe_worktree_path`, `newt-cli/src/crew.rs`); throwaway
+  git worktrees; the `b1` OS sandbox.
+- **Closure criterion:** the default worker's `fs_write` is workspace-scoped (not `Scope::All`,
+  step-4.2) AND every write target passes an object-bound `WorkspaceDir` resolve-beneath before
+  the open (step-52.x), so both the lexical and the symlink escape are structurally unreachable.
+- **Ratchet guard:** `apply_whole_files_rejects_path_escape`, `apply_patch_rejects_path_escape`,
+  and `is_workspace_contained_rejects_escapes` (`newt-tools/src/patch.rs`) drive real absolute/`..`
+  targets through the primitives and assert denial + no outside write — a regression to a raw
+  `join` fails them.
+- **Status:** PARTIAL (primitive containment landed — step-4.1) · owner: — · review-by: with
+  `fs-canonical-containment` (#522) + the ACP caveat fence (step-4.2)
 
 > `exec-behavior-bound`, `mcp-under-leash` — full entries to be filled as those land; each is
 > **disabled-while-open bounded by `b1`** (the OS sandbox is the backstop for
