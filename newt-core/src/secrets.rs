@@ -29,7 +29,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use age::secrecy::{ExposeSecret, SecretString};
+use age::secrecy::ExposeSecret;
+/// Re-exported so callers (the setup wizard) can build passphrases without a
+/// direct `age`/`secrecy` dependency.
+pub use age::secrecy::SecretString;
 
 /// Binary age v1 header magic.
 pub const AGE_BINARY_MAGIC: &[u8] = b"age-encryption.org/v1";
@@ -412,8 +415,11 @@ impl SecretsSession {
         self.lock().warned.insert(path.to_path_buf())
     }
 
-    /// Test-only: wipe all session state (env memoization included).
-    #[cfg(any(test, feature = "test-util"))]
+    /// Wipe all session state (env memoization included). Exists for tests,
+    /// but deliberately NOT feature-gated: dependent crates' suites need it,
+    /// and enabling `test-util` workspace-wide would break the PromptWindow
+    /// seal proof via feature unification (see newt-tui/Cargo.toml's note).
+    /// Always safe — wiping the in-memory cache merely forces a re-unlock.
     pub fn reset_for_test(&self) {
         *self.lock() = SessionState::default();
     }

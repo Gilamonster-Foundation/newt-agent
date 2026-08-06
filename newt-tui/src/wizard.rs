@@ -1,25 +1,20 @@
-//! First-run setup — offer, then bootstrap.
+//! First-run setup — the unboxing wizard.
 //!
-//! Triggered when `~/.newt/config.toml` does not exist (and by `newt init`).
+//! Triggered when there is NO user config file **and** no operator-supplied
+//! backend anywhere ([`Config::is_unconfigured`] — a `backends/*.toml`
+//! drop-in or a `--backend-*` flag counts as configured even without a
+//! `config.toml`).
 //!
-//! A human at a terminal is **offered the interactive wizard** for ten seconds
-//! before anything is written. Previously this path probed silently and
-//! committed the operator to whatever endpoint answered first — so someone
-//! whose inference lived on another box got a localhost config and no
-//! indication a choice had been made for them (#1453).
+//! A human at a terminal lands **directly in the interactive wizard** — the
+//! old ten-second countdown-to-silent-defaults is gone; asking is the
+//! default (#1453's fix made the silent choice *visible*; this makes it
+//! *interactive*). Esc / Ctrl-C / Ctrl-D at any wizard prompt falls back to
+//! the probe-and-write defaults path below, so the session still starts.
 //!
-//! Everything else — CI, image builds, piped invocations — skips the offer
-//! entirely and takes the original probe-and-write path, so unattended installs
-//! behave exactly as before. The countdown is what makes *asking* safe by
-//! default: without it, offering would mean blocking forever on a human who may
-//! not be there.
-//!
-//! Agent commit identity is separate (`agent-identity.toml` /
-//! `newt identity set`); a future setup dialog should collect it via
-//! [`newt_core::AgentIdentity::save`].
-
-use std::io::{self, Write};
-use std::time::{Duration, Instant};
+//! Everything else — CI, image builds, piped invocations — skips the wizard
+//! entirely and takes the original probe-and-write path **immediately** (the
+//! `<1s` guarantee is pinned by tests), so unattended installs behave
+//! exactly as before.
 
 use newt_core::Config;
 
@@ -27,8 +22,7 @@ use newt_core::Config;
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Run first-run setup if `~/.newt/config.toml` does not exist; no-op when it
-/// already does.
+/// Run first-run setup when nothing is configured; no-op otherwise.
 pub fn maybe_run(color: bool) -> anyhow::Result<()> {
     let config_path = match Config::user_config_path() {
         Some(p) => p,
@@ -37,91 +31,76 @@ pub fn maybe_run(color: bool) -> anyhow::Result<()> {
     if config_path.exists() {
         return Ok(());
     }
-    // A human at a terminal gets asked. Anyone else — CI, an image build, a
-    // piped invocation — falls straight through to the probe, so unattended
-    // installs are unaffected.
-    if offer_interactive(color, COUNTDOWN)? == FirstRun::Interactive {
-        return crate::setup::run(color);
+    // Second gate: a config-file-less box whose backends arrive some other
+    // way (a backends/*.toml drop-in, a --backend-* flag) is configured, not
+    // virgin — do not wizard it.
+    if !Config::resolve()
+        .map(|c| c.is_unconfigured())
+        .unwrap_or(true)
+    {
+        return Ok(());
     }
-    run_setup(color, &config_path)
+    if first_run_mode() == FirstRun::Defaults {
+        // CI / piped / no terminal: the original silent probe path,
+        // immediately.
+        return run_setup(color, &config_path);
+    }
+    print_first_run_banner(color);
+    match crate::setup::run_first_run(color) {
+        Err(e) if is_abort(&e) => {
+            println!(
+                "setup cancelled — continuing with localhost defaults (`newt setup` to change)"
+            );
+            run_setup(color, &config_path)
+        }
+        other => other,
+    }
 }
 
-/// How long the first-run offer waits before proceeding on its own.
-const COUNTDOWN: Duration = Duration::from_secs(10);
-
-/// What the operator chose at the first-run offer.
+/// What first run does for this invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FirstRun {
-    /// Run the interactive wizard — a key was pressed.
+    /// A human at a terminal — run the interactive wizard.
     Interactive,
-    /// Probe and write a default config — the countdown elapsed, or there is
-    /// nobody to ask.
+    /// Probe and write a default config — there is nobody to ask.
     Defaults,
 }
 
-/// Offer the interactive wizard for `budget`, counting down in place.
-///
-/// The countdown exists so that *offering* is safe by default. Without it,
-/// first run either blocks forever waiting for a human who may not be there, or
-/// — as it did before — silently commits the operator to whatever endpoint it
-/// happened to probe, never revealing that a choice existed.
-///
-/// Returns [`FirstRun::Defaults`] immediately when stdin or stdout is not a
-/// terminal, or when raw mode cannot be entered: a prompt nobody can answer is
-/// worse than no prompt.
-pub(crate) fn offer_interactive(color: bool, budget: Duration) -> anyhow::Result<FirstRun> {
+/// TTY on both ends → the wizard; anything else → silent defaults,
+/// immediately (a prompt nobody can answer is worse than no prompt).
+pub(crate) fn first_run_mode() -> FirstRun {
     use std::io::IsTerminal;
-
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Ok(FirstRun::Defaults);
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        FirstRun::Interactive
+    } else {
+        FirstRun::Defaults
     }
-    let dim = if color { "\x1b[38;2;100;100;100m" } else { "" };
-    let reset = if color { "\x1b[0m" } else { "" };
-
-    println!();
-    println!(
-        "{dim}newt v{} — no configuration yet.{reset}",
-        crate::VERSION
-    );
-
-    if crossterm::terminal::enable_raw_mode().is_err() {
-        return Ok(FirstRun::Defaults);
-    }
-    let outcome = countdown(budget, dim, reset);
-    let _ = crossterm::terminal::disable_raw_mode();
-
-    let mut out = io::stdout();
-    // Clear the countdown line so neither branch leaves it on screen.
-    let _ = write!(out, "\r\x1b[K");
-    let _ = out.flush();
-    match &outcome {
-        Ok(FirstRun::Interactive) => println!("running setup…\r"),
-        _ => println!("{dim}continuing with defaults — `newt setup` to change{reset}\r"),
-    }
-    outcome
 }
 
-/// The raw-mode wait. Split out so the surrounding mode handling is not
-/// duplicated across every early return.
-fn countdown(budget: Duration, dim: &str, reset: &str) -> anyhow::Result<FirstRun> {
-    let deadline = Instant::now() + budget;
-    let mut out = io::stdout();
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        let _ = write!(
-            out,
-            "\r\x1b[K{dim}Press any key to choose your inference endpoint — \
-             continuing in {}s…{reset}",
-            left.as_secs() + 1
-        );
-        let _ = out.flush();
-        // Poll in slices so the digit ticks while still reacting immediately.
-        if crossterm::event::poll(left.min(Duration::from_millis(200)))?
-            && matches!(crossterm::event::read()?, crossterm::event::Event::Key(_))
-        {
-            return Ok(FirstRun::Interactive);
-        }
-    }
-    Ok(FirstRun::Defaults)
+fn print_first_run_banner(color: bool) {
+    let dim = if color { "\x1b[38;2;100;100;100m" } else { "" };
+    let reset = if color { "\x1b[0m" } else { "" };
+    println!();
+    println!(
+        "{dim}newt v{} — no configuration yet; let's pick an inference endpoint.{reset}",
+        crate::VERSION
+    );
+    println!(
+        "{dim}(Esc or Ctrl-C at any prompt skips setup and starts with localhost defaults){reset}"
+    );
+}
+
+/// Did the wizard end on a deliberate operator abort (Esc/Ctrl-C → `Interrupted`,
+/// Ctrl-D/closed stdin → `UnexpectedEof`) rather than a real failure?
+fn is_abort(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::UnexpectedEof
+            )
+        })
 }
 
 /// Force setup to run, (re)writing config even if it already exists. Used by
@@ -328,38 +307,48 @@ mod tests {
     }
 
     use super::*;
+    use std::time::{Duration, Instant};
 
-    /// Non-terminal stdin/stdout must never see the offer: CI, image builds and
-    /// piped invocations have to keep taking the silent probe path.
+    /// Non-terminal stdin/stdout must never see the wizard: CI, image builds
+    /// and piped invocations have to keep taking the silent probe path.
     #[test]
-    fn a_non_terminal_never_gets_offered_the_wizard() {
+    fn a_non_terminal_never_gets_the_wizard() {
         // The test harness captures stdout, so neither handle is a terminal —
         // which is exactly the unattended shape this must return on.
-        assert_eq!(
-            offer_interactive(false, Duration::from_secs(10)).unwrap(),
-            FirstRun::Defaults
-        );
+        assert_eq!(first_run_mode(), FirstRun::Defaults);
     }
 
-    /// And it must return *immediately*, not after burning the countdown. An
-    /// unattended install that stalls ten seconds per launch is a regression
-    /// even though it eventually does the right thing.
+    /// And the decision must be *immediate*. The old countdown is gone, but
+    /// the guarantee it protected survives it: an unattended install must
+    /// never stall per launch.
     #[test]
-    fn the_offer_does_not_stall_an_unattended_run() {
+    fn the_first_run_decision_does_not_stall_an_unattended_run() {
         let start = Instant::now();
-        let _ = offer_interactive(false, Duration::from_secs(10));
+        let _ = first_run_mode();
         assert!(
             start.elapsed() < Duration::from_secs(1),
-            "returned in {:?}; must not wait out the countdown with nobody to ask",
+            "returned in {:?}; nobody to ask means no waiting",
             start.elapsed()
         );
     }
 
-    /// The budget is the contract: ten seconds, so a distracted operator has
-    /// time to react and an unattended box is not held up for long.
+    /// Abort detection: Esc/Ctrl-C (`Interrupted`) and closed-stdin
+    /// (`UnexpectedEof`) fall back to defaults; real failures propagate.
     #[test]
-    fn the_countdown_budget_is_ten_seconds() {
-        assert_eq!(COUNTDOWN, Duration::from_secs(10));
+    fn is_abort_detects_interrupted_and_eof_through_the_chain() {
+        let interrupted = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "cancelled",
+        ))
+        .context("asking for the backend");
+        assert!(is_abort(&interrupted));
+        let eof = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "eof",
+        ));
+        assert!(is_abort(&eof));
+        let real = anyhow::anyhow!("endpoint exploded");
+        assert!(!is_abort(&real));
     }
 
     /// The probe list must stay free of operator-specific hosts. Two
@@ -367,6 +356,7 @@ mod tests {
     /// real hostnames with the placeholder and left them in as LIVE targets, so
     /// every first run spent 2s apiece resolving a host literally named
     /// "REDACTED-HOST".
+    #[serial_test::serial(wizard_env)]
     #[test]
     fn the_probe_list_carries_no_baked_in_hosts() {
         for candidate in probe_candidates() {
@@ -382,6 +372,7 @@ mod tests {
         assert!(probe_candidates().iter().any(|u| u.contains("localhost")));
     }
 
+    #[serial_test::serial(wizard_env)]
     #[test]
     fn probe_candidates_includes_env_host() {
         std::env::set_var("NEWT_DGX_HOST", "myhost.local");

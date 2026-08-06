@@ -10122,6 +10122,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /persona switch <name>   - same as /persona <name> (an explicit verb)",
         "  /persona clear           - start fresh with no persona",
         "  /crew edit [name]        - edit a crew's settings (roles, control loop, test, budgets)",
+        "  /setup [host]            - configure an inference backend (wizard, or probe a host); \
+         pasted keys are stored encrypted",
         "  /dgx status              - DGX endpoint health + running models",
         "  /dgx models              - list models installed on the DGX",
         "  /dgx ps                  - models currently loaded in VRAM",
@@ -10199,6 +10201,7 @@ fn dispatch_slash(
             commands::model::dispatch(cmd, arg1, arg2, color, verbose)
         }
         "crew" => commands::crew::dispatch(arg1, arg2, color, verbose),
+        "setup" => commands::setup::dispatch(arg1, color, verbose),
         other => {
             print_newt(
                 &format!("unknown command: /{other}  (try /help)"),
