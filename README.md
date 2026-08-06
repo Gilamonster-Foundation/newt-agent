@@ -41,7 +41,7 @@ and the harness methodology — are published by
 a separate instrument that has no dependency on newt. If the ruler shipped with
 the thing it measures, one commit could move both at once. For how these
 particular numbers were kept honest — including the runs thrown out — see the
-[DGX Spark capability survey](./docs/findings/dgx-spark-terminal-bench-survey.md).
+[DGX Spark capability survey](./docs/findings/2026-07-29-dgx-spark-terminal-bench-survey.md).
 
 ## Quick start
 

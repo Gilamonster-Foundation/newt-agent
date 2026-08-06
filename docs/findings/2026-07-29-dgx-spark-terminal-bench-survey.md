@@ -1,5 +1,15 @@
 # DGX Spark on Terminal-Bench — a one-day capability survey (2026-07-29)
 
+> **Snapshot — 2026-07-29 · newt 0.7.x (the 0.7.6 release-gate window).** This is a
+> *dated* survey: its numbers reflect the harness and models **on this date** and
+> **will move** as newt and the served models change. Re-runs are published as
+> **new dated files** (`docs/findings/YYYY-MM-DD-dgx-spark-terminal-bench-survey.md`)
+> and listed in the [findings index](README.md#re-running-a-moving-survey); this
+> snapshot is the historical baseline and is **not edited in place**. The always-
+> current numbers live in the README scoreboard (auto-generated from
+> `bench-results.jsonl`); this document is the frozen narrative + integrity log
+> for its date.
+
 **What this is.** A single-day survey of how one NVIDIA DGX Spark (GB10, 121 GiB
 unified memory) performs on Terminal-Bench, driven by **newt**, across a range of
 local models — with hosted OpenAI models as reference points and a **newt-vs-Codex**
