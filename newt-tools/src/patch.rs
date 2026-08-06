@@ -134,6 +134,36 @@ pub fn apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
     applier_from_env().apply(root, diff)
 }
 
+/// Reject a candidate write target that would escape the workspace root.
+///
+/// The model (or a repo-supplied diff) controls the destination path, so a
+/// `..` (`ParentDir`), an absolute root (`RootDir`), or a Windows drive
+/// (`Prefix`) component would make the subsequent `root.join(rel)` land
+/// **outside** the fence — a `Scope::All` `fs_write` caveat does not stop it,
+/// and the `exec` caveat never sees the resulting cron / `authorized_keys` /
+/// git-hook drop-in (step-4.1, deviation `acp-worker-fs-scope`, issue #522).
+/// Checked by COMPONENTS, not `is_absolute()`: on Windows `/etc/passwd` is
+/// root-relative and `is_absolute()` is `false`, so a component check is the
+/// only guard correct on every platform. Ports the proven crew boundary
+/// (`newt-cli/src/crew.rs::is_safe_worktree_path`) to the shared write
+/// primitives so both the whole-files and unified-diff paths are contained at
+/// their one shared owner.
+fn is_workspace_contained(rel: &Path) -> bool {
+    use std::path::Component;
+    rel.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// Uniform refusal for an escaping write target — shared wording so both
+/// primitives fail the same way and callers can classify it as a capability
+/// denial.
+fn escape_error(rel: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing to write '{}': path escapes the workspace (absolute or `..` component)",
+        rel.display()
+    )
+}
+
 /// The in-house fuzzy applier implementation (the default backend).
 fn fuzzy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
     let patches = parse_unified_diff(diff)?;
@@ -146,6 +176,9 @@ fn fuzzy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
     let mut results: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     for patch in &patches {
+        if !is_workspace_contained(Path::new(&patch.path)) {
+            return Err(escape_error(Path::new(&patch.path)));
+        }
         let file_path = root.join(&patch.path);
         let original = if file_path.exists() {
             std::fs::read_to_string(&file_path)?
@@ -206,6 +239,10 @@ where
     let mut written = Vec::new();
     for (rel, contents) in files {
         let rel = rel.into();
+        // Contain the attacker-controlled path BEFORE the join (step-4.1).
+        if !is_workspace_contained(Path::new(&rel)) {
+            return Err(escape_error(Path::new(&rel)));
+        }
         let abs = workspace.join(&rel);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
@@ -242,6 +279,9 @@ fn diffy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
             .find(|l| l.starts_with("+++ "))
             .ok_or_else(|| anyhow::anyhow!("diff section missing +++ header"))?;
         let rel = extract_path(plus)?;
+        if !is_workspace_contained(Path::new(&rel)) {
+            return Err(escape_error(Path::new(&rel)));
+        }
         let file_path = root.join(&rel);
         let original = if file_path.exists() {
             std::fs::read_to_string(&file_path)?
@@ -677,6 +717,81 @@ mod tests {
         apply_patch(tmp.path(), diff).unwrap();
         let result = fs::read_to_string(&file).unwrap();
         assert_eq!(result, "line1\ninserted\nline2\nline3\n");
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_path_escape() {
+        // step-4.1 / #522 / P4: the model-supplied relative path is
+        // attacker-controlled. A `..` or absolute component must be refused
+        // BEFORE the join, so no write lands outside the workspace fence
+        // (out-of-band RCE via cron / authorized_keys / .git/hooks).
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir(&ws).unwrap();
+
+        // `..` traversal escape → would land at tmp/escape.txt, a sibling OUTSIDE ws.
+        let outside = tmp.path().join("escape.txt");
+        let err = apply_whole_files(&ws, [("../escape.txt", "pwned")]).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "got: {err}"
+        );
+        assert!(
+            !outside.exists(),
+            "`..` escape must not write outside the workspace"
+        );
+
+        // Absolute-path escape — target a TEMP path so even the pre-fix (RED)
+        // run can never touch a real system file. Checked by COMPONENT, not
+        // is_absolute() (on Windows `/etc/x` is root-relative yet not absolute).
+        let abs_target = tmp.path().join("abs-escape.txt");
+        let abs_key = abs_target.to_string_lossy().into_owned();
+        let err = apply_whole_files(&ws, [(abs_key.as_str(), "pwned")]).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "got: {err}"
+        );
+        assert!(!abs_target.exists(), "absolute path must not be written");
+
+        // A legitimate in-workspace path still applies.
+        let ok = apply_whole_files(&ws, [("sub/ok.rs", "fine")]).unwrap();
+        assert_eq!(ok, vec!["sub/ok.rs".to_string()]);
+        assert!(ws.join("sub/ok.rs").exists());
+    }
+
+    #[test]
+    fn apply_patch_rejects_path_escape() {
+        // Same containment for the legacy unified-diff path (fuzzy applier).
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir(&ws).unwrap();
+        let outside = tmp.path().join("escape.txt");
+        let diff = "\
+--- a/../escape.txt
++++ b/../escape.txt
+@@ -0,0 +1 @@
++pwned
+";
+        let err = apply_patch(&ws, diff).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "got: {err}"
+        );
+        assert!(
+            !outside.exists(),
+            "diff `..` escape must not write outside the workspace"
+        );
+    }
+
+    #[test]
+    fn is_workspace_contained_rejects_escapes() {
+        // Pure component check — the load-bearing predicate, no fs.
+        assert!(is_workspace_contained(Path::new("a/b.rs")));
+        assert!(is_workspace_contained(Path::new("./a.rs")));
+        assert!(is_workspace_contained(Path::new("sub/dir/file.txt")));
+        assert!(!is_workspace_contained(Path::new("../a.rs")));
+        assert!(!is_workspace_contained(Path::new("a/../../b")));
+        assert!(!is_workspace_contained(Path::new("/etc/passwd")));
     }
 
     #[test]
