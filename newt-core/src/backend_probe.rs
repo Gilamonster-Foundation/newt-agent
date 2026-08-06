@@ -620,6 +620,11 @@ pub fn parse_llamacpp_models_warm(json: &serde_json::Value) -> Option<Vec<String
         e["state"]
             .as_str()
             .or_else(|| e["status"].as_str())
+            // llama-swap reports status as an OBJECT: `{"value":"loaded", …}`
+            // — read the nested value so a router that swaps models on demand
+            // still reveals which model is resident (else adopt-warm never fires
+            // on it). See ADR docs/decisions/managed_backend.md.
+            .or_else(|| e["status"]["value"].as_str())
             .map(str::to_ascii_lowercase)
     };
     if !entries.iter().any(|e| state_of(e).is_some()) {
@@ -2032,6 +2037,22 @@ mod tests {
         // guessed empty-warm claim.
         let json = serde_json::json!({"data": [{"id": "a"}, {"id": "b"}]});
         assert_eq!(parse_llamacpp_models_warm(&json), None);
+    }
+
+    #[test]
+    fn parse_llamacpp_models_warm_reads_object_shaped_status() {
+        // The live dgx1 llama-swap router reports `status` as an OBJECT
+        // (`{"value":"loaded", "args":[…], "preset":"…"}`), not a bare string.
+        // Regression: this build's warm model must be detected so a Managed
+        // Shared backend can adopt-warm on it. Would return None before the fix.
+        let json = serde_json::json!({"data": [
+            {"id": "ornith-1.0-35b-q8", "status": {"value": "loaded", "args": ["--x"]}},
+            {"id": "ornith_35b", "status": {"value": "unloaded"}}
+        ]});
+        assert_eq!(
+            parse_llamacpp_models_warm(&json),
+            Some(vec!["ornith-1.0-35b-q8".to_string()])
+        );
     }
 
     #[tokio::test]
