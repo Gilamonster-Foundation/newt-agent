@@ -41,6 +41,7 @@
   /persona switch <name>   - same as /persona <name> (an explicit verb)
   /persona clear           - start fresh with no persona
   /crew edit [name]        - edit a crew's settings (roles, control loop, test, budgets)
+  /setup [host]            - configure an inference backend (wizard, or probe a host); pasted keys are stored encrypted
   /dgx status              - DGX endpoint health + running models
   /dgx models              - list models installed on the DGX
   /dgx ps                  - models currently loaded in VRAM
