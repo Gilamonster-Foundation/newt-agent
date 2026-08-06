@@ -27,6 +27,8 @@ mod mcp_probe_cmd;
 mod models_cmd;
 mod new_project;
 mod ocap_cmd;
+mod providers_cmd;
+mod providers_import;
 mod skills;
 mod solve;
 // W0 (#1511): the pure emitter-side declaration of the observability
@@ -765,6 +767,12 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Provider presets (the wizard's hosted-provider roster) — DISTINCT from
+    /// `[[providers]]` subprocess plugins. Includes a Hermes Agent importer.
+    Providers {
+        #[command(subcommand)]
+        cmd: providers_cmd::ProvidersCmd,
+    },
     /// Scaffold a NEW project for an ecosystem, already wired for its lifecycle
     /// phases. `newt new pyo3 mypkg` lays down a minimal, buildable Rust+PyO3
     /// (maturin) project; `python` and `rust` too. Templates are DATA (built-in
@@ -1461,6 +1469,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Providers { cmd } => providers_cmd::run(cmd),
         Command::Solve {
             cwd,
             instruction_file,
