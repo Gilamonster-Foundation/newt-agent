@@ -1,7 +1,12 @@
 //! Process-level coverage for `newt web` — the find-and-spawn launcher for
 //! the workspace-excluded newt-web cockpit (decision D1).
 
+// Every test here is `#[cfg(unix)]` (the stub web binary is a shell script), so
+// on Windows these imports are unused and `-D unused-imports` fails the build.
+// Gate the imports to match their only users.
+#[cfg(unix)]
 use assert_cmd::Command;
+#[cfg(unix)]
 use predicates::prelude::*;
 
 /// A stub "newt-web" that records its argv and exits 0, so the launcher's
