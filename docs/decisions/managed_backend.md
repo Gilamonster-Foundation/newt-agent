@@ -1,8 +1,9 @@
 # Managed Backend — cooperative model-swap awareness for shared inference hosts
 
-**Status:** Proposed · **Date:** 2026-08-06 · **Relates to:** the out-of-the-box
+**Status:** Accepted · **Date:** 2026-08-06 · **Relates to:** the out-of-the-box
 epic (#1126, the `Serving` axis + `backend_probe::adopt`), the unboxing wizard
-(#1549), the DGX-Spark tb-30 survey (`docs/findings/2026-07-29-…`).
+(#1549), the DGX-Spark tb-30 survey (`docs/findings/2026-07-29-…`). **Slice 1
+landed:** PR #1554 (`ManagedMode` + `Shared` adopt-warm + the `pin_conflict` signal).
 
 ## Context
 
@@ -56,6 +57,13 @@ currently warm on the box**, rather than forcing a swap to a configured model �
   runs — no swap, no stall, no thrash.
 - Only an **explicit override** (a pinned `model` + `force = true`, or `Dedicated`)
   makes newt cause a swap — a deliberate act that knowingly disrupts other guests.
+- **A pinned model that differs from the warm model is a conflict, not a silent
+  swap.** `adopt` takes the cooperative default (the warm model — flagged
+  `Adoption.adopted_warm`) and hands the pin back as `Adoption.pin_conflict`. An
+  interactive caller then notes *"running Y (warm); you pinned X"* and offers
+  **[A]dopt / [F]orce swap**; a headless caller keeps the cooperative default and
+  never silently evicts another agent's model. (Slice 1 emits this signal; the
+  prompt itself is a later TUI slice.)
 
 Adopt-warm reuses the existing `backend_probe::adopt` decision (which already picks
 "which model this session uses" from a probe) and the `Serving::Multiplexer`
@@ -115,10 +123,17 @@ custom-host auto-probe). When the operator says **"I have my own hardware"**:
 - **Stopgap (config-only, uncommitted):** raise `NEWT_BENCH_HTTP_RETRIES` +
   `NEWT_HTTP_BACKOFF_MAX_MS` so the retry window covers a single cold load. Buys
   time; not the fix.
-- **Slice 1 — `ManagedBackend` config type + `Shared` adopt-warm + swap-aware wait
-  (HTTP-only).** Widen `backend_probe::adopt` to prefer the warm model; treat a
-  `Serving::Multiplexer` stall as an expected swap. Unblocks the bench.
-- **Slice 2 — wizard "my hardware" step** (managed? shared/dedicated? SSH?).
+- **Slice 1 — `ManagedBackend` config type + `Shared` adopt-warm + the
+  `pin_conflict` signal (HTTP-only).** ✅ **Landed (PR #1554):** `ManagedMode` +
+  `backend_probe::adopt` prefers a warm model over forcing a swap and surfaces the
+  pin conflict. (The pure decision; live warm-probe wiring is Slice 1b.)
+- **Slice 1b — live warm-probe + dynamic re-adoption.** Populate `Served.warm` from
+  the serving tech and **re-run `adopt` per turn / on change** — so a long-running
+  autonomous agent follows the box's warm model *without a restart* (the router
+  auto-swaps on request; newt just re-adopts). This is what makes "always adopt-warm"
+  work for autonomous fleets on one `max_instances: 1` box.
+- **Slice 2 — wizard "my hardware" step** (managed? shared/dedicated? SSH?) + the
+  interactive [A]dopt / [F]orce prompt that consumes `pin_conflict`.
 - **Slice 3 — SSH control channel** (load/hold/keep-warm, `nvidia-smi`, restart),
   encrypted creds.
 - **Slice 4 — `Dedicated` lease/claim + coordination.**
