@@ -1477,6 +1477,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    // Anthropic speaks its own wire (/v1/messages). Until this bundle's
+    // native loop lands (slice 5), a typed refusal beats a silent misroute
+    // into the Ollama /api/chat loop below.
+    if ctx.kind == crate::BackendKind::Anthropic {
+        anyhow::bail!(
+            "kind=anthropic backends are not yet routed by the interactive loop \
+             (native /v1/messages support lands later in this bundle)"
+        );
+    }
     // OpenAI-compatible endpoints speak a different wire format (request,
     // tool_calls, and usage shapes all differ), so they get their own loop.
     if ctx.kind == crate::BackendKind::Openai {

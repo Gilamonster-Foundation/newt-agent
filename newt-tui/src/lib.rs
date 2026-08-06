@@ -805,6 +805,7 @@ fn runtime_context_block(
         .to_string();
     let backend = match kind {
         newt_core::BackendKind::Openai => "openai-compatible",
+        newt_core::BackendKind::Anthropic => "anthropic",
         _ => "ollama",
     };
     let author_email = identity.email.as_str();
@@ -4476,8 +4477,12 @@ fn warn_on_missing_bound_skills(
 /// `PersonaStore::DEFAULT_PERSONAS` uses (FR-16, #1000), so a
 /// `personal-assistant` persona's declared `skills:` binding resolves out of
 /// the box with no manual `[skills] bundled_dir` opt-in required.
-const GILA_SKILL: &str =
-    include_str!("../../.newt/bundled-skills/gila-personal-assistant/SKILL.md");
+///
+/// Sourced from `newt-tui/assets/`, NOT the repo-local `.newt/` config dir:
+/// compiled-in assets must never live under a `.newt/` directory, because
+/// operators legitimately move `.newt` dirs aside (e.g. to simulate a fresh
+/// unboxing) and that must never break `cargo build`.
+const GILA_SKILL: &str = include_str!("../assets/bundled-skills/gila-personal-assistant/SKILL.md");
 
 /// Seed [`GILA_SKILL`] into the default skill directory
 /// (`newt_skills::default_skills_dir()`, i.e. `~/.newt/skills`) if missing. A

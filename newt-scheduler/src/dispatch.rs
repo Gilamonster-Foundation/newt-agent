@@ -64,6 +64,17 @@ impl Dispatcher for LocalDispatcher {
                     .complete(req)
                     .await
             }
+            // Native Anthropic Messages API — the `/v1/messages` wire with the
+            // `x-api-key` header, so a crew/team can run on hosted Claude.
+            BackendKind::Anthropic => {
+                // TODO(unboxing bundle, slice 4): route through
+                // newt_inference::AnthropicBackend once it lands.
+                anyhow::bail!(
+                    "backend '{}' is kind=anthropic; the crew dispatcher's native \
+                     /v1/messages route lands later in this bundle",
+                    backend.name
+                )
+            }
             // The in-process embedded backend (#639): a first-class backend that
             // loads a local GGUF (no endpoint) and runs candle. Behind the
             // `embedded` feature so the lean/headless build never pulls candle.

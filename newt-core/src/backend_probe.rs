@@ -80,17 +80,28 @@ pub fn api_for(kind: BackendKind) -> &'static dyn BackendApi {
         BackendKind::Ollama => &OllamaApi,
         BackendKind::Openai => &OpenAiApi,
         BackendKind::Embedded => &EmbeddedApi,
+        BackendKind::Anthropic => &AnthropicApi,
     }
 }
 
+/// The `anthropic-version` header value both the probe and the `/v1/messages`
+/// transport send. ONE const so the two can never drift.
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
 /// Ollama: `/api/tags` to list, `/api/show` for the window, always a
-/// time-multiplexer (many models loaded on demand), no bearer auth.
+/// time-multiplexer (many models loaded on demand). Bearer auth is sent when
+/// a key is supplied (Ollama Cloud, `https://ollama.com`); LAN Ollama ignores
+/// an unexpected Authorization header.
 pub struct OllamaApi;
 /// OpenAI-compatible (vLLM / gateways): `/v1/models` to list + read
 /// `max_model_len`, bearer auth, serving derived from the served count.
 pub struct OpenAiApi;
 /// The in-process GGUF engine: no HTTP; runs exactly one model.
 pub struct EmbeddedApi;
+/// Anthropic's Messages API: `GET /v1/models` with `x-api-key` +
+/// `anthropic-version` headers (never a bearer), paginated via `after_id`;
+/// always a multiplexer (the hosted API fronts the whole Claude family).
+pub struct AnthropicApi;
 
 #[async_trait::async_trait]
 impl BackendApi for OllamaApi {
@@ -207,6 +218,93 @@ impl BackendApi for EmbeddedApi {
     fn serving(&self, _served_count: usize) -> Serving {
         Serving::Instance
     }
+}
+
+#[async_trait::async_trait]
+impl BackendApi for AnthropicApi {
+    async fn list_models(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        api_key: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let entries = anthropic_models_entries(client, endpoint, api_key).await?;
+        Ok(entries
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    async fn context_window(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> Option<u32> {
+        // Newer API responses declare `max_input_tokens` per model entry;
+        // absent → None (the caller keeps its default). Fail-soft like the
+        // other impls.
+        let entries = anthropic_models_entries(client, endpoint, api_key)
+            .await
+            .ok()?;
+        entries
+            .iter()
+            .find(|m| m["id"].as_str() == Some(model))
+            .and_then(|m| m["max_input_tokens"].as_u64())
+            .and_then(|w| u32::try_from(w).ok())
+    }
+
+    fn serving(&self, _served_count: usize) -> Serving {
+        // The hosted API fronts the whole Claude family — always many models,
+        // picked per request.
+        Serving::Multiplexer
+    }
+}
+
+/// How many `/v1/models` pages [`anthropic_models_entries`] will follow. A
+/// probe must stay bounded — the full catalog fits in far fewer pages, and a
+/// misbehaving proxy that always answers `has_more: true` must not hang setup.
+const ANTHROPIC_MODELS_PAGE_CAP: usize = 5;
+
+/// GET `/v1/models` with the Anthropic headers (`x-api-key` +
+/// `anthropic-version`), following `after_id` pagination up to
+/// [`ANTHROPIC_MODELS_PAGE_CAP`] pages. Returns the concatenated `data`
+/// entries. Shared by [`AnthropicApi::list_models`] and
+/// [`AnthropicApi::context_window`] — one round-trip shape, one place.
+async fn anthropic_models_entries(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let base = format!("{}/v1/models?limit=100", endpoint.trim_end_matches('/'));
+    let mut entries = Vec::new();
+    let mut after_id: Option<String> = None;
+    for _ in 0..ANTHROPIC_MODELS_PAGE_CAP {
+        let url = match &after_id {
+            Some(id) => format!("{base}&after_id={id}"),
+            None => base.clone(),
+        };
+        let mut req = client
+            .get(&url)
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+            req = req.header("x-api-key", key);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            return Err(ProbeHttpStatus(resp.status()).into());
+        }
+        let json: serde_json::Value = resp.json().await?;
+        let page = json["data"].as_array().ok_or(ProbeResponseShape("data"))?;
+        entries.extend(page.iter().cloned());
+        let has_more = json["has_more"].as_bool().unwrap_or(false);
+        after_id = json["last_id"].as_str().map(str::to_string);
+        if !has_more || after_id.is_none() {
+            break;
+        }
+    }
+    Ok(entries)
 }
 
 /// GET `/v1/models`, sending a bearer token when present (authenticated
