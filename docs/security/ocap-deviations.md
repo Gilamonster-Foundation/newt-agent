@@ -169,13 +169,18 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   tier) + `read_dir_lists_contained_entries` / `read_dir_denies_a_symlink_escape_directory`
   (`fs_cap_object_bound.rs`) drive a confined `list_dir` (and the underlying `WorkspaceDir::read_dir`)
   over a symlink-escape directory and assert it is *denied* rather than enumerated (verified
-  red→green — neutering the resolve flags re-fails them). The existing
+  red→green — neutering the resolve flags re-fails them). `write_file`'s escape residual is now
+  proven closed by `physical_symlink_escape_write_is_denied_object_bound` (`tools.rs`, step-52.4) —
+  the *flip* of the old `..._mutates_under_existing_policy...` test: a confined `write_file` through a
+  symlink-escape path is denied and the outside file is left unchanged (verified red→green) — plus
+  `create_dir_all_makes_nested_dirs_beneath` / `create_dir_all_denies_a_symlink_escape_component`
+  (`fs_cap_object_bound.rs`) ground the object-bound `mkdir -p`. The existing
   `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) still pins the *unrewired* arms
-  (find / write) so they can't silently widen before 52.3's remaining slices.
+  (`find`, `edit_file`, `delete_file`, `patch.rs`) so they can't silently widen.
 - **Status:** OPEN (lexical containment landed #502; object-bound `WorkspaceDir` resolver landed
-  step-52.1; **read_file arm rewired — step-52.2; list_dir arm rewired — step-52.3**; the remaining
-  read arm (`find`) + the write arms/primitives + the non-Linux fallback are pending — step-52.3
-  cont'd, #522) · review-by: with `b1` OS-sandbox work (#84)
+  step-52.1; **read_file — 52.2; list_dir — 52.3; write_file (+ object-bound `mkdir -p`) — 52.4**;
+  the remaining `find` + `edit_file` + `delete_file` + `patch.rs` primitives + the non-Linux fallback
+  are pending, after which #522 closes) · review-by: with `b1` OS-sandbox work (#84)
 
 ### acp-worker-fs-scope
 - **Invariant (ideal):** no production ACP/coder worker holds `fs_write = Scope::All`; every
