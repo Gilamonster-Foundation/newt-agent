@@ -44,15 +44,31 @@ use std::path::{Path, PathBuf};
 
 /// Run the interactive setup wizard, writing to `~/.newt/config.toml`.
 pub fn run(_color: bool) -> anyhow::Result<()> {
+    wizard_entry(&mut StdinConsole, Flow::Setup)
+}
+
+/// The first-run variant ([`crate::wizard::maybe_run`]): driven through
+/// [`FirstRunConsole`] so Esc/Ctrl-C surface as catchable aborts (the caller
+/// falls back to probe-and-write defaults), and the overwrite guard is
+/// skipped (the caller already proved no config exists).
+pub(crate) fn run_first_run(_color: bool) -> anyhow::Result<()> {
+    wizard_entry(&mut crate::line_console::FirstRunConsole, Flow::FirstRun)
+}
+
+fn wizard_entry(console: &mut dyn Console, flow: Flow) -> anyhow::Result<()> {
     let config_path =
         Config::user_config_path().unwrap_or_else(|| std::path::PathBuf::from("newt.toml"));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(4))
         .build()
         .unwrap_or_default();
-    let mut console = StdinConsole;
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(run_with(&mut console, &client, &config_path))
+        tokio::runtime::Handle::current().block_on(run_with_flow(
+            console,
+            &client,
+            &config_path,
+            flow,
+        ))
     })
 }
 
@@ -138,34 +154,8 @@ async fn run_target_with(
         if candidates.len() == 1 { "" } else { "s" }
     ));
 
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, endpoint) in candidates.iter().cloned().enumerate() {
-        let client = client.clone();
-        let api_key = api_key.clone();
-        tasks.spawn(async move {
-            let result =
-                newt_core::backend_probe::detect_endpoint(&client, &endpoint, api_key.as_deref())
-                    .await;
-            (index, endpoint, result)
-        });
-    }
-
-    let mut ordered: Vec<Option<EndpointProbeResult>> = vec![None; candidates.len()];
-    let mut failures: Vec<Option<String>> = vec![None; candidates.len()];
-    while let Some(joined) = tasks.join_next().await {
-        let (index, endpoint, result) = joined.map_err(|e| anyhow::anyhow!(e))?;
-        match result {
-            Ok(hit) if hit.models.is_empty() => {
-                failures[index] = Some(format!(
-                    "{endpoint}: endpoint answered but listed no models"
-                ));
-            }
-            Ok(hit) => ordered[index] = Some(hit),
-            Err(error) => failures[index] = Some(format!("{endpoint}: {error}")),
-        }
-    }
-    let hits: Vec<EndpointProbeResult> = ordered.into_iter().flatten().collect();
-    let failures: Vec<String> = failures.into_iter().flatten().collect();
+    let (hits, failures) =
+        probe_candidates_concurrently(client, &candidates, api_key.as_deref()).await?;
     if hits.is_empty() {
         for failure in failures {
             console.say(&format!("  {failure}"));
@@ -230,16 +220,35 @@ async fn run_target_with(
 // Driver (fully testable: scripted Console + wiremock client)
 // ---------------------------------------------------------------------------
 
+/// Which door the wizard was entered through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// `newt setup` — a deliberate re-run; guard against overwriting.
+    Setup,
+    /// First run (unboxing) — the caller already proved no config exists.
+    FirstRun,
+}
+
 /// The wizard flow, parameterised over its console and HTTP client so it can be
-/// exercised end-to-end in tests.
+/// exercised end-to-end in tests (production enters via [`run_with_flow`]).
+#[cfg(test)]
 async fn run_with(
     console: &mut dyn Console,
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<()> {
+    run_with_flow(console, client, config_path, Flow::Setup).await
+}
+
+async fn run_with_flow(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    config_path: &Path,
+    flow: Flow,
+) -> anyhow::Result<()> {
     console.say(&format!("newt v{} — interactive setup", crate::VERSION));
 
-    if config_path.exists() {
+    if flow == Flow::Setup && config_path.exists() {
         let ans = console.ask(&format!(
             "A config already exists at {}. Overwrite? [y/N] ",
             config_path.display()
@@ -251,9 +260,11 @@ async fn run_with(
     }
 
     let (cfg, backend) = match choose_backend(console)? {
-        BackendChoice::Ollama => configure_ollama(console, client).await?,
-        BackendChoice::Dgx => configure_dgx(console, client).await?,
-        BackendChoice::Cloud => configure_cloud(console, client, config_path).await?,
+        BackendChoice::LocalOllama => configure_ollama(console, client).await?,
+        BackendChoice::CustomHost => configure_custom_host(console, client, config_path).await?,
+        BackendChoice::Preset(preset) => {
+            configure_preset(console, client, preset, config_path).await?
+        }
     };
 
     // Preview before committing anything to disk: the backend drop-in is the
@@ -277,27 +288,89 @@ async fn run_with(
         dropin.display()
     ));
     console.say("Edit that file (or re-run `newt setup`) to change anything.");
+    offer_identity(console);
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One hosted-provider preset — pure data (the three Cs): the menu below and
+/// [`configure_preset`] render/consume rows, so adding a provider is a table
+/// entry, not a new flow. (A `~/.newt/providers/` drop-in layer is a flagged
+/// follow-up; it must reconcile naming with `Config::providers` first.)
+#[derive(Debug, Clone, Copy)]
+struct ProviderPreset {
+    /// Backend + drop-in name (fixed for known providers; #1448's derived
+    /// names remain the rule for custom hosts).
+    name: &'static str,
+    label: &'static str,
+    endpoint: &'static str,
+    kind: BackendKind,
+    /// Honored as a reference when already exported — nothing stored.
+    api_key_env: &'static str,
+    /// Fallback when the model list can't be fetched.
+    default_model: &'static str,
+    /// Where to create a key.
+    token_help: &'static str,
+}
+
+const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        name: "openai",
+        label: "OpenAI",
+        endpoint: "https://api.openai.com",
+        kind: BackendKind::Openai,
+        api_key_env: "OPENAI_API_KEY",
+        default_model: "gpt-5.2",
+        token_help: "https://platform.openai.com/api-keys",
+    },
+    ProviderPreset {
+        name: "anthropic",
+        label: "Anthropic",
+        endpoint: "https://api.anthropic.com",
+        kind: BackendKind::Anthropic,
+        api_key_env: "ANTHROPIC_API_KEY",
+        default_model: "claude-sonnet-4-5",
+        token_help: "https://console.anthropic.com/settings/keys",
+    },
+    ProviderPreset {
+        name: "ollama-cloud",
+        label: "Ollama Cloud",
+        endpoint: "https://ollama.com",
+        kind: BackendKind::Ollama,
+        api_key_env: "OLLAMA_API_KEY",
+        default_model: "gpt-oss:120b",
+        token_help: "https://ollama.com/settings/keys",
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
 enum BackendChoice {
-    Ollama,
-    Dgx,
-    Cloud,
+    LocalOllama,
+    CustomHost,
+    Preset(&'static ProviderPreset),
 }
 
 fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
     console.say("\nWhere does your model run?");
-    console.say("  1) Ollama  (local, or a plain self-hosted Ollama host)");
-    console.say("  2) DGX     (remote NVIDIA endpoint: Ollama or vLLM)");
-    console.say("  3) Remote  (any OpenAI-compatible endpoint — llama.cpp, vLLM, a hosted API)");
-    let ans = console.ask("Choose [1]: ")?;
-    match parse_choice(&ans, 3).unwrap_or(1) {
-        2 => Ok(BackendChoice::Dgx),
-        3 => Ok(BackendChoice::Cloud),
-        _ => Ok(BackendChoice::Ollama),
+    console.say("  1) Ollama on this machine   (http://127.0.0.1:11434)");
+    console.say(
+        "  2) Another machine          (hostname or URL — newt probes for Ollama / llama.cpp / vLLM)",
+    );
+    for (i, preset) in PROVIDER_PRESETS.iter().enumerate() {
+        console.say(&format!(
+            "  {}) {:<24}({} — API key)",
+            i + 3,
+            preset.label,
+            preset.endpoint
+        ));
     }
+    let ans = console.ask("Choose [1]: ")?;
+    Ok(
+        match parse_choice(&ans, 2 + PROVIDER_PRESETS.len()).unwrap_or(1) {
+            1 => BackendChoice::LocalOllama,
+            2 => BackendChoice::CustomHost,
+            n => BackendChoice::Preset(&PROVIDER_PRESETS[n - 3]),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +389,7 @@ async fn configure_ollama(
         11434,
     );
 
-    let model = pick_model(console, client, &url, Protocol::Ollama).await?;
+    let model = pick_model(console, client, &url).await?;
     Ok(build_ollama_config(
         Config::default(),
         "default",
@@ -327,160 +400,363 @@ async fn configure_ollama(
 }
 
 // ---------------------------------------------------------------------------
-// DGX path
+// Custom-host path (auto-probe: Ollama / llama.cpp / vLLM)
 // ---------------------------------------------------------------------------
 
-async fn configure_dgx(
-    console: &mut dyn Console,
-    client: &reqwest::Client,
-) -> anyhow::Result<(Config, BackendConfig)> {
-    // Host is required for DGX — keep asking until we get something.
-    let host = loop {
-        let raw = console.ask("DGX host (e.g. REDACTED-HOST or http://REDACTED-IP:8000): ")?;
-        if !raw.is_empty() {
-            break raw;
+/// One probe-result row for the endpoint menu: engine label (kind label when
+/// the fingerprint came back empty), model count, and the first warm model
+/// when one is reported. Pure.
+fn format_endpoint_row(hit: &EndpointProbeResult) -> String {
+    let engine = hit
+        .engine
+        .map(|e| e.label().to_string())
+        .unwrap_or_else(|| hit.kind.label().to_string());
+    let mut row = format!(
+        "{}   {}   {} model{}",
+        hit.endpoint,
+        engine,
+        hit.models.len(),
+        if hit.models.len() == 1 { "" } else { "s" }
+    );
+    if let Some(warm) = hit.warm.first() {
+        row.push_str(&format!("   warm: {warm}"));
+    }
+    row
+}
+
+/// Order `models` with the warm (loaded-in-memory) subset first, so the
+/// numbered menu's Enter default IS the model that answers immediately.
+/// Warm entries not present in `models` are ignored (stale-probe safety —
+/// same rule as `backend_probe::adopt`). Pure.
+fn order_models_warm_first(models: &[String], warm: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = warm
+        .iter()
+        .filter(|w| models.contains(w))
+        .cloned()
+        .collect();
+    for m in models {
+        if !out.contains(m) {
+            out.push(m.clone());
         }
-        console.say("  A host is required for a DGX endpoint.");
-    };
-
-    console.say("\nEndpoint flavour:");
-    console.say("  1) ollama       (direct DGX Ollama,        /api/chat)");
-    console.say("  2) ollama_lb    (round-robin Ollama LB,    /api/chat)");
-    console.say("  3) in_cluster   (in-cluster Ollama proxy,  /api/chat)");
-    console.say("  4) vllm         (vLLM OpenAI-compatible,   /v1/chat/completions)");
-    let ans = console.ask("Choose [1]: ")?;
-    let kind = match parse_choice(&ans, 4).unwrap_or(1) {
-        2 => EndpointKind::OllamaLb,
-        3 => EndpointKind::InCluster,
-        4 => EndpointKind::Vllm,
-        _ => EndpointKind::Ollama,
-    };
-
-    let (default_port, protocol) = match kind {
-        EndpointKind::Vllm => (8000, Protocol::OpenAi),
-        _ => (11434, Protocol::Ollama),
-    };
-    let url = normalize_url(&host, "http", default_port);
-
-    let model = pick_model(console, client, &url, protocol).await?;
-
-    let cfg = match kind {
-        EndpointKind::Vllm => {
-            let key_env = console.ask("API-key env var (optional) [none]: ")?;
-            let key_env = if key_env.is_empty() {
-                None
-            } else {
-                Some(key_env)
-            };
-            build_openai_config(Config::default(), "dgx-vllm", &url, &model, key_env)
-        }
-        _ => build_ollama_config(Config::default(), "dgx", kind, &url, &model),
-    };
-    Ok(cfg)
+    }
+    out
 }
 
-// ---------------------------------------------------------------------------
-// Cloud / OpenAI-compatible remote endpoint path
-// ---------------------------------------------------------------------------
-
-/// Strip `/v1` (and any trailing path suffix) from a user-supplied URL so the
-/// stored endpoint is the bare base that newt appends `/v1/…` paths to itself.
-///
-/// Handles: trailing `/`, `/v1`, `/v1/`, `/v1/models`, `/v1/chat/completions`.
-fn normalize_cloud_url(raw: &str) -> String {
-    let s = raw.trim().trim_end_matches('/');
-    // Strip common API-suffix paths the user might paste from docs.
-    let s = s
-        .trim_end_matches("/v1/chat/completions")
-        .trim_end_matches("/v1/completions")
-        .trim_end_matches("/v1/models")
-        .trim_end_matches("/v1/")
-        .trim_end_matches("/v1");
-    s.trim_end_matches('/').to_string()
-}
-
-/// Derive a short backend name from the hostname of a URL.
-/// `https://inference.example.com/v1` → `inference.example.com`
-fn derive_name_from_url(url: &str) -> Option<String> {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-}
-
-async fn configure_cloud(
+/// The wizard's "another machine" door: expand the host through
+/// `[discovery]`, probe every candidate concurrently, present what answered
+/// (engine + warm model), and adopt the warm model as the Enter default.
+/// Auth-required endpoints get one hidden-input key prompt + re-probe;
+/// pasted keys go through the encrypted store like every other wizard token.
+async fn configure_custom_host(
     console: &mut dyn Console,
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<(Config, BackendConfig)> {
-    // No default endpoint, deliberately. There is no sensible default for
-    // "somebody else's inference host": inventing one bakes whatever host we
-    // chose into every checkout, and lets a stray Enter configure a backend the
-    // operator never named.
-    let endpoint = loop {
+    loop {
+        let raw = console
+            .ask("Host name or URL (e.g. gpu-box, 10.0.0.5:8000, https://llm.example.net): ")?;
+        let target = raw.trim().to_string();
+        if target.is_empty() {
+            console.say("  A host is required.");
+            continue;
+        }
+        let discovery = if config_path.is_file() {
+            Config::load(config_path)
+                .map(|c| c.discovery)
+                .unwrap_or_default()
+        } else {
+            Discovery::default()
+        };
+        let candidates = match candidate_endpoints(&target, &discovery) {
+            Ok(c) => c,
+            Err(e) => {
+                console.say(&format!("  {e}"));
+                continue;
+            }
+        };
+        console.say(&format!("Probing {}…", candidates.join(", ")));
+        let (mut hits, mut failures) =
+            probe_candidates_concurrently(client, &candidates, None).await?;
+
+        // Authentication-required endpoints (the typed probe error): offer one
+        // hidden key prompt and re-probe. The https/loopback transport rule
+        // applies before any token leaves this process.
+        let mut api_key: Option<String> = None;
+        if hits.is_empty()
+            && failures
+                .iter()
+                .any(|f| f.contains("authentication required"))
+        {
+            let key = console.ask_secret("API key (input hidden, Enter to skip): ")?;
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                validate_authenticated_target(&target)?;
+                let (h, f) = probe_candidates_concurrently(client, &candidates, Some(&key)).await?;
+                hits = h;
+                failures = f;
+                api_key = Some(key);
+            }
+        }
+
+        if hits.is_empty() {
+            for failure in &failures {
+                console.say(&format!("  {failure}"));
+            }
+            console.say(&format!(
+                "\nNo inference API answered at {target} (tried {}).",
+                candidates.join(", ")
+            ));
+            console.say("  1) Try a different host");
+            console.say("  2) Enter endpoint and model by hand");
+            console.say("  3) Cancel setup");
+            let ans = console.ask("Choose [1]: ")?;
+            match parse_choice(&ans, 3).unwrap_or(1) {
+                2 => return manual_backend_entry(console),
+                3 => {
+                    // Interrupted, not a plain bail: first run maps this to
+                    // its defaults fallback (`wizard::is_abort`).
+                    return Err(anyhow::Error::from(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "setup cancelled",
+                    )));
+                }
+                _ => continue,
+            }
+        }
+
+        console.say(&format!(
+            "\nFound {} endpoint{}:",
+            hits.len(),
+            if hits.len() == 1 { "" } else { "s" }
+        ));
+        for (i, hit) in hits.iter().enumerate() {
+            console.say(&format!("  {}) {}", i + 1, format_endpoint_row(hit)));
+        }
+        let ans = console.ask("Endpoint [1]: ")?;
+        let idx = parse_choice(&ans, hits.len()).map(|n| n - 1).unwrap_or(0);
+        let hit = &hits[idx];
+
+        let ordered = order_models_warm_first(&hit.models, &hit.warm);
+        let model = if ordered.is_empty() {
+            ask_model_name(console)?
+        } else {
+            select_model(console, &ordered)?
+        };
+
+        let mut backend = backend_from_probe(hit, None, None)?;
+        backend.model = Some(model);
+        if let Some(key) = api_key {
+            let reference = persist_wizard_token(console, config_path, &backend.name, &key)?;
+            backend.api_key_file = Some(reference);
+        }
+        let config = Config {
+            backends: vec![], // the drop-in IS the backend list
+            default_backend: Some(backend.name.clone()),
+            ..Default::default()
+        };
+        return Ok((config, backend));
+    }
+}
+
+/// Nothing answered but the operator knows the endpoint: take it verbatim
+/// (name still host-derived, #1448 — never a fixed literal).
+fn manual_backend_entry(console: &mut dyn Console) -> anyhow::Result<(Config, BackendConfig)> {
+    let url = loop {
         let raw = console.ask("Endpoint URL: ")?;
         if !raw.trim().is_empty() {
-            break normalize_cloud_url(&raw);
+            break normalize_url(raw.trim(), "http", 11434);
         }
         console.say("  An endpoint URL is required (e.g. http://host:8080).");
     };
-
-    // Optional, and asked second: a self-hosted llama.cpp or vLLM usually needs
-    // no key at all, so leading with it would be a prompt most operators answer
-    // blank.
-    let api_key_raw = console.ask("API key [none]: ")?;
-    let api_key = if api_key_raw.trim().is_empty() {
-        None
-    } else {
-        Some(api_key_raw.trim().to_string())
+    console.say("\nWire protocol:");
+    console.say("  1) ollama            (POST /api/chat)");
+    console.say("  2) openai-compatible (POST /v1/chat/completions — llama.cpp, vLLM, gateways)");
+    let ans = console.ask("Choose [1]: ")?;
+    let kind = match parse_choice(&ans, 2) {
+        Some(2) => BackendKind::Openai,
+        _ => BackendKind::Ollama,
     };
-
-    // The name is DERIVED from the host, never asked and never a shared
-    // literal. The drop-in filename comes from it, so a fixed default means the
-    // second endpoint you configure silently overwrites the first (#1448).
-    let name = derive_name_from_url(&endpoint).unwrap_or_else(|| "remote".to_string());
-
-    let model = pick_cloud_model(console, client, &endpoint, api_key.as_deref()).await?;
-    console.say(&format!(
-        "  → ~/.newt/backends/{name}.toml  (model: {model})"
-    ));
-
-    Ok(build_cloud_config(
-        config_path,
-        &name,
-        &endpoint,
-        &model,
-        api_key.as_deref(),
+    let model = ask_model_name(console)?;
+    let name = backend_name(&url)?;
+    let serving = match kind {
+        BackendKind::Openai => newt_core::Serving::Instance,
+        _ => newt_core::Serving::Multiplexer,
+    };
+    Ok(build_backend_pair(
+        &name, &url, &model, kind, serving, None, "manual",
     ))
 }
 
-/// Probe with auth and present the model list; fall back to manual entry.
-async fn pick_cloud_model(
+// ---------------------------------------------------------------------------
+// Hosted-provider presets (OpenAI / Anthropic / Ollama Cloud)
+// ---------------------------------------------------------------------------
+
+/// Configure a hosted provider from its preset row: env-var reference first
+/// (nothing stored), else a hidden-input paste stored ENCRYPTED at rest, then
+/// a model pick probed through the provider's own API (`api_for(kind)` — the
+/// Anthropic arm sends x-api-key + anthropic-version).
+async fn configure_preset(
     console: &mut dyn Console,
     client: &reqwest::Client,
-    endpoint: &str,
-    api_key: Option<&str>,
-) -> anyhow::Result<String> {
-    console.say(&format!("Probing {endpoint}/v1/models…"));
-    let models = fetch_openai_models_auth(client, endpoint, api_key).await;
+    preset: &ProviderPreset,
+    config_path: &Path,
+) -> anyhow::Result<(Config, BackendConfig)> {
+    console.say(&format!("\n{} — {}", preset.label, preset.endpoint));
+    console.say(&format!("Create an API key at {}", preset.token_help));
 
-    let models = match models {
-        Ok(m) if !m.is_empty() => m,
-        Ok(_) => {
-            console.say("  Endpoint answered but listed no models.");
-            return ask_model_name(console);
-        }
-        Err(e) => {
-            console.say(&format!("  Could not reach the endpoint ({e})."));
-            return ask_model_name(console);
+    let exported = std::env::var(preset.api_key_env)
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    // (env reference, encrypted-file reference, key for the model probe)
+    let (api_key_env, api_key_file, probe_key): (Option<String>, Option<String>, Option<String>) =
+        if let Some(value) = exported {
+            let ans = console.ask(&format!(
+                "${} is set in this shell. Use it? [Y/n] ",
+                preset.api_key_env
+            ))?;
+            if is_yes(&ans, true) {
+                (Some(preset.api_key_env.to_string()), None, Some(value))
+            } else {
+                preset_pasted_key(console, preset, config_path)?
+            }
+        } else {
+            preset_pasted_key(console, preset, config_path)?
+        };
+
+    console.say(&format!(
+        "Probing {} for available models…",
+        preset.endpoint
+    ));
+    let models = newt_core::backend_probe::api_for(preset.kind)
+        .list_models(client, preset.endpoint, probe_key.as_deref())
+        .await;
+    let model = match models {
+        Ok(m) if !m.is_empty() => select_model(console, &m)?,
+        Ok(_) | Err(_) => {
+            console.say("  Could not list models (endpoint unreachable or key not yet usable).");
+            let raw = console.ask(&format!("Model name [{}]: ", preset.default_model))?;
+            if raw.trim().is_empty() {
+                preset.default_model.to_string()
+            } else {
+                raw.trim().to_string()
+            }
         }
     };
 
-    select_model(console, &models)
+    let (config, mut backend) = build_backend_pair(
+        preset.name,
+        preset.endpoint,
+        &model,
+        preset.kind,
+        newt_core::Serving::Multiplexer,
+        api_key_env,
+        &format!("preset {}", preset.name),
+    );
+    backend.api_key_file = api_key_file;
+    Ok((config, backend))
 }
 
-/// Build a cloud backend config and, when an API key is provided, write it to
-/// `backends/<name>.token` beside the config file and store the absolute path
-/// in `api_key_file`.
+/// The paste path shared by both preset branches: hidden input; Enter skips
+/// (env reference recorded, nothing stored); a pasted token goes through the
+/// encrypted store. Returns (api_key_env, api_key_file, probe key).
+#[allow(clippy::type_complexity)]
+fn preset_pasted_key(
+    console: &mut dyn Console,
+    preset: &ProviderPreset,
+    config_path: &Path,
+) -> anyhow::Result<(Option<String>, Option<String>, Option<String>)> {
+    let key = console.ask_secret("API key (input hidden, Enter to skip): ")?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        console.say(&format!(
+            "  No key — writing the backend anyway; export ${} before use.",
+            preset.api_key_env
+        ));
+        return Ok((Some(preset.api_key_env.to_string()), None, None));
+    }
+    let reference = persist_wizard_token(console, config_path, preset.name, &key)?;
+    Ok((None, Some(reference), Some(key)))
+}
+
+/// Store a pasted token ENCRYPTED at rest (`newt_core::secrets`): one
+/// optional-passphrase question (Enter = machine-local key), then the
+/// `.token.age` write. Returns the tilde-collapsed `api_key_file` value. The
+/// token itself is never echoed and never appears in any config file.
+fn persist_wizard_token(
+    console: &mut dyn Console,
+    config_path: &Path,
+    name: &str,
+    token: &str,
+) -> anyhow::Result<String> {
+    console.say("Protect the stored key with a passphrase? Enter uses a machine-local key.");
+    let pass = console.ask_secret("Passphrase (input hidden): ")?;
+    let backends_dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("backends"))
+        .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?;
+    let passphrase = {
+        let trimmed = pass.trim();
+        (!trimmed.is_empty()).then(|| newt_core::secrets::SecretString::from(trimmed.to_string()))
+    };
+    let path = newt_core::secrets::store_token(&backends_dir, name, token, passphrase.as_ref())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let reference = collapse_home(&path);
+    console.say(&format!("  → stored encrypted at {reference}"));
+    Ok(reference)
+}
+
+// ---------------------------------------------------------------------------
+// Agent commit identity (one question, Enter skips)
+// ---------------------------------------------------------------------------
+
+/// Offer to set the agent commit identity after a successful write. Parses
+/// `Name <email>`; saves via [`newt_core::AgentIdentity::save`] — the ONE
+/// sanctioned writer (never open-code a second). Non-fatal: the backend
+/// config already landed, so failures here only print.
+fn offer_identity(console: &mut dyn Console) {
+    let Some(path) = newt_core::AgentIdentity::user_identity_path() else {
+        return;
+    };
+    if path.exists() {
+        return; // already configured — don't nag on re-runs
+    }
+    let raw = match console
+        .ask("Attribution for agent commits — \"Name <email>\" (Enter to keep the default): ")
+    {
+        Ok(raw) => raw,
+        Err(_) => return, // Esc here must not undo a completed setup
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
+    let Some((name, email)) = parse_identity_line(raw) else {
+        console.say("  Expected \"Name <email>\" — skipped (set later with `newt identity set`).");
+        return;
+    };
+    let identity = newt_core::AgentIdentity {
+        name,
+        email,
+        ..Default::default()
+    };
+    match identity.save(&path) {
+        Ok(()) => console.say(&format!("  Wrote {}.", path.display())),
+        Err(e) => console.say(&format!("  Could not write identity ({e}) — skipped.")),
+    }
+}
+
+/// Parse `Name <email>` into its parts. Pure.
+fn parse_identity_line(raw: &str) -> Option<(String, String)> {
+    let (name, rest) = raw.split_once('<')?;
+    let email = rest.strip_suffix('>')?.trim();
+    let name = name.trim();
+    if name.is_empty() || email.is_empty() || !email.contains('@') {
+        return None;
+    }
+    Some((name.to_string(), email.to_string()))
+}
+
 /// Render `path` as `~/…` when it sits under the home directory, else as an
 /// absolute path.
 ///
@@ -499,71 +775,17 @@ fn collapse_home(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn build_cloud_config(
-    config_path: &Path,
-    name: &str,
-    endpoint: &str,
-    model: &str,
-    api_key: Option<&str>,
-) -> (Config, BackendConfig) {
-    let api_key_file = api_key.and_then(|key| {
-        // Write the key to backends/<name>.token next to config.toml.
-        let backends_dir = config_path.parent()?.join("backends");
-        std::fs::create_dir_all(&backends_dir).ok()?;
-        let token_path = backends_dir.join(format!("{name}.token"));
-        std::fs::write(&token_path, key).ok()?;
-        // Tilde-collapse when we can, but NEVER let that decide whether the key
-        // is referenced at all. This previously read `var_os("HOME")?`, and on
-        // Windows — where the variable is USERPROFILE — the `?` bailed out of
-        // the whole closure: the token file landed on disk and `api_key_file`
-        // stayed None, so the backend silently authenticated with nothing.
-        Some(collapse_home(&token_path))
-    });
-
-    let backend = BackendConfig {
-        name: name.to_string(),
-        endpoint: endpoint.to_string(),
-        model: Some(model.to_string()),
-        tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
-        kind: Some(BackendKind::Openai),
-        api_key_file,
-        serving: Some(newt_core::Serving::Instance),
-        provenance: Some(newt_core::config::BackendProvenance {
-            source: Some(format!("newt setup v{} (cloud)", crate::VERSION)),
-            probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-            derived_serving: Some(true),
-        }),
-        ..Default::default()
-    };
-    let config = Config {
-        backends: vec![],
-        default_backend: Some(backend.name.clone()),
-        ..Default::default()
-    };
-    (config, backend)
-}
-
 // ---------------------------------------------------------------------------
 // Model selection (probe → numbered list → pick, with manual fallback)
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Protocol {
-    Ollama,
-    OpenAi,
-}
 
 async fn pick_model(
     console: &mut dyn Console,
     client: &reqwest::Client,
     url: &str,
-    protocol: Protocol,
 ) -> anyhow::Result<String> {
     console.say(&format!("Probing {url} for installed models…"));
-    let models = match protocol {
-        Protocol::Ollama => fetch_ollama_models(client, url).await,
-        Protocol::OpenAi => fetch_openai_models(client, url).await,
-    };
+    let models = fetch_ollama_models(client, url).await;
 
     let models = match models {
         Ok(m) if !m.is_empty() => m,
@@ -641,9 +863,7 @@ fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
 /// List models from an Ollama endpoint via `GET /api/tags`.
 // The endpoint fetchers moved to `newt_core::backend_probe` (#1136) so the
 // TUI session, setup, and doctor share one probe path.
-use newt_core::backend_probe::{
-    fetch_ollama_models, fetch_openai_models, fetch_openai_models_auth,
-};
+use newt_core::backend_probe::fetch_ollama_models;
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested directly)
@@ -744,6 +964,47 @@ fn candidate_endpoints(target: &str, discovery: &Discovery) -> anyhow::Result<Ve
         endpoints.push(candidate.as_str().trim_end_matches('/').to_string());
     }
     Ok(endpoints)
+}
+
+/// Probe every candidate endpoint concurrently (`detect_endpoint` — the ONE
+/// probe core `newt setup <target>` and the wizard's custom-host door share).
+/// Returns hits in candidate order plus human-readable failures (an endpoint
+/// that answers with no models counts as a failure).
+async fn probe_candidates_concurrently(
+    client: &reqwest::Client,
+    candidates: &[String],
+    api_key: Option<&str>,
+) -> anyhow::Result<(Vec<EndpointProbeResult>, Vec<String>)> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, endpoint) in candidates.iter().cloned().enumerate() {
+        let client = client.clone();
+        let api_key = api_key.map(str::to_string);
+        tasks.spawn(async move {
+            let result =
+                newt_core::backend_probe::detect_endpoint(&client, &endpoint, api_key.as_deref())
+                    .await;
+            (index, endpoint, result)
+        });
+    }
+
+    let mut ordered: Vec<Option<EndpointProbeResult>> = vec![None; candidates.len()];
+    let mut failures: Vec<Option<String>> = vec![None; candidates.len()];
+    while let Some(joined) = tasks.join_next().await {
+        let (index, endpoint, result) = joined.map_err(|e| anyhow::anyhow!(e))?;
+        match result {
+            Ok(hit) if hit.models.is_empty() => {
+                failures[index] = Some(format!(
+                    "{endpoint}: endpoint answered but listed no models"
+                ));
+            }
+            Ok(hit) => ordered[index] = Some(hit),
+            Err(error) => failures[index] = Some(format!("{endpoint}: {error}")),
+        }
+    }
+    Ok((
+        ordered.into_iter().flatten().collect(),
+        failures.into_iter().flatten().collect(),
+    ))
 }
 
 fn validate_authenticated_target(target: &str) -> anyhow::Result<()> {
@@ -872,12 +1133,16 @@ fn backend_from_probe(
     Ok(BackendConfig {
         name: backend_name(&probe.endpoint)?,
         endpoint: probe.endpoint.clone(),
-        model: probe.models.first().cloned(),
+        // Adopt the WARM model as the default hint when the probe reports
+        // one — a resident model answers immediately; install order says
+        // nothing (mirrors adopt()'s multiplexer precedence).
+        model: probe.warm.first().or(probe.models.first()).cloned(),
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
         kind: Some(probe.kind),
         api_key_file: token_file,
         api_key_env: token_env.map(str::to_string),
         serving: Some(probe.serving),
+        engine: probe.engine,
         host: url.host_str().map(str::to_string),
         provenance: Some(newt_core::config::BackendProvenance {
             source: Some(format!(
@@ -1425,25 +1690,6 @@ fn build_ollama_config(
     )
 }
 
-/// vLLM / OpenAI-compatible endpoint: a single-model INSTANCE backend.
-fn build_openai_config(
-    _base: Config,
-    name: &str,
-    endpoint: &str,
-    model: &str,
-    api_key_env: Option<String>,
-) -> (Config, BackendConfig) {
-    build_backend_pair(
-        name,
-        endpoint,
-        model,
-        BackendKind::Openai,
-        newt_core::Serving::Instance,
-        api_key_env,
-        "vllm",
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1559,26 +1805,6 @@ mod tests {
     }
 
     #[test]
-    fn build_openai_config_sets_openai_instance() {
-        let (cfg, backend) = build_openai_config(
-            Config::default(),
-            "dgx-vllm",
-            "http://dgx:8000",
-            "meta/llama-3.1-8b-instruct",
-            Some("DGX_API_KEY".into()),
-        );
-        assert_eq!(cfg.default_backend.as_deref(), Some("dgx-vllm"));
-        assert!(cfg.dgx.is_none() && cfg.backends.is_empty());
-        assert_eq!(backend.kind, Some(BackendKind::Openai));
-        assert_eq!(backend.serving, Some(newt_core::Serving::Instance));
-        assert_eq!(backend.api_key_env.as_deref(), Some("DGX_API_KEY"));
-        assert_eq!(
-            backend.effective_model(),
-            Some("meta/llama-3.1-8b-instruct")
-        );
-    }
-
-    #[test]
     fn target_candidates_expand_a_bare_host_and_keep_an_explicit_url_single() {
         let discovery = newt_core::config::Discovery {
             hosts: vec![],
@@ -1648,6 +1874,8 @@ mod tests {
             kind: BackendKind::Openai,
             models: models.iter().map(|m| (*m).to_string()).collect(),
             serving: newt_core::backend_probe::api_for(BackendKind::Openai).serving(models.len()),
+            engine: None,
+            warm: Vec::new(),
         }
     }
 
@@ -2350,7 +2578,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let models = fetch_openai_models(&client, &server.uri()).await.unwrap();
+        let models = newt_core::backend_probe::fetch_openai_models(&client, &server.uri())
+            .await
+            .unwrap();
         assert_eq!(models, vec!["meta/llama-3.1-8b-instruct"]);
     }
 
@@ -2396,7 +2626,9 @@ mod tests {
 
     #[serial_test::serial(real_fs)]
     #[tokio::test]
-    async fn dgx_vllm_flow_writes_openai_backend() {
+    async fn custom_host_flow_detects_openai_backend() {
+        // The custom-host door subsumes the old DGX flavour menu: the probe
+        // detects the wire (here: OpenAI-compatible, one model = instance).
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -2408,17 +2640,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let client = reqwest::Client::new();
-        // backend=2 (DGX), host=<mock url>, flavour=4 (vllm), model=1, key-env=(none), write=Y
-        let mut console = ScriptedConsole::new(&["2", &server.uri(), "4", "1", "", "y"]);
+        // custom host=2, host=<mock url>, endpoint=1, model=1, write=Y
+        let mut console = ScriptedConsole::new(&["2", &server.uri(), "1", "1", "y"]);
         run_with(&mut console, &client, &path).await.unwrap();
 
+        let name = format!("127-0-0-1-{}", server.address().port());
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.default_backend.as_deref(), Some("dgx-vllm"));
-        let b = read_dropin(&path, "dgx-vllm");
+        assert_eq!(cfg.default_backend.as_deref(), Some(name.as_str()));
+        let b = read_dropin(&path, &name);
         assert_eq!(b.kind, Some(BackendKind::Openai));
         assert_eq!(b.serving, Some(newt_core::Serving::Instance));
         assert_eq!(b.effective_model(), Some("meta/llama-3.1-8b-instruct"));
         assert_eq!(b.endpoint, server.uri());
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn custom_host_adopts_the_warm_model_as_the_enter_default() {
+        // /api/tags lists install order; /api/ps says what's LOADED. The menu
+        // must put the warm model first so a blank Enter adopts it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    {"name": "cold-a:7b"}, {"name": "cold-b:13b"}, {"name": "warm:32b"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "warm:32b"}]
+            })))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let client = reqwest::Client::new();
+        // custom host=2, host, endpoint=1, model=<Enter> (default = warm), write=Y
+        let mut console = ScriptedConsole::new(&["2", &server.uri(), "1", "", "y"]);
+        run_with(&mut console, &client, &path).await.unwrap();
+
+        let name = format!("127-0-0-1-{}", server.address().port());
+        assert_eq!(
+            read_dropin(&path, &name).effective_model(),
+            Some("warm:32b"),
+            "a blank Enter adopts the WARM model, not install order"
+        );
+        let seen = console.transcript();
+        assert!(seen.contains("warm: warm:32b"), "row shows warmth: {seen}");
     }
 
     #[serial_test::serial(real_fs)]
@@ -2480,63 +2752,83 @@ mod tests {
         assert!(!path.exists());
     }
 
-    // --- normalize_cloud_url pure tests -------------------------------------
+    // --- custom-host / preset pure helpers ----------------------------------
 
     #[test]
-    fn normalize_cloud_url_strips_v1() {
-        assert_eq!(
-            normalize_cloud_url("https://inference.example.com/v1"),
-            "https://inference.example.com"
-        );
+    fn format_endpoint_row_shows_engine_and_warmth() {
+        let hit = newt_core::backend_probe::EndpointProbeResult {
+            endpoint: "http://gpu-box:8080".into(),
+            kind: BackendKind::Openai,
+            models: vec!["a".into(), "b".into()],
+            serving: newt_core::Serving::Multiplexer,
+            engine: Some(newt_core::config::Engine::LlamaCpp),
+            warm: vec!["b".into()],
+        };
+        let row = format_endpoint_row(&hit);
+        assert!(row.contains("llama.cpp"), "{row}");
+        assert!(row.contains("2 models"), "{row}");
+        assert!(row.contains("warm: b"), "{row}");
+        // Unknown engine degrades to the wire-kind label; no warmth shown.
+        let bare = newt_core::backend_probe::EndpointProbeResult {
+            engine: None,
+            warm: vec![],
+            ..hit
+        };
+        let row = format_endpoint_row(&bare);
+        assert!(row.contains("openai"), "{row}");
+        assert!(!row.contains("warm:"), "{row}");
     }
 
     #[test]
-    fn normalize_cloud_url_strips_v1_trailing_slash() {
+    fn order_models_warm_first_promotes_only_served_warm_entries() {
+        let models: Vec<String> = ["a", "b", "c"].map(String::from).into();
+        let warm: Vec<String> = ["c", "ghost"].map(String::from).into();
         assert_eq!(
-            normalize_cloud_url("https://inference.example.com/v1/"),
-            "https://inference.example.com"
+            order_models_warm_first(&models, &warm),
+            ["c", "a", "b"].map(String::from).to_vec(),
+            "warm first, stale warm entries ignored, order stable"
         );
+        assert_eq!(order_models_warm_first(&models, &[]), models);
     }
 
     #[test]
-    fn normalize_cloud_url_strips_models_path() {
+    fn parse_identity_line_accepts_name_email_and_rejects_malformed() {
         assert_eq!(
-            normalize_cloud_url("https://inference.example.com/v1/models"),
-            "https://inference.example.com"
+            parse_identity_line("Ada Lovelace <ada@example.com>"),
+            Some(("Ada Lovelace".to_string(), "ada@example.com".to_string()))
         );
+        assert_eq!(parse_identity_line("no brackets"), None);
+        assert_eq!(parse_identity_line("<ada@example.com>"), None, "empty name");
+        assert_eq!(parse_identity_line("Ada <not-an-email>"), None);
     }
 
     #[test]
-    fn normalize_cloud_url_strips_chat_completions_path() {
-        assert_eq!(
-            normalize_cloud_url("https://inference.example.com/v1/chat/completions"),
-            "https://inference.example.com"
-        );
+    fn the_preset_table_carries_the_three_hosted_providers() {
+        // The menu and configure_preset render/consume this table — the
+        // wizard's provider knowledge is DATA (three Cs), pinned here.
+        let names: Vec<&str> = PROVIDER_PRESETS.iter().map(|p| p.name).collect();
+        assert_eq!(names, ["openai", "anthropic", "ollama-cloud"]);
+        for preset in PROVIDER_PRESETS {
+            assert!(preset.endpoint.starts_with("https://"), "{}", preset.name);
+            assert!(!preset.api_key_env.is_empty());
+            assert!(!preset.default_model.is_empty());
+        }
+        let anthropic = &PROVIDER_PRESETS[1];
+        assert_eq!(anthropic.kind, BackendKind::Anthropic, "native wire");
+        let cloud = &PROVIDER_PRESETS[2];
+        assert_eq!(cloud.kind, BackendKind::Ollama, "ollama wire + bearer");
+        assert_eq!(cloud.endpoint, "https://ollama.com");
     }
 
-    #[test]
-    fn normalize_cloud_url_passthrough_bare_host() {
-        assert_eq!(
-            normalize_cloud_url("https://inference.example.com"),
-            "https://inference.example.com"
-        );
-    }
-
-    #[test]
-    fn derive_name_from_url_extracts_host() {
-        assert_eq!(
-            derive_name_from_url("https://inference.example.com/v1"),
-            Some("inference.example.com".to_string())
-        );
-    }
-
-    // --- cloud wizard integration test --------------------------------------
+    // --- custom-host / preset integration tests ------------------------------
 
     #[serial_test::serial(real_fs)]
     #[tokio::test]
-    async fn cloud_wizard_writes_backend_with_token_file() {
+    async fn custom_host_auth_required_stores_the_token_encrypted() {
+        // An authenticated endpoint 401s the bare probe; the wizard asks for
+        // the key ONCE (hidden input), re-probes, and stores the pasted token
+        // ENCRYPTED at rest — plaintext never lands on disk or in output.
         let server = MockServer::start().await;
-        // Serve /v1/models with an auth header.
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .and(wiremock::matchers::header(
@@ -2544,119 +2836,229 @@ mod tests {
                 "Bearer test-remote-key",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "object": "list",
                 "data": [
-                    {"id": "example/model-a", "object": "model"},
-                    {"id": "example/model-b", "object": "model"}
+                    {"id": "example/model-a"},
+                    {"id": "example/model-b"}
                 ]
             })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
+        // Pin the config dir: the machine identity for blank-passphrase
+        // encryption lives under it.
+        let prev = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
+        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        newt_core::secrets::session().reset_for_test();
         let client = reqwest::Client::new();
 
-        // Remote (3) → endpoint (with /v1, must be stripped) → key → model → write.
-        // No name prompt: the drop-in is named for the host.
-        let server_url = server.uri(); // e.g. http://127.0.0.1:PORT
-        let server_with_v1 = format!("{server_url}/v1");
-        let mut console = ScriptedConsole::new(&[
-            "3",               // Cloud
-            &server_with_v1,   // base_url (includes /v1 — should be stripped)
-            "test-remote-key", // API key
-            "1",               // pick model 1
-            "y",               // write
-        ]);
-
+        let server_with_v1 = format!("{}/v1", server.uri());
+        // custom host=2, host (with /v1 — stripped), key (hidden), endpoint=1,
+        // model=1, passphrase=<Enter: machine key>, write=Y
+        let mut console =
+            ScriptedConsole::new(&["2", &server_with_v1, "test-remote-key", "1", "1", "", "y"]);
         run_with(&mut console, &client, &path).await.unwrap();
 
-        let cfg = Config::load(&path).unwrap();
-        let dropin = read_dropin(&path, "127.0.0.1");
+        let name = format!("127-0-0-1-{}", server.address().port());
+        let dropin = read_dropin(&path, &name);
         assert_eq!(dropin.effective_model(), Some("example/model-a"));
-        assert_eq!(dropin.kind, Some(BackendKind::Openai));
-        // The endpoint must NOT include /v1.
-        assert!(!dropin.endpoint.ends_with("/v1"));
-        // A token file was written.
-        assert!(dropin.api_key_file.is_some());
-        let token_path_str = dropin.api_key_file.as_deref().unwrap();
-        let token_path = if let Some(rest) = token_path_str.strip_prefix("~/") {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(rest)
-        } else {
-            std::path::PathBuf::from(token_path_str)
+        assert!(!dropin.endpoint.ends_with("/v1"), "probe suffix stripped");
+        let token_ref = dropin.api_key_file.as_deref().expect("key recorded");
+        assert!(
+            token_ref.ends_with(".token.age"),
+            "encrypted ref: {token_ref}"
+        );
+        let token_path = std::path::PathBuf::from(token_ref);
+        let body = std::fs::read_to_string(&token_path).unwrap();
+        assert!(
+            body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"),
+            "ciphertext on disk"
+        );
+        assert!(!body.contains("test-remote-key"), "no plaintext token");
+        assert!(
+            !console.transcript().contains("test-remote-key"),
+            "the token is never echoed"
+        );
+        // The freshly stored token resolves transparently (machine identity).
+        newt_core::secrets::session().reset_for_test();
+        assert_eq!(dropin.resolve_api_key().as_deref(), Some("test-remote-key"));
+
+        newt_core::secrets::session().reset_for_test();
+        match prev {
+            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+        }
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn preset_skip_key_records_the_env_reference() {
+        // A preset with no pasted key writes the backend anyway, recording
+        // the provider's canonical env var — nothing stored on disk.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "open-model"}]
+            })))
+            .mount(&server)
+            .await;
+        std::env::remove_var("NEWT_TEST_PRESET_KEY");
+        let preset = ProviderPreset {
+            name: "testcloud",
+            label: "Test Cloud",
+            endpoint: Box::leak(server.uri().into_boxed_str()),
+            kind: BackendKind::Openai,
+            api_key_env: "NEWT_TEST_PRESET_KEY",
+            default_model: "fallback-model",
+            token_help: "https://example.invalid/keys",
         };
-        // The config reports a non-empty default.
-        assert_eq!(cfg.default_backend.as_deref(), Some("127.0.0.1"));
-        // Token file exists with the right content.
-        assert_eq!(
-            std::fs::read_to_string(token_path).unwrap(),
-            "test-remote-key"
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let client = reqwest::Client::new();
+        // key=<Enter: skip>, model=1
+        let mut console = ScriptedConsole::new(&["", "1"]);
+        let (_cfg, backend) = configure_preset(&mut console, &client, &preset, &path)
+            .await
+            .unwrap();
+        assert_eq!(backend.api_key_env.as_deref(), Some("NEWT_TEST_PRESET_KEY"));
+        assert!(backend.api_key_file.is_none(), "nothing stored on skip");
+        assert_eq!(backend.effective_model(), Some("open-model"));
+        assert_eq!(backend.kind, Some(BackendKind::Openai));
+        assert!(
+            console
+                .transcript()
+                .contains("export $NEWT_TEST_PRESET_KEY"),
+            "the skip warns how to supply the key: {}",
+            console.transcript()
         );
     }
 
     #[serial_test::serial(real_fs)]
     #[tokio::test]
-    async fn cloud_wizard_no_key_skips_token_file() {
+    async fn preset_pasted_token_is_stored_encrypted_with_a_passphrase() {
+        // The pasted-key path: hidden input, optional passphrase, encrypted
+        // .token.age reference — and the model probe runs WITH the key.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer sk-preset-secret",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "gated-model"}]
+            })))
+            .mount(&server)
+            .await;
+        std::env::remove_var("NEWT_TEST_PRESET_KEY");
+        let preset = ProviderPreset {
+            name: "gatedcloud",
+            label: "Gated Cloud",
+            endpoint: Box::leak(server.uri().into_boxed_str()),
+            kind: BackendKind::Openai,
+            api_key_env: "NEWT_TEST_PRESET_KEY",
+            default_model: "fallback-model",
+            token_help: "https://example.invalid/keys",
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let prev = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
+        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        newt_core::secrets::session().reset_for_test();
+        let client = reqwest::Client::new();
+        // key (hidden), passphrase, model=1
+        let mut console = ScriptedConsole::new(&["sk-preset-secret", "open sesame", "1"]);
+        let (_cfg, backend) = configure_preset(&mut console, &client, &preset, &path)
+            .await
+            .unwrap();
+        assert!(backend.api_key_env.is_none());
+        let token_ref = backend.api_key_file.as_deref().expect("encrypted ref");
+        assert!(token_ref.ends_with("gatedcloud.token.age"));
+        assert_eq!(backend.effective_model(), Some("gated-model"));
+        let body =
+            std::fs::read_to_string(dir.path().join("backends/gatedcloud.token.age")).unwrap();
+        assert!(body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
+        assert!(!body.contains("sk-preset-secret"));
+        assert!(!console.transcript().contains("sk-preset-secret"));
+
+        newt_core::secrets::session().reset_for_test();
+        match prev {
+            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+        }
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn preset_uses_an_exported_env_var_without_storing_anything() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "object": "list",
-                "data": [{"id": "open-model", "object": "model"}]
+                "data": [{"id": "env-model"}]
             })))
             .mount(&server)
             .await;
-
+        std::env::set_var("NEWT_TEST_PRESET_KEY", "sk-from-env");
+        let preset = ProviderPreset {
+            name: "envcloud",
+            label: "Env Cloud",
+            endpoint: Box::leak(server.uri().into_boxed_str()),
+            kind: BackendKind::Openai,
+            api_key_env: "NEWT_TEST_PRESET_KEY",
+            default_model: "fallback-model",
+            token_help: "https://example.invalid/keys",
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let client = reqwest::Client::new();
-        let server_url = server.uri();
-
-        // No API key — the common self-hosted case. The drop-in is still named
-        // for the host, so no name prompt appears.
-        let mut console = ScriptedConsole::new(&[
-            "3",         // Remote
-            &server_url, // endpoint, already bare
-            "",          // no API key
-            "1",         // pick model 1
-            "y",         // write
-        ]);
-
-        run_with(&mut console, &client, &path).await.unwrap();
-
-        // Named for the host, not for anything the operator typed.
-        let dropin = read_dropin(&path, "127.0.0.1");
-        assert_eq!(dropin.effective_model(), Some("open-model"));
-        assert!(
-            dropin.api_key_file.is_none(),
-            "no key given, so no token file may be written"
-        );
+        // use exported?=<Enter: yes>, model=1
+        let mut console = ScriptedConsole::new(&["", "1"]);
+        let (_cfg, backend) = configure_preset(&mut console, &client, &preset, &path)
+            .await
+            .unwrap();
+        std::env::remove_var("NEWT_TEST_PRESET_KEY");
+        assert_eq!(backend.api_key_env.as_deref(), Some("NEWT_TEST_PRESET_KEY"));
+        assert!(backend.api_key_file.is_none(), "env reference only");
+        assert_eq!(backend.effective_model(), Some("env-model"));
     }
 
-    /// Regression: the token path used `var_os("HOME")?`, so on Windows — where
-    /// the variable is `USERPROFILE` — the `?` bailed out of the whole closure.
-    /// The token file was written and `api_key_file` stayed `None`, leaving the
-    /// backend silently unauthenticated. Caught by the Windows CI job; this
-    /// pins it without needing one.
+    /// Regression heir: the old plaintext writer used `var_os("HOME")?`, so
+    /// on Windows — where the variable is `USERPROFILE` — the `?` bailed and
+    /// the key went unrecorded. The encrypted writer must likewise record a
+    /// usable (absolute) reference even with no home to collapse against.
     #[test]
     #[serial_test::serial(real_fs)]
-    fn a_token_path_is_recorded_even_when_home_is_unset() {
+    fn a_token_reference_is_recorded_even_when_home_is_unset() {
         let saved = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
+        // The machine identity needs a config root even with HOME unset.
+        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        newt_core::secrets::session().reset_for_test();
         // SAFETY: guarded by the `real_fs` serial lane, and restored below.
         unsafe {
             std::env::remove_var("HOME");
             std::env::remove_var("USERPROFILE");
         }
 
-        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let (_cfg, backend) = build_cloud_config(
-            &path,
-            "example.com",
-            "http://example.com:8080",
-            "model-a",
-            Some("a-secret"),
-        );
+        // passphrase=<Enter: machine key>
+        let mut console = ScriptedConsole::new(&[""]);
+        let recorded = persist_wizard_token(&mut console, &path, "example", "a-secret")
+            .expect("a supplied key must always be recorded, home dir or not");
 
         // SAFETY: same lane; restore before asserting so a failure cannot leak.
         unsafe {
@@ -2668,18 +3070,20 @@ mod tests {
             }
         }
 
-        let recorded = backend
-            .api_key_file
-            .expect("a supplied key must always be recorded, home dir or not");
         assert!(
             !recorded.starts_with('~'),
             "with no home to collapse against, the path stays absolute: {recorded}"
         );
-        assert_eq!(
-            std::fs::read_to_string(&recorded).unwrap(),
-            "a-secret",
-            "the recorded path must point at the token actually written"
-        );
+        assert!(recorded.ends_with("example.token.age"));
+        let body = std::fs::read_to_string(&recorded).unwrap();
+        assert!(body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
+        assert!(!body.contains("a-secret"), "never plaintext on disk");
+
+        newt_core::secrets::session().reset_for_test();
+        match prev {
+            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+        }
     }
 
     // --- model selector (#1452): a llama.cpp router serves 30+ models, so the
@@ -2754,7 +3158,7 @@ mod tests {
 
     #[serial_test::serial(real_fs)]
     #[tokio::test]
-    async fn dgx_requires_a_host() {
+    async fn custom_host_requires_a_host() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
@@ -2766,13 +3170,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let client = reqwest::Client::new();
-        // DGX, empty host (reprompt), then real host, flavour=1 (ollama), model=1, write=Y
+        // custom host, empty host (reprompt), then real host, endpoint=1, model=1, write=Y
         let mut console = ScriptedConsole::new(&["2", "", &server.uri(), "1", "1", "y"]);
         run_with(&mut console, &client, &path).await.unwrap();
+        let name = format!("127-0-0-1-{}", server.address().port());
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.default_backend.as_deref(), Some("dgx"));
+        assert_eq!(cfg.default_backend.as_deref(), Some(name.as_str()));
         assert_eq!(
-            read_dropin(&path, "dgx").effective_model(),
+            read_dropin(&path, &name).effective_model(),
             Some("qwen2.5-coder:32b")
         );
         // The reprompt message was shown.

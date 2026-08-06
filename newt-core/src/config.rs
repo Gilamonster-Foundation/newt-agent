@@ -64,6 +64,19 @@ pub struct Config {
     #[serde(default = "Vec::new")]
     pub backends: Vec<BackendConfig>,
 
+    /// Provenance marker for [`Config::is_unconfigured`]: true while the
+    /// backend list is exactly the compiled-in localhost fallback — nothing
+    /// operator-supplied (no inline `[[backends]]`, no drop-in, no CLI
+    /// override). Maintained deterministically by [`Config::resolve`] and
+    /// `Default` (serde is never trusted for it: `#[serde(skip)]`, and
+    /// `resolve()` recomputes it at every backend-assembly stage). Meaningful
+    /// only on a `resolve()`d config; never serialized. `pub` only because
+    /// `Config`'s struct-update syntax needs every field visible — read it
+    /// through [`Config::is_unconfigured`], never directly.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub backend_fallback: bool,
+
     /// Which backend the session starts on when several are configured and no
     /// env/loadout pins one (#1130, epic #1126). Unset + multiple backends =
     /// today's heuristic (prefer openai). Points at a backend NAME.
@@ -2657,6 +2670,14 @@ pub enum BackendKind {
     /// never a silent fallback. Intended for the summarizer + small auxiliary
     /// calls so they never contend with the primary model (#639).
     Embedded,
+    /// Anthropic's native Messages API (`POST /v1/messages`, `GET /v1/models`),
+    /// authenticated with `x-api-key` + `anthropic-version` headers (NOT a
+    /// bearer token). A genuinely distinct wire: top-level `system`, required
+    /// `max_tokens`, content-block responses. Unlike llama.cpp/vLLM (which
+    /// share the OpenAI wire and are told apart by [`Engine`] metadata),
+    /// Anthropic earns its own kind because the protocol differs.
+    #[serde(alias = "claude")]
+    Anthropic,
 }
 
 impl BackendKind {
@@ -2668,6 +2689,37 @@ impl BackendKind {
             Self::Ollama => "ollama",
             Self::Openai => "openai",
             Self::Embedded => "embedded",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+/// The inference ENGINE behind an endpoint — pure metadata, orthogonal to
+/// [`BackendKind`] (the wire protocol). llama.cpp's server and vLLM both
+/// speak the OpenAI wire, so `kind` alone cannot tell them apart; a
+/// fingerprint probe (`backend_probe::detect_engine`) can. The engine never
+/// gates a transport — it drives only which warm-model probe applies, display
+/// labels, and future model-card hints. `None` = undetected/unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    /// Ollama (`/api/version`, `/api/tags`, `/api/ps`).
+    Ollama,
+    /// llama.cpp's `llama-server` (`/props`, non-`/v1` `/models` with load
+    /// states).
+    #[serde(alias = "llama-cpp", alias = "llama.cpp")]
+    LlamaCpp,
+    /// vLLM (`/version`, single served model per instance).
+    Vllm,
+}
+
+impl Engine {
+    /// Short human label — shown beside probe results and in `/backends`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::LlamaCpp => "llama.cpp",
+            Self::Vllm => "vllm",
         }
     }
 }
@@ -2744,6 +2796,8 @@ pub fn derive_serving(kind: BackendKind, served_count: usize) -> Serving {
         }
         // The in-process engine runs one GGUF.
         BackendKind::Embedded => Serving::Instance,
+        // A hosted API fronting the whole Claude family — always many models.
+        BackendKind::Anthropic => Serving::Multiplexer,
     }
 }
 
@@ -2846,6 +2900,12 @@ pub struct BackendConfig {
     /// derive by probing (Phase B); `newt setup` caches the derivation here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving: Option<Serving>,
+    /// The detected inference engine (ollama | llama.cpp | vllm) — see
+    /// [`Engine`]. Pure metadata, orthogonal to `kind`: never gates a
+    /// transport, only refines warm-model probing and display. Unset =
+    /// undetected; `newt setup` caches the fingerprint result here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<Engine>,
     /// The physical host this endpoint lives on, for same-host reasoning (the
     /// vLLM-starves-ollama rule, crew spread). Unset = derived from the
     /// endpoint URL's host part; set it only to group endpoints the URL
@@ -2921,28 +2981,53 @@ impl BackendConfig {
     /// Resolve this backend's bearer token, if any.
     ///
     /// Checks [`api_key_env`](Self::api_key_env) first (environment
-    /// variable), then [`api_key_file`](Self::api_key_file) (first
-    /// non-empty line of the file, trimmed). Returns `None` when neither
-    /// is configured or neither resolves to a non-empty value.
+    /// variable), then [`api_key_file`](Self::api_key_file) — plaintext
+    /// (first non-empty line, trimmed) or age-encrypted (`.token.age`,
+    /// decrypted through [`crate::secrets`]). Returns `None` when nothing
+    /// resolves; a LOCKED/broken encrypted token additionally warns once per
+    /// path so it is never a silent `None` (use
+    /// [`resolve_api_key_detailed`](Self::resolve_api_key_detailed) for the
+    /// typed reason).
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(var) = &self.api_key_env {
-            if let Ok(val) = std::env::var(var) {
-                let val = val.trim();
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
+        match self.resolve_api_key_detailed() {
+            Ok(v) => v,
+            Err(e) => {
+                crate::secrets::warn_once(self.api_key_file.as_deref().unwrap_or(&self.name), &e);
+                None
             }
         }
-        if let Some(path) = &self.api_key_file {
-            let expanded = expand_tilde(path);
-            if let Ok(contents) = std::fs::read_to_string(&expanded) {
-                if let Some(token) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
-                    return Some(token.to_string());
-                }
-            }
-        }
-        None
     }
+
+    /// [`resolve_api_key`](Self::resolve_api_key) with the typed failure —
+    /// doctor and worker startup lines surface the actionable reason
+    /// (passphrase required / wrong passphrase / corrupt file).
+    pub fn resolve_api_key_detailed(
+        &self,
+    ) -> std::result::Result<Option<String>, crate::secrets::SecretsError> {
+        resolve_api_key_common(self.api_key_env.as_deref(), self.api_key_file.as_deref())
+    }
+}
+
+/// The ONE env-then-file credential rule shared by [`BackendConfig`] and
+/// [`SummarizerConfig`]. Env wins when set and non-empty; the file path goes
+/// through `secrets::resolve_token_file` (plaintext and encrypted alike).
+pub(crate) fn resolve_api_key_common(
+    api_key_env: Option<&str>,
+    api_key_file: Option<&str>,
+) -> std::result::Result<Option<String>, crate::secrets::SecretsError> {
+    if let Some(var) = api_key_env {
+        if let Ok(val) = std::env::var(var) {
+            let val = val.trim();
+            if !val.is_empty() {
+                return Ok(Some(val.to_string()));
+            }
+        }
+    }
+    if let Some(path) = api_key_file {
+        let expanded = expand_tilde(path);
+        return crate::secrets::resolve_token_file(&expanded);
+    }
+    Ok(None)
 }
 
 /// CLI-supplied backend override (`newt --backend-*` flags). Each field mirrors
@@ -2965,6 +3050,7 @@ pub struct BackendOverride {
     pub api_key_env: Option<String>,
     pub api_key_file: Option<String>,
     pub serving: Option<Serving>,
+    pub engine: Option<Engine>,
     pub host: Option<String>,
     pub coexist: Option<bool>,
     pub ram_gib: Option<f64>,
@@ -2993,6 +3079,9 @@ impl BackendOverride {
         if self.is_empty() {
             return;
         }
+        // An explicit `--backend-*` flag is operator configuration — the
+        // session is no longer running on the bare compiled-in fallback.
+        cfg.backend_fallback = false;
         let name = self.name.clone().unwrap_or_else(|| "cli".to_string());
         let has_destination = self.endpoint.is_some() || self.model_path.is_some();
 
@@ -3053,6 +3142,9 @@ impl BackendOverride {
         }
         if let Some(v) = self.serving {
             backend.serving = Some(v);
+        }
+        if let Some(v) = self.engine {
+            backend.engine = Some(v);
         }
         if let Some(v) = &self.host {
             backend.host = Some(v.clone());
@@ -3192,23 +3284,15 @@ impl SummarizerConfig {
         paths
     }
 
-    /// Resolve this summarizer's bearer token (env var first, then file), or
-    /// `None` — mirrors [`BackendConfig::resolve_api_key`].
+    /// Resolve this summarizer's bearer token (env var first, then file —
+    /// plaintext or encrypted), or `None` — the same
+    /// [`resolve_api_key_common`] rule as [`BackendConfig::resolve_api_key`]
+    /// (the mirrored body it used to carry is gone).
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(var) = &self.api_key_env {
-            if let Ok(val) = std::env::var(var) {
-                let val = val.trim();
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
-            }
-        }
-        if let Some(path) = &self.api_key_file {
-            let expanded = expand_tilde(path);
-            if let Ok(contents) = std::fs::read_to_string(&expanded) {
-                if let Some(token) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
-                    return Some(token.to_string());
-                }
+        match resolve_api_key_common(self.api_key_env.as_deref(), self.api_key_file.as_deref()) {
+            Ok(v) => return v,
+            Err(e) => {
+                crate::secrets::warn_once(self.api_key_file.as_deref().unwrap_or("summarizer"), &e);
             }
         }
         None
@@ -3380,6 +3464,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             backends: vec![fallback_localhost_backend()],
+            backend_fallback: true,
             default_backend: None,
             discovery: Discovery::default(),
             providers: Vec::new(),
@@ -3447,6 +3532,18 @@ impl Config {
     ///
     /// When no project override exists this is byte-for-byte the legacy
     /// first-match behavior. Returns `Config::default()` if nothing is found.
+    /// True when no operator-supplied inference backend exists anywhere: no
+    /// inline `[[backends]]` in any config file, no `backends/*.toml`
+    /// drop-in, no `--backend-*` CLI override — the backend list is exactly
+    /// the compiled-in localhost fallback. This is the first-run wizard's
+    /// "nothing configured" predicate: [`Config::resolve`] otherwise silently
+    /// invents a localhost Ollama, so a missing config was never observable
+    /// as a state. Meaningful only on a config produced by `resolve()`.
+    #[must_use]
+    pub fn is_unconfigured(&self) -> bool {
+        self.backend_fallback
+    }
+
     pub fn resolve() -> Result<Self> {
         let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
@@ -3514,6 +3611,14 @@ impl Config {
                 entry.trust = crate::mcp::McpTrust::Untrusted;
             }
         }
+        // `backend_fallback` provenance: serde never round-trips the skipped
+        // flag reliably, so recompute it at the file boundary. A config file
+        // that supplied inline `[[backends]]` is operator-configured; a file
+        // with none is (so far) as bare as no file at all. The `(None, None)
+        // => Self::default()` arm keeps the flag `Default` set (true).
+        if base_path.is_some() || project_path.is_some() {
+            cfg.backend_fallback = cfg.backends.is_empty();
+        }
         // Per-file backends (the endpoint control surface): drop a
         // `~/.newt/backends/<name>.toml` to add/override a backend — no
         // `config.toml` edit, and no overlapping inline `[[backends]]` to
@@ -3525,6 +3630,7 @@ impl Config {
         // either, restore the bare-install localhost Ollama so newt still has a
         // backend to talk to.
         if cfg.backends.is_empty() {
+            cfg.backend_fallback = true;
             cfg.backends.push(fallback_localhost_backend());
         }
         // Per-file bundles (the model-support-kit control surface): drop a
@@ -3670,6 +3776,10 @@ impl Config {
                     }
                     // The filename is authoritative for the name (collision-free).
                     backend.name = stem.to_string();
+                    // A successfully merged drop-in is operator-supplied
+                    // configuration — the resolved backend list is no longer
+                    // the bare compiled-in fallback (see `is_unconfigured`).
+                    self.backend_fallback = false;
                     match self.backends.iter_mut().find(|b| b.name == backend.name) {
                         Some(existing) => {
                             // A probe-cache drop-in records probed REALITY
@@ -4406,6 +4516,7 @@ const SENSITIVE_QUERY_KEYS: &[&str] = &[
     "access_token",
     "secret",
     "password",
+    "passphrase",
     "key",
 ];
 
@@ -5754,6 +5865,9 @@ mod tests {
             "GITHUB_TOKEN",
             "DGX_API_KEY",
             "NVIDIA_API_KEY",
+            // The encrypted-token-store unlock channel (crate::secrets):
+            // a child process must never inherit the vault passphrase.
+            crate::secrets::PASSPHRASE_ENV,
         ] {
             assert!(!allow.contains(&secret), "{secret} must never be inherited");
         }
@@ -6006,10 +6120,12 @@ mod tests {
         assert_eq!(after, before, "an empty override changes nothing");
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn writeback_probed_backend_lands_in_dedicated_dropin_not_config_toml() {
         // Probe write-back must never touch config.toml — only backends/<name>.toml
-        // so reset = delete that one file.
+        // so reset = delete that one file. Serial: pins NEWT_CONFIG_DIR, which
+        // races any parallel test that resolves the user config dir.
         let dir = tempfile::tempdir().unwrap();
         let config_toml = dir.path().join("config.toml");
         std::fs::write(&config_toml, "# keep me\n").unwrap();
@@ -6197,6 +6313,11 @@ mod tests {
         assert_eq!(cfg.disclosure, MemoryDisclosure::Frozen);
     }
 
+    /// Serial: reads `user_config_dir()`, which honors NEWT_CONFIG_DIR — a
+    /// parallel serial-lane test pinning that var to a tempdir makes the
+    /// `.newt` parent assertion observe the tempdir instead (caught by the
+    /// slower Windows CI runner).
+    #[serial_test::serial(real_fs)]
     #[test]
     fn skill_search_dirs_defaults_to_single_newt_dir() {
         let cfg = Config::default();
@@ -6213,6 +6334,7 @@ mod tests {
     /// #1021 PR 5.2: `personas_dir()` is the sibling-of-config default
     /// `PersonaStore::default_dir()` (newt-tui) also resolves to — a headless
     /// caller gets the exact same location without depending on newt-tui.
+    #[serial_test::serial(real_fs)] // same NEWT_CONFIG_DIR-reader race as above
     #[test]
     fn personas_dir_is_a_sibling_of_the_newt_config_dir() {
         let dir = Config::personas_dir();
@@ -6537,9 +6659,13 @@ tiers = ["COMPLEX"]
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn resolve_returns_default_when_no_file() {
         // Use a temp dir as cwd and clear env to ensure no candidates match.
+        // Serial: mutates process-global cwd + HOME, which races any parallel
+        // test that resolves paths (the unconfigured-provenance test shares
+        // this lane for the same reason).
         let dir = tempfile::tempdir().unwrap();
 
         // Save & clear environment to isolate the test.
@@ -6565,6 +6691,130 @@ tiers = ["COMPLEX"]
 
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].name, "ollama");
+        assert!(
+            cfg.is_unconfigured(),
+            "a resolve with no config anywhere is the unboxing state"
+        );
+    }
+
+    #[test]
+    fn default_config_is_unconfigured() {
+        assert!(
+            Config::default().is_unconfigured(),
+            "the struct default's sole backend is the compiled-in fallback"
+        );
+    }
+
+    #[test]
+    fn dropin_merge_clears_the_unconfigured_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("gpu.toml"),
+            "endpoint = \"http://gpu:11434\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        assert!(cfg.is_unconfigured());
+        cfg.merge_backends_from_dir(dir.path());
+        assert!(
+            !cfg.is_unconfigured(),
+            "a successfully merged drop-in is operator configuration"
+        );
+    }
+
+    #[test]
+    fn skipped_and_malformed_dropins_do_not_clear_the_unconfigured_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        // Malformed TOML → warn + skip.
+        std::fs::write(dir.path().join("bad.toml"), "endpoint = 42\n").unwrap();
+        // No endpoint and no model_path → skipped by the destination check.
+        std::fs::write(dir.path().join("hollow.toml"), "model = \"m\"\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.merge_backends_from_dir(dir.path());
+        assert!(
+            cfg.is_unconfigured(),
+            "only a drop-in that actually merges counts as configuration"
+        );
+    }
+
+    #[test]
+    fn cli_backend_override_clears_the_unconfigured_flag() {
+        let mut cfg = Config::default();
+        BackendOverride {
+            model: Some("qwen3:32b".into()),
+            ..Default::default()
+        }
+        .apply(&mut cfg);
+        assert!(
+            !cfg.is_unconfigured(),
+            "an explicit --backend-* flag is operator configuration"
+        );
+        // …but an empty override stays a no-op.
+        let mut untouched = Config::default();
+        BackendOverride::default().apply(&mut untouched);
+        assert!(untouched.is_unconfigured());
+    }
+
+    /// `resolve()`-boundary provenance: inline `[[backends]]` in a config file
+    /// and `backends/*.toml` drop-ins both mean "configured"; a config file
+    /// that declares neither is as bare as no file at all. Serial: pins
+    /// NEWT_CONFIG_DIR / HOME / cwd like `resolve_returns_default_when_no_file`.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn resolve_reports_unconfigured_only_without_operator_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved_config = std::env::var_os("NEWT_CONFIG");
+        let saved_config_dir = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+        let saved_home = std::env::var_os("HOME");
+        std::env::remove_var("NEWT_CONFIG");
+        std::env::set_var(NEWT_CONFIG_DIR_ENV, dir.path());
+        std::env::set_var("HOME", dir.path());
+        let prev_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let config_toml = dir.path().join("config.toml");
+
+        // 1. Config file with no backends and no drop-ins → still unboxed.
+        std::fs::write(&config_toml, "providers = []\n").unwrap();
+        let bare = Config::resolve().unwrap();
+
+        // 2. Inline [[backends]] → configured.
+        std::fs::write(
+            &config_toml,
+            "[[backends]]\nname = \"gpu\"\nendpoint = \"http://gpu:8000\"\n",
+        )
+        .unwrap();
+        let inline = Config::resolve().unwrap();
+
+        // 3. Backend-less config file + a drop-in → configured.
+        std::fs::write(&config_toml, "providers = []\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("backends")).unwrap();
+        std::fs::write(
+            dir.path().join("backends").join("gpu.toml"),
+            "endpoint = \"http://gpu:11434\"\n",
+        )
+        .unwrap();
+        let dropin = Config::resolve().unwrap();
+
+        std::env::set_current_dir(prev_dir).unwrap();
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_config_dir {
+            Some(v) => std::env::set_var(NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(NEWT_CONFIG_DIR_ENV),
+        }
+        if let Some(v) = saved_config {
+            std::env::set_var("NEWT_CONFIG", v);
+        }
+
+        assert!(
+            bare.is_unconfigured(),
+            "a backend-less config file is as bare as no file"
+        );
+        assert!(!inline.is_unconfigured(), "inline [[backends]] configure");
+        assert!(!dropin.is_unconfigured(), "a drop-in configures");
     }
 
     // --- Project-local `.newt/config.toml` layering (issue #222) ---

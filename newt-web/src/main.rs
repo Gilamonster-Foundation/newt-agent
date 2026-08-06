@@ -132,6 +132,7 @@ async fn spawn_agent(
 ) -> Html<String> {
     let kind = match form.kind.as_str() {
         "openai" => newt_core::BackendKind::Openai,
+        "anthropic" => newt_core::BackendKind::Anthropic,
         _ => newt_core::BackendKind::Ollama,
     };
     let id = reg.spawn(Spec {

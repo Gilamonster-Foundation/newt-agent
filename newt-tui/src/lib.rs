@@ -805,6 +805,7 @@ fn runtime_context_block(
         .to_string();
     let backend = match kind {
         newt_core::BackendKind::Openai => "openai-compatible",
+        newt_core::BackendKind::Anthropic => "anthropic",
         _ => "ollama",
     };
     let author_email = identity.email.as_str();
@@ -3354,20 +3355,33 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
                         if choice.serving.is_none() {
                             choice.serving = Some(probe.serving);
                         }
-                        Ok((probe.models, Some(probe.kind)))
+                        Ok((probe.models, probe.warm, Some(probe.kind)))
                     }
                     Err(e) => Err(e),
                 }
             } else {
-                backend_probe::api_for(choice.kind)
+                let api = backend_probe::api_for(choice.kind);
+                match api
                     .list_models(&client, &choice.url, choice.api_key.as_deref())
                     .await
-                    .map(|models| (models, None))
+                {
+                    Ok(models) => {
+                        // Warmth refines the no-preference fallback in adopt():
+                        // a model already resident answers immediately, install
+                        // order says nothing. Fail-soft (None → empty).
+                        let warm = api
+                            .warm_models(&client, &choice.url, choice.api_key.as_deref())
+                            .await
+                            .unwrap_or_default();
+                        Ok((models, warm, None))
+                    }
+                    Err(e) => Err(e),
+                }
             }
         })
     });
     match fetched {
-        Ok((models, detected_kind)) => {
+        Ok((models, warm, detected_kind)) => {
             if let Some(kind) = detected_kind {
                 lines.push(format!(
                     "detected {} at {} — {} model(s)",
@@ -3389,7 +3403,8 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
             let requested = std::env::var("NEWT_DGX_MODEL")
                 .ok()
                 .filter(|s| !s.is_empty());
-            let adoption = backend_probe::adopt(&synth, &Served { models }, requested.as_deref());
+            let adoption =
+                backend_probe::adopt(&synth, &Served { models, warm }, requested.as_deref());
             choice.serving = Some(adoption.serving);
             if adoption.requested_unavailable {
                 // #1122 fail-soft: a restored/typo'd model must not brick the
@@ -4476,8 +4491,12 @@ fn warn_on_missing_bound_skills(
 /// `PersonaStore::DEFAULT_PERSONAS` uses (FR-16, #1000), so a
 /// `personal-assistant` persona's declared `skills:` binding resolves out of
 /// the box with no manual `[skills] bundled_dir` opt-in required.
-const GILA_SKILL: &str =
-    include_str!("../../.newt/bundled-skills/gila-personal-assistant/SKILL.md");
+///
+/// Sourced from `newt-tui/assets/`, NOT the repo-local `.newt/` config dir:
+/// compiled-in assets must never live under a `.newt/` directory, because
+/// operators legitimately move `.newt` dirs aside (e.g. to simulate a fresh
+/// unboxing) and that must never break `cargo build`.
+const GILA_SKILL: &str = include_str!("../assets/bundled-skills/gila-personal-assistant/SKILL.md");
 
 /// Seed [`GILA_SKILL`] into the default skill directory
 /// (`newt_skills::default_skills_dir()`, i.e. `~/.newt/skills`) if missing. A
@@ -10103,6 +10122,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /persona switch <name>   - same as /persona <name> (an explicit verb)",
         "  /persona clear           - start fresh with no persona",
         "  /crew edit [name]        - edit a crew's settings (roles, control loop, test, budgets)",
+        "  /setup [host]            - configure an inference backend (wizard, or probe a host); \
+         pasted keys are stored encrypted",
         "  /dgx status              - DGX endpoint health + running models",
         "  /dgx models              - list models installed on the DGX",
         "  /dgx ps                  - models currently loaded in VRAM",
@@ -10180,6 +10201,7 @@ fn dispatch_slash(
             commands::model::dispatch(cmd, arg1, arg2, color, verbose)
         }
         "crew" => commands::crew::dispatch(arg1, arg2, color, verbose),
+        "setup" => commands::setup::dispatch(arg1, color, verbose),
         other => {
             print_newt(
                 &format!("unknown command: /{other}  (try /help)"),

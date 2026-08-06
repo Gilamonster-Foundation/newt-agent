@@ -12,6 +12,10 @@ pub struct LocalOllamaBackend {
     endpoint: String,
     model: String,
     client: reqwest::Client,
+    /// Optional bearer token sent as `Authorization: Bearer <token>` —
+    /// Ollama Cloud (`https://ollama.com`) requires one; LAN Ollama needs
+    /// none (the default) and ignores an unexpected header.
+    api_key: Option<String>,
     retry: RetryPolicy,
 }
 
@@ -21,6 +25,7 @@ impl LocalOllamaBackend {
             endpoint: endpoint.into(),
             model: model.into(),
             client: reqwest::Client::new(),
+            api_key: None,
             retry: RetryPolicy::from_env(),
         }
     }
@@ -36,6 +41,30 @@ impl LocalOllamaBackend {
     /// Return the configured endpoint URL.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Attach a bearer token, sent as `Authorization: Bearer <token>` on
+    /// every request (same contract as [`LocalVllmBackend::with_api_key`]).
+    /// `None`/empty leaves the backend unauthenticated.
+    pub fn with_api_key(mut self, api_key: impl Into<Option<String>>) -> Self {
+        self.api_key = api_key.into().filter(|k| !k.is_empty());
+        self
+    }
+
+    /// Build from a [`BackendConfig`](newt_core::BackendConfig): endpoint,
+    /// model, and bearer auth resolved from `api_key_env` / `api_key_file`
+    /// (parity with [`LocalVllmBackend::from_config`]).
+    pub fn from_config(cfg: &newt_core::BackendConfig) -> Self {
+        let model = cfg.effective_model().unwrap_or_default().to_string();
+        Self::new(cfg.endpoint.clone(), model).with_api_key(cfg.resolve_api_key())
+    }
+
+    /// Apply bearer auth to a request builder when a token is configured.
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => rb.bearer_auth(key),
+            None => rb,
+        }
     }
 
     /// Override the HTTP client timeout. Useful for testing.
@@ -189,9 +218,7 @@ impl LocalOllamaBackend {
 
         let url = format!("{}/api/chat", self.endpoint.trim_end_matches('/'));
         let resp = self
-            .client
-            .post(&url)
-            .json(&body)
+            .authed(self.client.post(&url).json(&body))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Ollama request failed: {e}"))?;

@@ -376,9 +376,14 @@ pub struct BackendArgs {
     )]
     pub tiers: Vec<newt_core::Tier>,
 
-    /// Wire protocol: `ollama`, `openai` (alias `vllm`), or `embedded`.
+    /// Wire protocol: `ollama`, `openai` (alias `vllm`), `anthropic` (alias
+    /// `claude`), or `embedded`.
     #[arg(long = "backend-kind", global = true, value_name = "KIND", value_parser = parse_backend_kind)]
     pub kind: Option<newt_core::config::BackendKind>,
+
+    /// Detected inference engine metadata: `ollama`, `llama.cpp`, or `vllm`.
+    #[arg(long = "backend-engine", global = true, value_name = "ENGINE", value_parser = parse_engine)]
+    pub engine: Option<newt_core::config::Engine>,
 
     /// OpenAI HTTP surface: `chat_completions` or `responses`.
     #[arg(long = "backend-api", global = true, value_name = "API", value_parser = parse_openai_api)]
@@ -436,6 +441,7 @@ impl BackendArgs {
             api_key_env: self.api_key_env.clone(),
             api_key_file: self.api_key_file.clone(),
             serving: self.serving,
+            engine: self.engine,
             host: self.host.clone(),
             coexist: self.coexist,
             ram_gib: self.ram_gib,
@@ -469,9 +475,20 @@ fn parse_backend_kind(s: &str) -> Result<newt_core::config::BackendKind, String>
         "ollama" => Ok(BackendKind::Ollama),
         "openai" | "vllm" | "openai-compatible" => Ok(BackendKind::Openai),
         "embedded" => Ok(BackendKind::Embedded),
+        "anthropic" | "claude" => Ok(BackendKind::Anthropic),
         _ => Err(format!(
-            "unknown backend kind '{s}' (ollama|openai|embedded)"
+            "unknown backend kind '{s}' (ollama|openai|anthropic|embedded)"
         )),
+    }
+}
+
+fn parse_engine(s: &str) -> Result<newt_core::config::Engine, String> {
+    use newt_core::config::Engine;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "ollama" => Ok(Engine::Ollama),
+        "llamacpp" | "llama.cpp" | "llama-cpp" => Ok(Engine::LlamaCpp),
+        "vllm" => Ok(Engine::Vllm),
+        _ => Err(format!("unknown engine '{s}' (ollama|llama.cpp|vllm)")),
     }
 }
 

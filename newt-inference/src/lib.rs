@@ -7,6 +7,7 @@
 //!   speaks the Newt-Provider JSON-RPC protocol — this is how OpenAI,
 //!   Anthropic, etc. join via opt-in plugin installs.
 
+pub mod anthropic;
 pub mod backend;
 /// In-process **embedder** (#720) — opt-in behind the `embedded` feature.
 #[cfg(feature = "embedded")]
@@ -31,6 +32,7 @@ pub use newt_core::retry;
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
+pub use anthropic::AnthropicBackend;
 pub use backend::{ChatReply, ChatRequest, InferenceBackend};
 pub use newt_core::retry::{with_backoff_notify, RetryPolicy};
 pub use registry::BackendRegistry;

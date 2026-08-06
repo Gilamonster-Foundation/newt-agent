@@ -205,7 +205,9 @@ fn context_window_for_core(
     safe_context: Option<u32>,
 ) -> Option<u32> {
     match kind {
-        newt_core::BackendKind::Openai => full_context_window,
+        // Hosted APIs (OpenAI-compatible and Anthropic) get the full declared
+        // window: core reserves the active generation policy itself.
+        newt_core::BackendKind::Openai | newt_core::BackendKind::Anthropic => full_context_window,
         newt_core::BackendKind::Ollama | newt_core::BackendKind::Embedded => safe_context,
     }
 }

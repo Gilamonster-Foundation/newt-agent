@@ -85,6 +85,10 @@ impl EmbeddingsClient {
                 "the embedded backend is chat-only and does not serve embeddings; \
                  set `embeddings_api` to an ollama/openai backend"
             ),
+            crate::BackendKind::Anthropic => anyhow::bail!(
+                "anthropic backends expose no embeddings surface; \
+                 set `embeddings_api` to an ollama/openai backend"
+            ),
         };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
@@ -102,8 +106,8 @@ impl EmbeddingsClient {
         let arr = match self.kind {
             crate::BackendKind::Ollama => json["embedding"].as_array(),
             crate::BackendKind::Openai => json["data"][0]["embedding"].as_array(),
-            // Unreachable: the embedded backend bails in the request match above.
-            crate::BackendKind::Embedded => None,
+            // Unreachable: embedded and anthropic bail in the request match above.
+            crate::BackendKind::Embedded | crate::BackendKind::Anthropic => None,
         }
         .ok_or_else(|| anyhow::anyhow!("embeddings response missing `embedding` array"))?;
         let vec: Vec<f32> = arr

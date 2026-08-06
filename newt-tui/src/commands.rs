@@ -8,3 +8,4 @@ pub(crate) mod crew;
 pub(crate) mod meta;
 pub(crate) mod model;
 pub(crate) mod settings;
+pub(crate) mod setup;

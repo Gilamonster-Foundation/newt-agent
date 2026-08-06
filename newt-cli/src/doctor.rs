@@ -27,6 +27,14 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
             backend.endpoint,
             backend.kind_label()
         );
+        // Credential verdict (encrypted token store, unboxing bundle): where
+        // the bearer comes from and whether it is usable right now.
+        if let Some(line) = token_status_line(
+            backend.api_key_env.as_deref(),
+            backend.api_key_file.as_deref(),
+        ) {
+            println!("    token: {line}");
+        }
     }
 
     println!("\nConfigured providers:");
@@ -235,6 +243,28 @@ async fn probe_configured_backend(backend: &newt_core::config::BackendConfig) ->
         // endpoint — keep that distinct from a connection failure.
         Err(e) if e.to_string().starts_with("HTTP ") => e.to_string(),
         Err(e) => format!("unreachable: {e}"),
+    }
+}
+
+/// One human line for a backend's credential state, `None` when no
+/// credential is configured at all (most local backends — no noise).
+fn token_status_line(api_key_env: Option<&str>, api_key_file: Option<&str>) -> Option<String> {
+    use newt_core::secrets::TokenStatus;
+    match newt_core::secrets::token_status(api_key_env, api_key_file) {
+        TokenStatus::Unset => None,
+        TokenStatus::FromEnv { var } => Some(format!("from env ${var}")),
+        TokenStatus::PlaintextFile { path } => Some(format!(
+            "plaintext file {} (re-run `newt setup` to store it encrypted)",
+            path.display()
+        )),
+        TokenStatus::EncryptedUnlocked { path } => {
+            Some(format!("encrypted (unlocked) — {}", path.display()))
+        }
+        TokenStatus::EncryptedLocked { path, reason } => Some(format!(
+            "encrypted (LOCKED) — {} · {reason}",
+            path.display()
+        )),
+        TokenStatus::MissingFile { path } => Some(format!("file missing — {}", path.display())),
     }
 }
 

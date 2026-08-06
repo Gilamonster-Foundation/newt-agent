@@ -17,6 +17,9 @@ async-trait.workspace = true
 # OCAP disclosure filter (ocap.rs): catch a known secret value in its common
 # re-encodings (base64), not just raw — filter by value, not by shape.
 base64.workspace = true
+# Encrypted token store (`newt_core::secrets`) — see the workspace-level
+# justification comment on this dependency.
+age.workspace = true
 # Gitignore-aware recursive walking for the embedded `find` tool (#496) — lets
 # agents search the workspace without the shell, which can be unavailable in a
 # given build (the stub-shell case that motivated the issue).

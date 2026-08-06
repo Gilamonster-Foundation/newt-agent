@@ -157,13 +157,30 @@ fn instantiate_configured_backend(
                 ollama_host_override = ollama_host.is_some(),
                 "worker: selected configured Ollama backend"
             );
-            Ok(Arc::new(newt_inference::local::LocalOllamaBackend::new(
-                endpoint, model,
+            Ok(Arc::new(
+                newt_inference::local::LocalOllamaBackend::new(endpoint, model)
+                    // Ollama Cloud (https://ollama.com) authenticates with a
+                    // bearer; LAN Ollama resolves no key and stays keyless.
+                    .with_api_key(backend.resolve_api_key()),
+            ))
+        }
+        // Native Anthropic Messages transport (/v1/messages, x-api-key).
+        // `$OLLAMA_HOST` does NOT apply — same rule as OpenAI above.
+        BackendKind::Anthropic => {
+            tracing::info!(
+                name = %backend.name,
+                endpoint = %backend.endpoint,
+                model = %backend.effective_model().unwrap_or("(server decides)"),
+                authenticated = backend.resolve_api_key().is_some(),
+                "worker: selected Anthropic backend"
+            );
+            Ok(Arc::new(newt_inference::AnthropicBackend::from_config(
+                backend,
             )))
         }
         other => anyhow::bail!(
             "worker: backend '{}' has unsupported kind {other:?} — the ACP worker \
-             supports `openai` and `ollama` backends",
+             supports `openai`, `ollama`, and `anthropic` backends",
             backend.name
         ),
     }
@@ -342,6 +359,23 @@ mod backend_selection_tests {
         // Responses → the POST /v1/responses transport, NOT chat/completions.
         assert_eq!(backend.name(), "openai-responses");
         assert_eq!(backend.endpoint(), Some("http://sol.host:8000/"));
+    }
+
+    #[test]
+    fn anthropic_backend_instantiates_native_transport_at_its_endpoint() {
+        let b = BackendConfig {
+            name: "claude".into(),
+            endpoint: "https://api.anthropic.com".into(),
+            model: Some("claude-sonnet-4-5".into()),
+            kind: Some(BackendKind::Anthropic),
+            tiers: vec![Tier::Complex],
+            ..Default::default()
+        };
+        let backend = instantiate_configured_backend(&b, None).expect("instantiate");
+        // Anthropic → the native /v1/messages transport, never the bail arm.
+        assert_eq!(backend.name(), "anthropic");
+        assert_eq!(backend.endpoint(), Some("https://api.anthropic.com"));
+        assert_eq!(backend.model_id(), "claude-sonnet-4-5");
     }
 
     #[test]

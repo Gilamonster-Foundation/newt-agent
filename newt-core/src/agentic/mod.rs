@@ -16,6 +16,10 @@
 mod budget;
 // #867: path-claim verification for the cap-exit summary (the file-name
 // sibling of the #717 phantom-tool-reach telemetry).
+/// Anthropic `/v1/messages` wire mapping — `pub` so `newt-inference`'s simple
+/// transport reuses the body builder/reply parser instead of duplicating them
+/// (the `retry` re-export precedent; the dependency points inference → core).
+pub mod anthropic_wire;
 mod claim_check;
 pub(crate) mod compress;
 mod crew_attest;
@@ -1477,6 +1481,20 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    // Anthropic speaks its own wire (/v1/messages) — request, tool_use, and
+    // usage shapes all differ — so it gets its own loop (the fourth parallel
+    // loop beside Ollama / Chat Completions / Responses).
+    if ctx.kind == crate::BackendKind::Anthropic {
+        return anthropic_chat_complete_with_prompt_and_artifacts(
+            ctx,
+            turn_prompt_context,
+            prompt_source,
+            artifact_source,
+            artifact_sink,
+            mcp,
+        )
+        .await;
+    }
     // OpenAI-compatible endpoints speak a different wire format (request,
     // tool_calls, and usage shapes all differ), so they get their own loop.
     if ctx.kind == crate::BackendKind::Openai {
@@ -6517,6 +6535,1837 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // #1214: the sibling check for claimed ACTIONS (commits, branches, pushes,
     // passing tests) — refuted against the workspace's real git state across
     // this turn. Fail-quiet off-repo (no evidence, no annotation).
+    let text = claim_check::annotate_action_claims(
+        text,
+        claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
+    );
+    if let Some(slot) = &mut end_reason {
+        **slot = Some(crate::TurnEndReason::RoundCap);
+    }
+    Ok((text, streamed, usage, hallucination_count))
+}
+
+// ── Anthropic Messages API (`POST /v1/messages`) ───────────────────────────
+//
+// The fourth parallel loop: a focused clone of
+// `openai_chat_complete_with_prompt_and_artifacts` over Anthropic's native
+// wire. The running transcript stays in the internal OpenAI-ish shape (see
+// `anthropic_wire`) and is converted at dispatch only, so every shared
+// subsystem — compression, nudges, claim check, budgets, repeat-call guard,
+// self-verify — is the same loop-policy code as the OpenAI path. Only the
+// dispatch/decode seams differ: URL, headers (`x-api-key`, never bearer),
+// request body, the `AnthropicRound` decode, and native SSE streaming.
+
+/// Anthropic auth headers: `x-api-key` when a non-empty key is configured
+/// (NEVER bearer auth on this wire) plus the pinned `anthropic-version`.
+fn anthropic_headers(
+    req: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let req = match api_key.filter(|k| !k.is_empty()) {
+        Some(key) => req.header("x-api-key", key),
+        None => req,
+    };
+    req.header("anthropic-version", crate::backend_probe::ANTHROPIC_VERSION)
+}
+
+/// Per-turn dispatch context for the Anthropic loop, bundled so
+/// [`anthropic_dispatch_round`] keeps a reviewable signature.
+struct AnthropicDispatch<'a> {
+    /// Whole-request-timeout client for `stream:false` bodies (a total bound
+    /// is correct for a single-shot response — mirrors the OpenAI path).
+    client: &'a reqwest::Client,
+    /// Idle-read-timeout client for `stream:true` bodies (mirrors the Ollama
+    /// path's #643 rationale: a progressing token stream must never be
+    /// aborted by a whole-request deadline; only silence times out).
+    stream_client: &'a reqwest::Client,
+    messages_url: &'a str,
+    api_key: Option<&'a str>,
+    retry: &'a RetryPolicy,
+    color: bool,
+    markdown: bool,
+}
+
+/// One `/v1/messages` dispatch → one decoded [`anthropic_wire::AnthropicRound`].
+///
+/// `stream:false`: the whole exchange (send + status + JSON body) sits in the
+/// retry envelope exactly like the OpenAI path's dispatch, then
+/// [`anthropic_wire::parse_messages_reply`] decodes it.
+///
+/// `stream:true`: only send()+status-check sit in the retry envelope; the SSE
+/// body is consumed OUTSIDE it (mirrors the Ollama streaming re-issue — a
+/// re-sent body after visible output would re-print). Text deltas print live
+/// following `stream_response`'s display idioms (spinner teardown before the
+/// first visible char, the `▸  ` prefix, the markdown block writer when
+/// markdown is on); thinking deltas go to the spinner detail like the Ollama
+/// `thinking` field. A mid-stream failure follows the #640 policy: with no
+/// visible output the round is re-issued under the retry budget; with partial
+/// visible output the partial answer is kept with a notice.
+///
+/// Returns `Ok(None)` when the user interrupted before the round produced a
+/// result (Esc / Ctrl-C) — the caller ends the turn with an empty reply. The
+/// returned bool is true iff visible answer text was printed live via SSE.
+async fn anthropic_dispatch_round(
+    d: &AnthropicDispatch<'_>,
+    body: &serde_json::Value,
+    stream: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<Option<(anthropic_wire::AnthropicRound, bool)>> {
+    if !stream {
+        let result = cancellable(
+            cancel,
+            with_backoff_notify(
+                d.retry,
+                || async {
+                    let req =
+                        anthropic_headers(d.client.post(d.messages_url), d.api_key).json(body);
+                    // W0 (#1511): classify while the error is TYPED — mirrors
+                    // the OpenAI path's dispatch site.
+                    let resp = req.send().await.map_err(|e| {
+                        anyhow::Error::new(observability::DispatchError::from_reqwest(
+                            "request failed",
+                            e,
+                        ))
+                    })?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(observability::DispatchError::http_status(format!(
+                            "inference endpoint {status}: {text}"
+                        ))
+                        .into());
+                    }
+                    resp.json::<serde_json::Value>()
+                        .await
+                        .map_err(anyhow::Error::from)
+                },
+                |attempt, delay| print_retry_indicator(attempt, delay, d.color),
+            ),
+        )
+        .await;
+        return match result {
+            None => Ok(None),
+            Some(Ok(json)) => Ok(Some((anthropic_wire::parse_messages_reply(&json), false))),
+            Some(Err(e)) => Err(e),
+        };
+    }
+
+    // Mid-body failures happen OUTSIDE the send/status retry envelope (which
+    // cannot see them), so the no-visible-output re-issues below are bounded
+    // by the same policy's retry budget with its own delays.
+    let mut stream_retries: u32 = 0;
+    loop {
+        let resp = match cancellable(
+            cancel,
+            with_backoff_notify(
+                d.retry,
+                || async {
+                    let req = anthropic_headers(d.stream_client.post(d.messages_url), d.api_key)
+                        .json(body);
+                    let resp = req.send().await.map_err(|e| {
+                        anyhow::Error::new(observability::DispatchError::from_reqwest(
+                            "stream request failed",
+                            e,
+                        ))
+                    })?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(observability::DispatchError::http_status(format!(
+                            "inference endpoint {status}: {text}"
+                        ))
+                        .into());
+                    }
+                    Ok(resp)
+                },
+                |attempt, delay| print_retry_indicator(attempt, delay, d.color),
+            ),
+        )
+        .await
+        {
+            None => return Ok(None),
+            Some(r) => r?,
+        };
+
+        // The ONE spinner (`newt_core::tty`), gated exactly like
+        // `stream_response`; the accumulated round text stays RAW (it is
+        // persisted and re-sent), display styling never enters it.
+        let mut spinner = crate::tty::Spinner::start_with_caps(
+            legacy_caps(d.color && thinking_stream_enabled()),
+            "thinking…",
+            crate::tty::Sink::Stdout,
+            d.color,
+        );
+        let cols = display::term_cols();
+        let mut md = d
+            .markdown
+            .then(|| MarkdownStreamWriter::new(io::stdout(), RenderOpts { color: true, cols }));
+        let mut acc = anthropic_wire::SseAccumulator::new();
+        let mut started = false;
+        let mut transport_break: Option<String> = None;
+        let mut resp = resp;
+        while !acc.is_done() {
+            match cancellable(cancel, resp.chunk()).await {
+                // Interrupted: stop reading and keep what already streamed
+                // (mirrors `stream_response`'s interrupt contract).
+                None => break,
+                Some(Ok(Some(chunk))) => {
+                    // Lossy UTF-8 into the accumulator's ROLLING line buffer —
+                    // an SSE `data:` line routinely splits across chunks, so a
+                    // per-chunk `lines()` split would drop events.
+                    for action in acc.feed(&String::from_utf8_lossy(&chunk)) {
+                        match action {
+                            anthropic_wire::StreamAction::TextDelta(t) => {
+                                if !started {
+                                    // The answer is starting — tear the
+                                    // spinner down first (stream_response's
+                                    // display convention).
+                                    drop(spinner.take());
+                                    if d.color {
+                                        execute!(
+                                            io::stdout(),
+                                            SetForegroundColor(NEWT_ORANGE_CT),
+                                            Print("▸  "),
+                                            ResetColor,
+                                        )
+                                        .ok();
+                                    } else {
+                                        print!("▸  ");
+                                    }
+                                    started = true;
+                                }
+                                if let Some(w) = md.as_mut() {
+                                    w.push(&t).ok();
+                                } else {
+                                    print!("{t}");
+                                    io::stdout().flush().ok();
+                                }
+                            }
+                            anthropic_wire::StreamAction::ThinkingDelta(t) => {
+                                if let Some(sp) = spinner.as_ref() {
+                                    sp.detail(&t);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(Ok(None)) => break,
+                Some(Err(e)) => {
+                    transport_break = Some(format!("stream request failed: {e}"));
+                    break;
+                }
+            }
+        }
+        drop(spinner.take());
+        if let Some(w) = md.as_mut() {
+            w.finish().ok();
+        }
+        if started && md.is_none() {
+            println!();
+        }
+        let round = acc.finish();
+
+        // #640 mid-stream-break policy (mirrors the Ollama path): a stream
+        // `error` event or a transport break after visible output keeps the
+        // partial text with a notice; before any visible output it converts
+        // to the retryable error shape and this round is re-issued.
+        let break_error = round.error.clone().or(transport_break);
+        if let Some(err) = break_error {
+            if !started {
+                let shaped: anyhow::Error = observability::DispatchError::http_status(format!(
+                    "inference endpoint 529: mid-stream error before any visible output: {err}"
+                ))
+                .into();
+                if stream_retries >= d.retry.max_retries {
+                    return Err(shaped);
+                }
+                stream_retries += 1;
+                let delay = d.retry.delay_for(stream_retries);
+                print_retry_indicator(stream_retries, delay, d.color);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            print_harness_notice(
+                &format!("stream broke mid-response ({err}) — keeping the partial answer"),
+                d.color,
+            );
+            return Ok(Some((round, true)));
+        }
+        return Ok(Some((round, started)));
+    }
+}
+
+/// Final tools-disabled completion for the Anthropic (`/v1/messages`) path.
+///
+/// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
+/// `accumulated` carries usage from the preceding tool-call rounds. Mirrors
+/// [`final_summary_openai`]: cap-exit nudge appended, same preflight, and
+/// `stream:false` with NO tools advertised so the model cannot emit tool_use.
+async fn final_summary_anthropic(
+    client: &reqwest::Client,
+    messages_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+    mut messages: Vec<serde_json::Value>,
+    generation_policy: generation_policy::GenerationPolicy,
+    cap: CapExit,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+    let CapExit {
+        max_tool_rounds,
+        accumulated,
+        wasted_calls,
+        progress,
+        observed,
+        request_budget,
+        calibration,
+        estimation,
+        ollama_num_ctx: _,
+    } = cap;
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
+    }));
+    let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
+    if preflight_full_message_request(
+        &wire_messages,
+        None,
+        request_budget,
+        calibration,
+        estimation,
+        model,
+    )
+    .is_err()
+    {
+        return Ok((
+            cap_exit_fallback(
+                max_tool_rounds,
+                accumulated,
+                wasted_calls,
+                progress.as_deref(),
+            ),
+            false,
+            accumulated,
+        ));
+    }
+    // Omit `tools` => the model cannot emit tool_use blocks (mirrors the
+    // OpenAI path's tools-disabled summary).
+    let body = anthropic_wire::build_messages_body(
+        model,
+        generation_policy
+            .max_output_tokens
+            .unwrap_or_else(anthropic_wire::default_max_tokens),
+        system.as_deref(),
+        &wire_messages,
+        None,
+        false,
+    );
+    let retry = tui_retry_policy();
+    let result = with_backoff_notify(
+        &retry,
+        || async {
+            let req = anthropic_headers(client.post(messages_url), api_key).json(&body);
+            let resp = req.send().await.map_err(|e| {
+                // Typed classification at the source (W0 #1511).
+                anyhow::Error::new(observability::DispatchError::from_reqwest(
+                    "request failed",
+                    e,
+                ))
+            })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(observability::DispatchError::http_status(format!(
+                    "inference endpoint {status}: {text}"
+                ))
+                .into());
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(anyhow::Error::from)
+        },
+        |_, _| {},
+    )
+    .await;
+    match result {
+        Ok(json) => {
+            // This wire separates thinking natively, so the OpenAI path's
+            // `split_reasoning` has no work to do here — `text` is clean.
+            let reply = anthropic_wire::parse_messages_reply(&json);
+            let content = reply.text;
+            let total = merge_round_usage(accumulated, reply.usage);
+            if content.is_empty() {
+                Ok((
+                    cap_exit_fallback(
+                        max_tool_rounds,
+                        accumulated,
+                        wasted_calls,
+                        progress.as_deref(),
+                    ),
+                    false,
+                    accumulated,
+                ))
+            } else if cap_exit_summary_is_action_handoff(&content) {
+                Ok((
+                    cap_exit_action_handoff_fallback(
+                        max_tool_rounds,
+                        accumulated,
+                        wasted_calls,
+                        progress.as_deref(),
+                    ),
+                    false,
+                    total,
+                ))
+            } else {
+                Ok((content, false, total))
+            }
+        }
+        Err(_) => Ok((
+            cap_exit_fallback(
+                max_tool_rounds,
+                accumulated,
+                wasted_calls,
+                progress.as_deref(),
+            ),
+            false,
+            accumulated,
+        )),
+    }
+}
+
+/// Anthropic-native variant of [`chat_complete`]: the same agentic tool-call
+/// loop, but over `POST {endpoint}/v1/messages` with `x-api-key` auth and the
+/// Anthropic `tool_use` / `tool_result` / `usage` shapes.
+///
+/// Streaming is native and ON by default (SSE, printed token-by-token); the
+/// `NEWT_ANTHROPIC_STREAM=off` env valve selects the non-streaming mode.
+pub async fn anthropic_chat_complete(
+    ctx: ChatCtx<'_>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    anthropic_chat_complete_with_prompt(ctx, None, None, mcp).await
+}
+
+/// Provenance-aware Anthropic Messages loop. See
+/// [`chat_complete_with_prompt`] for the compatibility contract.
+pub async fn anthropic_chat_complete_with_prompt(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    anthropic_chat_complete_with_prompt_and_artifacts(
+        ctx,
+        turn_prompt_context,
+        prompt_source,
+        None,
+        None,
+        mcp,
+    )
+    .await
+}
+
+async fn anthropic_chat_complete_with_prompt_and_artifacts(
+    ctx: ChatCtx<'_>,
+    turn_prompt_context: Option<&crate::TurnPromptContext>,
+    prompt_source: Option<&dyn PromptSource>,
+    artifact_source: Option<&dyn artifact_read::ArtifactSource>,
+    artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    let ChatCtx {
+        url,
+        model,
+        kind: _,
+        api_key,
+        messages: mem_messages,
+        task,
+        workspace,
+        color,
+        // Unlike the non-streaming OpenAI path, this loop streams natively —
+        // the caller-resolved markdown decision drives the live writer.
+        markdown,
+        tool_offload,
+        spill_store,
+        compaction_store,
+        scratchpad,
+        scratchpad_store,
+        code_search,
+        where_is,
+        nav,
+        exposure,
+        experience_store,
+        step_ledger,
+        caveats,
+        persona_tools,
+        // Resolved into a local generation policy like the OpenAI path; only
+        // the output cap projects onto this wire today (see below).
+        cognition,
+        chat_completions_capability,
+        reasoning_replay_scope,
+        max_tool_rounds,
+        workflow_grace_rounds,
+        narration_nudge_cap,
+        action_nudges,
+        prompt_disposition,
+        prompt_intake,
+        tool_output_lines,
+        debug,
+        trace,
+        num_ctx,
+        connect_timeout_secs,
+        inference_timeout_secs,
+        mid_loop_trim_threshold,
+        compaction_trigger_policy,
+        mid_loop_trim_tokens,
+        max_ok_input,
+        build_check_cmd,
+        safe_context,
+        recover_cw_400,
+        mut note_sink,
+        mut note_nudge,
+        recall_source,
+        memory_source,
+        summarizer,
+        compress_state,
+        mut tool_events,
+        mut phantom_reaches,
+        mut end_reason,
+        mut solve_obs,
+        mut permission_gate,
+        mut on_round_usage,
+        estimate_ratio,
+        estimation,
+        summary_input_cap_floor_chars,
+        input_ceiling_pct,
+        low_budget_pct,
+        exec_floor,
+        write_ledger,
+        cancel,
+        live_tool_output,
+        git_tool,
+        crew_runner,
+        operating_mode_control,
+        plan_mode_control,
+    } = ctx;
+    // See the Ollama path: a non-Act turn is allowed bounded reads but never
+    // execution-pressure nudges. (Mirrors the OpenAI path.)
+    let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
+    let generation_policy = generation_policy::GenerationPolicy::resolve(
+        cognition,
+        chat_completions_capability,
+        reasoning_replay_scope,
+    );
+    let reasoning_replay_scope = generation_policy.reasoning_replay_scope;
+    // Wire projection: the OpenAI path injects the resolved policy via
+    // `apply_to_chat_completions_body`; this wire takes only the REQUIRED
+    // `max_tokens` today. The request-shaping fields below are deliberately
+    // unused — the thinking/effort (and sampling) mapping onto /v1/messages
+    // is a declared follow-up — bound to `_` so the gap stays visible. (The
+    // output cap, replay scope, and continuation opt-in are read off
+    // `generation_policy` where the OpenAI path reads them.)
+    let generation_policy::GenerationPolicy {
+        thinking: _,
+        temperature: _,
+        top_p: _,
+        parallel_tool_calls: _,
+        chat_template_kwargs: _,
+        max_output_tokens: _,
+        reasoning_replay_scope: _,
+        one_bounded_reasoning_continuation: _,
+    } = generation_policy;
+    let max_tokens = generation_policy
+        .max_output_tokens
+        .unwrap_or_else(anthropic_wire::default_max_tokens);
+    // Streaming valve: default ON; `NEWT_ANTHROPIC_STREAM=off` disables SSE.
+    // Read once per loop invocation so a mid-turn flip cannot tear a round.
+    let streaming_enabled =
+        !std::env::var("NEWT_ANTHROPIC_STREAM").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
+    // Headless callers may pass no session state (mirrors the OpenAI path).
+    let mut local_compress_state = CompressState::new();
+    let compress_state = match compress_state {
+        Some(s) => s,
+        None => &mut local_compress_state,
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .timeout(std::time::Duration::from_secs(inference_timeout_secs))
+        .build()?;
+    // See the Ollama path's #643 rationale: the streaming client uses an IDLE
+    // `read_timeout` (caps the gap between chunks, resets on every token) so
+    // a slow-but-progressing stream is never aborted mid-flight.
+    let stream_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
+        .build()?;
+    let messages_url = anthropic_wire::messages_url(url);
+    let retry = tui_retry_policy();
+    let dispatcher = AnthropicDispatch {
+        client: &client,
+        stream_client: &stream_client,
+        messages_url: &messages_url,
+        api_key,
+        retry: &retry,
+        color,
+        markdown,
+    };
+    // Tool advertisement gating — mirrors the OpenAI path.
+    let advertise_save_note = note_sink.is_some();
+    let advertise_recall = recall_source.is_some();
+    let advertise_memory_fetch = memory_source.is_some();
+    let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
+    let advertise_code_search = code_search.is_some();
+    let advertise_experiential = experience_store.is_some();
+    let advertise_scheduled = step_ledger.is_some();
+    let advertise_git = git_tool.is_some();
+    let advertise_team = crew_runner.is_some();
+    let advertise_operating_mode = operating_mode_control.is_some();
+    let advertise_plan_mode = plan_mode_control.is_some();
+    let advertise_plan_mode_active =
+        plan_mode_control.is_some_and(|control| control.is_plan_mode());
+
+    let mut messages: Vec<serde_json::Value> = mem_messages
+        .iter()
+        .map(|m| {
+            let content = if m.role == crate::Role::Assistant
+                && reasoning_replay_scope != crate::model_card::ReasoningReplayScope::FullHistory
+            {
+                crate::reasoning::split_reasoning(&m.content).0
+            } else {
+                m.content.clone()
+            };
+            serde_json::json!({"role": m.role.as_str(), "content": content})
+        })
+        .collect();
+    let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
+        crate::TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        )
+    });
+    let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
+    let prompt_context =
+        prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
+    let artifact_context = turn_prompt_context
+        .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
+    let active_task = prompt_context.active_text();
+    if let Some(intake) = prompt_intake {
+        prompt_read::ensure_active_prompt_card_with_intake(&mut messages, prompt_context, intake);
+    } else {
+        prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
+    }
+
+    // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
+    if note_sink.is_some() {
+        if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
+            append_nudge_line(&mut messages, &line);
+        }
+    }
+
+    let mut accumulated_usage: Option<crate::TokenUsage> = None;
+    let mut hallucination_count: u32 = 0;
+    // Step 27.3/#771: guard against exact-repeat tool loops this run.
+    let mut repeat_calls = RepeatCallGuard::default();
+    // At most one reasoning-only length-stop continuation per user turn
+    // (mirrors the OpenAI path; the length stop is `max_tokens` here).
+    let mut reasoning_continuation_attempted = false;
+    let mut reasoning_overflow_signal_index: Option<usize> = None;
+    // `pause_turn` re-dispatches the same history at most once per turn.
+    let mut pause_turn_retried = false;
+    // Hard context-window 400s recovered (parse limit → trim → retry).
+    let mut cw_retries: u32 = 0;
+    // No-tools recovery (mirrors the OpenAI path): real Anthropic never
+    // rejects `tools`, but façades might; drop tools and retry, notice once.
+    let mut tools_supported = true;
+    let mut tools_unsupported_notified = false;
+    // Pre-send token budget gate — mirrors the OpenAI path (`num_ctx` is not
+    // sent on this wire, but an operator-declared local window still caps
+    // Newt's input budget).
+    let mut effective_input_ceiling = num_ctx_input_ceiling(
+        num_ctx,
+        input_ceiling_pct,
+        generation_policy.max_output_tokens,
+    );
+    let mut send_budget: Option<usize> =
+        initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
+    let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
+    // Tool schemas ride along in every request body; count them once (18.1).
+    let tools = merged_tool_definitions(
+        mcp,
+        advertise_save_note,
+        advertise_recall,
+        advertise_memory_fetch,
+        advertise_git,
+        advertise_team,
+        advertise_scratchpad,
+        advertise_code_search,
+        advertise_experiential,
+        advertise_scheduled,
+        advertise_operating_mode,
+        advertise_plan_mode,
+        advertise_plan_mode_active,
+    );
+    let tools = filter_advertised_tools(tools, persona_tools);
+    let tools = filter_tools_for_disposition(tools, prompt_disposition);
+    // #TEC Pass 1: exposure stage — mirrors the OpenAI path.
+    let tools = crate::agentic::tools::select_exposed(
+        tools,
+        &exposure,
+        exposure_budget_tokens(send_budget, safe_context),
+        &std::collections::BTreeSet::new(),
+        estimation,
+    );
+    // The Anthropic tool catalog, converted ONCE from the exposed catalog
+    // (`input_schema` copied wholesale, no `function` nesting).
+    let tools_anthropic = anthropic_wire::tools_to_anthropic(&tools);
+    let tool_tokens = estimate_value_tokens(&tools, estimation);
+    // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
+    // (mirrors the OpenAI path).
+    let cal = sanitize_estimate_ratio(estimate_ratio);
+    let tool_tokens_real = calibrate_up(tool_tokens, cal);
+    preflight_irreducible_request(
+        &messages,
+        Some(&tools),
+        authoritative_request_budget(send_budget, send_budget_authoritative, mid_loop_trim_tokens),
+        cal,
+        estimation,
+        model,
+    )?;
+    // Truthful context-size tracker (prompt-tokens-preferred, Step 18.1).
+    let mut prompt_tracker = PromptTracker::new();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // #867 Part A: observed-paths ledger (mirrors the OpenAI path).
+    let mut observed_paths = claim_check::ObservedPaths::default();
+    let observed_resolver = claim_check::workspace_resolver(workspace);
+    // #1214: HEAD at turn start (mirrors the OpenAI path).
+    let turn_start_head = claim_check::git_head(workspace);
+
+    // Narrate-then-stop rescue counter (mirrors the OpenAI path).
+    let mut narration_nudges: usize = 0;
+    // Self-verify gate (#23) — mirrors the OpenAI path.
+    let mut self_verify_nudges: usize = 0;
+    const SELF_VERIFY_CAP: usize = 2;
+    // Pending-plan final-answer gate counter (mirrors the OpenAI path).
+    let mut pending_plan_nudges: usize = 0;
+    // Unverified stale-file blocker rescue counter (mirrors the OpenAI path).
+    let mut stale_file_nudges: usize = 0;
+    let nudge_classifier = crate::NudgeClassifier::load_default();
+    // #1152/#1162: same intent gate as the primary loop.
+    let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
+    let workflow_steerer = crate::WorkflowSteerer::load_default();
+    let mut workflow_runtime = WorkflowRuntimeState {
+        tenacity: crate::tenacity::effective_tenacity(),
+        ..Default::default()
+    };
+    // See the OpenAI path: a matching workflow's grace-horizon override.
+    workflow_runtime.set_progress_horizon(
+        workflow_steerer.progress_horizon(&workflow_classifier_text(&messages, "")),
+    );
+
+    // Agentic loop — up to `max_tool_rounds` tool-call rounds plus the
+    // configurable workflow grace window (mirrors the OpenAI path).
+    let hard_tool_rounds = max_tool_rounds.saturating_add(workflow_grace_rounds);
+    let mut workflow_grace_active = false;
+    let mut current_tool_round_limit = max_tool_rounds;
+    'round_loop: for round in 0..hard_tool_rounds {
+        if round >= current_tool_round_limit {
+            if workflow_grace_active {
+                break;
+            }
+            if !action_nudges {
+                break;
+            }
+            let Some(nudge) = workflow_runtime.cap_grace_nudge(
+                step_ledger,
+                max_tool_rounds,
+                workflow_grace_rounds,
+            ) else {
+                break;
+            };
+            workflow_grace_active = true;
+            current_tool_round_limit = hard_tool_rounds;
+            if debug {
+                print_debug(
+                    "workflow progress at soft round cap — granting configured grace window",
+                    color,
+                );
+            }
+            messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+        }
+        // Interrupt checkpoint (Esc / Ctrl-C) — mirrors the OpenAI path.
+        if is_cancelled(cancel) {
+            return Ok((String::new(), false, accumulated_usage, hallucination_count));
+        }
+        if round > 0 && color {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(CtColor::DarkGrey),
+                Print("…\n"),
+                ResetColor
+            )
+            .ok();
+        }
+
+        // Conditional plan re-seat (#630 b) — mirrors the OpenAI path.
+        if round > 0 && action_nudges {
+            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+                messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+            }
+            if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
+                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+            }
+            // Tenacity action-forcing — mirrors the OpenAI path.
+            let remaining = current_tool_round_limit.saturating_sub(round + 1);
+            if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
+            {
+                if debug {
+                    print_debug(
+                        &format!(
+                            "tenacity[{}]: forcing action, read-only budget spent (round {round})",
+                            workflow_runtime.tenacity
+                        ),
+                        color,
+                    );
+                }
+                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+            }
+        }
+
+        // Context compression (Step 18.4, #247) — mirrors the OpenAI path:
+        // the shared prune → boundary → redacted summary → marker pipeline
+        // serves the mid-loop trigger and the pre-send budget guard.
+        {
+            let current = prompt_tracker.current(&messages, Some(&tools), cal, estimation);
+            let message_tokens = estimate_tokens(&messages, estimation);
+            let has_authoritative_headroom = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            )
+            .is_some();
+            let reasoning_tail_len =
+                compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
+            if let Some(trigger) = compression_trigger(
+                compress::compression_message_count(&messages, reasoning_tail_len),
+                current,
+                message_tokens,
+                CompressionTriggerLimits {
+                    count_threshold: mid_loop_trim_threshold,
+                    token_threshold: mid_loop_trim_tokens,
+                    send_budget,
+                    tool_tokens: tool_tokens_real,
+                    policy: compaction_trigger_policy,
+                    has_authoritative_headroom,
+                },
+            ) {
+                let pipeline_budget = if trigger.hard_budget {
+                    calibrate_down(trigger.budget, cal)
+                } else {
+                    trigger.budget
+                };
+                let token_fired = mid_loop_trim_tokens.is_some_and(|t| t > 0 && current > t);
+                let outcome = compress(
+                    CompressRequest {
+                        messages: &messages,
+                        budget: pipeline_budget,
+                        max_messages: if reasoning_tail_len > 0 {
+                            None
+                        } else {
+                            trigger.max_messages
+                        },
+                        replay_protected_tail_len: reasoning_tail_len,
+                        task: active_task,
+                        hard_budget: trigger.hard_budget,
+                        authoritative: token_fired || send_budget_authoritative,
+                        focus: None,
+                        est: estimation,
+                        summary_input_cap_floor_chars,
+                        compaction_store,
+                        compaction_stage: None,
+                    },
+                    summarizer,
+                    compress_state,
+                )
+                .await;
+                if let Some(notice) = outcome.notice {
+                    print_harness_notice(&notice, color);
+                }
+                if outcome.action == CompressAction::Refused {
+                    anyhow::bail!(
+                        "context (~{current} tokens) exceeds the model's input budget and \
+                         auto-compression is disabled after repeated ineffective passes — \
+                         start a new conversation or ask a more focused question, or run \
+                         `newt tunings reset {model}` if this model's learned budget looks wrong"
+                    );
+                }
+                if outcome.fired {
+                    let suffix = if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
+                        ", still over budget"
+                    } else {
+                        ""
+                    };
+                    emit_compression_notice(
+                        color,
+                        outcome.tokens_before,
+                        outcome.tokens_after,
+                        outcome.action,
+                        suffix,
+                    );
+                    if debug {
+                        print_debug(
+                            &format!(
+                                "compression: {} → {} messages (budget ~{} tokens, \
+                                 +~{tool_tokens} tool-schema tokens ride along)",
+                                messages.len(),
+                                outcome.messages.len(),
+                                pipeline_budget,
+                            ),
+                            color,
+                        );
+                    }
+                    messages = outcome.messages;
+                    prompt_tracker.invalidate();
+                    apply_post_compaction_continuation(
+                        &mut messages,
+                        &mut narration_nudges,
+                        outcome.action,
+                        step_ledger,
+                        prompt_context,
+                        round > 0,
+                        action_nudges,
+                    );
+                    record_compaction_artifact(
+                        artifact_sink,
+                        artifact_context,
+                        outcome.action,
+                        outcome.tokens_before,
+                        outcome.tokens_after,
+                        pipeline_budget,
+                        round,
+                        trigger.primary_cause.artifact_reason(),
+                        Some(&trigger),
+                        send_budget_authoritative,
+                        color,
+                    );
+                }
+            }
+        }
+
+        // #1528: inner recovery loop — a cw-400 (or a tools-unsupported
+        // error) retries THIS logical round IN PLACE (mirrors the OpenAI
+        // path); a `pause_turn` stop re-dispatches the same history once.
+        let (model_reply, printed_live, round_est_raw): (
+            anthropic_wire::AnthropicRound,
+            bool,
+            usize,
+        ) = loop {
+            // Convert the internal transcript to the Anthropic wire at
+            // dispatch only: leading system run → top-level `system`,
+            // assistant `tool_calls` → `tool_use` blocks, `role:"tool"` runs
+            // → ONE user message of `tool_result` blocks.
+            let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
+
+            // Mirror the OpenAI full-request gate.
+            preflight_full_message_request(
+                &wire_messages,
+                tools_supported.then_some(&tools),
+                authoritative_request_budget(
+                    send_budget,
+                    send_budget_authoritative,
+                    mid_loop_trim_tokens,
+                ),
+                cal,
+                estimation,
+                model,
+            )?;
+
+            // Phase 20 §2.2: chars/4 estimate of exactly the request about to
+            // be dispatched — mirrors the OpenAI path.
+            let round_est_raw = estimate_request_tokens(
+                &wire_messages,
+                tools_supported.then_some(&tools),
+                estimation,
+            );
+
+            let use_tools = tools_supported && !tools_anthropic.is_empty();
+            let body = anthropic_wire::build_messages_body(
+                model,
+                max_tokens,
+                system.as_deref(),
+                &wire_messages,
+                use_tools.then_some(tools_anthropic.as_slice()),
+                streaming_enabled,
+            );
+            let dispatch =
+                anthropic_dispatch_round(&dispatcher, &body, streaming_enabled, cancel).await;
+            match dispatch {
+                // Interrupted mid-dispatch: same contract as the round-
+                // boundary checkpoint (mirrors the Ollama raced probe).
+                Ok(None) => {
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count))
+                }
+                Ok(Some((reply, printed))) => {
+                    // `pause_turn`: the server paused a long turn; re-dispatch
+                    // the SAME history once — bounded so a façade that always
+                    // pauses cannot spin the loop.
+                    if reply.stop_reason.as_deref() == Some("pause_turn") && !pause_turn_retried {
+                        pause_turn_retried = true;
+                        if debug {
+                            print_debug("pause_turn — re-dispatching the same history once", color);
+                        }
+                        continue;
+                    }
+                    break (reply, printed, round_est_raw);
+                }
+                Err(e) => {
+                    // No-tools recovery (mirrors the OpenAI path): drop tools,
+                    // notice once, and re-dispatch the same round.
+                    if tools_supported && is_tools_unsupported_error(&e) {
+                        tools_supported = false;
+                        if !tools_unsupported_notified {
+                            tools_unsupported_notified = true;
+                            print_newt(
+                                &format!(
+                                "{model} does not support tools — tools disabled for this session"
+                            ),
+                                color,
+                                false,
+                            );
+                        }
+                        continue;
+                    }
+                    // Graceful context-window overflow recovery (mirrors the
+                    // OpenAI path): Anthropic's "prompt is too long: N tokens
+                    // > M maximum" 400 is parsed by the same shared hook;
+                    // numberless overflows fall back to deriving a tightened
+                    // cap from the current send budget.
+                    if cw_retries < 2 {
+                        let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
+                        if let Some(recovered_budget) = recovered_window
+                            .map(|context_window| {
+                                recovered_input_budget(
+                                    context_window,
+                                    input_ceiling_pct,
+                                    generation_policy.max_output_tokens,
+                                    effective_input_ceiling,
+                                )
+                            })
+                            .or_else(|| {
+                                cw_overflow::core_recover_overflow(
+                                    &e.to_string(),
+                                    send_budget,
+                                    None,
+                                )
+                                .map(|cap| cap as usize)
+                            })
+                        {
+                            if let Some(context_window) = recovered_window {
+                                emit_context_window_400(&mut on_round_usage, context_window);
+                            }
+                            let new_budget = effective_input_ceiling
+                                .map_or(recovered_budget, |c| recovered_budget.min(c));
+                            emit_overflow_notice(
+                                color,
+                                accumulated_usage.as_ref(),
+                                Some(new_budget.min(u32::MAX as usize) as u32),
+                                model,
+                                cw_retries + 1,
+                            );
+                            send_budget = Some(new_budget);
+                            effective_input_ceiling = Some(new_budget);
+                            send_budget_authoritative = true;
+                            let outcome = compress(
+                                CompressRequest {
+                                    messages: &messages,
+                                    budget: calibrate_down(
+                                        new_budget.saturating_sub(tool_tokens_real),
+                                        cal,
+                                    ),
+                                    max_messages: None,
+                                    replay_protected_tail_len:
+                                        compress::protected_reasoning_tail_len(
+                                            &messages,
+                                            reasoning_replay_scope,
+                                        ),
+                                    task: active_task,
+                                    hard_budget: true,
+                                    authoritative: true,
+                                    focus: None,
+                                    est: estimation,
+                                    summary_input_cap_floor_chars,
+                                    compaction_store,
+                                    compaction_stage: None,
+                                },
+                                summarizer,
+                                compress_state,
+                            )
+                            .await;
+                            if let Some(notice) = outcome.notice {
+                                print_harness_notice(&notice, color);
+                            }
+                            if outcome.action == CompressAction::Refused {
+                                // Refuse the resend; surface the endpoint's 400.
+                                return Err(e);
+                            }
+                            if outcome.fired {
+                                messages = outcome.messages;
+                                prompt_tracker.invalidate();
+                                apply_post_compaction_continuation(
+                                    &mut messages,
+                                    &mut narration_nudges,
+                                    outcome.action,
+                                    step_ledger,
+                                    prompt_context,
+                                    round > 0,
+                                    action_nudges,
+                                );
+                                record_compaction_artifact(
+                                    artifact_sink,
+                                    artifact_context,
+                                    outcome.action,
+                                    outcome.tokens_before,
+                                    outcome.tokens_after,
+                                    calibrate_down(
+                                        new_budget.saturating_sub(tool_tokens_real),
+                                        cal,
+                                    ),
+                                    round,
+                                    "context_window_400",
+                                    None,
+                                    false,
+                                    color,
+                                );
+                            }
+                            cw_retries += 1;
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        // Merge per-round token usage (input = max single prompt, output =
+        // sum — Step 18.1) and anchor the context-size tracker.
+        let round_usage = model_reply.usage;
+        if let Some(u) = round_usage {
+            prompt_tracker.record(u.input_tokens, messages.len());
+        }
+        accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
+
+        // Phase 20 §2.2: no silent head-truncation mode on this wire either —
+        // oversize requests get a parseable 400 (mirrors the OpenAI path).
+        let truncation_suspect = false;
+        if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
+            let raised = capped_accepted_prompt_tokens(u.input_tokens, effective_input_ceiling);
+            if raised > budget {
+                send_budget = Some(raised);
+                if debug {
+                    print_debug(
+                        &format!(
+                            "send budget raised to ~{raised} tokens (backend accepted \
+                             {}-token prompt)",
+                            u.input_tokens
+                        ),
+                        color,
+                    );
+                }
+            }
+        }
+
+        // `refusal` stop semantics (this wire only): NOT a tool round, NOT an
+        // error. The streamed/parsed text — if any — IS the answer; an empty
+        // refusal gets an honest placeholder. No rescue nudges: nudging a
+        // refusal toward action would fight the provider's decline.
+        if model_reply.stop_reason.as_deref() == Some("refusal") {
+            if !model_reply.text.is_empty() {
+                emit_accepted(
+                    &mut on_round_usage,
+                    round_usage,
+                    truncation_suspect,
+                    round_est_raw,
+                );
+            }
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::Completed);
+            }
+            let streamed = printed_live && !model_reply.text.is_empty();
+            let out = if model_reply.text.is_empty() {
+                "the model declined this request (refusal)".to_string()
+            } else {
+                model_reply.text.clone()
+            };
+            return Ok((out, streamed, accumulated_usage, hallucination_count));
+        }
+
+        // This wire separates thinking natively — `text` arrives clean, so
+        // the OpenAI path's `split_reasoning` has no work to do here.
+        let oa_content = model_reply.text.clone();
+        let separate_reasoning = {
+            let t = model_reply.thinking.trim();
+            (!t.is_empty()).then_some(t)
+        };
+        if debug && separate_reasoning.is_some() {
+            let n = separate_reasoning.map(str::len).unwrap_or(0);
+            print_debug(
+                &format!("reasoning ({n} chars) surfaced to the trace, not the answer"),
+                color,
+            );
+        }
+        let native_calls = (!model_reply.tool_uses.is_empty()).then_some(&model_reply.tool_uses);
+        // Recover tool calls emitted as content instead of native tool_use —
+        // mirrors the OpenAI path: real Anthropic emits native blocks, but a
+        // weak model behind a façade can drop content-emitted calls too.
+        let recovered = if native_calls.is_none() {
+            tool_recovery::recover_tool_calls(&oa_content)
+        } else {
+            tool_recovery::Recovery::default()
+        };
+        let tool_calls: Option<&Vec<serde_json::Value>> = match native_calls {
+            Some(t) => Some(t),
+            _ if !recovered.calls.is_empty() => Some(&recovered.calls),
+            _ => None,
+        };
+        let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        // `stop_reason` plays the OpenAI `finish_reason` role from here on.
+        let finish_reason = model_reply.stop_reason.as_deref();
+        if let Some(obs) = solve_obs.as_deref_mut() {
+            obs.behavior_signals
+                .push(observability::BehaviorSignal::ChatCompletionFinish {
+                    round,
+                    finish_reason: finish_reason.map(str::to_string),
+                });
+        }
+        let reasoning_text = separate_reasoning;
+        // Mirrors the OpenAI path's `reasoning_overflow_signature`, with the
+        // condition adapted to this wire's length stop: `max_tokens` with no
+        // visible text but non-empty thinking and no executable call.
+        let reasoning_overflow = finish_reason == Some("max_tokens")
+            && oa_content.is_empty()
+            && reasoning_text.is_some()
+            && !has_tools;
+
+        // Resolve the pending telemetry record on the first response after a
+        // continuation (mirrors the OpenAI path).
+        if reasoning_continuation_attempted && !reasoning_overflow {
+            if has_tools || !oa_content.is_empty() {
+                if let (Some(obs), Some(index)) =
+                    (solve_obs.as_deref_mut(), reasoning_overflow_signal_index)
+                {
+                    if let Some(signal) = obs.behavior_signals.get_mut(index) {
+                        signal.mark_continuation_succeeded();
+                    }
+                }
+            }
+            reasoning_overflow_signal_index = None;
+        }
+
+        if reasoning_overflow {
+            let has_round_budget = round + 1 < current_tool_round_limit;
+            let can_continue = generation_policy
+                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget);
+
+            let resolving_existing_continuation =
+                reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
+            if !resolving_existing_continuation {
+                if let Some(obs) = solve_obs.as_deref_mut() {
+                    let index = obs.behavior_signals.len();
+                    obs.behavior_signals
+                        .push(observability::BehaviorSignal::ReasoningOverflow {
+                            round,
+                            reasoning_overflow_detected: true,
+                            continuation_attempted: can_continue,
+                            continuation_succeeded: false,
+                            finish_reason: "max_tokens".into(),
+                            reasoning_tokens_estimate: estimation.tokens_for_chars(
+                                reasoning_text
+                                    .map(|reasoning| reasoning.chars().count())
+                                    .unwrap_or(0),
+                            ),
+                        });
+                    reasoning_overflow_signal_index = Some(index);
+                }
+            }
+
+            if can_continue {
+                print_newt(
+                    "reasoning reached the output limit before an answer — continuing once",
+                    color,
+                    false,
+                );
+                // Thinking replay onto this wire is a follow-up; the bounded
+                // continuation replays the (empty) visible text only, which
+                // the wire conversion drops — the re-dispatch is the same
+                // history plus one more attempt (mirrors the OpenAI path's
+                // structure).
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": oa_content,
+                }));
+                reasoning_continuation_attempted = true;
+                continue 'round_loop;
+            }
+
+            let reason = if resolving_existing_continuation {
+                "the bounded continuation also reached the output limit"
+            } else if reasoning_continuation_attempted {
+                "the turn already used its bounded continuation"
+            } else if !generation_policy.one_bounded_reasoning_continuation {
+                "the endpoint does not advertise bounded continuation"
+            } else if reasoning_replay_scope == crate::model_card::ReasoningReplayScope::Never {
+                "the endpoint does not allow current-turn reasoning replay"
+            } else {
+                "the turn has no remaining round budget"
+            };
+            print_newt(
+                &format!("reasoning overflow detected — {reason}"),
+                color,
+                false,
+            );
+        }
+        // W0 (#1511): served-model + parse-status observation — mirrors the
+        // OpenAI path.
+        if let Some(obs) = solve_obs.as_deref_mut() {
+            if let Some(m) = model_reply.model.as_deref().filter(|m| !m.is_empty()) {
+                obs.served_model = Some(m.to_string());
+            }
+            let native = native_calls.is_some();
+            if let Some(sig) = observability::round_parse_signal(
+                round,
+                !oa_content.is_empty(),
+                native,
+                recovered.dialect,
+            ) {
+                obs.parse_signals.push(sig);
+            }
+        }
+        if debug && !recovered.calls.is_empty() {
+            print_debug(
+                &format!(
+                    "recovered {} tool call(s) from content (non-native emission)",
+                    recovered.calls.len()
+                ),
+                color,
+            );
+        }
+
+        if debug {
+            let excerpt: String = oa_content.chars().take(80).collect();
+            let tc_count = tool_calls.map(|tc| tc.len()).unwrap_or(0);
+            let usage_str = match round_usage {
+                Some(u) => format!("{} in / {} out", u.input_tokens, u.output_tokens),
+                None => "no usage".into(),
+            };
+            print_debug(
+                &format!(
+                    "round {round}: tool_calls={tc_count} usage=[{usage_str}] content={excerpt:?}"
+                ),
+                color,
+            );
+        }
+
+        if !has_tools {
+            // Format-hallucination tracker (mirrors the OpenAI path).
+            if recovered.tool_shaped {
+                hallucination_count += 1;
+                if debug {
+                    print_debug(
+                        "format-hallucination: tool call emitted as unrecoverable text",
+                        color,
+                    );
+                }
+            }
+            let content = oa_content.clone();
+            if content.is_empty() && debug {
+                print_debug(
+                    "empty content with no tool calls — model produced nothing",
+                    color,
+                );
+            }
+            // Narrate-then-stop rescue and its siblings — mirror the OpenAI
+            // path. A superseded streamed round re-prints on the next round
+            // (accepted UX; no re-print suppression).
+            let nudge_classification =
+                (!content.is_empty()).then(|| nudge_classifier.classify(&content));
+            let workflow_classifier_text = workflow_classifier_text(&messages, &content);
+            let workflow_hint = nudge_classification
+                .as_ref()
+                .filter(|classification| classification.is_plan_update())
+                .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
+            let classifier_plan_direction = nudge_classification
+                .as_ref()
+                .filter(|classification| classification.is_plan_update())
+                .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
+            let plan_nudge_hint =
+                combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+            if !content.is_empty() && round + 1 < current_tool_round_limit && action_turn {
+                if let Some(nudge) = workflow_runtime.rediscovery_nudge(
+                    nudge_classification.as_ref(),
+                    &content,
+                    step_ledger,
+                ) {
+                    if debug {
+                        print_debug(
+                            "workflow evidence rediscovery — nudging toward active repair",
+                            color,
+                        );
+                    }
+                    messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge)
+                    }));
+                    continue 'round_loop;
+                }
+            }
+            if !content.is_empty()
+                && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
+                && round + 1 < current_tool_round_limit
+                && action_turn
+            {
+                let needs_plan_update = nudge_classification
+                    .as_ref()
+                    .is_some_and(|c| c.is_plan_update());
+                if let Some(nudge) = pending_plan_completion_nudge(
+                    step_ledger,
+                    needs_plan_update,
+                    plan_nudge_hint.as_deref(),
+                ) {
+                    if debug {
+                        print_debug(
+                            "active plan has unfinished steps — nudging before final answer",
+                            color,
+                        );
+                    }
+                    messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge)
+                    }));
+                    pending_plan_nudges += 1;
+                    continue 'round_loop;
+                }
+            }
+            if !content.is_empty()
+                && stale_file_nudges < STALE_FILE_NUDGE_CAP
+                && round + 1 < current_tool_round_limit
+                && action_nudges
+                && looks_like_unverified_stale_file_blocker(&content)
+            {
+                if debug {
+                    print_debug(
+                        "unverified stale-file blocker — nudging to check ground truth",
+                        color,
+                    );
+                }
+                messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "{} {}",
+                        compress::LOOP_GUIDANCE_PREFIX,
+                        stale_file_ground_truth_nudge()
+                    ),
+                }));
+                stale_file_nudges += 1;
+                continue 'round_loop;
+            }
+            if !content.is_empty()
+                && narration_nudges < narration_nudge_cap
+                && round + 1 < current_tool_round_limit
+                && action_turn
+                && nudge_classification
+                    .as_ref()
+                    .is_some_and(|c| c.is_pending_action())
+            {
+                if debug {
+                    print_debug(
+                        "narrated intent with no tool call — nudging to act and continuing",
+                        color,
+                    );
+                }
+                // #1158: ephemeral — replace the prior nudge, don't stack.
+                strip_trailing_nudge_exchange(&mut messages);
+                messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                let direction = if narration_nudges == 0 {
+                    nudge_classification
+                        .as_ref()
+                        .and_then(|classification| {
+                            nudge_classifier.direction_for(classification.class)
+                        })
+                        .map(str::to_string)
+                        .unwrap_or_else(narration_action_nudge)
+                } else {
+                    escalated_narration_action_nudge(
+                        narration_nudges + 1,
+                        narration_nudge_cap,
+                        step_ledger,
+                    )
+                };
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, direction),
+                }));
+                narration_nudges += 1;
+                continue 'round_loop;
+            }
+            // Self-verify gate (#23) — mirrors the OpenAI path.
+            if self_verify::enabled()
+                && action_nudges
+                && self_verify_nudges < SELF_VERIFY_CAP
+                && round + 1 < current_tool_round_limit
+                && !content.is_empty()
+            {
+                let entries = self_verify::workspace_entries(std::path::Path::new(workspace));
+                let checks = self_verify::detect_checks(&entries, active_task);
+                let cmds = self_verify::commands_from_messages(&messages);
+                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
+                    if debug {
+                        print_debug(
+                            "concluding with unrun verification — self-verify nudge",
+                            color,
+                        );
+                    }
+                    strip_trailing_nudge_exchange(&mut messages);
+                    messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge),
+                    }));
+                    self_verify_nudges += 1;
+                    continue 'round_loop;
+                }
+            }
+            // Phase 20 §2.2: non-empty final content is usable output —
+            // report the accepted prompt before returning.
+            if !content.is_empty() {
+                emit_accepted(
+                    &mut on_round_usage,
+                    round_usage,
+                    truncation_suspect,
+                    round_est_raw,
+                );
+            }
+            // Acceptance forensics — mirrors the OpenAI path.
+            let accepted_reason = if content.is_empty() {
+                crate::TurnEndReason::Empty
+            } else if nudge_classification
+                .as_ref()
+                .is_some_and(|c| c.is_pending_action())
+                && action_turn
+            {
+                if round + 1 >= current_tool_round_limit {
+                    crate::TurnEndReason::NarrationFinalRound
+                } else {
+                    crate::TurnEndReason::NarrationCapExhausted
+                }
+            } else {
+                crate::TurnEndReason::Completed
+            };
+            if debug && accepted_reason != crate::TurnEndReason::Completed {
+                print_debug(
+                    &format!("no-tool reply accepted as final answer ({accepted_reason:?})"),
+                    color,
+                );
+            }
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(accepted_reason);
+            }
+            // The streamed flag is true iff THIS round's SSE already printed
+            // the accepted text live (so the TUI doesn't re-print).
+            let streamed = printed_live && !content.is_empty();
+            let out = if content.is_empty() {
+                "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
+            } else {
+                content
+            };
+            return Ok((out, streamed, accumulated_usage, hallucination_count));
+        }
+
+        // Record the assistant turn, then VALIDATE the whole batch before
+        // emitting acceptance or running any call (#1528 B4 — mirrors the
+        // OpenAI path). The replay stays in the INTERNAL shape: the executed
+        // tool_calls (native or recovered) ride on the assistant turn so
+        // `anthropic_wire_messages` re-derives tool_use blocks (ids replayed
+        // verbatim) on the next dispatch — that's the round trip.
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": oa_content,
+            "tool_calls": tool_calls.unwrap(),
+        }));
+        let mut round_modified_workspace = false;
+        let mut round_progress = false;
+        let tcs = tool_calls.unwrap();
+        // Phase 1 (invariant #3, BATCH level) — mirrors the OpenAI path. The
+        // decoded `tool_uses` are already the internal shape (arguments as
+        // objects), so the same extractor and batch validation apply; the
+        // flat `name`/`input` fallback covers content-recovered calls.
+        let extracted: Vec<(Option<&str>, Option<&str>, &serde_json::Value)> = tcs
+            .iter()
+            .map(|tc| {
+                if tc["function"].is_null() {
+                    (tc["id"].as_str(), tc["name"].as_str(), &tc["input"])
+                } else {
+                    (
+                        tc["id"].as_str(),
+                        tc["function"]["name"].as_str(),
+                        &tc["function"]["arguments"],
+                    )
+                }
+            })
+            .collect();
+        let validated = match tools::validate_tool_call_batch(&extracted, true) {
+            Ok(v) => Some(v),
+            Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
+                // A missing/blank/duplicate id: a tool result cannot be
+                // correlated. Abort the turn — do not fabricate an id.
+                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+            }
+            Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                // ids are valid + unique → echo a correctly keyed rejection
+                // per call and re-dispatch so the model can retry.
+                for tc in tcs {
+                    let id = tc["id"].as_str().unwrap_or("");
+                    print_synthetic_tool_result(
+                        "(rejected tool-call batch)",
+                        &serde_json::Value::Null,
+                        workspace,
+                        &reason,
+                        color,
+                    );
+                    if let Some(rec) = tool_events.as_deref_mut() {
+                        rec.push(crate::ToolEvent::from_call(
+                            "(rejected tool-call batch)",
+                            &serde_json::Value::Null,
+                            false,
+                            Some(0),
+                        ));
+                    }
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": format!("tool-call batch rejected before execution: {reason}"),
+                    }));
+                }
+                None
+            }
+        };
+        // #1528 B4 — mirrors the OpenAI path: a FULLY-VALIDATED batch is
+        // usable output; emit the accepted-prompt observation before the
+        // first tool side effect.
+        if validated.is_some() {
+            emit_accepted(
+                &mut on_round_usage,
+                round_usage,
+                truncation_suspect,
+                round_est_raw,
+            );
+        }
+        // Phase 2: every call is valid — execute in order (empty when rejected).
+        for (tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
+            let id = vc.call_id.as_str();
+            let name = vc.name.as_str();
+            let args = vc.args.clone();
+            if debug && tc["function"].is_null() {
+                print_debug(
+                    &format!(
+                        "tool call in flat native format inside the executed batch \
+                         (no `function` key) — name={name:?}"
+                    ),
+                    color,
+                );
+            }
+            if trace {
+                print_trace(
+                    &format!(
+                        "raw tool_call element: {}",
+                        serde_json::to_string(tc).unwrap_or_else(|_| "?".into())
+                    ),
+                    color,
+                );
+            }
+            let mcp_handles = mcp.handles(name);
+            if debug {
+                print_debug(
+                    &format!("dispatching tool name={name:?} mcp_handles={mcp_handles}"),
+                    color,
+                );
+            }
+            if is_hallucination(name, &args) {
+                hallucination_count += 1;
+            }
+            // Step 27.3/#771: short-circuit selected exact repeats (mirrors
+            // the OpenAI path).
+            if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
+                print_synthetic_tool_result(name, &args, workspace, &steer, color);
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
+                }
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": steer,
+                }));
+                continue;
+            }
+            // Organic save_note use resets the memory-nudge counter (mirrors
+            // the OpenAI path).
+            if name == "save_note" && note_sink.is_some() {
+                if let Some(n) = note_nudge.as_deref_mut() {
+                    n.note_saved();
+                }
+            }
+            // retry technique: snapshot the file's pre-write bytes before the
+            // write tool runs (mirrors the OpenAI path).
+            ledger_note_write(write_ledger, name, &args, workspace);
+            let tool_t0 = std::time::Instant::now();
+            // #727: intercept the read-only budget self-read (mirrors the
+            // OpenAI path — `num_ctx` never rides this wire either).
+            let result = if tools::is_context_remaining_call(name) {
+                let report = budget::render_context_budget(
+                    prompt_tracker.current(&messages, Some(&tools), cal, estimation),
+                    effective_input_ceiling,
+                    num_ctx,
+                    input_ceiling_pct,
+                    low_budget_pct,
+                );
+                print_synthetic_tool_result(name, &args, workspace, &report, color);
+                report
+            } else {
+                let Some(result) = tools::execute_tool_with_collaborators(
+                    name,
+                    &args,
+                    workspace,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    mcp,
+                    tools::ToolCollaborators {
+                        build_check_cmd: build_check_cmd.as_deref(),
+                        // Reborrow + re-coerce — see the OpenAI path.
+                        note_sink: note_sink
+                            .as_deref_mut()
+                            .map(|s| &mut *s as &mut dyn NoteSink),
+                        recall_source,
+                        memory_source,
+                        prompt_context: Some(prompt_context),
+                        artifact_context,
+                        artifact_sink,
+                        permission_gate: permission_gate
+                            .as_deref_mut()
+                            .map(|g| &mut *g as &mut dyn PermissionGate),
+                        exec_floor,
+                        git_tool,
+                        crew_runner,
+                        scratchpad_store,
+                        code_search,
+                        where_is,
+                        nav,
+                        experience_store,
+                        step_ledger,
+                        operating_mode_control,
+                        plan_mode_control,
+                        spill_store,
+                        persona_tools,
+                        live_tool_output: live_tool_output.clone(),
+                    },
+                    tool_offload,
+                    prompt_disposition,
+                    cancel,
+                )
+                .await
+                else {
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                };
+                result
+            };
+            if debug {
+                let excerpt: String = result.chars().take(120).collect();
+                print_debug(&format!("tool result: {excerpt:?}"), color);
+            }
+            // 17.6 + 27.3 — mirrors the OpenAI path.
+            let ok = tools::tool_result_ok(&result);
+            if ok && is_workspace_write_call(name) {
+                round_modified_workspace = true;
+            }
+            if ok && meaningful_workflow_progress(name, &result) {
+                round_progress = true;
+            }
+            repeat_calls.record(name, &args, ok, &result);
+            if workflow_runtime.record_tool_result(&result) {
+                round_progress = true;
+            }
+            if let Some(rec) = tool_events.as_deref_mut() {
+                rec.push(crate::ToolEvent::from_call(
+                    name,
+                    &args,
+                    ok,
+                    u64::try_from(tool_t0.elapsed().as_millis()).ok(),
+                ));
+            }
+            // #717 / #479 (G4) — mirrors the OpenAI path.
+            if let Some(pr) = phantom_reaches.as_deref_mut() {
+                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok)
+                    .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
+                {
+                    pr.push(crate::PhantomReach {
+                        name_as_called: name.to_string(),
+                        resolution,
+                        active_context_features: Vec::new(),
+                    });
+                }
+            }
+            // #867 Part A: ledger verified paths (mirrors the OpenAI path).
+            observed_paths.record(&result, &observed_resolver);
+            // The tool result stays `role:"tool"` in the internal shape;
+            // `anthropic_wire_messages` folds each consecutive run into ONE
+            // user message of tool_result blocks (`tool_use_id` = this id)
+            // on the next dispatch.
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store),
+            }));
+        }
+        workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
+    }
+
+    // Reached the round cap. Trim the message list and make ONE final
+    // tools-disabled completion (mirrors the OpenAI path).
+    let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
+    let replay_protected_tail_len =
+        compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
+    let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
+    // Step 27.5: salvage progress + failed-call count (mirrors the OpenAI path).
+    let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    let (text, streamed, usage) = final_summary_anthropic(
+        &client,
+        &messages_url,
+        model,
+        api_key,
+        trimmed,
+        generation_policy,
+        CapExit {
+            max_tool_rounds,
+            accumulated: accumulated_usage,
+            wasted_calls: repeat_calls.total_failures(),
+            progress,
+            observed: observed_paths.into_vec(),
+            request_budget: authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            ),
+            calibration: cal,
+            estimation,
+            ollama_num_ctx: None,
+        },
+    )
+    .await?;
+    // #867: same path-claim refutation as the OpenAI cap exit.
+    let text = claim_check::annotate_against_workspace(text, workspace);
+    // #1214: the sibling check for claimed ACTIONS (mirrors the OpenAI path).
     let text = claim_check::annotate_action_claims(
         text,
         claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
@@ -13244,6 +15093,12 @@ mod artifact_provenance_tests;
 #[cfg(test)]
 #[path = "mod_tests/http_loop.rs"]
 mod http_loop_tests;
+// The Anthropic (`/v1/messages`) loop — dispatch, SSE streaming, tool
+// round-trips, stop-reason semantics, and recovery arms, all against
+// wiremock backends.
+#[cfg(test)]
+#[path = "mod_tests/anthropic_loop.rs"]
+mod anthropic_loop_tests;
 // #1265: EPIC #1257's acceptance gate — the "10 largest Rust files" session
 // replayed end-to-end (BAT tier: scripted backend, simulated workspace).
 #[cfg(test)]

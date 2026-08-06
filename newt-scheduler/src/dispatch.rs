@@ -52,6 +52,8 @@ impl Dispatcher for LocalDispatcher {
         match backend.kind {
             BackendKind::Ollama => {
                 LocalOllamaBackend::new(backend.endpoint.clone(), model)
+                    // Ollama Cloud bearer; LAN backends carry no key.
+                    .with_api_key(backend.api_key.clone())
                     .complete(req)
                     .await
             }
@@ -60,6 +62,14 @@ impl Dispatcher for LocalDispatcher {
             // can run on a HOSTED LLM, not just local Ollama.
             BackendKind::Openai => {
                 LocalVllmBackend::new(backend.endpoint.clone(), model)
+                    .with_api_key(backend.api_key.clone())
+                    .complete(req)
+                    .await
+            }
+            // Native Anthropic Messages API — the `/v1/messages` wire with the
+            // `x-api-key` header, so a crew/team can run on hosted Claude.
+            BackendKind::Anthropic => {
+                newt_inference::AnthropicBackend::new(backend.endpoint.clone(), model)
                     .with_api_key(backend.api_key.clone())
                     .complete(req)
                     .await

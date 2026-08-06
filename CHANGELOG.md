@@ -9,6 +9,51 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Added — the unboxing workflow
+
+- **First run opens the wizard immediately.** A fresh box (no config file AND
+  no backend from any source — the new `Config::is_unconfigured()` provenance
+  check) lands in the interactive wizard at a TTY; Esc/Ctrl-C falls back to
+  localhost defaults and the session still starts. Non-TTY invocations keep
+  the silent probe path byte-identical. The 10-second countdown is gone.
+- **The wizard menu is now** local Ollama / another machine (auto-probe) /
+  OpenAI / Anthropic / Ollama Cloud — the hosted rows are a pure-data preset
+  table. **Breaking for scripts piping answers into interactive `newt setup`:**
+  the old choice 2 (DGX flavour menu) and 3 (free-form remote URL) are
+  subsumed by the auto-probing "another machine" door; `newt setup <target>
+  --yes` remains the supported automation surface.
+- **Engine fingerprinting + warm-model adoption.** Probes now tell llama.cpp
+  and vLLM apart behind the shared OpenAI wire (`/props` → `/version` →
+  `/models` load states) and report which models are loaded (`/api/ps`,
+  llama.cpp load states, vLLM's resident model). Adoption prefers a WARM
+  model over install order everywhere no explicit choice exists — session
+  start, the wizard's Enter default, and probe write-backs (which now persist
+  the fingerprinted `engine`).
+- **Native Anthropic support, end to end.** `kind = "anthropic"` speaks
+  `/v1/messages` with `x-api-key` + `anthropic-version` on every seam: the
+  interactive agentic loop (SSE streaming, tool_use/tool_result round-trips,
+  refusal/max_tokens/pause_turn semantics, 529-overloaded retries, cw-400
+  compaction recovery), the ACP worker, crew dispatch, probing (`/v1/models`
+  paginated), and `newt doctor`. `NEWT_ANTHROPIC_STREAM=off` disables
+  streaming; `NEWT_ANTHROPIC_MAX_TOKENS` overrides the 8192 default.
+- **Ollama Cloud.** The bearer token now reaches Ollama's native API
+  everywhere (`/api/tags`, `/api/ps`, `/api/chat`), so `https://ollama.com`
+  works as a first-class backend; probe auth failures on the Ollama side are
+  classified ("check the bearer token") instead of "unsupported endpoint".
+- **Tokens are encrypted at rest.** Keys pasted into setup are typed with
+  echo off and stored as age ciphertext (`backends/<name>.token.age`) —
+  blank passphrase = machine-local X25519 identity (transparent decryption,
+  honestly key-beside-lock), passphrase = age scrypt with
+  `NEWT_TOKEN_PASSPHRASE` for headless unlock (excluded from child-process
+  environments). Legacy plaintext `.token` files keep working; `newt doctor`
+  reports each backend's credential state. New dependency: `age` 0.11.
+- **`/setup`** slash command (in-session `newt setup`), an agent-identity
+  question at the end of the wizard, and hidden input for `newt setup`'s
+  existing token prompts.
+- **Build hygiene:** the compiled-in gila skill moved out of the repo-local
+  `.newt/` into `newt-tui/assets/`, so moving a `.newt` dir aside (e.g. to
+  rehearse unboxing) can never break `cargo build` again.
+
 ## [0.7.6] — 2026-07-31
 
 ### Benchmarks

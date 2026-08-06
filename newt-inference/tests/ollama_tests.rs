@@ -3,7 +3,7 @@ use std::time::Duration;
 use newt_inference::backend::{ChatReply, ChatRequest};
 use newt_inference::local::LocalOllamaBackend;
 use newt_inference::{InferenceBackend, RetryPolicy};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Zero-delay, 3-retry policy so retry tests exercise the loop (1 initial + 3
@@ -30,6 +30,60 @@ async fn happy_path() {
     let reply: ChatReply = backend.complete(req).await.unwrap();
 
     assert_eq!(reply.content, "hello");
+}
+
+#[tokio::test]
+async fn sends_bearer_when_configured() {
+    // The Ollama Cloud contract: /api/chat carries Authorization: Bearer
+    // when a key is attached (mirrors LocalVllmBackend::with_api_key).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(header("authorization", "Bearer cloud-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": { "content": "authed" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalOllamaBackend::new(server.uri(), "gpt-oss:120b")
+        .with_api_key(Some("cloud-token".to_string()));
+    let reply = backend
+        .complete(ChatRequest::new().user("hi"))
+        .await
+        .unwrap();
+    assert_eq!(reply.content, "authed");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn sends_no_auth_header_when_keyless() {
+    // LAN behavior pinned: a keyless backend must not grow an auth header.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": { "content": "keyless" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalOllamaBackend::new(server.uri(), "test-model");
+    let reply = backend
+        .complete(ChatRequest::new().user("hi"))
+        .await
+        .unwrap();
+    assert_eq!(reply.content, "keyless");
+    server.verify().await;
 }
 
 #[tokio::test]

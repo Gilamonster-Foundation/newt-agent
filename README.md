@@ -48,13 +48,18 @@ particular numbers were kept honest — including the runs thrown out — see th
 ```bash
 git clone https://github.com/Gilamonster-Foundation/newt-agent
 cd newt-agent
-just install                       # → ~/bin/newt, ~/bin/newt-mcp-server
-newt setup inference.example.net   # probe discovery ports, select a model
-newt code                          # TUI coder in the current directory
+just install   # → ~/bin/newt, ~/bin/newt-mcp-server
+newt           # first run opens the setup wizard, then the TUI coder
 ```
 
-Authenticated endpoints, discovery ports, and where backends are stored:
-[the setup guide](./docs/guide/setup.md). Inside the TUI, `/mode` picks a working
+A fresh box needs no setup step: the first launch at a terminal opens the
+wizard — local Ollama, another machine (auto-probed for Ollama / llama.cpp /
+vLLM, adopting whatever model is already loaded), OpenAI, Anthropic, or Ollama
+Cloud. Already know the endpoint? `newt setup inference.example.net` probes it
+directly, and `newt code` names the default TUI-coder command explicitly.
+
+Authenticated endpoints, discovery ports, and where (encrypted) credentials and
+backends are stored: [the setup guide](./docs/guide/setup.md). Inside the TUI, `/mode` picks a working
 style and `/posture` is the separate authority control — a posture floor can only
 ever narrow authority
 ([decision record](./docs/decisions/operating_modes_and_permission_postures.md)).
