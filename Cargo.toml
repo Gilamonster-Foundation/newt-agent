@@ -95,6 +95,12 @@ serde_yaml = "0.9" # model cards (#853) accept YAML as well as TOML (already in 
 base64 = "0.22"
 sha2 = "0.10"
 getrandom = "0.2"
+# Encrypted-at-rest API-token store (unboxing bundle): audited pure-Rust
+# implementation of the age file-encryption spec — scrypt passphrase mode,
+# X25519 machine-identity mode, and ASCII armor in one crate, vs hand-rolling
+# a chacha20poly1305+argon2 composition we'd then own. Files stay
+# interoperable with the age/rage CLIs (`age -d -i ~/.newt/secrets/identity.txt`).
+age = { version = "0.11", features = ["armor"] }
 # Content addressing for spill identity (#1528 B3 follow-up): a spill handle is a
 # BLAKE3 CIDv1 over the canonical dag-cbor of a versioned, session-scoped spill
 # record — self-verifying identity that dissolves the allocator/reservation bug

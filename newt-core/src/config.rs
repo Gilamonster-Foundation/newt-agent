@@ -2981,28 +2981,53 @@ impl BackendConfig {
     /// Resolve this backend's bearer token, if any.
     ///
     /// Checks [`api_key_env`](Self::api_key_env) first (environment
-    /// variable), then [`api_key_file`](Self::api_key_file) (first
-    /// non-empty line of the file, trimmed). Returns `None` when neither
-    /// is configured or neither resolves to a non-empty value.
+    /// variable), then [`api_key_file`](Self::api_key_file) — plaintext
+    /// (first non-empty line, trimmed) or age-encrypted (`.token.age`,
+    /// decrypted through [`crate::secrets`]). Returns `None` when nothing
+    /// resolves; a LOCKED/broken encrypted token additionally warns once per
+    /// path so it is never a silent `None` (use
+    /// [`resolve_api_key_detailed`](Self::resolve_api_key_detailed) for the
+    /// typed reason).
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(var) = &self.api_key_env {
-            if let Ok(val) = std::env::var(var) {
-                let val = val.trim();
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
+        match self.resolve_api_key_detailed() {
+            Ok(v) => v,
+            Err(e) => {
+                crate::secrets::warn_once(self.api_key_file.as_deref().unwrap_or(&self.name), &e);
+                None
             }
         }
-        if let Some(path) = &self.api_key_file {
-            let expanded = expand_tilde(path);
-            if let Ok(contents) = std::fs::read_to_string(&expanded) {
-                if let Some(token) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
-                    return Some(token.to_string());
-                }
-            }
-        }
-        None
     }
+
+    /// [`resolve_api_key`](Self::resolve_api_key) with the typed failure —
+    /// doctor and worker startup lines surface the actionable reason
+    /// (passphrase required / wrong passphrase / corrupt file).
+    pub fn resolve_api_key_detailed(
+        &self,
+    ) -> std::result::Result<Option<String>, crate::secrets::SecretsError> {
+        resolve_api_key_common(self.api_key_env.as_deref(), self.api_key_file.as_deref())
+    }
+}
+
+/// The ONE env-then-file credential rule shared by [`BackendConfig`] and
+/// [`SummarizerConfig`]. Env wins when set and non-empty; the file path goes
+/// through `secrets::resolve_token_file` (plaintext and encrypted alike).
+pub(crate) fn resolve_api_key_common(
+    api_key_env: Option<&str>,
+    api_key_file: Option<&str>,
+) -> std::result::Result<Option<String>, crate::secrets::SecretsError> {
+    if let Some(var) = api_key_env {
+        if let Ok(val) = std::env::var(var) {
+            let val = val.trim();
+            if !val.is_empty() {
+                return Ok(Some(val.to_string()));
+            }
+        }
+    }
+    if let Some(path) = api_key_file {
+        let expanded = expand_tilde(path);
+        return crate::secrets::resolve_token_file(&expanded);
+    }
+    Ok(None)
 }
 
 /// CLI-supplied backend override (`newt --backend-*` flags). Each field mirrors
@@ -3259,23 +3284,15 @@ impl SummarizerConfig {
         paths
     }
 
-    /// Resolve this summarizer's bearer token (env var first, then file), or
-    /// `None` — mirrors [`BackendConfig::resolve_api_key`].
+    /// Resolve this summarizer's bearer token (env var first, then file —
+    /// plaintext or encrypted), or `None` — the same
+    /// [`resolve_api_key_common`] rule as [`BackendConfig::resolve_api_key`]
+    /// (the mirrored body it used to carry is gone).
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(var) = &self.api_key_env {
-            if let Ok(val) = std::env::var(var) {
-                let val = val.trim();
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
-            }
-        }
-        if let Some(path) = &self.api_key_file {
-            let expanded = expand_tilde(path);
-            if let Ok(contents) = std::fs::read_to_string(&expanded) {
-                if let Some(token) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
-                    return Some(token.to_string());
-                }
+        match resolve_api_key_common(self.api_key_env.as_deref(), self.api_key_file.as_deref()) {
+            Ok(v) => return v,
+            Err(e) => {
+                crate::secrets::warn_once(self.api_key_file.as_deref().unwrap_or("summarizer"), &e);
             }
         }
         None
@@ -4499,6 +4516,7 @@ const SENSITIVE_QUERY_KEYS: &[&str] = &[
     "access_token",
     "secret",
     "password",
+    "passphrase",
     "key",
 ];
 
@@ -5847,6 +5865,9 @@ mod tests {
             "GITHUB_TOKEN",
             "DGX_API_KEY",
             "NVIDIA_API_KEY",
+            // The encrypted-token-store unlock channel (crate::secrets):
+            // a child process must never inherit the vault passphrase.
+            crate::secrets::PASSPHRASE_ENV,
         ] {
             assert!(!allow.contains(&secret), "{secret} must never be inherited");
         }

@@ -69,6 +69,7 @@ pub mod sas_confirm;
 pub mod sas_transcript;
 pub mod scope_grounding;
 pub mod scratch;
+pub mod secrets;
 pub mod session;
 pub mod settings;
 pub mod shell_env;
