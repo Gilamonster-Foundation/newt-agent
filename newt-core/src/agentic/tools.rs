@@ -1355,9 +1355,13 @@ fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, String> {
 /// (`--full-access`) there is no object fence, so it reads via `std::fs` — the
 /// pre-existing unconfined behaviour. Linux-only (`openat2`); the non-Linux
 /// fallback keeps the lexical-gate + `std::fs` path.
+///
+/// `axis` labels the denial (`fs_read` for read_file; `fs_write` for edit_file,
+/// whose read is authorised by — and contained beneath — the `fs_write` root).
 #[cfg(target_os = "linux")]
 fn object_bound_read(
     scope: &crate::caveats::Scope<String>,
+    axis: &str,
     path: &str,
     full: &std::path::Path,
     full_str: &str,
@@ -1366,7 +1370,7 @@ fn object_bound_read(
     match object_bound_target(scope, full_str) {
         // The gate already permitted this read, so `None` here would be a logic
         // error (the two matchers disagreeing); fail closed rather than read.
-        None => Err(denied_fs_result("fs_read", path)),
+        None => Err(denied_fs_result(axis, path)),
         Some(None) => {
             std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
         }
@@ -1381,7 +1385,7 @@ fn object_bound_read(
             );
             match read {
                 Ok(s) => Ok(s),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_read", path)),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
                 Err(e) => Err(format!("error reading {path}: {e}")),
             }
         }
@@ -1423,6 +1427,7 @@ fn object_bound_list(
 #[cfg(not(target_os = "linux"))]
 fn object_bound_read(
     _scope: &crate::caveats::Scope<String>,
+    _axis: &str,
     path: &str,
     full: &std::path::Path,
     _full_str: &str,
@@ -1460,6 +1465,7 @@ fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), St
 #[cfg(target_os = "linux")]
 fn object_bound_write(
     scope: &crate::caveats::Scope<String>,
+    axis: &str,
     path: &str,
     full: &std::path::Path,
     full_str: &str,
@@ -1467,7 +1473,7 @@ fn object_bound_write(
 ) -> Result<(), String> {
     use std::io::Write;
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_write", path)),
+        None => Err(denied_fs_result(axis, path)),
         Some(None) => std_write(full, path, content),
         Some(Some((root, rel))) => {
             let write = crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
@@ -1483,7 +1489,7 @@ fn object_bound_write(
                 });
             match write {
                 Ok(()) => Ok(()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_write", path)),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
                 Err(e) => Err(format!("error writing {path}: {e}")),
             }
         }
@@ -1493,6 +1499,7 @@ fn object_bound_write(
 #[cfg(not(target_os = "linux"))]
 fn object_bound_write(
     _scope: &crate::caveats::Scope<String>,
+    _axis: &str,
     path: &str,
     full: &std::path::Path,
     _full_str: &str,
@@ -4116,7 +4123,7 @@ async fn execute_tool_inner(
             // vouched for by the human (#263), so it reads as-is; `Scope::All`
             // (--full-access) is unconfined inside `object_bound_read`.
             let read = if scope_permits {
-                object_bound_read(&caveats.fs_read, path, &full, &full_str)
+                object_bound_read(&caveats.fs_read, "fs_read", path, &full, &full_str)
             } else {
                 std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
             };
@@ -4225,7 +4232,7 @@ async fn execute_tool_inner(
                 // kernel. A gate-approved out-of-scope path was vouched for by the
                 // human (#263); `Scope::All` is unconfined inside the helper.
                 let write_result = if scope_permits {
-                    object_bound_write(&caveats.fs_write, path, &full, &full_str, content)
+                    object_bound_write(&caveats.fs_write, "fs_write", path, &full, &full_str, content)
                 } else {
                     std_write(&full, path, content)
                 };
@@ -4394,7 +4401,11 @@ async fn execute_tool_inner(
             let new_string = args["new_string"].as_str().unwrap_or("");
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
-            if !tui_permits_path(&caveats.fs_write, &full_str) {
+            // step-52.5: same scope-vs-#263-gate split as write_file — decides
+            // whether the read of `existing` and the write of `updated` below are
+            // object-bound (both authorised by, and contained beneath, fs_write).
+            let scope_permits = tui_permits_path(&caveats.fs_write, &full_str);
+            if !scope_permits {
                 // #263: same prompted-grant path as write_file.
                 let allowed = permission_gate.is_some_and(|gate| {
                     fs_gate_allows(gate, "edit_file", DenialKind::FsWrite, &full_str, |c| {
@@ -4417,9 +4428,17 @@ async fn execute_tool_inner(
                 return "error: old_string must not be empty — use write_file to create new files"
                     .to_string();
             }
-            let existing = match std::fs::read_to_string(&full) {
+            // step-52.5: read the existing file object-bound beneath the same
+            // fs_write root (a symlink-escape edit is refused here, so the
+            // no-match head display below can't leak an outside file either).
+            let read = if scope_permits {
+                object_bound_read(&caveats.fs_write, "fs_write", path, &full, &full_str)
+            } else {
+                std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
+            };
+            let existing = match read {
                 Ok(s) => s,
-                Err(e) => return format!("error reading {path}: {e}"),
+                Err(tool_output) => return tool_output,
             };
             let count = existing.matches(old_string).count();
             if count == 0 {
@@ -4484,8 +4503,14 @@ async fn execute_tool_inner(
             } else {
                 format!("{delta}")
             };
-            match std::fs::write(&full, &updated) {
-                Ok(_) => {
+            // step-52.5: object-bound write when the scope authorised it.
+            let write_result = if scope_permits {
+                object_bound_write(&caveats.fs_write, "fs_write", path, &full, &full_str, &updated)
+            } else {
+                std_write(&full, path, &updated)
+            };
+            match write_result {
+                Ok(()) => {
                     let artifact = if !artifact_tracking {
                         String::new()
                     } else if !artifact_path_within
@@ -4535,7 +4560,7 @@ async fn execute_tool_inner(
                         "edited {path} ({delta_str} lines, now {new_lines} total){artifact}{check}"
                     )
                 }
-                Err(e) => format!("error writing {path}: {e}"),
+                Err(tool_output) => tool_output,
             }
         }
 
@@ -9569,6 +9594,48 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert!(out.contains("error reading missing.txt"), "got: {out}");
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn edit_file_symlink_under_workspace_escaping_is_denied() {
+        // step-52.5: under a CONFINED fs_write, a symlink UNDER the workspace
+        // pointing outside must not let edit_file read OR write the outside file.
+        // Both the read of `existing` (which could leak the outside head on a
+        // no-match) and the write are object-bound; the outside file is unchanged
+        // and its contents never appear in the output. Verified red→green.
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE SECRET\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        let out = run_tool(
+            "edit_file",
+            serde_json::json!({
+                "path": "link/secret.txt",
+                "old_string": "OUTSIDE",
+                "new_string": "EDITED",
+            }),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            None,
+        )
+        .await;
+
+        assert!(
+            !out.contains("OUTSIDE SECRET"),
+            "object-bound edit must not leak the outside file: {out}"
+        );
+        assert_eq!(
+            out,
+            denied_fs_result("fs_write", "link/secret.txt"),
+            "the symlink-escape edit must be denied: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "OUTSIDE SECRET\n",
+            "the outside file must be UNCHANGED"
+        );
     }
 
     #[tokio::test]
