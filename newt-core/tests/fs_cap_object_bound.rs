@@ -237,3 +237,40 @@ fn create_dir_all_denies_a_symlink_escape_component() {
     );
     assert!(!outside.join("evil").exists(), "no dir created outside");
 }
+
+// ---- unlink (step-52.6): object-bound file removal ----
+
+#[test]
+#[serial]
+fn unlink_removes_a_contained_file() {
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("a.txt"), b"x").unwrap();
+    let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+    dir.unlink(Path::new("a.txt")).unwrap();
+    assert!(
+        !ws.path().join("a.txt").exists(),
+        "the contained file is removed"
+    );
+}
+
+#[test]
+#[serial]
+fn unlink_denies_a_symlink_escape_parent() {
+    let root = tempdir().unwrap();
+    let ws = root.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("victim"), b"x").unwrap();
+    symlink("../outside", ws.join("link")).unwrap();
+
+    let dir = WorkspaceDir::open_root(&ws).unwrap();
+    assert!(
+        dir.unlink(Path::new("link/victim")).is_err(),
+        "must not unlink through an escaping symlink parent"
+    );
+    assert!(
+        outside.join("victim").exists(),
+        "the outside file must survive"
+    );
+}

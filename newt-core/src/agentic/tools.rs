@@ -1508,6 +1508,93 @@ fn object_bound_write(
     std_write(full, path, content)
 }
 
+/// Object-bound file removal beneath the authorising root — the `delete_file`
+/// analogue of [`object_bound_write`]. The parent is resolved object-bound and
+/// the entry removed via `unlinkat`, so a symlink / `..` / absolute escape is
+/// refused by the kernel (an `fs_write` denial). `Scope::All` removes via
+/// `std::fs`. Linux-only.
+#[cfg(target_os = "linux")]
+fn object_bound_delete(
+    scope: &crate::caveats::Scope<String>,
+    path: &str,
+    full: &std::path::Path,
+    full_str: &str,
+) -> Result<(), String> {
+    match object_bound_target(scope, full_str) {
+        None => Err(denied_fs_result("fs_write", path)),
+        Some(None) => std::fs::remove_file(full).map_err(|e| format!("error deleting {path}: {e}")),
+        Some(Some((root, rel))) => {
+            match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
+                .and_then(|dir| dir.unlink(&rel))
+            {
+                Ok(()) => Ok(()),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_write", path)),
+                Err(e) => Err(format!("error deleting {path}: {e}")),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn object_bound_delete(
+    _scope: &crate::caveats::Scope<String>,
+    path: &str,
+    full: &std::path::Path,
+    _full_str: &str,
+) -> Result<(), String> {
+    std::fs::remove_file(full).map_err(|e| format!("error deleting {path}: {e}"))
+}
+
+/// Whether `find`'s recursive-read root is contained to the WORKSPACE. Unlike
+/// the other arms, `find` contains to the workspace *independent of the fs_read
+/// scope* (even under `Scope::All`) — a recursive read is dangerous, so the
+/// search root must stay in-tree. On Linux this is an object-bound
+/// `openat2(RESOLVE_BENEATH)` resolve of the root beneath the workspace fd
+/// (TOCTOU-free — replaces the old canonicalize-then-`starts_with`); `find` never
+/// follows symlinks during descent, so a contained root bounds the whole walk.
+#[cfg(target_os = "linux")]
+fn find_root_contained(
+    _scope: &crate::caveats::Scope<String>,
+    workspace: &str,
+    full: &std::path::Path,
+    _full_str: &str,
+) -> bool {
+    // The search root relative to the workspace. `full` = `workspace.join(path)`,
+    // so a lexical strip yields the model-supplied remainder (`..`, an absolute
+    // root, or a real subpath); `openat2` then adjudicates containment.
+    let rel = match full.strip_prefix(workspace) {
+        Ok(r) if !r.as_os_str().is_empty() => r.to_path_buf(),
+        Ok(_) => std::path::PathBuf::from("."), // root == workspace
+        Err(_) => return false,                 // absolute / not under the workspace
+    };
+    match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(workspace))
+        .and_then(|dir| dir.open_dir(&rel))
+    {
+        Ok(_) => true,
+        Err(e) if is_fs_containment_denied(&e) => false,
+        // ENOENT / perms are not a containment escape; the walk surfaces them.
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_root_contained(
+    _scope: &crate::caveats::Scope<String>,
+    workspace: &str,
+    full: &std::path::Path,
+    _full_str: &str,
+) -> bool {
+    match (
+        std::path::Path::new(workspace).canonicalize(),
+        full.canonicalize(),
+    ) {
+        (Ok(ws), Ok(root)) => root.starts_with(&ws),
+        // Can't canonicalize — keep the old permissive behaviour (deny only on a
+        // proven escape).
+        _ => true,
+    }
+}
+
 /// Full-access/custom unrestricted writes keep the final y/N guard in ordinary
 /// interactive mode. Under --yolo the operator already chose an explicit
 /// auto-run mode, so do not let EOF on stdin become a fake human denial.
@@ -4303,7 +4390,10 @@ async fn execute_tool_inner(
             }
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
-            if !tui_permits_path(&caveats.fs_write, &full_str) {
+            // step-52.6: same scope-vs-#263-gate split — decides whether the
+            // removal below is object-bound (via unlinkat on the resolved parent).
+            let scope_permits = tui_permits_path(&caveats.fs_write, &full_str);
+            if !scope_permits {
                 // #1022: deletion is a normal fs_write operation. A denial
                 // consults the same prompted-grant path as write_file/edit_file,
                 // so deletion is possible with operator approval instead of
@@ -4348,8 +4438,16 @@ async fn execute_tool_inner(
                 return format!("user declined to delete {path}");
             }
 
-            match std::fs::remove_file(&full) {
-                Ok(_) => {
+            // step-52.6: object-bound removal when the scope authorised it (the
+            // parent is resolved beneath the root and the entry unlinked via its
+            // fd, so a symlink/`..`/absolute escape is refused by the kernel).
+            let delete_result = if scope_permits {
+                object_bound_delete(&caveats.fs_write, path, &full, &full_str)
+            } else {
+                std::fs::remove_file(&full).map_err(|e| format!("error deleting {path}: {e}"))
+            };
+            match delete_result {
+                Ok(()) => {
                     let artifact = if !artifact_tracking {
                         String::new()
                     } else if !artifact_path_within
@@ -4391,7 +4489,7 @@ async fn execute_tool_inner(
                         .unwrap_or_default();
                     format!("deleted {path}{artifact}{check}")
                 }
-                Err(e) => format!("error deleting {path}: {e}"),
+                Err(tool_output) => tool_output,
             }
         }
 
@@ -4640,16 +4738,13 @@ async fn execute_tool_inner(
             if !full.exists() {
                 return format!("error: no such path '{path}'");
             }
-            // Defence-in-depth for a *recursive* read: refuse a root that
-            // canonicalises outside the workspace (e.g. via `..`). `find` never
-            // follows symlinks, so descent can't escape either.
-            if let (Ok(ws_canon), Ok(root_canon)) = (
-                std::path::Path::new(workspace).canonicalize(),
-                full.canonicalize(),
-            ) {
-                if !root_canon.starts_with(&ws_canon) {
-                    return denied_fs_result("fs_read", path);
-                }
+            // step-52.6: object-bound root containment for a *recursive* read —
+            // resolve the search root beneath the granted fs_read root
+            // (openat2 RESOLVE_BENEATH on Linux; canonicalize fallback elsewhere),
+            // TOCTOU-free. `find` never follows symlinks during descent, so a
+            // contained root bounds the whole walk.
+            if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
+                return denied_fs_result("fs_read", path);
             }
             // #1264: stream hits through the LIVE viewport as the walk
             // discovers them — the first built-in on the #1235 machinery (the
@@ -9937,6 +10032,40 @@ mod execute_tool_branch_tests {
         .await;
         assert!(out.contains("refuses directories"), "got: {out}");
         assert!(ws.path().join("dir").is_dir(), "directory must remain");
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn delete_file_symlink_under_workspace_escaping_is_denied() {
+        // step-52.6: under a CONFINED fs_write, a symlink UNDER the workspace
+        // pointing outside must not let delete_file remove the outside file.
+        // Object-bound via `unlinkat` on the resolved parent — the escape is
+        // refused and the outside file survives. Before the rewire `remove_file`
+        // followed the intermediate symlink and deleted outside. Verified
+        // red→green.
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("victim.txt"), "keep me\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        let out = run_tool(
+            "delete_file",
+            serde_json::json!({"path": "link/victim.txt"}),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            denied_fs_result("fs_write", "link/victim.txt"),
+            "the symlink-escape delete must be denied: {out}"
+        );
+        assert!(
+            outside.path().join("victim.txt").exists(),
+            "the outside file must survive — the delete never escaped"
+        );
     }
 
     #[tokio::test]
