@@ -18,7 +18,9 @@
 //!   probe result; an unreachable endpoint is the caller's fallback path (file
 //!   hint + banner), not this module's.
 
-use crate::config::{BackendConfig, BackendKind, Engine, OpenAiApi as OpenAiApiSurface, Serving};
+use crate::config::{
+    BackendConfig, BackendKind, Engine, ManagedMode, OpenAiApi as OpenAiApiSurface, Serving,
+};
 
 /// HTTP status returned by a model-list probe. Keeping the status typed lets
 /// endpoint detection distinguish authentication and unsupported APIs from a
@@ -1036,6 +1038,17 @@ pub struct Adoption {
     /// (#1122 fail-soft: a restored/typo'd model must not brick the session) —
     /// the caller warns and the adoption fell back to declared/first-served.
     pub requested_unavailable: bool,
+    /// True when a `ManagedMode::Shared` backend adopted a currently-WARM model
+    /// instead of forcing its pinned/first model to load — the cooperative path
+    /// that avoids swapping a model another agent may be using. Always false for
+    /// unmanaged / `Dedicated` backends and for instance serving.
+    pub adopted_warm: bool,
+    /// `Some(pinned)` when adopt-warm took the cooperative default (`model` = the
+    /// warm model) but a DIFFERENT model was pinned/configured — the pinned model
+    /// is named here so an interactive caller can offer "adopt the warm model, or
+    /// force a swap to your pin?"; a headless caller keeps the cooperative default
+    /// and never silently evicts the warm model. `None` = no conflict.
+    pub pin_conflict: Option<String>,
 }
 
 /// The pure adoption rule. `served` is what the probe saw; `requested` is the
@@ -1070,6 +1083,10 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
                 serving,
                 requested_ignored,
                 requested_unavailable: false,
+                // An instance serves one bound model — there is nothing to
+                // adopt-warm and no swap to force.
+                adopted_warm: false,
+                pin_conflict: None,
             }
         }
         Serving::Multiplexer => {
@@ -1081,27 +1098,46 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
             let requested_ok =
                 requested.map(|r| served.models.is_empty() || served.models.iter().any(|m| m == r));
             let requested_unavailable = requested_ok == Some(false);
-            // Precedence: requested → declared → first WARM (a model already
-            // resident answers immediately; install order says nothing) →
-            // first served. Warmth never overrides an explicit choice, so
-            // there is nothing to warn about.
-            let model = requested
+            // The model this session pins: a served session request outranks
+            // the file's declared model.
+            let pin: Option<String> = requested
                 .filter(|_| requested_ok == Some(true))
                 .map(str::to_string)
-                .or_else(|| backend.effective_model().map(str::to_string))
-                .or_else(|| {
-                    served
-                        .warm
-                        .iter()
-                        .find(|w| served.models.contains(w))
-                        .cloned()
-                })
-                .or_else(|| served.models.first().cloned());
+                .or_else(|| backend.effective_model().map(str::to_string));
+            // The first WARM model the server still lists (a stale `/api/ps`
+            // entry not in `models` is ignored — see [`Served::warm`]).
+            let warm: Option<String> = served
+                .warm
+                .iter()
+                .find(|w| served.models.contains(w))
+                .cloned();
+
+            // `ManagedMode::Shared` adopt-warm: a cooperative guest PREFERS a
+            // warm model over forcing its pin to load — a swap that would evict
+            // the model another agent may be using. When the pin differs from
+            // the warm model, take the cooperative default (warm) and surface
+            // the pin as a force-swap choice via `pin_conflict`. Every other
+            // case keeps the historical precedence (pin → first-warm →
+            // first-served), where warmth is only a tiebreaker and never
+            // overrides an explicit choice.
+            let shared = backend.managed == Some(ManagedMode::Shared);
+            let (model, adopted_warm, pin_conflict) = match warm {
+                Some(w) if shared && pin.as_deref() != Some(w.as_str()) => {
+                    let conflict = pin.filter(|p| p != &w);
+                    (Some(w), true, conflict)
+                }
+                other => {
+                    let model = pin.or(other).or_else(|| served.models.first().cloned());
+                    (model, false, None)
+                }
+            };
             Adoption {
                 model,
                 serving,
                 requested_ignored: false,
                 requested_unavailable,
+                adopted_warm,
+                pin_conflict,
             }
         }
     }
@@ -1163,6 +1199,101 @@ mod tests {
             models: models.iter().map(|m| m.to_string()).collect(),
             warm: warm.iter().map(|m| m.to_string()).collect(),
         }
+    }
+
+    fn managed_mux(model: Option<&str>, mode: ManagedMode) -> BackendConfig {
+        BackendConfig {
+            managed: Some(mode),
+            ..openai_backend(model, Some(Serving::Multiplexer))
+        }
+    }
+
+    // ── ManagedMode::Shared adopt-warm (ADR docs/decisions/managed_backend.md) ──
+
+    #[test]
+    fn shared_adopts_warm_when_nothing_is_pinned() {
+        // A cooperative guest with no pin uses whatever model is already loaded.
+        let b = managed_mux(None, ManagedMode::Shared);
+        let a = adopt(&b, &served_warm(&["cold", "warm-y"], &["warm-y"]), None);
+        assert_eq!(a.model.as_deref(), Some("warm-y"));
+        assert!(a.adopted_warm);
+        assert_eq!(a.pin_conflict, None);
+    }
+
+    #[test]
+    fn shared_adopts_warm_over_a_conflicting_pin_and_offers_the_force_choice() {
+        // Pinned "mine" but "warm-y" is loaded: adopt the warm one (never evict
+        // another agent's model silently) and hand the pin back as a force choice.
+        let b = managed_mux(Some("mine"), ManagedMode::Shared);
+        let a = adopt(&b, &served_warm(&["mine", "warm-y"], &["warm-y"]), None);
+        assert_eq!(
+            a.model.as_deref(),
+            Some("warm-y"),
+            "cooperative default = warm"
+        );
+        assert!(a.adopted_warm);
+        assert_eq!(
+            a.pin_conflict.as_deref(),
+            Some("mine"),
+            "the pin is surfaced as the force-swap choice"
+        );
+    }
+
+    #[test]
+    fn shared_keeps_the_pin_when_the_pin_is_already_warm() {
+        // No swap, no conflict — the pinned model happens to be resident.
+        let b = managed_mux(Some("mine"), ManagedMode::Shared);
+        let a = adopt(&b, &served_warm(&["mine", "other"], &["mine"]), None);
+        assert_eq!(a.model.as_deref(), Some("mine"));
+        assert!(!a.adopted_warm);
+        assert_eq!(a.pin_conflict, None);
+    }
+
+    #[test]
+    fn shared_loads_the_pin_when_nothing_is_warm() {
+        // Nothing resident: fall back to the pin (an unavoidable cold load).
+        let b = managed_mux(Some("mine"), ManagedMode::Shared);
+        let a = adopt(&b, &served_warm(&["mine", "other"], &[]), None);
+        assert_eq!(a.model.as_deref(), Some("mine"));
+        assert!(!a.adopted_warm);
+        assert_eq!(a.pin_conflict, None);
+    }
+
+    #[test]
+    fn shared_surfaces_the_conflict_for_a_session_request_too() {
+        // An explicit /model request is still a pin: on a Shared box it does not
+        // silently force a swap — the warm model wins by default and the request
+        // is offered as the force choice (the two-agent clash the ADR guards).
+        let b = managed_mux(Some("declared"), ManagedMode::Shared);
+        let a = adopt(
+            &b,
+            &served_warm(&["asked", "warm-y"], &["warm-y"]),
+            Some("asked"),
+        );
+        assert_eq!(a.model.as_deref(), Some("warm-y"));
+        assert!(a.adopted_warm);
+        assert_eq!(a.pin_conflict.as_deref(), Some("asked"));
+    }
+
+    #[test]
+    fn dedicated_forces_the_pin_and_never_adopts_warm() {
+        // "I own this box": force the configured model even if another is warm.
+        let b = managed_mux(Some("mine"), ManagedMode::Dedicated);
+        let a = adopt(&b, &served_warm(&["mine", "warm-y"], &["warm-y"]), None);
+        assert_eq!(a.model.as_deref(), Some("mine"), "dedicated forces its pin");
+        assert!(!a.adopted_warm);
+        assert_eq!(a.pin_conflict, None);
+    }
+
+    #[test]
+    fn unmanaged_keeps_precedence_warm_is_only_a_tiebreaker() {
+        // Regression: an ordinary (unmanaged) backend is unchanged — the declared
+        // pin wins over a differently-warm model (warmth never overrides a pin).
+        let b = openai_backend(Some("declared"), Some(Serving::Multiplexer));
+        let a = adopt(&b, &served_warm(&["declared", "warm-y"], &["warm-y"]), None);
+        assert_eq!(a.model.as_deref(), Some("declared"));
+        assert!(!a.adopted_warm);
+        assert_eq!(a.pin_conflict, None);
     }
 
     #[tokio::test]

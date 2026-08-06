@@ -2776,6 +2776,27 @@ pub enum Serving {
     Instance,
 }
 
+/// Whether newt actively **tends** this backend's host — a shared, model-
+/// swapping box (e.g. a llama.cpp router) — rather than merely consuming a
+/// dedicated endpoint. Orthogonal to [`BackendKind`] (the wire) and
+/// [`Serving`] (how the box serves). See ADR `docs/decisions/managed_backend.md`.
+///
+/// - **`Shared`** — cooperative guest: the box may serve other consumers
+///   (including other newt-agents), so the default is to **adopt whatever model
+///   is warm** rather than force a swap (see [`crate::backend_probe::adopt`]).
+///   This is the clash-avoidance primitive — two agents on one box don't thrash
+///   the single-model swap.
+/// - **`Dedicated`** — "I own this box": newt may force its configured model
+///   (force-load + keep-warm are later slices). No adopt-warm.
+///
+/// Unset on a backend = an ordinary consumed endpoint (no swap-awareness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedMode {
+    Shared,
+    Dedicated,
+}
+
 /// Derive the serving axis from what a probe saw: the wire kind plus how many
 /// models the endpoint reported. Pure — Phase B's probe/adopt calls this; kept
 /// here so the rule lives beside the type. `served_count` = models listed by
@@ -2900,6 +2921,14 @@ pub struct BackendConfig {
     /// derive by probing (Phase B); `newt setup` caches the derivation here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving: Option<Serving>,
+    /// When set, newt actively **tends** this backend's host rather than merely
+    /// consuming it — see [`ManagedMode`] and ADR
+    /// `docs/decisions/managed_backend.md`. `Shared` makes
+    /// [`crate::backend_probe::adopt`] prefer a warm model over forcing a swap
+    /// (clash-avoidance for several agents on one box); unset = an ordinary
+    /// consumed endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedMode>,
     /// The detected inference engine (ollama | llama.cpp | vllm) — see
     /// [`Engine`]. Pure metadata, orthogonal to `kind`: never gates a
     /// transport, only refines warm-model probing and display. Unset =
@@ -5769,15 +5798,18 @@ mod tests {
         assert_eq!(legacy.serving, None);
         assert_eq!(legacy.host, None);
         assert_eq!(legacy.coexist, None);
+        assert_eq!(legacy.managed, None);
 
         let full: BackendConfig = toml::from_str(
-            "endpoint=\"http://dgx:8000\"\nkind=\"openai\"\nserving=\"instance\"\n\
+            "endpoint=\"http://dgx:8000\"\nkind=\"openai\"\nserving=\"multiplexer\"\n\
+             managed=\"shared\"\n\
              host=\"dgx1\"\ncoexist=true\nram_gib=480.0\ncard=\"ornith-1.0-35b\"\n\
              [capability]\nthinking_default=true\n\
              [provenance]\nsource=\"newt setup v0.7.3\"\nderived_serving=true\n",
         )
         .unwrap();
-        assert_eq!(full.serving, Some(Serving::Instance));
+        assert_eq!(full.serving, Some(Serving::Multiplexer));
+        assert_eq!(full.managed, Some(ManagedMode::Shared));
         assert_eq!(full.host.as_deref(), Some("dgx1"));
         assert_eq!(full.coexist, Some(true));
         assert_eq!(full.ram_gib, Some(480.0));
@@ -5795,6 +5827,7 @@ mod tests {
         // generated backends/<name>.toml doesn't bloat with nulls.
         let out = toml::to_string(&legacy).unwrap();
         assert!(!out.contains("serving"), "unset fields are skipped: {out}");
+        assert!(!out.contains("managed"), "unset managed is skipped: {out}");
         assert!(!out.contains("provenance"));
     }
 
