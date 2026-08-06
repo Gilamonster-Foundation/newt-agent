@@ -58,6 +58,14 @@ vLLM, adopting whatever model is already loaded), OpenAI, Anthropic, or Ollama
 Cloud. Already know the endpoint? `newt setup inference.example.net` probes it
 directly, and `newt code` names the default TUI-coder command explicitly.
 
+Prefer a browser? The HTMX web cockpit is a separately built binary
+([`newt-web/`](./newt-web/), deliberately outside the workspace graph):
+
+```bash
+just install-web   # → ~/bin/newt-web
+newt web           # launches it (127.0.0.1:8880 by default)
+```
+
 Authenticated endpoints, discovery ports, and where (encrypted) credentials and
 backends are stored: [the setup guide](./docs/guide/setup.md). Inside the TUI, `/mode` picks a working
 style and `/posture` is the separate authority control — a posture floor can only
