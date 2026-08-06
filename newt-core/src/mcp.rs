@@ -166,9 +166,16 @@ impl std::fmt::Display for AdmissionDenied {
 }
 
 /// An MCP server that PASSED [`admit`] — the unforgeable witness the transport
-/// layer requires before it may spawn or dial. The inner reference is private,
-/// so the ONLY way to obtain an `AdmittedServer` is through [`admit`]: a
-/// spawn/dial of an un-admitted server does not type-check.
+/// constructors require before they may spawn or dial. The inner reference is
+/// private, so the ONLY way to obtain an `AdmittedServer` is through [`admit`];
+/// and because the `newt-mcp-client` transport constructors (`StdioTransport::spawn`
+/// and `HttpTransport::connect`) take `&AdmittedServer` — not a bare
+/// `&McpServerEntry` — a spawn/dial of an un-admitted server does not type-check.
+/// This guarantee is **structural**, not by-convention: step-1.2 (#1562 follow-up)
+/// sealed the constructors so no call site — in-crate or downstream — can reach a
+/// spawn without the witness. `entry()` hands back a read-only `&McpServerEntry`
+/// for the transport to build against, which cannot reopen the bypass (the
+/// constructors want the witness, not the entry).
 #[derive(Debug, Clone, Copy)]
 pub struct AdmittedServer<'a> {
     entry: &'a McpServerEntry,

@@ -235,7 +235,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   public transport entry points — `newt_mcp_client::{connect_stdio, connect_http}` and both
   planners (`McpToolset::connect` headless, `newt_tui::mcp::Mcp::connect` interactive) — take
   `&AdmittedServer`, so a `connect_*` on an un-admitted entry **does not compile**: the bug is
-  unrepresentable, not merely unhit. Previously the headless planner connected *every* discovered
+  unrepresentable, not merely unhit. **step-1.2** sealed the *lower-level* constructors too —
+  `StdioTransport::spawn` and `HttpTransport::connect` now also require `&AdmittedServer` (not a bare
+  `&McpServerEntry`), closing an adversarial-review finding that the witness was enforced only by
+  convention at the two wrapper call sites; no in-crate or downstream caller can now reach a
+  spawn/dial without the witness. Previously the headless planner connected *every* discovered
   entry (the interactive one already checked `enabled` but not trust), so a cloned repo shipping a
   `.mcp.json` could spawn an arbitrary subprocess on first agent turn — the closed vector.
 - **Residual:** 🟢 closed for the spawn/dial vector. Remaining scope is *feature*, not exposure: no
