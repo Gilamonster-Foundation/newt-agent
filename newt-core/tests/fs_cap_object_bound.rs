@@ -160,3 +160,46 @@ fn object_resolver_denies_what_a_lexical_prefix_check_would_admit() {
         "the object resolver is not fooled — the opened object escapes ws"
     );
 }
+
+// ---- read_dir (step-52.3): object-bound directory listing ----
+
+#[test]
+#[serial]
+fn read_dir_lists_contained_entries() {
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("a.txt"), b"").unwrap();
+    std::fs::write(ws.path().join("b.txt"), b"").unwrap();
+    std::fs::create_dir(ws.path().join("sub")).unwrap();
+
+    let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+    let mut names: Vec<String> = dir
+        .read_dir(Path::new("."))
+        .unwrap()
+        .into_iter()
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["a.txt", "b.txt", "sub"],
+        "`.`/`..` filtered, all entries listed"
+    );
+}
+
+#[test]
+#[serial]
+fn read_dir_denies_a_symlink_escape_directory() {
+    let root = tempdir().unwrap();
+    let ws = root.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret"), b"x").unwrap();
+    symlink("../outside", ws.join("link")).unwrap();
+
+    let dir = WorkspaceDir::open_root(&ws).unwrap();
+    assert!(
+        dir.read_dir(Path::new("link")).is_err(),
+        "listing a symlink-escape directory must be denied"
+    );
+}
