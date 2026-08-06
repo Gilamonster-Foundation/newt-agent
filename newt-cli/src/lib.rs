@@ -36,6 +36,7 @@ pub mod stack;
 pub mod stdio_guard;
 mod summarizer_cmd;
 mod tuning_cmd;
+mod web_cmd;
 
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
@@ -755,6 +756,15 @@ pub enum Command {
         #[arg(long, short = 'y', requires = "target")]
         yes: bool,
     },
+    /// Launch the newt-web HTMX cockpit (a SEPARATELY built binary — decision
+    /// D1 keeps its web dependency tree out of the agent workspace). Looks for
+    /// `$NEWT_WEB_BIN`, then `newt-web` beside this binary (`just install-web`
+    /// puts it there), then `PATH`. Extra args pass through to newt-web.
+    Web {
+        /// Arguments passed through to the newt-web binary.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Scaffold a NEW project for an ecosystem, already wired for its lifecycle
     /// phases. `newt new pyo3 mypkg` lays down a minimal, buildable Rust+PyO3
     /// (maturin) project; `python` and `rust` too. Templates are DATA (built-in
@@ -1439,6 +1449,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Ocap { cmd } => {
             let code = ocap_cmd::run(cmd, cli.config.as_deref())?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Web { args } => {
+            let code = web_cmd::run(&args)?;
             if code != 0 {
                 std::process::exit(code);
             }

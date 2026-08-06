@@ -54,6 +54,20 @@ install dest=`echo $HOME/bin` features="":
     @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server {{ if features == "" { "" } else { "[features: " + features + "]" } }}"
     @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
 
+# Install the newt-web HTMX cockpit beside newt (default: ~/bin), so
+# `newt web` finds it. newt-web is deliberately NOT a workspace member
+# (decision D1 in docs/decisions/newt_web_htmx.md) — it builds with its own
+# manifest/lock, and its target dir is resolved the same
+# honor-configured-target-dir way `_place-binaries` does.
+install-web dest=`echo $HOME/bin`:
+    cargo build --release --manifest-path newt-web/Cargo.toml
+    mkdir -p {{dest}}
+    rm -f {{dest}}/newt-web
+    target_dir="$(cargo metadata --no-deps --manifest-path newt-web/Cargo.toml --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"; \
+        cp "$target_dir/release/newt-web" {{dest}}/newt-web
+    @if command -v codesign >/dev/null 2>&1; then codesign --force --sign - {{dest}}/newt-web && echo "re-signed ad-hoc (macOS AMFI)"; fi
+    @echo "Installed: {{dest}}/newt-web — launch with \`newt web\`"
+
 # Install the LEAN strip-down build (hand-rolled crossterm lean box, no rich TTY
 # surface) — the wyvern/headless tier. Same as `just install` but with
 # `--no-default-features`.
