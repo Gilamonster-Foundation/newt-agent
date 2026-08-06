@@ -7481,7 +7481,7 @@ mod tests {
     /// `find_does_not_follow_symlinks_out_of_workspace`).
     #[cfg(unix)]
     #[test]
-    fn tui_permits_path_symlink_escape_is_the_known_residual() {
+    fn tui_permits_path_is_a_lexical_prefilter_not_the_fence() {
         use crate::caveats::Scope;
         let outside = tempfile::TempDir::new().unwrap();
         std::fs::write(outside.path().join("secret"), b"x").unwrap();
@@ -7493,11 +7493,18 @@ mod tests {
 
         // What the read/write call sites feed the gate for model path "link/secret".
         let via_link = ws.path().join("link").join("secret");
-        // RESIDUAL: permitted today — the gate can't see through the symlink.
-        // Flip to `!` when the gate canonicalizes (closes fs-canonical-containment).
+        // `tui_permits_path` is a cheap LEXICAL PRE-FILTER — it still admits the
+        // symlinked name (it cannot see through the link, and is not meant to).
+        // The authoritative fence is now object-bound: the fs tool arms resolve
+        // through `WorkspaceDir` (openat2 RESOLVE_BENEATH), so the *arm* denies
+        // this escape even though the predicate admits the name — proven by
+        // `{read_file,list_dir,write_file,edit_file,delete_file}_symlink_under_
+        // workspace_escaping_is_denied` and `apply_whole_files_denies_symlink_
+        // escape_object_bound`. This test therefore pins that the predicate stays
+        // a prefilter (NOT that a residual is open — #522 is CLOSED, step-52.7).
         assert!(
             tui_permits_path(&only, &via_link.to_string_lossy()),
-            "string gate permits a symlinked escape — known residual (#522)"
+            "the lexical prefilter admits the name; object-binding is the fence"
         );
 
         // Contrast: a plain `..` escape through the SAME root is already denied

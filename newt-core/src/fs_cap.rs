@@ -149,25 +149,51 @@ impl WorkspaceDir {
         Ok(())
     }
 
-    /// Remove a file entry, contained beneath the root. The **parent** directory
-    /// is resolved object-bound (a symlink / `..` in the parent path is refused),
-    /// then the final component is removed with `unlinkat` relative to the parent
-    /// fd — so the removal cannot be redirected outside the root, and a symlink at
-    /// the final component is removed *as the link* (its target is not followed).
-    /// Refuses directories (use a dedicated call if directory removal is needed).
-    pub fn unlink(&self, rel: &Path) -> io::Result<()> {
+    /// Resolve the directory that holds `rel`'s final component (object-bound —
+    /// a symlink / `..` in the parent path is refused) and return it with that
+    /// final component name. A bare filename resolves against the root itself.
+    /// The shared owner of the name-granularity mutation ops ([`unlink`], [`rename`]).
+    ///
+    /// [`unlink`]: Self::unlink
+    /// [`rename`]: Self::rename
+    fn parent_dir_and_name(&self, rel: &Path) -> io::Result<(OwnedFd, std::ffi::OsString)> {
         let name = rel
             .file_name()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?
+            .to_os_string();
         let parent = rel.parent().unwrap_or(Path::new(""));
-        // The directory the entry lives in — the root itself for a bare filename,
-        // else an object-bound resolve of the parent path.
-        let parent_dir: OwnedFd = if parent.as_os_str().is_empty() {
+        let dir = if parent.as_os_str().is_empty() {
             self.root.try_clone()?
         } else {
             self.resolve(parent, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?
         };
-        unlinkat(&parent_dir, Path::new(name), AtFlags::empty()).map_err(io::Error::from)
+        Ok((dir, name))
+    }
+
+    /// Remove a file entry, contained beneath the root. The parent is resolved
+    /// object-bound, then the final component is removed with `unlinkat` relative
+    /// to the parent fd — so the removal cannot be redirected outside the root,
+    /// and a symlink at the final component is removed *as the link* (its target
+    /// is not followed).
+    pub fn unlink(&self, rel: &Path) -> io::Result<()> {
+        let (parent_dir, name) = self.parent_dir_and_name(rel)?;
+        unlinkat(&parent_dir, Path::new(&name), AtFlags::empty()).map_err(io::Error::from)
+    }
+
+    /// Rename `from` → `to`, both contained beneath the root. Each path's parent
+    /// is resolved object-bound, then `renameat` moves the final component between
+    /// the parent fds — so neither endpoint can be redirected outside the root by
+    /// a symlink / `..` in its path. Used for atomic temp-then-rename writes.
+    pub fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let (from_dir, from_name) = self.parent_dir_and_name(from)?;
+        let (to_dir, to_name) = self.parent_dir_and_name(to)?;
+        rustix::fs::renameat(
+            &from_dir,
+            Path::new(&from_name),
+            &to_dir,
+            Path::new(&to_name),
+        )
+        .map_err(io::Error::from)
     }
 
     /// Open a subdirectory as its own contained [`WorkspaceDir`]. Traversal stays
