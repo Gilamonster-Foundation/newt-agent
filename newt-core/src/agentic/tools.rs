@@ -1904,13 +1904,21 @@ fn execute_request_permissions(
             ),
         },
         // Headless / eval / ACP: no interactive gate exists to grant authority.
-        // This is recoverable (change strategy), not a config edit the model
-        // can perform mid-turn.
+        // #1547: this must be FORWARD guidance, not a dead-end. The old copy
+        // rerouted the model to a `[tui.permissions]` edit it cannot perform
+        // mid-run and told it to "take a different approach for now" — which,
+        // in the confined bench lane (where the model already holds broad
+        // workspace + system-root authority), abandons a task it was authorized
+        // to finish and burns rounds. Tell it to stop re-asking and proceed
+        // within the authority it already has; only report the blocker if the
+        // target is genuinely essential and out of scope.
         None => format!(
             "no operator available to grant {capability} for '{target}' — this session \
-             has no interactive permission gate (headless / eval / piped). The capability \
-             must be configured by the owner (e.g. [tui.permissions] in newt config); \
-             take a different approach for now."
+             has no interactive permission gate (headless / eval / piped), so authority \
+             cannot be widened mid-run and re-calling request_permissions will not help. \
+             Proceed within the authority you already have and the tools available to you; \
+             if '{target}' is genuinely essential and outside your current scope, say so in \
+             your final answer rather than retrying it."
         ),
     };
     out
@@ -10559,6 +10567,45 @@ mod execute_tool_branch_tests {
             20,
         );
         assert!(out.contains("no operator available"), "got: {out}");
+    }
+
+    /// #1547: the headless `request_permissions` answer must be ACTIONABLE, not
+    /// a dead-end. With no gate, authority cannot be widened mid-run, so the
+    /// model must be told to (a) stop re-asking and (b) proceed within the
+    /// authority it already holds — NOT that "the owner must configure it"
+    /// (there is no owner mid-run) or to "take a different approach for now"
+    /// (which abandons a task the confined bench lane already authorizes and
+    /// burns tool-call rounds). Would fail on the old dead-end copy.
+    #[test]
+    fn request_permissions_headless_answer_is_forward_guidance_not_a_dead_end() {
+        let out = execute_request_permissions(
+            &serde_json::json!({"capability": "fs_write", "target": "/app/out", "reason": "write result"}),
+            None,
+            false,
+            20,
+        );
+        // Preserves the recoverable "no operator" signal.
+        assert!(out.contains("no operator available"), "got: {out}");
+        // Tells the model to proceed within its existing authority (forward
+        // guidance) and that re-calling the tool is pointless headless.
+        assert!(
+            out.contains("Proceed within the authority you already have"),
+            "headless answer must tell the model to proceed within current authority: {out}"
+        );
+        assert!(
+            out.contains("re-calling request_permissions will not help"),
+            "headless answer must tell the model not to keep asking: {out}"
+        );
+        // Must NOT re-route the model to a config edit it cannot perform
+        // mid-run, or tell it to abandon its approach — the old dead-ends.
+        assert!(
+            !out.contains("must be configured by the owner"),
+            "headless answer must not dead-end on an owner config edit: {out}"
+        );
+        assert!(
+            !out.contains("take a different approach for now"),
+            "headless answer must not tell the model to abandon its approach: {out}"
+        );
     }
 
     #[test]
