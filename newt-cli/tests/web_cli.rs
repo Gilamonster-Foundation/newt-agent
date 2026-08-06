@@ -1,12 +1,17 @@
 //! Process-level coverage for `newt web` — the find-and-spawn launcher for
 //! the workspace-excluded newt-web cockpit (decision D1).
+//!
+//! Unix-only as a WHOLE FILE: the stub binaries are shell scripts, and a
+//! per-test `#[cfg(unix)]` left the imports below unused on Windows, where
+//! `-D warnings` fails the clippy step (caught by Windows CI, invisible on
+//! unix hosts where the imports are used).
+#![cfg(unix)]
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 
 /// A stub "newt-web" that records its argv and exits 0, so the launcher's
 /// spawn/passthrough contract is provable without building the real crate.
-#[cfg(unix)]
 fn stub_web_binary(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = dir.join("newt-web");
@@ -15,7 +20,6 @@ fn stub_web_binary(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
-#[cfg(unix)]
 #[test]
 fn web_launches_the_env_override_binary_and_passes_args_through() {
     let dir = tempfile::tempdir().unwrap();
@@ -30,7 +34,6 @@ fn web_launches_the_env_override_binary_and_passes_args_through() {
         .stdout(predicate::str::contains("stub-newt-web:--port 9999"));
 }
 
-#[cfg(unix)]
 #[test]
 fn web_missing_binary_error_names_every_escape_hatch() {
     let dir = tempfile::tempdir().unwrap();
@@ -53,7 +56,6 @@ fn web_missing_binary_error_names_every_escape_hatch() {
         );
 }
 
-#[cfg(unix)]
 #[test]
 fn web_propagates_a_nonzero_exit_code() {
     use std::os::unix::fs::PermissionsExt as _;
