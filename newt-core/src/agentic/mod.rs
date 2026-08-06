@@ -16,6 +16,10 @@
 mod budget;
 // #867: path-claim verification for the cap-exit summary (the file-name
 // sibling of the #717 phantom-tool-reach telemetry).
+/// Anthropic `/v1/messages` wire mapping — `pub` so `newt-inference`'s simple
+/// transport reuses the body builder/reply parser instead of duplicating them
+/// (the `retry` re-export precedent; the dependency points inference → core).
+pub mod anthropic_wire;
 mod claim_check;
 pub(crate) mod compress;
 mod crew_attest;
