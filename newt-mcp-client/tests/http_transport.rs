@@ -166,6 +166,8 @@ fn http_connect_wires_the_egress_proxy_only_under_a_remote_host_grant() {
     use newt_mcp_client::HttpTransport;
 
     let entry = http_entry("http://example.com/mcp".to_string(), BTreeMap::new());
+    // step-1.2: the transport constructor now requires the admission witness.
+    let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry admits");
 
     // A general remote-host grant engages the proxy.
     let granted = Caveats {
@@ -173,14 +175,14 @@ fn http_connect_wires_the_egress_proxy_only_under_a_remote_host_grant() {
         ..Caveats::top()
     };
     assert!(
-        HttpTransport::connect(&entry, &granted)
+        HttpTransport::connect(&admitted, &granted)
             .expect("build")
             .egress_proxied(),
         "a remote-host net grant must route the client through the proxy"
     );
 
     // `net: All` (top) warrants no proxy — egress advisory.
-    assert!(!HttpTransport::connect(&entry, &Caveats::top())
+    assert!(!HttpTransport::connect(&admitted, &Caveats::top())
         .expect("build")
         .egress_proxied());
 
@@ -190,7 +192,7 @@ fn http_connect_wires_the_egress_proxy_only_under_a_remote_host_grant() {
         net: Scope::only([] as [String; 0]),
         ..Caveats::top()
     };
-    assert!(!HttpTransport::connect(&entry, &deny)
+    assert!(!HttpTransport::connect(&admitted, &deny)
         .expect("build")
         .egress_proxied());
 }

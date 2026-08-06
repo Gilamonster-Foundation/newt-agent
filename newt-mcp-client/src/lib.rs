@@ -570,7 +570,12 @@ impl StdioTransport {
     /// exec admission-check, the OS sandbox, and fails closed if a restricted fs
     /// axis cannot be kernel-enforced. `stderr` is discarded so server logging
     /// cannot corrupt the JSON-RPC stream.
-    pub fn spawn(entry: &McpServerEntry, caveats: &Caveats) -> Result<Self> {
+    pub fn spawn(admitted: &newt_core::mcp::AdmittedServer<'_>, caveats: &Caveats) -> Result<Self> {
+        // Admission is a compile-time precondition of a spawn: the only way to
+        // hold an `AdmittedServer` is a successful `newt_core::mcp::admit`, so a
+        // disabled or untrusted entry cannot reach this constructor (the witness
+        // is unforgeable — private field). #1562 / step-1.2.
+        let entry = admitted.entry();
         let command = entry
             .command
             .as_deref()
@@ -618,7 +623,12 @@ impl StdioTransport {
     /// sandbox — the confined `spawn_tokio` primitive is Unix-only. `caveats` is
     /// accepted for signature parity and to keep the boundary explicit; it does
     /// not yet kernel-confine here.
-    pub fn spawn(entry: &McpServerEntry, _caveats: &Caveats) -> Result<Self> {
+    pub fn spawn(
+        admitted: &newt_core::mcp::AdmittedServer<'_>,
+        _caveats: &Caveats,
+    ) -> Result<Self> {
+        // Admission is a compile-time precondition (see the Unix `spawn`).
+        let entry = admitted.entry();
         let command = entry
             .command
             .as_deref()
@@ -708,7 +718,12 @@ impl HttpTransport {
     /// `reqwest::Proxy::all`, so per-call traffic AND redirects are enforced
     /// against the allow-list — not only the connect-time host (#1156). A
     /// deny-all / `All` / loopback-only grant starts no proxy (unchanged).
-    pub fn connect(entry: &McpServerEntry, caveats: &Caveats) -> Result<Self> {
+    pub fn connect(
+        admitted: &newt_core::mcp::AdmittedServer<'_>,
+        caveats: &Caveats,
+    ) -> Result<Self> {
+        // Admission is a compile-time precondition of a dial (see stdio `spawn`).
+        let entry = admitted.entry();
         let url = entry
             .url
             .clone()
@@ -977,7 +992,7 @@ pub async fn connect_stdio(
             entry.name
         ));
     }
-    let transport = StdioTransport::spawn(entry, caveats)?;
+    let transport = StdioTransport::spawn(admitted, caveats)?;
     let sandbox_kind = Some(transport.sandbox_kind());
     // #1243 Leg 4: spawn_tokio engaged the egress proxy iff the child's egress
     // is fenced (a remote-host grant on a fence-capable host); its posture is
@@ -1012,7 +1027,7 @@ pub async fn connect_http(
             entry.name
         ));
     }
-    let transport = HttpTransport::connect(entry, caveats)?;
+    let transport = HttpTransport::connect(admitted, caveats)?;
     let net = net_posture(caveats, transport.egress_proxied());
     // No local process → no local OS-sandbox posture; net posture is real.
     finish_connect(entry, AnyTransport::Http(Box::new(transport)), None, net).await
@@ -1933,7 +1948,8 @@ mod env_isolation_tests {
         // top() = advisory leash: `sh` is permitted (exec unrestricted) and the
         // env is still scrubbed to the explicit grants, so this validates the
         // confined path's env isolation without a fail-closed on a restricted axis.
-        let mut t = StdioTransport::spawn(&entry, &Caveats::top()).expect("spawn");
+        let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry admits");
+        let mut t = StdioTransport::spawn(&admitted, &Caveats::top()).expect("spawn");
         let mut leaked = false;
         let mut saw_path = false;
         while let Ok(Some(line)) = t.stdout.next_line().await {
