@@ -136,6 +136,14 @@ pyo3 = { workspace = true, optional = true }
 # build graph addition minimal.
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
+[target."cfg(target_os = \"linux\")".dependencies]
+# Object-bound workspace fs capability (src/fs_cap.rs, step-52.1). `openat2` is a
+# Linux syscall, so the capability — and this dep — exist only on Linux; the
+# module is `#[cfg(target_os = "linux")]`. The cross-platform fallback (and the
+# fail-closed-for-untrusted policy where openat2 is absent) lands with the
+# consumer rewire (step-52.2/52.3).
+rustix.workspace = true
+
 [features]
 default = ["markdown"]
 # Markdown → ANSI rendering of assistant output (Step 25.1). On by default for
