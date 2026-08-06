@@ -89,6 +89,11 @@ authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 anyhow = "1.0"
 thiserror = "2.0"
 libc = "0.2"
+# Object-bound filesystem capability (newt-core::fs_cap, step-52.1): a safe
+# wrapper over openat2(RESOLVE_BENEATH) so authorization binds to the opened
+# object, not a normalized pathname. Already vendored transitively (tempfile,
+# agent-bridle-tool-shell), so a direct dep adds no build cost. Linux-only path.
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9" # model cards (#853) accept YAML as well as TOML (already in the lock)

@@ -143,18 +143,28 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   for a genuinely-untrusted worker.
 - **Compensating controls:** lexical containment (the #502 fix) blocks the `..`/sibling
   vectors; the crew/worker run in throwaway git worktrees; `b1`'s OS sandbox (Landlock fs) is
-  the backstop that bounds the symlink residual once present.
-- **Closure criterion:** the gate canonicalizes (or `openat2`-resolves) the target before
-  containment, and `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) is
-  flipped from "permitted" to "denied" — that test already drives a real symlink under the
-  workspace through the gate, so closing the deviation is exactly: implement canonicalization,
-  flip the assertion.
-- **Ratchet guard:** two tests in `tools.rs` — `tui_permits_path_prefix_semantics` drives
-  `..`, repeated `..`, and a sibling-prefix path through the real gate and asserts denial (the
-  lexical part #502 fixed; can't regress to raw `str::starts_with` without failing); and
-  `tui_permits_path_symlink_escape_is_the_known_residual` pins the still-open symlink gap so it
-  can't silently widen and so closing it is a visible, test-driven flip.
-- **Status:** OPEN (lexical containment landed; symlink resolution pending — issue #522) ·
+  the backstop that bounds the symlink residual once present. **The object-bound resolver now
+  exists** — `newt_core::fs_cap::WorkspaceDir` (step-52.1) resolves every path *beneath* an
+  `O_DIRECTORY` root fd with `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, so the symlink /
+  `..` / absolute escape is refused by the kernel at open time. It is proven and available; the
+  residual persists only because the fs tool arms have not yet been *rewired* onto it.
+- **Closure criterion:** the read arms, write arms, and write primitives resolve through
+  `WorkspaceDir` (step-52.2/52.3) rather than `join` + a `&str→bool` predicate, so the escape is
+  structurally unreachable. Note: the register's earlier "make `tui_permits_path` canonicalize,
+  flip its assertion" plan is **superseded** — `tui_permits_path` is a lexical `&str→bool`
+  predicate, and having it canonicalize would re-introduce the TOCTOU (check decoupled from
+  open). The correct closure binds authority to the opened object; the proof is an object-level
+  test (`fs_cap_object_bound.rs`, landed here) plus each arm's own contained-open test, not a
+  predicate flip. `tui_permits_path_symlink_escape_is_the_known_residual` is retired when its
+  arm moves to `WorkspaceDir`, not flipped in place.
+- **Ratchet guard:** `newt-core/tests/fs_cap_object_bound.rs` (step-52.1, real-fs tier) drives
+  real `..`, absolute, in-tree-relative-symlink-escape, and absolute-symlink-escape paths through
+  `WorkspaceDir` and asserts denial, with an explicit contrast test proving the object resolver
+  denies exactly what a lexical `starts_with` admits — neutering the resolve flags fails 5 of the
+  8 (verified red→green). The existing `tui_permits_path_symlink_escape_is_the_known_residual`
+  (`tools.rs`) still pins the *unrewired* gap so it can't silently widen before 52.2/52.3.
+- **Status:** OPEN (lexical containment landed #502; object-bound `WorkspaceDir` resolver landed
+  step-52.1; consumer rewire of the fs arms + write primitives pending — step-52.2/52.3, #522) ·
   review-by: with `b1` OS-sandbox work (#84)
 
 ### acp-worker-fs-scope
@@ -183,7 +193,9 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   and `is_workspace_contained_rejects_escapes` (`newt-tools/src/patch.rs`) drive real absolute/`..`
   targets through the primitives and assert denial + no outside write — a regression to a raw
   `join` fails them.
-- **Status:** PARTIAL (primitive containment landed — step-4.1) · owner: — · review-by: with
+- **Status:** OPEN — partial (primitive containment landed — step-4.1; full closure still needs
+  both the `Scope::All` caveat attenuation (step-4.2) and the object-bound `WorkspaceDir` resolve
+  (#522/step-52.x), so the invariant is not yet enforced end-to-end) · owner: — · review-by: with
   `fs-canonical-containment` (#522) + the ACP caveat fence (step-4.2)
 
 > `exec-behavior-bound`, `mcp-under-leash` — full entries to be filled as those land; each is

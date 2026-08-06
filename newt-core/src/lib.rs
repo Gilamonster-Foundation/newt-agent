@@ -28,6 +28,11 @@ pub mod error;
 pub mod ffi_manifest;
 pub mod ffi_surface;
 pub mod flight_recorder;
+// Object-bound workspace filesystem capability (step-52.1). `openat2` is
+// Linux-only, so the capability exists only there; consumers apply the
+// cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).
+#[cfg(target_os = "linux")]
+pub mod fs_cap;
 pub mod git_caveats;
 pub mod kit;
 pub mod lazy_emission;
