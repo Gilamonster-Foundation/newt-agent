@@ -982,7 +982,7 @@ async fn adopt_detects_openai_when_kind_absent() {
         api_needs_probe: false,
         context_window: None,
     };
-    let lines = adopt_backend_choice(&mut choice);
+    let lines = adopt_backend_choice(&mut choice, None);
     assert_eq!(choice.kind, newt_core::BackendKind::Openai);
     assert!(!choice.kind_needs_probe);
     assert_eq!(choice.model, "nemotron");
@@ -1020,7 +1020,7 @@ async fn adopt_detects_ollama_when_kind_absent() {
         api_needs_probe: false,
         context_window: None,
     };
-    let _ = adopt_backend_choice(&mut choice);
+    let _ = adopt_backend_choice(&mut choice, None);
     assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
     assert_eq!(choice.model, "llama3.1:8b");
 }
@@ -1054,7 +1054,7 @@ async fn adopt_respects_explicit_kind_without_detect() {
         api_needs_probe: false,
         context_window: None,
     };
-    let lines = adopt_backend_choice(&mut choice);
+    let lines = adopt_backend_choice(&mut choice, None);
     assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
     assert_eq!(
         choice.model, "configured",
@@ -1095,7 +1095,21 @@ async fn adopt_detects_authenticated_openai_with_bearer() {
         api_needs_probe: false,
         context_window: None,
     };
-    let _ = adopt_backend_choice(&mut choice);
+    let _ = adopt_backend_choice(&mut choice, None);
     assert_eq!(choice.kind, newt_core::BackendKind::Openai);
     assert_eq!(choice.model, "gated-model");
+}
+
+#[test]
+fn prewarm_applies_is_url_equality_modulo_trailing_slash() {
+    // The pre-warm probe is consumed only for the endpoint it ran against —
+    // a first-run wizard may have rewritten the config since splash entry.
+    assert!(crate::prewarm_applies(
+        "http://gpu:11434",
+        "http://gpu:11434/"
+    ));
+    assert!(!crate::prewarm_applies(
+        "http://gpu:11434",
+        "http://other:11434"
+    ));
 }

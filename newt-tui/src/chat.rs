@@ -752,6 +752,9 @@ pub(crate) fn run_chat(
     // FR-5 (#999): the session `--altitude` override, applied to `active_persona`.
     altitude: Option<newt_core::Altitude>,
     crew_runner: Option<&dyn newt_core::agentic::CrewRunner>,
+    // Backend probe started at splash entry (splash-first startup): consumed
+    // by adopt_backend_choice when the resolved choice still matches its URL.
+    prewarm: Option<crate::Prewarm>,
 ) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
@@ -834,7 +837,7 @@ pub(crate) fn run_chat(
     let mut choice = resolve_backend_choice(&cfg);
     // #1126 C1b: the server dictates — adopt what the endpoint actually
     // serves (bounded ~1s; offline keeps the file hint + says so).
-    for line in adopt_backend_choice(&mut choice) {
+    for line in adopt_backend_choice(&mut choice, prewarm) {
         print_newt(&line, color, verbose);
     }
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
