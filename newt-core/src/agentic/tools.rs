@@ -8047,7 +8047,11 @@ mod tests {
         // Where the kernel fs fence is available the trivial commands run under
         // it; where it is NOT, the AgentInfluenced spawn fails closed (never
         // runs the repo-controlled command unconfined).
-        let confinable = cfg!(target_os = "linux") && agent_bridle::landlock_is_supported();
+        // Use the cfg-correct predicate: `agent_bridle::landlock_is_supported`
+        // is a Linux-only symbol, so calling it under a runtime `cfg!()` fails to
+        // COMPILE on Windows/macOS. `kernel_fs_fence_available()` gates the call
+        // behind a compile-time `#[cfg]`.
+        let confinable = crate::confined_exec::kernel_fs_fence_available();
         let passed = run_build_check(passing_build_check_cmd(), &ws_str);
         if confinable {
             assert_eq!(passed, "  ✓ build check passed");
