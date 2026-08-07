@@ -88,10 +88,62 @@ mod linux {
         let prog = egress_deny_program()?;
         apply_filter(&prog).map_err(|e| e.to_string())
     }
+
+    /// Distinct exit/return codes the egress probe reports, so a caller (the
+    /// `newt-net-guard --probe-egress` self-test, an executor probe) can tell
+    /// exactly which family the kernel failed to deny.
+    pub mod probe_code {
+        pub const OK: i32 = 0;
+        pub const TCP_NOT_DENIED: i32 = 2;
+        pub const TCP_WRONG_ERRNO: i32 = 3;
+        pub const UDP_NOT_DENIED: i32 = 4;
+        pub const RAW_NOT_DENIED: i32 = 5;
+        pub const UNIX_WRONGLY_DENIED: i32 = 6;
+    }
+
+    /// Probe, on the CURRENT thread (which must already have the filter
+    /// installed), that off-box `socket()` is kernel-denied while `AF_UNIX`
+    /// survives. Returns `Ok(())` when the floor holds, else the failing
+    /// [`probe_code`]. Uses only raw syscalls — safe post-`fork`.
+    ///
+    /// # Safety
+    /// Calls `libc::socket`/`close`; must run after `install_egress_deny`.
+    pub fn probe_egress_denied() -> Result<(), i32> {
+        // TCP over IPv4: normally openable unprivileged, so its denial proves
+        // seccomp is doing the work.
+        let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        if s >= 0 {
+            unsafe { libc::close(s) };
+            return Err(probe_code::TCP_NOT_DENIED);
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno != libc::EACCES {
+            return Err(probe_code::TCP_WRONG_ERRNO);
+        }
+        // UDP over IPv6 — the DNS / datagram egress Landlock misses.
+        let s6 = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+        if s6 >= 0 {
+            unsafe { libc::close(s6) };
+            return Err(probe_code::UDP_NOT_DENIED);
+        }
+        // Raw packet socket.
+        let sp = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0) };
+        if sp >= 0 {
+            unsafe { libc::close(sp) };
+            return Err(probe_code::RAW_NOT_DENIED);
+        }
+        // Local IPC must still work (fs fence governs its path, not seccomp).
+        let su = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if su < 0 {
+            return Err(probe_code::UNIX_WRONGLY_DENIED);
+        }
+        unsafe { libc::close(su) };
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{egress_deny_program, install_egress_deny};
+pub use linux::{egress_deny_program, install_egress_deny, probe_code, probe_egress_denied};
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
