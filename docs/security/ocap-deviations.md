@@ -397,8 +397,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   (`newt-core/tests/config_project_trust.rs`, real-resource `#[serial]` — plants a walked-up
   `.newt/config.toml` with an RCE provider + lifecycle command + host shell + exfil endpoint, runs
   real `Config::resolve()`, asserts every control-plane key is absent from the resolved config while
-  a benign `[context]` preference survives). Neutering `strip_control_plane` re-admits them.
-- **Status:** CLOSED (fail-closed) — step-7.1 · owner: — · review-by: when a `newt config adopt`
+  a benign `[context]` preference survives; step-7.2 extended it to `[crews.*]` + `[loadouts.*]`).
+  Neutering `strip_control_plane` re-admits them. step-7.2 (convergence audit) added `crews` +
+  `loadouts` to `CONTROL_PLANE_KEYS`: a `crews[].test` is a `sh -c` verification command run on
+  `newt crew`, and a bare `[loadouts.*]` passes validation, so an overlay could otherwise mint a
+  (confined) command by declaring the sole auto-selected crew.
+- **Status:** CLOSED (fail-closed) — step-7.1 + step-7.2 (crews/loadouts) · owner: — · review-by: when a `newt config adopt`
   path or the ambient-base control-plane strip is designed.
 
 ### noninteractive-launch-policy
