@@ -4499,6 +4499,7 @@ version = "0.8.0"
 dependencies = [
  "serde",
  "serde_yaml",
+ "serial_test",
  "tempfile",
  "thiserror 2.0.18",
 ]
