@@ -8043,25 +8043,30 @@ mod tests {
         let ws = tempfile::TempDir::new().unwrap();
         let ws_str = ws.path().to_string_lossy();
 
-        // build_check now runs CONFINED through `ConstrainedExecutor` (P4).
-        // Where the kernel fs fence is available the trivial commands run under
-        // it; where it is NOT, the AgentInfluenced spawn fails closed (never
-        // runs the repo-controlled command unconfined).
-        // Use the cfg-correct predicate: `agent_bridle::landlock_is_supported`
-        // is a Linux-only symbol, so calling it under a runtime `cfg!()` fails to
-        // COMPILE on Windows/macOS. `kernel_fs_fence_available()` gates the call
-        // behind a compile-time `#[cfg]`.
-        let confinable = crate::confined_exec::kernel_fs_fence_available();
+        // build_check now runs CONFINED through `ConstrainedExecutor` (P4). On the
+        // normative Linux+Landlock platform the trivial commands run under the
+        // fence, so we assert the exact confined pass/fail. Off it, the outcome
+        // depends on the platform's kernel backend — Windows AppContainer / macOS
+        // Seatbelt may confine-and-run, or the spawn fails closed — and BOTH are
+        // secure (the executor never runs the repo-controlled command unconfined).
+        // So off Linux we assert only a well-formed outcome, never the specific
+        // one; the strong confinement guarantee is proven by the real-resource
+        // Landlock test (`tests/confined_exec_landlock.rs`).
+        //
+        // `kernel_fs_fence_available()` is used (not `cfg!() &&
+        // agent_bridle::landlock_is_supported()`): that symbol is Linux-only, so
+        // calling it under a runtime `cfg!()` fails to COMPILE off Linux.
         let passed = run_build_check(passing_build_check_cmd(), &ws_str);
-        if confinable {
+        if crate::confined_exec::kernel_fs_fence_available() {
             assert_eq!(passed, "  ✓ build check passed");
             let failed = run_build_check(&failing_build_check_cmd("boom"), &ws_str);
             assert!(failed.contains("✗ build check failed"), "got: {failed}");
             assert!(failed.contains("boom"), "stderr excerpt shown: {failed}");
         } else {
             assert!(
-                passed.contains("⚠ build check could not run"),
-                "without a kernel fence build_check must fail closed, got: {passed}"
+                passed == "  ✓ build check passed"
+                    || passed.contains("⚠ build check could not run"),
+                "off Linux, build_check must confine-and-run or fail closed, got: {passed}"
             );
         }
         // A nonexistent workspace dir → the command can't even spawn/confine.

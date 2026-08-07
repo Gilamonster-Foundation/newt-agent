@@ -2438,9 +2438,13 @@ mod tests {
             assert!(ok.run_test().0, "committed file present → pass (confined)");
             assert!(!bad.run_test().0, "non-zero exit → fail");
         } else {
+            // Off the normative Linux+Landlock platform the confined outcome is
+            // backend-dependent (macOS Seatbelt may confine-and-run, or the spawn
+            // fails closed) — both secure. Assert the invariant that holds either
+            // way: a non-zero-exit verify is NEVER reported as passing.
             assert!(
-                !ok.run_test().0,
-                "without a kernel fence the confined verify fails closed"
+                !bad.run_test().0,
+                "a failing verify must never be reported as passing"
             );
         }
     }
