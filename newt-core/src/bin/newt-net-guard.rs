@@ -17,6 +17,11 @@ fn main() -> ! {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    // Close any file descriptor the parent left open (>= 3): an inherited fd is
+    // a capability that bypasses pathname confinement. Do this first, before the
+    // real program can observe it.
+    newt_core::netguard::close_inherited_fds();
+
     // Install the seccomp egress-deny floor on this soon-to-exec process.
     if let Err(e) = newt_core::netguard::install_egress_deny() {
         eprintln!("newt-net-guard: seccomp install failed (fail-closed): {e}");
