@@ -34,6 +34,14 @@ pyo3 = { workspace = true, optional = true }
 
 [features]
 default = []
+# `allow-no-key` (step-1.3): the debug escape hatch that lets the worker dispatch
+# WITHOUT a signed operator key, under `Caveats::top()` (`WorkerIdentity::AllowNoKey`).
+# It is DEV-ONLY and OFF by default, so a production build cannot reach the
+# unrestricted-authority path at runtime — without this feature, `--allow-no-key`
+# is inert (the worker refuses to start with no key) and any `AllowNoKey` identity
+# fails CLOSED (deny-all), never `top()`. A scary flag name is not a boundary; the
+# compile-time feature is.
+allow-no-key = []
 pyo3 = [
     "dep:pyo3",
     "newt-core/pyo3",

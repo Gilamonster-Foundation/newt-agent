@@ -71,6 +71,10 @@ fn worker_generates_key_and_answers_initialize() {
     assert!(key.exists(), "first run must persist the operator key");
 }
 
+// step-1.3: `--allow-no-key` is compile-gated behind the DEV-ONLY `allow-no-key`
+// feature. With the feature ON (this build), the flag restores the debug
+// fallback and the worker starts under unbounded debug authority.
+#[cfg(feature = "allow-no-key")]
 #[test]
 fn worker_allow_no_key_falls_back_to_debug_identity() {
     let home = tempfile::tempdir().unwrap();
@@ -84,6 +88,28 @@ fn worker_allow_no_key_falls_back_to_debug_identity() {
         .success()
         .stdout(predicate::str::contains("\"jsonrpc\":\"2.0\""))
         .stderr(predicate::str::contains("unbounded debug authority"));
+}
+
+// step-1.3: with the feature OFF (production default), `--allow-no-key` is
+// INERT — a scary flag name is not a capability boundary. The worker must still
+// REFUSE to start when no operator key can be resolved, exactly as if the flag
+// were absent. This is the adversarial regression: a hostile launch that passes
+// `--allow-no-key` to a production binary gets fail-closed, not `top()`.
+#[cfg(not(feature = "allow-no-key"))]
+#[test]
+fn worker_allow_no_key_is_inert_in_production_build() {
+    let home = tempfile::tempdir().unwrap();
+    let key = blocked_key_path(&home);
+
+    worker(&home)
+        .arg("--operator-key-path")
+        .arg(&key)
+        .arg("--allow-no-key")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("headless worker refused to start"))
+        .stderr(predicate::str::contains("compiled out of this build"))
+        .stderr(predicate::str::contains("unbounded debug authority").not());
 }
 
 #[test]
