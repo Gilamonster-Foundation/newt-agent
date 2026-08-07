@@ -141,7 +141,14 @@ impl ExecRequest {
             caveats,
             env: Vec::new(),
             timeout: None,
-            net_grant: NetGrant::Unrestricted,
+            // An attacker-influenced child defaults to the full egress-deny floor
+            // (fail-closed if it cannot be established); a fixed-argv trusted
+            // helper keeps the sandbox's own net policy. Callers can still widen
+            // an attacker child to a mediated grant explicitly via `net_grant`.
+            net_grant: match origin {
+                ExecOrigin::AgentInfluenced => NetGrant::DenyAll,
+                ExecOrigin::TrustedInfra => NetGrant::Unrestricted,
+            },
             net_guard_bin: None,
         }
     }
