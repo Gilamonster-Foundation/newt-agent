@@ -80,6 +80,35 @@ mod linux {
         BpfProgram::try_from(filter).map_err(|e| e.to_string())
     }
 
+    /// Close every inherited file descriptor `>= 3` so a confined child cannot
+    /// use a descriptor the parent left open. An already-open fd is a capability
+    /// that BYPASSES pathname confinement (Landlock governs `open`, not an
+    /// inherited fd), so an unintended inherited fd would let a hostile child read
+    /// or write an out-of-fence object. stdio (0/1/2 — the confined pipes) is
+    /// preserved. Call child-side just before exec.
+    pub fn close_inherited_fds() {
+        // `close_range(3, ~0, 0)` closes the whole upper range in one syscall
+        // (Linux 5.9+). SAFETY: no memory effects; closing an already-closed fd is
+        // harmless.
+        let rc = unsafe { libc::close_range(3, libc::c_uint::MAX, 0) };
+        if rc == 0 {
+            return;
+        }
+        // Fallback for a pre-5.9 kernel (ENOSYS): enumerate /proc/self/fd, collect
+        // first (so the dir handle is dropped before we close), then close each.
+        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+            let fds: Vec<i32> = entries
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+                .filter(|&fd| fd >= 3)
+                .collect();
+            for fd in fds {
+                // SAFETY: closing a possibly-stale fd returns EBADF, ignored.
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+
     /// Install the egress-deny filter on the CURRENT thread; it is inherited
     /// across `execve` and by every descendant. Irreversible — call immediately
     /// before handing off to the confined program. `apply_filter` sets
@@ -143,7 +172,9 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{egress_deny_program, install_egress_deny, probe_code, probe_egress_denied};
+pub use linux::{
+    close_inherited_fds, egress_deny_program, install_egress_deny, probe_code, probe_egress_denied,
+};
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
