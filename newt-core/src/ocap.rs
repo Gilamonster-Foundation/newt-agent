@@ -107,10 +107,20 @@ pub fn verify_b1() -> Verification {
 /// from the model-facing stream and this returns `Verified`.
 #[must_use]
 pub fn verify_disclosure_gate() -> Verification {
-    Verification::Absent {
-        deviation: "disclosure-gate-live-path",
-        reason: "live chokepoint gated by-value (step-6.1a); session-start \
-                 registration + observation/summary convergence pending"
+    // Enforced (step-6.6): the by-value session filter is REGISTERED at session
+    // start (`session_disclosure_filter`, both live builders) and consulted on
+    // EVERY model-ingress funnel — the tool-result chokepoint
+    // (`maybe_offload_tool_result`), the final-summary path (`redact_model_facing`),
+    // and the memory / observation / compaction / spill path (`redact_secrets`) —
+    // via the explicit `&DisclosureFilter` param AND the `scoped_session_disclosure`
+    // TLS backstop, so a registered secret cannot reach model context in any
+    // encoding through any of them. Note: flipping this alone does not enable
+    // `seed_live_credential`, which ALSO requires `verify_b1` (still Absent).
+    Verification::Verified {
+        evidence: "session secret registered + value-filtered at the tool-result, \
+                   summary, and memory model-ingress funnels (TLS backstop); guarded by \
+                   no_model_ingress_funnel_leaks_a_registered_session_secret + \
+                   redact_secrets_value_filters_a_registered_session_secret"
             .into(),
     }
 }
@@ -164,14 +174,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verifiers_are_absent_until_built() {
+    fn b1_verifier_absent_until_built() {
+        // b1 remains fail-closed until the kernel floor lands (P5).
         assert!(!verify_b1().is_verified());
         assert_eq!(verify_b1().deviation(), Some("b1-os-isolation"));
-        assert!(!verify_disclosure_gate().is_verified());
-        assert_eq!(
-            verify_disclosure_gate().deviation(),
-            Some("disclosure-gate-live-path")
-        );
+    }
+
+    #[test]
+    fn disclosure_gate_verified_after_registration_and_funnel_coverage() {
+        // step-6.6: the disclosure gate is now ENFORCED (session secret registered
+        // + value-filtered at every model-ingress funnel). It reports Verified and
+        // names no open deviation.
+        assert!(verify_disclosure_gate().is_verified());
+        assert_eq!(verify_disclosure_gate().deviation(), None);
     }
 
     #[test]
@@ -353,6 +368,58 @@ pub fn session_disclosure_filter(api_key: Option<&str>) -> DisclosureFilter {
     filter
 }
 
+std::thread_local! {
+    /// The current thread's session disclosure filter. A driven turn installs it
+    /// before crossing onto its dedicated thread (same pattern as the effective-
+    /// tenacity override), so every model-ingress redaction path on that thread —
+    /// the tool-result chokepoint, summaries, AND the memory/observation/
+    /// compaction/spill path that funnels through `redact_secrets` — value-filters
+    /// against the same registered secrets, regardless of which path assembled the
+    /// text. This is the "no alternate path" backstop for the sinks that do not
+    /// carry an explicit `&DisclosureFilter`.
+    static SESSION_DISCLOSURE: std::cell::RefCell<Option<DisclosureFilter>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the prior current-thread session filter on drop. The `Rc` marker
+/// keeps the guard on the thread whose TLS slot it owns; driven turns use a
+/// current-thread runtime, so the guard safely spans the whole async turn.
+#[must_use]
+pub struct ScopedSessionDisclosure {
+    previous: Option<DisclosureFilter>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for ScopedSessionDisclosure {
+    fn drop(&mut self) {
+        let prev = self.previous.take();
+        let _ = SESSION_DISCLOSURE.try_with(|slot| *slot.borrow_mut() = prev);
+    }
+}
+
+/// Install `filter` as the current thread's session disclosure filter until the
+/// returned guard drops. Every by-value model-ingress redaction on this thread
+/// then consults it. Nests in lexical (LIFO) order.
+pub fn scoped_session_disclosure(filter: DisclosureFilter) -> ScopedSessionDisclosure {
+    let previous = SESSION_DISCLOSURE.with(|slot| slot.borrow_mut().replace(filter));
+    ScopedSessionDisclosure {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// Redact `text` through the current thread's session disclosure filter, if one
+/// is installed. The by-value gate for model-ingress paths that don't carry an
+/// explicit `&DisclosureFilter` (memory / observation / compaction / spill).
+/// Identity when no session filter is installed.
+#[must_use]
+pub fn redact_session_ingress(text: &str) -> String {
+    SESSION_DISCLOSURE.with(|slot| match &*slot.borrow() {
+        Some(filter) => filter.redact(text),
+        None => text.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod disclosure_tests {
     use super::*;
@@ -381,6 +448,30 @@ mod disclosure_tests {
         // A short/placeholder value is NOT registered — registering it would
         // over-redact benign text.
         assert!(!session_disclosure_filter(Some("x")).leaks("x marks the spot"));
+    }
+
+    #[test]
+    fn session_tls_redacts_installed_secret_and_restores() {
+        // No filter installed on this thread → identity.
+        assert_eq!(
+            redact_session_ingress("plain sk-live-abc12345"),
+            "plain sk-live-abc12345"
+        );
+        {
+            let mut f = DisclosureFilter::new();
+            f.register("sk-live-abc12345");
+            let _g = scoped_session_disclosure(f);
+            // Installed → the registered secret (raw + re-encoded) is redacted on
+            // ANY model-ingress path that consults the TLS.
+            assert!(!redact_session_ingress("token=sk-live-abc12345").contains("sk-live-abc12345"));
+            let enc = b64("sk-live-abc12345");
+            assert!(!redact_session_ingress(&format!("b={enc}")).contains(&enc));
+        }
+        // Guard dropped → restored to identity (no leak of the guard across turns).
+        assert_eq!(
+            redact_session_ingress("token=sk-live-abc12345"),
+            "token=sk-live-abc12345"
+        );
     }
 
     #[test]

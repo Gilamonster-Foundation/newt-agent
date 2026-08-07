@@ -4017,10 +4017,13 @@ fn is_workspace_write_call(name: &str) -> bool {
 /// leaves the loop, the same by-value gate the tool-result chokepoint applies.
 /// `None` (no session filter) is bit-for-bit identity.
 fn redact_model_facing(disclosure: Option<&crate::ocap::DisclosureFilter>, text: String) -> String {
-    match disclosure {
+    let text = match disclosure {
         Some(filter) => filter.redact(&text),
         None => text,
-    }
+    };
+    // TLS backstop (step-6.6): the same session filter, so the summary path is
+    // covered even where the explicit `disclosure` param is not threaded.
+    crate::ocap::redact_session_ingress(&text)
 }
 
 fn maybe_offload_tool_result(
@@ -4045,11 +4048,15 @@ fn maybe_offload_tool_result(
     // which the offload/spill redaction never touched — passes the by-VALUE
     // filter before it becomes a `{"role":"tool"}` message, so a registered
     // session secret / canary cannot reach the model verbatim in-turn, in ANY
-    // encoding (raw / base64 / hex). `None` = no registered secret → unchanged.
-    match disclosure {
+    // encoding (raw / base64 / hex / chunk-split). The explicit `disclosure`
+    // param redacts when threaded; the TLS session filter (installed per turn)
+    // is the uniform backstop, so even a caller that forgot the param can't
+    // place tool-derived text into model context unfiltered (step-6.6).
+    let out = match disclosure {
         Some(filter) => filter.redact(&out),
         None => out,
-    }
+    };
+    crate::ocap::redact_session_ingress(&out)
 }
 
 fn meaningful_workflow_progress(name: &str, result: &str) -> bool {
@@ -10303,6 +10310,35 @@ mod cap_exit_unit_tests {
         assert_eq!(
             ungated, raw,
             "a `None` disclosure filter must not alter output"
+        );
+    }
+
+    #[test]
+    fn no_model_ingress_funnel_leaks_a_registered_session_secret() {
+        // step-6.6 (`disclosure-gate-live-path` #5): with the session filter
+        // installed on this turn's thread (as both live builders do), NO
+        // model-ingress funnel may carry a registered secret — even when the
+        // explicit `disclosure` param is `None` (the TLS is the uniform backstop).
+        // Covers the tool-result chokepoint AND the summary path here; the
+        // memory/observation/compaction/spill funnel (`redact_secrets`) is proven
+        // by `compress::tests::redact_secrets_value_filters_a_registered_session_secret`.
+        let canary = "NEWT-CANARY-e2e-7f3a9c2b1d";
+        let mut f = crate::ocap::DisclosureFilter::new();
+        f.register(canary);
+        let _g = crate::ocap::scoped_session_disclosure(f);
+
+        // 1. Tool-result chokepoint, explicit param = None → TLS backstop redacts.
+        let tool =
+            maybe_offload_tool_result("run_command", format!("out: {canary}"), false, None, None);
+        assert!(
+            !tool.contains(canary),
+            "tool-result funnel leaked a registered secret via the TLS backstop: {tool}"
+        );
+        // 2. Summary funnel, param = None → TLS backstop redacts.
+        let summary = redact_model_facing(None, format!("final answer mentions {canary}"));
+        assert!(
+            !summary.contains(canary),
+            "summary funnel leaked a registered secret: {summary}"
         );
     }
 

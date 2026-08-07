@@ -2083,7 +2083,12 @@ pub(crate) fn redact_secrets(input: &str) -> String {
             out = re.replace_all(&out, *rep).into_owned();
         }
     }
-    out
+    // Then the by-VALUE session disclosure filter (registered secrets, every
+    // encoding + chunk-split), so the observation / compaction / spill memory
+    // paths that funnel through here cannot carry a KNOWN secret into model
+    // context — not just the shape-matched patterns above. Identity when no
+    // session filter is installed (the guard is set per driven turn).
+    crate::ocap::redact_session_ingress(&out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2099,6 +2104,28 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// disclosure-gate-live-path (#5): the observation / compaction / spill
+    /// memory paths funnel through `redact_secrets`, which now also runs the
+    /// by-VALUE session filter. A high-entropy registered secret (which the
+    /// shape-only regexes would MISS) must not survive into model-context memory.
+    #[test]
+    fn redact_secrets_value_filters_a_registered_session_secret() {
+        let canary = "NEWT-CANARY-9f3a2b7c1d4e";
+        // Baseline: with no session filter installed, the canary passes through
+        // (the shape-only patterns don't recognise it) — proving the value gate,
+        // not a coincidental regex, is what redacts it below.
+        assert!(redact_secrets(&format!("observed: {canary}")).contains(canary));
+
+        let mut f = crate::ocap::DisclosureFilter::new();
+        f.register(canary);
+        let _g = crate::ocap::scoped_session_disclosure(f);
+        let out = redact_secrets(&format!("observed: {canary} at end"));
+        assert!(
+            !out.contains(canary),
+            "a registered session secret must be value-filtered from the memory path: {out}"
+        );
+    }
 
     // -- builders ------------------------------------------------------------
 

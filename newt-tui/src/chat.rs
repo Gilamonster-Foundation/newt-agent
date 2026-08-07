@@ -4792,6 +4792,13 @@ pub(crate) fn run_chat(
                     // before it reaches the model. Outlives the ChatCtx below.
                     let session_disclosure =
                         newt_core::ocap::session_disclosure_filter(inf_key.as_deref());
+                    // Also install it on this thread so the memory / observation /
+                    // compaction / spill paths (via `redact_secrets`) value-filter
+                    // against the same secret. The turn runs on this thread
+                    // (`block_in_place` + current-thread `block_on`), so the TLS is
+                    // visible throughout.
+                    let _disclosure_guard =
+                        newt_core::ocap::scoped_session_disclosure(session_disclosure.clone());
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
