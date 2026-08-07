@@ -36,7 +36,7 @@ impl Console for StdinConsole {
         Ok(buf.trim().to_string())
     }
     fn ask_secret(&mut self, prompt: &str) -> io::Result<String> {
-        read_line_raw(prompt, Echo::Hidden)
+        read_line_raw(prompt, Echo::Stars)
     }
     fn say(&mut self, line: &str) {
         println!("{line}");
@@ -52,11 +52,14 @@ pub fn is_yes(input: &str, default: bool) -> bool {
     }
 }
 
-/// Whether a raw-mode line read shows the characters typed.
+/// Whether a raw-mode line read shows the characters typed. `Stars` echoes
+/// one `*` per character — a secret still gets keystroke feedback (a fully
+/// silent prompt reads as a hung terminal, per field testing) without ever
+/// showing the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Echo {
     Chars,
-    Hidden,
+    Stars,
 }
 
 /// What one key event does to a raw-mode line read. Pure — unit-tested
@@ -127,13 +130,14 @@ pub fn read_line_raw(prompt: &str, echo: Echo) -> io::Result<String> {
         match key_step(&ev, buf.is_empty()) {
             KeyStep::Push(c) => {
                 buf.push(c);
-                if echo == Echo::Chars {
-                    print!("{c}");
-                    io::stdout().flush()?;
+                match echo {
+                    Echo::Chars => print!("{c}"),
+                    Echo::Stars => print!("*"),
                 }
+                io::stdout().flush()?;
             }
             KeyStep::Backspace => {
-                if buf.pop().is_some() && echo == Echo::Chars {
+                if buf.pop().is_some() {
                     print!("\x08 \x08");
                     io::stdout().flush()?;
                 }
@@ -173,7 +177,7 @@ impl Console for FirstRunConsole {
         read_line_raw(prompt, Echo::Chars)
     }
     fn ask_secret(&mut self, prompt: &str) -> io::Result<String> {
-        read_line_raw(prompt, Echo::Hidden)
+        read_line_raw(prompt, Echo::Stars)
     }
     fn say(&mut self, line: &str) {
         println!("{line}");

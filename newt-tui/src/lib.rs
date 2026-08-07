@@ -604,6 +604,18 @@ pub(crate) fn prewarm_applies(choice_url: &str, prewarm_url: &str) -> bool {
     choice_url.trim_end_matches('/') == prewarm_url.trim_end_matches('/')
 }
 
+/// Whole-request bound for the session's endpoint probes. LAN boxes answer in
+/// well under a second; a hosted HTTPS gateway needs DNS + TLS + auth and
+/// real-world jitter — field testing showed api.openai.com blowing a 3 s
+/// bound while being perfectly healthy, so the remote beat is a patient 10 s.
+pub(crate) fn probe_timeout_secs(url: &str) -> u64 {
+    if url.starts_with("https://") {
+        10
+    } else {
+        1
+    }
+}
+
 /// Start the pre-warm probe for the resolved backend choice, if this box is
 /// configured (an unconfigured box has nothing real to probe — the wizard is
 /// about to change everything) and a tokio runtime is available.
@@ -618,7 +630,7 @@ fn spawn_backend_prewarm() -> Option<Prewarm> {
     let api_key = choice.api_key.clone();
     let needs_probe = choice.kind_needs_probe;
     let kind = choice.kind;
-    let secs = if url.starts_with("https://") { 3 } else { 1 };
+    let secs = probe_timeout_secs(&url);
     let task_url = url.clone();
     let handle = runtime.spawn(async move {
         let client = reqwest::Client::builder()
@@ -3447,14 +3459,7 @@ fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) ->
         };
         return finish_adoption(choice, lines, probe.models, probe.warm, detected);
     }
-    // Local endpoints answer in well under a second; a remote authenticated
-    // HTTPS gateway needs a TLS + auth round-trip — still a bounded beat,
-    // just a wider one.
-    let secs = if choice.url.starts_with("https://") {
-        3
-    } else {
-        1
-    };
+    let secs = probe_timeout_secs(&choice.url);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(secs))
         .build()
@@ -3522,11 +3527,7 @@ fn finish_adoption(
     detected_kind: Option<newt_core::BackendKind>,
 ) -> Vec<String> {
     use newt_core::backend_probe::{self, Served};
-    let secs = if choice.url.starts_with("https://") {
-        3
-    } else {
-        1
-    };
+    let secs = probe_timeout_secs(&choice.url);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(secs))
         .build()
@@ -3602,9 +3603,14 @@ fn finish_adoption(
             // OpenAI surface probe: absent `api` → try chat/completions, adopt
             // `responses` when the server says the model is responses-only.
             let mut api_was_probed = false;
+            // Hosted (https) endpoints only: Responses-only models are an
+            // OpenAI-cloud phenomenon, and on a plain-HTTP LAN multiplexer
+            // (llama-swap) the probe completion can trigger a full model load
+            // that always outlives the probe timeout — pure noise.
             if choice.kind == newt_core::BackendKind::Openai
                 && choice.api_needs_probe
                 && !choice.model.is_empty()
+                && choice.url.starts_with("https://")
             {
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
@@ -3629,7 +3635,7 @@ fn finish_adoption(
                         ));
                     }
                     Err(e) => lines.push(format!(
-                        "api probe failed ({e}) — using chat_completions until it answers"
+                        "api probe failed ({e:#}) — using chat_completions until it answers"
                     )),
                 }
             }
@@ -3668,12 +3674,12 @@ fn offline_adoption(
 ) -> Vec<String> {
     if choice.model.is_empty() {
         lines.push(format!(
-            "{} is unreachable ({e}) and no model is configured — check the                      endpoint, then /backends",
+            "{} is unreachable ({e:#}) and no model is configured — check the                      endpoint, then /backends",
             choice.url
         ));
     } else {
         lines.push(format!(
-            "{} is unreachable ({e}) — using configured model {} until it answers",
+            "{} is unreachable ({e:#}) — using configured model {} until it answers",
             choice.url, choice.model
         ));
     }

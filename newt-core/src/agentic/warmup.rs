@@ -11,16 +11,18 @@ use crate::retry::with_backoff_notify;
 /// Silently returns `false` on any network or parse error so the caller always
 /// falls through to the warm-up path — a false negative just means we warm
 /// unnecessarily, which is safe.
-fn is_model_resident(endpoint: &str, model: &str) -> bool {
+fn is_model_resident(endpoint: &str, model: &str, api_key: Option<&str>) -> bool {
     let ps_url = format!("{}/api/ps", endpoint.trim_end_matches('/'));
     let Ok(json) = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            let resp = reqwest::Client::builder()
+            let mut req = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()?
-                .get(&ps_url)
-                .send()
-                .await?;
+                .get(&ps_url);
+            if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+                req = req.bearer_auth(key);
+            }
+            let resp = req.send().await?;
             resp.json::<serde_json::Value>()
                 .await
                 .map_err(anyhow::Error::from)
@@ -39,8 +41,15 @@ fn is_model_resident(endpoint: &str, model: &str) -> bool {
 /// warm-up itself fails), then prints a ready line.
 ///
 /// Skipped silently on non-Ollama endpoints (caller's responsibility).
-pub fn warmup_if_cold(endpoint: &str, model: &str, keep_alive: &str, color: bool, verbose: bool) {
-    if is_model_resident(endpoint, model) {
+pub fn warmup_if_cold(
+    endpoint: &str,
+    model: &str,
+    keep_alive: &str,
+    api_key: Option<&str>,
+    color: bool,
+    verbose: bool,
+) {
+    if is_model_resident(endpoint, model, api_key) {
         print_newt(
             &format!("✓ {model} — already resident, ready"),
             color,
@@ -86,9 +95,11 @@ pub fn warmup_if_cold(endpoint: &str, model: &str, keep_alive: &str, color: bool
             with_backoff_notify(
                 &retry,
                 || async {
-                    let resp = client
-                        .post(&warm_url)
-                        .json(&body)
+                    let mut req = client.post(&warm_url).json(&body);
+                    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+                        req = req.bearer_auth(key);
+                    }
+                    let resp = req
                         .send()
                         .await
                         .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
@@ -141,7 +152,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        assert!(!is_model_resident(&server.uri(), "wanted-model:13b"));
+        assert!(!is_model_resident(&server.uri(), "wanted-model:13b", None));
     }
 
     /// `is_model_resident` returns `true` when the model appears in `/api/ps`.
@@ -159,7 +170,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        assert!(is_model_resident(&server.uri(), "wanted-model:13b"));
+        assert!(is_model_resident(&server.uri(), "wanted-model:13b", None));
     }
 
     /// `is_model_resident` returns `false` (safe default) when the endpoint
@@ -173,7 +184,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        assert!(!is_model_resident(&server.uri(), "any-model"));
+        assert!(!is_model_resident(&server.uri(), "any-model", None));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -194,7 +205,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        warmup_if_cold(&server.uri(), "warm-model:8b", "5m", false, false);
+        warmup_if_cold(&server.uri(), "warm-model:8b", "5m", None, false, false);
         server.verify().await;
     }
 
@@ -217,7 +228,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        warmup_if_cold(&server.uri(), "cold-model:70b", "5m", false, false);
+        warmup_if_cold(&server.uri(), "cold-model:70b", "5m", None, false, false);
         server.verify().await;
     }
 
@@ -238,6 +249,6 @@ mod tests {
             .await;
 
         // Must not panic or hang — the warning path swallows the error.
-        warmup_if_cold(&server.uri(), "ghost-model", "5m", false, false);
+        warmup_if_cold(&server.uri(), "ghost-model", "5m", None, false, false);
     }
 }

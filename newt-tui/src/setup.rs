@@ -470,7 +470,7 @@ async fn configure_custom_host(
                 .iter()
                 .any(|f| f.contains("authentication required"))
         {
-            let key = console.ask_secret("API key (input hidden, Enter to skip): ")?;
+            let key = console.ask_secret("API key (echoes as *, Enter to skip): ")?;
             let key = key.trim().to_string();
             if !key.is_empty() {
                 validate_authenticated_target(&target)?;
@@ -693,6 +693,19 @@ async fn configure_preset(
         }
     };
 
+    // Field note: a bad token used to sail through setup (list endpoints
+    // aren't uniformly auth-gated) and only 401 on the first real message.
+    // Test the credential NOW, with re-entry on rejection.
+    let (api_key_env, api_key_file, _probe_key) = verify_key_with_retries(
+        console,
+        client,
+        preset,
+        config_path,
+        &model,
+        (api_key_env, api_key_file, probe_key),
+    )
+    .await?;
+
     let backend = provider_preset::backend_from_preset(
         preset,
         &model,
@@ -709,6 +722,54 @@ async fn configure_preset(
     Ok((config, backend))
 }
 
+/// Credential triple as the wizard threads it: (env reference, encrypted-file
+/// reference, plaintext key for probes — never persisted).
+type WizardCred = (Option<String>, Option<String>, Option<String>);
+
+/// Live-test the pasted key before anything is written (wire-aware —
+/// [`provider_preset::verify_key_for_preset`]), with up to two re-entries on
+/// a 401/403. Env-only / keyless configurations (no probe key) pass through
+/// untouched, and an unverifiable check (endpoint down) continues honestly
+/// rather than blocking setup.
+async fn verify_key_with_retries(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    preset: &ProviderPreset,
+    config_path: &Path,
+    model: &str,
+    mut cred: WizardCred,
+) -> anyhow::Result<WizardCred> {
+    for _ in 0..3 {
+        let Some(key) = cred.2.as_deref() else {
+            return Ok(cred);
+        };
+        console.say(&format!("Testing the key against {}…", preset.base_url));
+        match provider_preset::verify_key_for_preset(client, preset, key, model).await {
+            provider_preset::KeyCheck::Accepted => {
+                console.say("  ✓ key accepted");
+                return Ok(cred);
+            }
+            provider_preset::KeyCheck::Rejected(code) => {
+                console.say(&format!("  ✗ key rejected (HTTP {code})"));
+                let ans = console.ask("Re-enter the key? [Y/n] ")?;
+                if !is_yes(&ans, true) {
+                    console.say("  Keeping it — fix later by re-running `newt setup`.");
+                    return Ok(cred);
+                }
+                cred = preset_pasted_key(console, preset, config_path)?;
+            }
+            provider_preset::KeyCheck::Unverified(reason) => {
+                console.say(&format!(
+                    "  Could not verify the key ({reason}) — continuing."
+                ));
+                return Ok(cred);
+            }
+        }
+    }
+    console.say("  Still rejected — keeping the last key; fix later with `newt setup`.");
+    Ok(cred)
+}
+
 /// The paste path shared by both preset branches: hidden input; Enter skips
 /// (env reference recorded, nothing stored); a pasted token goes through the
 /// encrypted store. Returns (api_key_env, api_key_file, probe key).
@@ -718,7 +779,7 @@ fn preset_pasted_key(
     preset: &ProviderPreset,
     config_path: &Path,
 ) -> anyhow::Result<(Option<String>, Option<String>, Option<String>)> {
-    let key = console.ask_secret("API key (input hidden, Enter to skip): ")?;
+    let key = console.ask_secret("API key (echoes as *, Enter to skip): ")?;
     let key = key.trim().to_string();
     if key.is_empty() {
         let var = preset
@@ -746,7 +807,7 @@ fn persist_wizard_token(
     token: &str,
 ) -> anyhow::Result<String> {
     console.say("Protect the stored key with a passphrase? Enter uses a machine-local key.");
-    let pass = console.ask_secret("Passphrase (input hidden): ")?;
+    let pass = console.ask_secret("Passphrase (echoes as *): ")?;
     let backends_dir = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -2688,6 +2749,70 @@ mod tests {
         let b = read_dropin(&path, "default");
         assert_eq!(b.effective_model(), Some("qwen2.5-coder:7b"));
         assert_eq!(b.endpoint, server.uri());
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn bad_pasted_key_is_caught_by_the_live_test_and_reentered() {
+        // Field regression: ollama.com serves the model catalog to anyone, so
+        // a mistyped key sailed through setup and 401'd on the first message.
+        // The wizard now live-tests the key (1-token chat on the ollama wire)
+        // and offers re-entry.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "big-cloud-model"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer good-key",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": "hi"}, "done": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(serde_json::json!({"error": "Unauthorized"})),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        // Pin the config dir: the machine identity for blank-passphrase
+        // encryption lives under it.
+        let prev = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
+        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        newt_core::secrets::session().reset_for_test();
+        let preset = ProviderPreset {
+            name: "cloudish".into(),
+            base_url: server.uri(),
+            api_mode: newt_core::provider_preset::ApiMode::Ollama,
+            env_vars: vec!["NEWT_TEST_NO_SUCH_VAR_EXISTS".into()],
+            ..Default::default()
+        };
+        // paste bad key → blank passphrase → model 1 → re-enter? Y →
+        // paste good key → blank passphrase.
+        let mut console = ScriptedConsole::new(&["bad-key", "", "1", "Y", "good-key", ""]);
+        let result =
+            configure_preset(&mut console, &reqwest::Client::new(), &preset, &cfg_path).await;
+        match prev {
+            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+        }
+        let (_cfg, backend) = result.unwrap();
+        let t = console.transcript();
+        assert!(t.contains("✗ key rejected (HTTP 401)"), "{t}");
+        assert!(t.contains("✓ key accepted"), "{t}");
+        assert!(backend.api_key_file.is_some(), "re-entered key is stored");
     }
 
     #[serial_test::serial(real_fs)]

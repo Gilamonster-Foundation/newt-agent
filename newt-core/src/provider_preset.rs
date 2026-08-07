@@ -324,6 +324,86 @@ pub async fn list_models_for_preset(
         .await
 }
 
+/// Verdict of a live credential test against a preset's endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyCheck {
+    /// The endpoint accepted the credential (any non-auth status counts —
+    /// a 404/429 still proves the key got past the gate).
+    Accepted,
+    /// HTTP 401/403 — the key itself was refused.
+    Rejected(u16),
+    /// The check couldn't run (network error, unsupported wire) — carries
+    /// the reason; the caller should continue rather than block setup.
+    Unverified(String),
+}
+
+/// Test a pasted key against the preset's endpoint BEFORE setup writes
+/// anything, so a mistyped token surfaces in the wizard instead of as a 401
+/// on the first real message.
+///
+/// Wire-aware, because list endpoints don't uniformly enforce auth
+/// (measured: ollama.com serves `/api/tags` and `/api/show` to anyone and
+/// gates only generation) — so the ollama wire is tested with a 1-token
+/// `/api/chat` against the chosen model, while the openai and anthropic
+/// wires use their auth-gated `/v1/models`. Only 401/403 reject the key:
+/// any other reachable status proves the credential got past the gate.
+pub async fn verify_key_for_preset(
+    client: &reqwest::Client,
+    p: &ProviderPreset,
+    key: &str,
+    model: &str,
+) -> KeyCheck {
+    let PresetSupport::Supported { kind, endpoint, .. } = preset_support(p) else {
+        return KeyCheck::Unverified("preset is not usable on this build".into());
+    };
+    let base = endpoint.trim_end_matches('/').to_string();
+    let classify = |status: reqwest::StatusCode| {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            KeyCheck::Rejected(status.as_u16())
+        } else {
+            KeyCheck::Accepted
+        }
+    };
+    let sent = match kind {
+        BackendKind::Ollama => {
+            let body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": false,
+                "options": {"num_predict": 1},
+            });
+            client
+                .post(format!("{base}/api/chat"))
+                .bearer_auth(key)
+                .json(&body)
+                .send()
+                .await
+        }
+        BackendKind::Openai => {
+            client
+                .get(format!("{base}/v1/models"))
+                .bearer_auth(key)
+                .send()
+                .await
+        }
+        BackendKind::Anthropic => {
+            client
+                .get(format!("{base}/v1/models"))
+                .header("x-api-key", key)
+                .header("anthropic-version", crate::backend_probe::ANTHROPIC_VERSION)
+                .send()
+                .await
+        }
+        BackendKind::Embedded => {
+            return KeyCheck::Unverified("embedded backends take no key".into())
+        }
+    };
+    match sent {
+        Ok(resp) => classify(resp.status()),
+        Err(e) => KeyCheck::Unverified(format!("{e:#}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Builtin roster
 // ---------------------------------------------------------------------------
@@ -1153,5 +1233,100 @@ providers:
             .await
             .unwrap();
         assert_eq!(models, vec!["normal-model"]);
+    }
+
+    // --- verify_key_for_preset (wiremock) ---
+
+    #[tokio::test]
+    async fn verify_key_ollama_wire_uses_one_token_chat_and_classifies_auth() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // ollama.com serves /api/tags to anyone and gates only generation, so
+        // the check MUST exercise /api/chat — a good key passes, a bad one 401s.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(header("authorization", "Bearer good-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": "hi"}, "done": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "Unauthorized"
+            })))
+            .mount(&server)
+            .await;
+        let p = ProviderPreset {
+            name: "ol".into(),
+            base_url: server.uri(),
+            api_mode: ApiMode::Ollama,
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        assert_eq!(
+            verify_key_for_preset(&client, &p, "good-key", "m").await,
+            KeyCheck::Accepted
+        );
+        assert_eq!(
+            verify_key_for_preset(&client, &p, "typo-key", "m").await,
+            KeyCheck::Rejected(401)
+        );
+        // The chat body is a 1-token probe against the chosen model.
+        let reqs = server.received_requests().await.expect("journal");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["model"], serde_json::json!("m"));
+        assert_eq!(body["options"]["num_predict"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn verify_key_openai_wire_uses_models_endpoint() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer sk-good"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+        let p = ProviderPreset {
+            name: "oa".into(),
+            base_url: format!("{}/v1", server.uri()),
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        assert_eq!(
+            verify_key_for_preset(&client, &p, "sk-good", "m").await,
+            KeyCheck::Accepted
+        );
+        assert_eq!(
+            verify_key_for_preset(&client, &p, "sk-bad", "m").await,
+            KeyCheck::Rejected(403)
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_key_unreachable_is_unverified_not_rejected() {
+        // A down endpoint must not block setup (and must not claim the key
+        // is bad — we simply don't know).
+        let p = ProviderPreset {
+            name: "down".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            ..Default::default()
+        };
+        match verify_key_for_preset(&reqwest::Client::new(), &p, "k", "m").await {
+            KeyCheck::Unverified(_) => {}
+            other => panic!("expected Unverified, got {other:?}"),
+        }
     }
 }

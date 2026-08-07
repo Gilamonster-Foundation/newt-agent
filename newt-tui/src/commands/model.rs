@@ -180,7 +180,14 @@ pub(crate) fn dispatch(
                         } else {
                             print_newt(&format!("Probing {model}…"), color, verbose);
                         }
-                        warmup_if_cold(endpoint, model, &keep_alive_str(&cfg), color, verbose);
+                        warmup_if_cold(
+                            endpoint,
+                            model,
+                            &keep_alive_str(&cfg),
+                            choice.api_key.as_deref(),
+                            color,
+                            verbose,
+                        );
 
                         let today = today_date();
                         // Mutate the cache entry in place so the 20.1 fields
@@ -336,6 +343,7 @@ pub(crate) fn dispatch(
                         &choice.url,
                         &choice.model,
                         &keep_alive_str(&cfg),
+                        choice.api_key.as_deref(),
                         color,
                         verbose,
                     );
