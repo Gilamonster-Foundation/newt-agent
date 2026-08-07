@@ -4,16 +4,20 @@
 //!
 //! It is a THIN wrapper over the same [`TurnDriver`] / `chat_complete` loop the
 //! interactive TUI runs — no second loop. Headless contract:
-//! `permission_gate: None` (a capability denial fails the call, never hangs) and
-//! caveats default to [`Caveats::top`] (unconfined).
+//! `permission_gate: None` (a capability denial fails the call, never hangs).
+//! P3: the default lane is now `Confined` (OCAP on, workspace-fenced); the
+//! unconfined [`Caveats::top`] lane requires the explicit `--unsafe-host-exec`.
 //!
-//! Two headless lanes, selected up front:
+//! Two headless lanes, selected up front. **P3 (`noninteractive-launch-policy`):
+//! OCAP-off is an EXPLICIT opt-in — `--non-interactive` no longer selects it.**
 //!
-//! - **`--non-interactive` (the `--yolo` lane, default):** sets
-//!   `NEWT_FULL_ACCESS=1` + `NEWT_DISABLE_OCAP=1` so the host shell runs and no
-//!   prompt can appear — the bootstrap lane that isolated the agentic variable
-//!   from the confinement variable while the bench floor was established.
-//! - **`--confined` / `NEWT_BENCH_OCAP=on` (the OCAP-on lane):** OCAP stays ON.
+//! - **`--unsafe-host-exec` / `NEWT_UNSAFE_HOST_EXEC` (the `--yolo`/full-access
+//!   lane):** sets `NEWT_FULL_ACCESS=1` + `NEWT_DISABLE_OCAP=1` so the host shell
+//!   runs and no prompt can appear — the bootstrap lane that isolated the agentic
+//!   variable from the confinement variable while the bench floor was
+//!   established. Requires the explicit flag; `--confined` still wins.
+//! - **`--confined` / `NEWT_BENCH_OCAP=on` — the OCAP-on lane AND the default:**
+//!   OCAP stays ON.
 //!   Instead of full access, [`confined_bench_caveats`] seeds a workspace-fenced
 //!   authority — reads/exec/net stay open, but writes are confined to the
 //!   workspace and the container's mutable system roots (a `Scope::Only`
@@ -56,11 +60,15 @@ pub struct SolveArgs {
     pub instruction_file: PathBuf,
     pub profile: Option<PathBuf>,
     pub non_interactive: bool,
+    /// EXPLICIT opt-in to OCAP-off ambient host execution (`--unsafe-host-exec`,
+    /// or the `NEWT_UNSAFE_HOST_EXEC` env twin). This is the ONLY route to the
+    /// full-access Yolo lane — `--non-interactive` never grants it. `--confined`
+    /// still wins (confinement is never silently dropped). P3.
+    pub unsafe_host_exec: bool,
     /// OCAP-ON confined bench lane: keep OCAP enabled and seed a workspace-fenced
-    /// caveat (see [`confined_bench_caveats`]) instead of the `--yolo` full-access
-    /// lane. Also enabled by the `NEWT_BENCH_OCAP=on` env twin (so the Harbor
-    /// adapter can flip it without a flag). Supersedes `non_interactive`'s
-    /// OCAP-off behaviour when set.
+    /// caveat (see [`confined_bench_caveats`]). Also enabled by the
+    /// `NEWT_BENCH_OCAP=on` env twin (so the Harbor adapter can flip it without a
+    /// flag). Wins over `--unsafe-host-exec`.
     pub confined: bool,
     pub events: Option<PathBuf>,
     pub max_rounds: Option<usize>,
@@ -83,32 +91,43 @@ pub struct SolveArgs {
 /// Which headless lane `newt solve` runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeadlessLane {
-    /// OCAP on, workspace-fenced tool writes (`--confined` / `NEWT_BENCH_OCAP=on`).
+    /// OCAP on, workspace-fenced tool writes — the safe default and the
+    /// `--confined` / `NEWT_BENCH_OCAP=on` parity lane.
     Confined,
-    /// OCAP off, full host access (`--non-interactive`, the default).
+    /// OCAP off, full host access — the explicit `--unsafe-host-exec` /
+    /// `NEWT_UNSAFE_HOST_EXEC` opt-in only.
     Yolo,
-    /// Neither — OCAP on with no gate; out-of-grant writes deny silently.
-    Neither,
 }
 
-/// Resolve the headless lane purely from the flags + the `NEWT_BENCH_OCAP` env
-/// twin, so precedence is unit-tested without a live run. `--confined` (or a
-/// trimmed, case-insensitive `NEWT_BENCH_OCAP=on`) wins over the `--yolo`
-/// default — the parity run flips the env from the adapter without also
-/// unsetting `--non-interactive`. The `.trim()` keeps a `"on "` from a shell or
-/// YAML value from silently missing the lane.
+/// Resolve the headless lane purely from the flags + env twins, so precedence
+/// is unit-tested without a live run.
+///
+/// P3 (`noninteractive-launch-policy`): OCAP-off host access is now an
+/// **explicit, unmistakable opt-in** — `--unsafe-host-exec` (or the
+/// `NEWT_UNSAFE_HOST_EXEC` env twin) — NEVER a side effect of `--non-interactive`.
+/// `--non-interactive` changes interaction only; it does not widen authority.
+/// The precedence is fail-closed:
+/// - `--confined` / `NEWT_BENCH_OCAP=on` → OCAP on, workspace-fenced writes (the
+///   parity lane) — wins over an unsafe request (confinement is never silently
+///   dropped);
+/// - else `--unsafe-host-exec` / `NEWT_UNSAFE_HOST_EXEC` → Yolo (OCAP off, host
+///   shell) — the sole route to unconfined execution;
+/// - else → **Confined** (the safe default): OCAP stays on and writes are fenced
+///   to the workspace. A plain `newt solve` is confined, not full-access.
 fn resolve_lane(
     confined_flag: bool,
     ocap_env: Option<&str>,
-    non_interactive: bool,
+    unsafe_host_exec: bool,
 ) -> HeadlessLane {
     let confined = confined_flag || ocap_env.is_some_and(|v| v.trim().eq_ignore_ascii_case("on"));
     if confined {
         HeadlessLane::Confined
-    } else if non_interactive {
+    } else if unsafe_host_exec {
         HeadlessLane::Yolo
     } else {
-        HeadlessLane::Neither
+        // Fail-closed default: OCAP retained, workspace-fenced. Ambient host
+        // execution requires the explicit `--unsafe-host-exec` opt-in above.
+        HeadlessLane::Confined
     }
 }
 
@@ -191,8 +210,24 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // 2. Choose the headless lane (pure resolution → unit-tested precedence),
     //    then apply its process-env setup.
     //    SAFETY: single-threaded before the driver spawns its turn thread.
+    // P3: `--non-interactive` is accepted for CLI back-compat and controls
+    // INTERACTION only. `newt solve` is always headless (there is no prompt gate
+    // to suppress), so the flag has no effect on authority — that is now solely
+    // `--confined` / `--unsafe-host-exec` (the lane), never a side effect of it.
+    let _non_interactive = args.non_interactive;
     let ocap_env = std::env::var("NEWT_BENCH_OCAP").ok();
-    let lane = resolve_lane(args.confined, ocap_env.as_deref(), args.non_interactive);
+    // P3: OCAP-off host access requires the explicit `--unsafe-host-exec` flag or
+    // its `NEWT_UNSAFE_HOST_EXEC` env twin — NEVER `--non-interactive`.
+    let unsafe_host = args.unsafe_host_exec
+        || std::env::var("NEWT_UNSAFE_HOST_EXEC")
+            .ok()
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            });
+    let lane = resolve_lane(args.confined, ocap_env.as_deref(), unsafe_host);
     match lane {
         HeadlessLane::Confined => {
             // Keep OCAP enabled. DEFENSIVELY clear any inherited
@@ -218,16 +253,6 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 std::env::set_var("NEWT_FULL_ACCESS", "1");
                 std::env::set_var("NEWT_DISABLE_OCAP", "1");
             }
-        }
-        HeadlessLane::Neither => {
-            // OCAP on with no headless prompt gate, so out-of-grant writes deny
-            // silently (the WS1 trap). Only reachable via `--non-interactive
-            // false` without `--confined`; warn rather than fail mysteriously.
-            tracing::warn!(
-                "newt solve: neither --confined nor --non-interactive is set; OCAP \
-                 is on with no prompt gate, so writes outside the default grant \
-                 will be denied silently. Pass --confined for the fenced lane."
-            );
         }
     }
 
@@ -763,21 +788,40 @@ mod tests {
     #[test]
     fn resolve_lane_precedence_and_trim() {
         use HeadlessLane::*;
-        // --confined flag wins regardless of the others.
+        // The 3rd arg is now the EXPLICIT `--unsafe-host-exec` opt-in.
+        // --confined flag wins regardless of the unsafe request.
         assert_eq!(resolve_lane(true, None, true), Confined);
         assert_eq!(resolve_lane(true, Some("off"), false), Confined);
-        // NEWT_BENCH_OCAP=on (trimmed, case-insensitive) selects the confined lane.
+        // NEWT_BENCH_OCAP=on (trimmed, case-insensitive) selects the confined
+        // lane — even over an unsafe request (confinement is never dropped).
         assert_eq!(resolve_lane(false, Some("on"), true), Confined);
         assert_eq!(resolve_lane(false, Some(" ON "), true), Confined);
         assert_eq!(resolve_lane(false, Some("On"), false), Confined);
-        // Any non-`on` env value is NOT confined — it does not silently confine,
-        // and (with --non-interactive) it is the yolo lane.
+        // The explicit unsafe opt-in is the SOLE route to Yolo.
         assert_eq!(resolve_lane(false, Some("1"), true), Yolo);
-        assert_eq!(resolve_lane(false, Some("true"), true), Yolo);
         assert_eq!(resolve_lane(false, None, true), Yolo);
-        // Neither flag nor env → the warn lane.
-        assert_eq!(resolve_lane(false, None, false), Neither);
-        assert_eq!(resolve_lane(false, Some("off"), false), Neither);
+        // A non-`on` env value alone neither confines nor goes unsafe → default
+        // Confined (OCAP on).
+        assert_eq!(resolve_lane(false, Some("1"), false), Confined);
+        assert_eq!(resolve_lane(false, Some("true"), false), Confined);
+    }
+
+    /// P3 (`noninteractive-launch-policy`) regression: `--non-interactive` must
+    /// change interaction only, never authority. Modelled at the lane-resolution
+    /// choke: with no explicit unsafe/confined signal (a plain
+    /// `newt solve --non-interactive`), the lane is Confined (OCAP ON) — NEVER
+    /// the OCAP-off Yolo lane. Only an INDEPENDENT explicit `--unsafe-host-exec`
+    /// reaches Yolo. Before P3, `resolve_lane(false, None, /*non_interactive*/ true)`
+    /// returned Yolo — the bug this closes.
+    #[test]
+    fn non_interactive_never_relaxes_authority() {
+        assert_eq!(resolve_lane(false, None, false), HeadlessLane::Confined);
+        assert_eq!(
+            resolve_lane(false, Some("off"), false),
+            HeadlessLane::Confined
+        );
+        // Independent explicit opt-in is required for host access.
+        assert_eq!(resolve_lane(false, None, true), HeadlessLane::Yolo);
     }
 
     use newt_core::caveats::CaveatsExt;

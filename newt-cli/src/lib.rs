@@ -679,13 +679,22 @@ pub enum Command {
         /// File whose contents are the task instruction.
         #[arg(long, value_name = "FILE")]
         instruction_file: PathBuf,
-        /// Run OCAP-off + full-access with no prompts (default true).
+        /// Run headless with no interactive prompts (default true). P3: this
+        /// controls INTERACTION only — it does NOT disable OCAP or grant host
+        /// access. A plain `newt solve` is confined; unconfined execution needs
+        /// the explicit `--unsafe-host-exec` below.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         non_interactive: bool,
+        /// EXPLICIT opt-in to OCAP-off ambient host execution (full access, no
+        /// prompt gate). The ONLY route to the unconfined lane — never a side
+        /// effect of `--non-interactive`. Env twin: `NEWT_UNSAFE_HOST_EXEC`.
+        /// `--confined` wins (confinement is never silently dropped).
+        #[arg(long, default_value_t = false)]
+        unsafe_host_exec: bool,
         /// OCAP-ON confined lane: keep OCAP enabled and fence writes to the
-        /// workspace + the container's mutable roots (reads/exec/net stay open)
-        /// instead of the `--yolo` full-access lane. Also enabled by
-        /// `NEWT_BENCH_OCAP=on`. This is the lane the OCAP-parity gate measures.
+        /// workspace + the container's mutable roots (reads/exec/net stay open).
+        /// Also enabled by `NEWT_BENCH_OCAP=on`. This is the lane the OCAP-parity
+        /// gate measures, and (as of P3) the safe default when no lane flag is set.
         #[arg(long, default_value_t = false)]
         confined: bool,
         /// Append a JSONL trace record here.
@@ -1474,6 +1483,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             cwd,
             instruction_file,
             non_interactive,
+            unsafe_host_exec,
             confined,
             events,
             max_rounds,
@@ -1486,6 +1496,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 // The pinned benchmark profile is the global `--config <FILE>`.
                 profile: cli.config.clone(),
                 non_interactive,
+                unsafe_host_exec,
                 confined,
                 events,
                 max_rounds,

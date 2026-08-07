@@ -75,6 +75,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `acp-worker-fs-scope` | worker fs attenuated to the session workspace (caveat fence + object-bound) | 🟢 closed | (fence active; non-Linux keeps the lexical-prefix fallback) |
 | `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
 | `config-plane-provenance` | an untrusted project `.newt/config.toml` cannot grant exec / endpoint (control-plane) authority | 🟢 closed (fail-closed) | (overlay stripped; ambient `./newt.toml` base control-plane strip = tracked follow-up) |
+| `noninteractive-launch-policy` | `--non-interactive` changes interaction only; OCAP-off host exec is an explicit opt-in | 🟠→🟡 | libraries still read `NEWT_DISABLE_OCAP`/`NEWT_FULL_ACCESS` from ambient env (typed `LaunchAuthority` follow-on) |
 
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
@@ -387,6 +388,39 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   a benign `[context]` preference survives). Neutering `strip_control_plane` re-admits them.
 - **Status:** CLOSED (fail-closed) — step-7.1 · owner: — · review-by: when a `newt config adopt`
   path or the ambient-base control-plane strip is designed.
+
+### noninteractive-launch-policy
+- **Invariant (ideal):** launch authority is resolved once, explicitly, and cannot be widened by an
+  ambient signal after the fact. `--non-interactive` changes INTERACTION only; OCAP-off ambient host
+  execution is an unmistakable explicit opt-in; authority may attenuate but never widen because an
+  environment variable later appears; child processes never inherit the authority switches.
+- **Practical caveat (now):** the sharpest vector is closed. `newt solve` previously defaulted to the
+  OCAP-**off** full-access Yolo lane purely because `--non-interactive` defaults to true
+  (`resolve_lane(false, None, /*non_interactive*/ true) == Yolo`, which set `NEWT_FULL_ACCESS=1` +
+  `NEWT_DISABLE_OCAP=1`). **step-3.1** decoupled them: the lane no longer consults `--non-interactive`
+  at all; OCAP-off requires the explicit `--unsafe-host-exec` flag (or the `NEWT_UNSAFE_HOST_EXEC` env
+  twin), `--confined` still wins, and the **default lane is now `Confined`** (OCAP on, workspace-
+  fenced). A plain `newt solve --non-interactive` is confined.
+- **Residual:** 🟠 high → 🟡 medium. The remaining architectural work: (i) libraries still READ
+  `NEWT_DISABLE_OCAP`/`NEWT_FULL_ACCESS` from the ambient process env (`ocap_disabled` /
+  `full_access_requested` in `newt-core/agentic/tools.rs`), so a later-appearing env var could still
+  widen authority mid-process — the fix is a typed, immutable `LaunchAuthority`/`ExecutionPolicy`
+  resolved once at startup and threaded by value instead of consulted from libraries; (ii) stripping
+  the authority switches from every child process is folded into `p4-constrained-executor` (the
+  cleared-env boundary). Until then the Yolo lane still *sets* those env vars for its own
+  (now-explicit) use.
+- **Disabled while open:** n/a for the closed vector; the typed-authority + child-env-strip work is
+  tracked here + under `p4-constrained-executor`.
+- **Closure criterion (the `--non-interactive` invariant):** met — `--non-interactive` cannot select
+  the OCAP-off lane; only an independent explicit `--unsafe-host-exec` can. Full closure of the row
+  needs the typed immutable `LaunchAuthority` retiring the ambient env reads.
+- **Ratchet guard:** `non_interactive_never_relaxes_authority` (`newt-cli/src/solve.rs`) — a plain
+  headless run (`resolve_lane(false, None, false)`) resolves to `Confined`, never `Yolo`; only an
+  explicit opt-in (`resolve_lane(false, None, true)`) reaches `Yolo`. Reverting the decouple (letting
+  `--non-interactive` pick Yolo) turns this red.
+- **Status:** OPEN (narrowed) — the `--non-interactive`-disables-OCAP vector CLOSED (step-3.1, with
+  the regression guard); the typed `LaunchAuthority` + ambient-env-read retirement remain · owner: —
+  · review-by: with the `LaunchAuthority` + `p4-constrained-executor` work.
 
 ### mcp-under-leash
 - **Invariant (ideal):** every individual MCP tool call is mediated at CALL time before it reaches
