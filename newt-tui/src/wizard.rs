@@ -80,11 +80,9 @@ pub(crate) fn first_run_mode() -> FirstRun {
 fn print_first_run_banner(color: bool) {
     let dim = if color { "\x1b[38;2;100;100;100m" } else { "" };
     let reset = if color { "\x1b[0m" } else { "" };
-    println!();
-    println!(
-        "{dim}newt v{} — no configuration yet; let's pick an inference endpoint.{reset}",
-        crate::VERSION
-    );
+    // Version/branding live in the crawl header run_code prints above this
+    // (brand::crawl_header) — no duplicate version line here.
+    println!("{dim}No configuration yet — let's pick an inference endpoint.{reset}");
     println!(
         "{dim}(Esc or Ctrl-C at any prompt skips setup and starts with localhost defaults){reset}"
     );

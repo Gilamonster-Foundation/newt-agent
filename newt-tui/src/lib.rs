@@ -527,6 +527,16 @@ pub fn run_code(
         // its backend probe while the logo shows; run_chat consumes the result
         // when (and only when) the resolved choice still matches.
         let prewarm = spawn_backend_prewarm();
+        // The unboxed state names the splash context ("initial setup") —
+        // computed before `setup` is consumed below.
+        let unconfigured = newt_core::Config::resolve()
+            .map(|c| c.is_unconfigured())
+            .unwrap_or(true);
+        let context = if unconfigured || setup.is_some() {
+            "initial setup"
+        } else {
+            "starting"
+        };
         // First-run setup, COVERED by the splash (#985): a spinner + status under
         // the logo while the model provisions on a background thread; input is
         // blocked except a triple abort. Then the Enter-to-continue splash —
@@ -539,7 +549,7 @@ pub fn run_code(
         } else {
             "initializing…"
         };
-        let cont = splash::show_splash(&mut stdout, &workspace, color, status)?;
+        let cont = splash::show_splash(&mut stdout, &workspace, color, status, context)?;
         // Give the terminal back before anything else prints: chat must not run
         // inside the alternate screen. Explicit rather than implicit at the end
         // of the block so the ordering stays visible to a reader.
@@ -550,8 +560,12 @@ pub fn run_code(
             }
             return Ok(());
         }
-        // First-run wizard: silent no-op when configured — otherwise its menus
-        // print here, in cooked scrollback beneath where the splash was.
+        // The branded crawl header opens the post-splash scrollback (the seam
+        // inheriting agents override — see brand::crawl_header), then the
+        // first-run wizard's menus roll underneath it when unconfigured.
+        if unconfigured {
+            print!("{}", brand::crawl_header(Some("initial setup")));
+        }
         wizard::maybe_run(color)?;
         print_inline_header(&workspace, color);
         return run_chat(&workspace, color, persona, altitude, crew_runner, prewarm);

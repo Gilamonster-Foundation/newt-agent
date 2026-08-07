@@ -249,7 +249,11 @@ async fn run_with_flow(
     config_path: &Path,
     flow: Flow,
 ) -> anyhow::Result<()> {
-    console.say(&format!("newt v{} — interactive setup", crate::VERSION));
+    // First run already printed the branded crawl header; only a standalone
+    // `newt setup` announces itself.
+    if flow == Flow::Setup {
+        console.say(&format!("newt v{} — interactive setup", crate::VERSION));
+    }
 
     if flow == Flow::Setup && config_path.exists() {
         let ans = console.ask(&format!(
@@ -262,33 +266,69 @@ async fn run_with_flow(
         }
     }
 
-    let (cfg, backend) = match choose_backend(console)? {
-        BackendChoice::LocalOllama => configure_ollama(console, client).await?,
-        BackendChoice::CustomHost => configure_custom_host(console, client, config_path).await?,
-        BackendChoice::HostedProvider => configure_hosted(console, client, config_path).await?,
-    };
+    // Multi-backend loop: each pass configures + writes ONE backend, then
+    // offers another round — so anthropic + ollama.com + a LAN box can all
+    // land in one sitting. With several written, the default is picked at
+    // the end (until then, last-written wins via each cfg.save).
+    let mut written: Vec<String> = Vec::new();
+    loop {
+        let (cfg, backend) = match choose_backend(console)? {
+            BackendChoice::LocalOllama => configure_ollama(console, client).await?,
+            BackendChoice::CustomHost => {
+                configure_custom_host(console, client, config_path).await?
+            }
+            BackendChoice::HostedProvider => configure_hosted(console, client, config_path).await?,
+        };
 
-    // Preview before committing anything to disk: the backend drop-in is the
-    // interesting file; config.toml just points at it.
-    let preview = toml::to_string_pretty(&backend)
-        .unwrap_or_else(|e| format!("# (could not render preview: {e})"));
-    console.say(&format!("\nbackends/{}.toml:\n", backend.name));
-    console.say(&preview);
+        // Preview before committing anything to disk: the backend drop-in is
+        // the interesting file; config.toml just points at it.
+        let preview = toml::to_string_pretty(&backend)
+            .unwrap_or_else(|e| format!("# (could not render preview: {e})"));
+        console.say(&format!("\nbackends/{}.toml:\n", backend.name));
+        console.say(&preview);
 
-    let ans = console.ask(&format!("Write to {}? [Y/n] ", config_path.display()))?;
-    if !is_yes(&ans, true) {
-        console.say("Aborted. Nothing written.");
-        return Ok(());
+        let ans = console.ask(&format!("Write to {}? [Y/n] ", config_path.display()))?;
+        if !is_yes(&ans, true) {
+            if written.is_empty() {
+                console.say("Aborted. Nothing written.");
+                return Ok(());
+            }
+            console.say("Skipped this one.");
+        } else {
+            let dropin = newt_core::write_backend_dropin(config_path, &backend)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            cfg.save(config_path)?;
+            console.say(&format!(
+                "Wrote {} and {}.",
+                config_path.display(),
+                dropin.display()
+            ));
+            written.push(backend.name.clone());
+        }
+
+        let more = console.ask("Add another backend? [y/N] ")?;
+        if !is_yes(&more, false) {
+            break;
+        }
     }
-    let dropin =
-        newt_core::write_backend_dropin(config_path, &backend).map_err(|e| anyhow::anyhow!(e))?;
-    cfg.save(config_path)?;
-    console.say(&format!(
-        "Wrote {} and {}.",
-        config_path.display(),
-        dropin.display()
-    ));
-    console.say("Edit that file (or re-run `newt setup`) to change anything.");
+
+    if written.len() > 1 {
+        console.say("\nWhich backend should sessions start on?");
+        let idx = select_row(console, &written, "backends")?;
+        let chosen = &written[idx];
+        // Rewrite ONLY default_backend, preserving the config's other keys
+        // and comments (the same comment-preserving editor `newt setup
+        // <target>` uses).
+        let old_text = std::fs::read_to_string(config_path).unwrap_or_default();
+        let new_text =
+            Config::with_default_backend(&old_text, chosen).map_err(|e| anyhow::anyhow!(e))?;
+        std::fs::write(config_path, new_text)?;
+        console.say(&format!(
+            "Default backend: {chosen} (/backends switches per session)."
+        ));
+    }
+
+    console.say("Edit those files (or re-run `newt setup`) to change anything.");
     offer_identity(console);
     Ok(())
 }
@@ -2648,6 +2688,65 @@ mod tests {
         let b = read_dropin(&path, "default");
         assert_eq!(b.effective_model(), Some("qwen2.5-coder:7b"));
         assert_eq!(b.endpoint, server.uri());
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn two_backends_in_one_sitting_with_default_pick() {
+        // The multi-backend loop: local ollama, then a custom host, then the
+        // default-backend pick — all in one wizard pass.
+        let s1 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "llama3.1:8b"}]
+            })))
+            .mount(&s1)
+            .await;
+        let s2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "qwen3:30b"}]
+            })))
+            .mount(&s2)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let client = reqwest::Client::new();
+        let host2_name = format!("127-0-0-1-{}", s2.address().port());
+        // ollama door → write → add another → custom host door → write →
+        // stop → pick backend 2 as the default.
+        let mut console = ScriptedConsole::new(&[
+            "1",
+            &s1.uri(),
+            "1",
+            "y",
+            "y",
+            "2",
+            &s2.uri(),
+            "1",
+            "1",
+            "y",
+            "n",
+            "2",
+        ]);
+        run_with(&mut console, &client, &cfg_path).await.unwrap();
+
+        assert!(cfg_path
+            .with_file_name("backends")
+            .join("default.toml")
+            .exists());
+        assert!(cfg_path
+            .with_file_name("backends")
+            .join(format!("{host2_name}.toml"))
+            .exists());
+        let cfg = Config::load(&cfg_path).unwrap();
+        assert_eq!(
+            cfg.default_backend.as_deref(),
+            Some(host2_name.as_str()),
+            "the end-of-loop pick wins over last-written"
+        );
     }
 
     #[serial_test::serial(real_fs)]

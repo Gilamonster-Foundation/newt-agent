@@ -180,6 +180,34 @@ pub(crate) fn logo_for_size(cols: u16, rows: u16) -> (Cow<'static, str>, u16) {
     (brand_logo(LOGO_10, "ansi-10"), LOGO_10_COLS)
 }
 
+/// The scrollback "crawl header" printed when the splash clears — the
+/// branding seam for inheriting agents (gilamonster-agent etc.): every part
+/// comes from the overridable brand env (`NEWT_BRAND_NAME`,
+/// `NEWT_BRAND_TAGLINE`), so a fork substitutes its own identity without
+/// touching this code. `context` renders as a bracketed suffix
+/// (e.g. "[initial setup]").
+pub(crate) fn crawl_header(context: Option<&str>) -> String {
+    let ctx = context.map(|c| format!("  [{c}]")).unwrap_or_default();
+    format!(
+        "\n{}  ·  {}\nv{}{}\n",
+        brand_name(),
+        brand_tagline(),
+        crate::VERSION,
+        ctx
+    )
+}
+
+/// The one-line splash top header: `{brand} agent v{VERSION} [context]`.
+/// Same brand seam as [`crawl_header`].
+pub(crate) fn splash_top_header(context: &str) -> String {
+    format!(
+        "{} agent  ·  v{}  [{}]",
+        brand_name(),
+        crate::VERSION,
+        context
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

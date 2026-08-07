@@ -105,11 +105,12 @@ pub(crate) fn show_splash(
     workspace: &str,
     color: bool,
     status: &str,
+    context: &str,
 ) -> anyhow::Result<bool> {
     if color {
-        show_splash_color(out, workspace, status)
+        show_splash_color(out, workspace, status, context)
     } else {
-        show_splash_plain(out, workspace, status)
+        show_splash_plain(out, workspace, status, context)
     }
 }
 
@@ -121,7 +122,12 @@ fn spinner_frame(tick: u32) -> &'static str {
     frames[(tick as usize) % frames.len()]
 }
 
-fn show_splash_color(out: &mut io::Stdout, _workspace: &str, status: &str) -> anyhow::Result<bool> {
+fn show_splash_color(
+    out: &mut io::Stdout,
+    _workspace: &str,
+    status: &str,
+    context: &str,
+) -> anyhow::Result<bool> {
     let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
     let (logo, logo_cols) = logo_for_size(term_cols, term_rows);
     let logo_lines: Vec<&str> = logo.lines().collect();
@@ -129,6 +135,17 @@ fn show_splash_color(out: &mut io::Stdout, _workspace: &str, status: &str) -> an
 
     // Print ANSI logo flush to top. In raw mode \n is LF only; \r\n resets column.
     write!(out, "{}", logo.replace('\n', "\r\n"))?;
+    // Top-of-screen header over the art's (blank) first row — brand-seamed so
+    // inheriting agents substitute their own (see brand::splash_top_header).
+    let header = crate::brand::splash_top_header(context);
+    let header_col = (term_cols as usize).saturating_sub(header.chars().count()) as u16 / 2;
+    queue!(
+        out,
+        MoveTo(header_col, 0),
+        SetForegroundColor(CtColor::DarkGrey),
+        Print(&header),
+        ResetColor
+    )?;
     out.flush()?;
 
     // A branded logo (e.g. gilamonster's wide half-block hero) leaves big blank
@@ -205,7 +222,12 @@ fn show_splash_color(out: &mut io::Stdout, _workspace: &str, status: &str) -> an
     splash_wait_with_spinner(out, brand_col, brand_row + 5, status)
 }
 
-fn show_splash_plain(_out: &mut io::Stdout, workspace: &str, status: &str) -> anyhow::Result<bool> {
+fn show_splash_plain(
+    _out: &mut io::Stdout,
+    workspace: &str,
+    status: &str,
+    context: &str,
+) -> anyhow::Result<bool> {
     // For the plain path ratatui takes a fresh io::stdout() handle — fine since
     // stdout is a singleton and we already hold raw mode + alt screen.
     let backend = CrosstermBackend::new(io::stdout());
@@ -218,7 +240,10 @@ fn show_splash_plain(_out: &mut io::Stdout, workspace: &str, status: &str) -> an
                 .fg(NEWT_ORANGE)
                 .add_modifier(Modifier::BOLD);
             let dim = Style::default().fg(Color::DarkGray);
-            let mut lines: Vec<Line> = vec![Line::from("")];
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                crate::brand::splash_top_header(context),
+                dim,
+            ))];
             let logo = brand_logo(LOGO_PLAIN, "ascii-40");
             for l in logo.lines() {
                 lines.push(Line::from(l.to_owned()));
