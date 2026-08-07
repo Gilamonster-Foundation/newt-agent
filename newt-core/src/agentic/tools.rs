@@ -1059,13 +1059,57 @@ async fn host_shell_output(
     host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout()).await
 }
 
-/// Build the host-shell child command, stripping the two authority-switch env
-/// vars so an inherited `NEWT_DISABLE_OCAP=1` / `NEWT_FULL_ACCESS=1` (from a
-/// wrapper/pod, or this process's own Yolo lane) cannot flow into the child and
-/// re-assert authority the session did not grant it (step-7.1a, invariant 9).
-/// The child inherits the rest of the environment by default; `env_remove`
-/// excises only these two switches. Own process group (setsid-equivalent) +
-/// `kill_on_drop` so a hung or tty-stealing child is reaped as a whole tree.
+/// newt's control-plane env vars that must NEVER flow into a host-shell child
+/// (#8 / invariant 9). Two classes, both newt-internal:
+///
+/// - **authority switches** — an inherited `NEWT_DISABLE_OCAP` /
+///   `NEWT_FULL_ACCESS` / `NEWT_UNSAFE_HOST_EXEC` / … would silently re-assert
+///   authority the session did not grant: a `newt` spawned by a Yolo child would
+///   re-derive Yolo from the env twin instead of a fresh operator decision (the
+///   authority-switch-survives-one-hop hole);
+/// - **newt's own secrets** — `NEWT_AGENT_KEY` (the capability envelope),
+///   `NEWT_OPERATOR_KEY`, and `NEWT_TOKEN_PASSPHRASE` (the encrypted-token-store
+///   unlock) would let the child forge capabilities or decrypt the token store.
+///
+/// Knowledge in data (three Cs): a new `NEWT_` control switch is added here. The
+/// child KEEPS the operator's *general* environment — the `--full-access` /
+/// `--disable-ocap` lane is the operator's explicit "run with my ambient
+/// authority" opt-out, so provider credentials etc. are their deliberate grant;
+/// only newt's OWN control plane is excised.
+const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
+    "NEWT_DISABLE_OCAP",
+    "NEWT_FULL_ACCESS",
+    "NEWT_UNSAFE_HOST_EXEC",
+    "NEWT_BENCH_OCAP",
+    "NEWT_SHELL_ENGINE",
+    "NEWT_SHELL_ENV_PASSTHROUGH",
+    "NEWT_WRITE_PATHS",
+    "NEWT_READ_PATHS",
+    "NEWT_EXEC_PATHS",
+    "NEWT_VENV",
+    "NEWT_NO_ROUTE",
+    "NEWT_AGENT_KEY",
+    "NEWT_OPERATOR_KEY",
+    "NEWT_TOKEN_PASSPHRASE",
+];
+
+/// Excise newt's whole control plane ([`CHILD_STRIPPED_AUTHORITY_ENV`]) from a
+/// host-shell child. `env_remove` marks each key removed in the child's env plan
+/// whether or not it is currently set, so no authority switch or newt secret can
+/// reach the child regardless of the ambient environment.
+fn strip_child_authority_env(c: &mut tokio::process::Command) {
+    for key in CHILD_STRIPPED_AUTHORITY_ENV {
+        c.env_remove(key);
+    }
+}
+
+/// Build the host-shell child command, stripping newt's whole control plane
+/// (authority switches + newt's own secrets, [`strip_child_authority_env`]) so
+/// none can flow into the child and re-assert authority the session did not
+/// grant it or leak newt's credentials (#8 / step-7.1a, invariant 9). The child
+/// inherits the rest of the environment (the Yolo lane's explicit ambient-
+/// authority grant). Own process group (setsid-equivalent) + `kill_on_drop` so a
+/// hung or tty-stealing child is reaped as a whole tree.
 #[cfg(not(windows))]
 fn host_shell_command(program: &str, cmd: &str, cwd: &str) -> tokio::process::Command {
     use std::process::Stdio;
@@ -1073,8 +1117,6 @@ fn host_shell_command(program: &str, cmd: &str, cwd: &str) -> tokio::process::Co
     c.arg("-c")
         .arg(cmd)
         .current_dir(cwd)
-        .env_remove("NEWT_DISABLE_OCAP")
-        .env_remove("NEWT_FULL_ACCESS")
         // A child that reads stdin gets EOF, never a blocking wait on a tty
         // the agent cannot drive.
         .stdin(Stdio::null())
@@ -1082,6 +1124,7 @@ fn host_shell_command(program: &str, cmd: &str, cwd: &str) -> tokio::process::Co
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
+    strip_child_authority_env(&mut c);
     c
 }
 
@@ -1168,19 +1211,18 @@ async fn host_shell_output_with_timeout(
 ) -> std::io::Result<HostShellRun> {
     use std::process::Stdio;
 
-    let mut child = tokio::process::Command::new("cmd")
+    // step-7.1a / #8 / invariant 9: newt's whole control plane (authority
+    // switches + newt's own secrets) must not flow into the host-shell child.
+    let mut cmd_builder = tokio::process::Command::new("cmd");
+    cmd_builder
         .args(["/C", cmd])
         .current_dir(cwd)
-        // step-7.1a / invariant 9: an inherited authority switch must not flow
-        // into the host-shell child and re-assert authority the session did not
-        // grant it.
-        .env_remove("NEWT_DISABLE_OCAP")
-        .env_remove("NEWT_FULL_ACCESS")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    strip_child_authority_env(&mut cmd_builder);
+    let mut child = cmd_builder.spawn()?;
 
     let stdout = child
         .stdout
@@ -7104,14 +7146,29 @@ mod tests {
             .filter(|(_, v)| v.is_none())
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
-        assert!(
-            removed.iter().any(|k| k == "NEWT_DISABLE_OCAP"),
-            "NEWT_DISABLE_OCAP not stripped from the child; env plan: {removed:?}"
-        );
-        assert!(
-            removed.iter().any(|k| k == "NEWT_FULL_ACCESS"),
-            "NEWT_FULL_ACCESS not stripped from the child; env plan: {removed:?}"
-        );
+        // #8: newt's WHOLE control plane is excised — every authority switch and
+        // every newt-owned secret, not just the two OCAP flags. A regression that
+        // drops any one of them re-opens the authority-survives-one-hop /
+        // secret-leak hole.
+        for key in CHILD_STRIPPED_AUTHORITY_ENV {
+            assert!(
+                removed.iter().any(|k| k == key),
+                "{key} not stripped from the host-shell child; env plan: {removed:?}"
+            );
+        }
+        // The specific credential-grade + Yolo-deriving switches, named so the
+        // intent is legible in the test, not just the loop.
+        for critical in [
+            "NEWT_UNSAFE_HOST_EXEC",
+            "NEWT_AGENT_KEY",
+            "NEWT_OPERATOR_KEY",
+            "NEWT_TOKEN_PASSPHRASE",
+        ] {
+            assert!(
+                removed.iter().any(|k| k == critical),
+                "{critical} must never reach a host-shell child"
+            );
+        }
     }
 
     /// #898: after a push whose output carries a PR-creation URL,

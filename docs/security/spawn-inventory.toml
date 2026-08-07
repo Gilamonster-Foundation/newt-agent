@@ -22,10 +22,19 @@
 #                       explicit action — not agent- or repo-controlled.
 #   trusted-infra       Operator-invoked infrastructure (dgx ssh, doctor, web) —
 #                       not reachable from a hostile repo/model turn.
+#   operator-yolo-optout The DELIBERATE unconfined host shell, reached ONLY via an
+#                       explicit `--disable-ocap` / `--full-access` operator opt-out
+#                       (`ocap_disabled()` && the exec floor permits). Confining it
+#                       would defeat the flag's purpose; instead it is env-scrubbed
+#                       of newt's whole control plane (authority switches + newt's
+#                       own secrets, `CHILD_STRIPPED_AUTHORITY_ENV`) so a nested
+#                       newt cannot silently re-assert Yolo and newt's credentials
+#                       never leak (#8). In the DEFAULT confined posture run_command
+#                       uses the confined brush engine, NOT this lane.
 #   test                Spawns confined to `#[cfg(test)]` / a `_test.rs` file.
 
 [files]
-"newt-core/src/agentic/tools.rs"          = { count = 3, class = "agent-exec-todo-p4", note = "run_command HOST-SHELL yolo lane only (explicit --disable-ocap/--full-access opt-out; env-scrubbed) — build_check_shell MIGRATED to ConstrainedExecutor in step-4.3; #8 env-strip hardening of the yolo lane is a later slice" }
+"newt-core/src/agentic/tools.rs"          = { count = 4, class = "operator-yolo-optout", note = "run_command HOST-SHELL lane, reached ONLY via an explicit --disable-ocap/--full-access opt-out (default confined posture uses the brush engine). Not a confinement-migration target; step-4.6 hardened its #8 env-strip to newt's WHOLE control plane (CHILD_STRIPPED_AUTHORITY_ENV: authority switches + NEWT_AGENT_KEY/OPERATOR_KEY/TOKEN_PASSPHRASE). build_check_shell was MIGRATED to ConstrainedExecutor in step-4.3. Count = 2 spawns (unix + windows) + the host_shell_command return type + the strip_child_authority_env(&mut Command) helper signature (a type ref the counter also matches, not a spawn)." }
 "newt-cli/src/crew.rs"                     = { count = 3, class = "git-helper", note = "normalize (formatters) + run_test (verify) MIGRATED to ConstrainedExecutor (step-4.4, run_confined_build); remaining spawns are the trusted `git` worktree helper + a `gh` issue/PR read (fixed subcommands, cannot run repo-authored code)" }
 "newt-cli/src/crew_runner.rs"              = { count = 0, class = "agent-exec-todo-p4", note = "placeholder — keep at 0 until reviewed" }
 "newt-mcp-client/src/lib.rs"               = { count = 2, class = "confined", note = "MCP stdio via ConfinedCommand::spawn_tokio (already inside the boundary)" }
