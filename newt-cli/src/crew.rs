@@ -66,6 +66,72 @@ fn is_safe_worktree_path(path: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
+/// Run a repo-configured build / test / format command **confined** inside the
+/// crew worktree (P4 / `p4-constrained-executor`). The command string comes from
+/// the repo's tooling config (`resolved_phase_commands`) or the operator's
+/// `--verify`, so it is attacker-influenced; it no longer runs as a raw `sh -c`.
+///
+/// Through [`ConstrainedExecutor`] the child starts env-EMPTY — only
+/// `PATH`/`HOME`/`TMPDIR`/`CARGO_TARGET_DIR` are granted, no credentials or
+/// authority switches (#8) — its writes are fenced to the worktree plus the crew
+/// build infrastructure (the shared `CARGO_TARGET_DIR` and the operator's Cargo
+/// cache; crew is an operator-run build context), its reads are the calibrated
+/// toolchain/cache set (not `~/.ssh` etc.), its **network is denied** so nothing
+/// exfiltrates (#9), and it **fails closed** off the kernel fence (#10). Returns
+/// `(success, combined stdout+stderr)` or an `Err` describing the refusal.
+fn run_confined_build(worktree: &Path, base: &Path, cmd: &str) -> Result<(bool, String), String> {
+    use newt_core::confined_exec::{
+        build_tool_caveats_with_writes, ConstrainedExecutor, ExecOrigin, ExecRequest,
+    };
+    let target = crew_shared_target_dir(base);
+    let target_str = target.to_string_lossy().into_owned();
+    // Grant the shared crew target + the operator's Cargo cache as write roots so
+    // incremental builds and the `~/.cargo/.package-cache` lock work. Both are
+    // operator/build infrastructure, never repository-controlled paths.
+    let mut extra_writes = vec![target_str.clone()];
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+    {
+        extra_writes.push(cargo_home.to_string_lossy().into_owned());
+    }
+    let caveats = build_tool_caveats_with_writes(worktree, &extra_writes);
+
+    #[cfg(unix)]
+    let (program, args): (&str, [String; 2]) = ("sh", ["-c".into(), cmd.into()]);
+    #[cfg(windows)]
+    let (program, args): (&str, [String; 2]) = ("cmd", ["/C".into(), cmd.into()]);
+
+    let mut req = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        program,
+        args,
+        worktree,
+        caveats,
+    )
+    .env("CARGO_TARGET_DIR", &target_str)
+    .env("TMPDIR", worktree.to_string_lossy());
+    // Real HOME so cargo/tools find ~/.cargo (read via the calibrated set,
+    // written via the grant above); nothing else credential-bearing is granted.
+    if let Some(home) = std::env::var_os("HOME") {
+        req = req.env("HOME", home.to_string_lossy());
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        req = req.env("PATH", path);
+    }
+    match ConstrainedExecutor::run(&req) {
+        Ok(out) => Ok((
+            out.success,
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Run `git <args>` in `dir`, returning trimmed stdout on success.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git").args(args).current_dir(dir).output()?;
@@ -174,30 +240,16 @@ impl WorktreeWorkspace {
     /// Best-effort: a missing/failing formatter warns and the commit still lands.
     fn normalize(&self) {
         // A polyglot repo can match several tooling packs → run every formatter.
+        // Each is repo-configured, so it runs CONFINED (P4, see `run_confined_build`).
         for cmd in crew_normalize_commands(&self.worktree) {
-            #[cfg(unix)]
-            let mut c = {
-                let mut c = Command::new("sh");
-                c.arg("-c").arg(&cmd);
-                c
-            };
-            #[cfg(windows)]
-            let mut c = {
-                let mut c = Command::new("cmd");
-                c.arg("/C").arg(&cmd);
-                c
-            };
-            c.env("CARGO_TARGET_DIR", crew_shared_target_dir(&self.base));
-            match c.current_dir(&self.worktree).output() {
-                Ok(o) if !o.status.success() => {
-                    eprintln!("  crew normalize (`{cmd}`) failed — committing unformatted; the gate may flag it");
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  crew normalize (`{cmd}`) could not run ({e}) — committing unformatted"
-                    );
-                }
-                _ => {}
+            match run_confined_build(&self.worktree, &self.base, &cmd) {
+                Ok((true, _)) => {}
+                Ok((false, _)) => eprintln!(
+                    "  crew normalize (`{cmd}`) failed — committing unformatted; the gate may flag it"
+                ),
+                Err(e) => eprintln!(
+                    "  crew normalize (`{cmd}`) could not run ({e}) — committing unformatted"
+                ),
             }
         }
     }
@@ -311,35 +363,14 @@ impl Workspace for WorktreeWorkspace {
     }
 
     fn run_test(&self) -> (bool, String) {
-        // Shell out via the platform shell so a command string like `just check`
-        // or `cargo test` runs as written.
-        #[cfg(unix)]
-        let mut cmd = {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(&self.test_cmd);
-            c
-        };
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(&self.test_cmd);
-            c
-        };
-        // #697: point the leaf's cargo verify at a per-RUN shared target under the
-        // crew root, so the SEQUENTIAL ephemeral leaves build incrementally instead
-        // of each cold (the #548 retests' per-leaf cold builds). Harmless for a
-        // non-cargo verify (it ignores CARGO_TARGET_DIR). This is NOT the dev
-        // worktrees — WORKSPACE_RULES keeps those on their own per-worktree target.
-        cmd.env("CARGO_TARGET_DIR", crew_shared_target_dir(&self.base));
-        match cmd.current_dir(&self.worktree).output() {
-            Ok(o) => {
-                let out = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                );
-                (o.status.success(), out)
-            }
+        // The verify command (`just check` / `cargo test` / operator `--verify`)
+        // runs the repo's own code in a worktree that may hold hostile content, so
+        // it runs CONFINED (P4, see `run_confined_build`): env-empty, fs fenced to
+        // the worktree + crew build dirs, network denied, fail-closed off the
+        // kernel fence. `CARGO_TARGET_DIR` is a per-RUN shared target under the
+        // crew root so the sequential leaves build incrementally (#697).
+        match run_confined_build(&self.worktree, &self.base, &self.test_cmd) {
+            Ok((ok, out)) => (ok, out),
             Err(e) => (false, format!("failed to run `{}`: {e}", self.test_cmd)),
         }
     }
@@ -2395,12 +2426,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_test_passes_and_reports_failure() {
+        // run_test now runs CONFINED (P4). Where the kernel fence is available the
+        // verify runs under it; where it is not, it fails closed (never runs the
+        // repo-controlled command unconfined).
+        let confinable = newt_core::confined_exec::kernel_fs_fence_available();
         let repo = git_repo();
         let ok = WorktreeWorkspace::create(repo.path(), "t2a", "HEAD", "test -f hello.txt".into())
             .unwrap();
-        assert!(ok.run_test().0, "committed file present → pass");
         let bad = WorktreeWorkspace::create(repo.path(), "t2b", "HEAD", "exit 3".into()).unwrap();
-        assert!(!bad.run_test().0, "non-zero exit → fail");
+        if confinable {
+            assert!(ok.run_test().0, "committed file present → pass (confined)");
+            assert!(!bad.run_test().0, "non-zero exit → fail");
+        } else {
+            assert!(
+                !ok.run_test().0,
+                "without a kernel fence the confined verify fails closed"
+            );
+        }
     }
 
     #[test]

@@ -214,6 +214,23 @@ fn mint_context(origin: ExecOrigin, caveats: &Caveats) -> Result<ToolContext, Ex
         .map_err(|e| ExecRefused::Authorize(e.to_string()))
 }
 
+/// Whether this platform can actually **kernel-enforce** the workspace fs fence
+/// an [`ExecOrigin::AgentInfluenced`] spawn requires. When `false`, such a spawn
+/// FAILS CLOSED ([`ExecRefused::ConfinementUnenforceable`]) rather than running
+/// unconfined — the honest signal a caller (or a test) uses to know whether the
+/// executor will confine or refuse on this host.
+#[must_use]
+pub fn kernel_fs_fence_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        agent_bridle::landlock_is_supported()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// The single confined-subprocess executor. Every attacker-influenced spawn in
 /// newt routes through [`run`](Self::run); there is no other confined-spawn
 /// implementation to keep in sync.
@@ -295,24 +312,69 @@ pub fn workspace_confined_caveats(workspace: &Path) -> Caveats {
 /// A `Caveats` fence for a repo-configured **build / test / format tool** run on
 /// the model's edits (`build_check_cmd`, crew formatters, roadmap `verify`).
 ///
-/// It is exactly [`workspace_confined_caveats`] with ONE relaxation: `fs_read` is
-/// open. Build tools legitimately read widely (toolchains, a shared package
-/// cache, system libraries), and reads are not an exfiltration path once the
-/// network is closed. The *dangerous* half stays fully fenced — `fs_write` is
-/// the workspace only (no writing the shared package cache to poison it, no
-/// writing `/tmp` that another session shares) and `net` is an empty deny-all.
-/// Scratch belongs inside the fence: callers point `TMPDIR` at the workspace.
+/// It widens [`workspace_confined_caveats`]'s reads to the **toolchain + package
+/// cache** a real build tool needs (so `cargo`/`rustc` resolve and cached deps
+/// are found) but NOT `$HOME` broadly — `~/.ssh`, `~/.aws`, `/etc/shadow`, and
+/// arbitrary secrets stay unreadable. That closes a read-then-disclose path: a
+/// hostile `build_check_cmd = "cat ~/.ssh/id_rsa"` would otherwise surface the
+/// key in the tool output the model sees, and the net fence alone (which stops
+/// the *child* exfiltrating) does not close the child→output→model channel.
 ///
-/// A child a hostile build spawns inherits the same Landlock fence (kernel
-/// inheritance across `execve`), so it is confined too.
+/// The dangerous halves stay fully fenced — `fs_write` is the workspace only (no
+/// poisoning the shared cache, no shared `/tmp`), `net` is an empty deny-all, and
+/// scratch belongs in the fence (callers point `TMPDIR` at the workspace). A
+/// child a hostile build spawns inherits the same Landlock fence.
 #[must_use]
 pub fn build_tool_caveats(workspace: &Path) -> Caveats {
+    build_tool_caveats_with_writes(workspace, &[])
+}
+
+/// [`build_tool_caveats`] plus additional writable roots — for a build tool that
+/// legitimately writes OUTSIDE the workspace to an operator-configured location,
+/// e.g. crew's shared `CARGO_TARGET_DIR` (one incremental target across the
+/// sequential worktrees). Each extra root is an explicit, reviewed grant; `net`
+/// stays denied and the read set stays the calibrated toolchain/cache set. Only
+/// add roots the OPERATOR configured, not anything the repository controls.
+#[must_use]
+pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[String]) -> Caveats {
+    let mut write_roots = vec![workspace.to_string_lossy().into_owned()];
+    write_roots.extend(extra_write_roots.iter().cloned());
     Caveats {
-        // Open reads: build tools read toolchains + a shared package cache;
-        // safe once `net` is closed (no channel to exfiltrate what is read).
-        fs_read: Scope::All,
-        ..workspace_confined_caveats(workspace)
+        // Calibrated reads: workspace + the toolchain/package-cache roots build
+        // tools need — NOT all of `$HOME` (so ~/.ssh etc. stay unreadable). The
+        // system dirs (/usr, /lib, loaders) are covered by the sandbox backend's
+        // base read paths; here we add the workspace and the per-user caches.
+        fs_read: Scope::only(build_tool_read_roots(workspace)),
+        fs_write: Scope::only(write_roots),
+        exec: Scope::All,
+        net: Scope::none(),
+        max_calls: crate::caveats::CountBound::Unlimited,
+        valid_for_generation: Scope::All,
     }
+}
+
+/// The read roots a build tool needs beyond the sandbox backend's base system
+/// paths: the workspace and the per-user toolchain / package caches (Cargo,
+/// rustup, and the XDG cache) — resolved from the operator's environment, never
+/// `$HOME` as a whole. Deliberately excludes credential dirs (`~/.ssh`, `~/.aws`,
+/// `~/.gnupg`): a build tool has no reason to read those, and granting them would
+/// reopen the read-then-disclose path.
+fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
+    let mut roots = vec![workspace.to_string_lossy().into_owned()];
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    // (env var that overrides the default, default subdir under HOME)
+    for (var, default) in [
+        ("CARGO_HOME", ".cargo"),
+        ("RUSTUP_HOME", ".rustup"),
+        ("XDG_CACHE_HOME", ".cache"),
+    ] {
+        if let Some(explicit) = std::env::var_os(var) {
+            roots.push(explicit.to_string_lossy().into_owned());
+        } else if let Some(home) = &home {
+            roots.push(home.join(default).to_string_lossy().into_owned());
+        }
+    }
+    roots
 }
 
 #[cfg(test)]
@@ -354,12 +416,24 @@ mod tests {
     }
 
     #[test]
-    fn build_tool_caveats_deny_write_escape_and_net_but_allow_reads() {
-        // A build/test tool reads widely (open reads) but must not write outside
-        // the workspace/temp fence, and must not reach the network.
+    fn build_tool_caveats_calibrated_reads_fenced_writes_no_net() {
+        // A build/test tool reads the workspace + toolchain caches, but NOT
+        // arbitrary secrets; it must not write outside the workspace fence, and
+        // must not reach the network.
         use crate::caveats::ScopeExt;
         let cav = build_tool_caveats(Path::new("/ws"));
-        assert!(matches!(cav.fs_read, Scope::All), "build tools read widely");
+        // Reads: the workspace is granted; an arbitrary credential path is not.
+        assert!(cav.fs_read.permits(&"/ws".to_string()));
+        assert!(
+            !cav.fs_read
+                .permits(&"/home/someone-else/.ssh/id_rsa".to_string()),
+            "a build tool must not be able to READ arbitrary secrets (disclosure via output)"
+        );
+        assert!(
+            matches!(cav.fs_read, Scope::Only(_)),
+            "reads are a calibrated set, never open"
+        );
+        // Writes: workspace only.
         assert!(cav.fs_write.permits(&"/ws".to_string()));
         assert!(
             !cav.fs_write.permits(&"/home/user/.cargo".to_string()),
@@ -374,6 +448,18 @@ mod tests {
             !cav.net.permits(&"evil.example".to_string()),
             "no network — the exfil channel is closed"
         );
+    }
+
+    #[test]
+    fn build_tool_caveats_with_writes_grants_only_the_named_extra_root() {
+        use crate::caveats::ScopeExt;
+        let cav = build_tool_caveats_with_writes(Path::new("/ws"), &["/crew/target".to_string()]);
+        assert!(cav.fs_write.permits(&"/ws".to_string()));
+        assert!(
+            cav.fs_write.permits(&"/crew/target".to_string()),
+            "the explicitly-granted extra write root is permitted"
+        );
+        assert!(!cav.fs_write.permits(&"/crew/other".to_string()));
     }
 
     #[test]

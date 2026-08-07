@@ -26,7 +26,7 @@
 
 [files]
 "newt-core/src/agentic/tools.rs"          = { count = 3, class = "agent-exec-todo-p4", note = "run_command HOST-SHELL yolo lane only (explicit --disable-ocap/--full-access opt-out; env-scrubbed) — build_check_shell MIGRATED to ConstrainedExecutor in step-4.3; #8 env-strip hardening of the yolo lane is a later slice" }
-"newt-cli/src/crew.rs"                     = { count = 7, class = "agent-exec-todo-p4", note = "crew spawns agent subprocesses" }
+"newt-cli/src/crew.rs"                     = { count = 3, class = "git-helper", note = "normalize (formatters) + run_test (verify) MIGRATED to ConstrainedExecutor (step-4.4, run_confined_build); remaining spawns are the trusted `git` worktree helper + a `gh` issue/PR read (fixed subcommands, cannot run repo-authored code)" }
 "newt-cli/src/crew_runner.rs"              = { count = 0, class = "agent-exec-todo-p4", note = "placeholder — keep at 0 until reviewed" }
 "newt-mcp-client/src/lib.rs"               = { count = 2, class = "confined", note = "MCP stdio via ConfinedCommand::spawn_tokio (already inside the boundary)" }
 "newt-core/src/confined_exec.rs"           = { count = 1, class = "confined", note = "THE ConstrainedExecutor itself — ConfinedCommand::spawn with a Kernel strength floor (fail-closed); the seam the agent-exec-todo-p4 sites migrate onto" }
