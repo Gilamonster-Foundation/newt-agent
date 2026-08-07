@@ -522,9 +522,14 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   and the executor **SIGKILLs the child's whole process group** (`killpg`, pgid == the
   `new_process_group` leader) at the deadline AND sweeps the group after completion — a hostile child
   can neither hang the harness nor leave a background same-group descendant running
-  (`confined_exec_lifetime.rs`, real-resource). One bounded residual remains: a descendant that
-  **double-forks / `setsid`** escapes the process group and is contained only by `b1`'s PID namespace
-  (open); killpg covers the common same-group case. Does NOT block v0.8.0.
+  (`confined_exec_lifetime.rs`, real-resource). The **setsid / double-fork escape is now closed too**
+  (step-8.10): a guarded (opt-in `NetGrant::DenyAll`) child and its whole subtree
+  are placed in a delegated **cgroup-v2** subtree (`newt-net-guard` joins it before exec; membership is
+  inherited and survives `setsid`), and the executor terminates the tree with **`cgroup.kill`** on
+  timeout AND completion — so a descendant that escapes the process group is still killed
+  (`net_guard_descendant_lifetime.rs`, real-resource: a setsid session that killpg cannot reach never
+  fires). Best-effort/fail-open to `killpg` only where cgroup-v2 delegation is unavailable (that host's
+  full-tree containment stays a `b1` residual). Does NOT block v0.8.0.
 - **Disabled while open:** (closed for the routing/confinement bound) — the process-tree-cancel
   residual is bounded by `b1`'s OS sandbox as the backstop.
 - **Closure criterion:** met for the migration + confinement bound — `spawn-inventory` shows ZERO
