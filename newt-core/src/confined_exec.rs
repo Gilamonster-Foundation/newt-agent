@@ -43,7 +43,9 @@
 //! fixed-argv internal helpers that are *not* attacker-influenced; it is here
 //! for signature completeness and is not used by the agent-exec paths.)
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use agent_bridle::{AxisEnforcement, ConfinedCommand, Gate, Tool, ToolContext, ToolError};
 
@@ -89,6 +91,11 @@ pub struct ExecRequest {
     cwd: PathBuf,
     caveats: Caveats,
     env: Vec<(String, String)>,
+    /// A wall-clock bound on the child. `None` = unbounded (the historical
+    /// behavior, kept for long legitimate builds). When set, the executor
+    /// SIGKILLs the child's whole process group at the deadline so a hostile
+    /// child cannot hang the harness indefinitely.
+    timeout: Option<Duration>,
 }
 
 impl ExecRequest {
@@ -109,7 +116,18 @@ impl ExecRequest {
             cwd: cwd.into(),
             caveats,
             env: Vec::new(),
+            timeout: None,
         }
+    }
+
+    /// Bound the child to `duration` of wall-clock time. At the deadline the
+    /// executor SIGKILLs the child's entire process group and returns with
+    /// [`ConfinedOutput::timed_out`] set — a hostile child that hangs (or spins)
+    /// cannot stall the harness. Unset by default (unbounded, for long builds).
+    #[must_use]
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout = Some(duration);
+        self
     }
 
     /// Grant one environment variable to the child. Absent any grant the child
@@ -180,6 +198,9 @@ pub struct ConfinedOutput {
     pub stderr: Vec<u8>,
     /// The OS sandbox actually applied to the child.
     pub sandbox_kind: agent_bridle::SandboxKind,
+    /// True iff the child hit its [`ExecRequest::timeout`] and was killed. A
+    /// timed-out run is never reported as `success`.
+    pub timed_out: bool,
 }
 
 /// A throwaway [`Tool`] used only to mint the spawn [`ToolContext`] through the
@@ -264,7 +285,7 @@ impl ConstrainedExecutor {
             cmd = cmd.env(k, v);
         }
 
-        let child = cmd.spawn(&cx).map_err(|e| match e {
+        let mut child = cmd.spawn(&cx).map_err(|e| match e {
             // A `Denied` from spawn is the fail-closed refusal: the fence could
             // not be kernel-enforced (confinement_unenforceable) — do NOT fall
             // back to an unconfined run.
@@ -273,18 +294,81 @@ impl ConstrainedExecutor {
         })?;
 
         let sandbox_kind = child.sandbox_kind;
-        // `wait_with_output` drains stdout/stderr concurrently (its own threads)
-        // so a child that fills a pipe buffer cannot deadlock the wait.
-        let out = child.child.wait_with_output().map_err(ExecRefused::Spawn)?;
+        // The child leads its own process group (`new_process_group`, pgid ==
+        // pid), so one `killpg` reaps the child AND any descendants it left in
+        // the group — the child-lifetime containment the raw `Command`s lacked.
+        let pgid = child.child.id();
+
+        // Drain stdout/stderr on their own threads so a child that fills a pipe
+        // buffer cannot deadlock the wait (matches `wait_with_output`).
+        let out_pipe = child.child.stdout.take();
+        let err_pipe = child.child.stderr.take();
+        let out_thread = std::thread::spawn(move || drain_pipe(out_pipe));
+        let err_thread = std::thread::spawn(move || drain_pipe(err_pipe));
+
+        // Bounded wait: poll for exit until the optional deadline. At the
+        // deadline (leader still alive → pgid valid, no pid-reuse race) SIGKILL
+        // the whole group so a hostile child cannot hang the harness.
+        let deadline = req.timeout.map(|t| Instant::now() + t);
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(s) = child.child.try_wait().map_err(ExecRefused::Spawn)? {
+                break s;
+            }
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    kill_process_group(pgid);
+                    timed_out = true;
+                    break child.child.wait().map_err(ExecRefused::Spawn)?;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        // Sweep any descendant the child left running in its group (a background
+        // `cmd &` that stayed in-group). A double-fork/`setsid` daemon escapes
+        // the group and is bounded by b1's PID namespace (open residual);
+        // killpg contains the common same-group case.
+        kill_process_group(pgid);
+
+        let stdout = out_thread.join().unwrap_or_default();
+        let stderr = err_thread.join().unwrap_or_default();
 
         Ok(ConfinedOutput {
-            success: out.status.success(),
-            code: out.status.code(),
-            stdout: out.stdout,
-            stderr: out.stderr,
+            // A killed/timed-out run is never a success even if the reaped status
+            // is a signal-death the OS reports oddly.
+            success: status.success() && !timed_out,
+            code: status.code(),
+            stdout,
+            stderr,
             sandbox_kind,
+            timed_out,
         })
     }
+}
+
+/// Read a captured pipe to EOF (best-effort). Runs on its own thread so the
+/// wait loop cannot deadlock behind a full pipe buffer.
+fn drain_pipe(pipe: Option<impl Read>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(mut p) = pipe {
+        let _ = p.read_to_end(&mut buf);
+    }
+    buf
+}
+
+/// SIGKILL an entire process group (`pgid`). Best-effort: `ESRCH` (the group is
+/// already gone) is fine. On non-unix this is a no-op — the confined executor is
+/// the Linux-normative path; other platforms fail closed before reaching here.
+fn kill_process_group(pgid: u32) {
+    #[cfg(unix)]
+    // SAFETY: `killpg` with a valid pgid and SIGKILL has no memory effects; a
+    // stale pgid returns ESRCH which we ignore.
+    unsafe {
+        let _ = libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
 }
 
 /// A `Caveats` fence for an attacker-influenced subprocess confined to
@@ -413,6 +497,23 @@ mod tests {
                 ("LANG".to_string(), "C".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn timeout_builder_sets_the_bound_default_is_unbounded() {
+        // #1598: the bound is opt-in (unbounded by default so long legitimate
+        // builds are not killed), and `.timeout()` records it — the field the
+        // real-resource `confined_exec_lifetime` tests exercise for real.
+        let base = ExecRequest::new(
+            ExecOrigin::AgentInfluenced,
+            "sh",
+            ["-c", "true"],
+            "/ws",
+            workspace_confined_caveats(Path::new("/ws")),
+        );
+        assert_eq!(base.timeout, None);
+        let bounded = base.timeout(Duration::from_secs(5));
+        assert_eq!(bounded.timeout, Some(Duration::from_secs(5)));
     }
 
     #[test]
