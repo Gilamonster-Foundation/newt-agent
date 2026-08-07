@@ -113,8 +113,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `admit_untrusted_remote`) are fail-closed OFF while it is open; **basic egress is now fully denied**
   (TCP+UDP+DNS+raw via seccomp — #1599's socket-level goal met on Linux; the netns/egress-proxy form
   remains for the credential-bearing floor). Bounded confinement-hardening follow-ons, each tracked and
-  NONE blocking v0.8.0: **#1599** (mediated egress proxy / netns for the credential floor), **#1600**
-  (SafeSubset degraded-lane `env_clear`). **#1601 (inherited-fd hygiene) is CLOSED** (step-8.8):
+  NONE blocking v0.8.0: **#1599** (mediated egress proxy / netns for the credential floor). **#1600
+  (SafeSubset/confined-shell env inheritance) is CLOSED** (step-8.9): the confined shell env
+  (`venv_env_map`) is an allowlist — `ConfinedCommand::env_clear` + a narrow name passthrough
+  (default `HOME`/`USER`) + explicit `~/.newt/shell-env/` file imports — never an ambient copy; a
+  regression test proves a parent-only secret (non-allowlisted name) never reaches the confined child.
+  **#1601 (inherited-fd hygiene) is CLOSED** (step-8.8):
   `newt-net-guard` calls `close_inherited_fds()` (`close_range(3, ~0)`) before exec, so every
   attacker-influenced child has all fds ≥ 3 closed — an inherited fd (a capability that bypasses
   pathname confinement) cannot cross the fence (`net_guard_fd_hygiene.rs`: a control proves the fd is
