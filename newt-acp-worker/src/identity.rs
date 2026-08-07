@@ -34,7 +34,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use newt_core::caveats::{Caveats, CountBound, Scope};
+use newt_core::caveats::{lock_fs_to_workspace, Caveats, CountBound, Scope};
 use newt_identity::{
     attenuate, enforced_caveats, load_or_generate, session_root, unbounded_debug_fallback, AgentKey,
 };
@@ -180,15 +180,22 @@ impl WorkerIdentity {
     pub fn caveats_for_dispatch(
         &self,
         backend_host: Option<&str>,
+        workspace: Option<&str>,
     ) -> Result<Caveats, IdentityError> {
         match self {
             Self::Operator { root } => {
-                // NOTE: the CWD fs-lock (newt_core::caveats::apply_cli_fs_grants,
-                // applied for `newt code` and `newt crew`) is NOT applied here yet
-                // — the ACP worker's workspace is per-session (the ACP `cwd`
-                // param), not the process CWD, so the lock must be threaded from
-                // the session, not read from `current_dir()`. Follow-up.
-                let policy = worker_session_caveats(backend_host);
+                // step-4.2 (`acp-worker-fs-scope`): fence the worker's fs to the
+                // per-session ACP workspace (the `cwd` the session was opened on),
+                // replacing the open `Scope::All` policy default — threaded from the
+                // session, NOT read from `current_dir()`. The object-bound fs
+                // resolver (#522) then makes even the fenced roots symlink-safe, so
+                // `fs_read`/`fs_write = Only([workspace])` is now a real containment,
+                // not a lexical one. A `None` workspace keeps the open policy (the
+                // caller is responsible for supplying the session cwd).
+                let mut policy = worker_session_caveats(backend_host);
+                if let Some(ws) = workspace {
+                    lock_fs_to_workspace(&mut policy, ws, &[], &[]);
+                }
                 let op = attenuate(root, &policy)?;
                 let verified = enforced_caveats(&op)?;
                 Ok(verified)
@@ -304,7 +311,8 @@ mod tests {
         let path = dir.path().join("identity.pem");
         let id = WorkerIdentity::from_operator_key(&path).unwrap();
 
-        let c = id.caveats_for_dispatch(Some("127.0.0.1")).unwrap();
+        // `None` workspace keeps the open policy — the equality below still holds.
+        let c = id.caveats_for_dispatch(Some("127.0.0.1"), None).unwrap();
         // The returned caveats came from verifying the cert chain, so
         // they must equal the policy we attenuated with.
         assert_eq!(c, worker_session_caveats(Some("127.0.0.1")));
@@ -317,15 +325,49 @@ mod tests {
         let dir = fresh_dir();
         let path = dir.path().join("identity.pem");
         let id = WorkerIdentity::from_operator_key(&path).unwrap();
-        let c = id.caveats_for_dispatch(None).unwrap();
+        let c = id.caveats_for_dispatch(None, None).unwrap();
         assert_eq!(c, worker_session_caveats(None));
+    }
+
+    #[test]
+    fn caveats_for_dispatch_fences_fs_to_the_session_workspace() {
+        // step-4.2 (`acp-worker-fs-scope`): with a session workspace, the worker's
+        // fs is scoped to that workspace (`Only`), not the open `Scope::All`
+        // default — so a dispatch cannot read/write outside the ACP `cwd`. (The
+        // object-bound resolver, #522, then makes even this fence symlink-safe.)
+        let dir = fresh_dir();
+        let path = dir.path().join("identity.pem");
+        let id = WorkerIdentity::from_operator_key(&path).unwrap();
+
+        let fenced = id
+            .caveats_for_dispatch(Some("127.0.0.1"), Some("/ws"))
+            .unwrap();
+        // The workspace root is in the fence; outside it is denied (NOT Scope::All).
+        assert!(fenced.permits_fs_read("/ws"), "workspace root readable");
+        assert!(fenced.permits_fs_write("/ws"), "workspace root writable");
+        assert!(
+            !fenced.permits_fs_read("/etc/passwd"),
+            "reads outside the workspace are denied — no longer Scope::All"
+        );
+        assert!(
+            !fenced.permits_fs_write("/etc/cron.d/newt"),
+            "writes outside the workspace are denied — no longer Scope::All"
+        );
+
+        // Control: the un-fenced (None-workspace) policy still permits anything —
+        // proving the workspace fence is what closed the escape.
+        let open = id.caveats_for_dispatch(Some("127.0.0.1"), None).unwrap();
+        assert!(
+            open.permits_fs_write("/etc/cron.d/newt"),
+            "the open policy permits anything (control for the fence)"
+        );
     }
 
     #[test]
     fn allow_no_key_returns_top() {
         let id = WorkerIdentity::AllowNoKey;
         assert!(!id.is_operator());
-        let c = id.caveats_for_dispatch(Some("127.0.0.1")).unwrap();
+        let c = id.caveats_for_dispatch(Some("127.0.0.1"), None).unwrap();
         assert_eq!(c, Caveats::top());
     }
 

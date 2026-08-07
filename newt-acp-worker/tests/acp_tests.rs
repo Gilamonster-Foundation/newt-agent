@@ -771,7 +771,7 @@ async fn coder_dispatch_with_operator_identity_carries_non_top_caveats() {
 
     // And the verified caveats are strictly narrower than `top()` —
     // pin the property at the dispatch layer.
-    let resolved = identity.caveats_for_dispatch(None).unwrap();
+    let resolved = identity.caveats_for_dispatch(None, None).unwrap();
     assert_ne!(
         resolved,
         newt_core::Caveats::top(),
@@ -826,7 +826,7 @@ async fn worker_identity_allow_no_key_falls_back_to_top() {
     let identity = WorkerIdentity::AllowNoKey;
     assert!(!identity.is_operator());
     assert_eq!(
-        identity.caveats_for_dispatch(None).unwrap(),
+        identity.caveats_for_dispatch(None, None).unwrap(),
         newt_core::Caveats::top(),
         "AllowNoKey must preserve pre-#94 top() behavior"
     );
