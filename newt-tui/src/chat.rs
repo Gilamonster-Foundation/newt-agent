@@ -4787,6 +4787,11 @@ pub(crate) fn run_chat(
                             &turn_auto_mode_control
                                 as &dyn newt_core::agentic::OperatingModeControl,
                         );
+                    // Session disclosure filter: register the live provider secret
+                    // so a tool result or summary echoing it is value-redacted
+                    // before it reaches the model. Outlives the ChatCtx below.
+                    let session_disclosure =
+                        newt_core::ocap::session_disclosure_filter(inf_key.as_deref());
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -4814,7 +4819,7 @@ pub(crate) fn run_chat(
                                         spill_store: Some(
                                             &spill_store as &dyn newt_core::SpillStore,
                                         ),
-                                        disclosure: None,
+                                        disclosure: Some(&session_disclosure),
                                         compaction_store: Some(
                                             &compaction_store as &dyn newt_core::SpillStore,
                                         ),

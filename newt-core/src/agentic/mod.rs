@@ -3385,6 +3385,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         text,
         claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
     );
+    // Disclosure gate on the final answer: the model may have echoed a secret it
+    // read earlier, so value-filter the summary before it leaves the loop — the
+    // same by-value gate the tool-result chokepoint applies.
+    let text = redact_model_facing(disclosure, text);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -4005,6 +4009,18 @@ fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
 
 fn is_workspace_write_call(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file")
+}
+
+/// Redact a model-/user-facing string through the session disclosure filter,
+/// if one is registered. Used for the final-summary path — the model's own
+/// answer may echo a secret it read earlier, so it is value-filtered before it
+/// leaves the loop, the same by-value gate the tool-result chokepoint applies.
+/// `None` (no session filter) is bit-for-bit identity.
+fn redact_model_facing(disclosure: Option<&crate::ocap::DisclosureFilter>, text: String) -> String {
+    match disclosure {
+        Some(filter) => filter.redact(&text),
+        None => text,
+    }
 }
 
 fn maybe_offload_tool_result(
@@ -6563,6 +6579,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         text,
         claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
     );
+    // Disclosure gate on the final answer: the model may have echoed a secret it
+    // read earlier, so value-filter the summary before it leaves the loop — the
+    // same by-value gate the tool-result chokepoint applies.
+    let text = redact_model_facing(disclosure, text);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -8395,6 +8415,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         text,
         claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
     );
+    // Disclosure gate on the final answer: the model may have echoed a secret it
+    // read earlier, so value-filter the summary before it leaves the loop — the
+    // same by-value gate the tool-result chokepoint applies.
+    let text = redact_model_facing(disclosure, text);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
