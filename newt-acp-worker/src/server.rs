@@ -486,17 +486,19 @@ impl AcpServer {
         // host derivation below for peer-cert extraction without
         // touching the call shape.
         let backend_host = self.backend.endpoint().map(host_from_endpoint);
-        // step-4.2: the workspace fence is available (`caveats_for_dispatch` can
-        // scope fs to `session.workspace_path` — see its unit test), but is kept
-        // INERT here (`None`) until the coder's fs predicates are switched from
-        // exact-match / `fs_write == All` to PREFIX (newt-coder `coder.rs:394/417/
-        // 488`), so a `Scope::only([workspace])` fence still permits the coder's
-        // own in-workspace writes. Activating it before that would deny every
-        // legitimate whole-file/diff apply. Follow-up; #522's object-binding is the
-        // hard containment in the meantime.
+        // step-4.3: ACTIVATE the workspace fence. `caveats_for_dispatch` scopes
+        // fs_read/fs_write to this session's workspace (`Scope::only([ws])`)
+        // instead of the open `Scope::All` default, so the dispatched authority
+        // is workspace-bound. The coder's fs predicates now gate by PREFIX
+        // containment (`newt_core::permits_path`) against the same workspace, so
+        // the fence permits the coder's own in-workspace writes and denies any
+        // `..`/absolute escape — belt to #522's object-binding suspenders. The
+        // root is passed as the same lossy string the coder joins against, so the
+        // two enforcement points agree on containment even for non-UTF8 paths.
+        let workspace = session.workspace_path.to_string_lossy();
         let caveats = self
             .identity
-            .caveats_for_dispatch(backend_host, None)
+            .caveats_for_dispatch(backend_host, Some(&workspace))
             .map_err(|e| anyhow::anyhow!("dispatch identity error: {e}"))?;
         let t0 = std::time::Instant::now();
         let run = coder

@@ -153,7 +153,7 @@ pub use artifact::{
     ArtifactId, ArtifactKind, ArtifactRelation, NewPromptArtifact, PromptArtifact,
     MAX_ARTIFACT_BODY_BYTES, MAX_ARTIFACT_LOCATOR_BYTES, MAX_ARTIFACT_METADATA_BYTES,
 };
-pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
+pub use caveats::{permits_path, CaveatsExt, CountBoundExt, ScopeExt};
 pub use classifiers::{
     classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
 };

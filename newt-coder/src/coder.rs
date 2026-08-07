@@ -20,7 +20,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use newt_core::{Caveats, CaveatsExt, CountBoundExt};
+use newt_core::{permits_path, Caveats, CaveatsExt, CountBoundExt};
 use newt_identity::AgentKey;
 use newt_inference::{ChatRequest, InferenceBackend};
 
@@ -180,7 +180,7 @@ impl Coder {
         //    prompt actually injected, not on the candidate set the
         //    scanner considered.
         let prompt = build_prompt(workspace, task)?;
-        check_fs_read(caveats, &prompt)?;
+        check_fs_read(caveats, workspace, &prompt)?;
         tracing::info!(
             files_included = prompt.included_files.len(),
             user_chars = prompt.user.len(),
@@ -284,7 +284,7 @@ impl Coder {
         };
         // The re-prompt re-reads the same workspace; fs_read scope must
         // still permit every file the second pass would inject.
-        if let Err(e) = check_fs_read(caveats, &prompt) {
+        if let Err(e) = check_fs_read(caveats, workspace, &prompt) {
             tracing::warn!(error = %e, "newt-coder: re-prompt fs_read denied");
             return Err(original_err);
         }
@@ -357,17 +357,23 @@ impl Coder {
     /// Apply one classified emission to `workspace`, under `caveats`.
     /// Returns the list of relative paths written, where known.
     ///
-    /// Every filesystem write goes through the `fs_write` axis first.
-    /// For a [`Emission::WholeFiles`] emission we know every target
-    /// path up front, so the check happens before any write touches
-    /// disk — partial-apply is never possible under a denied caveat.
-    /// For a [`Emission::UnifiedDiff`] we cannot enumerate paths
-    /// without re-parsing, so we require `fs_write` to be
-    /// [`Scope::All`](newt_core::Scope::All) — bounded fs_write +
-    /// diff emission is a denial. This is conservative on purpose:
-    /// 35c will swap diff dispatch for a parser that knows the paths,
-    /// and the conservative rule is easier to weaken later than to
-    /// retrofit a "we already wrote half the diff" rollback.
+    /// Every filesystem write goes through the `fs_write` axis first,
+    /// under **prefix (containment)** semantics: the model-supplied path
+    /// is joined to `workspace` and checked with
+    /// [`newt_core::permits_path`], the same shared gate the interactive
+    /// tool sites use. A production dispatch fences `fs_write` to the
+    /// session workspace (`Scope::only([workspace])`, step-4.3), so an
+    /// in-workspace target is permitted and a `..`/absolute escape is
+    /// denied *before* any write.
+    ///
+    /// For a [`Emission::WholeFiles`] emission we know every target path
+    /// up front, so the check happens before any write touches disk —
+    /// partial-apply is never possible under a denied caveat. For a
+    /// [`Emission::UnifiedDiff`] we cannot enumerate paths without
+    /// re-parsing, so we gate on the **workspace root** itself (the fence
+    /// must authorise the session workspace); each hunk is then object-
+    /// bound *beneath* the workspace by `apply_patch` (#522), so a hunk
+    /// escaping the fence is rejected at the write primitive regardless.
     fn apply(
         &self,
         emission: &Emission,
@@ -387,11 +393,15 @@ impl Coder {
                     reject_bad_shape(path, contents)?;
                 }
                 // Caveat check: every target path must be permitted on
-                // the fs_write axis. We loop *all* paths before
-                // committing any write so a denial on the second file
-                // can't leave the first file half-written.
+                // the fs_write axis. The emission key is workspace-relative;
+                // join it to `workspace` and gate with prefix (containment)
+                // semantics so a workspace fence permits in-workspace targets
+                // and denies `..`/absolute escapes. We loop *all* paths before
+                // committing any write so a denial on the second file can't
+                // leave the first file half-written.
                 for path in files.keys() {
-                    if !caveats.permits_fs_write(path) {
+                    let full = workspace.join(path);
+                    if !permits_path(&caveats.fs_write, &full.to_string_lossy()) {
                         return Err(CoderError::CapabilityDenied {
                             kind: "fs_write",
                             target: path.clone(),
@@ -408,13 +418,17 @@ impl Coder {
                 Ok(written)
             }
             Emission::UnifiedDiff(diff) => {
-                // We can't enumerate the touched paths without
-                // re-parsing the diff. Be conservative: require
-                // `fs_write = All`. Anything narrower denies the
-                // dispatch up front. Target the diff blob itself so
-                // the error message points the reader at the
-                // can't-enumerate-paths reason.
-                if !matches!(caveats.fs_write, newt_core::Scope::All) {
+                // We can't enumerate the touched paths without re-parsing the
+                // diff, so gate on the workspace root itself: the fence must
+                // authorise the session workspace (`Scope::All`, or an
+                // `Only([…])` that contains it). A fence that doesn't cover the
+                // workspace — or a deny-all `none()` — denies the dispatch up
+                // front. Each hunk is then object-bound *beneath* the workspace
+                // by `apply_patch` (#522), so a hunk targeting `../escape` is
+                // rejected at the write primitive even though this coarse check
+                // passed. Target the diff blob itself so the error message
+                // points at the can't-enumerate-paths reason.
+                if !permits_path(&caveats.fs_write, &workspace.to_string_lossy()) {
                     return Err(CoderError::CapabilityDenied {
                         kind: "fs_write",
                         target: "<unified_diff: paths not enumerable>".to_string(),
@@ -482,13 +496,17 @@ fn check_net(caveats: &Caveats, backend: &dyn InferenceBackend) -> Result<()> {
 /// actually injected. We gate on `included_files` (what was read), not
 /// on the wider candidate set the scanner considered, so the denial
 /// fires only when the model would have *seen* a forbidden path.
-fn check_fs_read(caveats: &Caveats, prompt: &CoderPrompt) -> Result<()> {
+fn check_fs_read(caveats: &Caveats, workspace: &Path, prompt: &CoderPrompt) -> Result<()> {
     for path in &prompt.included_files {
-        let s = path.to_string_lossy();
-        if !caveats.permits_fs_read(&s) {
+        // `included_files` are workspace-relative; join to `workspace` and gate
+        // with prefix (containment) semantics, matching the fs_write side and
+        // the interactive tool gate. A workspace-scoped fs_read fence then
+        // permits every in-workspace file the prompt injected.
+        let full = workspace.join(path);
+        if !permits_path(&caveats.fs_read, &full.to_string_lossy()) {
             return Err(CoderError::CapabilityDenied {
                 kind: "fs_read",
-                target: s.into_owned(),
+                target: path.to_string_lossy().into_owned(),
             });
         }
     }
@@ -770,26 +788,26 @@ mod tests {
 
     // ── Caveat enforcement at the apply boundary ─────────────────────────
 
+    // ── Caveat enforcement at the apply boundary ─────────────────────────
+    //
+    // step-4.3: the fs_write scope now stores absolute roots and is matched by
+    // containment (`newt_core::permits_path`), mirroring production dispatch
+    // (`Scope::only([workspace])`). The pre-step-4.3 per-file relative-exact
+    // fixtures are retired — see `apply_under_workspace_fence_permits_inside_
+    // denies_escape` above for the core permit/deny property.
+
     #[test]
-    fn apply_whole_files_denies_path_outside_fs_write_scope() {
+    fn apply_whole_files_denies_when_fence_excludes_workspace() {
+        // A fs_write fence pointing at some OTHER directory must deny a write
+        // into this workspace — the fence is a real gate, not vacuous.
         let tmp = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
         let coder = coder_with_no_backend_used();
         let caveats = Caveats {
-            fs_write: newt_core::Scope::only(["allowed.rs".to_string()]),
+            fs_write: newt_core::Scope::only([elsewhere.path().to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
 
-        // Allowed write succeeds.
-        let allowed = coder
-            .apply(
-                &whole_files("allowed.rs", "fn ok() {}\n"),
-                tmp.path(),
-                &caveats,
-            )
-            .expect("permitted write must succeed");
-        assert_eq!(allowed, vec!["allowed.rs".to_string()]);
-
-        // Forbidden write returns CapabilityDenied.
         let err = coder
             .apply(
                 &whole_files("forbidden.rs", "fn evil() {}\n"),
@@ -810,19 +828,18 @@ mod tests {
 
     #[test]
     fn apply_whole_files_denies_atomically_on_partial_scope() {
-        // A multi-file emission where one path is denied must write
-        // NOTHING — the check loops every path before committing any
-        // write. Regression for the "wrote half the emission then
-        // refused" failure mode.
+        // A multi-file emission where one path ESCAPES the workspace fence must
+        // write NOTHING — the check loops every path before committing any
+        // write. Regression for the "wrote half the emission then refused" mode.
         let tmp = TempDir::new().unwrap();
         let coder = coder_with_no_backend_used();
         let caveats = Caveats {
-            fs_write: newt_core::Scope::only(["a.rs".to_string()]),
+            fs_write: newt_core::Scope::only([tmp.path().to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
         let mut files = BTreeMap::new();
-        files.insert("a.rs".to_string(), "fn a() {}\n".to_string());
-        files.insert("b.rs".to_string(), "fn b() {}\n".to_string());
+        files.insert("a.rs".to_string(), "fn a() {}\n".to_string()); // inside
+        files.insert("../b.rs".to_string(), "fn b() {}\n".to_string()); // escape
 
         let err = coder
             .apply(&Emission::WholeFiles(files), tmp.path(), &caveats)
@@ -834,25 +851,29 @@ mod tests {
                 ..
             }
         ));
-        // Neither file landed.
+        // Neither the in-workspace file nor the escape landed.
         assert!(!tmp.path().join("a.rs").exists());
-        assert!(!tmp.path().join("b.rs").exists());
+        assert!(!tmp.path().parent().unwrap().join("b.rs").exists());
     }
 
     #[test]
-    fn apply_unified_diff_denied_under_bounded_fs_write() {
-        // We can't enumerate diff paths up front, so any non-`All`
-        // fs_write scope conservatively denies the dispatch.
+    fn apply_unified_diff_gated_on_workspace_fence() {
+        // We can't enumerate diff paths up front, so the dispatch is gated on
+        // the workspace root itself: a fence that does NOT cover the workspace
+        // denies; a fence that DOES cover it permits (each hunk is then object-
+        // bound beneath the workspace by `apply_patch`).
         let tmp = TempDir::new().unwrap();
         let coder = coder_with_no_backend_used();
-        let caveats = Caveats {
-            fs_write: newt_core::Scope::only(["whatever.rs".to_string()]),
-            ..Caveats::top()
-        };
         let diff = Emission::UnifiedDiff(
             "--- a/whatever.rs\n+++ b/whatever.rs\n@@ -1 +1 @@\n-x\n+y\n".to_string(),
         );
-        let err = coder.apply(&diff, tmp.path(), &caveats).unwrap_err();
+
+        // Deny-all fence → denied up front.
+        let foreign = Caveats {
+            fs_write: newt_core::Scope::none(),
+            ..Caveats::top()
+        };
+        let err = coder.apply(&diff, tmp.path(), &foreign).unwrap_err();
         assert!(matches!(
             err,
             CoderError::CapabilityDenied {
@@ -860,6 +881,72 @@ mod tests {
                 ..
             }
         ));
+
+        // Workspace fence → the caveat gate permits it. Any error here is
+        // downstream diff-apply mechanics (the target file doesn't exist), a
+        // different error class — NOT a fs_write capability denial.
+        let fenced = Caveats {
+            fs_write: newt_core::Scope::only([tmp.path().to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        if let Err(e) = coder.apply(&diff, tmp.path(), &fenced) {
+            assert!(
+                !matches!(
+                    e,
+                    CoderError::CapabilityDenied {
+                        kind: "fs_write",
+                        ..
+                    }
+                ),
+                "workspace fence must not raise a fs_write capability denial: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_under_workspace_fence_permits_inside_denies_escape() {
+        // step-4.3 (`acp-worker-fs-scope`): production ACP dispatch fences
+        // fs_write to the session workspace (`Scope::only([workspace_abs])`)
+        // instead of `Scope::All`. The coder's apply gate must therefore PERMIT
+        // a write to a file INSIDE the workspace and DENY a `..`-escape that
+        // resolves outside — the adversarial case a hostile model would emit.
+        //
+        // Regression: before the exact-match → prefix switch, a workspace fence
+        // denied EVERY in-workspace write (the relative emission key never
+        // string-matched the absolute root), so the fence could not be activated
+        // without breaking the coder's own legitimate writes. This test is red
+        // until `apply` joins to the workspace and gates with prefix semantics.
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let ws = tmp.path().to_str().unwrap().to_string();
+        let caveats = Caveats {
+            fs_write: newt_core::Scope::only([ws]),
+            ..Caveats::top()
+        };
+
+        // Inside the workspace → permitted, and the file lands.
+        let written = coder
+            .apply(&whole_files("lib.rs", "fn ok() {}\n"), tmp.path(), &caveats)
+            .expect("in-workspace write must be permitted under a workspace fence");
+        assert_eq!(written, vec!["lib.rs".to_string()]);
+        assert!(tmp.path().join("lib.rs").exists());
+
+        // `..`-escape → denied before any write, and nothing lands outside.
+        let err = coder
+            .apply(
+                &whole_files("../evil.rs", "fn evil() {}\n"),
+                tmp.path(),
+                &caveats,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoderError::CapabilityDenied {
+                kind: "fs_write",
+                ..
+            }
+        ));
+        assert!(!tmp.path().parent().unwrap().join("evil.rs").exists());
     }
 
     // ── host_from_endpoint ───────────────────────────────────────────────

@@ -765,10 +765,11 @@ async fn coder_dispatch_with_operator_identity_carries_non_top_caveats() {
     // the user's top() authority to the conservative worker policy
     // (`worker_session_caveats`) — exec=None, max_calls=AtMost(32),
     // net=Only([backend_host]). The mock backend has no endpoint, so
-    // the coder's net check is vacuously satisfied; fs_read / fs_write
-    // are both `All`; max_calls budget is 32. The dispatch therefore
-    // lands without a `CapabilityDenied`, proving the wiring without
-    // hard-coding the caveats into the wire.
+    // the coder's net check is vacuously satisfied; step-4.3 fences
+    // fs_read / fs_write to the session workspace, and the emission
+    // writes an in-workspace file so the dispatch lands without a
+    // `CapabilityDenied` — proving the wiring without hard-coding the
+    // caveats into the wire.
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_initial(tmp.path(), "lib.rs", "pub fn greet() {}\n");
@@ -830,6 +831,70 @@ async fn coder_dispatch_with_operator_identity_carries_non_top_caveats() {
 // under the `allow-no-key` feature. Production (feature off) is covered by
 // `allow_no_key_authority_is_compile_gated` (fail-closed) in identity.rs.
 #[cfg(feature = "allow-no-key")]
+#[tokio::test]
+async fn coder_dispatch_under_fence_contains_workspace_escape() {
+    // step-4.3 acceptance: with the workspace fence ACTIVE at dispatch, a
+    // hostile model that emits a whole-file write to a path OUTSIDE the session
+    // workspace (`../escape.rs`) must be contained — the file is never created
+    // beside the workspace, and the dispatch reports failure rather than a
+    // silent apply. Proves end-to-end that `handle_prompt_coder` passes the
+    // session workspace (not `None`) and the coder's prefix gate + #522
+    // object-binding deny the escape. Grounds the mocked coder-unit fence test
+    // `apply_under_workspace_fence_permits_inside_denies_escape`.
+    let parent = tempfile::tempdir().unwrap();
+    let ws = parent.path().join("workspace");
+    std::fs::create_dir(&ws).unwrap();
+    init_git_repo(&ws);
+    commit_initial(&ws, "lib.rs", "pub fn greet() {}\n");
+
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_path = key_dir.path().join("identity.pem");
+    let identity = WorkerIdentity::from_operator_key(&key_path).unwrap();
+
+    // The model tries to write a sibling of the workspace.
+    let canned = "FILE: ../escape.rs\npub fn pwned() {}\nEND-FILE\n";
+    let backend = mock_backend(canned);
+
+    let responses = drive_dependent_with_identity(
+        backend,
+        identity,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": {
+                "workspace_path": ws.to_str().unwrap(),
+                "coder": true,
+            },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompt",
+                "params": {
+                    "session_id": sid,
+                    "prompt": "write an escape file",
+                },
+            })
+        },
+    )
+    .await;
+
+    // The escape file must NOT exist next to the workspace — the fence held.
+    assert!(
+        !parent.path().join("escape.rs").exists(),
+        "workspace fence must contain the `..` escape write"
+    );
+    // And the dispatch surfaced a failure rather than a successful apply.
+    assert!(
+        responses[1].get("error").is_some(),
+        "a contained escape must report a dispatch error, got: {}",
+        responses[1]
+    );
+}
+
 #[tokio::test]
 async fn worker_identity_allow_no_key_falls_back_to_top() {
     // Debug-only fallback: `--allow-no-key` (modeled by
