@@ -442,29 +442,41 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   and process budget — clearing inherited env, denying net by default, fencing fs to the workspace,
   killing the process tree on cancel, and FAILING CLOSED when the required confinement cannot be
   established. No raw `Command`/`sh -c` bypass may remain for repo-controlled execution.
-- **Practical caveat (now):** the confined-spawn seam already exists — `agent_bridle::ConfinedCommand`
-  (`spawn_tokio`, Landlock/Seatbelt + env-scrub + exec admission), used by `newt-mcp-client` for MCP
-  stdio. **step-4.1** landed the automated no-bypass GATE: `scripts/spawn_inventory.py` +
-  `docs/security/spawn-inventory.toml` enumerate + classify every `Command`/`process::Command` site
-  (48 across 15 files) and FAIL CI on any new/unreviewed one, wired into `.github/workflows/ci.yml`
-  (mirrored by `just spawn-inventory`). Of those, **25 are classed `agent-exec-todo-p4`** — the
-  attacker-influenced sites (`agentic/tools.rs` run_command host shell + `build_check_shell`'s raw
-  `sh -c`; `crew.rs`; `newt-tui/lib.rs`) still to be routed through the executor.
-- **Residual:** 🔴 critical — the 25 agent-exec sites still spawn raw (the sharpest: `build_check_shell`
-  runs `sh -c` unconfined UNCONDITIONALLY). The inventory gate prevents the surface from GROWING
-  unreviewed and makes the migration backlog explicit + auditable, but does not itself confine the
-  existing sites. Full closure depends on the P5 Linux kernel backend (`b1-os-isolation`) so the
-  executor has real enforcement to fail-closed against.
+- **Practical caveat (now):** the confined-spawn seam is now **owned by newt** —
+  `newt_core::confined_exec::ConstrainedExecutor` (**step-4.2**). It wraps the audited
+  `agent_bridle::ConfinedCommand::spawn` (the same primitive `newt-mcp-client` uses for MCP stdio) and
+  adds the fail-closed contract: an `ExecOrigin::AgentInfluenced` request is minted under a **`Kernel`
+  strength floor**, so `spawn` REFUSES (`confinement_unenforceable`) whenever the fs fence cannot be
+  kernel-enforced — on a kernel without Landlock, or any platform without an OS fs backend — instead
+  of running the child unconfined. The child starts env-EMPTY (only explicit grants cross), and
+  `workspace_confined_caveats` fences fs read/write to the workspace with an **empty `net`
+  allow-list** (kernel deny-all). A real-resource Landlock adversarial test
+  (`newt-core/tests/confined_exec_landlock.rs`) proves a hostile child under this executor cannot
+  write outside the workspace, read outside it, inherit a parent credential env var, or open a network
+  connection — by kernel denial where Landlock is present, by refusal where it is not.
+  **step-4.1** already landed the automated no-bypass GATE (`scripts/spawn_inventory.py` +
+  `docs/security/spawn-inventory.toml`, CI-wired). **25 sites remain classed `agent-exec-todo-p4`** —
+  the attacker-influenced spawns (`agentic/tools.rs` run_command host shell + `build_check_shell`'s
+  raw `sh -c`; `crew.rs`; `newt-tui/lib.rs`) still to be routed onto the new executor, one slice each.
+- **Residual:** 🔴 critical → 🟠 high. The executor + its kernel-backed enforcement now EXIST and are
+  proven (step-4.2); the residual is the *migration* — the 25 raw `agent-exec-todo-p4` sites are not
+  yet routed onto it, so `build_check_shell` et al. still spawn raw `sh -c` until each is migrated.
+  The seam being fail-closed means the migration lands real confinement (not advisory) the moment a
+  site moves onto it.
 - **Disabled while open:** running genuinely-untrusted repository code on an unsandboxed host
   (bounded by `b1`'s OS sandbox as the backstop, itself still open).
 - **Closure criterion:** the `spawn-inventory` shows ZERO `agent-exec-todo-p4` sites (all routed
   through `ConstrainedExecutor`), and a hostile-child adversarial test proves a build/test/plugin
   cannot read/write outside the workspace, reach the network unauthorized, read parent credentials,
-  or leave surviving descendants.
+  or leave surviving descendants. The adversarial-test half is **met** (step-4.2); the routing half
+  is the remaining migration.
 - **Ratchet guard:** `scripts/spawn_inventory.py` (self-tested; CI-gated) — a new or moved
-  `Command`/`process::Command` site fails the build until it is inventoried + classified.
-- **Status:** OPEN — inventory gate landed (step-4.1); the executor migration of the 25 agent-exec
-  sites + the P5 kernel backend remain · owner: — · review-by: as each migration slice lands.
+  `Command`/`process::Command` site fails the build until it is inventoried + classified; plus
+  `newt-core/tests/confined_exec_landlock.rs` (real-resource) + the `confined_exec` unit tests, which
+  fail if the executor stops confining or stops failing-closed.
+- **Status:** OPEN — inventory gate (step-4.1) + fail-closed executor seam & kernel-backed
+  adversarial proof (step-4.2) landed; the executor migration of the 25 agent-exec sites remains ·
+  owner: — · review-by: as each migration slice lands.
 
 ### mcp-under-leash
 - **Invariant (ideal):** every individual MCP tool call is mediated at CALL time before it reaches

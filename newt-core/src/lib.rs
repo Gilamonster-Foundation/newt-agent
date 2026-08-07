@@ -18,6 +18,7 @@ pub mod classifiers;
 /// persona's `cognition:` (psyche sibling of [`tenacity`]).
 pub mod cognition;
 pub mod config;
+pub mod confined_exec;
 pub mod conversation;
 pub mod credential_registry;
 pub mod denial_journal;
