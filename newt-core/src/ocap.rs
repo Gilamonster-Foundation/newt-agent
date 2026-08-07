@@ -992,16 +992,47 @@ pub fn verify_fs_object_bound() -> Verification {
 }
 
 /// Verify the mandatory confined executor (`p4-constrained-executor`): every
-/// attacker-influenced subprocess routed through one env-cleared, confined
-/// spawn seam. OPEN — the spawn inventory still carries unmigrated agent-exec
-/// sites, so children can inherit env/credentials until the migration lands.
+/// attacker-influenced subprocess is routed through one env-cleared, confined
+/// spawn seam ([`crate::confined_exec::ConstrainedExecutor`] →
+/// `agent_bridle::ConfinedCommand`, which `env_clear`s the child and applies the
+/// kernel fs fence under an `AgentInfluenced` `Kernel` strength floor).
+///
+/// This is `Verified` iff the kernel fs fence the executor requires is actually
+/// available on this host ([`crate::confined_exec::kernel_fs_fence_available`]) —
+/// the runtime-checkable half of the guarantee, so the report can never claim
+/// confinement the executor could not deliver. Where the fence is absent (a
+/// pre-Landlock kernel, or any non-Linux platform) an `AgentInfluenced` spawn
+/// *refuses* (`ExecRefused::ConfinementUnenforceable`) rather than run
+/// unconfined — so `Absent` here is honest, not a silent downgrade.
+///
+/// The complementary half — that ALL attacker-influenced spawn sites route
+/// through this seam (`agent-exec-todo-p4 == 0`) — is the CI-enforced
+/// spawn-inventory gate (`scripts/spawn_inventory.py` over
+/// `docs/security/spawn-inventory.toml`). The integration test
+/// `constrained_executor_truth.rs` ties the two: it fails if the inventory
+/// carries an unmigrated attacker spawn OR if this verifier disagrees with the
+/// gate on a fence-available host — so live enforcement, this verifier, and the
+/// register cannot drift apart.
 #[must_use]
 pub fn verify_constrained_executor() -> Verification {
-    Verification::Absent {
-        deviation: "p4-constrained-executor",
-        reason: "agent-exec spawn sites not yet routed through the confined executor \
-                 (see docs/security/spawn-inventory.toml; inventory-gated in CI)"
-            .into(),
+    if crate::confined_exec::kernel_fs_fence_available() {
+        Verification::Verified {
+            evidence: "ConstrainedExecutor routes every attacker-influenced spawn through \
+                       agent_bridle::ConfinedCommand under a Kernel strength floor: the child is \
+                       env-cleared (only explicit grants) and the fs fence is kernel-enforced, \
+                       fail-closed when it cannot be; the CI spawn-inventory gate holds \
+                       agent-exec-todo-p4 at 0 so no attacker spawn bypasses it \
+                       (constrained_executor_truth.rs ties the gate to this verifier)"
+                .into(),
+        }
+    } else {
+        Verification::Absent {
+            deviation: "p4-constrained-executor",
+            reason: "the kernel fs fence is unavailable on this host — an AgentInfluenced spawn \
+                     refuses (fail-closed) rather than confine \
+                     (see docs/security/spawn-inventory.toml)"
+                .into(),
+        }
     }
 }
 
@@ -1209,10 +1240,11 @@ mod report_tests {
 
     #[test]
     fn linux_report_matches_live_verifier_state() {
-        // Reporting derives from the SAME verifiers the gates use (#11):
-        // with b1 + p4 open, only disclosure (+ fs/fail-closed on Linux) may
-        // report enforced — and process/network/env/credential must name their
-        // open deviations.
+        // Reporting derives from the SAME verifiers the gates use (#11).
+        // Disclosure (+ fs/fail-closed on Linux) report enforced; EnvIsolation
+        // tracks the confined-executor verifier (Enforced where the kernel fs
+        // fence is available, else its open deviation); and network / process /
+        // credential must still name b1 (their meet includes the open b1 half).
         let report = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
         assert!(matches!(
             report.achieved(Guarantee::DisclosureFiltering),
@@ -1225,13 +1257,24 @@ mod report_tests {
                 ..
             }
         ));
-        assert!(matches!(
-            report.achieved(Guarantee::EnvIsolation),
-            Achieved::Unverified {
-                deviation: "p4-constrained-executor",
-                ..
-            }
-        ));
+        // EnvIsolation = the confined-executor verifier alone: Enforced when the
+        // executor can kernel-confine on this host, otherwise fail-closed Absent.
+        if crate::confined_exec::kernel_fs_fence_available() {
+            assert!(matches!(
+                report.achieved(Guarantee::EnvIsolation),
+                Achieved::Enforced { .. }
+            ));
+        } else {
+            assert!(matches!(
+                report.achieved(Guarantee::EnvIsolation),
+                Achieved::Unverified {
+                    deviation: "p4-constrained-executor",
+                    ..
+                }
+            ));
+        }
+        // Process + credential confinement take the meet with the still-open b1,
+        // so they stay Unverified regardless of the executor half.
         assert!(matches!(
             report.achieved(Guarantee::ProcessConfinement),
             Achieved::Unverified { .. }
