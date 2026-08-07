@@ -869,7 +869,7 @@ mod tests {
             };
             match preset_support(&p) {
                 PresetSupport::Unsupported { reason } => {
-                    assert!(reason.contains(needle), "{reason}")
+                    assert!(reason.contains(needle), "{reason}");
                 }
                 other => panic!("{auth:?} must be unsupported, got {other:?}"),
             }
