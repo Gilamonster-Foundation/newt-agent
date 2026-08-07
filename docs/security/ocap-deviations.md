@@ -74,6 +74,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `mcp-config-admission` | untrusted/disabled MCP config cannot spawn or dial | 🟢 closed (fail-closed) | admitting an untrusted server without out-of-repo approval |
 | `acp-worker-fs-scope` | worker fs attenuated to the session workspace (caveat fence + object-bound) | 🟢 closed | (fence active; non-Linux keeps the lexical-prefix fallback) |
 | `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
+| `config-plane-provenance` | an untrusted project `.newt/config.toml` cannot grant exec / endpoint (control-plane) authority | 🟢 closed (fail-closed) | (overlay stripped; ambient `./newt.toml` base control-plane strip = tracked follow-up) |
 
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
@@ -338,6 +339,40 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   launching the process. Neutering the gate re-creates the marker (verified red→green).
 - **Status:** CLOSED (fail-closed) — step-1.1 · owner: — · review-by: revisit if/when an
   out-of-repo untrusted-server approval path is designed.
+
+### config-plane-provenance
+- **Invariant (ideal):** repository-controlled configuration cannot grant executable or
+  control-plane authority. A walked-up project `.newt/config.toml` (a cloned repo can ship one, so
+  it is attacker-reachable, exactly like a `.mcp.json`) must not be able to run a command
+  (`[[providers]]`, `[lifecycle]`), select the exec/shell backend (`[shell]`), or redirect the
+  agent's inference/data endpoints (`[[backends]]`, `default_backend`, `[dgx]`, `[discovery]`) — via
+  config alone. It may still pin benign, non-control-plane preferences.
+- **Practical caveat (now):** none for the walked-up project-overlay vector. This generalizes the
+  #1301 MCP-trust model (which already stamps a project overlay's `[[mcp_servers]]` `Untrusted`) to
+  the rest of the control plane.
+- **Mechanism:** control-plane authority is a **data table** — `CONTROL_PLANE_KEYS`
+  (`newt-core/src/config.rs`) — and the raw `merge_toml` of the project overlay is replaced by
+  `merge_project_overlay`, which `strip_control_plane`s the overlay at the `toml::Value` layer
+  *before* `try_into::<Config>()`. A stripped key therefore fails closed to the trusted base's value
+  (or the built-in default), never the attacker's. `mcp_servers` is deliberately left to its finer
+  literal-only untrusted gate (`mark_project_mcp_untrusted`), not blanket-stripped.
+- **Residual:** 🟢 closed for the walked-up `.newt/config.toml` overlay. Remaining scope is *feature*
+  (a `newt config adopt` path so an operator can opt a repo's control-plane keys back in) and one
+  sibling vector: the ambient `./newt.toml` **base** (`cd repo && newt`) — already MCP-downgraded by
+  #1301 but its control-plane keys are not yet stripped. Tracked as the follow-up; cross-referenced
+  here so it is not mistaken for closed.
+- **Disabled while open:** n/a (closed for the overlay vector).
+- **Closure criterion:** met — the project overlay's control-plane keys are stripped before
+  deserialize, proven on the real `Config::resolve()` path.
+- **Ratchet guard:** `untrusted_project_overlay_cannot_contribute_control_plane_keys`
+  (`config.rs`, pure unit — the strip at the merge seam) and
+  `walked_up_project_config_cannot_grant_control_plane_authority`
+  (`newt-core/tests/config_project_trust.rs`, real-resource `#[serial]` — plants a walked-up
+  `.newt/config.toml` with an RCE provider + lifecycle command + host shell + exfil endpoint, runs
+  real `Config::resolve()`, asserts every control-plane key is absent from the resolved config while
+  a benign `[context]` preference survives). Neutering `strip_control_plane` re-admits them.
+- **Status:** CLOSED (fail-closed) — step-7.1 · owner: — · review-by: when a `newt config adopt`
+  path or the ambient-base control-plane strip is designed.
 
 > `exec-behavior-bound`, `mcp-under-leash` — full entries to be filled as those land; each is
 > **disabled-while-open bounded by `b1`** (the OS sandbox is the backstop for
