@@ -77,6 +77,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `config-plane-provenance` | an untrusted project `.newt/config.toml` cannot grant exec / endpoint (control-plane) authority | 🟢 closed (fail-closed) | (overlay stripped; ambient `./newt.toml` base control-plane strip = tracked follow-up) |
 | `noninteractive-launch-policy` | `--non-interactive` changes interaction only; OCAP-off host exec is an explicit opt-in | 🟠→🟡 | libraries still read `NEWT_DISABLE_OCAP`/`NEWT_FULL_ACCESS` from ambient env (typed `LaunchAuthority` follow-on) |
 | `p4-constrained-executor` | all attacker-influenced subprocess creation routes through one confined executor | 🔴 critical | 25 agent-exec spawn sites not yet migrated (now inventory-gated) |
+| `posture-report-honesty` | every security-posture surface is DERIVED from the same `verify_*` invariants the gates enforce, never independent prose | 🟢 closed | (a posture surface that asserts a claim the verifiers don't back — a report/enforcement drift) |
+| `platform-capability-ceiling` | an unsupported/unverified platform reports each guarantee as `unsupported` and REFUSES operations needing it — never a Linux-equivalent OCAP claim | 🟢 closed | (a non-Linux build silently claiming a kernel-backed guarantee it cannot provide) |
 
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
@@ -503,6 +505,72 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   secret-forwarding + name-classification residuals cross-referenced to `disclosure-gate-live-path`
   / `b1-os-isolation` · owner: — · review-by: with per-call budget/scope attenuation, or when
   `disclosure-gate-live-path` closes.
+
+### posture-report-honesty
+- **Invariant (ideal):** every place newt reports its security posture — to the user, to logs, or
+  to the model — is DERIVED from the same runtime `verify_*` invariants the fail-closed capability
+  gates consult, so a reporting surface can never claim more (or less) than what is actually
+  enforced. No hand-written per-lane prose asserts a guarantee the verifiers do not back.
+- **Practical caveat (now):** the typed **achieved-security report** exists and is derived, not
+  asserted. `newt_core::ocap::SecurityReport` builds one `Achieved` entry per `Guarantee` from
+  `RuntimeEvidence::current()` — the very `verify_b1` / `verify_disclosure_gate` /
+  `verify_fs_object_bound` / `verify_constrained_executor` / `verify_fail_closed_execution`
+  invariants the gates use — with `meet` for compound guarantees (credential/process isolation need
+  BOTH the executor and `b1`). There is deliberately **no constructor that takes a free-form claim**.
+  `newt doctor` renders it via `security_posture_lines(&SecurityReport::current())` (an
+  "Achieved OCAP posture (per guarantee)" block), generalizing the `#1256` "report the achieved
+  `SandboxKind`, never the intent" precedent from `newt mcp probe` / the `/mcp` table.
+- **Residual:** 🟢 closed for the report type + the `doctor` surface. Follow-up (tracked, not
+  claimed here): feed the same report into the remaining hand-written surfaces (the per-turn
+  `runtime_context_block` "# Filesystem confinement" claim, the session-start banners) so they too
+  read from the report instead of restating it.
+- **Disabled while open:** (closed) — a posture surface asserting a claim the verifiers don't back.
+- **Compensating controls:** the `verify_*` invariants remain the single source of truth for the
+  fail-closed gates; the report is a pure function of them (`SecurityReport::from_parts`).
+- **Closure criterion:** met — the report derives every entry from the verifiers, and the `doctor`
+  render is a pure function of the report (no independent claim); a guarantee reported `enforced`
+  implies its verifier is `Verified`.
+- **Ratchet guard:** `linux_report_matches_live_verifier_state`, `compound_guarantees_take_the_meet`,
+  `summary_lines_cover_every_guarantee_honestly` (`newt-core/src/ocap.rs`) +
+  `posture_lines_are_derived_from_the_report_not_prose` (`newt-cli/src/doctor.rs`). Adding a
+  free-form-claim constructor or an over-claiming render breaks these.
+- **Status:** CLOSED — step-8.1 (typed `SecurityReport` derived from the verifiers, rendered by
+  `newt doctor`) · owner: — · review-by: when the per-turn/banner surfaces are migrated onto it.
+
+### platform-capability-ceiling
+- **Invariant (ideal):** newt never claims a security guarantee a platform cannot provide. On a
+  platform whose kernel primitives are absent or unverified (no `openat2(RESOLVE_BENEATH)`, no
+  Landlock, no proven Seatbelt/AppContainer floor), each affected guarantee is reported
+  `unsupported` and any operation that REQUIRES it is refused (fail-closed) — never silently
+  downgraded to a best-effort path that still reports "confined".
+- **Practical caveat (now):** the report takes the **meet of a pure-data platform ceiling and the
+  runtime evidence**, and the ceiling never rounds up. `PlatformCeiling` is one const table per
+  platform (`LINUX_CEILING` supports every guarantee; `MACOS_CEILING` / `WINDOWS_CEILING` mark the
+  kernel-backed guarantees `Unsupported` with an honest reason; `UNKNOWN_CEILING` — the default
+  arm — marks EVERYTHING unsupported, the opposite of a `_ => true` fail-open). Even if every
+  runtime verifier were `Verified`, a ceiling entry of "cannot provide" forces `Unsupported`.
+  `require_achieved(&report, guarantee)` is the refusal primitive: it returns `Ok` only on
+  `Enforced` and a `FailClosed { deviation: "platform-unsupported", … }` on `Unsupported`.
+- **Residual:** 🟢 closed for the reporting + refusal contract. This does NOT build the non-Linux
+  kernel floors (macOS Seatbelt / Windows AppContainer) — those stay honestly `Unsupported`, which
+  is the point: "Linux is the normative fully-supported OCAP platform for this milestone" (no macOS
+  runner is needed to represent unsupported truthfully and fail closed). The still-open *runtime*
+  fail-open of the non-Linux lexical fs fallback in `tools.rs` is tracked under
+  `fs-canonical-containment` (a Linux-closed row) — this row governs the *report/refusal* honesty.
+- **Disabled while open:** (closed) — a non-Linux build silently claiming a kernel-backed guarantee.
+- **Compensating controls:** unrecognized platforms default to the all-`Unsupported` ceiling;
+  `Achieved` has no "best effort" variant (enforced-with-evidence, open-with-deviation, or
+  unsupported — nothing else).
+- **Closure criterion:** met — an unsupported-platform report never marks a kernel-backed guarantee
+  `Enforced`, and `require_achieved` refuses it.
+- **Ratchet guard:** `ceiling_never_rounds_up`, `unknown_platform_is_fully_unsupported`,
+  `require_achieved_refuses_unverified_and_unsupported`, `current_report_reflects_build_platform`
+  (`newt-core/src/ocap.rs`) + `unsupported_platform_never_renders_a_linux_equivalent_claim`
+  (`newt-cli/src/doctor.rs`). A permissive default arm or an `Enforced`-on-unsupported path breaks
+  these.
+- **Status:** CLOSED — step-8.1 (platform ceiling `meet` + `require_achieved` refusal) · owner: — ·
+  review-by: when a non-Linux kernel floor lands and its ceiling can flip a guarantee off
+  `Unsupported`.
 
 > `exec-behavior-bound` — full entry to be filled as it lands; **disabled-while-open bounded by
 > `b1`** (the OS sandbox is the backstop for name-granularity exec until it closes).
