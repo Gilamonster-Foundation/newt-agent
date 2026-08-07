@@ -66,7 +66,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
 | `b1-os-isolation` | OS isolation + egress proxy | 🔴 critical | live credentials, untrusted-remote voices |
-| `disclosure-gate-live-path` | output filtered before it reaches the model | 🔴 critical | seeding any secret-bearing file readable by the worker |
+| `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model | 🔴→🟡 | seeding a secret into the observation/streaming paths still redacted shape-only |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
 | `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`) | 🟢 closed (Linux) | (non-Linux lexical fallback) |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
@@ -102,12 +102,21 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   backend loops call and nothing else to make a `{"role":"tool"}` content string, including the
   early-return tools (`run_command`/`lifecycle`/`prompt_read`/`artifact_read`) the offload/spill
   redaction never touched. Threaded via a new `ChatCtx.disclosure` (`None` = inert, bit-for-bit
-  unchanged). Two gaps remain: (i) the caller does not yet register the session secret into
-  `ChatCtx.disclosure` at session start; (ii) the next-turn observation + summary paths still redact
-  shape-only (`redact_secrets`, 7 regexes), not by value.
-- **Residual:** 🔴 critical → 🟠 high — the *mechanism* now exists and is proven (canary redacted in
-  every encoding at the live chokepoint), but it is inert until session-start registration lands; the
-  other two paths remain shape-only.
+  unchanged). **step-6.5 LANDED session-start registration + the summary path:** both live ChatCtx
+  builders — the headless driver (`agentic/driver.rs`) and the interactive TUI (`newt-tui/chat.rs`) —
+  now build a session filter via `ocap::session_disclosure_filter(api_key)` (registers the live
+  provider bearer value; inert when absent) and pass `Some(&filter)`, so the tool-result chokepoint
+  is LIVE; and the three backend loops' `final_summary_*` outputs are value-filtered through
+  `redact_model_facing` before they leave the loop. Remaining gaps: (i) the next-turn
+  **observation/compaction** memory still redacts shape-only (`redact_secrets`, 7 regexes), not by
+  value; (ii) **streaming/chunked** deltas printed live and non-`api_key` secrets (MCP credential
+  handles, brokered/temporary tokens) are not yet registered; (iii) `ChatCtx.disclosure` is still an
+  `Option` — a *future* builder could pass `None` (the "no alternate path" guarantee wants the field
+  made required).
+- **Residual:** 🔴 critical → 🟡 medium — the live tool-result path (native / shell / MCP / error
+  tool results, all via the one chokepoint) and the final-summary path are now value-filtered with a
+  registered session secret; observation/compaction shape-only, streaming deltas, the non-`api_key`
+  secrets, and the not-yet-required field type remain.
 - **Disabled while open:** seeding **any secret-bearing file the worker can `read_file`/
   `cat`** (until registration + convergence land).
 - **Compensating controls:** keep secrets out of the box; the value-filter chokepoint (step-6.1a) is
@@ -128,10 +137,15 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `catches_base64_nopad_reencoding`, `catches_uppercase_hex`, `catches_percent_encoding`,
   `catches_string_escapes`, `catches_chunk_split_raw`, `catches_chunk_split_base64`,
   `redact_withholds_chunk_split`, and `redact_post_condition_holds_for_every_form` (`ocap.rs`,
-  step-6.2). Follow-up guards will assert absence from the assembled `{"role":"tool"}` messages
-  and every summary once registration + the observation/summary convergence land.
-- **Status:** OPEN — mechanism landed (step-6.1a: live-path value chokepoint + canary guard);
-  session-start registration + observation/summary value-convergence pending · review-by: with B1
+  step-6.2). **step-6.5:** `session_filter_registers_a_real_provider_key` +
+  `session_filter_ignores_trivial_or_absent_key` (`ocap.rs`) prove the live registration; the summary
+  redaction is `redact_model_facing` at the three `final_summary_*` returns (`agentic/mod.rs`).
+- **Status:** OPEN — session-start registration + tool-result + summary value-filtering LIVE
+  (step-6.5) atop the step-6.1a chokepoint + step-6.2 encoding matrix. Closure needs the
+  observation/compaction convergence, streaming/error-delta coverage, the remaining session secrets
+  registered, `ChatCtx.disclosure` made required (no `None` escape), and an end-to-end session-secret
+  test — then `verify_disclosure_gate` flips. Do NOT flip it until that e2e test is green · review-by:
+  with the observation-convergence + made-required follow-on
 
 ### sod-proposer-not-worker
 - **Invariant (ideal):** the policy-proposing surface is cryptographically a *different,

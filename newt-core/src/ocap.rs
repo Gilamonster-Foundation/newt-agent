@@ -332,6 +332,27 @@ impl DisclosureFilter {
     }
 }
 
+/// Build the session's model-ingress [`DisclosureFilter`], registering the live
+/// secret VALUES the worker actually holds so they are redacted before any tool
+/// result or summary reaches the model. Today that is the provider API key /
+/// bearer token (`api_key`); the signature is a seam for the other session
+/// secrets (operator key, MCP credential handles) as they are threaded.
+///
+/// A short/empty/placeholder key is NOT registered — a real bearer token is
+/// long and high-entropy, and registering a trivial value would over-redact
+/// benign text. The returned filter is inert (redacts nothing) when there is no
+/// secret to guard, so wiring it into `ChatCtx.disclosure` is bit-for-bit safe.
+#[must_use]
+pub fn session_disclosure_filter(api_key: Option<&str>) -> DisclosureFilter {
+    let mut filter = DisclosureFilter::new();
+    if let Some(key) = api_key {
+        if key.len() >= 8 {
+            filter.register(key);
+        }
+    }
+    filter
+}
+
 #[cfg(test)]
 mod disclosure_tests {
     use super::*;
@@ -341,6 +362,25 @@ mod disclosure_tests {
     }
     fn hexs(s: &str) -> String {
         s.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn session_filter_registers_a_real_provider_key() {
+        // The live session filter catches the provider bearer token — raw and
+        // re-encoded — so a tool result or summary echoing it is redacted.
+        let f = session_disclosure_filter(Some("sk-live-9f3a2b7c1d"));
+        assert!(f.leaks("Authorization: Bearer sk-live-9f3a2b7c1d"));
+        assert!(f.leaks(&format!("k={}", b64("sk-live-9f3a2b7c1d"))));
+        assert!(f.redact("token=sk-live-9f3a2b7c1d").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn session_filter_ignores_trivial_or_absent_key() {
+        // No key → inert (bit-for-bit safe to wire everywhere).
+        assert!(!session_disclosure_filter(None).leaks("anything at all"));
+        // A short/placeholder value is NOT registered — registering it would
+        // over-redact benign text.
+        assert!(!session_disclosure_filter(Some("x")).leaks("x marks the spot"));
     }
 
     #[test]

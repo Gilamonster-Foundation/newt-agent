@@ -534,6 +534,10 @@ async fn run_one_turn(
     // W0 (#1511): served-model + parse-signal observation for the solve
     // contract — same lend-per-turn pattern as `tool_events`.
     let mut solve_obs = crate::agentic::observability::SolveObservation::default();
+    // Session disclosure filter: register the live provider secret so a tool
+    // result or summary that echoes it is value-redacted before it reaches the
+    // model (`disclosure-gate-live-path`). Must outlive `ctx`, which borrows it.
+    let session_disclosure = crate::ocap::session_disclosure_filter(config.api_key.as_deref());
     let ctx = ChatCtx {
         url: &config.url,
         model: &config.model,
@@ -558,7 +562,7 @@ async fn run_one_turn(
         // Headless: no tool-offload (26.3) / scratchpad (26.4) — bit-for-bit.
         tool_offload: false,
         spill_store: None,
-        disclosure: None,
+        disclosure: Some(&session_disclosure),
         compaction_store: None,
         scratchpad: false,
         scratchpad_store: None,
