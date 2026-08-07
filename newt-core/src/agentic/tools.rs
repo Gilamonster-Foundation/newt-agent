@@ -8043,21 +8043,30 @@ mod tests {
         let ws = tempfile::TempDir::new().unwrap();
         let ws_str = ws.path().to_string_lossy();
 
-        // build_check now runs CONFINED through `ConstrainedExecutor` (P4).
-        // Where the kernel fs fence is available the trivial commands run under
-        // it; where it is NOT, the AgentInfluenced spawn fails closed (never
-        // runs the repo-controlled command unconfined).
-        let confinable = cfg!(target_os = "linux") && agent_bridle::landlock_is_supported();
+        // build_check now runs CONFINED through `ConstrainedExecutor` (P4). On the
+        // normative Linux+Landlock platform the trivial commands run under the
+        // fence, so we assert the exact confined pass/fail. Off it, the outcome
+        // depends on the platform's kernel backend — Windows AppContainer / macOS
+        // Seatbelt may confine-and-run, or the spawn fails closed — and BOTH are
+        // secure (the executor never runs the repo-controlled command unconfined).
+        // So off Linux we assert only a well-formed outcome, never the specific
+        // one; the strong confinement guarantee is proven by the real-resource
+        // Landlock test (`tests/confined_exec_landlock.rs`).
+        //
+        // `kernel_fs_fence_available()` is used (not `cfg!() &&
+        // agent_bridle::landlock_is_supported()`): that symbol is Linux-only, so
+        // calling it under a runtime `cfg!()` fails to COMPILE off Linux.
         let passed = run_build_check(passing_build_check_cmd(), &ws_str);
-        if confinable {
+        if crate::confined_exec::kernel_fs_fence_available() {
             assert_eq!(passed, "  ✓ build check passed");
             let failed = run_build_check(&failing_build_check_cmd("boom"), &ws_str);
             assert!(failed.contains("✗ build check failed"), "got: {failed}");
             assert!(failed.contains("boom"), "stderr excerpt shown: {failed}");
         } else {
             assert!(
-                passed.contains("⚠ build check could not run"),
-                "without a kernel fence build_check must fail closed, got: {passed}"
+                passed == "  ✓ build check passed"
+                    || passed.contains("⚠ build check could not run"),
+                "off Linux, build_check must confine-and-run or fail closed, got: {passed}"
             );
         }
         // A nonexistent workspace dir → the command can't even spawn/confine.
@@ -9777,7 +9786,19 @@ mod execute_tool_branch_tests {
             Some(passing_build_check_cmd()),
         )
         .await;
-        assert!(out.contains("✓ build check passed"), "got: {out}");
+        // build_check runs CONFINED (P4). On Linux+Landlock the check runs and
+        // its outcome is reflected; off it (e.g. Windows without the AppContainer
+        // launcher) it fails closed — either way the tool APPENDS a build-check
+        // line, which is what this test guards.
+        let confinable = crate::confined_exec::kernel_fs_fence_available();
+        if confinable {
+            assert!(out.contains("✓ build check passed"), "got: {out}");
+        } else {
+            assert!(
+                out.contains("build check"),
+                "build-check line appended: {out}"
+            );
+        }
 
         let failing_check = failing_build_check_cmd("broke");
         let out = run_tool(
@@ -9788,8 +9809,15 @@ mod execute_tool_branch_tests {
             Some(&failing_check),
         )
         .await;
-        assert!(out.contains("✗ build check failed"), "got: {out}");
-        assert!(out.contains("broke"), "model sees the failure text: {out}");
+        if confinable {
+            assert!(out.contains("✗ build check failed"), "got: {out}");
+            assert!(out.contains("broke"), "model sees the failure text: {out}");
+        } else {
+            assert!(
+                out.contains("build check"),
+                "build-check line appended: {out}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9851,7 +9879,16 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert!(out.starts_with("deleted old.rs"), "got: {out}");
-        assert!(out.contains("✓ build check passed"), "got: {out}");
+        // Confined build_check (P4): outcome-checked on Linux+Landlock, else the
+        // fail-closed line still counts as an appended build-check result.
+        if crate::confined_exec::kernel_fs_fence_available() {
+            assert!(out.contains("✓ build check passed"), "got: {out}");
+        } else {
+            assert!(
+                out.contains("build check"),
+                "build-check line appended: {out}"
+            );
+        }
         assert!(
             !ws.path().join("old.rs").exists(),
             "delete_file must remove the target file"
