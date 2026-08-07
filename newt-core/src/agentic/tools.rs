@@ -1605,10 +1605,38 @@ fn mutation_confirm_question(question: &str) -> Question<PermissionAction> {
 
 /// Run the configured build-check command in `workspace` and return a compact
 /// result string appended to the tool output so the model sees it immediately.
+///
+/// The `build_check_cmd` is **repository-configured** (`.newt/config.toml`), so a
+/// hostile repo controls the shell string. It is therefore attacker-influenced
+/// execution and runs **confined** through [`ConstrainedExecutor`] (P4): the
+/// child starts env-empty (only `PATH`/`HOME` granted — no credentials, #8), its
+/// writes are fenced to the workspace + temp dir and its network denied
+/// ([`build_tool_caveats`], #9), and where the kernel fence cannot be established
+/// the spawn is **refused** rather than run unconfined (#10). It is no longer a
+/// raw `sh -c` on the host.
 pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
-    let result = build_check_shell(cmd).current_dir(workspace).output();
-    match result {
-        Ok(out) if out.status.success() => "  ✓ build check passed".to_string(),
+    use crate::confined_exec::{build_tool_caveats, ConstrainedExecutor, ExecOrigin, ExecRequest};
+    let (program, args) = build_check_argv(cmd);
+    let mut req = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        program,
+        args,
+        workspace,
+        build_tool_caveats(std::path::Path::new(workspace)),
+    )
+    // `HOME` + `TMPDIR` point at the workspace so any HOME-relative or scratch
+    // writes stay inside the write fence; nothing credential-bearing is granted
+    // (#8).
+    .env("HOME", workspace)
+    .env("TMPDIR", workspace);
+    // `PATH` so the configured build tools (cargo/make/…) resolve. It is not a
+    // credential; the fence still governs everything the resolved tool may do.
+    if let Ok(path) = std::env::var("PATH") {
+        req = req.env("PATH", path);
+    }
+
+    match ConstrainedExecutor::run(&req) {
+        Ok(out) if out.success => "  ✓ build check passed".to_string(),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1620,18 +1648,15 @@ pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
     }
 }
 
+/// The interpreter + argv for the configured build-check string, per platform.
 #[cfg(windows)]
-fn build_check_shell(cmd: &str) -> std::process::Command {
-    let mut shell = std::process::Command::new("cmd");
-    shell.args(["/C", cmd]);
-    shell
+fn build_check_argv(cmd: &str) -> (&'static str, Vec<String>) {
+    ("cmd", vec!["/C".to_string(), cmd.to_string()])
 }
 
 #[cfg(not(windows))]
-fn build_check_shell(cmd: &str) -> std::process::Command {
-    let mut shell = std::process::Command::new("sh");
-    shell.args(["-c", cmd]);
-    shell
+fn build_check_argv(cmd: &str) -> (&'static str, Vec<String>) {
+    ("sh", vec!["-c".to_string(), cmd.to_string()])
 }
 
 #[cfg(all(test, windows))]
@@ -8017,14 +8042,25 @@ mod tests {
     fn run_build_check_reports_pass_fail_and_spawn_error() {
         let ws = tempfile::TempDir::new().unwrap();
         let ws_str = ws.path().to_string_lossy();
-        assert_eq!(
-            run_build_check(passing_build_check_cmd(), &ws_str),
-            "  ✓ build check passed"
-        );
-        let failed = run_build_check(&failing_build_check_cmd("boom"), &ws_str);
-        assert!(failed.contains("✗ build check failed"), "got: {failed}");
-        assert!(failed.contains("boom"), "stderr excerpt shown: {failed}");
-        // A nonexistent workspace dir → the command can't even spawn.
+
+        // build_check now runs CONFINED through `ConstrainedExecutor` (P4).
+        // Where the kernel fs fence is available the trivial commands run under
+        // it; where it is NOT, the AgentInfluenced spawn fails closed (never
+        // runs the repo-controlled command unconfined).
+        let confinable = cfg!(target_os = "linux") && agent_bridle::landlock_is_supported();
+        let passed = run_build_check(passing_build_check_cmd(), &ws_str);
+        if confinable {
+            assert_eq!(passed, "  ✓ build check passed");
+            let failed = run_build_check(&failing_build_check_cmd("boom"), &ws_str);
+            assert!(failed.contains("✗ build check failed"), "got: {failed}");
+            assert!(failed.contains("boom"), "stderr excerpt shown: {failed}");
+        } else {
+            assert!(
+                passed.contains("⚠ build check could not run"),
+                "without a kernel fence build_check must fail closed, got: {passed}"
+            );
+        }
+        // A nonexistent workspace dir → the command can't even spawn/confine.
         let err = run_build_check(passing_build_check_cmd(), "/definitely/not/a/dir");
         assert!(err.contains("⚠ build check could not run"), "got: {err}");
     }
