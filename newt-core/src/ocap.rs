@@ -721,6 +721,629 @@ pub fn auto_apply_policy(proposer_fp: &str, worker_fp: &str) -> Result<(), FailC
     Ok(())
 }
 
+// ===========================================================================
+// Achieved-security capability report — the typed, per-guarantee posture model
+// (P8; adversarial targets #11 "reporting matches enforcement" and #12
+// "unsupported platforms cannot claim Linux-equivalent OCAP").
+//
+// The report answers, for the ACTIVE platform and session, seven independent
+// questions — fs / process / network confinement, env / credential isolation,
+// disclosure filtering, fail-closed execution — each with one of three honest
+// answers: Enforced (with evidence), Unverified (open deviation, named), or
+// Unsupported (the platform cannot provide it; permanently fail-closed here).
+//
+// Two laws, both fail-closed:
+//
+//   achieved = meet( platform ceiling , runtime verification )
+//
+// 1. **The ceiling never rounds up.** A `Verified` runtime verifier on a
+//    platform whose ceiling says "cannot provide" still reports Unsupported —
+//    an unsupported platform can never claim Linux-equivalent OCAP (#12).
+// 2. **Reporting is derived, never asserted.** Every entry comes from the same
+//    verifiers the capability gates use (`verify_b1`, `verify_disclosure_gate`,
+//    …), so a posture surface rendering this report cannot drift from actual
+//    enforcement (#11). There is no constructor that takes a free-form claim.
+//
+// Knowledge lives in data (three Cs): each platform's ceiling is a pure const
+// table, and unknown platforms get the all-Unsupported ceiling — the default
+// arm is the MOST restrictive, never `_ => true`.
+// ===========================================================================
+
+/// The seven independently-reported guarantees of the achieved-security report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Guarantee {
+    /// Filesystem authority is object-bound beneath the workspace root.
+    FsConfinement,
+    /// Untrusted child processes run under kernel-backed confinement.
+    ProcessConfinement,
+    /// Untrusted code has no network egress without an explicit capability.
+    NetworkConfinement,
+    /// Untrusted children start from a cleared, minimal environment.
+    EnvIsolation,
+    /// Ambient credentials are unreachable from untrusted code.
+    CredentialIsolation,
+    /// Registered secret values are filtered from every model-ingress funnel.
+    DisclosureFiltering,
+    /// A missing required guarantee refuses the operation (no silent downgrade).
+    FailClosedExecution,
+}
+
+impl Guarantee {
+    /// Every guarantee, for exhaustive iteration (reports, banners, audits).
+    pub const ALL: [Self; 7] = [
+        Self::FsConfinement,
+        Self::ProcessConfinement,
+        Self::NetworkConfinement,
+        Self::EnvIsolation,
+        Self::CredentialIsolation,
+        Self::DisclosureFiltering,
+        Self::FailClosedExecution,
+    ];
+
+    /// Stable short label for banners and logs.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FsConfinement => "fs-confinement",
+            Self::ProcessConfinement => "process-confinement",
+            Self::NetworkConfinement => "network-confinement",
+            Self::EnvIsolation => "env-isolation",
+            Self::CredentialIsolation => "credential-isolation",
+            Self::DisclosureFiltering => "disclosure-filtering",
+            Self::FailClosedExecution => "fail-closed-execution",
+        }
+    }
+}
+
+/// What the active platform + session actually achieve for one guarantee.
+/// There is deliberately no "best effort" variant — a guarantee is enforced
+/// with evidence, open with a named deviation, or unsupported. Nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Achieved {
+    /// Actually enforced this session; `evidence` records how.
+    Enforced { evidence: String },
+    /// The platform could provide it, but the enforcement is unbuilt or
+    /// unproven — the named open deviation in the register.
+    Unverified {
+        deviation: &'static str,
+        reason: String,
+    },
+    /// The platform cannot provide it. Permanently fail-closed here; an
+    /// operation requiring it must refuse (never silently degrade).
+    Unsupported { reason: String },
+}
+
+impl Achieved {
+    #[must_use]
+    pub fn is_enforced(&self) -> bool {
+        matches!(self, Self::Enforced { .. })
+    }
+}
+
+/// A platform's *capability ceiling*: for each guarantee, either "the platform
+/// can support it — let the runtime verifier decide" (`None`) or "the platform
+/// cannot provide it" with the honest reason (`Some`). Pure data, one const
+/// per platform; the meet with runtime evidence never exceeds this ceiling.
+#[derive(Debug)]
+pub struct PlatformCeiling {
+    pub platform: &'static str,
+    /// `(guarantee, None | Some(cannot-provide reason))`, one row per guarantee.
+    table: [(Guarantee, Option<&'static str>); 7],
+}
+
+impl PlatformCeiling {
+    /// `Some(reason)` when the platform cannot provide `g`; `None` when the
+    /// runtime verifier decides. A guarantee missing from the table is treated
+    /// as unsupported — absence of knowledge is not a grant.
+    #[must_use]
+    pub fn cannot_provide(&self, g: Guarantee) -> Option<&'static str> {
+        for (row, reason) in &self.table {
+            if *row == g {
+                return *reason;
+            }
+        }
+        Some("guarantee not present in this platform's ceiling table")
+    }
+}
+
+/// Linux: the normative fully-supported OCAP platform. Every guarantee is
+/// supportable; the runtime verifiers decide what is actually achieved.
+pub const LINUX_CEILING: PlatformCeiling = PlatformCeiling {
+    platform: "linux",
+    table: [
+        (Guarantee::FsConfinement, None),
+        (Guarantee::ProcessConfinement, None),
+        (Guarantee::NetworkConfinement, None),
+        (Guarantee::EnvIsolation, None),
+        (Guarantee::CredentialIsolation, None),
+        (Guarantee::DisclosureFiltering, None),
+        (Guarantee::FailClosedExecution, None),
+    ],
+};
+
+/// macOS: explicitly NOT Linux-equivalent for this milestone. Object-bound fs
+/// (`openat2`) does not exist; the Seatbelt-backed kernel floor is unbuilt and
+/// unverified (no runner), so kernel-backed guarantees are unsupported — honest
+/// and fail-closed, per the "Linux is normative" ADR. Process-independent
+/// guarantees (disclosure filtering, fail-closed gating) remain supportable.
+pub const MACOS_CEILING: PlatformCeiling = PlatformCeiling {
+    platform: "macos",
+    table: [
+        (
+            Guarantee::FsConfinement,
+            Some("no openat2(RESOLVE_BENEATH); lexical fallback is not object-bound"),
+        ),
+        (
+            Guarantee::ProcessConfinement,
+            Some("Seatbelt floor unbuilt/unverified (no macOS runner); B1 unsupported here"),
+        ),
+        (
+            Guarantee::NetworkConfinement,
+            Some("no kernel-backed default-deny egress on this platform"),
+        ),
+        (Guarantee::EnvIsolation, None),
+        (
+            Guarantee::CredentialIsolation,
+            Some("without fs/process confinement, ambient credentials are reachable"),
+        ),
+        (Guarantee::DisclosureFiltering, None),
+        (Guarantee::FailClosedExecution, None),
+    ],
+};
+
+/// Windows: same posture as macOS — kernel-backed guarantees unsupported
+/// (no openat2/Landlock; AppContainer unbuilt), process-independent ones
+/// supportable. Never claims Linux-equivalent OCAP.
+pub const WINDOWS_CEILING: PlatformCeiling = PlatformCeiling {
+    platform: "windows",
+    table: [
+        (
+            Guarantee::FsConfinement,
+            Some("no openat2(RESOLVE_BENEATH); lexical fallback is not object-bound"),
+        ),
+        (
+            Guarantee::ProcessConfinement,
+            Some("AppContainer floor unbuilt; B1 unsupported here"),
+        ),
+        (
+            Guarantee::NetworkConfinement,
+            Some("no kernel-backed default-deny egress on this platform"),
+        ),
+        (Guarantee::EnvIsolation, None),
+        (
+            Guarantee::CredentialIsolation,
+            Some("without fs/process confinement, ambient credentials are reachable"),
+        ),
+        (Guarantee::DisclosureFiltering, None),
+        (Guarantee::FailClosedExecution, None),
+    ],
+};
+
+/// Any platform we have no ceiling for: everything unsupported. The default
+/// arm of the platform axis is the most restrictive — the exact opposite of a
+/// `_ => true` fail-open.
+pub const UNKNOWN_CEILING: PlatformCeiling = PlatformCeiling {
+    platform: "unknown",
+    table: [
+        (Guarantee::FsConfinement, Some("unrecognized platform")),
+        (Guarantee::ProcessConfinement, Some("unrecognized platform")),
+        (Guarantee::NetworkConfinement, Some("unrecognized platform")),
+        (Guarantee::EnvIsolation, Some("unrecognized platform")),
+        (
+            Guarantee::CredentialIsolation,
+            Some("unrecognized platform"),
+        ),
+        (
+            Guarantee::DisclosureFiltering,
+            Some("unrecognized platform"),
+        ),
+        (
+            Guarantee::FailClosedExecution,
+            Some("unrecognized platform"),
+        ),
+    ],
+};
+
+/// The ceiling for the platform this binary was built for.
+#[must_use]
+pub fn current_platform_ceiling() -> &'static PlatformCeiling {
+    #[cfg(target_os = "linux")]
+    {
+        &LINUX_CEILING
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &MACOS_CEILING
+    }
+    #[cfg(windows)]
+    {
+        &WINDOWS_CEILING
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        &UNKNOWN_CEILING
+    }
+}
+
+/// Verify object-bound workspace fs (`fs-canonical-containment`). On Linux the
+/// `fs_cap::WorkspaceDir` capability resolves every access with
+/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`; on kernels without
+/// `openat2` the resolve *errors* (refusal, not downgrade). Elsewhere the
+/// object-bound capability does not exist — the named open residual.
+#[must_use]
+pub fn verify_fs_object_bound() -> Verification {
+    #[cfg(target_os = "linux")]
+    {
+        Verification::Verified {
+            evidence: "fs_cap::WorkspaceDir: openat2(RESOLVE_BENEATH|NO_MAGICLINKS) object-bound \
+                       resolve on every access; ENOSYS kernels refuse rather than degrade \
+                       (register: fs-canonical-containment closed on Linux)"
+                .into(),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Verification::Absent {
+            deviation: "fs-canonical-containment",
+            reason: "no openat2 on this platform; only the lexical-prefix fallback exists".into(),
+        }
+    }
+}
+
+/// Verify the mandatory confined executor (`p4-constrained-executor`): every
+/// attacker-influenced subprocess routed through one env-cleared, confined
+/// spawn seam. OPEN — the spawn inventory still carries unmigrated agent-exec
+/// sites, so children can inherit env/credentials until the migration lands.
+#[must_use]
+pub fn verify_constrained_executor() -> Verification {
+    Verification::Absent {
+        deviation: "p4-constrained-executor",
+        reason: "agent-exec spawn sites not yet routed through the confined executor \
+                 (see docs/security/spawn-inventory.toml; inventory-gated in CI)"
+            .into(),
+    }
+}
+
+/// Verify fail-closed execution: a *required-but-unavailable* guarantee refuses
+/// the operation instead of silently degrading. On Linux this is structural —
+/// the `require()`/[`FailClosed`] gates plus the CI-enforced OCAP-DANGER/GATE
+/// pairing (`scripts/ocap_check.py`) make un-gated dangerous paths a build
+/// error. Off Linux, untrusted fs still falls back to lexical containment — a
+/// silent downgrade — so this verifier stays honest-Absent there until the
+/// refusal wiring lands.
+#[must_use]
+pub fn verify_fail_closed_execution() -> Verification {
+    #[cfg(target_os = "linux")]
+    {
+        Verification::Verified {
+            evidence: "require()/FailClosed capability gates; OCAP-DANGER/OCAP-GATE pairing \
+                       statically enforced in CI (scripts/ocap_check.py); confined-by-default \
+                       launch lane (resolve_lane: Yolo only via explicit --unsafe-host-exec)"
+                .into(),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Verification::Absent {
+            deviation: "fs-canonical-containment",
+            reason: "untrusted fs falls back to lexical containment off Linux — a silent \
+                     downgrade, not a refusal"
+                .into(),
+        }
+    }
+}
+
+/// The runtime half of the meet: the verifier results the report derives from.
+/// Constructed from the SAME verifiers the capability gates call — there is no
+/// field a caller can set to a free-form claim.
+#[derive(Debug, Clone)]
+pub struct RuntimeEvidence {
+    pub b1: Verification,
+    pub disclosure: Verification,
+    pub fs_object_bound: Verification,
+    pub constrained_executor: Verification,
+    pub fail_closed: Verification,
+}
+
+impl RuntimeEvidence {
+    /// The live evidence for this build + session.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            b1: verify_b1(),
+            disclosure: verify_disclosure_gate(),
+            fs_object_bound: verify_fs_object_bound(),
+            constrained_executor: verify_constrained_executor(),
+            fail_closed: verify_fail_closed_execution(),
+        }
+    }
+
+    /// meet: `Verified` only when both are; otherwise the first `Absent` wins.
+    fn meet(a: &Verification, b: &Verification) -> Verification {
+        match (a, b) {
+            (Verification::Verified { evidence: ea }, Verification::Verified { evidence: eb }) => {
+                Verification::Verified {
+                    evidence: format!("{ea}; {eb}"),
+                }
+            }
+            (Verification::Absent { .. }, _) => a.clone(),
+            (_, Verification::Absent { .. }) => b.clone(),
+        }
+    }
+
+    /// Which verifier(s) ground each guarantee. Compound guarantees take the
+    /// meet — e.g. credential isolation needs BOTH the env-cleared executor
+    /// (no inherited creds) and the B1 floor (no fs/net reach to stored creds).
+    #[must_use]
+    pub fn for_guarantee(&self, g: Guarantee) -> Verification {
+        match g {
+            Guarantee::FsConfinement => self.fs_object_bound.clone(),
+            Guarantee::ProcessConfinement => Self::meet(&self.constrained_executor, &self.b1),
+            Guarantee::NetworkConfinement => self.b1.clone(),
+            Guarantee::EnvIsolation => self.constrained_executor.clone(),
+            Guarantee::CredentialIsolation => Self::meet(&self.constrained_executor, &self.b1),
+            Guarantee::DisclosureFiltering => self.disclosure.clone(),
+            Guarantee::FailClosedExecution => self.fail_closed.clone(),
+        }
+    }
+}
+
+/// The achieved-security report: platform + one honest [`Achieved`] entry per
+/// guarantee. Posture surfaces render THIS (never independent strings), so
+/// reporting cannot drift from enforcement.
+#[derive(Debug, Clone)]
+pub struct SecurityReport {
+    pub platform: &'static str,
+    entries: Vec<(Guarantee, Achieved)>,
+}
+
+impl SecurityReport {
+    /// The report for this build's platform and the live runtime evidence.
+    #[must_use]
+    pub fn current() -> Self {
+        Self::from_parts(current_platform_ceiling(), &RuntimeEvidence::current())
+    }
+
+    /// The pure meet — testable with any ceiling/evidence combination.
+    #[must_use]
+    pub fn from_parts(ceiling: &PlatformCeiling, ev: &RuntimeEvidence) -> Self {
+        let entries = Guarantee::ALL
+            .iter()
+            .map(|&g| {
+                let achieved = match ceiling.cannot_provide(g) {
+                    // The ceiling never rounds up: unsupported stays unsupported
+                    // even if a runtime verifier would report Verified (#12).
+                    Some(reason) => Achieved::Unsupported {
+                        reason: reason.into(),
+                    },
+                    None => match ev.for_guarantee(g) {
+                        Verification::Verified { evidence } => Achieved::Enforced { evidence },
+                        Verification::Absent { deviation, reason } => {
+                            Achieved::Unverified { deviation, reason }
+                        }
+                    },
+                };
+                (g, achieved)
+            })
+            .collect();
+        Self {
+            platform: ceiling.platform,
+            entries,
+        }
+    }
+
+    /// The achieved state for one guarantee.
+    #[must_use]
+    pub fn achieved(&self, g: Guarantee) -> &Achieved {
+        // ALL is exhaustive and from_parts builds one entry per guarantee.
+        &self
+            .entries
+            .iter()
+            .find(|(row, _)| *row == g)
+            .expect("SecurityReport holds every Guarantee")
+            .1
+    }
+
+    #[must_use]
+    pub fn is_enforced(&self, g: Guarantee) -> bool {
+        self.achieved(g).is_enforced()
+    }
+
+    /// One honest line per guarantee for posture banners / logs.
+    #[must_use]
+    pub fn summary_lines(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|(g, a)| match a {
+                Achieved::Enforced { .. } => format!("{}: enforced", g.label()),
+                Achieved::Unverified { deviation, .. } => {
+                    format!("{}: OPEN ({deviation})", g.label())
+                }
+                Achieved::Unsupported { .. } => {
+                    format!("{}: unsupported on {}", g.label(), self.platform)
+                }
+            })
+            .collect()
+    }
+}
+
+/// The refusal primitive for operations that require a guarantee: proceeds only
+/// on `Enforced`, refuses (fail-closed) on `Unverified` and `Unsupported`. The
+/// P8 law "if an operation requires an unavailable guarantee, refuse it".
+pub fn require_achieved(report: &SecurityReport, g: Guarantee) -> Result<(), FailClosed> {
+    match report.achieved(g) {
+        Achieved::Enforced { .. } => Ok(()),
+        Achieved::Unverified { deviation, reason } => Err(FailClosed {
+            deviation,
+            reason: reason.clone(),
+        }),
+        Achieved::Unsupported { reason } => Err(FailClosed {
+            deviation: "platform-unsupported",
+            reason: format!(
+                "{} is unsupported on {}: {reason}",
+                g.label(),
+                report.platform
+            ),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// Evidence with everything Verified — for proving the ceiling still wins.
+    fn all_verified() -> RuntimeEvidence {
+        let v = || Verification::Verified {
+            evidence: "synthetic".into(),
+        };
+        RuntimeEvidence {
+            b1: v(),
+            disclosure: v(),
+            fs_object_bound: v(),
+            constrained_executor: v(),
+            fail_closed: v(),
+        }
+    }
+
+    #[test]
+    fn linux_report_matches_live_verifier_state() {
+        // Reporting derives from the SAME verifiers the gates use (#11):
+        // with b1 + p4 open, only disclosure (+ fs/fail-closed on Linux) may
+        // report enforced — and process/network/env/credential must name their
+        // open deviations.
+        let report = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+        assert!(matches!(
+            report.achieved(Guarantee::DisclosureFiltering),
+            Achieved::Enforced { .. }
+        ));
+        assert!(matches!(
+            report.achieved(Guarantee::NetworkConfinement),
+            Achieved::Unverified {
+                deviation: "b1-os-isolation",
+                ..
+            }
+        ));
+        assert!(matches!(
+            report.achieved(Guarantee::EnvIsolation),
+            Achieved::Unverified {
+                deviation: "p4-constrained-executor",
+                ..
+            }
+        ));
+        assert!(matches!(
+            report.achieved(Guarantee::ProcessConfinement),
+            Achieved::Unverified { .. }
+        ));
+        assert!(matches!(
+            report.achieved(Guarantee::CredentialIsolation),
+            Achieved::Unverified { .. }
+        ));
+    }
+
+    #[test]
+    fn ceiling_never_rounds_up() {
+        // Adversarial #12: even with EVERY runtime verifier Verified, a
+        // platform whose ceiling says "cannot provide" must report Unsupported
+        // — an unsupported platform can never claim Linux-equivalent OCAP.
+        for ceiling in [&MACOS_CEILING, &WINDOWS_CEILING] {
+            let report = SecurityReport::from_parts(ceiling, &all_verified());
+            for g in [
+                Guarantee::FsConfinement,
+                Guarantee::ProcessConfinement,
+                Guarantee::NetworkConfinement,
+                Guarantee::CredentialIsolation,
+            ] {
+                assert!(
+                    matches!(report.achieved(g), Achieved::Unsupported { .. }),
+                    "{} must be Unsupported on {}",
+                    g.label(),
+                    ceiling.platform
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_platform_is_fully_unsupported() {
+        // The default arm of the platform axis is the MOST restrictive.
+        let report = SecurityReport::from_parts(&UNKNOWN_CEILING, &all_verified());
+        for g in Guarantee::ALL {
+            assert!(
+                matches!(report.achieved(g), Achieved::Unsupported { .. }),
+                "{} must be Unsupported on unknown platforms",
+                g.label()
+            );
+        }
+    }
+
+    #[test]
+    fn require_achieved_refuses_unverified_and_unsupported() {
+        // The refusal primitive: Enforced proceeds; everything else refuses.
+        let linux = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+        assert!(require_achieved(&linux, Guarantee::DisclosureFiltering).is_ok());
+        let err = require_achieved(&linux, Guarantee::NetworkConfinement).unwrap_err();
+        assert_eq!(err.deviation, "b1-os-isolation");
+
+        let mac = SecurityReport::from_parts(&MACOS_CEILING, &all_verified());
+        let err = require_achieved(&mac, Guarantee::FsConfinement).unwrap_err();
+        assert_eq!(err.deviation, "platform-unsupported");
+        assert!(err.to_string().contains("fail-closed"));
+    }
+
+    #[test]
+    fn compound_guarantees_take_the_meet() {
+        // Credential isolation needs BOTH the executor and b1: one Absent half
+        // keeps the guarantee Unverified even when the other half is Verified.
+        let mut ev = all_verified();
+        ev.b1 = verify_b1(); // Absent
+        let report = SecurityReport::from_parts(&LINUX_CEILING, &ev);
+        assert!(matches!(
+            report.achieved(Guarantee::CredentialIsolation),
+            Achieved::Unverified {
+                deviation: "b1-os-isolation",
+                ..
+            }
+        ));
+        // And with both halves Verified it is enforced.
+        let report = SecurityReport::from_parts(&LINUX_CEILING, &all_verified());
+        assert!(report.is_enforced(Guarantee::CredentialIsolation));
+    }
+
+    #[test]
+    fn summary_lines_cover_every_guarantee_honestly() {
+        let report = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+        let lines = report.summary_lines();
+        assert_eq!(lines.len(), Guarantee::ALL.len());
+        assert!(lines.iter().any(|l| l == "disclosure-filtering: enforced"));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("network-confinement: OPEN (b1-os-isolation)")));
+    }
+
+    #[test]
+    fn current_report_reflects_build_platform() {
+        // On the Linux CI/dev platform the live report enforces fs +
+        // fail-closed; on non-Linux builds those same rows must be honest
+        // (Absent/Unsupported), never a silent Linux-equivalent claim.
+        let report = SecurityReport::current();
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(report.platform, "linux");
+            assert!(report.is_enforced(Guarantee::FsConfinement));
+            assert!(report.is_enforced(Guarantee::FailClosedExecution));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_ne!(report.platform, "linux");
+            assert!(!report.is_enforced(Guarantee::FsConfinement));
+            assert!(!report.is_enforced(Guarantee::FailClosedExecution));
+        }
+        // Everywhere: disclosure filtering is process-independent and live.
+        assert!(report.is_enforced(Guarantee::DisclosureFiltering));
+    }
+}
+
 #[cfg(test)]
 mod sod_tests {
     use super::*;

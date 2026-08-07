@@ -1,9 +1,21 @@
 //! `newt doctor` — health-check local backends and provider plugins.
 
 use newt_core::dgx::{DgxConfig, EndpointKind};
+use newt_core::ocap::SecurityReport;
 use newt_core::Config;
 use newt_inference::local::LocalOllamaBackend;
 use std::path::Path;
+
+/// Render the achieved-security report as `doctor` posture lines. Pure over the
+/// report so it is testable without a live host: one honest line per guarantee,
+/// derived from the report (never independent prose), and headed with the
+/// platform so an unsupported platform's lines read `unsupported on <plat>`.
+fn security_posture_lines(report: &SecurityReport) -> Vec<String> {
+    let mut lines = Vec::with_capacity(report.summary_lines().len() + 1);
+    lines.push(format!("platform: {}", report.platform));
+    lines.extend(report.summary_lines());
+    lines
+}
 
 pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     println!("newt doctor — checking backends\n");
@@ -109,6 +121,16 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         "  agent-bridle attenuates your full ambient authority into structural OCAP grants; \
          --full-access temporarily lifts them."
     );
+
+    // Achieved OCAP posture, per guarantee (#11 / #12). Every line is DERIVED
+    // from the same `verify_*` invariants the capability gates enforce (via
+    // `SecurityReport::current()`), never hand-written prose — so this diagnostic
+    // cannot drift from what is actually enforced, and an unsupported platform
+    // reports `unsupported` rather than a Linux-equivalent claim.
+    println!("\nAchieved OCAP posture (per guarantee):");
+    for line in security_posture_lines(&newt_core::ocap::SecurityReport::current()) {
+        println!("  {line}");
+    }
 
     println!("\nMCP servers (newt config + Claude Code config):");
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -387,4 +409,55 @@ pub fn sign_ocap() -> anyhow::Result<i32> {
     println!("verified: {live} durable grant(s) live at load");
 
     Ok(if refused.is_empty() { 0 } else { 2 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use newt_core::ocap::{Guarantee, RuntimeEvidence, LINUX_CEILING, MACOS_CEILING};
+
+    #[test]
+    fn posture_lines_are_derived_from_the_report_not_prose() {
+        // #11: doctor renders exactly the report's guarantees, one line each,
+        // plus a platform header — the diagnostic cannot drift from enforcement.
+        let report = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+        let lines = security_posture_lines(&report);
+        assert_eq!(lines.len(), Guarantee::ALL.len() + 1);
+        assert_eq!(lines[0], "platform: linux");
+        // Disclosure filtering is enforced on the live path; the render says so.
+        assert!(lines.iter().any(|l| l == "disclosure-filtering: enforced"));
+        // b1-gated guarantees are honestly OPEN, not silently claimed.
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("network-confinement: OPEN (b1-os-isolation)")));
+    }
+
+    #[test]
+    fn unsupported_platform_never_renders_a_linux_equivalent_claim() {
+        // #12: even if every runtime verifier were Verified, a macOS render
+        // reports kernel-backed guarantees as `unsupported on macos`.
+        let all_verified = {
+            let v = || newt_core::ocap::Verification::Verified {
+                evidence: "synthetic".into(),
+            };
+            RuntimeEvidence {
+                b1: v(),
+                disclosure: v(),
+                fs_object_bound: v(),
+                constrained_executor: v(),
+                fail_closed: v(),
+            }
+        };
+        let report = SecurityReport::from_parts(&MACOS_CEILING, &all_verified);
+        let lines = security_posture_lines(&report);
+        assert_eq!(lines[0], "platform: macos");
+        assert!(lines
+            .iter()
+            .any(|l| l == "fs-confinement: unsupported on macos"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "process-confinement: unsupported on macos"));
+        // No line may claim a kernel guarantee is "enforced" on macOS.
+        assert!(!lines.iter().any(|l| l == "fs-confinement: enforced"));
+    }
 }
