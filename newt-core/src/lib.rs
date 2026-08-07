@@ -35,6 +35,7 @@ pub mod flight_recorder;
 #[cfg(target_os = "linux")]
 pub mod fs_cap;
 pub mod git_caveats;
+pub mod git_hardening;
 pub mod kit;
 pub mod lazy_emission;
 pub mod mcp;

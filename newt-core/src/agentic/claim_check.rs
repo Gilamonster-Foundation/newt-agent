@@ -329,10 +329,10 @@ pub(crate) fn git_head(workspace: &str) -> Option<String> {
 
 /// Run a read-only git plumbing command in `workspace`; `None` on any failure.
 fn git_in(workspace: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
+    // Confused-deputy-safe: `workspace` may be a hostile repo whose `.git/config`
+    // could turn a raw `git` read into out-of-fence code (core.fsmonitor, hooks,
+    // diff.external, …). `hardened_git` disarms that surface (step-7.4).
+    let out = crate::git_hardening::hardened_git(std::path::Path::new(workspace), args)
         .output()
         .ok()?;
     out.status

@@ -4932,13 +4932,15 @@ fn build_system_prompt_with_persona(
         }
     }
 
-    // Recent git log
-    let log = std::process::Command::new("git")
-        .args(["-C", workspace, "log", "--oneline", "-10"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
+    // Recent git log (confused-deputy-safe, step-7.4: the workspace may be hostile)
+    let log = newt_core::git_hardening::hardened_git(
+        std::path::Path::new(workspace),
+        &["log", "--oneline", "-10"],
+    )
+    .output()
+    .ok()
+    .and_then(|o| String::from_utf8(o.stdout).ok())
+    .unwrap_or_default();
     if !log.is_empty() {
         ctx.push_str(&format!("\nRecent commits:\n{log}"));
     }
@@ -7437,20 +7439,25 @@ fn search_help_text() -> &'static str {
 /// Best-effort HEAD + dirty bit for lightweight index status (#1387). Runtime
 /// glue (not unit-tier) — absence is reported honestly as unavailable.
 fn lightweight_git_meta(workspace: &str) -> (Option<String>, Option<bool>) {
-    let head = std::process::Command::new("git")
-        .args(["-C", workspace, "rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let dirty = std::process::Command::new("git")
-        .args(["-C", workspace, "status", "--porcelain"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| !o.stdout.is_empty());
+    // Confused-deputy-safe (step-7.4): the workspace may be a hostile repo.
+    let head = newt_core::git_hardening::hardened_git(
+        std::path::Path::new(workspace),
+        &["rev-parse", "HEAD"],
+    )
+    .output()
+    .ok()
+    .filter(|o| o.status.success())
+    .and_then(|o| String::from_utf8(o.stdout).ok())
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+    let dirty = newt_core::git_hardening::hardened_git(
+        std::path::Path::new(workspace),
+        &["status", "--porcelain"],
+    )
+    .output()
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| !o.stdout.is_empty());
     (head, dirty)
 }
 
