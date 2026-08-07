@@ -249,24 +249,74 @@ impl DisclosureFilter {
         }
     }
 
-    /// The forms of `secret` we match: raw, standard base64, and lowercase hex.
-    fn encodings(secret: &str) -> [String; 3] {
+    /// The concrete forms of `secret` we match: the raw value plus its common
+    /// re-encodings — base64 (standard + url-safe, padded + unpadded), hex
+    /// (lower + upper), percent-encoding (upper + lower), and the `\xXX` /
+    /// `\uXXXX` string escapes. A model bent on exfiltration re-encodes; a
+    /// VALUE filter follows the value through each transform rather than
+    /// guessing at a shape. Deduped — short secrets collide across some forms.
+    ///
+    /// The `\uXXXX` form escapes per byte (`\u00XX`), which matches a real JSON
+    /// escape only for ASCII secrets; non-ASCII tokens are still caught by the
+    /// raw / base64 / hex forms.
+    fn encodings(secret: &str) -> Vec<String> {
+        use base64::engine::general_purpose::{
+            STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
+        };
         let bytes = secret.as_bytes();
-        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        [secret.to_string(), b64, hex]
+        let hex_lower: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_upper: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let pct_upper: String = bytes.iter().map(|b| format!("%{b:02X}")).collect();
+        let pct_lower: String = bytes.iter().map(|b| format!("%{b:02x}")).collect();
+        let esc_x: String = bytes.iter().map(|b| format!("\\x{b:02x}")).collect();
+        let esc_u: String = bytes.iter().map(|b| format!("\\u{b:04x}")).collect();
+        let mut forms = vec![
+            secret.to_string(),
+            STANDARD.encode(bytes),
+            STANDARD_NO_PAD.encode(bytes),
+            URL_SAFE.encode(bytes),
+            URL_SAFE_NO_PAD.encode(bytes),
+            hex_lower,
+            hex_upper,
+            pct_upper,
+            pct_lower,
+            esc_x,
+            esc_u,
+        ];
+        forms.sort();
+        forms.dedup();
+        forms
     }
 
-    /// Does `text` disclose any registered secret, raw or re-encoded?
+    /// The text with all Unicode whitespace removed — the normalisation that
+    /// defeats a **chunk-split** obfuscation, where a secret (or one of its
+    /// encodings) is broken across whitespace: `CANARY\n-7f3a…`, a line-wrapped
+    /// base64 blob, hex split every N chars. Scanning both the raw text and its
+    /// whitespace-stripped form catches the split without a reflow pass.
+    fn strip_ws(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Does `text` disclose any registered secret, in any tracked encoding —
+    /// including a **chunk-split** occurrence broken across whitespace? This is
+    /// the authoritative gate decision; the live path withholds a result for
+    /// which this returns `true`.
     #[must_use]
     pub fn leaks(&self, text: &str) -> bool {
-        self.secrets
-            .iter()
-            .any(|s| Self::encodings(s).iter().any(|e| text.contains(e.as_str())))
+        let normalized = Self::strip_ws(text);
+        self.secrets.iter().any(|s| {
+            Self::encodings(s)
+                .iter()
+                .any(|e| text.contains(e.as_str()) || normalized.contains(e.as_str()))
+        })
     }
 
     /// Replace every occurrence of every registered secret (raw or re-encoded)
-    /// with `[REDACTED]`.
+    /// with `[REDACTED]`. Contiguous forms are excised inline; a **chunk-split**
+    /// occurrence can't be excised without reflowing the text, so if any secret
+    /// still surfaces once whitespace is normalised away, the whole text is
+    /// withheld (fail closed). The post-condition `!self.leaks(&self.redact(t))`
+    /// therefore holds for *every* input, contiguous or split.
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
         let mut out = text.to_string();
@@ -274,6 +324,9 @@ impl DisclosureFilter {
             for enc in Self::encodings(s) {
                 out = out.replace(enc.as_str(), "[REDACTED]");
             }
+        }
+        if self.leaks(&out) {
+            return "[REDACTED: withheld — disclosed a registered secret]".to_string();
         }
         out
     }
@@ -341,6 +394,148 @@ mod disclosure_tests {
         let mut f = DisclosureFilter::new();
         f.register("");
         assert!(!f.leaks("anything at all"));
+    }
+
+    // ── Full re-encoding matrix (mandate: raw, base64/base64url, hex, escaped,
+    //    URL-encoded, chunk-split) ─────────────────────────────────────────────
+
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+
+    /// A secret whose bytes force `+`/`/` in standard base64, so its base64url
+    /// form genuinely differs (the `-`/`_` alphabet). The non-ASCII tail
+    /// guarantees it.
+    const B64_DISTINCT: &str = "canary-\u{00ff}\u{00fe}\u{00fd}";
+
+    #[test]
+    fn catches_base64url_reencoding() {
+        let mut f = DisclosureFilter::new();
+        f.register(B64_DISTINCT);
+        let url = URL_SAFE.encode(B64_DISTINCT.as_bytes());
+        let std = base64::engine::general_purpose::STANDARD.encode(B64_DISTINCT.as_bytes());
+        assert_ne!(
+            url, std,
+            "test secret must distinguish base64 from base64url"
+        );
+        assert!(
+            f.leaks(&format!("payload={url}")),
+            "base64url must be caught"
+        );
+        assert!(f.leaks(&format!(
+            "payload={}",
+            URL_SAFE_NO_PAD.encode(B64_DISTINCT.as_bytes())
+        )));
+    }
+
+    #[test]
+    fn catches_base64_nopad_reencoding() {
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        assert!(f.leaks(&format!(
+            "b={}",
+            STANDARD_NO_PAD.encode("CANARY-7f3a9c2b".as_bytes())
+        )));
+    }
+
+    #[test]
+    fn catches_uppercase_hex() {
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        let upper: String = "CANARY-7f3a9c2b"
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        assert!(f.leaks(&format!("HX={upper}")));
+    }
+
+    #[test]
+    fn catches_percent_encoding() {
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        let pct: String = "CANARY-7f3a9c2b"
+            .as_bytes()
+            .iter()
+            .map(|b| format!("%{b:02X}"))
+            .collect();
+        assert!(
+            f.leaks(&format!("q={pct}")),
+            "URL/percent-encoding must be caught"
+        );
+    }
+
+    #[test]
+    fn catches_string_escapes() {
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        let esc_x: String = "CANARY-7f3a9c2b"
+            .as_bytes()
+            .iter()
+            .map(|b| format!("\\x{b:02x}"))
+            .collect();
+        let esc_u: String = "CANARY-7f3a9c2b"
+            .as_bytes()
+            .iter()
+            .map(|b| format!("\\u{b:04x}"))
+            .collect();
+        assert!(
+            f.leaks(&format!("s=\"{esc_x}\"")),
+            "\\xXX escape must be caught"
+        );
+        assert!(
+            f.leaks(&format!("s=\"{esc_u}\"")),
+            "\\uXXXX escape must be caught"
+        );
+    }
+
+    #[test]
+    fn catches_chunk_split_raw() {
+        // The secret broken across whitespace (newline/space) — a shape a model
+        // uses to slip a value past a naive contiguous scan.
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        assert!(f.leaks("prefix CANARY-\n7f3a9c2b suffix"));
+        assert!(f.leaks("C A N A R Y - 7 f 3 a 9 c 2 b"));
+    }
+
+    #[test]
+    fn catches_chunk_split_base64() {
+        // A line-wrapped base64 blob (the classic MIME 76-col wrap) must still
+        // be caught once whitespace is normalised.
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        let b64 = base64::engine::general_purpose::STANDARD.encode("CANARY-7f3a9c2b".as_bytes());
+        let mid = b64.len() / 2;
+        let wrapped = format!("{}\n{}", &b64[..mid], &b64[mid..]);
+        assert!(f.leaks(&wrapped), "line-wrapped base64 must be caught");
+    }
+
+    #[test]
+    fn redact_withholds_chunk_split() {
+        // Chunk-split can't be excised inline; redact must fail closed by
+        // withholding the whole text, so the post-condition holds for split too.
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        let split = "leak: CANARY-\n7f3a9c2b done";
+        let red = f.redact(split);
+        assert!(!f.leaks(&red), "redacted split text must not leak");
+        assert!(
+            red.contains("withheld"),
+            "split redaction withholds wholesale"
+        );
+    }
+
+    #[test]
+    fn redact_post_condition_holds_for_every_form() {
+        // The invariant that makes redact safe to forward: its output never
+        // leaks, across the whole encoding matrix + a chunk split.
+        let mut f = DisclosureFilter::new();
+        f.register("SECRETVAL-abc123");
+        let s = "SECRETVAL-abc123";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(s.as_bytes());
+        let hex: String = s.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let pct: String = s.as_bytes().iter().map(|b| format!("%{b:02X}")).collect();
+        let text = format!("raw={s} b64={b64} hex={hex} pct={pct} split=SEC\nRETVAL-abc123");
+        assert!(!f.leaks(&f.redact(&text)), "redact output must never leak");
     }
 }
 
