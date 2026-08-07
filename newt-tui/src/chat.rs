@@ -4811,6 +4811,7 @@ pub(crate) fn run_chat(
                                         spill_store: Some(
                                             &spill_store as &dyn newt_core::SpillStore,
                                         ),
+                                        disclosure: None,
                                         compaction_store: Some(
                                             &compaction_store as &dyn newt_core::SpillStore,
                                         ),

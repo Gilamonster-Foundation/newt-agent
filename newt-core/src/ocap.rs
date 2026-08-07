@@ -97,15 +97,21 @@ pub fn verify_b1() -> Verification {
 /// Verify **disclosure-gate-live-path**: every tool result passes a single
 /// disclosure filter before it is pushed into `messages` (one chokepoint).
 ///
-/// UNBUILT — always [`Verification::Absent`] (today redaction runs only on the
-/// next-turn observation and is shape-only). When the single chokepoint lands and
-/// a canary seeded at session start never appears in the model-facing stream,
-/// this returns `Verified`.
+/// Still [`Verification::Absent`] — but the mechanism now exists. step-6.1a wired
+/// the by-value [`DisclosureFilter`] into the SINGLE live tool-result chokepoint
+/// (`maybe_offload_tool_result`), with the canary ratchet guard proving it redacts
+/// a registered value in any encoding. This stays `Absent` until (a) the caller
+/// registers the session secret into `ChatCtx.disclosure` at session start, and
+/// (b) the next-turn observation + summary paths converge on the same value filter
+/// (today shape-only). Then a canary seeded at session start is provably absent
+/// from the model-facing stream and this returns `Verified`.
 #[must_use]
 pub fn verify_disclosure_gate() -> Verification {
     Verification::Absent {
         deviation: "disclosure-gate-live-path",
-        reason: "no single disclosure chokepoint on the live tool-result path".into(),
+        reason: "live chokepoint gated by-value (step-6.1a); session-start \
+                 registration + observation/summary convergence pending"
+            .into(),
     }
 }
 
