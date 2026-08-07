@@ -292,6 +292,29 @@ pub fn workspace_confined_caveats(workspace: &Path) -> Caveats {
     }
 }
 
+/// A `Caveats` fence for a repo-configured **build / test / format tool** run on
+/// the model's edits (`build_check_cmd`, crew formatters, roadmap `verify`).
+///
+/// It is exactly [`workspace_confined_caveats`] with ONE relaxation: `fs_read` is
+/// open. Build tools legitimately read widely (toolchains, a shared package
+/// cache, system libraries), and reads are not an exfiltration path once the
+/// network is closed. The *dangerous* half stays fully fenced — `fs_write` is
+/// the workspace only (no writing the shared package cache to poison it, no
+/// writing `/tmp` that another session shares) and `net` is an empty deny-all.
+/// Scratch belongs inside the fence: callers point `TMPDIR` at the workspace.
+///
+/// A child a hostile build spawns inherits the same Landlock fence (kernel
+/// inheritance across `execve`), so it is confined too.
+#[must_use]
+pub fn build_tool_caveats(workspace: &Path) -> Caveats {
+    Caveats {
+        // Open reads: build tools read toolchains + a shared package cache;
+        // safe once `net` is closed (no channel to exfiltrate what is read).
+        fs_read: Scope::All,
+        ..workspace_confined_caveats(workspace)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +350,29 @@ mod tests {
                 ("HOME".to_string(), "/ws".to_string()),
                 ("LANG".to_string(), "C".to_string())
             ]
+        );
+    }
+
+    #[test]
+    fn build_tool_caveats_deny_write_escape_and_net_but_allow_reads() {
+        // A build/test tool reads widely (open reads) but must not write outside
+        // the workspace/temp fence, and must not reach the network.
+        use crate::caveats::ScopeExt;
+        let cav = build_tool_caveats(Path::new("/ws"));
+        assert!(matches!(cav.fs_read, Scope::All), "build tools read widely");
+        assert!(cav.fs_write.permits(&"/ws".to_string()));
+        assert!(
+            !cav.fs_write.permits(&"/home/user/.cargo".to_string()),
+            "no write to the shared package cache (poisoning) outside the fence"
+        );
+        assert!(!cav.fs_write.permits(&"/etc".to_string()));
+        assert!(
+            !cav.fs_write.permits(&"/tmp".to_string()),
+            "no write to shared /tmp — scratch goes in-workspace via TMPDIR"
+        );
+        assert!(
+            !cav.net.permits(&"evil.example".to_string()),
+            "no network — the exfil channel is closed"
         );
     }
 

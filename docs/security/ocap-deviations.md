@@ -455,9 +455,14 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   write outside the workspace, read outside it, inherit a parent credential env var, or open a network
   connection — by kernel denial where Landlock is present, by refusal where it is not.
   **step-4.1** already landed the automated no-bypass GATE (`scripts/spawn_inventory.py` +
-  `docs/security/spawn-inventory.toml`, CI-wired). **25 sites remain classed `agent-exec-todo-p4`** —
-  the attacker-influenced spawns (`agentic/tools.rs` run_command host shell + `build_check_shell`'s
-  raw `sh -c`; `crew.rs`; `newt-tui/lib.rs`) still to be routed onto the new executor, one slice each.
+  `docs/security/spawn-inventory.toml`, CI-wired). **step-4.3** migrated the FIRST attacker-influenced
+  site — the repo-configured `build_check_cmd`: `run_build_check` no longer runs a raw `sh -c` on the
+  host, it routes through `ConstrainedExecutor` with `build_tool_caveats` (open reads, workspace-only
+  writes, `TMPDIR` in-workspace, net deny-all) and fails closed off the kernel fence. **21 sites
+  remain classed `agent-exec-todo-p4`** — `crew.rs` (formatters/tests), `newt-tui/lib.rs` (roadmap
+  verify + git/gh reads to reclassify), and the `agentic/tools.rs` run_command HOST-SHELL yolo lane
+  (an explicit `--disable-ocap`/`--full-access` opt-out, env-scrubbed; its #8 authority-env hardening
+  is a later slice, not a confinement migration).
 - **Residual:** 🔴 critical → 🟠 high. The executor + its kernel-backed enforcement now EXIST and are
   proven (step-4.2); the residual is the *migration* — the 25 raw `agent-exec-todo-p4` sites are not
   yet routed onto it, so `build_check_shell` et al. still spawn raw `sh -c` until each is migrated.

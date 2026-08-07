@@ -26,8 +26,8 @@
 use std::path::Path;
 
 use newt_core::confined_exec::{
-    workspace_confined_caveats, ConfinedOutput, ConstrainedExecutor, ExecOrigin, ExecRefused,
-    ExecRequest,
+    build_tool_caveats, workspace_confined_caveats, ConfinedOutput, ConstrainedExecutor,
+    ExecOrigin, ExecRefused, ExecRequest,
 };
 use serial_test::serial;
 use tempfile::tempdir;
@@ -216,4 +216,39 @@ fn hostile_child_cannot_open_a_network_connection() {
         Err(e) => panic!("unexpected refusal: {e}"),
     }
     drop(listener);
+}
+
+/// The build/test-tool fence (`build_tool_caveats`, used by the migrated
+/// `run_build_check`) reads widely but still denies the dangerous half: a
+/// hostile build command cannot write OUTSIDE the workspace (e.g. poison the
+/// shared package cache) even though it may read. Denied by Landlock, or the
+/// spawn is refused.
+#[test]
+#[serial]
+fn build_fence_denies_write_escape_even_with_open_reads() {
+    let ws = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let target = outside.path().join("poisoned.txt");
+    let script = format!("echo poison > '{}'", target.display());
+    let req = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        "sh",
+        ["-c", script.as_str()],
+        ws.path(),
+        build_tool_caveats(ws.path()),
+    )
+    .env("PATH", "/usr/bin:/bin");
+
+    match ConstrainedExecutor::run(&req) {
+        Ok(out) => assert!(
+            !out.success,
+            "a build tool must not write outside the workspace fence: {out:?}"
+        ),
+        Err(ExecRefused::ConfinementUnenforceable(_)) => {}
+        Err(e) => panic!("unexpected refusal: {e}"),
+    }
+    assert!(
+        !target.exists(),
+        "no file may be written outside the build fence (cache-poisoning vector)"
+    );
 }
