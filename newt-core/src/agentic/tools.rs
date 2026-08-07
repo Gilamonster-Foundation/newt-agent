@@ -1223,52 +1223,20 @@ async fn host_shell_output_with_timeout(
     }
 }
 
-/// Lexically normalise a path *string* — collapse `.` and `..` components
-/// without touching the filesystem — so containment is decided on the location
-/// the caller actually named, not on a raw byte prefix. Does NOT resolve
-/// symlinks (that needs `canonicalize`, which requires the path to exist and is
-/// the still-open `fs-canonical-containment` deviation): a symlink *inside* the
-/// workspace can still point out. What this DOES close are the string-only
-/// escapes — `..` traversal and sibling-prefix collisions.
-fn lexically_normalize(path: &str) -> std::path::PathBuf {
-    use std::path::{Component, PathBuf};
-    let mut out = PathBuf::new();
-    for comp in std::path::Path::new(path).components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // Pop a real segment; never climb above a root/prefix.
-                if !out.pop() {
-                    out.push(comp.as_os_str());
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
+// The lexical-normalisation + prefix-containment helpers now live in one shared
+// place — `crate::caveats` — so the interactive tool gate here and the headless
+// `newt-coder` apply path decide containment identically (no drift surface).
+// Only the Linux object-bound helpers below normalise paths directly; the
+// prefix gate itself goes through `crate::caveats::permits_path`.
+#[cfg(target_os = "linux")]
+use crate::caveats::lexically_normalize;
 
-/// Returns true if `full_path` is permitted by `scope`.
-///
-/// The `Caveats` lattice stores workspace-root strings (not individual file
-/// paths) with exact-set semantics; this layer adds containment so that "the
-/// workspace root is permitted" means "any path *under* it is permitted". Both
-/// the candidate and each root are lexically normalised (collapsing `..`) and
-/// then compared by whole path components via [`std::path::Path::starts_with`],
-/// so `..` traversal (`/ws/../etc/passwd`) and sibling-prefix collisions
-/// (`/ws-secret` vs root `/ws`) no longer escape the fence — unlike the raw
-/// string prefix match this replaced. Symlink containment is still open
-/// (`fs-canonical-containment`); creating one needs exec, which is gated separately.
+/// Returns true if `full_path` is permitted by `scope`, under prefix
+/// (containment) semantics. Thin alias for [`crate::caveats::permits_path`],
+/// kept so the many call sites in this module read as the tool-gate they are;
+/// the containment logic lives in one shared owner.
 pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path: &str) -> bool {
-    match scope {
-        crate::caveats::Scope::All => true,
-        crate::caveats::Scope::Only(set) if set.is_empty() => false,
-        crate::caveats::Scope::Only(set) => {
-            let candidate = lexically_normalize(full_path);
-            set.iter()
-                .any(|root| candidate.starts_with(lexically_normalize(root)))
-        }
-    }
+    crate::caveats::permits_path(scope, full_path)
 }
 
 /// The root in `scope` that lexically authorises `full_path`, if any.

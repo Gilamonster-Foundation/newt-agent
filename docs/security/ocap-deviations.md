@@ -72,7 +72,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
 | `mcp-under-leash` | MCP calls under the Caveats leash | 🟠 high | MCP tools holding/forwarding secrets |
 | `mcp-config-admission` | untrusted/disabled MCP config cannot spawn or dial | 🟢 closed (fail-closed) | admitting an untrusted server without out-of-repo approval |
-| `acp-worker-fs-scope` | model write target contained to the workspace (object-bound) | 🟠→🟡 | untrusted worker with write access on an unsandboxed host |
+| `acp-worker-fs-scope` | worker fs attenuated to the session workspace (caveat fence + object-bound) | 🟢 closed | (fence active; non-Linux keeps the lexical-prefix fallback) |
 | `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
 
 ### b1-os-isolation
@@ -224,42 +224,40 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Invariant (ideal):** no production ACP/coder worker holds `fs_write = Scope::All`; every
   model-supplied write target is object-bound to the session workspace before any `join`, so a
   path with an absolute or `..` component cannot resolve outside the fence.
-- **Practical caveat (now):** the default operator worker's `fs_write` is `Scope::All`
-  (`newt-acp-worker/src/identity.rs`), so `permits_fs_write` admits any target; containment is
-  enforced at the two shared write primitives — `apply_whole_files` (the `Emission::WholeFiles`
-  landing) and `apply_patch` (the unified-diff path) in `newt-tools/src/patch.rs` — which now
-  reject any target whose relative path has a non-`Normal` component (absolute / `..`) *before*
-  the `join`, at their one shared owner.
-- **Residual:** 🟠 high → 🟡 medium — the primitive containment closes the lexical absolute/`..`
-  escape on the default write paths, and the symlink-*under*-the-workspace escape is now **closed
-  too** (`fs-canonical-containment`/#522 CLOSED on Linux, step-52.7: `apply_whole_files`/`apply_patch`
-  write object-bound through `WorkspaceDir`). The one part that remains is the `Scope::All` caveat
-  itself not yet being attenuated (step-4.2) — so an untrusted worker still *nominally* holds
-  `fs_write = All`, though it can no longer escape the workspace object-bound-wise.
-- **Disabled while open:** a genuinely-untrusted model/worker with write access on an unsandboxed
-  host (bounded by `b1`'s OS sandbox as backstop).
-- **Compensating controls:** the primitive containment (step-4.1); the object-bound `WorkspaceDir`
-  fence (#522 CLOSED — the writes are structurally contained to the workspace regardless of the
-  caveat); the crew/plan write path was already contained (`is_safe_worktree_path`); throwaway git
-  worktrees; the `b1` OS sandbox. **step-4.2 landed the caveat-fence MECHANISM** —
-  `WorkerIdentity::caveats_for_dispatch(backend_host, workspace)` now scopes `fs_read`/`fs_write` to
-  the per-session ACP workspace via `lock_fs_to_workspace` (proven by
-  `caveats_for_dispatch_fences_fs_to_the_session_workspace`) — but it is kept **inert** at the dispatch
-  site (`server.rs` passes `None`) until the coder's fs predicates switch exact-match / `fs_write ==
-  All` → PREFIX (`newt-coder coder.rs:394/417/488`), else a `Scope::only([workspace])` fence would deny
-  the coder's own in-workspace writes.
-- **Closure criterion:** the default worker's `fs_write` is workspace-scoped (not `Scope::All`) AND
-  every write target passes an object-bound `WorkspaceDir` resolve-beneath (step-52.x — **DONE**), so
-  both the lexical and the symlink escape are structurally unreachable. Remaining: activate the fence
-  at the dispatch site once the coder predicates are prefix-aware.
-- **Ratchet guard:** `apply_whole_files_rejects_path_escape`, `apply_patch_rejects_path_escape`,
-  `is_workspace_contained_rejects_escapes`, `apply_whole_files_denies_symlink_escape_object_bound`
-  (`newt-tools/src/patch.rs`), plus `caveats_for_dispatch_fences_fs_to_the_session_workspace`
-  (`newt-acp-worker`) — the fence scopes fs to the workspace and denies outside, with an un-fenced
-  control.
-- **Status:** OPEN — object-bound containment DONE (#522/step-52.7) + caveat-fence mechanism landed
-  (step-4.2); remaining is only the dispatch-site activation, gated on the coder fs-predicate
-  prefix-switch (`coder.rs:394/417/488`) · review-by: with the coder prefix-switch follow-up
+- **Practical caveat (now):** none for the workspace-escape vector. step-4.3 ACTIVATED the fence:
+  `handle_prompt_coder` passes the session workspace to `caveats_for_dispatch`, so the dispatched
+  authority is `fs_read`/`fs_write = Scope::only([workspace])`, not `Scope::All`. The coder's fs
+  predicates gate by PREFIX containment (`newt_core::permits_path`) against that same workspace, so
+  the fence permits the coder's own in-workspace writes and denies any `..`/absolute escape — and
+  every write is additionally object-bound beneath the workspace fd at the two shared primitives
+  (`apply_whole_files` / `apply_patch`, `newt-tools/src/patch.rs`).
+- **Residual:** 🟢 closed — the `Scope::All` default is gone at the dispatch layer (attenuated to
+  the workspace, step-4.3), the coarse caveat gate now denies escapes lexically (prefix), and the
+  symlink-*under*-the-workspace escape is closed by the object-bound `WorkspaceDir`
+  (`fs-canonical-containment`/#522 CLOSED on Linux, step-52.7). Two independent layers now contain a
+  hostile model's write: the caveat fence AND the kernel `openat2 RESOLVE_BENEATH`.
+- **Disabled while open:** n/a (closed). On non-Linux the object-bound layer degrades to the lexical
+  prefix gate (`fs-canonical-containment`'s portability residual); the caveat fence itself is
+  platform-independent.
+- **Compensating controls:** the object-bound `WorkspaceDir` fence (#522, the kernel-enforced
+  containment); the prefix caveat gate shared with the interactive tool sites
+  (`newt_core::permits_path`); the crew/plan write path was already contained
+  (`is_safe_worktree_path`); throwaway git worktrees; the `b1` OS sandbox backstop.
+- **Closure criterion:** met — the dispatched worker's `fs_write`/`fs_read` are workspace-scoped
+  (not `Scope::All`), the coder gate denies escapes by containment, and every write resolves
+  object-bound beneath the workspace fd. Proven by executable tests at the unit, dispatch, and
+  end-to-end tiers.
+- **Ratchet guard:** `apply_under_workspace_fence_permits_inside_denies_escape`,
+  `apply_whole_files_denies_atomically_on_partial_scope`, `apply_unified_diff_gated_on_workspace_fence`
+  (`newt-coder`, coder gate); `caveats_for_dispatch_fences_fs_to_the_session_workspace`
+  (`newt-acp-worker`, the fence is workspace-scoped); `coder_dispatch_under_fence_contains_workspace_escape`
+  (`newt-acp-worker` integration — an operator dispatch emitting `../escape.rs` never creates the
+  file and reports a dispatch error); plus the object-bound `apply_whole_files_denies_symlink_escape_object_bound`
+  et al. (`newt-tools/src/patch.rs`, #522).
+- **Status:** CLOSED — dispatch-site fence ACTIVATED (step-4.3) atop object-bound containment
+  (#522/step-52.7); the coder fs predicates are prefix-aware and share `newt_core::permits_path`
+  with the interactive gate · owner: — · review-by: if a non-workspace write grant (e.g. `--write`)
+  is ever threaded into ACP dispatch.
 
 ### acp-worker-debug-authority
 - **Invariant (ideal):** a production headless worker NEVER dispatches under `Caveats::top()`. The

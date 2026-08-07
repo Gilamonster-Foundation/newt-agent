@@ -19,9 +19,11 @@
 //!     if !caveats.max_calls.permits_one_more(used) { … }
 //! ```
 //!
-//! Path-prefix and host-suffix matching is *not* in scope here; the lattice
-//! deals in set membership only. Enforcement sites (e.g. `tui_permits_path`)
-//! layer prefix semantics on top.
+//! Host-suffix matching is *not* in scope here; the lattice deals in set
+//! membership only. Path-prefix (containment) semantics DO live here, in one
+//! shared [`permits_path`] enforcement helper, so every dispatch site — the
+//! interactive tool gate (`tui_permits_path`) and the headless coder apply
+//! path alike — decides "is this path under a granted root?" identically.
 
 pub use agent_mesh_protocol::caveats::{Caveats, CountBound, Scope};
 
@@ -169,6 +171,66 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
         &parse("NEWT_READ_PATHS"),
         &parse("NEWT_WRITE_PATHS"),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Path containment (the shared prefix-semantics enforcement helper)
+// ---------------------------------------------------------------------------
+
+/// Lexically normalise a path *string* — collapse `.` and `..` components
+/// without touching the filesystem — so containment is decided on the location
+/// the caller actually named, not on a raw byte prefix. Does NOT resolve
+/// symlinks (that needs `canonicalize`, which requires the path to exist and is
+/// the still-open `fs-canonical-containment` deviation): a symlink *inside* a
+/// granted root can still point out — the object-bound `WorkspaceDir` resolver
+/// (`openat2 RESOLVE_BENEATH`) is what closes that. What this DOES close are the
+/// string-only escapes — `..` traversal and sibling-prefix collisions.
+pub(crate) fn lexically_normalize(path: &str) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    for comp in std::path::Path::new(path).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop a real segment; never climb above a root/prefix.
+                if !out.pop() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Does `scope` authorise `full_path` under **prefix (containment)** semantics?
+///
+/// The [`Caveats`] lattice stores workspace-root strings (not individual file
+/// paths) with exact-set membership; this layer adds containment so that "the
+/// workspace root is permitted" means "any path *under* it is permitted". Both
+/// the candidate and each root are [`lexically_normalize`]d (collapsing `..`)
+/// and then compared by whole path components via [`std::path::Path::starts_with`],
+/// so `..` traversal (`/ws/../etc/passwd`) and sibling-prefix collisions
+/// (`/ws-secret` vs root `/ws`) cannot escape the fence.
+///
+/// Fail-closed: an empty `Only(∅)` set permits nothing. `All` permits
+/// everything. Symlink containment is not decided here — that is the
+/// object-bound resolver's job (`fs-canonical-containment`); creating a symlink
+/// needs `exec`, which is gated on its own axis.
+///
+/// This is the single site both the interactive tool gate (`tui_permits_path`,
+/// which delegates here) and the headless coder apply path consult, so the two
+/// enforcement points can never drift on what "inside the fence" means.
+pub fn permits_path(scope: &Scope<String>, full_path: &str) -> bool {
+    match scope {
+        Scope::All => true,
+        Scope::Only(set) if set.is_empty() => false,
+        Scope::Only(set) => {
+            let candidate = lexically_normalize(full_path);
+            set.iter()
+                .any(|root| candidate.starts_with(lexically_normalize(root)))
+        }
+    }
 }
 
 #[cfg(test)]
