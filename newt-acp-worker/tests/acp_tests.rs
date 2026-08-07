@@ -118,7 +118,17 @@ where
     let (server_rx, mut client_tx) = tokio::io::duplex(8 * 1024);
     let (mut server_tx, client_rx) = tokio::io::duplex(8 * 1024);
 
-    let server = AcpServer::new(backend);
+    // step-1.3: drive under a real OPERATOR identity (not the debug `AllowNoKey`
+    // default, whose authority is now compile-gated behind `allow-no-key`), so
+    // these tests exercise the production dispatch authority and pass in the
+    // default (feature-off) lane. `resolve` loads the freshly-generated key into
+    // memory, so the temp keydir need not outlive it.
+    let identity = {
+        let keydir = tempfile::tempdir().expect("tempdir");
+        WorkerIdentity::resolve(Some(&keydir.path().join("id.pem")), false)
+            .expect("generate an operator identity")
+    };
+    let server = AcpServer::new(backend).with_identity(identity);
     let server_task = tokio::spawn(async move { server.run(server_rx, &mut server_tx).await });
 
     // Write the first request.
@@ -816,6 +826,10 @@ async fn coder_dispatch_with_operator_identity_carries_non_top_caveats() {
     assert!(result["diff"].as_str().unwrap().contains("+pub fn hello"));
 }
 
+// step-1.3: this asserts the DEV-ONLY `top()` authority, so it only compiles/runs
+// under the `allow-no-key` feature. Production (feature off) is covered by
+// `allow_no_key_authority_is_compile_gated` (fail-closed) in identity.rs.
+#[cfg(feature = "allow-no-key")]
 #[tokio::test]
 async fn worker_identity_allow_no_key_falls_back_to_top() {
     // Debug-only fallback: `--allow-no-key` (modeled by
@@ -886,11 +900,20 @@ async fn resolve_refuses_when_path_unresolved_without_allow_no_key() {
         "operator key load failure must refuse without --allow-no-key, got: {refused:?}"
     );
 
-    let fallback =
-        WorkerIdentity::resolve(Some(&bad), /*allow_no_key=*/ true).expect("must fall back");
+    // WITH `--allow-no-key`: dev feature falls back to AllowNoKey; production
+    // (feature off, step-1.3) keeps refusing — the flag is inert.
+    let with_flag = WorkerIdentity::resolve(Some(&bad), /*allow_no_key=*/ true);
+
+    #[cfg(feature = "allow-no-key")]
     assert!(
-        !fallback.is_operator(),
-        "--allow-no-key must produce AllowNoKey on key load failure"
+        !with_flag.expect("dev feature must fall back").is_operator(),
+        "--allow-no-key must produce AllowNoKey on key load failure (dev feature)"
+    );
+
+    #[cfg(not(feature = "allow-no-key"))]
+    assert!(
+        with_flag.is_err(),
+        "production: --allow-no-key is inert; the worker still refuses, got: {with_flag:?}"
     );
 }
 

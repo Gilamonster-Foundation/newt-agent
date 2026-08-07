@@ -35,9 +35,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use newt_core::caveats::{lock_fs_to_workspace, Caveats, CountBound, Scope};
-use newt_identity::{
-    attenuate, enforced_caveats, load_or_generate, session_root, unbounded_debug_fallback, AgentKey,
-};
+use newt_identity::{attenuate, enforced_caveats, load_or_generate, session_root, AgentKey};
+// The unrestricted debug authority is only compiled in under the dev feature.
+#[cfg(feature = "allow-no-key")]
+use newt_identity::unbounded_debug_fallback;
 
 /// Per-turn inference-call budget that headless dispatches operate under.
 /// Tight enough that a runaway model can't bill the operator into the
@@ -133,13 +134,20 @@ impl WorkerIdentity {
         cli_override: Option<&std::path::Path>,
         allow_no_key: bool,
     ) -> Result<Self, IdentityError> {
+        // step-1.3: without the `allow-no-key` dev feature the flag is INERT — a
+        // production build refuses to start with no usable key rather than falling
+        // back to unrestricted debug authority.
+        #[cfg(not(feature = "allow-no-key"))]
+        let _ = allow_no_key;
+
         let path = match Self::resolve_key_path(cli_override) {
             Ok(p) => p,
+            #[cfg(feature = "allow-no-key")]
             Err(e) if allow_no_key => {
                 tracing::warn!(
                     error = %e,
                     "headless worker: operator key path unresolved, \
-                     --allow-no-key restores unbounded debug authority (debug only)"
+                     --allow-no-key restores unbounded debug authority (dev feature)"
                 );
                 return Ok(Self::AllowNoKey);
             }
@@ -148,12 +156,13 @@ impl WorkerIdentity {
 
         match Self::from_operator_key(&path) {
             Ok(id) => Ok(id),
+            #[cfg(feature = "allow-no-key")]
             Err(e) if allow_no_key => {
                 tracing::warn!(
                     error = %e,
                     path = %path.display(),
                     "headless worker: operator key unavailable, \
-                     --allow-no-key restores unbounded debug authority (debug only)"
+                     --allow-no-key restores unbounded debug authority (dev feature)"
                 );
                 Ok(Self::AllowNoKey)
             }
@@ -200,7 +209,21 @@ impl WorkerIdentity {
                 let verified = enforced_caveats(&op)?;
                 Ok(verified)
             }
-            Self::AllowNoKey => Ok(unbounded_debug_fallback()),
+            Self::AllowNoKey => {
+                // step-1.3: the unrestricted debug authority is COMPILE-GATED. In a
+                // production build (the `allow-no-key` feature off) an `AllowNoKey`
+                // identity — however it was constructed — fails CLOSED (deny-all),
+                // never `top()`. The dev feature is the capability boundary, not the
+                // flag name.
+                #[cfg(feature = "allow-no-key")]
+                {
+                    Ok(unbounded_debug_fallback())
+                }
+                #[cfg(not(feature = "allow-no-key"))]
+                {
+                    Ok(fail_closed_caveats())
+                }
+            }
         }
     }
 
@@ -231,6 +254,23 @@ impl WorkerIdentity {
             Self::Operator { root } => Some(root),
             Self::AllowNoKey => None,
         }
+    }
+}
+
+/// Deny-all caveats — the fail-closed authority a **production** build (the
+/// `allow-no-key` dev feature off) hands an `AllowNoKey` identity in place of
+/// `top()`. Grants nothing on any axis, so the unrestricted debug path is
+/// unreachable at runtime regardless of how the identity was constructed
+/// (step-1.3). Only compiled when the dev feature is absent.
+#[cfg(not(feature = "allow-no-key"))]
+fn fail_closed_caveats() -> Caveats {
+    Caveats {
+        fs_read: Scope::none(),
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::AtMost(0),
+        valid_for_generation: Scope::none(),
     }
 }
 
@@ -364,11 +404,39 @@ mod tests {
     }
 
     #[test]
-    fn allow_no_key_returns_top() {
+    fn allow_no_key_authority_is_compile_gated() {
+        // step-1.3 ratchet guard: the unrestricted debug authority is behind the
+        // `allow-no-key` DEV feature. A PRODUCTION build (feature off) hands an
+        // `AllowNoKey` identity FAIL-CLOSED (deny-all) authority — never `top()` —
+        // so the escape hatch is not a runtime capability-boundary hole, however
+        // the identity was constructed. The dev feature restores the historical
+        // `top()`.
         let id = WorkerIdentity::AllowNoKey;
         assert!(!id.is_operator());
         let c = id.caveats_for_dispatch(Some("127.0.0.1"), None).unwrap();
-        assert_eq!(c, Caveats::top());
+
+        #[cfg(feature = "allow-no-key")]
+        assert_eq!(
+            c,
+            Caveats::top(),
+            "dev feature: unrestricted debug authority"
+        );
+
+        #[cfg(not(feature = "allow-no-key"))]
+        {
+            assert_ne!(
+                c,
+                Caveats::top(),
+                "production: AllowNoKey must NOT grant top()"
+            );
+            assert_eq!(
+                c,
+                super::fail_closed_caveats(),
+                "production: AllowNoKey is fail-closed (deny-all)"
+            );
+            assert!(!c.permits_fs_read("/etc/passwd"), "denies fs_read");
+            assert!(!c.permits_fs_write("/tmp/x"), "denies fs_write");
+        }
     }
 
     #[test]
@@ -384,24 +452,37 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_allow_no_key_falls_back_on_bad_pem() {
-        // Write a junk file at the path so load_or_generate fails the
-        // PEM decode. Without --allow-no-key this is a refusal; with
-        // it, the worker falls back to AllowNoKey (debug only).
+    fn resolve_bad_pem_refuses_and_allow_no_key_is_gated() {
+        // Write junk at the path so load_or_generate fails the PEM decode.
         let dir = fresh_dir();
         let path = dir.path().join("identity.pem");
         std::fs::write(&path, b"not a real PEM key").unwrap();
 
+        // Bad PEM, no `--allow-no-key` → refuse (both builds).
         let refused = WorkerIdentity::resolve(Some(&path), false);
         assert!(
             matches!(refused, Err(IdentityError::Key(_))),
             "bad PEM must refuse without --allow-no-key, got: {refused:?}"
         );
 
-        let fallback = WorkerIdentity::resolve(Some(&path), true).unwrap();
+        // Bad PEM WITH `--allow-no-key`:
+        let with_flag = WorkerIdentity::resolve(Some(&path), true);
+
+        #[cfg(feature = "allow-no-key")]
+        {
+            let fallback = with_flag.unwrap();
+            assert!(
+                !fallback.is_operator(),
+                "dev feature: --allow-no-key yields AllowNoKey on bad PEM"
+            );
+        }
+
+        #[cfg(not(feature = "allow-no-key"))]
         assert!(
-            !fallback.is_operator(),
-            "--allow-no-key must yield AllowNoKey on bad PEM"
+            matches!(with_flag, Err(IdentityError::Key(_))),
+            "step-1.3: in a production build `--allow-no-key` is INERT — the worker \
+             refuses to start with no usable key rather than dropping to debug \
+             authority; got {with_flag:?}"
         );
     }
 

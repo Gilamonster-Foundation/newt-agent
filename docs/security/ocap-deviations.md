@@ -73,6 +73,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `mcp-under-leash` | MCP calls under the Caveats leash | 🟠 high | MCP tools holding/forwarding secrets |
 | `mcp-config-admission` | untrusted/disabled MCP config cannot spawn or dial | 🟢 closed (fail-closed) | admitting an untrusted server without out-of-repo approval |
 | `acp-worker-fs-scope` | model write target contained to the workspace (object-bound) | 🟠→🟡 | untrusted worker with write access on an unsandboxed host |
+| `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
 
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
@@ -249,6 +250,41 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Status:** OPEN — object-bound containment DONE (#522/step-52.7) + caveat-fence mechanism landed
   (step-4.2); remaining is only the dispatch-site activation, gated on the coder fs-predicate
   prefix-switch (`coder.rs:394/417/488`) · review-by: with the coder prefix-switch follow-up
+
+### acp-worker-debug-authority
+- **Invariant (ideal):** a production headless worker NEVER dispatches under `Caveats::top()`. The
+  only two authorities it can hold are (a) an attenuated, signed operator identity, or (b) a
+  fail-closed deny-all when no key resolves. The `--allow-no-key` debug escape hatch — which
+  restores the pre-#94 `top()` dispatch via `WorkerIdentity::AllowNoKey` — must be **unreachable in
+  a production build**, not merely discouraged by a scary flag name.
+- **Practical caveat (now):** none in a production build — the fallback is compiled out. During
+  local development the `allow-no-key` Cargo feature (off by default, in both `newt-acp-worker` and
+  the `newt-agent` CLI) re-enables it so key-less iteration keeps working.
+- **Mechanism:** the `top()` path is behind a compile-time feature, not a runtime flag. With the
+  `allow-no-key` feature OFF (the default, hence every release build):
+  `WorkerIdentity::resolve(path, allow_no_key)` **ignores** `allow_no_key` and propagates any
+  key-load failure (the worker refuses to start), and `WorkerIdentity::AllowNoKey` — if constructed
+  at all — yields `fail_closed_caveats()` (deny-all: `Scope::none()` on every axis,
+  `CountBound::AtMost(0)`), never `top()`. Only when the feature is compiled in does `resolve` fall
+  back to `AllowNoKey` and `caveats_for_dispatch` return `unbounded_debug_fallback()`. A runtime
+  `--allow-no-key` on a production binary is therefore inert: it parses, but changes nothing.
+- **Residual:** 🟢 closed for the production-authority vector. A developer who deliberately compiles
+  `--features allow-no-key` still gets `top()` — that is the intended dev affordance, and such a
+  build is not a production artifact.
+- **Disabled while open:** n/a (closed). The dev feature must never be enabled in a released binary
+  or a CI/bench image that runs foreign models.
+- **Closure criterion:** met — `top()` is structurally unreachable without a compile-time opt-in,
+  proven by executable tests in both feature configurations.
+- **Ratchet guard:** `allow_no_key_authority_is_compile_gated` (`newt-acp-worker/src/identity.rs`,
+  unit tier — asserts `AllowNoKey.caveats_for_dispatch(..)` is deny-all `fail_closed_caveats()` with
+  `!permits_fs_read`/`!permits_fs_write` when the feature is off, and `top()` when on);
+  `resolve_refuses_when_path_unresolved_without_allow_no_key` and (feature-off)
+  `worker_allow_no_key_is_inert_in_production_build` (`newt-agent`
+  `tests/worker_cli.rs`, real-subprocess tier — a production `newt worker --allow-no-key` with an
+  unresolvable key exits with "refused to start" and never prints "unbounded debug authority").
+  Flipping the feature re-enables the `top()` fallback (verified both directions).
+- **Status:** CLOSED (compile-gated) — step-1.3 · owner: — · review-by: if a runtime approval path
+  for key-less dispatch is ever designed (it should not be).
 
 ### mcp-config-admission
 - **Invariant (ideal):** repository-controlled configuration cannot cause a process spawn or a

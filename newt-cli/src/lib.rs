@@ -1584,13 +1584,21 @@ async fn run_worker(
 
     // Resolve the operator identity once, BEFORE any tokio work, so a
     // missing-key refusal fails fast and never tries to drain stdin.
+    // step-1.3: the `--allow-no-key` debug fallback is compiled out of
+    // production builds (the `allow-no-key` feature is dev-only, off by
+    // default). Keep the hint honest about whether the flag can actually help.
+    #[cfg(feature = "allow-no-key")]
+    const ALLOW_NO_KEY_HINT: &str = "or use --allow-no-key (debug only) to fall back to top()";
+    #[cfg(not(feature = "allow-no-key"))]
+    const ALLOW_NO_KEY_HINT: &str =
+        "the --allow-no-key debug fallback is compiled out of this build \
+         (dev-only `allow-no-key` feature) and is inert";
     let identity =
         newt_acp_worker::WorkerIdentity::resolve(operator_key_path.as_deref(), allow_no_key)
             .map_err(|e| {
                 anyhow::anyhow!(
                     "headless worker refused to start: {e}\n\
-                     hint: pass --operator-key-path <PEM>, set NEWT_OPERATOR_KEY, \
-                     or use --allow-no-key (debug only) to fall back to top()"
+                     hint: pass --operator-key-path <PEM>, set NEWT_OPERATOR_KEY; {ALLOW_NO_KEY_HINT}"
                 )
             })?;
 

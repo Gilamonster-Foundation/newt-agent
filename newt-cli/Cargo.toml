@@ -65,6 +65,13 @@ default = ["rich-tui", "live-spill", "embedded"]
 rich-tui = ["newt-tui/rich-tui"]
 live-spill = ["newt-tui/live-spill"]
 
+# `allow-no-key` (step-1.3): forwards to `newt-acp-worker/allow-no-key`, the
+# DEV-ONLY compile gate for the headless worker's `--allow-no-key` debug escape
+# hatch. OFF by default, so a production `newt` binary cannot dispatch under
+# `Caveats::top()` without a signed operator key — the `--allow-no-key` flag is
+# inert (the worker refuses to start) unless this feature is compiled in.
+allow-no-key = ["newt-acp-worker/allow-no-key"]
+
 # In-process candle inference (#639), opt-in/default-off. CPU by default;
 # accelerators are opt-in and adapt to the host (NEWT_EMBEDDED_DEVICE).
 embedded = ["newt-scheduler/embedded", "newt-tui/embedded"]
