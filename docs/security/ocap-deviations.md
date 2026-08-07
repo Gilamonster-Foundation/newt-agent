@@ -76,6 +76,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
 | `config-plane-provenance` | an untrusted project `.newt/config.toml` cannot grant exec / endpoint (control-plane) authority | 🟢 closed (fail-closed) | (overlay stripped; ambient `./newt.toml` base control-plane strip = tracked follow-up) |
 | `noninteractive-launch-policy` | `--non-interactive` changes interaction only; OCAP-off host exec is an explicit opt-in | 🟠→🟡 | libraries still read `NEWT_DISABLE_OCAP`/`NEWT_FULL_ACCESS` from ambient env (typed `LaunchAuthority` follow-on) |
+| `p4-constrained-executor` | all attacker-influenced subprocess creation routes through one confined executor | 🔴 critical | 25 agent-exec spawn sites not yet migrated (now inventory-gated) |
 
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
@@ -430,6 +431,38 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Status:** OPEN (narrowed) — the `--non-interactive`-disables-OCAP vector CLOSED (step-3.1, with
   the regression guard); the typed `LaunchAuthority` + ambient-env-read retirement remain · owner: —
   · review-by: with the `LaunchAuthority` + `p4-constrained-executor` work.
+
+### p4-constrained-executor
+- **Invariant (ideal):** every attacker-influenced subprocess (model shell, build checks, tests,
+  formatters, lifecycle hooks, crew ops, MCP stdio, provider/plugin processes, and any git/helper
+  that can run repository-authored code) is created through ONE `ConstrainedExecutor` that receives
+  explicit origin/trust class, executable + argv, cwd, fs / net / env grants, credentials, timeout,
+  and process budget — clearing inherited env, denying net by default, fencing fs to the workspace,
+  killing the process tree on cancel, and FAILING CLOSED when the required confinement cannot be
+  established. No raw `Command`/`sh -c` bypass may remain for repo-controlled execution.
+- **Practical caveat (now):** the confined-spawn seam already exists — `agent_bridle::ConfinedCommand`
+  (`spawn_tokio`, Landlock/Seatbelt + env-scrub + exec admission), used by `newt-mcp-client` for MCP
+  stdio. **step-4.1** landed the automated no-bypass GATE: `scripts/spawn_inventory.py` +
+  `docs/security/spawn-inventory.toml` enumerate + classify every `Command`/`process::Command` site
+  (48 across 15 files) and FAIL CI on any new/unreviewed one, wired into `.github/workflows/ci.yml`
+  (mirrored by `just spawn-inventory`). Of those, **25 are classed `agent-exec-todo-p4`** — the
+  attacker-influenced sites (`agentic/tools.rs` run_command host shell + `build_check_shell`'s raw
+  `sh -c`; `crew.rs`; `newt-tui/lib.rs`) still to be routed through the executor.
+- **Residual:** 🔴 critical — the 25 agent-exec sites still spawn raw (the sharpest: `build_check_shell`
+  runs `sh -c` unconfined UNCONDITIONALLY). The inventory gate prevents the surface from GROWING
+  unreviewed and makes the migration backlog explicit + auditable, but does not itself confine the
+  existing sites. Full closure depends on the P5 Linux kernel backend (`b1-os-isolation`) so the
+  executor has real enforcement to fail-closed against.
+- **Disabled while open:** running genuinely-untrusted repository code on an unsandboxed host
+  (bounded by `b1`'s OS sandbox as the backstop, itself still open).
+- **Closure criterion:** the `spawn-inventory` shows ZERO `agent-exec-todo-p4` sites (all routed
+  through `ConstrainedExecutor`), and a hostile-child adversarial test proves a build/test/plugin
+  cannot read/write outside the workspace, reach the network unauthorized, read parent credentials,
+  or leave surviving descendants.
+- **Ratchet guard:** `scripts/spawn_inventory.py` (self-tested; CI-gated) — a new or moved
+  `Command`/`process::Command` site fails the build until it is inventoried + classified.
+- **Status:** OPEN — inventory gate landed (step-4.1); the executor migration of the 25 agent-exec
+  sites + the P5 kernel backend remain · owner: — · review-by: as each migration slice lands.
 
 ### mcp-under-leash
 - **Invariant (ideal):** every individual MCP tool call is mediated at CALL time before it reaches
