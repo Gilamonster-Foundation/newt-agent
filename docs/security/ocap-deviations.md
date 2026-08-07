@@ -97,7 +97,16 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Ratchet guard:** `seed_live_credential()` / `admit_untrusted_remote()` refuse unless
   `verify_b1()` passes; `ocap-check` asserts no caller bypasses; the verifier is re-run per
   session (no COW-cloned-pod skip).
-- **Status:** OPEN · owner: — · review-by: at credential-seeding work (#84)
+- **0.8.0 disposition:** DOES NOT block v0.8.0 — **follow-on** (milestone v0.9.0, OCAP
+  enforcement-floor epic #749). The dangerous capabilities it gates (`seed_live_credential`,
+  `admit_untrusted_remote`) are fail-closed OFF while it is open, and the confined executor already
+  denies **TCP** egress + fails closed; the residual is UDP/DNS/raw egress + the full netns/seccomp/
+  egress-proxy floor. Bounded confinement-hardening follow-ons, each tracked and NONE blocking
+  v0.8.0: **#1599** (UDP/DNS/raw egress → netns + egress proxy), **#1600** (SafeSubset degraded-lane
+  `env_clear` so a fallback path cannot leak newt's authority env), **#1601** (`ConfinedCommand`
+  fds ≥ 3 set `CLOEXEC` so an inherited descriptor cannot cross the fence). All are bounded by `b1`'s
+  OS sandbox as the eventual backstop.
+- **Status:** OPEN · owner: — · review-by: at the kernel-isolation floor (#1599 / epic #749)
 
 ### disclosure-gate-live-path
 - **Invariant (ideal):** *every* tool result passes a single disclosure filter before it is
@@ -176,6 +185,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   taint-aware proposal that down-weights worker-controlled transcript.
 - **Ratchet guard:** the promote path refuses if `proposer_fp == worker_fp`; `ocap-check`
   asserts no auto-apply path exists.
+- **0.8.0 disposition:** DOES NOT block v0.8.0 — **follow-on**. `auto_apply_policy` is fail-closed
+  OFF while this is open (every promotion needs a human approval bound to the lowered-`Caveats`
+  hash), so no self-proposal privilege escalation is reachable; the distinctness half is already
+  checkable. Not in the hostile-repo/model live-turn path. Tracked: this register entry (CI-gated).
 - **Status:** OPEN
 
 ### fs-canonical-containment
@@ -435,6 +448,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   headless run (`resolve_lane(false, None, false)`) resolves to `Confined`, never `Yolo`; only an
   explicit opt-in (`resolve_lane(false, None, true)`) reaches `Yolo`. Reverting the decouple (letting
   `--non-interactive` pick Yolo) turns this red.
+- **0.8.0 disposition:** DOES NOT block v0.8.0 — the `--non-interactive`-weakens-security vector is
+  CLOSED. A hostile repo/model CANNOT set `NEWT_DISABLE_OCAP` / `NEWT_FULL_ACCESS` (operator-env-only,
+  no config key, no model channel — re-verified by the final adversarial pass), and step-4.6 strips
+  them from host-shell children. The residual (typed immutable `LaunchAuthority` retiring the ambient
+  reads) is **defense-in-depth follow-on**, not a live-turn escape. Tracked: this register entry.
 - **Status:** OPEN (narrowed) — the `--non-interactive`-disables-OCAP vector CLOSED (step-3.1, with
   the regression guard); the typed `LaunchAuthority` + ambient-env-read retirement remain · owner: —
   · review-by: with the `LaunchAuthority` + `p4-constrained-executor` work.
@@ -485,7 +503,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   named residual remains, bounded by `b1` and NOT claimed closed: the sync executor runs each child to
   completion (no per-child **timeout / process-tree cancellation**) — a hostile build that hangs is a
   DoS, not an escape (the raw sites it replaced had no timeout either), and a descendant surviving a
-  cancel is bounded by `b1`'s process containment. Tree-kill-on-cancel is the tracked follow-on.
+  cancel is bounded by `b1`'s process containment. Tree-kill-on-cancel is the tracked follow-on
+  (**#1598**). Does NOT block v0.8.0.
 - **Disabled while open:** (closed for the routing/confinement bound) — the process-tree-cancel
   residual is bounded by `b1`'s OS sandbox as the backstop.
 - **Closure criterion:** met for the migration + confinement bound — `spawn-inventory` shows ZERO
@@ -503,7 +522,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   fail-closed executor + kernel-backed adversarial proof (step-4.2), build_check (step-4.3), crew +
   calibrated read fence (step-4.4), roadmap verify + newt-tui reclassify (step-4.5), yolo reclassify +
   whole-control-plane env-strip (step-4.6). `agent-exec-todo-p4 == 0`. Residual: process-tree
-  cancellation (bounded by `b1`) · owner: — · review-by: when tree-kill-on-cancel lands or `b1` closes.
+  cancellation (bounded by `b1`, tracked **#1598**, does NOT block v0.8.0) · owner: — · review-by:
+  when tree-kill-on-cancel lands or `b1` closes.
 
 ### mcp-under-leash
 - **Invariant (ideal):** every individual MCP tool call is mediated at CALL time before it reaches
@@ -540,6 +560,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `remote_tool_outside_allow_list_is_prompted_not_hard_vetoed` (`agentic/tools.rs`), and
   `classify_reads_by_verb_prefix_stripping_namespace` + `leash_mints_only_when_granted`
   (`agentic/mcp.rs`). Removing the witness requirement makes the un-leashed dispatch compile again.
+- **0.8.0 disposition:** DOES NOT block v0.8.0 — the LEASH invariant is CLOSED (witness-typed
+  call-time leash; a no-persona mutating dispatch fails closed). The residual (name-based effect
+  classification) requires a **trusted-but-compromised ADMITTED server**, which is OUTSIDE the
+  hostile-repo/model threat model (admission requires operator trust) and is further bounded by
+  `mcp-config-admission` + `b1`. **Follow-on** (per-call budget/scope/credential attenuation).
+  Tracked: this register entry + `disclosure-gate-live-path` cross-ref.
 - **Status:** OPEN (narrowed) — LEASH invariant CLOSED (step-6.4, witness-typed call-time leash);
   secret-forwarding + name-classification residuals cross-referenced to `disclosure-gate-live-path`
   / `b1-os-isolation` · owner: — · review-by: with per-call budget/scope attenuation, or when
@@ -628,7 +654,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   does not spawn these subprocess gadgets.
 - **Residual:** 🟢 closed. Belt-and-suspenders follow-on (NOT required, the gadgets are already
   disarmed): a `.git/`-write guard on the model's fs_write tools so a model cannot even plant
-  `.git/config` — tracked, not a break because `hardened_git` ignores a planted gadget anyway.
+  `.git/config` — tracked **#1602**, not a break because `hardened_git` ignores a planted gadget
+  anyway. Does NOT block v0.8.0.
 - **Disabled while open:** (closed).
 - **Compensating controls:** `spawn_inventory` (a new raw `Command::new("git")` fails the gate until
   reviewed); the `newt-git` model tool is library-based (no gadget subprocess).
@@ -641,6 +668,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 
 > `exec-behavior-bound` — full entry to be filled as it lands; **disabled-while-open bounded by
 > `b1`** (the OS sandbox is the backstop for name-granularity exec until it closes).
+> **0.8.0 disposition:** DOES NOT block v0.8.0 — a follow-on refinement (binding a *granted*
+> interpreter's exec to its resolved-path behavior tier). It is bounded by `b1`'s OS sandbox and by
+> the confined executor (a granted interpreter's fs/net behavior is already Landlock-fenced). Tracked
+> in this register; milestone v0.9.0 with `b1` / epic #749.
 
 ## 5. How to use this (for the practical-caveat moments)
 
