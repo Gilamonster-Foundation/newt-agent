@@ -227,8 +227,10 @@ async fn coder_run_attenuated_fs_write_permits_allowed_path() {
     let backend = Arc::new(MockBackend::all_tiers("mock", canned)) as Arc<dyn InferenceBackend>;
     let coder = Coder::new(backend);
 
+    // step-4.3: the fence grants the session workspace (absolute); the coder
+    // gates by prefix containment, so an in-workspace write is permitted.
     let caveats = Caveats {
-        fs_write: Scope::only(["src/lib.rs".to_string()]),
+        fs_write: Scope::only([tmp.path().to_string_lossy().into_owned()]),
         ..Caveats::top()
     };
     let run = coder
@@ -241,14 +243,16 @@ async fn coder_run_attenuated_fs_write_permits_allowed_path() {
 #[tokio::test]
 async fn coder_run_attenuated_fs_write_denies_forbidden_path() {
     let tmp = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
     write_file(&tmp.path().join("src/lib.rs"), "fn x() {}\n");
-    // Model targets src/lib.rs, but caveats only allow "other.rs".
+    // Model targets src/lib.rs in the workspace, but the fence grants only an
+    // UNRELATED directory — so the in-workspace write is denied.
     let canned = "FILE: src/lib.rs\nfn y() {}\nEND-FILE\n";
     let backend = Arc::new(MockBackend::all_tiers("mock", canned)) as Arc<dyn InferenceBackend>;
     let coder = Coder::new(backend);
 
     let caveats = Caveats {
-        fs_write: Scope::only(["other.rs".to_string()]),
+        fs_write: Scope::only([other.path().to_string_lossy().into_owned()]),
         ..Caveats::top()
     };
     let err = coder
@@ -372,13 +376,16 @@ async fn coder_run_attenuated_fs_read_denies_workspace_file() {
     // build_prompt would have *read* it, so the dispatch is denied
     // before the model ever sees it.
     let tmp = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
     write_file(&tmp.path().join("a.rs"), "fn x() {}\n");
     let canned = "FILE: a.rs\nfn y() {}\nEND-FILE\n";
     let backend = Arc::new(MockBackend::all_tiers("mock", canned)) as Arc<dyn InferenceBackend>;
     let coder = Coder::new(backend);
 
+    // fs_read fenced to an unrelated dir → the workspace file a.rs is outside
+    // the read scope, so the dispatch is denied before the model sees it.
     let caveats = Caveats {
-        fs_read: Scope::only(["only-this.rs".to_string()]),
+        fs_read: Scope::only([other.path().to_string_lossy().into_owned()]),
         ..Caveats::top()
     };
     let err = coder
@@ -400,13 +407,16 @@ async fn coder_run_denial_carries_axis_and_target_context() {
     // the failing axis name AND the concrete target. Lock that contract
     // explicitly so future error-format changes can't silently drop it.
     let tmp = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
     write_file(&tmp.path().join("a.rs"), "fn x() {}\n");
     let canned = "FILE: a.rs\nfn y() {}\nEND-FILE\n";
     let backend = Arc::new(MockBackend::all_tiers("mock", canned)) as Arc<dyn InferenceBackend>;
     let coder = Coder::new(backend);
 
+    // fs_write fenced to an unrelated dir → the in-workspace write of a.rs is
+    // denied, and the error must carry the axis + concrete target.
     let caveats = Caveats {
-        fs_write: Scope::only(["else.rs".to_string()]),
+        fs_write: Scope::only([other.path().to_string_lossy().into_owned()]),
         ..Caveats::top()
     };
     let err = coder
