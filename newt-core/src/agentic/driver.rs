@@ -538,6 +538,10 @@ async fn run_one_turn(
     // result or summary that echoes it is value-redacted before it reaches the
     // model (`disclosure-gate-live-path`). Must outlive `ctx`, which borrows it.
     let session_disclosure = crate::ocap::session_disclosure_filter(config.api_key.as_deref());
+    // Also install it on this turn's thread so the memory / observation /
+    // compaction / spill paths (which funnel through `redact_secrets`, not the
+    // explicit `disclosure` param) value-filter against the same secret.
+    let _disclosure_guard = crate::ocap::scoped_session_disclosure(session_disclosure.clone());
     let ctx = ChatCtx {
         url: &config.url,
         model: &config.model,

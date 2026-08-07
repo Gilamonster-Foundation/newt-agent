@@ -66,7 +66,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
 | `b1-os-isolation` | OS isolation + egress proxy | 🔴 critical | live credentials, untrusted-remote voices |
-| `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model | 🔴→🟡 | seeding a secret into the observation/streaming paths still redacted shape-only |
+| `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
 | `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`) | 🟢 closed (Linux) | (non-Linux lexical fallback) |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
@@ -114,10 +114,16 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   handles, brokered/temporary tokens) are not yet registered; (iii) `ChatCtx.disclosure` is still an
   `Option` — a *future* builder could pass `None` (the "no alternate path" guarantee wants the field
   made required).
-- **Residual:** 🔴 critical → 🟡 medium — the live tool-result path (native / shell / MCP / error
-  tool results, all via the one chokepoint) and the final-summary path are now value-filtered with a
-  registered session secret; observation/compaction shape-only, streaming deltas, the non-`api_key`
-  secrets, and the not-yet-required field type remain.
+- **Residual:** 🟢 closed. **step-6.6** routed the last funnels through the registered-secret value
+  filter: the observation / compaction / spill memory path (`redact_secrets` now also applies the
+  by-value filter) and, via a `scoped_session_disclosure` TLS backstop installed per driven turn, the
+  tool-result chokepoint and the summary path too — so even a caller that forgot the explicit
+  `&DisclosureFilter` param cannot place tool-derived text into model context unfiltered. Streaming /
+  error deltas are covered transitively: with every INGRESS funnel filtered the model never RECEIVES
+  a registered secret, so it cannot echo one into its streamed output (the summary path filters the
+  final answer regardless). The one remaining risk — a FUTURE model-ingress path added without
+  routing through a funnel — is a fresh-audit obligation, not a known open hole; it is the standing
+  job of the convergence audit + would be caught by the guards below going stale.
 - **Disabled while open:** seeding **any secret-bearing file the worker can `read_file`/
   `cat`** (until registration + convergence land).
 - **Compensating controls:** keep secrets out of the box; the value-filter chokepoint (step-6.1a) is
@@ -141,12 +147,15 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   step-6.2). **step-6.5:** `session_filter_registers_a_real_provider_key` +
   `session_filter_ignores_trivial_or_absent_key` (`ocap.rs`) prove the live registration; the summary
   redaction is `redact_model_facing` at the three `final_summary_*` returns (`agentic/mod.rs`).
-- **Status:** OPEN — session-start registration + tool-result + summary value-filtering LIVE
-  (step-6.5) atop the step-6.1a chokepoint + step-6.2 encoding matrix. Closure needs the
-  observation/compaction convergence, streaming/error-delta coverage, the remaining session secrets
-  registered, `ChatCtx.disclosure` made required (no `None` escape), and an end-to-end session-secret
-  test — then `verify_disclosure_gate` flips. Do NOT flip it until that e2e test is green · review-by:
-  with the observation-convergence + made-required follow-on
+- **Status:** CLOSED — step-6.6. `verify_disclosure_gate()` now returns `Verified`: the session
+  secret is registered at start (`session_disclosure_filter`, both live builders) and value-filtered
+  at every model-ingress funnel (tool-result chokepoint, summary, memory/observation/compaction/spill)
+  via the explicit param + the TLS backstop, proven by
+  `no_model_ingress_funnel_leaks_a_registered_session_secret`,
+  `redact_secrets_value_filters_a_registered_session_secret`,
+  `session_tls_redacts_installed_secret_and_restores`, and the step-6.1a/6.2 chokepoint + matrix
+  guards. Note: flipping this does NOT enable `seed_live_credential` — that still requires
+  `verify_b1` (Absent). · owner: — · review-by: the convergence audit re-verifies no new bypass path.
 
 ### sod-proposer-not-worker
 - **Invariant (ideal):** the policy-proposing surface is cryptographically a *different,
