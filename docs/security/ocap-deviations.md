@@ -76,7 +76,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
 | `config-plane-provenance` | an untrusted project `.newt/config.toml` cannot grant exec / endpoint (control-plane) authority | 🟢 closed (fail-closed) | (overlay stripped; ambient `./newt.toml` base control-plane strip = tracked follow-up) |
 | `noninteractive-launch-policy` | `--non-interactive` changes interaction only; OCAP-off host exec is an explicit opt-in | 🟠→🟡 | libraries still read `NEWT_DISABLE_OCAP`/`NEWT_FULL_ACCESS` from ambient env (typed `LaunchAuthority` follow-on) |
-| `p4-constrained-executor` | all attacker-influenced subprocess creation routes through one confined executor | 🔴 critical | 25 agent-exec spawn sites not yet migrated (now inventory-gated) |
+| `p4-constrained-executor` | all attacker-influenced subprocess creation routes through one confined executor (kernel-backed, fail-closed) + host-shell child stripped of newt's control plane | 🟢 closed (migration+confinement+#8) | (a new `agent-exec-todo-p4` spawn site, or the yolo lane ceasing to strip the control plane — both ratchet-guarded); process-tree-cancel bounded by `b1` |
 | `posture-report-honesty` | every security-posture surface is DERIVED from the same `verify_*` invariants the gates enforce, never independent prose | 🟢 closed | (a posture surface that asserts a claim the verifiers don't back — a report/enforcement drift) |
 | `platform-capability-ceiling` | an unsupported/unverified platform reports each guarantee as `unsupported` and REFUSES operations needing it — never a Linux-equivalent OCAP claim | 🟢 closed | (a non-Linux build silently claiming a kernel-backed guarantee it cannot provide) |
 
@@ -465,29 +465,40 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `TMPDIR` in-fence, net deny-all, and fail-closed off the kernel fence. **step-4.5** migrated the roadmap
   `verify` command (`CommandVerifyRunner::run`, `newt-tui/lib.rs`) onto the executor and reclassified
   that file's remaining spawns (git/gh reads, self-re-exec, human bang-escape) as `trusted-infra`.
-  **Only 3 sites remain classed `agent-exec-todo-p4`** — the `agentic/tools.rs` run_command HOST-SHELL
-  yolo lane, which is an explicit `--disable-ocap`/`--full-access` operator opt-out (confining it would
-  defeat the flag's purpose); it is not a confinement-migration target but a reclassification + a #8
-  authority-env hardening, which is the next slice.
-- **Residual:** 🔴 critical → 🟠 high. The executor + its kernel-backed enforcement now EXIST and are
-  proven (step-4.2); the residual is the *migration* — the 25 raw `agent-exec-todo-p4` sites are not
-  yet routed onto it, so `build_check_shell` et al. still spawn raw `sh -c` until each is migrated.
-  The seam being fail-closed means the migration lands real confinement (not advisory) the moment a
-  site moves onto it.
-- **Disabled while open:** running genuinely-untrusted repository code on an unsandboxed host
-  (bounded by `b1`'s OS sandbox as the backstop, itself still open).
-- **Closure criterion:** the `spawn-inventory` shows ZERO `agent-exec-todo-p4` sites (all routed
-  through `ConstrainedExecutor`), and a hostile-child adversarial test proves a build/test/plugin
-  cannot read/write outside the workspace, reach the network unauthorized, read parent credentials,
-  or leave surviving descendants. The adversarial-test half is **met** (step-4.2); the routing half
-  is the remaining migration.
+  **step-4.6** finished the sweep: the last `agent-exec-todo-p4` sites — the `agentic/tools.rs`
+  run_command HOST-SHELL lane — are reached ONLY via an explicit `--disable-ocap`/`--full-access`
+  operator opt-out (the default confined posture uses the confined brush engine), so they are
+  reclassified `operator-yolo-optout` (confining them would defeat the flag) and **hardened for #8**:
+  a shared const table `CHILD_STRIPPED_AUTHORITY_ENV` now excises newt's WHOLE control plane from the
+  host-shell child — every authority switch (so a nested `newt` cannot silently re-derive Yolo from an
+  inherited `NEWT_UNSAFE_HOST_EXEC`) and newt's own secrets (`NEWT_AGENT_KEY` / `NEWT_OPERATOR_KEY` /
+  `NEWT_TOKEN_PASSPHRASE`) — while the operator's general ambient env (their explicit grant) is kept.
+  **`spawn-inventory` now shows ZERO `agent-exec-todo-p4` sites** — every attacker-influenced
+  subprocess is routed through `ConstrainedExecutor` or the confined brush engine; the remainder are
+  classified trusted / git-helper / operator-opt-out and machine-enumerated in `spawn-inventory.toml`.
+- **Residual:** 🔴 critical → 🟢 closed for the migration + confinement + env-isolation invariant. One
+  named residual remains, bounded by `b1` and NOT claimed closed: the sync executor runs each child to
+  completion (no per-child **timeout / process-tree cancellation**) — a hostile build that hangs is a
+  DoS, not an escape (the raw sites it replaced had no timeout either), and a descendant surviving a
+  cancel is bounded by `b1`'s process containment. Tree-kill-on-cancel is the tracked follow-on.
+- **Disabled while open:** (closed for the routing/confinement bound) — the process-tree-cancel
+  residual is bounded by `b1`'s OS sandbox as the backstop.
+- **Closure criterion:** met for the migration + confinement bound — `spawn-inventory` shows ZERO
+  `agent-exec-todo-p4` sites (every attacker-influenced spawn routed through `ConstrainedExecutor` or
+  the confined engine), and the real-resource hostile-child adversarial test proves a build/test child
+  cannot read/write outside the workspace, reach the network unauthorized, or inherit a parent
+  credential. The surviving-descendant-after-cancel clause is the tracked residual above.
 - **Ratchet guard:** `scripts/spawn_inventory.py` (self-tested; CI-gated) — a new or moved
-  `Command`/`process::Command` site fails the build until it is inventoried + classified; plus
-  `newt-core/tests/confined_exec_landlock.rs` (real-resource) + the `confined_exec` unit tests, which
-  fail if the executor stops confining or stops failing-closed.
-- **Status:** OPEN — inventory gate (step-4.1) + fail-closed executor seam & kernel-backed
-  adversarial proof (step-4.2) landed; the executor migration of the 25 agent-exec sites remains ·
-  owner: — · review-by: as each migration slice lands.
+  `Command`/`process::Command` site fails the build until it is inventoried + classified, and a NEW
+  `agent-exec-todo-p4` classification re-opens the migration debt; plus
+  `newt-core/tests/confined_exec_landlock.rs` (real-resource), the `confined_exec` unit tests, and
+  `host_shell_command_strips_authority_env` (asserts the whole `CHILD_STRIPPED_AUTHORITY_ENV` set is
+  excised), which fail if the executor stops confining/failing-closed or the yolo lane stops stripping.
+- **Status:** CLOSED (migration + confinement + #8 env-isolation) — inventory gate (step-4.1),
+  fail-closed executor + kernel-backed adversarial proof (step-4.2), build_check (step-4.3), crew +
+  calibrated read fence (step-4.4), roadmap verify + newt-tui reclassify (step-4.5), yolo reclassify +
+  whole-control-plane env-strip (step-4.6). `agent-exec-todo-p4 == 0`. Residual: process-tree
+  cancellation (bounded by `b1`) · owner: — · review-by: when tree-kill-on-cancel lands or `b1` closes.
 
 ### mcp-under-leash
 - **Invariant (ideal):** every individual MCP tool call is mediated at CALL time before it reaches
