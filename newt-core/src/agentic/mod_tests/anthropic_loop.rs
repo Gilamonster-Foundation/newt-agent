@@ -194,8 +194,8 @@ impl McpTools for RecordingMcp {
     fn tool_defs(&self) -> Vec<serde_json::Value> {
         Vec::new()
     }
-    async fn call(&mut self, _name: &str, args: &serde_json::Value) -> String {
-        self.seen.lock().unwrap().push(args.clone());
+    async fn call(&mut self, leased: &LeasedMcpCall<'_>) -> String {
+        self.seen.lock().unwrap().push(leased.args().clone());
         self.result.to_string()
     }
 }
@@ -327,7 +327,7 @@ impl Respond for RoundTripResponder {
                 serde_json::json!([
                     {"type": "text", "text": "Checking."},
                     {"type": "tool_use", "id": "toolu_1",
-                     "name": "my_server__my_tool", "input": {"key": "value"}},
+                     "name": "my_server__get_thing", "input": {"key": "value"}},
                 ]),
                 40,
                 9,
@@ -341,7 +341,7 @@ impl Respond for RoundTripResponder {
                     blocks.iter().any(|b| {
                         b["type"] == "tool_use"
                             && b["id"] == "toolu_1"
-                            && b["name"] == "my_server__my_tool"
+                            && b["name"] == "my_server__get_thing"
                             && b["input"]["key"] == "value"
                     })
                 })
@@ -387,7 +387,7 @@ async fn tool_use_round_trip_replays_blocks_verbatim() {
     let messages = msgs();
     let caveats = Caveats::top();
     let mut mcp = RecordingMcp {
-        name: "my_server__my_tool",
+        name: "my_server__get_thing",
         result: "tool-result-text",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
@@ -420,9 +420,9 @@ impl Respond for ParallelResultsResponder {
                 "tool_use",
                 serde_json::json!([
                     {"type": "tool_use", "id": "toolu_a",
-                     "name": "my_server__my_tool", "input": {"n": 1}},
+                     "name": "my_server__get_thing", "input": {"n": 1}},
                     {"type": "tool_use", "id": "toolu_b",
-                     "name": "my_server__my_tool", "input": {"n": 2}},
+                     "name": "my_server__get_thing", "input": {"n": 2}},
                 ]),
                 50,
                 12,
@@ -486,7 +486,7 @@ async fn parallel_tool_results_land_in_one_user_message_in_call_order() {
     let messages = msgs();
     let caveats = Caveats::top();
     let mut mcp = RecordingMcp {
-        name: "my_server__my_tool",
+        name: "my_server__get_thing",
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
@@ -539,7 +539,7 @@ async fn input_json_delta_split_mid_token_executes_with_the_full_object() {
                     "message": {"model": "claude-test", "usage": {"input_tokens": 30}}}),
                 serde_json::json!({"type": "content_block_start", "index": 0,
                     "content_block": {"type": "tool_use", "id": "toolu_j",
-                                      "name": "my_server__my_tool"}}),
+                                      "name": "my_server__get_thing"}}),
                 // The JSON splits mid-key and mid-value across frames.
                 serde_json::json!({"type": "content_block_delta", "index": 0,
                     "delta": {"type": "input_json_delta", "partial_json": "{\"pa"}}),
@@ -559,7 +559,7 @@ async fn input_json_delta_split_mid_token_executes_with_the_full_object() {
     let messages = msgs();
     let caveats = Caveats::top();
     let mut mcp = RecordingMcp {
-        name: "my_server__my_tool",
+        name: "my_server__get_thing",
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
@@ -592,7 +592,7 @@ async fn zero_argument_tool_use_executes_with_an_empty_object() {
                 // No input_json_delta at all — a zero-argument call.
                 serde_json::json!({"type": "content_block_start", "index": 0,
                     "content_block": {"type": "tool_use", "id": "toolu_z",
-                                      "name": "my_server__my_tool"}}),
+                                      "name": "my_server__get_thing"}}),
                 serde_json::json!({"type": "content_block_stop", "index": 0}),
                 serde_json::json!({"type": "message_delta",
                     "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
@@ -605,7 +605,7 @@ async fn zero_argument_tool_use_executes_with_an_empty_object() {
     let messages = msgs();
     let caveats = Caveats::top();
     let mut mcp = RecordingMcp {
-        name: "my_server__my_tool",
+        name: "my_server__get_thing",
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
@@ -653,7 +653,7 @@ impl Respond for ToolsUntilCap {
             "tool_use",
             serde_json::json!([
                 {"type": "tool_use", "id": format!("toolu_{n}"),
-                 "name": "my_server__my_tool", "input": {"n": n}},
+                 "name": "my_server__get_thing", "input": {"n": n}},
             ]),
             40 + n as u64,
             7,
@@ -681,7 +681,7 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
     let mut c = ctx(&uri, &messages, &caveats);
     c.max_tool_rounds = 2;
     let mut mcp = RecordingMcp {
-        name: "my_server__my_tool",
+        name: "my_server__get_thing",
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
@@ -984,7 +984,7 @@ impl Respond for UsageAcrossRounds {
                 "tool_use",
                 serde_json::json!([
                     {"type": "tool_use", "id": "toolu_u1",
-                     "name": "my_server__my_tool", "input": {"n": 1}},
+                     "name": "my_server__get_thing", "input": {"n": 1}},
                 ]),
                 100,
                 10,
@@ -1017,7 +1017,7 @@ async fn usage_across_rounds_takes_max_input_and_sums_output() {
     let messages = msgs();
     let caveats = Caveats::top();
     let mut mcp = RecordingMcp {
-        name: "my_server__my_tool",
+        name: "my_server__get_thing",
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };

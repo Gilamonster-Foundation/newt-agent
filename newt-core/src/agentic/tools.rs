@@ -7,7 +7,7 @@ use super::content_spill::{self, SpillStore};
 use super::crew_tool::CrewRunner;
 use super::display::{ToolDisplay, ToolPresentation};
 use super::git_tool::GitTool;
-use super::mcp::McpTools;
+use super::mcp::{classify_mcp_effect, leash_mcp_call, McpEffect, McpTools};
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{
@@ -3583,37 +3583,56 @@ async fn execute_tool_inner(
     // allow-list. A tool the persona already grants dispatches directly; one it
     // does not is PROMPTED through the #263 [`PermissionGate`] (allow once /
     // session / deny) rather than hard-vetoed — so a human can grant a remote
-    // READ tool on demand while a mutating one stays gated. With no persona
-    // (`persona_tools == None`) remote tools dispatch unleashed, as before.
+    // READ tool on demand while a mutating one stays gated. With NO persona
+    // (`persona_tools == None`) "no persona" is NOT "unrestricted"
+    // (`mcp-under-leash`): a read-class tool passes, but a mutating/unknown one
+    // must be granted by a human `PermissionGate`, else it is denied — closing
+    // the pre-leash hole where a no-persona session dispatched every remote tool
+    // unmediated. The effect class comes from the tool NAME by a droppable
+    // convention (`classify_mcp_effect`), never the server's own hints.
     if mcp.handles(name) {
-        if let Some(allow) = persona_tools {
-            if !persona_tool_allowed(name, allow) {
-                let request = PermissionRequest {
-                    tool: name.to_string(),
-                    kind: DenialKind::RemoteTool,
-                    target: name.to_string(),
-                    reason: format!(
-                        "remote tool `{name}` is outside the active persona's tool allow-list"
-                    ),
-                };
-                // This branch always returns, so consuming the gate here never
-                // races the later fs/exec dispatch (unreached once mcp handled).
-                let granted = match permission_gate {
-                    Some(gate) => {
-                        matches!(gate.ask(&[request]), PermissionDecision::Allow(_))
-                    }
-                    // Headless / no operator to consult: fail-closed, like every
-                    // other gate this session.
-                    None => false,
-                };
-                if !granted {
-                    let msg = persona_tool_denied_message(name);
-                    return msg;
-                }
+        // `PermissionRequest` for the human-in-the-loop cases (persona
+        // out-of-list, or a no-persona mutating tool).
+        let prompt_gate = |permission_gate: Option<&mut dyn PermissionGate>, reason: String| {
+            let request = PermissionRequest {
+                tool: name.to_string(),
+                kind: DenialKind::RemoteTool,
+                target: name.to_string(),
+                reason,
+            };
+            match permission_gate {
+                Some(gate) => matches!(gate.ask(&[request]), PermissionDecision::Allow(_)),
+                // Headless / no operator to consult: fail-closed.
+                None => false,
             }
-        }
-        let out = mcp.call(name, args).await;
-        return out;
+        };
+        let granted = match persona_tools {
+            // Persona path (unchanged): allow-listed dispatches; otherwise the
+            // human is prompted and an explicit deny hard-stops.
+            Some(allow) if persona_tool_allowed(name, allow) => true,
+            Some(_) => prompt_gate(
+                permission_gate,
+                format!("remote tool `{name}` is outside the active persona's tool allow-list"),
+            ),
+            // No-persona path (`mcp-under-leash`): read passes; mutating/unknown
+            // is gated, fail-closed when headless.
+            None => match classify_mcp_effect(name) {
+                McpEffect::Read => true,
+                McpEffect::Mutating => prompt_gate(
+                    permission_gate,
+                    format!(
+                        "remote tool `{name}` is mutating and no persona bounds it \
+                         (no persona is not unrestricted)"
+                    ),
+                ),
+            },
+        };
+        // The witness leash: `mcp.call` requires a `LeasedMcpCall`, so this is
+        // the only way to dispatch — an un-leashed call does not type-check.
+        return match leash_mcp_call(name, args, granted) {
+            Ok(leased) => mcp.call(&leased).await,
+            Err(_) => persona_tool_denied_message(name),
+        };
     }
 
     // Step 27.1: resolve foreign / hallucinated tool names (str_replace_editor,
@@ -8017,6 +8036,7 @@ mod tests {
 
 #[cfg(test)]
 mod execute_tool_branch_tests {
+    use super::super::mcp::LeasedMcpCall;
     use super::super::NoMcp;
     use super::*;
     use crate::agentic::{
@@ -9014,14 +9034,14 @@ mod execute_tool_branch_tests {
     #[async_trait::async_trait]
     impl McpTools for EmptyRemote {
         fn handles(&self, name: &str) -> bool {
-            name == "test__empty"
+            name == "test__get_empty"
         }
 
         fn tool_defs(&self) -> Vec<serde_json::Value> {
             Vec::new()
         }
 
-        async fn call(&mut self, _name: &str, _args: &serde_json::Value) -> String {
+        async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
             String::new()
         }
     }
@@ -9031,7 +9051,7 @@ mod execute_tool_branch_tests {
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_rw(ws.path());
         let (out, rendered) = run_tool_captured(
-            "test__empty",
+            "test__get_empty",
             serde_json::json!({}),
             ws.path(),
             &caveats,
@@ -9042,7 +9062,7 @@ mod execute_tool_branch_tests {
         assert!(out.is_empty());
         assert_eq!(
             rendered,
-            "⚙  test__empty: {}\n\
+            "⚙  test__get_empty: {}\n\
              ▒ (no output)\n\
              …\n"
         );
@@ -10593,7 +10613,7 @@ mod execute_tool_branch_tests {
                 "function": { "name": self.name, "description": "", "parameters": {} }
             })]
         }
-        async fn call(&mut self, _name: &str, _args: &serde_json::Value) -> String {
+        async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
             self.called = true;
             "remote-tool-ran".to_string()
         }
@@ -10912,6 +10932,75 @@ mod execute_tool_branch_tests {
     }
 
     /// FR-2 (#1001): a remote MCP tool OUTSIDE the persona's allow-list is
+    /// `mcp-under-leash`: with NO active persona, a MUTATING remote tool must NOT
+    /// dispatch unleashed — "no persona" is not "unrestricted". Headless (no
+    /// gate) → fail-closed. Regression for the pre-leash hole where a no-persona
+    /// session dispatched every remote tool with zero mediation.
+    #[tokio::test]
+    async fn no_persona_does_not_dispatch_a_mutating_mcp_tool_unleashed() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = crate::caveats::Caveats::top();
+
+        let mut mcp = OneRemoteTool::new("incident__delete"); // mutating verb
+        let out = run_remote_gated(
+            "incident__delete",
+            ws.path(),
+            &caveats,
+            None, // NO persona
+            &mut mcp,
+            None, // headless: no gate to consult
+        )
+        .await;
+        assert!(
+            !mcp.called,
+            "a no-persona mutating remote tool must NOT dispatch unleashed"
+        );
+        assert!(out.contains("persona") || out.contains("denied") || out.contains("leash"));
+    }
+
+    /// The leash does not over-block: a no-persona READ-class remote tool still
+    /// dispatches (low-risk lookups stay usable without a persona or a prompt).
+    #[tokio::test]
+    async fn no_persona_read_class_mcp_tool_still_dispatches() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = crate::caveats::Caveats::top();
+
+        let mut mcp = OneRemoteTool::new("incident__list"); // read verb
+        let out =
+            run_remote_gated("incident__list", ws.path(), &caveats, None, &mut mcp, None).await;
+        assert!(mcp.called, "a no-persona read-class remote tool dispatches");
+        assert_eq!(out, "remote-tool-ran");
+    }
+
+    /// A human can still grant a no-persona MUTATING tool through the gate.
+    #[tokio::test]
+    async fn no_persona_mutating_mcp_tool_dispatches_when_human_grants() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = crate::caveats::Caveats::top();
+
+        let mut mcp = OneRemoteTool::new("incident__delete");
+        let mut gate = MockGate::new(true, &caveats); // human allows
+        let out = run_remote_gated(
+            "incident__delete",
+            ws.path(),
+            &caveats,
+            None,
+            &mut mcp,
+            Some(&mut gate),
+        )
+        .await;
+        assert!(
+            mcp.called,
+            "a human-granted mutating remote tool dispatches"
+        );
+        assert_eq!(
+            gate.asks.len(),
+            1,
+            "the human was prompted for the mutating op"
+        );
+        assert_eq!(out, "remote-tool-ran");
+    }
+
     /// PROMPTED (not hard-vetoed like a built-in). Deny → withheld and `call`
     /// never runs; Allow → dispatched; a tool the persona already grants
     /// dispatches with NO prompt; headless (no gate) fails closed.
