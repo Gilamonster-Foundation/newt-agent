@@ -368,10 +368,18 @@ cov-ci:
 # unless that deviation is CLOSED. So a dangerous capability cannot be added without
 # either closing its invariant or wiring its gate. See
 # docs/design/centaur-swarm-architecture.md and docs/security/ocap-deviations.md.
-# Standalone for now (pure-Python, no cargo deps); wire into the pre-push hook + CI
-# once the captured-shell / credential code begins to land.
+# PIPELINE PARITY: mirrored by the "OCAP register honesty" step in
+# .github/workflows/ci.yml (Rust lint job).
 ocap-check:
     python3 scripts/ocap_check.py
+
+# Automated process-spawn inventory gate (P4 `p4-constrained-executor`): fails on
+# any NEW/unreviewed `Command`/`process::Command` site vs docs/security/spawn-inventory.toml.
+# PIPELINE PARITY: mirrored by the "process-spawn inventory" step in
+# .github/workflows/ci.yml (Rust lint job).
+spawn-inventory:
+    python3 scripts/spawn_inventory.py --self-test
+    python3 scripts/spawn_inventory.py
 
 #
 # `main`/release MUST stay on agent-bridle's `feat/step-up-decision-mvp` branch

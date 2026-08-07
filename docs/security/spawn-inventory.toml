@@ -1,0 +1,43 @@
+# Process-spawn inventory (P4 `p4-constrained-executor`).
+#
+# Every raw process-spawn site in the workspace is enumerated here with a
+# per-file count + a trust classification. `scripts/spawn_inventory.py` counts
+# `Command::new` / `process::Command` occurrences per file and FAILS if any file
+# exceeds its allowlisted count, or a NEW file introduces a spawn — so a future
+# unreviewed subprocess cannot be added without a reviewer updating this file
+# and justifying the class. This is the automated no-bypass gate the P4 closure
+# criterion requires; the `class` column tracks migration status.
+#
+# Classes:
+#   agent-exec-todo-p4  ATTACKER-INFLUENCED execution (model/repo-controlled) that
+#                       must be routed through `ConstrainedExecutor` (agent-bridle
+#                       `ConfinedCommand`). NOT yet migrated — the P4 backlog.
+#   confined            Already spawned through the confined boundary
+#                       (`agent_bridle::ConfinedCommand::spawn_tokio`).
+#   git-helper          Runs a trusted `git` binary against the workspace to READ
+#                       state (diff/status/evidence) or set local identity. Cannot
+#                       execute attacker-authored code by itself; still to be
+#                       routed for env-scrub + timeout in a later slice.
+#   user-editor         Launches the human operator's own editor / pager on their
+#                       explicit action — not agent- or repo-controlled.
+#   trusted-infra       Operator-invoked infrastructure (dgx ssh, doctor, web) —
+#                       not reachable from a hostile repo/model turn.
+#   test                Spawns confined to `#[cfg(test)]` / a `_test.rs` file.
+
+[files]
+"newt-core/src/agentic/tools.rs"          = { count = 7, class = "agent-exec-todo-p4", note = "run_command host shell + build_check_shell (sh -c) — the sharpest bypass; migrate first" }
+"newt-cli/src/crew.rs"                     = { count = 7, class = "agent-exec-todo-p4", note = "crew spawns agent subprocesses" }
+"newt-cli/src/crew_runner.rs"              = { count = 0, class = "agent-exec-todo-p4", note = "placeholder — keep at 0 until reviewed" }
+"newt-mcp-client/src/lib.rs"               = { count = 2, class = "confined", note = "MCP stdio via ConfinedCommand::spawn_tokio (already inside the boundary)" }
+"newt-acp-worker/src/diff.rs"              = { count = 6, class = "git-helper", note = "captures `git diff` of the session workspace" }
+"newt-core/src/agentic/claim_check.rs"     = { count = 1, class = "git-helper", note = "collects git evidence to refute action claims" }
+"newt-core/src/agent_identity.rs"          = { count = 3, class = "git-helper", note = "sets local git identity" }
+"newt-tui/src/workspace_state.rs"          = { count = 1, class = "git-helper", note = "reads `git status`" }
+"newt-tui/src/lib.rs"                      = { count = 11, class = "agent-exec-todo-p4", note = "TUI: editor/git/helper spawns — classify per-site in a follow-on slice" }
+"newt-tui/src/prompt.rs"                   = { count = 1, class = "user-editor", note = "opens the operator's $EDITOR on explicit action" }
+"newt-tui/src/mcp_token.rs"                = { count = 1, class = "trusted-infra", note = "operator MCP token helper" }
+"newt-cli/src/dgx/ssh.rs"                  = { count = 3, class = "trusted-infra", note = "operator dgx ssh" }
+"newt-cli/src/doctor.rs"                   = { count = 1, class = "trusted-infra", note = "operator diagnostics" }
+"newt-cli/src/web_cmd.rs"                  = { count = 1, class = "trusted-infra", note = "operator web command" }
+"newt-core/src/tty/pty_notice_test.rs"     = { count = 1, class = "test", note = "PTY test harness" }
+"newt-tui/src/prompt_visibility_test.rs"   = { count = 2, class = "test", note = "real-PTY prompt-visibility test" }

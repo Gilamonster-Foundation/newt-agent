@@ -50,6 +50,14 @@ jobs:
         # tests (off by default; mirrored in the justfile `lint`/`check`).
         if: always()
         run: cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings
+      # OCAP security gates (pure-Python, no cargo deps). Mirrored by the
+      # `ocap-check` + `spawn-inventory` recipes in the justfile.
+      - name: OCAP register honesty (ocap-check)
+        if: always()
+        run: python3 scripts/ocap_check.py
+      - name: process-spawn inventory (no unreviewed subprocess)
+        if: always()
+        run: python3 scripts/spawn_inventory.py
 
   test:
     name: Rust tests
