@@ -200,6 +200,27 @@ mod tests {
     }
 
     #[test]
+    fn network_confinement_is_the_basic_floor_not_the_credential_floor() {
+        // The split: the basic network floor is Verified where the seccomp +
+        // Landlock egress floor is enforceable, while the credential-bearing b1
+        // floor stays Absent (so credential-seeding gates keep failing closed).
+        let net = verify_network_confinement();
+        if crate::confined_exec::kernel_fs_fence_available() {
+            assert!(
+                net.is_verified(),
+                "basic network confinement should be enforced here"
+            );
+            assert_eq!(net.deviation(), None);
+        } else {
+            assert!(!net.is_verified());
+            assert_eq!(net.deviation(), Some("b1-os-isolation"));
+        }
+        // The stronger credential-bearing floor is independent and still open.
+        assert!(!verify_b1().is_verified());
+        assert_eq!(verify_b1().deviation(), Some("b1-os-isolation"));
+    }
+
+    #[test]
     fn seed_live_credential_fails_closed_on_b1() {
         let cred = ScopedCredential {
             label: "pa-token".into(),
@@ -1065,11 +1086,69 @@ pub fn verify_fail_closed_execution() -> Verification {
     }
 }
 
+/// Verify **untrusted-child network confinement** — the property that an
+/// attacker-influenced child cannot reach the network. This is the *basic*
+/// network floor, split out from the stronger credential-bearing [`verify_b1`]:
+/// the confined executor runs every `AgentInfluenced` child under the seccomp
+/// egress-deny floor by default ([`crate::confined_exec::NetGrant::DenyAll`] →
+/// `newt-net-guard`), which denies `socket()` for TCP/UDP/DNS/raw *in addition
+/// to* the Landlock TCP-deny, and REFUSES the spawn if the floor cannot be
+/// established.
+///
+/// `Verified` iff both halves of that floor are enforceable on this host: the
+/// seccomp filter ([`crate::netguard::egress_deny_supported`]) and the Landlock
+/// fs fence the guard runs under ([`crate::confined_exec::kernel_fs_fence_available`]).
+/// Either way an attacker child never egresses — it is denied if it runs, or the
+/// spawn is refused. Where the floor is unenforceable this is fail-closed
+/// `Absent`.
+///
+/// This is deliberately WEAKER than `verify_b1`: it does NOT provide a mediated
+/// egress proxy, credential brokering, or the full OS floor, so it must not
+/// unlock credential-seeding capabilities (those still require `verify_b1`).
+/// Grounded by `newt-core/tests/net_guard_executor.rs` (a live child + its
+/// descendants cannot open a socket).
+#[must_use]
+pub fn verify_network_confinement() -> Verification {
+    #[cfg(target_os = "linux")]
+    {
+        if crate::netguard::egress_deny_supported()
+            && crate::confined_exec::kernel_fs_fence_available()
+        {
+            Verification::Verified {
+                evidence: "attacker-influenced children run under the seccomp egress-deny floor \
+                           (newt-net-guard: socket() deny for AF_INET/AF_INET6/AF_PACKET) beneath \
+                           the Landlock fs fence, by default and fail-closed; no TCP/UDP/DNS/raw \
+                           egress (net_guard_executor.rs)"
+                    .into(),
+            }
+        } else {
+            Verification::Absent {
+                deviation: "b1-os-isolation",
+                reason: "the seccomp egress floor or the Landlock fs fence is unavailable on this \
+                         host — an AgentInfluenced spawn refuses rather than run with weaker \
+                         network confinement"
+                    .into(),
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Verification::Absent {
+            deviation: "b1-os-isolation",
+            reason: "no seccomp egress floor off Linux; the platform ceiling reports this \
+                     unsupported"
+                .into(),
+        }
+    }
+}
+
 /// The runtime half of the meet: the verifier results the report derives from.
 /// Constructed from the SAME verifiers the capability gates call — there is no
 /// field a caller can set to a free-form claim.
 #[derive(Debug, Clone)]
 pub struct RuntimeEvidence {
+    /// The full credential-bearing OS-isolation floor (netns + mediated egress +
+    /// …). Still open — gates `seed_live_credential` / `admit_untrusted_remote`.
     pub b1: Verification,
     pub disclosure: Verification,
     pub fs_object_bound: Verification,
@@ -1111,6 +1190,11 @@ impl RuntimeEvidence {
         match g {
             Guarantee::FsConfinement => self.fs_object_bound.clone(),
             Guarantee::ProcessConfinement => Self::meet(&self.constrained_executor, &self.b1),
+            // NetworkConfinement reflects the FULL floor (b1). The seccomp
+            // egress-deny floor ([`verify_network_confinement`]) is real but
+            // OPT-IN (`NetGrant::DenyAll`) and does not cover the agent-bridle
+            // `run_command` model-exec path, so it does not by itself make the
+            // whole-agent guarantee Enforced — we do not over-claim here.
             Guarantee::NetworkConfinement => self.b1.clone(),
             Guarantee::EnvIsolation => self.constrained_executor.clone(),
             Guarantee::CredentialIsolation => Self::meet(&self.constrained_executor, &self.b1),
@@ -1241,15 +1325,17 @@ mod report_tests {
     #[test]
     fn linux_report_matches_live_verifier_state() {
         // Reporting derives from the SAME verifiers the gates use (#11).
-        // Disclosure (+ fs/fail-closed on Linux) report enforced; EnvIsolation
-        // tracks the confined-executor verifier (Enforced where the kernel fs
-        // fence is available, else its open deviation); and network / process /
-        // credential must still name b1 (their meet includes the open b1 half).
+        // Disclosure (+ fs/fail-closed on Linux) report enforced; EnvIsolation and
+        // NetworkConfinement track their own verifiers (Enforced where the kernel
+        // fence is available); process / credential still name b1 (their meet
+        // includes the open credential-bearing b1 half).
         let report = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
         assert!(matches!(
             report.achieved(Guarantee::DisclosureFiltering),
             Achieved::Enforced { .. }
         ));
+        // NetworkConfinement still names the full credential-bearing b1 floor
+        // (the seccomp egress deny is opt-in and does not cover run_command).
         assert!(matches!(
             report.achieved(Guarantee::NetworkConfinement),
             Achieved::Unverified {
@@ -1257,8 +1343,8 @@ mod report_tests {
                 ..
             }
         ));
-        // EnvIsolation = the confined-executor verifier alone: Enforced when the
-        // executor can kernel-confine on this host, otherwise fail-closed Absent.
+        // EnvIsolation is the executor's own single-half guarantee: Enforced when
+        // the kernel fence is available on this host, else fail-closed Absent.
         if crate::confined_exec::kernel_fs_fence_available() {
             assert!(matches!(
                 report.achieved(Guarantee::EnvIsolation),
@@ -1324,9 +1410,18 @@ mod report_tests {
     #[test]
     fn require_achieved_refuses_unverified_and_unsupported() {
         // The refusal primitive: Enforced proceeds; everything else refuses.
-        let linux = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+        // Mock the evidence (like `compound_guarantees_take_the_meet`) rather than
+        // the live `RuntimeEvidence::current()` host probe: `verify_constrained_executor`
+        // is now honest (Verified only when `kernel_fs_fence_available()`), so off
+        // Linux the `meet(constrained_executor, b1)` half flips to
+        // `p4-constrained-executor` and this deviation assertion would be
+        // platform-dependent. With `constrained_executor` synthetically Verified,
+        // b1 is the only Absent half, so the deviation is `b1` everywhere.
+        let mut ev = all_verified();
+        ev.b1 = verify_b1();
+        let linux = SecurityReport::from_parts(&LINUX_CEILING, &ev);
         assert!(require_achieved(&linux, Guarantee::DisclosureFiltering).is_ok());
-        let err = require_achieved(&linux, Guarantee::NetworkConfinement).unwrap_err();
+        let err = require_achieved(&linux, Guarantee::CredentialIsolation).unwrap_err();
         assert_eq!(err.deviation, "b1-os-isolation");
 
         let mac = SecurityReport::from_parts(&MACOS_CEILING, &all_verified());
@@ -1360,6 +1455,8 @@ mod report_tests {
         let lines = report.summary_lines();
         assert_eq!(lines.len(), Guarantee::ALL.len());
         assert!(lines.iter().any(|l| l == "disclosure-filtering: enforced"));
+        // Network confinement still names the full credential-bearing b1 floor
+        // (the seccomp egress deny is opt-in and does not cover run_command).
         assert!(lines
             .iter()
             .any(|l| l.contains("network-confinement: OPEN (b1-os-isolation)")));

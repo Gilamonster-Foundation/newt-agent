@@ -97,15 +97,25 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Ratchet guard:** `seed_live_credential()` / `admit_untrusted_remote()` refuse unless
   `verify_b1()` passes; `ocap-check` asserts no caller bypasses; the verifier is re-run per
   session (no COW-cloned-pod skip).
+- **Seccomp egress floor — real, PROVEN, OPT-IN (steps 8.4–8.7).** A seccomp `socket()`-family deny
+  (`newt_core::netguard` + the `newt-net-guard` wrapper) kernel-denies TCP+UDP+DNS+raw egress for a
+  confined child — the UDP/DNS/raw gap Landlock (TCP-only) leaves open — beneath the Landlock fs fence.
+  It is applied via `ExecRequest::net_grant(NetGrant::DenyAll)` and is **opt-in, not the default**: it
+  needs the `newt-net-guard` binary deployed alongside the executor and is Linux-only, so a default
+  would fail-closed on platforms/deployments lacking it rather than degrade honestly — and the primary
+  attacker-exec path (`run_command`) is agent-bridle's ShellTool, NOT this executor, so a default here
+  would not cover it. **Therefore `SecurityReport`'s `NetworkConfinement` still names the full `b1`
+  floor (Unverified) — we do not over-claim.** `verify_network_confinement()` records the floor's
+  *availability*. The credential-bearing `b1` (`verify_b1`, `Absent`) is unchanged and STILL gates
+  `seed_live_credential` / `admit_untrusted_remote`.
 - **0.8.0 disposition:** DOES NOT block v0.8.0 — **follow-on** (milestone v0.9.0, OCAP
   enforcement-floor epic #749). The dangerous capabilities it gates (`seed_live_credential`,
-  `admit_untrusted_remote`) are fail-closed OFF while it is open, and the confined executor already
-  denies **TCP** egress + fails closed; the residual is UDP/DNS/raw egress + the full netns/seccomp/
-  egress-proxy floor. Bounded confinement-hardening follow-ons, each tracked and NONE blocking
-  v0.8.0: **#1599** (UDP/DNS/raw egress → netns + egress proxy), **#1600** (SafeSubset degraded-lane
-  `env_clear` so a fallback path cannot leak newt's authority env), **#1601** (`ConfinedCommand`
-  fds ≥ 3 set `CLOEXEC` so an inherited descriptor cannot cross the fence). All are bounded by `b1`'s
-  OS sandbox as the eventual backstop.
+  `admit_untrusted_remote`) are fail-closed OFF while it is open; **basic egress is now fully denied**
+  (TCP+UDP+DNS+raw via seccomp — #1599's socket-level goal met on Linux; the netns/egress-proxy form
+  remains for the credential-bearing floor). Bounded confinement-hardening follow-ons, each tracked and
+  NONE blocking v0.8.0: **#1599** (mediated egress proxy / netns for the credential floor), **#1600**
+  (SafeSubset degraded-lane `env_clear`), **#1601** (`ConfinedCommand` fds ≥ 3 `CLOEXEC`). All are
+  bounded by `b1`'s OS sandbox as the eventual backstop.
 - **Status:** OPEN · owner: — · review-by: at the kernel-isolation floor (#1599 / epic #749)
 
 ### disclosure-gate-live-path
