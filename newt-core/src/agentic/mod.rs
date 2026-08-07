@@ -194,7 +194,9 @@ pub use experiential::{
 };
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
-pub use mcp::{McpTools, NoMcp};
+pub use mcp::{
+    classify_mcp_effect, leash_mcp_call, LeasedMcpCall, LeashDenied, McpEffect, McpTools, NoMcp,
+};
 pub use observability::{
     classify_reqwest, error_class, round_parse_signal, BehaviorSignal, DispatchError, ErrorClass,
     ParseSignal, SolveObservation, ToolCallDialect,

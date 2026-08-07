@@ -2020,7 +2020,7 @@ impl McpTools for OneToolMcp {
     fn tool_defs(&self) -> Vec<serde_json::Value> {
         Vec::new()
     }
-    async fn call(&mut self, _name: &str, _args: &serde_json::Value) -> String {
+    async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
         self.result.to_string()
     }
 }

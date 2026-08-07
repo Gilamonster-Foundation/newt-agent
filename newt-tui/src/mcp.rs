@@ -531,8 +531,10 @@ impl newt_core::agentic::McpTools for Mcp {
     fn tool_defs(&self) -> Vec<Value> {
         Self::tool_defs(self)
     }
-    async fn call(&mut self, name: &str, args: &Value) -> String {
-        Self::call(self, name, args).await
+    async fn call(&mut self, leased: &newt_core::agentic::LeasedMcpCall<'_>) -> String {
+        // The witness carries the leash-approved tool name + args; forward to the
+        // inherent implementation.
+        Self::call(self, leased.tool(), leased.args()).await
     }
 }
 

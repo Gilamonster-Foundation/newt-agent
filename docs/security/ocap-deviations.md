@@ -70,7 +70,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
 | `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`) | 🟢 closed (Linux) | (non-Linux lexical fallback) |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
-| `mcp-under-leash` | MCP calls under the Caveats leash | 🟠 high | MCP tools holding/forwarding secrets |
+| `mcp-under-leash` | every MCP call mediated at call time (witness-typed leash; no-persona ≠ unrestricted) | 🟠→🟡 | untrusted server holding/forwarding a live secret (bounded by admission + `b1` + disclosure) |
 | `mcp-config-admission` | untrusted/disabled MCP config cannot spawn or dial | 🟢 closed (fail-closed) | admitting an untrusted server without out-of-repo approval |
 | `acp-worker-fs-scope` | worker fs attenuated to the session workspace (caveat fence + object-bound) | 🟢 closed | (fence active; non-Linux keeps the lexical-prefix fallback) |
 | `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
@@ -374,9 +374,48 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Status:** CLOSED (fail-closed) — step-7.1 · owner: — · review-by: when a `newt config adopt`
   path or the ambient-base control-plane strip is designed.
 
-> `exec-behavior-bound`, `mcp-under-leash` — full entries to be filled as those land; each is
-> **disabled-while-open bounded by `b1`** (the OS sandbox is the backstop for
-> name-granularity exec and unleashed MCP until they are closed).
+### mcp-under-leash
+- **Invariant (ideal):** every individual MCP tool call is mediated at CALL time before it reaches
+  the wire — admission (`mcp-config-admission`) decides *which* servers may connect; this is the
+  per-call counterpart. Authority is a leash, not a blanket: an operation the session did not
+  authorize does not dispatch, and "no persona" is NOT "unrestricted".
+- **Practical caveat (now):** the LEASH invariant is enforced. `McpTools::call` requires a
+  `LeasedMcpCall` witness (`newt-core/src/agentic/mcp.rs`, private field, minted only by
+  `leash_mcp_call`), so an un-leashed dispatch does not type-check — structurally, like
+  `mcp-config-admission`'s `AdmittedServer`. At the sole dispatch choke
+  (`agentic/tools.rs`, `execute_tool_inner`) the grant is computed and the witness minted: the
+  persona allow-list path is unchanged (allow-listed dispatches; out-of-list is prompted, a deny
+  hard-stops), and the previously-**unleashed** no-persona path is closed — a read-class tool (by
+  `classify_mcp_effect`, a droppable name convention, NEVER the server's own `readOnlyHint`) passes,
+  a mutating/unknown one is prompted (interactive) or **denied fail-closed** (headless).
+- **Residual:** 🟠 high → 🟡 medium. The leash mediates *dispatch*; two residuals remain, both
+  cross-referenced, NOT claimed closed here:
+  1. **secret-forwarding** — an admitted server handed a value could still exfiltrate it. That is a
+     disclosure/egress concern bounded by `disclosure-gate-live-path` + `b1-os-isolation`, not by
+     this leash.
+  2. **name-based effect classification is server-influenceable** — a hostile server could name a
+     destructive tool with a read verb (`get_…`) to earn read-class tolerance. The real containment
+     for a genuinely-hostile server is admission (only trusted servers connect) + `b1` (OS sandbox),
+     with the name convention as defense-in-depth. Per-call budget + resource-scope + credential-
+     handle attenuation are the follow-on that tightens this.
+- **Disabled while open:** admitting a genuinely-untrusted server that holds a live secret (bounded
+  by `mcp-config-admission` + `b1` + `disclosure-gate-live-path`).
+- **Closure criterion (LEASH):** met — an un-leashed `McpTools::call` does not compile, and the
+  no-persona mutating dispatch is prompted/denied on the real dispatch path. Full closure of the row
+  additionally needs the secret-forwarding residual retired (via `disclosure-gate-live-path`).
+- **Ratchet guard:** `no_persona_does_not_dispatch_a_mutating_mcp_tool_unleashed`,
+  `no_persona_read_class_mcp_tool_still_dispatches`,
+  `no_persona_mutating_mcp_tool_dispatches_when_human_grants`,
+  `remote_tool_outside_allow_list_is_prompted_not_hard_vetoed` (`agentic/tools.rs`), and
+  `classify_reads_by_verb_prefix_stripping_namespace` + `leash_mints_only_when_granted`
+  (`agentic/mcp.rs`). Removing the witness requirement makes the un-leashed dispatch compile again.
+- **Status:** OPEN (narrowed) — LEASH invariant CLOSED (step-6.4, witness-typed call-time leash);
+  secret-forwarding + name-classification residuals cross-referenced to `disclosure-gate-live-path`
+  / `b1-os-isolation` · owner: — · review-by: with per-call budget/scope attenuation, or when
+  `disclosure-gate-live-path` closes.
+
+> `exec-behavior-bound` — full entry to be filled as it lands; **disabled-while-open bounded by
+> `b1`** (the OS sandbox is the backstop for name-granularity exec until it closes).
 
 ## 5. How to use this (for the practical-caveat moments)
 
