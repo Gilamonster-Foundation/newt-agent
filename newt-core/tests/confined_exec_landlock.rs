@@ -219,26 +219,28 @@ fn hostile_child_cannot_open_a_network_connection() {
 }
 
 /// The build/test-tool fence (`build_tool_caveats`, used by the migrated
-/// `run_build_check`) reads widely but still denies the dangerous half: a
-/// hostile build command cannot write OUTSIDE the workspace (e.g. poison the
-/// shared package cache) even though it may read. Denied by Landlock, or the
-/// spawn is refused.
+/// `run_build_check`) denies the dangerous halves: a hostile build command
+/// cannot write OUTSIDE the workspace (cache-poisoning) and cannot READ an
+/// arbitrary secret (which it could otherwise disclose through the tool output
+/// the model sees). Denied by Landlock, or the spawn is refused.
 #[test]
 #[serial]
-fn build_fence_denies_write_escape_even_with_open_reads() {
+fn build_fence_denies_write_escape_and_secret_read() {
     let ws = tempdir().unwrap();
     let outside = tempdir().unwrap();
     let target = outside.path().join("poisoned.txt");
-    let script = format!("echo poison > '{}'", target.display());
+    let secret = outside.path().join("id_rsa");
+    std::fs::write(&secret, "PRIVATE-KEY-material").unwrap();
+
+    let write_escape = format!("echo poison > '{}'", target.display());
     let req = ExecRequest::new(
         ExecOrigin::AgentInfluenced,
         "sh",
-        ["-c", script.as_str()],
+        ["-c", write_escape.as_str()],
         ws.path(),
         build_tool_caveats(ws.path()),
     )
     .env("PATH", "/usr/bin:/bin");
-
     match ConstrainedExecutor::run(&req) {
         Ok(out) => assert!(
             !out.success,
@@ -251,4 +253,24 @@ fn build_fence_denies_write_escape_even_with_open_reads() {
         !target.exists(),
         "no file may be written outside the build fence (cache-poisoning vector)"
     );
+
+    // Read-then-disclose: a hostile build command must not be able to read a
+    // secret outside the calibrated toolchain read set and echo it to output.
+    let read_escape = format!("cat '{}'", secret.display());
+    let req = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        "sh",
+        ["-c", read_escape.as_str()],
+        ws.path(),
+        build_tool_caveats(ws.path()),
+    )
+    .env("PATH", "/usr/bin:/bin");
+    match ConstrainedExecutor::run(&req) {
+        Ok(out) => assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("PRIVATE-KEY-material"),
+            "a build tool must not read (and thus disclose) a secret outside its read set"
+        ),
+        Err(ExecRefused::ConfinementUnenforceable(_)) => {}
+        Err(e) => panic!("unexpected refusal: {e}"),
+    }
 }
