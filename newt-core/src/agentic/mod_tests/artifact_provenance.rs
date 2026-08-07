@@ -33,6 +33,7 @@ fn ctx<'a>(
         markdown: false,
         tool_offload: false,
         spill_store: None,
+        disclosure: None,
         compaction_store: None,
         scratchpad: false,
         scratchpad_store: None,

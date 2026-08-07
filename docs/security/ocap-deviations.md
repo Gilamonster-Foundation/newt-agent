@@ -95,19 +95,31 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 ### disclosure-gate-live-path
 - **Invariant (ideal):** *every* tool result passes a single disclosure filter before it is
   pushed into `messages` (one chokepoint at `mod.rs:1312`/`2025`).
-- **Practical caveat (now):** redaction runs only on the next-turn observation/summary; the
-  live tool result reaches the model raw; the filter is shape-only (7 regexes).
-- **Residual:** 🔴 critical — a seeded token (or any secret a tool emits) reaches the model
-  verbatim in-turn; re-encoding defeats shape-matching.
+- **Practical caveat (now):** **step-6.1a** wired the by-VALUE `ocap::DisclosureFilter` into the
+  SINGLE live tool-result chokepoint — `maybe_offload_tool_result` (`agentic/mod.rs`), which all four
+  backend loops call and nothing else to make a `{"role":"tool"}` content string, including the
+  early-return tools (`run_command`/`lifecycle`/`prompt_read`/`artifact_read`) the offload/spill
+  redaction never touched. Threaded via a new `ChatCtx.disclosure` (`None` = inert, bit-for-bit
+  unchanged). Two gaps remain: (i) the caller does not yet register the session secret into
+  `ChatCtx.disclosure` at session start; (ii) the next-turn observation + summary paths still redact
+  shape-only (`redact_secrets`, 7 regexes), not by value.
+- **Residual:** 🔴 critical → 🟠 high — the *mechanism* now exists and is proven (canary redacted in
+  every encoding at the live chokepoint), but it is inert until session-start registration lands; the
+  other two paths remain shape-only.
 - **Disabled while open:** seeding **any secret-bearing file the worker can `read_file`/
-  `cat`**.
-- **Compensating controls:** keep secrets out of the box (above); for any unavoidable seeded
-  secret, redact by **known value** (B3 knows the exact path), not by shape.
-- **Closure criterion:** all three disclosure paths share one chokepoint; a canary value
-  seeded at session start never appears in the model-facing message stream.
-- **Ratchet guard:** a canary test — a known sentinel value placed at a seeded path must be
-  absent from every `{"role":"tool"}` message and every summary.
-- **Status:** OPEN · review-by: with B1 (they pair)
+  `cat`** (until registration + convergence land).
+- **Compensating controls:** keep secrets out of the box; the value-filter chokepoint (step-6.1a) is
+  ready to redact by known value the moment B3 registers it — no longer only shape-matching.
+- **Closure criterion:** all three disclosure paths share one **value** chokepoint; the session
+  secret is registered at start; a canary seeded at session start never appears in the model-facing
+  message stream in any encoding.
+- **Ratchet guard:** `disclosure_chokepoint_redacts_registered_canary_in_every_encoding` (`agentic/mod.rs`,
+  step-6.1a) — a registered canary embedded raw + base64 + hex in a tool result is absent from the
+  chokepoint output in every encoding (`DisclosureFilter::leaks == false`), and the `None` path is
+  byte-identical. Follow-up guards will assert absence from the assembled `{"role":"tool"}` messages
+  and every summary once registration + the observation/summary convergence land.
+- **Status:** OPEN — mechanism landed (step-6.1a: live-path value chokepoint + canary guard);
+  session-start registration + observation/summary value-convergence pending · review-by: with B1
 
 ### sod-proposer-not-worker
 - **Invariant (ideal):** the policy-proposing surface is cryptographically a *different,

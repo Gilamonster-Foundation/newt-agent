@@ -78,6 +78,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         markdown: false,
         tool_offload: false,
         spill_store: None,
+        disclosure: None,
         compaction_store: None,
         scratchpad: false,
         scratchpad_store: None,

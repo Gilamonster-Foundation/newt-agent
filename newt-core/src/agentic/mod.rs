@@ -900,6 +900,15 @@ pub struct ChatCtx<'a> {
     /// (and `spill:` re-reads resolve to a labelled absence). Shared `&dyn`
     /// (interior mutability) so it serves both the write path and `memory_fetch`.
     pub spill_store: Option<&'a dyn crate::agentic::content_spill::SpillStore>,
+    /// step-6.1a (`disclosure-gate-live-path`): the by-VALUE disclosure filter for
+    /// the single live tool-result chokepoint (`maybe_offload_tool_result`). Holds
+    /// the session-registered secret/canary values; every tool result is passed
+    /// through [`DisclosureFilter::redact`](crate::ocap::DisclosureFilter::redact)
+    /// before it becomes a `{"role":"tool"}` message, catching the value in any
+    /// encoding (re-encoding defeats the shape filter). `None` = no registered
+    /// secret (bit-for-bit unchanged) — the session-start registration wiring is a
+    /// follow-up; this establishes the chokepoint + its canary ratchet guard.
+    pub disclosure: Option<&'a crate::ocap::DisclosureFilter>,
     /// Session compaction store (#661 group B): the compressor stores each
     /// evicted (redacted) middle span here and names a `compaction:<id>` handle
     /// in the marker, so the model can losslessly recover a detail the summary
@@ -1537,6 +1546,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         markdown: _,
         tool_offload,
         spill_store,
+        disclosure,
         compaction_store,
         scratchpad,
         scratchpad_store,
@@ -3320,7 +3330,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 "role": "tool",
                 // Step 26.3 (#584): offload an oversized result (redact → spill →
                 // teaser+handle) when tool_offload is on; unchanged otherwise.
-                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store)
+                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store, disclosure)
             }));
         }
         if round_wrote {
@@ -4000,8 +4010,9 @@ fn maybe_offload_tool_result(
     result: String,
     tool_offload: bool,
     spill_store: Option<&dyn content_spill::SpillStore>,
+    disclosure: Option<&crate::ocap::DisclosureFilter>,
 ) -> String {
-    if matches!(
+    let out = if matches!(
         name,
         "run_command" | "lifecycle" | "prompt_read" | "artifact_read"
     ) {
@@ -4010,6 +4021,16 @@ fn maybe_offload_tool_result(
         // Thread the tool name into provenance so a tool output and an identical-looking
         // compaction span never share an address (content_spill binds provenance).
         content_spill::maybe_offload(result, tool_offload, Some(name.to_string()), spill_store)
+    };
+    // step-6.1a (`disclosure-gate-live-path`): the SINGLE live-path disclosure
+    // chokepoint. Every tool result — including the early-return tools above,
+    // which the offload/spill redaction never touched — passes the by-VALUE
+    // filter before it becomes a `{"role":"tool"}` message, so a registered
+    // session secret / canary cannot reach the model verbatim in-turn, in ANY
+    // encoding (raw / base64 / hex). `None` = no registered secret → unchanged.
+    match disclosure {
+        Some(filter) => filter.redact(&out),
+        None => out,
     }
 }
 
@@ -5097,6 +5118,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         markdown: _,
         tool_offload,
         spill_store,
+        disclosure,
         compaction_store,
         scratchpad,
         scratchpad_store,
@@ -6492,7 +6514,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 "role": "tool",
                 "tool_call_id": id,
                 // Step 26.3 (#584): see the Ollama path.
-                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store),
+                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store, disclosure),
             }));
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
@@ -6986,6 +7008,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         markdown,
         tool_offload,
         spill_store,
+        disclosure,
         compaction_store,
         scratchpad,
         scratchpad_store,
@@ -8325,7 +8348,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
-                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store),
+                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store, disclosure),
             }));
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
@@ -8582,6 +8605,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         markdown: _,
         tool_offload,
         spill_store,
+        disclosure,
         compaction_store,
         scratchpad,
         scratchpad_store,
@@ -9278,7 +9302,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 "type": "function_call_output",
                 "call_id": call_id,
                 // Step 26.3 (#584): see the Ollama path (Responses output shape).
-                "output": maybe_offload_tool_result(name, result, tool_offload, spill_store),
+                "output": maybe_offload_tool_result(name, result, tool_offload, spill_store, disclosure),
             }));
         }
     }
@@ -10206,9 +10230,54 @@ mod cap_exit_unit_tests {
     fn prompt_read_exact_recovery_is_never_spilled() {
         let store = content_spill::SessionSpillStore::new([7u8; 16]);
         let exact = "x".repeat(content_spill::TOOL_RESULT_SPILL_CAP + 1);
-        let output = maybe_offload_tool_result("prompt_read", exact.clone(), true, Some(&store));
+        let output =
+            maybe_offload_tool_result("prompt_read", exact.clone(), true, Some(&store), None);
         assert_eq!(output, exact);
         assert_eq!(content_spill::SpillStore::unique_objects(&store), 0);
+    }
+
+    #[test]
+    fn disclosure_chokepoint_redacts_registered_canary_in_every_encoding() {
+        // step-6.1a ratchet guard (`disclosure-gate-live-path`): a value registered
+        // at session start must not reach the model-facing tool message in ANY
+        // encoding — raw, base64, or hex. Proves the single live chokepoint
+        // (`maybe_offload_tool_result`) runs the by-value `DisclosureFilter`,
+        // including for the early-return tools (`run_command` here) that the
+        // offload/spill redaction never touched. Also pins that the `None` path is
+        // byte-for-byte unchanged, so the gate is inert until a secret is registered.
+        use crate::ocap::DisclosureFilter;
+        use base64::Engine as _;
+
+        let canary = "CANARY-9f3a2b1c8d7e6f50";
+        let mut filter = DisclosureFilter::new();
+        filter.register(canary);
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(canary.as_bytes());
+        let hex: String = canary
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // A tool output embedding the canary raw + re-encoded, as an exfil would.
+        let raw = format!("secret {canary} b64 {b64} hex {hex}\n");
+
+        let gated =
+            maybe_offload_tool_result("run_command", raw.clone(), false, None, Some(&filter));
+        assert!(
+            !filter.leaks(&gated),
+            "no encoding of the registered canary may survive the chokepoint: {gated}"
+        );
+        assert!(
+            gated.contains("[REDACTED]"),
+            "the canary is replaced: {gated}"
+        );
+
+        // Negative control: no filter → byte-identical (the gate is off = unchanged).
+        let ungated = maybe_offload_tool_result("run_command", raw.clone(), false, None, None);
+        assert_eq!(
+            ungated, raw,
+            "a `None` disclosure filter must not alter output"
+        );
     }
 
     #[test]
@@ -10663,6 +10732,7 @@ mod tool_round_cap_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            disclosure: None,
             compaction_store: None,
             scratchpad: false,
             scratchpad_store: None,
@@ -10885,6 +10955,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -11194,6 +11265,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -11293,6 +11365,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -13409,6 +13482,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -13520,6 +13594,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -13640,6 +13715,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -13772,6 +13848,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -13896,6 +13973,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -14062,6 +14140,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -14237,6 +14316,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                disclosure: None,
                 compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
@@ -15151,6 +15231,7 @@ mod save_note_loop_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            disclosure: None,
             compaction_store: None,
             scratchpad: false,
             scratchpad_store: None,
@@ -15655,6 +15736,7 @@ mod compression_loop_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            disclosure: None,
             compaction_store: None,
             scratchpad: false,
             scratchpad_store: None,
@@ -16948,6 +17030,7 @@ mod observation_hook_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            disclosure: None,
             compaction_store: None,
             scratchpad: false,
             scratchpad_store: None,
