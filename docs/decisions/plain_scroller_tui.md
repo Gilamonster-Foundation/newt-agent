@@ -108,6 +108,12 @@ The practical wins compound with the architectural one:
   scrollback in both `--splash` and `--no-splash` modes (PR #301 — the
   preamble always shows). ratatui is permitted as a dependency *only* for the
   alt-screen surfaces; if both ever drop it, drop the dependency.
+  *Splash-first amendment:* the splash now runs **before** the first-run
+  wizard (whose cooked-mode menus print into real scrollback after the guard
+  drops) and always draws a spinner + status line inside its existing
+  alt-screen surface — an extension of this same carve-out, not a new one.
+  Background initialization (model provisioning, backend pre-warm) starts at
+  splash entry so the beat covers real work.
 - **The `/plan` editor** — the second ephemeral alternate-screen surface,
   opened **only on explicit human request** (`/plan edit`) to edit a
   structured plan document as a form instead of hand-writing TOML. Like the

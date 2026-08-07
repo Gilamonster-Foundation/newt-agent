@@ -9,6 +9,33 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Added — splash-first startup, open provider roster, Hermes compatibility
+
+- **Splash first, always a spinner.** The splash now precedes the first-run
+  wizard (its menus roll underneath in normal scrollback after the splash
+  drops) and always shows a spinner + status from the shared frame set, so a
+  launch never looks hung. Background work starts at splash entry: configured
+  boxes pre-warm the backend probe during the splash beat and session start
+  consumes the in-flight result when the resolved endpoint still matches.
+  Non-TTY / `--no-splash` paths are byte-identical to before.
+- **Open hosted-provider roster.** The wizard's hosted door is now a
+  filterable picker over a pure-data preset roster: OpenAI, Anthropic, Ollama
+  Cloud, OpenRouter, NVIDIA NIM, Hugging Face router, Moonshot (Kimi),
+  LM Studio (local, keyless), Venice.ai — plus operator drop-ins at
+  `~/.newt/providers/*.{toml,yaml,yml}` (merge-by-name over the builtins).
+  Unsupported presets (oauth auth, Bedrock mode, unroutable base URLs) stay
+  visible as "(unavailable: reason)" rows. First-menu doors 1–2 unchanged;
+  the hosted entries moved behind door 3 (scripted-setup note).
+- **Hermes Agent compatibility.** Preset fields mirror Hermes
+  `ProviderProfile` 1:1; the drop-in loader reads newt TOML AND Hermes YAML —
+  including a full copied `~/.hermes/config.yaml` (`custom_providers:` blocks
+  expand to presets; inline `api_key` values are NEVER loaded — export the
+  env var or paste at setup, stored encrypted). `newt providers
+  import-hermes` converts Hermes model-provider *plugins* (Python) to preset
+  drop-ins via a whitelist literal-extractor that never executes plugin code;
+  hook-bearing plugins are skipped with the reason printed. `newt providers
+  list` shows the merged roster. See docs/provider-presets.md.
+
 ### Added — the unboxing workflow
 
 - **First run opens the wizard immediately.** A fresh box (no config file AND

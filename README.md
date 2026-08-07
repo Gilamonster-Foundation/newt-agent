@@ -72,6 +72,10 @@ just install-web   # → ~/bin/newt-web
 newt web           # launches it (127.0.0.1:8880 by default)
 ```
 
+Hosted providers (OpenAI, Anthropic, OpenRouter, NVIDIA NIM, …) live in an
+extensible preset roster that also reads **Hermes Agent** configs — copy a
+`~/.hermes/config.yaml` into `~/.newt/providers/` or run `newt providers
+import-hermes` ([provider presets](./docs/provider-presets.md)).
 Authenticated endpoints, discovery ports, and where (encrypted) credentials and
 backends are stored: [the setup guide](./docs/guide/setup.md). Inside the TUI, `/mode` picks a working
 style and `/posture` is the separate authority control — a posture floor can only

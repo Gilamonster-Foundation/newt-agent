@@ -511,47 +511,132 @@ pub fn run_code(
         io::stdout().is_terminal(),
     );
 
-    // First-run wizard: silent no-op if config already exists.
-    wizard::maybe_run(color)?;
-
     let workspace = resolve_workspace(path);
 
     // `no_splash` is already resolved by the caller (CLI flags + config).
     let inline = no_splash;
 
     if !inline {
-        // Default: full ANSI splash in alt screen — blinks off on Enter.
+        // SPLASH FIRST — it covers the initialization work, and the first-run
+        // wizard's menus roll underneath (normal scrollback) after it drops.
         // #1411: the guard owns raw mode + the alternate screen + the cursor for
         // this whole block, so the `?`s below cannot strand the terminal.
         let screen = SplashScreenGuard::enter()?;
         let mut stdout = io::stdout();
+        // Background work starts AT splash entry: a configured box pre-warms
+        // its backend probe while the logo shows; run_chat consumes the result
+        // when (and only when) the resolved choice still matches.
+        let prewarm = spawn_backend_prewarm();
         // First-run setup, COVERED by the splash (#985): a spinner + status under
         // the logo while the model provisions on a background thread; input is
-        // blocked except a triple abort. Then the normal Enter-to-continue splash.
+        // blocked except a triple abort. Then the Enter-to-continue splash —
+        // which always shows its own spinner so a launch never looks hung.
         if let Some(setup) = setup {
             run_setup_screen(&mut stdout, color, setup)?;
         }
-        let cont = splash::show_splash(&mut stdout, &workspace, color)?;
+        let status = if prewarm.is_some() {
+            "warming up backend…"
+        } else {
+            "initializing…"
+        };
+        let cont = splash::show_splash(&mut stdout, &workspace, color, status)?;
         // Give the terminal back before anything else prints: chat must not run
         // inside the alternate screen. Explicit rather than implicit at the end
         // of the block so the ordering stays visible to a reader.
         drop(screen);
         if !cont {
+            if let Some(pw) = prewarm {
+                pw.handle.abort();
+            }
             return Ok(());
         }
-    } else if let Some(setup) = setup {
+        // First-run wizard: silent no-op when configured — otherwise its menus
+        // print here, in cooked scrollback beneath where the splash was.
+        wizard::maybe_run(color)?;
+        print_inline_header(&workspace, color);
+        return run_chat(&workspace, color, persona, altitude, crew_runner, prewarm);
+    }
+
+    // No-splash paths keep the pre-splash order exactly (wizard first): CI,
+    // piped, and --no-splash launches see no behavior change.
+    wizard::maybe_run(color)?;
+    if let Some(setup) = setup {
         // No-splash (#985): the header still shows, then an inline setup spinner
         // covers the provisioning before chat starts.
         print_inline_header(&workspace, color);
         run_setup_inline(&setup);
-        return run_chat(&workspace, color, persona, altitude, crew_runner);
+        return run_chat(&workspace, color, persona, altitude, crew_runner, None);
     }
 
-    // The preamble always shows. The splash lives in the alternate screen
-    // and vanishes with it, so the inline header is printed into normal
-    // scrollback in BOTH modes before chat starts.
     print_inline_header(&workspace, color);
-    run_chat(&workspace, color, persona, altitude, crew_runner)
+    run_chat(&workspace, color, persona, altitude, crew_runner, None)
+}
+
+/// A backend probe started at splash entry so a configured box's session
+/// start finds the answer already in flight (or done) instead of probing
+/// cold after the splash.
+pub(crate) struct Prewarm {
+    /// The URL the probe ran against — consumption is gated on it still
+    /// matching the resolved choice (a first-run wizard may have changed
+    /// everything in between).
+    pub(crate) url: String,
+    pub(crate) handle:
+        tokio::task::JoinHandle<Option<newt_core::backend_probe::EndpointProbeResult>>,
+}
+
+/// True when a pre-warmed probe is for the same endpoint the session
+/// resolved — trailing-slash-insensitive. Pure.
+pub(crate) fn prewarm_applies(choice_url: &str, prewarm_url: &str) -> bool {
+    choice_url.trim_end_matches('/') == prewarm_url.trim_end_matches('/')
+}
+
+/// Start the pre-warm probe for the resolved backend choice, if this box is
+/// configured (an unconfigured box has nothing real to probe — the wizard is
+/// about to change everything) and a tokio runtime is available.
+fn spawn_backend_prewarm() -> Option<Prewarm> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let cfg = newt_core::Config::resolve().ok()?;
+    if cfg.is_unconfigured() {
+        return None;
+    }
+    let choice = resolve_backend_choice(&cfg);
+    let url = choice.url.clone();
+    let api_key = choice.api_key.clone();
+    let needs_probe = choice.kind_needs_probe;
+    let kind = choice.kind;
+    let secs = if url.starts_with("https://") { 3 } else { 1 };
+    let task_url = url.clone();
+    let handle = runtime.spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(secs))
+            .build()
+            .ok()?;
+        if needs_probe {
+            newt_core::backend_probe::detect_endpoint(&client, &task_url, api_key.as_deref())
+                .await
+                .ok()
+        } else {
+            // Same shape adopt_backend_choice's known-kind path fetches cold.
+            let api = newt_core::backend_probe::api_for(kind);
+            let models = api
+                .list_models(&client, &task_url, api_key.as_deref())
+                .await
+                .ok()?;
+            let warm = api
+                .warm_models(&client, &task_url, api_key.as_deref())
+                .await
+                .unwrap_or_default();
+            Some(newt_core::backend_probe::EndpointProbeResult {
+                endpoint: task_url.trim_end_matches('/').to_string(),
+                serving: api.serving(models.len()),
+                kind,
+                models,
+                warm,
+                engine: None,
+            })
+        }
+    });
+    Some(Prewarm { url, handle })
 }
 
 /// Compact inline header — the session preamble.
@@ -3317,12 +3402,37 @@ pub(crate) fn active_backend_name(cfg: &newt_core::Config) -> Option<String> {
 /// When the config omitted `kind` (`kind_needs_probe`), race `/api/tags` vs
 /// `/v1/models` via [`newt_core::backend_probe::detect_endpoint`] first so a
 /// minimal `name`+`endpoint` backend still connects.
-fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
-    use newt_core::backend_probe::{self, Served};
+fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) -> Vec<String> {
+    use newt_core::backend_probe;
     if choice.kind == newt_core::BackendKind::Embedded && !choice.kind_needs_probe {
         return Vec::new();
     }
-    let mut lines = Vec::new();
+    let lines = Vec::new();
+    // Splash-first pre-warm: a probe started at splash entry for THIS
+    // endpoint means the answer is already in flight (or done) — await it
+    // instead of probing cold. Gated on the URL still matching (a first-run
+    // wizard may have rewritten the config since the probe was spawned) and
+    // fail-soft: a failed/mismatched pre-warm falls through to the cold path.
+    let prewarmed = prewarm
+        .filter(|pw| prewarm_applies(&choice.url, &pw.url))
+        .and_then(|pw| {
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(pw.handle))
+                .ok()
+                .flatten()
+        });
+    if let Some(probe) = prewarmed {
+        let detected = if choice.kind_needs_probe {
+            choice.kind = probe.kind;
+            choice.kind_needs_probe = false;
+            if choice.serving.is_none() {
+                choice.serving = Some(probe.serving);
+            }
+            Some(probe.kind)
+        } else {
+            None
+        };
+        return finish_adoption(choice, lines, probe.models, probe.warm, detected);
+    }
     // Local endpoints answer in well under a second; a remote authenticated
     // HTTPS gateway needs a TLS + auth round-trip — still a bounded beat,
     // just a wider one.
@@ -3382,6 +3492,36 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
     });
     match fetched {
         Ok((models, warm, detected_kind)) => {
+            finish_adoption(choice, lines, models, warm, detected_kind)
+        }
+        Err(e) => offline_adoption(choice, lines, e),
+    }
+}
+
+/// The shared adopt tail: probe results (live or pre-warmed) → the choice's
+/// model/serving/window/api, with the honest status lines.
+fn finish_adoption(
+    choice: &mut BackendChoice,
+    mut lines: Vec<String>,
+    models: Vec<String>,
+    warm: Vec<String>,
+    detected_kind: Option<newt_core::BackendKind>,
+) -> Vec<String> {
+    use newt_core::backend_probe::{self, Served};
+    let secs = if choice.url.starts_with("https://") {
+        3
+    } else {
+        1
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(secs))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return lines,
+    };
+    {
+        {
             if let Some(kind) = detected_kind {
                 lines.push(format!(
                     "detected {} at {} — {} model(s)",
@@ -3501,19 +3641,27 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
                 }
             }
         }
-        Err(e) => {
-            if choice.model.is_empty() {
-                lines.push(format!(
-                    "{} is unreachable ({e}) and no model is configured — check the                      endpoint, then /backends",
-                    choice.url
-                ));
-            } else {
-                lines.push(format!(
-                    "{} is unreachable ({e}) — using configured model {} until it answers",
-                    choice.url, choice.model
-                ));
-            }
-        }
+    }
+    lines
+}
+
+/// The offline tail: the endpoint is unreachable — keep the file-hint model
+/// with an honest line; never fail the session.
+fn offline_adoption(
+    choice: &mut BackendChoice,
+    mut lines: Vec<String>,
+    e: anyhow::Error,
+) -> Vec<String> {
+    if choice.model.is_empty() {
+        lines.push(format!(
+            "{} is unreachable ({e}) and no model is configured — check the                      endpoint, then /backends",
+            choice.url
+        ));
+    } else {
+        lines.push(format!(
+            "{} is unreachable ({e}) — using configured model {} until it answers",
+            choice.url, choice.model
+        ));
     }
     lines
 }
@@ -3946,7 +4094,7 @@ pub(crate) fn refresh_backend(
     // Adopt served reality only when the endpoint or model actually changed (a
     // plain slash command must not re-probe every time).
     if choice.url != prev_url || choice.model != *inf_model {
-        for line in adopt_backend_choice(choice) {
+        for line in adopt_backend_choice(choice, None) {
             print_newt(&line, color, verbose);
         }
     }

@@ -104,15 +104,24 @@ pub(crate) fn show_splash(
     out: &mut io::Stdout,
     workspace: &str,
     color: bool,
+    status: &str,
 ) -> anyhow::Result<bool> {
     if color {
-        show_splash_color(out, workspace)
+        show_splash_color(out, workspace, status)
     } else {
-        show_splash_plain(out, workspace)
+        show_splash_plain(out, workspace, status)
     }
 }
 
-fn show_splash_color(out: &mut io::Stdout, _workspace: &str) -> anyhow::Result<bool> {
+/// One spinner frame from the workspace's ONE braille frame set — the splash
+/// always shows motion so a launch never looks hung while background work
+/// (model provisioning, backend pre-warm) runs.
+fn spinner_frame(tick: u32) -> &'static str {
+    let frames = newt_core::tty::SPINNER_FRAMES;
+    frames[(tick as usize) % frames.len()]
+}
+
+fn show_splash_color(out: &mut io::Stdout, _workspace: &str, status: &str) -> anyhow::Result<bool> {
     let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
     let (logo, logo_cols) = logo_for_size(term_cols, term_rows);
     let logo_lines: Vec<&str> = logo.lines().collect();
@@ -151,7 +160,9 @@ fn show_splash_color(out: &mut io::Stdout, _workspace: &str) -> anyhow::Result<b
             queue!(out, ResetColor)?;
         }
         out.flush()?;
-        return splash_wait_for_continue();
+        let spin_row = (top + block.len() + 1).min(logo_lines.len().saturating_sub(1)) as u16;
+        let spin_col = (logo_cols as usize).saturating_sub(status.len() + 2) as u16 / 2;
+        return splash_wait_with_spinner(out, spin_col, spin_row, status);
     }
 
     let brand_col = logo_cols + 2;
@@ -191,10 +202,10 @@ fn show_splash_color(out: &mut io::Stdout, _workspace: &str) -> anyhow::Result<b
     )?;
     out.flush()?;
 
-    splash_wait_for_continue()
+    splash_wait_with_spinner(out, brand_col, brand_row + 5, status)
 }
 
-fn show_splash_plain(_out: &mut io::Stdout, workspace: &str) -> anyhow::Result<bool> {
+fn show_splash_plain(_out: &mut io::Stdout, workspace: &str, status: &str) -> anyhow::Result<bool> {
     // For the plain path ratatui takes a fresh io::stdout() handle — fine since
     // stdout is a singleton and we already hold raw mode + alt screen.
     let backend = CrosstermBackend::new(io::stdout());
@@ -226,6 +237,10 @@ fn show_splash_plain(_out: &mut io::Stdout, workspace: &str) -> anyhow::Result<b
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Enter  start coder   ·   q quit",
+                dim,
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("{} {status}", spinner_frame(polls)),
                 dim,
             )));
             let w = 60u16.min(area.width);
@@ -266,9 +281,24 @@ fn splash_poll_event() -> anyhow::Result<Option<bool>> {
 }
 
 /// Wait for the user to press Enter (true) or a quit key (false) — or
-/// auto-continue (true) after [`SPLASH_AUTO_CONTINUE_POLLS`] quiet polls.
-fn splash_wait_for_continue() -> anyhow::Result<bool> {
-    for _ in 0..SPLASH_AUTO_CONTINUE_POLLS {
+/// auto-continue (true) after [`SPLASH_AUTO_CONTINUE_POLLS`] quiet polls —
+/// redrawing a spinner + status line each poll so the wait visibly IS a
+/// wait, not a hang.
+fn splash_wait_with_spinner(
+    out: &mut io::Stdout,
+    col: u16,
+    row: u16,
+    status: &str,
+) -> anyhow::Result<bool> {
+    for tick in 0..SPLASH_AUTO_CONTINUE_POLLS {
+        queue!(
+            out,
+            MoveTo(col, row),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("{} {status}", spinner_frame(tick))),
+            ResetColor
+        )?;
+        out.flush()?;
         if event::poll(std::time::Duration::from_millis(100))? {
             return Ok(splash_key_action(&event::read()?));
         }
@@ -303,6 +333,17 @@ fn splash_key_action(ev: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinner_frames_cycle_through_the_shared_set() {
+        // The splash always shows motion (never a hung-looking wait); frames
+        // come from the workspace's ONE braille set and wrap cleanly.
+        let n = newt_core::tty::SPINNER_FRAMES.len() as u32;
+        assert!(n > 1);
+        assert_eq!(spinner_frame(0), newt_core::tty::SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(n), spinner_frame(0), "wraps");
+        assert_ne!(spinner_frame(0), spinner_frame(1), "visibly ticks");
+    }
 
     #[test]
     fn row_is_blank_distinguishes_dark_fill_from_ink() {

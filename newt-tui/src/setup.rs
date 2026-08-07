@@ -33,6 +33,9 @@
 use crate::line_console::{is_yes, Console, StdinConsole};
 use newt_core::backend_probe::EndpointProbeResult;
 use newt_core::config::Discovery;
+use newt_core::provider_preset::{
+    self, list_models_for_preset, preset_support, PresetSupport, ProviderPreset,
+};
 use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, Tier};
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
@@ -262,9 +265,7 @@ async fn run_with_flow(
     let (cfg, backend) = match choose_backend(console)? {
         BackendChoice::LocalOllama => configure_ollama(console, client).await?,
         BackendChoice::CustomHost => configure_custom_host(console, client, config_path).await?,
-        BackendChoice::Preset(preset) => {
-            configure_preset(console, client, preset, config_path).await?
-        }
+        BackendChoice::HostedProvider => configure_hosted(console, client, config_path).await?,
     };
 
     // Preview before committing anything to disk: the backend drop-in is the
@@ -292,61 +293,11 @@ async fn run_with_flow(
     Ok(())
 }
 
-/// One hosted-provider preset — pure data (the three Cs): the menu below and
-/// [`configure_preset`] render/consume rows, so adding a provider is a table
-/// entry, not a new flow. (A `~/.newt/providers/` drop-in layer is a flagged
-/// follow-up; it must reconcile naming with `Config::providers` first.)
-#[derive(Debug, Clone, Copy)]
-struct ProviderPreset {
-    /// Backend + drop-in name (fixed for known providers; #1448's derived
-    /// names remain the rule for custom hosts).
-    name: &'static str,
-    label: &'static str,
-    endpoint: &'static str,
-    kind: BackendKind,
-    /// Honored as a reference when already exported — nothing stored.
-    api_key_env: &'static str,
-    /// Fallback when the model list can't be fetched.
-    default_model: &'static str,
-    /// Where to create a key.
-    token_help: &'static str,
-}
-
-const PROVIDER_PRESETS: &[ProviderPreset] = &[
-    ProviderPreset {
-        name: "openai",
-        label: "OpenAI",
-        endpoint: "https://api.openai.com",
-        kind: BackendKind::Openai,
-        api_key_env: "OPENAI_API_KEY",
-        default_model: "gpt-5.2",
-        token_help: "https://platform.openai.com/api-keys",
-    },
-    ProviderPreset {
-        name: "anthropic",
-        label: "Anthropic",
-        endpoint: "https://api.anthropic.com",
-        kind: BackendKind::Anthropic,
-        api_key_env: "ANTHROPIC_API_KEY",
-        default_model: "claude-sonnet-4-5",
-        token_help: "https://console.anthropic.com/settings/keys",
-    },
-    ProviderPreset {
-        name: "ollama-cloud",
-        label: "Ollama Cloud",
-        endpoint: "https://ollama.com",
-        kind: BackendKind::Ollama,
-        api_key_env: "OLLAMA_API_KEY",
-        default_model: "gpt-oss:120b",
-        token_help: "https://ollama.com/settings/keys",
-    },
-];
-
 #[derive(Debug, Clone, Copy)]
 enum BackendChoice {
     LocalOllama,
     CustomHost,
-    Preset(&'static ProviderPreset),
+    HostedProvider,
 }
 
 fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
@@ -355,22 +306,14 @@ fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
     console.say(
         "  2) Another machine          (hostname or URL — newt probes for Ollama / llama.cpp / vLLM)",
     );
-    for (i, preset) in PROVIDER_PRESETS.iter().enumerate() {
-        console.say(&format!(
-            "  {}) {:<24}({} — API key)",
-            i + 3,
-            preset.label,
-            preset.endpoint
-        ));
-    }
+    console
+        .say("  3) A hosted provider        (OpenAI, Anthropic, OpenRouter, NVIDIA, … — API key)");
     let ans = console.ask("Choose [1]: ")?;
-    Ok(
-        match parse_choice(&ans, 2 + PROVIDER_PRESETS.len()).unwrap_or(1) {
-            1 => BackendChoice::LocalOllama,
-            2 => BackendChoice::CustomHost,
-            n => BackendChoice::Preset(&PROVIDER_PRESETS[n - 3]),
-        },
-    )
+    Ok(match parse_choice(&ans, 3).unwrap_or(1) {
+        2 => BackendChoice::CustomHost,
+        3 => BackendChoice::HostedProvider,
+        _ => BackendChoice::LocalOllama,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -588,71 +531,141 @@ fn manual_backend_entry(console: &mut dyn Console) -> anyhow::Result<(Config, Ba
 }
 
 // ---------------------------------------------------------------------------
-// Hosted-provider presets (OpenAI / Anthropic / Ollama Cloud)
+// Hosted-provider presets (the newt_core::provider_preset roster)
 // ---------------------------------------------------------------------------
 
-/// Configure a hosted provider from its preset row: env-var reference first
-/// (nothing stored), else a hidden-input paste stored ENCRYPTED at rest, then
-/// a model pick probed through the provider's own API (`api_for(kind)` — the
-/// Anthropic arm sends x-api-key + anthropic-version).
+/// The "hosted provider" door: resolve the roster (builtin + drop-ins,
+/// incl. copied Hermes YAML), pick one, configure it.
+async fn configure_hosted(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    config_path: &Path,
+) -> anyhow::Result<(Config, BackendConfig)> {
+    let presets = provider_preset::resolve_presets(None);
+    let preset = select_preset(console, &presets)?;
+    configure_preset(console, client, &preset, config_path).await
+}
+
+/// Filterable roster picker. Unsupported presets (oauth-auth drop-ins,
+/// bedrock modes, unroutable base URLs) are listed as "(unavailable: …)"
+/// notes with the reason — visible, never numbered, never silently dropped.
+fn select_preset(
+    console: &mut dyn Console,
+    presets: &[ProviderPreset],
+) -> anyhow::Result<ProviderPreset> {
+    let mut available: Vec<(&ProviderPreset, String)> = Vec::new();
+    let mut unavailable: Vec<(String, String)> = Vec::new();
+    for p in presets {
+        match preset_support(p) {
+            PresetSupport::Supported { endpoint, .. } => available.push((p, endpoint)),
+            PresetSupport::Unsupported { reason } => {
+                unavailable.push((p.label().to_string(), reason));
+            }
+        }
+    }
+    for (label, reason) in &unavailable {
+        console.say(&format!("  (unavailable: {label} — {reason})"));
+    }
+    if available.is_empty() {
+        anyhow::bail!("no usable provider presets (see the unavailable notes above)");
+    }
+    let rows: Vec<String> = available
+        .iter()
+        .map(|(p, endpoint)| format!("{:<24}{}", p.label(), endpoint))
+        .collect();
+    let idx = select_row(console, &rows, "providers")?;
+    Ok(available[idx].0.clone())
+}
+
+/// Configure a hosted provider from its preset: env-var reference first
+/// (checked in `env_vars` priority order — the var that RESOLVES is the one
+/// recorded), else a hidden-input paste stored ENCRYPTED at rest; then a
+/// model pick probed through the preset's own catalog. An empty `env_vars`
+/// (LM Studio) skips the credential step entirely.
 async fn configure_preset(
     console: &mut dyn Console,
     client: &reqwest::Client,
     preset: &ProviderPreset,
     config_path: &Path,
 ) -> anyhow::Result<(Config, BackendConfig)> {
-    console.say(&format!("\n{} — {}", preset.label, preset.endpoint));
-    console.say(&format!("Create an API key at {}", preset.token_help));
+    console.say(&format!("\n{} — {}", preset.label(), preset.base_url));
+    if let Some(description) = &preset.description {
+        console.say(description);
+    }
+    if let Some(signup) = &preset.signup_url {
+        console.say(&format!("Create an API key at {signup}"));
+    }
+    if !preset.default_headers.is_empty() {
+        // Limitation L1 (docs/provider-presets.md): carried, not sent.
+        console.say(&format!(
+            "  Note: {} suggests extra request headers; newt does not send custom headers yet.",
+            preset.label()
+        ));
+    }
 
-    let exported = std::env::var(preset.api_key_env)
-        .ok()
-        .filter(|v| !v.trim().is_empty());
     // (env reference, encrypted-file reference, key for the model probe)
     let (api_key_env, api_key_file, probe_key): (Option<String>, Option<String>, Option<String>) =
-        if let Some(value) = exported {
-            let ans = console.ask(&format!(
-                "${} is set in this shell. Use it? [Y/n] ",
-                preset.api_key_env
-            ))?;
-            if is_yes(&ans, true) {
-                (Some(preset.api_key_env.to_string()), None, Some(value))
+        if preset.env_vars.is_empty() {
+            (None, None, None) // keyless provider — no credential step
+        } else {
+            let exported = preset.env_vars.iter().find_map(|var| {
+                std::env::var(var)
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| (var.clone(), v))
+            });
+            if let Some((var, value)) = exported {
+                let ans = console.ask(&format!("${var} is set in this shell. Use it? [Y/n] "))?;
+                if is_yes(&ans, true) {
+                    // Record the var that actually resolved, not [0].
+                    (Some(var), None, Some(value))
+                } else {
+                    preset_pasted_key(console, preset, config_path)?
+                }
             } else {
                 preset_pasted_key(console, preset, config_path)?
             }
-        } else {
-            preset_pasted_key(console, preset, config_path)?
         };
 
     console.say(&format!(
         "Probing {} for available models…",
-        preset.endpoint
+        preset.base_url
     ));
-    let models = newt_core::backend_probe::api_for(preset.kind)
-        .list_models(client, preset.endpoint, probe_key.as_deref())
-        .await;
+    let models = list_models_for_preset(client, preset, probe_key.as_deref()).await;
     let model = match models {
         Ok(m) if !m.is_empty() => select_model(console, &m)?,
         Ok(_) | Err(_) => {
             console.say("  Could not list models (endpoint unreachable or key not yet usable).");
-            let raw = console.ask(&format!("Model name [{}]: ", preset.default_model))?;
-            if raw.trim().is_empty() {
-                preset.default_model.to_string()
-            } else {
-                raw.trim().to_string()
+            // Fallback ladder: curated list → single default → free entry.
+            match preset.fallback_models.len() {
+                0 => ask_model_name(console)?,
+                1 => {
+                    let default = &preset.fallback_models[0];
+                    let raw = console.ask(&format!("Model name [{default}]: "))?;
+                    if raw.trim().is_empty() {
+                        default.clone()
+                    } else {
+                        raw.trim().to_string()
+                    }
+                }
+                _ => select_model(console, &preset.fallback_models)?,
             }
         }
     };
 
-    let (config, mut backend) = build_backend_pair(
-        preset.name,
-        preset.endpoint,
+    let backend = provider_preset::backend_from_preset(
+        preset,
         &model,
-        preset.kind,
-        newt_core::Serving::Multiplexer,
         api_key_env,
-        &format!("preset {}", preset.name),
-    );
-    backend.api_key_file = api_key_file;
+        api_key_file,
+        crate::VERSION,
+    )
+    .map_err(|reason| anyhow::anyhow!("preset {} is not usable: {reason}", preset.name))?;
+    let config = Config {
+        backends: vec![], // the drop-in IS the backend list
+        default_backend: Some(backend.name.clone()),
+        ..Default::default()
+    };
     Ok((config, backend))
 }
 
@@ -668,13 +681,17 @@ fn preset_pasted_key(
     let key = console.ask_secret("API key (input hidden, Enter to skip): ")?;
     let key = key.trim().to_string();
     if key.is_empty() {
+        let var = preset
+            .env_vars
+            .first()
+            .cloned()
+            .unwrap_or_else(|| provider_preset::synthesized_env_var(&preset.name));
         console.say(&format!(
-            "  No key — writing the backend anyway; export ${} before use.",
-            preset.api_key_env
+            "  No key — writing the backend anyway; export ${var} before use."
         ));
-        return Ok((Some(preset.api_key_env.to_string()), None, None));
+        return Ok((Some(var), None, None));
     }
-    let reference = persist_wizard_token(console, config_path, preset.name, &key)?;
+    let reference = persist_wizard_token(console, config_path, &preset.name, &key)?;
     Ok((None, Some(reference), Some(key)))
 }
 
@@ -815,35 +832,44 @@ const FILTER_THRESHOLD: usize = 9;
 /// in exactly those cases. Filtering gets the same "find it among 36" result
 /// while staying pipe-safe and unit-testable.
 fn select_model(console: &mut dyn Console, models: &[String]) -> anyhow::Result<String> {
-    let mut pool: Vec<String> = models.to_vec();
+    let idx = select_row(console, models, "models")?;
+    Ok(models[idx].clone())
+}
+
+/// The generic filterable numbered picker `select_model` and
+/// `select_preset` share: same threshold, same blank-filter and
+/// no-match-falls-back-to-all semantics, same pipe-safety. Returns the
+/// index into the ORIGINAL `rows` slice.
+fn select_row(console: &mut dyn Console, rows: &[String], noun: &str) -> anyhow::Result<usize> {
+    let mut pool: Vec<(usize, &String)> = rows.iter().enumerate().collect();
 
     if pool.len() > FILTER_THRESHOLD {
-        console.say(&format!("\n{} models available.", pool.len()));
+        console.say(&format!("\n{} {noun} available.", pool.len()));
         let needle = console.ask("Filter (blank = show all): ")?;
         let needle = needle.trim().to_ascii_lowercase();
         if !needle.is_empty() {
-            let matched: Vec<String> = pool
+            let matched: Vec<(usize, &String)> = pool
                 .iter()
-                .filter(|m| m.to_ascii_lowercase().contains(&needle))
-                .cloned()
+                .filter(|(_, row)| row.to_ascii_lowercase().contains(&needle))
+                .copied()
                 .collect();
             // A filter that matches nothing falls back to the full list rather
             // than dead-ending the operator in an empty menu.
             if matched.is_empty() {
-                console.say(&format!("  No model matches {needle:?}; showing all."));
+                console.say(&format!("  No match for {needle:?}; showing all."));
             } else {
                 pool = matched;
             }
         }
     }
 
-    console.say("\nAvailable models:");
-    for (i, m) in pool.iter().enumerate() {
-        console.say(&format!("  {}) {m}", i + 1));
+    console.say(&format!("\nAvailable {noun}:"));
+    for (i, (_, row)) in pool.iter().enumerate() {
+        console.say(&format!("  {}) {row}", i + 1));
     }
     let ans = console.ask("Choose [1]: ")?;
-    let idx = parse_choice(&ans, pool.len()).map(|n| n - 1).unwrap_or(0);
-    Ok(pool[idx].clone())
+    let picked = parse_choice(&ans, pool.len()).map(|n| n - 1).unwrap_or(0);
+    Ok(pool[picked].0)
 }
 
 fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
@@ -2803,21 +2829,48 @@ mod tests {
     }
 
     #[test]
-    fn the_preset_table_carries_the_three_hosted_providers() {
-        // The menu and configure_preset render/consume this table — the
-        // wizard's provider knowledge is DATA (three Cs), pinned here.
-        let names: Vec<&str> = PROVIDER_PRESETS.iter().map(|p| p.name).collect();
-        assert_eq!(names, ["openai", "anthropic", "ollama-cloud"]);
-        for preset in PROVIDER_PRESETS {
-            assert!(preset.endpoint.starts_with("https://"), "{}", preset.name);
-            assert!(!preset.api_key_env.is_empty());
-            assert!(!preset.default_model.is_empty());
-        }
-        let anthropic = &PROVIDER_PRESETS[1];
-        assert_eq!(anthropic.kind, BackendKind::Anthropic, "native wire");
-        let cloud = &PROVIDER_PRESETS[2];
-        assert_eq!(cloud.kind, BackendKind::Ollama, "ollama wire + bearer");
-        assert_eq!(cloud.endpoint, "https://ollama.com");
+    fn select_preset_lists_available_and_notes_unavailable_rows() {
+        // The picker over the core roster: supported rows are numbered;
+        // an oauth-auth drop-in shows as an "(unavailable: …)" note with
+        // the reason — visible, never silently dropped, never numbered.
+        let mut presets = newt_core::provider_preset::builtin_presets();
+        presets.push(ProviderPreset {
+            name: "corp-sso".into(),
+            display_name: Some("Corp SSO".into()),
+            base_url: "https://llm.corp.example/v1".into(),
+            auth_type: newt_core::provider_preset::AuthType::OauthDeviceCode,
+            ..Default::default()
+        });
+        // 9 available rows == FILTER_THRESHOLD → straight numbered list
+        // (no filter prompt); row 4 is OpenRouter in roster order. The
+        // filter path itself is pinned by select_row_filter_maps_back….
+        let mut console = ScriptedConsole::new(&["4"]);
+        let picked = select_preset(&mut console, &presets).unwrap();
+        assert_eq!(picked.name, "openrouter");
+        assert!(
+            !console.transcript().contains("Filter"),
+            "at the threshold the list shows directly: {}",
+            console.transcript()
+        );
+        let seen = console.transcript();
+        assert!(
+            seen.contains("(unavailable: Corp SSO — auth oauth_device_code"),
+            "{seen}"
+        );
+        assert!(
+            !seen.contains(") Corp SSO"),
+            "unavailable rows are never numbered: {seen}"
+        );
+    }
+
+    #[test]
+    fn select_row_filter_maps_back_to_original_indices() {
+        let rows: Vec<String> = (1..=12).map(|i| format!("row-{i}")).collect();
+        // Filter to "row-1" matches row-1, row-10..12; pick 2 → "row-10"
+        // (original index 9) — the picker must return ORIGINAL indices.
+        let mut console = ScriptedConsole::new(&["row-1", "2"]);
+        let idx = select_row(&mut console, &rows, "rows").unwrap();
+        assert_eq!(idx, 9);
     }
 
     // --- custom-host / preset integration tests ------------------------------
@@ -2916,13 +2969,13 @@ mod tests {
             .await;
         std::env::remove_var("NEWT_TEST_PRESET_KEY");
         let preset = ProviderPreset {
-            name: "testcloud",
-            label: "Test Cloud",
-            endpoint: Box::leak(server.uri().into_boxed_str()),
-            kind: BackendKind::Openai,
-            api_key_env: "NEWT_TEST_PRESET_KEY",
-            default_model: "fallback-model",
-            token_help: "https://example.invalid/keys",
+            name: "testcloud".into(),
+            display_name: Some("Test Cloud".into()),
+            base_url: format!("{}/v1", server.uri()),
+            env_vars: vec!["NEWT_TEST_PRESET_KEY".into()],
+            fallback_models: vec!["fallback-model".into()],
+            signup_url: Some("https://example.invalid/keys".into()),
+            ..Default::default()
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -2964,13 +3017,13 @@ mod tests {
             .await;
         std::env::remove_var("NEWT_TEST_PRESET_KEY");
         let preset = ProviderPreset {
-            name: "gatedcloud",
-            label: "Gated Cloud",
-            endpoint: Box::leak(server.uri().into_boxed_str()),
-            kind: BackendKind::Openai,
-            api_key_env: "NEWT_TEST_PRESET_KEY",
-            default_model: "fallback-model",
-            token_help: "https://example.invalid/keys",
+            name: "gatedcloud".into(),
+            display_name: Some("Gated Cloud".into()),
+            base_url: format!("{}/v1", server.uri()),
+            env_vars: vec!["NEWT_TEST_PRESET_KEY".into()],
+            fallback_models: vec!["fallback-model".into()],
+            signup_url: Some("https://example.invalid/keys".into()),
+            ..Default::default()
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -3013,13 +3066,13 @@ mod tests {
             .await;
         std::env::set_var("NEWT_TEST_PRESET_KEY", "sk-from-env");
         let preset = ProviderPreset {
-            name: "envcloud",
-            label: "Env Cloud",
-            endpoint: Box::leak(server.uri().into_boxed_str()),
-            kind: BackendKind::Openai,
-            api_key_env: "NEWT_TEST_PRESET_KEY",
-            default_model: "fallback-model",
-            token_help: "https://example.invalid/keys",
+            name: "envcloud".into(),
+            display_name: Some("Env Cloud".into()),
+            base_url: format!("{}/v1", server.uri()),
+            env_vars: vec!["NEWT_TEST_PRESET_KEY".into()],
+            fallback_models: vec!["fallback-model".into()],
+            signup_url: Some("https://example.invalid/keys".into()),
+            ..Default::default()
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

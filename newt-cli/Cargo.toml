@@ -37,6 +37,8 @@ clap.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The Hermes config.yaml side of `newt providers import-hermes`.
+serde_yaml.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -81,6 +83,9 @@ cargo_metadata.workspace = true
 predicates.workspace = true
 # Validates the #687 definition-grep pattern matches defs, not mentions.
 regex.workspace = true
+# Real-fs CLI tests share one lane (`#[serial(real_fs)]`) — no workspace
+# entry yet; version matches newt-core's direct dep.
+serial_test = "3"
 tempfile.workspace = true
 tokio.workspace = true
 wiremock.workspace = true
