@@ -118,9 +118,10 @@ pub fn verify_disclosure_gate() -> Verification {
     // `seed_live_credential`, which ALSO requires `verify_b1` (still Absent).
     Verification::Verified {
         evidence: "session secret registered + value-filtered at the tool-result, \
-                   summary, and memory model-ingress funnels (TLS backstop); guarded by \
-                   no_model_ingress_funnel_leaks_a_registered_session_secret + \
-                   redact_secrets_value_filters_a_registered_session_secret"
+                   summary, memory, and repeat-steer model-ingress funnels (TLS backstop); \
+                   guarded by no_model_ingress_funnel_leaks_a_registered_session_secret + \
+                   redact_secrets_value_filters_a_registered_session_secret + \
+                   repeat_steer_value_filters_a_registered_session_secret"
             .into(),
     }
 }
