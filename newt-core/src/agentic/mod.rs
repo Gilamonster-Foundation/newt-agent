@@ -3460,7 +3460,7 @@ impl RepeatCallGuard {
     /// outcome that should not be repeated this run, else `None` (let it execute).
     fn repeat_steer(&self, name: &str, args: &serde_json::Value) -> Option<String> {
         let key = Self::key(name, args);
-        match self.repeat_memos.get(&key)? {
+        let raw: String = match self.repeat_memos.get(&key)? {
             RepeatMemo::Failure { first_line: prev } => {
                 let mut msg = format!(
                     "You already called `{name}` with these exact arguments and it failed: {prev}. \
@@ -3472,18 +3472,26 @@ impl RepeatCallGuard {
                          the embedded tools (read_file, edit_file, write_file, find, git)."
                     ));
                 }
-                Some(msg)
+                msg
             }
-            RepeatMemo::NoResult { reason } => Some(format!(
+            RepeatMemo::NoResult { reason } => format!(
                 "You already ran `{name}` with these exact arguments this turn and {reason}. \
                  Don't repeat the identical call — create or update the missing state, change \
                  the arguments when the tool accepts them, or use a different tool."
-            )),
-            RepeatMemo::EvidenceObserved { subject, advice } => Some(format!(
+            ),
+            RepeatMemo::EvidenceObserved { subject, advice } => format!(
                 "You already observed {subject} with `{name}` and received output. Do NOT repeat \
                  the identical call — {advice}"
-            )),
-        }
+            ),
+        };
+        // disclosure-gate-live-path (#5): the steer is a SYNTHETIC model-ingress
+        // message re-injected as a `{"role":"tool"}` turn, bypassing the
+        // tool-result funnel — and the `Failure` arm interpolates `prev`, the raw
+        // first line of a FAILED tool result. Value-filter the composed steer so a
+        // registered session secret that landed in that line cannot reach the model
+        // on the repeat. This is the one chokepoint every repeat_steer caller
+        // shares, so no push site can leak it.
+        Some(crate::ocap::redact_session_ingress(&raw))
     }
 
     fn successful_fetch_url(name: &str, args: &serde_json::Value, result: &str) -> Option<String> {
@@ -9629,6 +9637,44 @@ mod repeat_call_guard_tests {
              ▒ context budget: 75% remaining\n\
              …\n"
         );
+    }
+
+    /// disclosure-gate-live-path (#5): the repeat-steer synthetic message is a
+    /// model-ingress path (re-injected as a `{"role":"tool"}` turn) that
+    /// interpolates the first line of a FAILED tool result. A registered session
+    /// secret that lands in that line must be value-filtered before the steer
+    /// reaches the model — the convergence-audit falsification. This FAILS on the
+    /// pre-fix code (the raw secret is interpolated verbatim).
+    #[test]
+    fn repeat_steer_value_filters_a_registered_session_secret() {
+        let secret = "CANARY-repeatsteer-9f3a2b71";
+        let mut filter = crate::ocap::DisclosureFilter::new();
+        filter.register(secret);
+        let _guard = crate::ocap::scoped_session_disclosure(filter);
+
+        let mut g = RepeatCallGuard::default();
+        let args = serde_json::json!({"command": "cat /etc/token"});
+        // The tool FAILS with the secret echoed in the first line of its result.
+        g.record(
+            "run_command",
+            &args,
+            false,
+            &format!("error: unexpected token {secret} in response"),
+        );
+        // The model repeats the exact call → the steer re-injects the prior line.
+        let steer = g
+            .repeat_steer("run_command", &args)
+            .expect("steers on repeat");
+        assert!(
+            !steer.contains(secret),
+            "the repeat-steer message leaked a registered session secret: {steer}"
+        );
+        assert!(
+            steer.contains("[REDACTED]"),
+            "the secret should be redacted in place: {steer}"
+        );
+        // The steer is still useful (names the tool + the do-not-repeat guidance).
+        assert!(steer.contains("already called"), "{steer}");
     }
 
     #[test]
