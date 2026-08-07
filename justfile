@@ -53,6 +53,8 @@ install dest=`echo $HOME/bin` features="":
     @just _place-binaries {{dest}}
     @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server {{ if features == "" { "" } else { "[features: " + features + "]" } }}"
     @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
+    @just _warn-if-shadowed newt {{dest}}
+    @just _warn-if-shadowed newt-mcp-server {{dest}}
 
 # Install the newt-web HTMX cockpit beside newt (default: ~/bin), so
 # `newt web` finds it. newt-web is deliberately NOT a workspace member
@@ -67,6 +69,7 @@ install-web dest=`echo $HOME/bin`:
         cp "$target_dir/release/newt-web" {{dest}}/newt-web
     @if command -v codesign >/dev/null 2>&1; then codesign --force --sign - {{dest}}/newt-web && echo "re-signed ad-hoc (macOS AMFI)"; fi
     @echo "Installed: {{dest}}/newt-web — launch with \`newt web\`"
+    @just _warn-if-shadowed newt-web {{dest}}
 
 # Install the LEAN strip-down build (hand-rolled crossterm lean box, no rich TTY
 # surface) — the wyvern/headless tier. Same as `just install` but with
@@ -75,6 +78,7 @@ install-lean dest=`echo $HOME/bin`:
     cargo build --release --no-default-features --bin newt --bin newt-mcp-server
     @just _place-binaries {{dest}}
     @echo "Installed (lean, no rich-tui): {{dest}}/newt  {{dest}}/newt-mcp-server"
+    @just _warn-if-shadowed newt {{dest}}
 
 # Place freshly built release binaries into DEST with a CLEAN inode and (on
 # macOS) a fresh ad-hoc signature. Why not a plain `cp` over the old binary:
@@ -95,6 +99,17 @@ _place-binaries dest:
         cp "$target_dir/release/newt" {{dest}}/newt; \
         cp "$target_dir/release/newt-mcp-server" {{dest}}/newt-mcp-server
     @if command -v codesign >/dev/null 2>&1; then codesign --force --sign - {{dest}}/newt {{dest}}/newt-mcp-server && echo "re-signed ad-hoc (macOS AMFI)"; fi
+
+# PATH-precedence check: being IN PATH is not enough — an older binary of the
+# same name earlier in PATH (a forgotten `cargo install` in ~/.cargo/bin is the
+# classic) silently shadows a fresh install, and every launch runs stale code.
+# Detected in the field: a `cargo install`ed newt 0.6.8 shadowing 0.8.0.
+_warn-if-shadowed name dest:
+    @found="$(command -v {{name}} 2>/dev/null || true)"; \
+        if [ -n "$found" ] && [ "$found" != "{{dest}}/{{name}}" ]; then \
+            echo "WARNING: '{{name}}' resolves to $found — earlier in PATH than {{dest}}/{{name}}, so a stale binary SHADOWS this install."; \
+            echo "         Remove it (e.g. \`cargo uninstall newt-agent\` for a ~/.cargo/bin copy) or reorder PATH."; \
+        fi
 
 # Remove the binaries `just install` placed in DEST (default: ~/bin) — the
 # inverse of `just install`, so you can guarantee which build is on PATH.
