@@ -3590,8 +3590,25 @@ impl Config {
             Self::project_config_path().filter(|p| Some(p.as_path()) != base_path.as_deref());
 
         let mut cfg = match (&base_path, &project_path) {
-            // Fast path: no project override → exact legacy behavior.
-            (Some(p), None) => Self::load(p)?,
+            // Fast path: no project override.
+            (Some(p), None) => {
+                if base_ambient {
+                    // config-plane-provenance: an AMBIENT `./newt.toml` base is
+                    // attacker-reachable (a cloned repo ships one at its root), so
+                    // strip its control-plane keys before deserialize — the same
+                    // fail-closed treatment the walk-up overlay already gets, and
+                    // the base vector the convergence audit surfaced. A
+                    // `$NEWT_CONFIG`-pinned / user-home / `/etc` base is
+                    // operator-explicit (Trusted) and loaded verbatim.
+                    let mut base_val = Self::load_value(p)?;
+                    strip_control_plane(&mut base_val);
+                    base_val
+                        .try_into()
+                        .map_err(|e| NewtError::Config(e.to_string()))?
+                } else {
+                    Self::load(p)?
+                }
+            }
             (None, None) => Self::default(),
             // Project override present → layer it over the base (or the default
             // config when there is no base file).
@@ -3601,6 +3618,12 @@ impl Config {
                     None => toml::Value::try_from(Self::default())
                         .map_err(|e| NewtError::Config(e.to_string()))?,
                 };
+                // config-plane-provenance: an ambient `./newt.toml` base is
+                // untrusted, so strip its control-plane keys too (the overlay is
+                // stripped separately by `merge_project_overlay` below).
+                if base_ambient {
+                    strip_control_plane(&mut merged);
+                }
                 let project_val = Self::load_value(proj)?;
                 // The merge strategy is itself config: the project declares how
                 // it wants to be merged (`[merge] arrays = ...`), else the global
@@ -4730,6 +4753,14 @@ pub(crate) const CONTROL_PLANE_KEYS: &[&str] = &[
     // strip both so an untrusted overlay cannot introduce a crew/loadout at all.
     "crews",
     "loadouts",
+    // `[tui.permissions]` is the SESSION AUTHORITY preset — `to_caveats()` turns
+    // it into the caveats the turn runs under (config.rs mcp_probe_caveats /
+    // caveats_for_session). A project overlay setting `preset = "full-access"` /
+    // `extra_exec` / `net` would escalate an ordinary interactive turn to
+    // `Caveats::top()`. A repo has no business setting the operator's permission
+    // authority, so the whole `[tui]` table is stripped from an untrusted config
+    // (convergence-audit finding: repo-controlled posture escalation).
+    "tui",
 ];
 
 /// Remove every [`CONTROL_PLANE_KEYS`] entry from an untrusted config table in
