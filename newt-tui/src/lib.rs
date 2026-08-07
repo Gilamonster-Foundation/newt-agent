@@ -277,7 +277,7 @@ impl<F: FnMut()> Drop for RestoreOnDrop<F> {
 ///
 /// **#1411.** The splash used to enable raw mode and restore it ~30 lines
 /// later, with *three* fallible `?` operators in between: the `execute!` that
-/// enters the alternate screen, `run_setup_screen`, and `show_splash`. Any I/O
+/// enters the alternate screen and `show_splash`. Any I/O
 /// error in that window returned early past the restore and left the operator
 /// in the alternate screen, in raw mode, with the cursor hidden — a terminal
 /// that echoes nothing and shows no cursor, recoverable only via `reset`. A
@@ -371,8 +371,7 @@ mod splash_guard_tests {
     }
 
     /// The path that actually bit: an inner `?` returns early, jumping over
-    /// every statement below it. `run_setup_screen(..)?` and
-    /// `show_splash(..)?` are both this shape.
+    /// every statement below it. `show_splash(..)?` is this shape.
     #[test]
     fn restore_runs_when_an_inner_question_mark_returns_early() {
         let ran = Cell::new(0);
@@ -381,7 +380,7 @@ mod splash_guard_tests {
             let _g = RestoreOnDrop {
                 restore: || ran.set(ran.get() + 1),
             };
-            // Stands in for a failing `run_setup_screen` / `show_splash`.
+            // Stands in for a failing `show_splash`.
             Err(std::io::Error::other("splash step failed"))?;
             unreachable!("the ? above returns");
         }
@@ -537,19 +536,17 @@ pub fn run_code(
         } else {
             "starting"
         };
-        // First-run setup, COVERED by the splash (#985): a spinner + status under
-        // the logo while the model provisions on a background thread; input is
-        // blocked except a triple abort. Then the Enter-to-continue splash —
-        // which always shows its own spinner so a launch never looks hung.
-        if let Some(setup) = setup {
-            run_setup_screen(&mut stdout, color, setup)?;
-        }
+        // ONE splash covers everything (field note: two consecutive splash
+        // screens read as a bug): a first-run provision (#985) renders as an
+        // extra spinner line on this same screen — input blocked except a
+        // triple abort while it runs — and the splash's own spinner keeps a
+        // launch from ever looking hung.
         let status = if prewarm.is_some() {
             "warming up backend…"
         } else {
             "initializing…"
         };
-        let cont = splash::show_splash(&mut stdout, &workspace, color, status, context)?;
+        let cont = splash::show_splash(&mut stdout, &workspace, color, status, context, setup)?;
         // Give the terminal back before anything else prints: chat must not run
         // inside the alternate screen. Explicit rather than implicit at the end
         // of the block so the ordering stays visible to a reader.
@@ -742,7 +739,7 @@ use crate::permissions::{
     permission_prompting_configured, production_danger_table, prompt_permission_choice,
     should_prompt_permissions, PermissionPromptState, PromptChoice, PromptPermissionGate,
 };
-use crate::setup_tui::{run_setup_inline, run_setup_screen};
+use crate::setup_tui::run_setup_inline;
 pub use crate::setup_tui::{SetupEvent, SetupHandle};
 
 // ---------------------------------------------------------------------------

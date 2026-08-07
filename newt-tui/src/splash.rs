@@ -23,6 +23,7 @@ use ratatui::Terminal;
 
 use newt_core::agentic::NEWT_ORANGE_CT;
 
+use crate::setup_tui::{drain_setup, is_abort_key, setup_status_line, SetupHandle};
 use crate::{
     brand_active, brand_logo, brand_name, brand_plugins, brand_tagline, logo_for_size, LOGO_PLAIN,
     NEWT_ORANGE, VERSION,
@@ -100,17 +101,107 @@ fn splash_block() -> Vec<Vec<(String, Option<CtColor>)>> {
 
 /// Render the splash. Returns `true` if the user pressed Enter (continue to
 /// chat), `false` if they pressed q / Esc / Ctrl-C (quit).
+///
+/// `setup` is the optional first-run provisioning handle (#985): the download
+/// renders as an EXTRA spinner line on this one splash — never a second
+/// screen — and blocks continue (triple-Esc skips) until it resolves.
 pub(crate) fn show_splash(
     out: &mut io::Stdout,
     workspace: &str,
     color: bool,
     status: &str,
     context: &str,
+    setup: Option<SetupHandle>,
 ) -> anyhow::Result<bool> {
+    let setup = setup.map(SetupWait::new);
     if color {
-        show_splash_color(out, workspace, status, context)
+        show_splash_color(out, workspace, status, context, setup)
     } else {
-        show_splash_plain(out, workspace, status, context)
+        show_splash_plain(out, workspace, status, context, setup)
+    }
+}
+
+/// The first-run download folded onto the splash: per-tick event drain, the
+/// extra status line, and the blocked-input / triple-Esc-skip key rules that
+/// apply while the download is in flight.
+struct SetupWait {
+    handle: SetupHandle,
+    step: String,
+    done: u64,
+    total: Option<u64>,
+    finished: Option<Result<(), String>>,
+    aborts: u8,
+}
+
+impl SetupWait {
+    fn new(handle: SetupHandle) -> Self {
+        Self {
+            handle,
+            step: "starting".to_string(),
+            done: 0,
+            total: None,
+            finished: None,
+            aborts: 0,
+        }
+    }
+
+    /// Fold pending progress events. Idempotent once finished.
+    fn advance(&mut self) {
+        if self.finished.is_none() {
+            self.finished = drain_setup(
+                &self.handle.rx,
+                &mut self.step,
+                &mut self.done,
+                &mut self.total,
+            );
+        }
+    }
+
+    fn in_flight(&self) -> bool {
+        self.finished.is_none()
+    }
+
+    /// The extra splash line for this tick: live progress with its own
+    /// spinner, or the settled ✓/⚠ result once done.
+    fn line(&self, tick: u32) -> String {
+        match &self.finished {
+            None => format!(
+                "{} {}  (triple-Esc skips)",
+                spinner_frame(tick),
+                setup_status_line(&self.handle.what, &self.step, self.done, self.total)
+            ),
+            Some(Ok(())) => format!("✓ ready — {} set up", self.handle.what),
+            Some(Err(e)) => format!("⚠ setup skipped ({e}) — will use the session model"),
+        }
+    }
+
+    /// Key handling while the download runs: ordinary keys are swallowed
+    /// (chat must not start under a half-provisioned model); three
+    /// consecutive Esc/Ctrl-C cancel the download and let the splash resume.
+    fn on_key(&mut self, ev: &Event) {
+        if is_abort_key(ev) {
+            self.aborts += 1;
+            if self.aborts >= 3 {
+                self.handle
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.finished = Some(Err("skipped".into()));
+            }
+        } else {
+            self.aborts = 0;
+        }
+    }
+}
+
+/// Route a splash key: swallowed by an in-flight download, else the normal
+/// continue/quit action.
+fn splash_handle_key(ev: &Event, setup: Option<&mut SetupWait>) -> Option<bool> {
+    match setup {
+        Some(sw) if sw.in_flight() => {
+            sw.on_key(ev);
+            None
+        }
+        _ => Some(splash_key_action(ev)),
     }
 }
 
@@ -127,6 +218,7 @@ fn show_splash_color(
     _workspace: &str,
     status: &str,
     context: &str,
+    setup: Option<SetupWait>,
 ) -> anyhow::Result<bool> {
     let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
     let (logo, logo_cols) = logo_for_size(term_cols, term_rows);
@@ -177,9 +269,9 @@ fn show_splash_color(
             queue!(out, ResetColor)?;
         }
         out.flush()?;
-        let spin_row = (top + block.len() + 1).min(logo_lines.len().saturating_sub(1)) as u16;
+        let spin_row = (top + block.len() + 1).min(logo_lines.len().saturating_sub(2)) as u16;
         let spin_col = (logo_cols as usize).saturating_sub(status.len() + 2) as u16 / 2;
-        return splash_wait_with_spinner(out, spin_col, spin_row, status);
+        return splash_wait_with_spinner(out, spin_col, spin_row, status, setup);
     }
 
     let brand_col = logo_cols + 2;
@@ -219,7 +311,7 @@ fn show_splash_color(
     )?;
     out.flush()?;
 
-    splash_wait_with_spinner(out, brand_col, brand_row + 5, status)
+    splash_wait_with_spinner(out, brand_col, brand_row + 5, status, setup)
 }
 
 fn show_splash_plain(
@@ -227,13 +319,18 @@ fn show_splash_plain(
     workspace: &str,
     status: &str,
     context: &str,
+    mut setup: Option<SetupWait>,
 ) -> anyhow::Result<bool> {
     // For the plain path ratatui takes a fresh io::stdout() handle — fine since
     // stdout is a singleton and we already hold raw mode + alt screen.
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut polls: u32 = 0;
+    let mut quiet: u32 = 0;
     let result = loop {
+        if let Some(sw) = setup.as_mut() {
+            sw.advance();
+        }
         terminal.draw(|f| {
             let area = f.area();
             let orange_bold = Style::default()
@@ -268,6 +365,9 @@ fn show_splash_plain(
                 format!("{} {status}", spinner_frame(polls)),
                 dim,
             )));
+            if let Some(sw) = setup.as_ref() {
+                lines.push(Line::from(Span::styled(sw.line(polls), dim)));
+            }
             let w = 60u16.min(area.width);
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
@@ -279,13 +379,18 @@ fn show_splash_plain(
                 .split(area);
             f.render_widget(Paragraph::new(Text::from(lines)), cols[1]);
         })?;
-        if let Some(cont) = splash_poll_event()? {
-            break cont;
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Some(cont) = splash_handle_key(&event::read()?, setup.as_mut()) {
+                break cont;
+            }
         }
         polls += 1;
-        if polls >= SPLASH_AUTO_CONTINUE_POLLS {
-            // ~3 s with no input: auto-continue instead of hanging (#1127).
-            break true;
+        if setup.as_ref().is_none_or(|sw| !sw.in_flight()) {
+            quiet += 1;
+            if quiet >= SPLASH_AUTO_CONTINUE_POLLS {
+                // ~3 s with no input: auto-continue instead of hanging (#1127).
+                break true;
+            }
         }
     };
     Ok(result)
@@ -297,38 +402,54 @@ fn show_splash_plain(
 /// keypress still skips (or quits) immediately.
 const SPLASH_AUTO_CONTINUE_POLLS: u32 = 30;
 
-/// Poll for a splash keypress. Returns `Some(true)` = continue, `Some(false)` = quit, `None` = keep waiting.
-fn splash_poll_event() -> anyhow::Result<Option<bool>> {
-    if event::poll(std::time::Duration::from_millis(100))? {
-        return Ok(Some(splash_key_action(&event::read()?)));
-    }
-    Ok(None)
-}
-
 /// Wait for the user to press Enter (true) or a quit key (false) — or
 /// auto-continue (true) after [`SPLASH_AUTO_CONTINUE_POLLS`] quiet polls —
 /// redrawing a spinner + status line each poll so the wait visibly IS a
-/// wait, not a hang.
+/// wait, not a hang. An in-flight first-run download draws as a second
+/// line at `row + 1`, holds the auto-continue clock, and swallows keys
+/// (triple-Esc skips it) until it resolves.
 fn splash_wait_with_spinner(
     out: &mut io::Stdout,
     col: u16,
     row: u16,
     status: &str,
+    mut setup: Option<SetupWait>,
 ) -> anyhow::Result<bool> {
-    for tick in 0..SPLASH_AUTO_CONTINUE_POLLS {
+    let mut quiet: u32 = 0;
+    let mut tick: u32 = 0;
+    loop {
+        if let Some(sw) = setup.as_mut() {
+            sw.advance();
+        }
         queue!(
             out,
             MoveTo(col, row),
             SetForegroundColor(CtColor::DarkGrey),
             Print(format!("{} {status}", spinner_frame(tick))),
-            ResetColor
         )?;
+        if let Some(sw) = setup.as_ref() {
+            queue!(
+                out,
+                MoveTo(col, row + 1),
+                terminal::Clear(terminal::ClearType::UntilNewLine),
+                Print(sw.line(tick)),
+            )?;
+        }
+        queue!(out, ResetColor)?;
         out.flush()?;
         if event::poll(std::time::Duration::from_millis(100))? {
-            return Ok(splash_key_action(&event::read()?));
+            if let Some(cont) = splash_handle_key(&event::read()?, setup.as_mut()) {
+                return Ok(cont);
+            }
         }
+        if setup.as_ref().is_none_or(|sw| !sw.in_flight()) {
+            quiet += 1;
+            if quiet >= SPLASH_AUTO_CONTINUE_POLLS {
+                return Ok(true);
+            }
+        }
+        tick += 1;
     }
-    Ok(true)
 }
 
 /// Map a key event to splash intent: `true` = continue, `false` = quit.
@@ -397,6 +518,60 @@ mod tests {
         // Top-only band when the bottom is too small.
         let top_heavy = [dark, dark, dark, ink, ink];
         assert_eq!(blank_band(&top_heavy, 3), Some((0, 3)));
+    }
+
+    fn wait_with_channel() -> (
+        std::sync::mpsc::Sender<crate::setup_tui::SetupEvent>,
+        SetupWait,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = SetupHandle {
+            what: "on-host summarizer".into(),
+            rx,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        (tx, SetupWait::new(handle))
+    }
+
+    #[test]
+    fn setup_wait_folds_progress_into_the_extra_line_then_settles() {
+        use crate::setup_tui::SetupEvent;
+        let (tx, mut sw) = wait_with_channel();
+        assert!(sw.in_flight());
+        tx.send(SetupEvent::Step("weights".into())).unwrap();
+        tx.send(SetupEvent::Progress {
+            done: 42 * 1_048_576,
+            total: Some(100 * 1_048_576),
+        })
+        .unwrap();
+        sw.advance();
+        let line = sw.line(0);
+        assert!(line.contains("42/100 MB"), "{line}");
+        assert!(line.contains("triple-Esc"), "{line}");
+        tx.send(SetupEvent::Done).unwrap();
+        sw.advance();
+        assert!(!sw.in_flight());
+        assert!(sw.line(0).starts_with('✓'), "{}", sw.line(0));
+    }
+
+    #[test]
+    fn setup_wait_triple_esc_cancels_and_frees_the_splash() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_tx, mut sw) = wait_with_channel();
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        // Ordinary keys are swallowed and reset the abort count.
+        assert_eq!(splash_handle_key(&esc, Some(&mut sw)), None);
+        assert_eq!(splash_handle_key(&plain, Some(&mut sw)), None);
+        assert_eq!(splash_handle_key(&esc, Some(&mut sw)), None);
+        assert_eq!(splash_handle_key(&esc, Some(&mut sw)), None);
+        assert!(sw.in_flight(), "two in a row is not enough");
+        assert_eq!(splash_handle_key(&esc, Some(&mut sw)), None);
+        assert!(!sw.in_flight(), "third consecutive Esc skips the download");
+        assert!(sw.handle.cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(sw.line(0).starts_with('⚠'), "{}", sw.line(0));
+        // Once settled, keys act on the splash again (Esc = quit).
+        assert_eq!(splash_handle_key(&esc, Some(&mut sw)), Some(false));
     }
 
     #[test]

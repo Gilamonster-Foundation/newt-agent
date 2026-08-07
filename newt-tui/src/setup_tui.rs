@@ -1,11 +1,12 @@
-//! The **first-run setup / provisioning screen** — the TUI shown while the
-//! on-host summarizer model is downloaded on first launch.
+//! First-run **provisioning plumbing** — the event channel and status lines
+//! for the on-host summarizer download on first launch.
 //!
 //! The binary (newt-cli) provisions the model on a background thread and hands
-//! `run_code` a [`SetupHandle`]; the splash then COVERS that work with a
-//! spinner and status line under the logo, so the download never runs as raw
-//! cooked-mode output before the TUI comes up. [`SetupEvent`]s stream progress
-//! from that thread to this screen.
+//! `run_code` a [`SetupHandle`]. The ONE splash screen renders that work as an
+//! extra spinner line (`crate::splash::SetupWait`) — there is deliberately no
+//! second, separate setup screen (field note: two consecutive splashes read as
+//! a bug). [`SetupEvent`]s stream progress from the download thread; the
+//! no-splash fallback is [`run_setup_inline`].
 //!
 //! This is the UI of the setup step. The *logic* lives elsewhere: [`crate::setup`]
 //! is the human-driven config wizard (`newt setup`), and [`crate::wizard`] is the
@@ -15,17 +16,7 @@
 
 use std::io::{self, Write as _};
 
-use crossterm::{
-    cursor::MoveTo,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    queue,
-    style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
-};
-
-use newt_core::agentic::NEWT_ORANGE_CT;
-
-use crate::logo_for_size;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 /// Progress events from the background provisioning thread to the setup screen.
 pub enum SetupEvent {
@@ -52,7 +43,7 @@ pub struct SetupHandle {
 }
 
 /// Is this key an abort press (Esc or Ctrl+C)? Three in a row abort setup.
-fn is_abort_key(ev: &Event) -> bool {
+pub(crate) fn is_abort_key(ev: &Event) -> bool {
     match ev {
         Event::Key(KeyEvent {
             code: KeyCode::Esc, ..
@@ -67,7 +58,7 @@ fn is_abort_key(ev: &Event) -> bool {
 }
 
 /// The status line from the latest provisioning state.
-fn setup_status_line(what: &str, step: &str, done: u64, total: Option<u64>) -> String {
+pub(crate) fn setup_status_line(what: &str, step: &str, done: u64, total: Option<u64>) -> String {
     let mb = |b: u64| b / 1_048_576;
     match total.filter(|&t| t > 0) {
         Some(t) => format!(
@@ -82,7 +73,7 @@ fn setup_status_line(what: &str, step: &str, done: u64, total: Option<u64>) -> S
 
 /// Poll `rx` non-blocking, folding events into the running state. Returns
 /// `Some(Ok/Err)` once setup is finished (or the sender died), else `None`.
-fn drain_setup(
+pub(crate) fn drain_setup(
     rx: &std::sync::mpsc::Receiver<SetupEvent>,
     step: &mut String,
     done: &mut u64,
@@ -106,94 +97,6 @@ fn drain_setup(
             // Sender dropped without a terminal event → the thread died.
             Err(TryRecvError::Disconnected) => return Some(Err("interrupted".into())),
         }
-    }
-}
-
-/// The alt-screen setup screen: logo + a prominent spinner/status while the model
-/// provisions on a background thread. Blocks input except a triple abort. Returns
-/// when setup finishes, fails, or is aborted (the caller then shows the splash).
-pub(crate) fn run_setup_screen(
-    out: &mut io::Stdout,
-    color: bool,
-    setup: SetupHandle,
-) -> anyhow::Result<()> {
-    use std::sync::atomic::Ordering;
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let (logo, _logo_cols) = logo_for_size(cols, rows);
-    let logo_rows = logo.lines().count() as u16;
-
-    let mut frame = 0usize;
-    let mut aborts = 0u8;
-    let mut step = "starting".to_string();
-    let (mut done, mut total) = (0u64, None);
-
-    loop {
-        let finished = drain_setup(&setup.rx, &mut step, &mut done, &mut total);
-
-        queue!(out, Clear(ClearType::All), MoveTo(0, 0))?;
-        write!(out, "{}", logo.replace('\n', "\r\n"))?;
-        let row = logo_rows + 1;
-        let (glyph, line, hint) = match &finished {
-            None => (
-                newt_core::tty::SPINNER_FRAMES[frame % newt_core::tty::SPINNER_FRAMES.len()]
-                    .to_string(),
-                setup_status_line(&setup.what, &step, done, total),
-                "triple-Esc to skip (uses the session model instead)",
-            ),
-            Some(Ok(())) => (
-                "✓".to_string(),
-                format!("ready — {} set up", setup.what),
-                "",
-            ),
-            Some(Err(e)) => (
-                "⚠".to_string(),
-                format!("setup skipped ({e}) — will use the session model"),
-                "",
-            ),
-        };
-        queue!(out, MoveTo(2, row))?;
-        if color {
-            queue!(out, SetForegroundColor(NEWT_ORANGE_CT))?;
-        }
-        queue!(out, Print(format!("{glyph}  {line}")), ResetColor)?;
-        if !hint.is_empty() {
-            queue!(
-                out,
-                MoveTo(2, row + 1),
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(hint),
-                ResetColor
-            )?;
-        }
-        out.flush()?;
-
-        if finished.is_some() {
-            // Hold briefly so the result is seen, then drain any keys typed during
-            // setup so the following splash isn't instantly dismissed by them.
-            let _ = event::poll(std::time::Duration::from_millis(800))?;
-            while event::poll(std::time::Duration::from_millis(0))? {
-                let _ = event::read()?;
-            }
-            return Ok(());
-        }
-
-        // Animate + poll input at ~100ms. Non-abort keys are swallowed (blocked);
-        // three consecutive Esc/Ctrl+C cancel the download and return.
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if is_abort_key(&event::read()?) {
-                aborts += 1;
-                if aborts >= 3 {
-                    setup.cancel.store(true, Ordering::SeqCst);
-                    while event::poll(std::time::Duration::from_millis(0))? {
-                        let _ = event::read()?;
-                    }
-                    return Ok(());
-                }
-            } else {
-                aborts = 0;
-            }
-        }
-        frame += 1;
     }
 }
 
