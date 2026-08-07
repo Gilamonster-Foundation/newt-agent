@@ -9786,7 +9786,19 @@ mod execute_tool_branch_tests {
             Some(passing_build_check_cmd()),
         )
         .await;
-        assert!(out.contains("✓ build check passed"), "got: {out}");
+        // build_check runs CONFINED (P4). On Linux+Landlock the check runs and
+        // its outcome is reflected; off it (e.g. Windows without the AppContainer
+        // launcher) it fails closed — either way the tool APPENDS a build-check
+        // line, which is what this test guards.
+        let confinable = crate::confined_exec::kernel_fs_fence_available();
+        if confinable {
+            assert!(out.contains("✓ build check passed"), "got: {out}");
+        } else {
+            assert!(
+                out.contains("build check"),
+                "build-check line appended: {out}"
+            );
+        }
 
         let failing_check = failing_build_check_cmd("broke");
         let out = run_tool(
@@ -9797,8 +9809,15 @@ mod execute_tool_branch_tests {
             Some(&failing_check),
         )
         .await;
-        assert!(out.contains("✗ build check failed"), "got: {out}");
-        assert!(out.contains("broke"), "model sees the failure text: {out}");
+        if confinable {
+            assert!(out.contains("✗ build check failed"), "got: {out}");
+            assert!(out.contains("broke"), "model sees the failure text: {out}");
+        } else {
+            assert!(
+                out.contains("build check"),
+                "build-check line appended: {out}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9860,7 +9879,16 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert!(out.starts_with("deleted old.rs"), "got: {out}");
-        assert!(out.contains("✓ build check passed"), "got: {out}");
+        // Confined build_check (P4): outcome-checked on Linux+Landlock, else the
+        // fail-closed line still counts as an appended build-check result.
+        if crate::confined_exec::kernel_fs_fence_available() {
+            assert!(out.contains("✓ build check passed"), "got: {out}");
+        } else {
+            assert!(
+                out.contains("build check"),
+                "build-check line appended: {out}"
+            );
+        }
         assert!(
             !ws.path().join("old.rs").exists(),
             "delete_file must remove the target file"
