@@ -17,9 +17,25 @@ fn main() -> ! {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    let mut args = std::env::args_os().skip(1).peekable();
+
+    // Optional leading `--cgroup-procs PATH`: join the cgroup-v2 subtree the
+    // executor created, BEFORE anything forks, so every descendant (including a
+    // setsid / double-fork daemon) is a member and the executor's `cgroup.kill`
+    // reaches the whole tree. Best-effort: a failure leaves the killpg fallback.
+    if args.peek().is_some_and(|a| a == "--cgroup-procs") {
+        args.next();
+        if let Some(path) = args.next() {
+            let pid = std::process::id().to_string();
+            if let Err(e) = std::fs::write(&path, &pid) {
+                eprintln!("newt-net-guard: cgroup join failed (killpg fallback applies): {e}");
+            }
+        }
+    }
+
     // Close any file descriptor the parent left open (>= 3): an inherited fd is
-    // a capability that bypasses pathname confinement. Do this first, before the
-    // real program can observe it.
+    // a capability that bypasses pathname confinement. Do this before the real
+    // program can observe it.
     newt_core::netguard::close_inherited_fds();
 
     // Install the seccomp egress-deny floor on this soon-to-exec process.
@@ -28,7 +44,6 @@ fn main() -> ! {
         std::process::exit(120);
     }
 
-    let mut args = std::env::args_os().skip(1);
     let first = args.next();
 
     // Self-test: prove the floor is active on this process, exit with its code.
