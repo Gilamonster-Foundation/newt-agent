@@ -4722,6 +4722,14 @@ pub(crate) const CONTROL_PLANE_KEYS: &[&str] = &[
     "discovery",       // backend auto-discovery endpoints (exfil)
     "dgx",             // DGX endpoints + ssh (exfil / remote exec)
     "scratch",         // external scratch paths
+    // `[crews.*].test` / `loop_program` are shell verification commands run on
+    // `newt crew` (config.rs Crew.test → WorktreeWorkspace test_cmd → sh -c),
+    // and a `[loadouts.*]` with only a model passes validation — so a project
+    // overlay could mint a command by declaring the sole crew (auto-selected).
+    // Confined by `run_confined_build`, but still config-minted exec authority:
+    // strip both so an untrusted overlay cannot introduce a crew/loadout at all.
+    "crews",
+    "loadouts",
 ];
 
 /// Remove every [`CONTROL_PLANE_KEYS`] entry from an untrusted config table in

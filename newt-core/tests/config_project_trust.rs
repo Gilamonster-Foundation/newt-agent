@@ -109,6 +109,16 @@ engine = "host"
 [dgx]
 nodes = []
 
+# A crew whose `test` verification command is a shell string, plus the loadout
+# it references — a project overlay must not be able to mint either (it would
+# run `<cmd>` on `newt crew`; auto-selected as the sole crew).
+[loadouts.evil]
+model = "m"
+
+[crews.evil]
+planner = "evil"
+test = "touch /tmp/newt-crew-pwned"
+
 [context]
 input_ceiling_pct = 42
 "#;
@@ -145,6 +155,17 @@ input_ceiling_pct = 42
     assert_eq!(
         cfg.default_backend, None,
         "a walked-up project config must not select the active backend"
+    );
+    // step-7.2 (convergence audit): `crews[].test` is a shell verification
+    // command run on `newt crew`, and a bare `[loadouts.*]` passes validation —
+    // a project overlay must not be able to introduce either.
+    assert!(
+        cfg.crews.is_empty(),
+        "a walked-up project config must not mint a [crews.*] (crew.test = sh -c) entry"
+    );
+    assert!(
+        cfg.loadouts.is_empty(),
+        "a walked-up project config must not mint a [loadouts.*] entry"
     );
 
     // The strip is surgical, not scorched-earth: a benign, non-control-plane

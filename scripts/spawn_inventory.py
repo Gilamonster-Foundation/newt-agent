@@ -34,6 +34,15 @@ SCAN_ROOTS = [
     "newt-mcp-client/src",
     "newt-acp-worker/src",
     "newt-coder/src",
+    # step-7.2 (convergence audit): widened so the no-bypass gate covers EVERY
+    # crate that spawns, not just the agent-loop crates — a future attacker-
+    # influenced spawn added to any of these is now caught, not silently missed.
+    "newt-git/src",
+    "newt-inference/src",
+    "newt-mesh/src",
+    "plugins-protocol/src",
+    "newt-eval/src",
+    "newt-mcp-server/src",
 ]
 
 SPAWN_RE = re.compile(r"Command::new|process::Command")
