@@ -29,6 +29,7 @@
 "newt-cli/src/crew.rs"                     = { count = 7, class = "agent-exec-todo-p4", note = "crew spawns agent subprocesses" }
 "newt-cli/src/crew_runner.rs"              = { count = 0, class = "agent-exec-todo-p4", note = "placeholder — keep at 0 until reviewed" }
 "newt-mcp-client/src/lib.rs"               = { count = 2, class = "confined", note = "MCP stdio via ConfinedCommand::spawn_tokio (already inside the boundary)" }
+"newt-core/src/confined_exec.rs"           = { count = 1, class = "confined", note = "THE ConstrainedExecutor itself — ConfinedCommand::spawn with a Kernel strength floor (fail-closed); the seam the agent-exec-todo-p4 sites migrate onto" }
 "newt-acp-worker/src/diff.rs"              = { count = 6, class = "git-helper", note = "captures `git diff` of the session workspace" }
 "newt-core/src/agentic/claim_check.rs"     = { count = 1, class = "git-helper", note = "collects git evidence to refute action claims" }
 "newt-core/src/agent_identity.rs"          = { count = 3, class = "git-helper", note = "sets local git identity" }
