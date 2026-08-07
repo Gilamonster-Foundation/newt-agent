@@ -499,12 +499,14 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   **`spawn-inventory` now shows ZERO `agent-exec-todo-p4` sites** — every attacker-influenced
   subprocess is routed through `ConstrainedExecutor` or the confined brush engine; the remainder are
   classified trusted / git-helper / operator-opt-out and machine-enumerated in `spawn-inventory.toml`.
-- **Residual:** 🔴 critical → 🟢 closed for the migration + confinement + env-isolation invariant. One
-  named residual remains, bounded by `b1` and NOT claimed closed: the sync executor runs each child to
-  completion (no per-child **timeout / process-tree cancellation**) — a hostile build that hangs is a
-  DoS, not an escape (the raw sites it replaced had no timeout either), and a descendant surviving a
-  cancel is bounded by `b1`'s process containment. Tree-kill-on-cancel is the tracked follow-on
-  (**#1598**). Does NOT block v0.8.0.
+- **Residual:** 🔴 critical → 🟢 closed for the migration + confinement + env-isolation invariant, and
+  child-lifetime containment now lands too (**#1598**, step-8.3): `ExecRequest::timeout` bounds a child
+  and the executor **SIGKILLs the child's whole process group** (`killpg`, pgid == the
+  `new_process_group` leader) at the deadline AND sweeps the group after completion — a hostile child
+  can neither hang the harness nor leave a background same-group descendant running
+  (`confined_exec_lifetime.rs`, real-resource). One bounded residual remains: a descendant that
+  **double-forks / `setsid`** escapes the process group and is contained only by `b1`'s PID namespace
+  (open); killpg covers the common same-group case. Does NOT block v0.8.0.
 - **Disabled while open:** (closed for the routing/confinement bound) — the process-tree-cancel
   residual is bounded by `b1`'s OS sandbox as the backstop.
 - **Closure criterion:** met for the migration + confinement bound — `spawn-inventory` shows ZERO
