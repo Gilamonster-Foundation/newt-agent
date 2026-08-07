@@ -827,10 +827,6 @@ async fn coder_dispatch_with_operator_identity_carries_non_top_caveats() {
     assert!(result["diff"].as_str().unwrap().contains("+pub fn hello"));
 }
 
-// step-1.3: this asserts the DEV-ONLY `top()` authority, so it only compiles/runs
-// under the `allow-no-key` feature. Production (feature off) is covered by
-// `allow_no_key_authority_is_compile_gated` (fail-closed) in identity.rs.
-#[cfg(feature = "allow-no-key")]
 #[tokio::test]
 async fn coder_dispatch_under_fence_contains_workspace_escape() {
     // step-4.3 acceptance: with the workspace fence ACTIVE at dispatch, a
@@ -895,6 +891,10 @@ async fn coder_dispatch_under_fence_contains_workspace_escape() {
     );
 }
 
+// step-1.3: this asserts the DEV-ONLY `top()` authority, so it only compiles/runs
+// under the `allow-no-key` feature. Production (feature off) is covered by
+// `allow_no_key_authority_is_compile_gated` (fail-closed) in identity.rs.
+#[cfg(feature = "allow-no-key")]
 #[tokio::test]
 async fn worker_identity_allow_no_key_falls_back_to_top() {
     // Debug-only fallback: `--allow-no-key` (modeled by
