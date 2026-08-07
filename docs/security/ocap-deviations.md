@@ -462,11 +462,13 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   (workspace + toolchain/package caches, never `~/.ssh`/`$HOME` broadly) — closing a read-then-
   disclose path where a hostile build reads a secret and surfaces it in the tool output the model
   sees — with workspace-only writes (+ explicit operator roots via `build_tool_caveats_with_writes`),
-  `TMPDIR` in-fence, net deny-all, and fail-closed off the kernel fence. **14 sites remain classed
-  `agent-exec-todo-p4`** — `newt-tui/lib.rs` (the roadmap `verify` `sh -c`, plus git/gh reads + the
-  human bang-escape / self-re-exec to reclassify) and the `agentic/tools.rs` run_command HOST-SHELL
-  yolo lane (an explicit `--disable-ocap`/`--full-access` opt-out, env-scrubbed; its #8 authority-env
-  hardening is a later slice, not a confinement migration).
+  `TMPDIR` in-fence, net deny-all, and fail-closed off the kernel fence. **step-4.5** migrated the roadmap
+  `verify` command (`CommandVerifyRunner::run`, `newt-tui/lib.rs`) onto the executor and reclassified
+  that file's remaining spawns (git/gh reads, self-re-exec, human bang-escape) as `trusted-infra`.
+  **Only 3 sites remain classed `agent-exec-todo-p4`** — the `agentic/tools.rs` run_command HOST-SHELL
+  yolo lane, which is an explicit `--disable-ocap`/`--full-access` operator opt-out (confining it would
+  defeat the flag's purpose); it is not a confinement-migration target but a reclassification + a #8
+  authority-env hardening, which is the next slice.
 - **Residual:** 🔴 critical → 🟠 high. The executor + its kernel-backed enforcement now EXIST and are
   proven (step-4.2); the residual is the *migration* — the 25 raw `agent-exec-todo-p4` sites are not
   yet routed onto it, so `build_check_shell` et al. still spawn raw `sh -c` until each is migrated.

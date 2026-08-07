@@ -6382,14 +6382,48 @@ struct CommandVerifyRunner {
 
 impl newt_core::roadmap_eval::VerifyRunner for CommandVerifyRunner {
     fn run(&self, cmd: &str) -> bool {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(&self.workspace)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        // A roadmap node's `verify` string is loaded from the on-repo
+        // `.newt/roadmap.toml`, so it is attacker-influenced and runs CONFINED
+        // through `ConstrainedExecutor` (P4): an env-empty child (only PATH/HOME/
+        // TMPDIR granted — no credentials, #8), fs fenced to the workspace + the
+        // operator's Cargo cache (a verify may `cargo test`) with reads calibrated
+        // to the toolchain/cache set, network denied (#9), and fail-closed off the
+        // kernel fence (#10). No longer a raw `sh -c` on the host.
+        use newt_core::confined_exec::{
+            build_tool_caveats_with_writes, ConstrainedExecutor, ExecOrigin, ExecRequest,
+        };
+        let mut extra_writes = Vec::new();
+        if let Some(cargo_home) = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo"))
+            })
+        {
+            extra_writes.push(cargo_home.to_string_lossy().into_owned());
+        }
+        #[cfg(windows)]
+        let (program, args): (&str, [String; 2]) = ("cmd", ["/C".into(), cmd.into()]);
+        #[cfg(not(windows))]
+        let (program, args): (&str, [String; 2]) = ("sh", ["-c".into(), cmd.into()]);
+
+        let mut req = ExecRequest::new(
+            ExecOrigin::AgentInfluenced,
+            program,
+            args,
+            &self.workspace,
+            build_tool_caveats_with_writes(&self.workspace, &extra_writes),
+        )
+        .env("TMPDIR", self.workspace.to_string_lossy());
+        // Real HOME so a `cargo` verify finds ~/.cargo (read via the calibrated
+        // set, written via the grant above); nothing credential-bearing crosses.
+        if let Some(home) = std::env::var_os("HOME") {
+            req = req.env("HOME", home.to_string_lossy());
+        }
+        if let Ok(path) = std::env::var("PATH") {
+            req = req.env("PATH", path);
+        }
+        ConstrainedExecutor::run(&req)
+            .map(|o| o.success)
             .unwrap_or(false)
     }
 }

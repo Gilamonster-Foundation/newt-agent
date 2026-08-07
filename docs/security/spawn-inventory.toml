@@ -34,7 +34,7 @@
 "newt-core/src/agentic/claim_check.rs"     = { count = 1, class = "git-helper", note = "collects git evidence to refute action claims" }
 "newt-core/src/agent_identity.rs"          = { count = 3, class = "git-helper", note = "sets local git identity" }
 "newt-tui/src/workspace_state.rs"          = { count = 1, class = "git-helper", note = "reads `git status`" }
-"newt-tui/src/lib.rs"                      = { count = 11, class = "agent-exec-todo-p4", note = "TUI: editor/git/helper spawns — classify per-site in a follow-on slice" }
+"newt-tui/src/lib.rs"                      = { count = 10, class = "trusted-infra", note = "roadmap `verify` (the one attacker-influenced sh -c) MIGRATED to ConstrainedExecutor (step-4.5, CommandVerifyRunner). Remaining spawns are non-attacker-reachable: git reads (log/rev-parse/status — state into context), gh reads (pr/issue/run view — forge state), self-re-exec (run_newt_subcmd re-runs THIS newt binary with operator slash-command args; child re-applies its own OCAP), and the human `!`-bang-escape ($SHELL -c on the operator's own typed line — their authority, no model channel). Plus a fn-param + a `use CommandExt` the counter also matches." }
 "newt-tui/src/prompt.rs"                   = { count = 1, class = "user-editor", note = "opens the operator's $EDITOR on explicit action" }
 "newt-tui/src/mcp_token.rs"                = { count = 1, class = "trusted-infra", note = "operator MCP token helper" }
 "newt-cli/src/dgx/ssh.rs"                  = { count = 3, class = "trusted-infra", note = "operator dgx ssh" }
