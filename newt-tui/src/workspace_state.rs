@@ -35,10 +35,9 @@ fn collect_workspace_state(workspace: &str) -> WorkspaceStateSnapshot {
 }
 
 fn git_stdout(workspace: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
+    // Confused-deputy-safe (step-7.4): `workspace` may be a hostile repo whose
+    // `.git/config` could turn this read into out-of-fence code.
+    let output = newt_core::git_hardening::hardened_git(std::path::Path::new(workspace), args)
         .output()
         .ok()?;
     if !output.status.success() {

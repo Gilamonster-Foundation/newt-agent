@@ -11,7 +11,6 @@
 //! ACP layer above decides what to do with that.
 
 use std::path::Path;
-use std::process::Command;
 
 /// Capture the workspace diff with `git diff --no-color`.
 ///
@@ -26,15 +25,17 @@ use std::process::Command;
 /// pre-push) don't accidentally diff the *hook's* repo instead of
 /// the workspace passed in.
 pub fn capture_diff(workspace: &Path) -> anyhow::Result<String> {
-    let output = Command::new("git")
-        .args(["diff", "--no-color"])
-        .current_dir(workspace)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_PREFIX")
-        .output();
+    // Confused-deputy-safe (step-7.4): the worktree may hold hostile repo
+    // content, and `git diff` is the textconv/external-diff gadget surface.
+    // `hardened_git` disarms it (and its `env_clear` subsumes the GIT_DIR /
+    // GIT_WORK_TREE / … scrub above — those inherited vars are dropped, so the
+    // diff is scoped to `workspace`, not a hook's repo); `--no-ext-diff
+    // --no-textconv` close the named-driver textconv vector on top.
+    let output = newt_core::git_hardening::hardened_git(
+        workspace,
+        &["diff", "--no-color", "--no-ext-diff", "--no-textconv"],
+    )
+    .output();
 
     match output {
         Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).to_string()),

@@ -8,7 +8,6 @@
 //! `docs/design/config-scaling-deployment-and-trust.md`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use newt_core::scope_grounding::{definition_grep_pattern, grep_terms, ground_scope};
 use newt_scheduler::{Edit, Workspace};
@@ -133,8 +132,13 @@ fn run_confined_build(worktree: &Path, base: &Path, cmd: &str) -> Result<(bool, 
 }
 
 /// Run `git <args>` in `dir`, returning trimmed stdout on success.
+///
+/// Confused-deputy-safe (step-7.4): a crew worktree can hold hostile repo
+/// content, so this routes through `hardened_git`, which disarms the git
+/// config-gadget surface (`core.fsmonitor`, hooks, `diff.external`, pager, …).
+/// Diff callers additionally pass `--no-ext-diff --no-textconv`.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git").args(args).current_dir(dir).output()?;
+    let out = newt_core::git_hardening::hardened_git(dir, args).output()?;
     if !out.status.success() {
         anyhow::bail!(
             "git {}: {}",
@@ -231,7 +235,11 @@ impl WorktreeWorkspace {
     /// the index against HEAD. Empty string if nothing changed or git errs.
     pub fn diff(&self) -> String {
         let _ = git(&self.worktree, &["add", "-A"]);
-        git(&self.worktree, &["diff", "--cached", "HEAD"]).unwrap_or_default()
+        git(
+            &self.worktree,
+            &["diff", "--no-ext-diff", "--no-textconv", "--cached", "HEAD"],
+        )
+        .unwrap_or_default()
     }
 
     /// #880: run the repo-convention formatter (or the `NEWT_CREW_NORMALIZE`
@@ -275,7 +283,18 @@ impl WorktreeWorkspace {
         git(&self.worktree, &["add", "-A"])?;
         // `diff --cached --quiet` exits 0 when the index matches HEAD (nothing to
         // land) → don't manufacture an empty commit.
-        if git(&self.worktree, &["diff", "--cached", "--quiet"]).is_ok() {
+        if git(
+            &self.worktree,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--cached",
+                "--quiet",
+            ],
+        )
+        .is_ok()
+        {
             anyhow::bail!("no changes to land");
         }
         git(

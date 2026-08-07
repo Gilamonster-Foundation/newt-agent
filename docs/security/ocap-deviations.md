@@ -77,6 +77,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `config-plane-provenance` | an untrusted project `.newt/config.toml` cannot grant exec / endpoint (control-plane) authority | 🟢 closed (fail-closed) | (overlay stripped; ambient `./newt.toml` base control-plane strip = tracked follow-up) |
 | `noninteractive-launch-policy` | `--non-interactive` changes interaction only; OCAP-off host exec is an explicit opt-in | 🟠→🟡 | libraries still read `NEWT_DISABLE_OCAP`/`NEWT_FULL_ACCESS` from ambient env (typed `LaunchAuthority` follow-on) |
 | `p4-constrained-executor` | all attacker-influenced subprocess creation routes through one confined executor (kernel-backed, fail-closed) + host-shell child stripped of newt's control plane | 🟢 closed (migration+confinement+#8) | (a new `agent-exec-todo-p4` spawn site, or the yolo lane ceasing to strip the control plane — both ratchet-guarded); process-tree-cancel bounded by `b1` |
+| `git-confused-deputy` | every harness `git` subprocess disarms the repo's config-based code-execution gadgets (`core.fsmonitor`, hooks, `diff.external`/`textconv`, pager, sshCommand) | 🟢 closed | (a raw `Command::new("git")` in the workspace re-introduced without `hardened_git`) |
 | `posture-report-honesty` | every security-posture surface is DERIVED from the same `verify_*` invariants the gates enforce, never independent prose | 🟢 closed | (a posture surface that asserts a claim the verifiers don't back — a report/enforcement drift) |
 | `platform-capability-ceiling` | an unsupported/unverified platform reports each guarantee as `unsupported` and REFUSES operations needing it — never a Linux-equivalent OCAP claim | 🟢 closed | (a non-Linux build silently claiming a kernel-backed guarantee it cannot provide) |
 
@@ -609,6 +610,34 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Status:** CLOSED — step-8.1 (platform ceiling `meet` + `require_achieved` refusal) · owner: — ·
   review-by: when a non-Linux kernel floor lands and its ceiling can flip a guarantee off
   `Unsupported`.
+
+### git-confused-deputy
+- **Invariant (ideal):** the harness never runs `git` as a subprocess in a way that lets a hostile
+  repository (or a hostile model that wrote into `.git/`) turn an ordinary `git` read into arbitrary,
+  UNCONFINED code execution. `git` is a confused-deputy engine — `core.fsmonitor` (fires on
+  `git status`), hooks, `diff.external` / per-driver `textconv` (fire on `git diff`), `core.pager`,
+  `core.sshCommand`, `protocol.ext` all point ordinary commands at an attacker-named program.
+- **Practical caveat (now):** closed. The final OCAP adversarial pass EMPIRICALLY confirmed the escape
+  (a repo-local `core.fsmonitor=<payload>` ran out-of-fence on `git status`, inheriting newt's full
+  env incl. `NEWT_AGENT_KEY`). **step-7.4** routes every harness `git` subprocess through
+  `newt_core::git_hardening::hardened_git`, which `-c`-overrides the gadget keys (beats repo-local
+  `.git/config`), `env_clear`s (dropping ambient `GIT_*` gadget vars AND newt's secrets), and points
+  `GIT_CONFIG_GLOBAL`/`SYSTEM` at `/dev/null`; diff callers add `--no-ext-diff --no-textconv`. Sites
+  migrated: `claim_check` (live cap-exit evidence), `workspace_state` + `lib.rs` context/meta (TUI),
+  `acp-worker` diff, `crew`. The model's own `git` tool is the pure-Rust `newt-git` (git2/gix), which
+  does not spawn these subprocess gadgets.
+- **Residual:** 🟢 closed. Belt-and-suspenders follow-on (NOT required, the gadgets are already
+  disarmed): a `.git/`-write guard on the model's fs_write tools so a model cannot even plant
+  `.git/config` — tracked, not a break because `hardened_git` ignores a planted gadget anyway.
+- **Disabled while open:** (closed).
+- **Compensating controls:** `spawn_inventory` (a new raw `Command::new("git")` fails the gate until
+  reviewed); the `newt-git` model tool is library-based (no gadget subprocess).
+- **Closure criterion:** met — a repo-local `core.fsmonitor` gadget does not fire under `hardened_git`
+  (real-resource proof), and every workspace `git` subprocess routes through it.
+- **Ratchet guard:** `newt-core/tests/git_hardening_confused_deputy.rs` (real-resource, `#[serial]`):
+  plants the `core.fsmonitor` gadget and asserts `hardened_git` never runs it while still reading the
+  repo correctly. Reverting a site to a raw `Command::new("git")` re-opens the escape.
+- **Status:** CLOSED — step-7.4 · owner: — · review-by: if a new harness `git` subprocess is added.
 
 > `exec-behavior-bound` — full entry to be filled as it lands; **disabled-while-open bounded by
 > `b1`** (the OS sandbox is the backstop for name-granularity exec until it closes).
