@@ -518,6 +518,14 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `newt-core/tests/confined_exec_landlock.rs` (real-resource), the `confined_exec` unit tests, and
   `host_shell_command_strips_authority_env` (asserts the whole `CHILD_STRIPPED_AUTHORITY_ENV` set is
   excised), which fail if the executor stops confining/failing-closed or the yolo lane stops stripping.
+- **Live verifier (register↔verifier↔gate must agree):** `newt_core::ocap::verify_constrained_executor()`
+  is no longer a hardcoded `Absent` stub — it reports `Verified` iff the kernel fs fence the executor
+  requires is available at runtime (`confined_exec::kernel_fs_fence_available()`), else fail-closed
+  `Absent`. `SecurityReport`'s `EnvIsolation` derives from it, so the posture surface tracks live
+  enforcement. `newt-core/tests/constrained_executor_truth.rs` ties the three sources: it fails if the
+  spawn-inventory gate carries an unmigrated attacker spawn OR if the verifier disagrees with the gate on
+  a fence-available host, and a real-resource test proves a parent-only secret never reaches a confined
+  child (grounds the `EnvIsolation = Enforced` claim).
 - **Status:** CLOSED (migration + confinement + #8 env-isolation) — inventory gate (step-4.1),
   fail-closed executor + kernel-backed adversarial proof (step-4.2), build_check (step-4.3), crew +
   calibrated read fence (step-4.4), roadmap verify + newt-tui reclassify (step-4.5), yolo reclassify +
