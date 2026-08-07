@@ -111,13 +111,23 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `cat`** (until registration + convergence land).
 - **Compensating controls:** keep secrets out of the box; the value-filter chokepoint (step-6.1a) is
   ready to redact by known value the moment B3 registers it — no longer only shape-matching.
+  **step-6.2** hardened the by-value primitive itself to the full re-encoding matrix — base64
+  (standard + url-safe, padded + unpadded), hex (lower + upper), percent/URL-encoding, the `\xXX` /
+  `\uXXXX` string escapes, and **chunk-split** obfuscation (whitespace normalisation) — with `redact`
+  now fail-closed (a split form that can't be excised inline withholds the whole text). So the moment
+  registration lands, the live chokepoint catches every common exfil transform, not just raw/base64/
+  hex.
 - **Closure criterion:** all three disclosure paths share one **value** chokepoint; the session
   secret is registered at start; a canary seeded at session start never appears in the model-facing
   message stream in any encoding.
 - **Ratchet guard:** `disclosure_chokepoint_redacts_registered_canary_in_every_encoding` (`agentic/mod.rs`,
   step-6.1a) — a registered canary embedded raw + base64 + hex in a tool result is absent from the
   chokepoint output in every encoding (`DisclosureFilter::leaks == false`), and the `None` path is
-  byte-identical. Follow-up guards will assert absence from the assembled `{"role":"tool"}` messages
+  byte-identical. The primitive's own matrix is guarded by `catches_base64url_reencoding`,
+  `catches_base64_nopad_reencoding`, `catches_uppercase_hex`, `catches_percent_encoding`,
+  `catches_string_escapes`, `catches_chunk_split_raw`, `catches_chunk_split_base64`,
+  `redact_withholds_chunk_split`, and `redact_post_condition_holds_for_every_form` (`ocap.rs`,
+  step-6.2). Follow-up guards will assert absence from the assembled `{"role":"tool"}` messages
   and every summary once registration + the observation/summary convergence land.
 - **Status:** OPEN — mechanism landed (step-6.1a: live-path value chokepoint + canary guard);
   session-start registration + observation/summary value-convergence pending · review-by: with B1
