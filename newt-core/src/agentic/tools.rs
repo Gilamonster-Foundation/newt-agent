@@ -570,7 +570,12 @@ fn bridle_registry(
 /// confined shell becomes the default everywhere — see agent-bridle#20 and
 /// the `[patch.crates-io]` note in the workspace Cargo.toml.
 pub fn ocap_disabled() -> bool {
-    std::env::var("NEWT_DISABLE_OCAP").is_ok_and(|v| v == "1")
+    // Reads the process's FROZEN `LaunchAuthority` (resolved once from
+    // `NEWT_DISABLE_OCAP` near startup), never the live env — so a switch that
+    // appears after startup cannot widen authority mid-process
+    // (`noninteractive-launch-policy`). `launch_authority::from_env` is the sole
+    // env reader.
+    crate::launch_authority::current().ocap_disabled()
 }
 
 /// Is the per-invocation `full_access` preset override asserted?
@@ -590,7 +595,10 @@ pub fn ocap_disabled() -> bool {
 /// instead of the confined shell) and still honors whatever floor is in
 /// force. `--yolo --full-access` together yield an unrestricted host shell.
 pub fn full_access_requested() -> bool {
-    std::env::var("NEWT_FULL_ACCESS").is_ok_and(|v| v == "1")
+    // Frozen `LaunchAuthority` (resolved once from `NEWT_FULL_ACCESS` at
+    // startup), never the live env — a later-appearing switch cannot widen the
+    // session preset mid-process. See [`crate::launch_authority`].
+    crate::launch_authority::current().full_access()
 }
 
 /// #1176: should an about-to-run command be shadow-recorded? Exactly when it

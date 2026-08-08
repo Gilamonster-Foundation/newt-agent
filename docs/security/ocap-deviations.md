@@ -75,7 +75,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `acp-worker-fs-scope` | worker fs attenuated to the session workspace (caveat fence + object-bound) | 🟢 closed | (fence active; non-Linux keeps the lexical-prefix fallback) |
 | `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
 | `config-plane-provenance` | an untrusted project `.newt/config.toml` cannot grant exec / endpoint (control-plane) authority | 🟢 closed (fail-closed) | (overlay stripped; ambient `./newt.toml` base control-plane strip = tracked follow-up) |
-| `noninteractive-launch-policy` | `--non-interactive` changes interaction only; OCAP-off host exec is an explicit opt-in | 🟠→🟡 | libraries still read `NEWT_DISABLE_OCAP`/`NEWT_FULL_ACCESS` from ambient env (typed `LaunchAuthority` follow-on) |
+| `noninteractive-launch-policy` | `--non-interactive` changes interaction only; OCAP-off host exec is an explicit opt-in; authority resolved once, cannot widen from later env | 🟢 closed | (authority is a frozen `LaunchAuthority`; a new deep `env::var` authority read re-opens it — gated) |
 | `p4-constrained-executor` | all attacker-influenced subprocess creation routes through one confined executor (kernel-backed, fail-closed) + host-shell child stripped of newt's control plane | 🟢 closed (migration+confinement+#8) | (a new `agent-exec-todo-p4` spawn site, or the yolo lane ceasing to strip the control plane — both ratchet-guarded); process-tree-cancel bounded by `b1` |
 | `git-confused-deputy` | every harness `git` subprocess disarms the repo's config-based code-execution gadgets (`core.fsmonitor`, hooks, `diff.external`/`textconv`, pager, sshCommand) | 🟢 closed | (a raw `Command::new("git")` in the workspace re-introduced without `hardened_git`) |
 | `posture-report-honesty` | every security-posture surface is DERIVED from the same `verify_*` invariants the gates enforce, never independent prose | 🟢 closed | (a posture surface that asserts a claim the verifiers don't back — a report/enforcement drift) |
@@ -449,31 +449,36 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   at all; OCAP-off requires the explicit `--unsafe-host-exec` flag (or the `NEWT_UNSAFE_HOST_EXEC` env
   twin), `--confined` still wins, and the **default lane is now `Confined`** (OCAP on, workspace-
   fenced). A plain `newt solve --non-interactive` is confined.
-- **Residual:** 🟠 high → 🟡 medium. The remaining architectural work: (i) libraries still READ
-  `NEWT_DISABLE_OCAP`/`NEWT_FULL_ACCESS` from the ambient process env (`ocap_disabled` /
-  `full_access_requested` in `newt-core/agentic/tools.rs`), so a later-appearing env var could still
-  widen authority mid-process — the fix is a typed, immutable `LaunchAuthority`/`ExecutionPolicy`
-  resolved once at startup and threaded by value instead of consulted from libraries; (ii) stripping
-  the authority switches from every child process is folded into `p4-constrained-executor` (the
-  cleared-env boundary). Until then the Yolo lane still *sets* those env vars for its own
-  (now-explicit) use.
-- **Disabled while open:** n/a for the closed vector; the typed-authority + child-env-strip work is
-  tracked here + under `p4-constrained-executor`.
-- **Closure criterion (the `--non-interactive` invariant):** met — `--non-interactive` cannot select
-  the OCAP-off lane; only an independent explicit `--unsafe-host-exec` can. Full closure of the row
-  needs the typed immutable `LaunchAuthority` retiring the ambient env reads.
+- **Residual:** 🟢 closed. The two halves are now both done: (i) the `--non-interactive` decouple
+  (step-3.1) means interaction never selects the OCAP-off lane; (ii) authority is a **typed, immutable
+  value** resolved ONCE near startup — `newt_core::launch_authority::LaunchAuthority`. Its
+  `from_env()` is the *sole* reader of the three env twins; the entrypoints call it after translating
+  their flags, then `freeze()` the result. Deep libraries (`ocap_disabled` / `full_access_requested`
+  in `newt-core/agentic/tools.rs`, and the newt-tui policy/banner sites through them) decide via
+  `launch_authority::current()` — the FROZEN value — never a live `env::var`. So a `NEWT_DISABLE_OCAP`
+  / `NEWT_FULL_ACCESS` / `NEWT_UNSAFE_HOST_EXEC` that appears AFTER startup cannot widen the running
+  process's authority. Child-process authority stripping is already covered by `p4-constrained-executor`
+  (`CHILD_STRIPPED_AUTHORITY_ENV`).
+- **Disabled while open:** n/a (closed).
+- **Compensating controls:** `--non-interactive`/`--unsafe-host-exec` decouple (step-3.1); the
+  child-env strip (`p4-constrained-executor`); `meet`-only attenuation on `LaunchAuthority` (a later
+  context can lower authority, never raise it).
+- **Closure criterion:** met — (a) `--non-interactive` cannot select the OCAP-off lane, only the
+  explicit `--unsafe-host-exec`; (b) a frozen `LaunchAuthority`, resolved once, is the authority
+  source, and a source-inventory gate proves no deep library reads the env twins directly.
 - **Ratchet guard:** `non_interactive_never_relaxes_authority` (`newt-cli/src/solve.rs`) — a plain
-  headless run (`resolve_lane(false, None, false)`) resolves to `Confined`, never `Yolo`; only an
-  explicit opt-in (`resolve_lane(false, None, true)`) reaches `Yolo`. Reverting the decouple (letting
-  `--non-interactive` pick Yolo) turns this red.
-- **0.8.0 disposition:** DOES NOT block v0.8.0 — the `--non-interactive`-weakens-security vector is
-  CLOSED. A hostile repo/model CANNOT set `NEWT_DISABLE_OCAP` / `NEWT_FULL_ACCESS` (operator-env-only,
-  no config key, no model channel — re-verified by the final adversarial pass), and step-4.6 strips
-  them from host-shell children. The residual (typed immutable `LaunchAuthority` retiring the ambient
-  reads) is **defense-in-depth follow-on**, not a live-turn escape. Tracked: this register entry.
-- **Status:** OPEN (narrowed) — the `--non-interactive`-disables-OCAP vector CLOSED (step-3.1, with
-  the regression guard); the typed `LaunchAuthority` + ambient-env-read retirement remain · owner: —
-  · review-by: with the `LaunchAuthority` + `p4-constrained-executor` work.
+  headless run resolves `Confined`, never `Yolo`; `frozen_authority_ignores_later_env_mutation`,
+  `freeze_is_first_wins_a_second_freeze_cannot_widen`, `meet_can_only_attenuate_never_widen`,
+  `from_env_reads_exactly_one_fail_closed` (`newt-core/src/launch_authority.rs`) — freeze a confined
+  authority, set every switch env var afterward, and `current()` stays confined; plus the
+  `ocap_check.py` source gate (`check_launch_authority_reads`) which FAILS the build if any
+  `newt-core/src` file other than `launch_authority.rs` reads an authority env twin with `env::var`
+  (a stray deep read re-opens the widen-mid-process hole — verified red on a probe).
+- **0.8.0 disposition:** already did not block v0.8.0; this now CLOSES the row entirely (the
+  typed-authority follow-on is done, not deferred).
+- **Status:** CLOSED — `--non-interactive` decouple (step-3.1) + typed immutable `LaunchAuthority`
+  (frozen once, deep-read-free, inventory-gated). Milestone v0.9.0 / epic #749 · owner: — · review-by:
+  if a new authority switch is added (route it through `LaunchAuthority`, not a fresh `env::var`).
 
 ### p4-constrained-executor
 - **Invariant (ideal):** every attacker-influenced subprocess (model shell, build checks, tests,

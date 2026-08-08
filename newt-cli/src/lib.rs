@@ -1225,6 +1225,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             if cli.full_access {
                 unsafe { std::env::set_var("NEWT_FULL_ACCESS", "1") };
             }
+            // Freeze the launch authority now that the flags have set their env
+            // twins. Deep libraries read this frozen value (never the live env),
+            // so a `NEWT_DISABLE_OCAP` / `NEWT_FULL_ACCESS` that appears LATER
+            // cannot widen authority mid-process (noninteractive-launch-policy).
+            newt_core::launch_authority::freeze(
+                newt_core::launch_authority::LaunchAuthority::from_env(),
+            );
             // #1176: arm the shadow-OCAP flight recorder whenever the session
             // runs UNCONFINED (--full-access or --yolo/--disable-ocap). Every
             // unconfined command then records the authority a leash would have
