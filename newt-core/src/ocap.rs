@@ -78,19 +78,196 @@ fn require(v: Verification) -> Result<(), FailClosed> {
     }
 }
 
-/// Verify **b1-os-isolation**: uid-namespace + Landlock fs + seccomp +
-/// default-deny netns + an egress proxy that is the *only* egress.
+/// The **b1-os-isolation** floor expressed as backend-neutral security
+/// PROPERTIES — the invariants that must hold for an attacker-controlled child,
+/// NOT the mechanisms that happen to establish them. A property may be proven on
+/// Linux by Landlock / seccomp / cgroup v2 / a mediated broker, on macOS by
+/// Seatbelt + a broker + a process-lifetime mechanism, on Windows by
+/// AppContainer/LPAC + a Job Object + a broker. Two rules follow, and they are
+/// the whole reason this is a property set rather than a mechanism list:
 ///
-/// UNBUILT — always [`Verification::Absent`] (`sandbox_kind = none`; the
-/// in-process monitor is the only barrier). When the per-OS stack lands (Linux
-/// Landlock-net 6.7 / seccomp / netns, macOS Seatbelt, Windows AppContainer —
-/// `docs/design/captured-shell-cross-platform.md`), this returns `Verified` with
-/// the confirmed floor, re-run *per session* (no COW-cloned-pod skip).
+/// 1. A missing *optional* mechanism is **not** a failure if another mechanism
+///    proves the same property. Unprivileged user/net namespaces are disabled by
+///    host policy on hardened Linux (`apparmor_restrict_unprivileged_userns`,
+///    Ubuntu ≥ 23.10), so [`DirectNetworkEgressDenied`] is proven there by a
+///    seccomp `socket()`-family deny instead — a *complete* proof, not a
+///    degraded one. uid-ns/netns are mechanisms, never theorem clauses.
+/// 2. A mechanism merely being *available* is **not** proof the property holds
+///    on the live path. Proof is per-session runtime evidence that the actual
+///    attacker-exec route (`run_command` → agent-bridle shell) inherited the
+///    enforcement — never a host-capability probe.
+///
+/// [`DirectNetworkEgressDenied`]: B1Property::DirectNetworkEgressDenied
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum B1Property {
+    /// Object-bounded filesystem authority — no read/write outside the fence.
+    FilesystemConfinement,
+    /// No DIRECT network egress: the child cannot itself open an off-box socket
+    /// (TCP, UDP, DNS, raw, or packet).
+    DirectNetworkEgressDenied,
+    /// Any reachability is only through an explicit broker capability (a
+    /// pre-opened handle), never ambient socket-creation authority.
+    MediatedEgressOnly,
+    /// The child starts from an empty environment plus only explicit grants.
+    EnvironmentIsolation,
+    /// No unintended inherited descriptor/handle (fd ≥ 3) crosses into the child.
+    InheritedHandleIsolation,
+    /// A hostile descendant cannot survive cancellation/timeout — the whole
+    /// process subtree is owned and reaped.
+    ProcessTreeContainment,
+    /// No ambient credential (token, agent socket, key material) is reachable.
+    CredentialIsolation,
+    /// Tool-derived text is value-filtered before it can reach the model.
+    DisclosureFiltering,
+    /// Execution is REFUSED when a required property cannot be established — the
+    /// floor never silently degrades.
+    FailClosedEnforcement,
+}
+
+impl B1Property {
+    /// Every property the b1 floor requires, in credential-safety order (the
+    /// legs that keep a seeded token from leaving the box come first).
+    pub const REQUIRED: [Self; 9] = [
+        Self::FilesystemConfinement,
+        Self::DirectNetworkEgressDenied,
+        Self::MediatedEgressOnly,
+        Self::CredentialIsolation,
+        Self::EnvironmentIsolation,
+        Self::InheritedHandleIsolation,
+        Self::ProcessTreeContainment,
+        Self::DisclosureFiltering,
+        Self::FailClosedEnforcement,
+    ];
+
+    /// A stable slug for the property (used in verifier reasons + the register).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FilesystemConfinement => "filesystem-confinement",
+            Self::DirectNetworkEgressDenied => "direct-network-egress-denied",
+            Self::MediatedEgressOnly => "mediated-egress-only",
+            Self::EnvironmentIsolation => "environment-isolation",
+            Self::InheritedHandleIsolation => "inherited-handle-isolation",
+            Self::ProcessTreeContainment => "process-tree-containment",
+            Self::CredentialIsolation => "credential-isolation",
+            Self::DisclosureFiltering => "disclosure-filtering",
+            Self::FailClosedEnforcement => "fail-closed-enforcement",
+        }
+    }
+}
+
+/// The b1 floor as a per-route report: which [`B1Property`] invariants are
+/// *proven* on a given execution path and which are not yet. This is the object
+/// `verify_b1` reasons over — it replaces the old mechanism list
+/// (`fs_fence`/`seccomp`/`uidns`/`netns`/`proxy`) so a backend that proves a
+/// property by a *different* mechanism is never miscounted as a gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct B1Floor {
+    /// Properties NOT yet proven on this route, in [`B1Property::REQUIRED`]
+    /// order. Empty iff the full semantic floor is proven on the live path.
+    unmet: Vec<B1Property>,
+}
+
+impl B1Floor {
+    /// The status of the **live attacker-exec path** (`run_command` →
+    /// `dispatch_bridled_shell` → agent-bridle shell) today.
+    ///
+    /// That path spawns through agent-bridle's `ShellTool`, which applies a
+    /// Landlock filesystem fence + a Landlock **TCP-only** connect deny — and
+    /// nothing else. So of the required properties:
+    ///
+    /// * [`DirectNetworkEgressDenied`] is **not** proven — UDP, DNS, raw and
+    ///   packet sockets remain openable; Landlock cannot filter them, and the
+    ///   seccomp `socket()`-family floor is not installed on bridle's spawn
+    ///   thread (agent-bridle exposes no seam for it until the `0.7.15` security
+    ///   patch that adds a declarative child-network policy).
+    /// * [`MediatedEgressOnly`], [`InheritedHandleIsolation`], and
+    ///   [`ProcessTreeContainment`] are wired only into the opt-in
+    ///   `ConstrainedExecutor` lane (via `newt-net-guard` / cgroup subtree),
+    ///   never this shell path.
+    ///
+    /// The remaining properties cannot be asserted from this constructor either:
+    /// proof requires **per-session runtime evidence** that the child inherited
+    /// the enforcement, and no such evidence seam exists yet (a later slice).
+    /// This constructor reports the *known structural* gaps; it never
+    /// manufactures a proof.
+    ///
+    /// [`DirectNetworkEgressDenied`]: B1Property::DirectNetworkEgressDenied
+    /// [`MediatedEgressOnly`]: B1Property::MediatedEgressOnly
+    /// [`InheritedHandleIsolation`]: B1Property::InheritedHandleIsolation
+    /// [`ProcessTreeContainment`]: B1Property::ProcessTreeContainment
+    #[must_use]
+    pub fn live_attacker_path() -> Self {
+        Self {
+            unmet: vec![
+                B1Property::DirectNetworkEgressDenied,
+                B1Property::MediatedEgressOnly,
+                B1Property::InheritedHandleIsolation,
+                B1Property::ProcessTreeContainment,
+            ],
+        }
+    }
+
+    /// The first unmet property, in credential-safety order. `None` iff the full
+    /// semantic floor is proven on this route.
+    #[must_use]
+    pub fn first_unmet(&self) -> Option<B1Property> {
+        B1Property::REQUIRED
+            .into_iter()
+            .find(|p| self.unmet.contains(p))
+    }
+
+    /// True iff every required property is proven on this route.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.unmet.is_empty()
+    }
+}
+
+/// Verify **b1-os-isolation** as a set of proven security PROPERTIES on the live
+/// attacker-exec path — filesystem confinement, direct-egress denial,
+/// mediated-egress-only, environment + credential isolation, inherited-handle
+/// isolation, process-tree containment, disclosure filtering, and fail-closed
+/// enforcement — each established by whatever mechanism the platform backend
+/// uses (NOT a fixed uid-ns/netns stack). See [`B1Property`].
+///
+/// **Stays [`Verification::Absent`] by construction** for two independent
+/// reasons, either of which alone forbids the flip:
+///
+/// 1. The live path (`run_command` → agent-bridle shell) does not yet prove the
+///    network-egress properties — see [`B1Floor::live_attacker_path`].
+/// 2. Proof is per-session *runtime evidence* that the actual child inherited
+///    the enforcement; there is no such evidence seam yet, so no property can be
+///    marked proven from host availability alone.
+///
+/// It is the SOLE remaining runtime lock on [`seed_live_credential`] +
+/// [`admit_untrusted_remote`]; flipping it hollowly would admit a live token
+/// into a still-reachable box. The flip is a later slice: the live `run_command`
+/// path fenced through the agent-bridle child-network policy + a per-session
+/// canary grounding test.
 #[must_use]
 pub fn verify_b1() -> Verification {
+    let floor = B1Floor::live_attacker_path();
+    let reason = match floor.first_unmet() {
+        Some(p) => format!(
+            "b1 property not proven on the live attacker-exec path (run_command → \
+             agent-bridle shell): {} — that path applies only a Landlock fs fence + \
+             TCP-only connect deny, so the seccomp egress floor / mediated broker / \
+             fd hygiene / process-tree containment are not established here, and no \
+             per-session evidence seam records live enforcement. b1 is a set of \
+             PROVEN properties, each met by ANY sufficient mechanism, not a fixed \
+             uid-ns/netns stack",
+            p.name()
+        ),
+        // Unreachable today (the live path has unmet properties). Even a complete
+        // structural floor stays Absent until a per-session run records evidence.
+        None => "b1 structural floor complete but live-session enforcement is \
+                 unproven (per-session evidence seam + canary grounding test pending)"
+            .to_string(),
+    };
     Verification::Absent {
         deviation: "b1-os-isolation",
-        reason: "no OS sandbox or egress proxy; the in-process monitor is the only barrier".into(),
+        reason,
     }
 }
 
@@ -179,6 +356,87 @@ mod tests {
         // b1 remains fail-closed until the kernel floor lands (P5).
         assert!(!verify_b1().is_verified());
         assert_eq!(verify_b1().deviation(), Some("b1-os-isolation"));
+    }
+
+    #[test]
+    fn b1floor_live_path_reports_network_egress_properties_unmet() {
+        let floor = B1Floor::live_attacker_path();
+        // The live run_command -> bridle-shell path proves neither direct-egress
+        // denial nor mediated-egress-only today (Landlock fs + TCP-only deny).
+        assert!(
+            !floor.is_complete(),
+            "the live path is not fully fenced yet"
+        );
+        assert_eq!(
+            floor.first_unmet(),
+            Some(B1Property::DirectNetworkEgressDenied),
+            "direct-egress denial is the first (clearest) gap on the live path"
+        );
+    }
+
+    #[test]
+    fn verify_b1_names_an_unmet_property_not_a_mechanism() {
+        // Honest-as-code: the reason names a semantic PROPERTY that is unproven on
+        // the live path — never the old blanket "no OS sandbox", and it states
+        // the floor is property-based (uid-ns/netns are not mandatory clauses).
+        let v = verify_b1();
+        assert!(!v.is_verified());
+        assert_eq!(v.deviation(), Some("b1-os-isolation"));
+        let Verification::Absent { reason, .. } = &v else {
+            unreachable!("b1 is Absent")
+        };
+        assert!(
+            reason.contains(B1Property::DirectNetworkEgressDenied.name()),
+            "reason should name the unmet property: {reason}"
+        );
+        assert!(
+            reason.contains("not a fixed uid-ns/netns stack"),
+            "reason must state b1 is property-based, not mechanism-locked: {reason}"
+        );
+        assert!(
+            !reason.contains("no OS sandbox"),
+            "reason must be property-specific, not the old blanket constant: {reason}"
+        );
+    }
+
+    #[test]
+    fn b1property_required_is_credential_safety_ordered_and_first_unmet_follows_it() {
+        // Filesystem confinement is the base; the egress/broker/credential legs
+        // come before the lifecycle + disclosure + fail-closed legs.
+        assert_eq!(B1Property::REQUIRED[0], B1Property::FilesystemConfinement);
+        assert_eq!(
+            B1Property::REQUIRED[1],
+            B1Property::DirectNetworkEgressDenied
+        );
+        assert_eq!(B1Property::REQUIRED[2], B1Property::MediatedEgressOnly);
+        assert_eq!(B1Property::REQUIRED[3], B1Property::CredentialIsolation);
+
+        // A complete floor has no gap.
+        let complete = B1Floor { unmet: vec![] };
+        assert!(complete.is_complete());
+        assert_eq!(complete.first_unmet(), None);
+
+        // first_unmet follows REQUIRED order regardless of the Vec's order:
+        // process-tree containment is last, so with only it missing it is named.
+        let only_lifecycle = B1Floor {
+            unmet: vec![B1Property::ProcessTreeContainment],
+        };
+        assert_eq!(
+            only_lifecycle.first_unmet(),
+            Some(B1Property::ProcessTreeContainment)
+        );
+        // With both egress denial and containment missing (Vec in reverse order),
+        // the earlier-ordered egress-denial property is named first.
+        let mixed = B1Floor {
+            unmet: vec![
+                B1Property::ProcessTreeContainment,
+                B1Property::DirectNetworkEgressDenied,
+            ],
+        };
+        assert_eq!(
+            mixed.first_unmet(),
+            Some(B1Property::DirectNetworkEgressDenied)
+        );
     }
 
     #[test]
