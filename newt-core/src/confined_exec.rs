@@ -427,6 +427,12 @@ impl ConstrainedExecutor {
         req: &ExecRequest,
         cgroup_procs: Option<&Path>,
     ) -> Result<(String, Vec<String>, Caveats), ExecRefused> {
+        // Only the Linux `DenyAll` arm reads `cgroup_procs`; on other platforms
+        // that arm is `#[cfg]`'d out and `DenyAll` fails closed, so the parameter
+        // is genuinely unused there. Consume it to keep `-D warnings` happy
+        // without weakening the Linux signature both callers share.
+        #[cfg(not(target_os = "linux"))]
+        let _ = cgroup_procs;
         match req.net_grant {
             NetGrant::Unrestricted => {
                 Ok((req.program.clone(), req.args.clone(), req.caveats.clone()))
