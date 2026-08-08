@@ -8,6 +8,18 @@ fn main() -> Result<()> {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    // b1 child-side network guard, self-exec'd through this already-shipped
+    // binary: `newt __net-guard [--cgroup-procs P] (--probe-egress | -- PROG …)`.
+    // The confined executor's `NetGrant::DenyAll` path re-execs us here so the
+    // seccomp egress floor rides in a released `newt` with no separately packaged
+    // helper. MUST be before clap — the args after `--` are an arbitrary program
+    // + flags — and `run_guard_and_exec` never returns (it execs or exits).
+    {
+        let mut argv = std::env::args_os();
+        if argv.nth(1).as_deref() == Some(std::ffi::OsStr::new("__net-guard")) {
+            newt_core::netguard::run_guard_and_exec(argv);
+        }
+    }
     // Windows' default main-thread stack (~1 MB) overflows on the large clap
     // command tree during `Cli::parse()` before any diagnostics are printed.
     // Keep parse + dispatch behind Newt's explicit CLI stack policy. (#747)
