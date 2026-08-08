@@ -38,6 +38,7 @@ pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
 pub mod kit;
+pub mod launch_authority;
 pub mod lazy_emission;
 pub mod mcp;
 pub mod mcp_catalog;

@@ -256,6 +256,12 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         }
     }
 
+    // Freeze the launch authority for this headless process now that the lane
+    // has resolved its env twins (Confined cleared them; Yolo set them). Deep
+    // libraries read the frozen value, so a later env mutation cannot widen
+    // authority mid-run (noninteractive-launch-policy).
+    newt_core::launch_authority::freeze(newt_core::launch_authority::LaunchAuthority::from_env());
+
     // 3. Backend: honor NEWT_PROVIDER, else the first backend with an endpoint.
     let backend = pick_backend(&cfg)
         .context("no usable backend in config (set one in the --profile [[backends]] or via --backend-endpoint)")?;

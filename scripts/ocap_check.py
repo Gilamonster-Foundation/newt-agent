@@ -62,6 +62,20 @@ SKIP_DIRS = {".git", "target", "node_modules", ".venv", "__pycache__"}
 DANGER_RE = re.compile(r"OCAP-DANGER:\s*([a-z0-9-]+)")
 GATE_RE = re.compile(r"OCAP-GATE:\s*([a-z0-9-]+)")
 
+# `noninteractive-launch-policy` ratchet: authority is a value resolved ONCE at
+# startup, not an ambient signal a later actor can flip. The three authority env
+# twins may be READ (`env::var`) only by the single resolver
+# (`LaunchAuthority::from_env` in `newt-core/src/launch_authority.rs`); every
+# deep library decides authority via `launch_authority::current()`. A stray deep
+# `env::var("NEWT_DISABLE_OCAP" | …)` re-opens the widen-mid-process hole.
+AUTHORITY_ENV_READ_RE = re.compile(
+    r'env::var(?:_os)?\s*\(\s*"(NEWT_DISABLE_OCAP|NEWT_FULL_ACCESS|NEWT_UNSAFE_HOST_EXEC)"'
+)
+# The deep-library crate the ban applies to (entrypoint crates may still read the
+# twins at startup as the compatibility input, then freeze the resolved value).
+AUTHORITY_LIB_ROOT = REPO / "newt-core" / "src"
+AUTHORITY_RESOLVER = AUTHORITY_LIB_ROOT / "launch_authority.rs"
+
 
 class Result:
     def __init__(self) -> None:
@@ -162,6 +176,36 @@ def check_code_guards(res: Result, known_ids: set, entries: dict):
     return danger_sites
 
 
+def check_launch_authority_reads(res: Result):
+    """`noninteractive-launch-policy`: no deep-library ambient authority read.
+
+    In `newt-core/src`, `env::var("NEWT_DISABLE_OCAP" | "NEWT_FULL_ACCESS" |
+    "NEWT_UNSAFE_HOST_EXEC")` may appear ONLY in `launch_authority.rs` (the sole
+    resolver). Any other deep read lets a later-appearing env var widen authority
+    mid-process — the hole the frozen `LaunchAuthority` closes.
+    """
+    if not AUTHORITY_LIB_ROOT.is_dir():
+        return
+    resolver = AUTHORITY_RESOLVER.resolve()
+    for path in AUTHORITY_LIB_ROOT.rglob("*.rs"):
+        if path.resolve() == resolver:
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            m = AUTHORITY_ENV_READ_RE.search(line)
+            if m:
+                rel = path.relative_to(REPO)
+                res.err(
+                    f"{rel}:{i+1} reads authority env var {m.group(1)!r} directly — deep "
+                    "libraries must decide authority via launch_authority::current() (the "
+                    "frozen value); only launch_authority.rs may read the env twin "
+                    "(noninteractive-launch-policy)"
+                )
+
+
 def print_ledger(known_ids: set, entries: dict, danger_sites: int):
     open_ids = sorted(i for i in known_ids if entries.get(i, {}).get("status", "OPEN") != "CLOSED")
     closed = sorted(i for i in known_ids if entries.get(i, {}).get("status") == "CLOSED")
@@ -177,6 +221,7 @@ def main() -> int:
     res = Result()
     known_ids, entries = check_register(res)
     danger_sites = check_code_guards(res, known_ids, entries)
+    check_launch_authority_reads(res)
     print_ledger(known_ids, entries, danger_sites)
 
     for w in res.warnings:
