@@ -9,6 +9,22 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Security — OCAP enforcement-floor (0.8.1 line, epic #749)
+
+Bug-fix hardening on the 0.8.0 line: closing the remaining OPEN deviations in
+[`docs/security/ocap-deviations.md`](docs/security/ocap-deviations.md) toward
+*"zero deviations = full OCAP"*. Not new features — security fixes — hence a
+patch bump.
+
+- **`noninteractive-launch-policy` closed** (#1620). Launch authority
+  (`--disable-ocap`/`--yolo`, `--full-access`, `--unsafe-host-exec`) is now a
+  typed, immutable value (`newt_core::launch_authority::LaunchAuthority`)
+  resolved once at startup and frozen: deep libraries read the frozen value, so
+  a `NEWT_*` authority env var that appears *after* startup can no longer widen
+  a running process's authority. A source-inventory CI gate
+  (`ocap_check.py`) forbids any deep `env::var` authority read outside the sole
+  resolver. Register: 11 CLOSED / 4 OPEN.
+
 ### Added — splash-first startup, open provider roster, Hermes compatibility
 
 - **Splash first, always a spinner.** The splash now precedes the first-run
