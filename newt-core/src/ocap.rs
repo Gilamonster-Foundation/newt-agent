@@ -127,31 +127,31 @@ pub enum B1Property {
 impl B1Property {
     /// Every property the b1 floor requires, in credential-safety order (the
     /// legs that keep a seeded token from leaving the box come first).
-    pub const REQUIRED: [B1Property; 9] = [
-        B1Property::FilesystemConfinement,
-        B1Property::DirectNetworkEgressDenied,
-        B1Property::MediatedEgressOnly,
-        B1Property::CredentialIsolation,
-        B1Property::EnvironmentIsolation,
-        B1Property::InheritedHandleIsolation,
-        B1Property::ProcessTreeContainment,
-        B1Property::DisclosureFiltering,
-        B1Property::FailClosedEnforcement,
+    pub const REQUIRED: [Self; 9] = [
+        Self::FilesystemConfinement,
+        Self::DirectNetworkEgressDenied,
+        Self::MediatedEgressOnly,
+        Self::CredentialIsolation,
+        Self::EnvironmentIsolation,
+        Self::InheritedHandleIsolation,
+        Self::ProcessTreeContainment,
+        Self::DisclosureFiltering,
+        Self::FailClosedEnforcement,
     ];
 
     /// A stable slug for the property (used in verifier reasons + the register).
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            B1Property::FilesystemConfinement => "filesystem-confinement",
-            B1Property::DirectNetworkEgressDenied => "direct-network-egress-denied",
-            B1Property::MediatedEgressOnly => "mediated-egress-only",
-            B1Property::EnvironmentIsolation => "environment-isolation",
-            B1Property::InheritedHandleIsolation => "inherited-handle-isolation",
-            B1Property::ProcessTreeContainment => "process-tree-containment",
-            B1Property::CredentialIsolation => "credential-isolation",
-            B1Property::DisclosureFiltering => "disclosure-filtering",
-            B1Property::FailClosedEnforcement => "fail-closed-enforcement",
+            Self::FilesystemConfinement => "filesystem-confinement",
+            Self::DirectNetworkEgressDenied => "direct-network-egress-denied",
+            Self::MediatedEgressOnly => "mediated-egress-only",
+            Self::EnvironmentIsolation => "environment-isolation",
+            Self::InheritedHandleIsolation => "inherited-handle-isolation",
+            Self::ProcessTreeContainment => "process-tree-containment",
+            Self::CredentialIsolation => "credential-isolation",
+            Self::DisclosureFiltering => "disclosure-filtering",
+            Self::FailClosedEnforcement => "fail-closed-enforcement",
         }
     }
 }
@@ -363,7 +363,10 @@ mod tests {
         let floor = B1Floor::live_attacker_path();
         // The live run_command -> bridle-shell path proves neither direct-egress
         // denial nor mediated-egress-only today (Landlock fs + TCP-only deny).
-        assert!(!floor.is_complete(), "the live path is not fully fenced yet");
+        assert!(
+            !floor.is_complete(),
+            "the live path is not fully fenced yet"
+        );
         assert_eq!(
             floor.first_unmet(),
             Some(B1Property::DirectNetworkEgressDenied),
@@ -401,7 +404,10 @@ mod tests {
         // Filesystem confinement is the base; the egress/broker/credential legs
         // come before the lifecycle + disclosure + fail-closed legs.
         assert_eq!(B1Property::REQUIRED[0], B1Property::FilesystemConfinement);
-        assert_eq!(B1Property::REQUIRED[1], B1Property::DirectNetworkEgressDenied);
+        assert_eq!(
+            B1Property::REQUIRED[1],
+            B1Property::DirectNetworkEgressDenied
+        );
         assert_eq!(B1Property::REQUIRED[2], B1Property::MediatedEgressOnly);
         assert_eq!(B1Property::REQUIRED[3], B1Property::CredentialIsolation);
 
