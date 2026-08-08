@@ -80,7 +80,7 @@ fn is_safe_worktree_path(path: &str) -> bool {
 /// `(success, combined stdout+stderr)` or an `Err` describing the refusal.
 fn run_confined_build(worktree: &Path, base: &Path, cmd: &str) -> Result<(bool, String), String> {
     use newt_core::confined_exec::{
-        build_tool_caveats_with_writes, ConstrainedExecutor, ExecOrigin, ExecRequest,
+        build_tool_caveats_with_writes, ConstrainedExecutor, ExecOrigin, ExecRequest, NetGrant,
     };
     let target = crew_shared_target_dir(base);
     let target_str = target.to_string_lossy().into_owned();
@@ -108,6 +108,12 @@ fn run_confined_build(worktree: &Path, base: &Path, cmd: &str) -> Result<(bool, 
         worktree,
         caveats,
     )
+    // Seccomp egress floor on the crew build/test child: the `net: none` caveat
+    // already Landlock-denies TCP; `DenyAll` additionally closes UDP/DNS/raw, so
+    // a hostile repo's `build.rs`/test cannot exfiltrate. Pure hardening — the
+    // crew build already ran with no network (deps are pre-fetched under the
+    // shared CARGO_TARGET_DIR / cargo cache), so nothing legitimate regresses.
+    .net_grant(NetGrant::DenyAll)
     .env("CARGO_TARGET_DIR", &target_str)
     .env("TMPDIR", worktree.to_string_lossy());
     // Real HOME so cargo/tools find ~/.cargo (read via the calibrated set,
@@ -2448,7 +2454,12 @@ mod tests {
         // run_test now runs CONFINED (P4). Where the kernel fence is available the
         // verify runs under it; where it is not, it fails closed (never runs the
         // repo-controlled command unconfined).
-        let confinable = newt_core::confined_exec::kernel_fs_fence_available();
+        // Confined-and-runs requires BOTH the kernel fs fence AND a resolvable
+        // DenyAll net guard; where the guard is absent (a `-p newt-agent` build
+        // that does not compile `newt-net-guard`, run from a non-`newt` harness)
+        // the confined verify fails closed — secure, but not the "pass" outcome.
+        let confinable = newt_core::confined_exec::kernel_fs_fence_available()
+            && newt_core::confined_exec::net_guard_available();
         let repo = git_repo();
         let ok = WorktreeWorkspace::create(repo.path(), "t2a", "HEAD", "test -f hello.txt".into())
             .unwrap();
@@ -2569,6 +2580,16 @@ mod tests {
     #[cfg(unix)] // the verification command is a POSIX `test -f`
     #[tokio::test]
     async fn crew_converges_with_a_fixing_planner() {
+        // The crew verify runs CONFINED under the DenyAll egress floor. Where the
+        // kernel fs fence or the net guard cannot be established the confined
+        // verify fails closed (never runs the repo command unconfined) and the
+        // crew cannot converge — so the convergence assertion is only meaningful
+        // when both are available (in CI's workspace build they are).
+        if !newt_core::confined_exec::kernel_fs_fence_available()
+            || !newt_core::confined_exec::net_guard_available()
+        {
+            return;
+        }
         let repo = git_repo();
         let cfg = crew_cfg();
         let args = CrewArgs {

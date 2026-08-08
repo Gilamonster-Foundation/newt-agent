@@ -15,8 +15,8 @@
 use std::path::Path;
 
 use newt_core::confined_exec::{
-    workspace_confined_caveats, ConfinedOutput, ConstrainedExecutor, ExecOrigin, ExecRefused,
-    ExecRequest, NetGrant,
+    build_tool_caveats, workspace_confined_caveats, ConfinedOutput, ConstrainedExecutor,
+    ExecOrigin, ExecRefused, ExecRequest, NetGrant,
 };
 use serial_test::serial;
 use tempfile::tempdir;
@@ -87,6 +87,35 @@ fn a_nested_shell_and_descendant_cannot_open_a_socket() {
         stdout.contains("nested_exit=0"),
         "a nested-shell descendant's egress was NOT denied (want nested_exit=0):\n{stdout}\n\
          stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[serial]
+fn build_tool_caveats_under_deny_all_deny_a_build_steps_egress() {
+    // The exact contract run_build_check + crew now apply (b1 slice 1b):
+    // build_tool_caveats (net: none) + NetGrant::DenyAll. Run the guard's egress
+    // probe under that contract — exit 0 iff seccomp denied TCP/UDP/raw while
+    // AF_UNIX survived, proving a hostile `build.rs` / test cannot resolve a name
+    // or exfiltrate over UDP (the leg the net:none Landlock TCP-deny alone misses).
+    let ws = tempdir().unwrap();
+    let req = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        GUARD_BIN,
+        ["--probe-egress"],
+        ws.path(),
+        build_tool_caveats(ws.path()),
+    )
+    .env("PATH", "/usr/bin:/bin")
+    .net_grant(NetGrant::DenyAll)
+    .net_guard_bin(GUARD_BIN);
+    let Some(out) = run(&req) else { return };
+    assert!(
+        out.success,
+        "a build step under build_tool_caveats + DenyAll could still reach the network \
+         (probe code {:?}): the seccomp floor did not reach the build child. stderr: {}",
+        out.code,
         String::from_utf8_lossy(&out.stderr)
     );
 }

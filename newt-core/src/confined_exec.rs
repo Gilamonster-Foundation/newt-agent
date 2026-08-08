@@ -473,19 +473,26 @@ impl ConstrainedExecutor {
     }
 
     /// Resolve how to invoke the child-side network guard as `(program,
-    /// prefix_args)`.
+    /// prefix_args)`, in three tiers:
     ///
-    /// An explicit `net_guard_bin` override (the crate's real-resource tests
-    /// point it at the Cargo-built `newt-net-guard`) runs standalone with no
-    /// prefix. Otherwise the guard is **self-exec'd through the running `newt`
-    /// binary** — `current_exe __net-guard …` — so a released `newt` always
-    /// carries the guard and there is no separately packaged helper to fall out
-    /// of the release archive / `cargo install` / package payload (the earlier
-    /// sibling-file lookup silently failed in every installed layout, forcing
-    /// `DenyAll` to fail closed in production). Refuses if `current_exe` cannot
-    /// be resolved — the egress floor cannot be established without a guard.
+    /// 1. an explicit `net_guard_bin` override (the crate's real-resource tests
+    ///    point it at the Cargo-built `newt-net-guard`) — standalone, no prefix;
+    /// 2. a co-located `newt-net-guard` helper next to the running exe or one dir
+    ///    up (the cargo dev/test layout builds it there) — standalone, no prefix.
+    ///    Preferred in tests/dev so the guard is always a *real, correct* binary,
+    ///    never a re-exec of a non-`newt` harness;
+    /// 3. **self-exec** `current_exe __net-guard …` — production, where only
+    ///    `newt` ships and carries the guard, so nothing separate can fall out of
+    ///    the release archive / `cargo install` / package payload.
+    ///
+    /// Tier 3 self-exec fires **only when the running exe is `newt`**: re-exec'ing
+    /// an arbitrary binary that lacks the `__net-guard` dispatch (a test harness,
+    /// say) would run neither the guard nor the intended child — so when the exe
+    /// is not `newt` and no helper was found, refuse (fail-closed) rather than
+    /// re-exec something that cannot enforce the floor.
     #[cfg(target_os = "linux")]
     fn resolve_net_guard(req: &ExecRequest) -> Result<(String, Vec<String>), ExecRefused> {
+        // Tier 1: explicit override.
         if let Some(p) = &req.net_guard_bin {
             return if p.is_file() {
                 Ok((p.to_string_lossy().into_owned(), Vec::new()))
@@ -496,15 +503,80 @@ impl ConstrainedExecutor {
                 )))
             };
         }
-        match std::env::current_exe() {
-            Ok(exe) => Ok((
+        let exe = std::env::current_exe().map_err(|e| {
+            ExecRefused::ConfinementUnenforceable(format!(
+                "cannot resolve current executable to locate the net guard: {e}"
+            ))
+        })?;
+        // Tier 2: a sibling `newt-net-guard` (exe dir, or one dir up for the
+        // cargo `deps/` test layout).
+        for cand in [
+            exe.parent().map(|d| d.join("newt-net-guard")),
+            exe.parent()
+                .and_then(Path::parent)
+                .map(|d| d.join("newt-net-guard")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if cand.is_file() {
+                return Ok((cand.to_string_lossy().into_owned(), Vec::new()));
+            }
+        }
+        // Tier 3: self-exec — only if the running exe actually IS `newt` (the
+        // binary that carries the hidden `__net-guard` dispatch).
+        if exe.file_name().and_then(|n| n.to_str()) == Some("newt") {
+            return Ok((
                 exe.to_string_lossy().into_owned(),
                 vec!["__net-guard".to_string()],
-            )),
-            Err(e) => Err(ExecRefused::ConfinementUnenforceable(format!(
-                "cannot resolve current executable to self-exec the net guard: {e}"
-            ))),
+            ));
         }
+        Err(ExecRefused::ConfinementUnenforceable(format!(
+            "no net guard: no `newt-net-guard` next to {} and it is not the `newt` \
+             binary, so the `__net-guard` self-exec dispatch is unavailable",
+            exe.display()
+        )))
+    }
+}
+
+/// Whether the [`NetGrant::DenyAll`] network guard can be resolved in the current
+/// process WITHOUT an explicit override — mirroring tiers 2–3 of
+/// [`ConstrainedExecutor::resolve_net_guard`]: a co-located `newt-net-guard`
+/// helper (the cargo dev/test layout), or the running exe being `newt` (which
+/// carries the `__net-guard` self-exec dispatch).
+///
+/// Tests gate their "the confined verify actually runs" assertions on this:
+/// where the guard cannot be established the `DenyAll` spawn correctly FAILS
+/// CLOSED (it never runs the repo-controlled command unconfined), so a test that
+/// needs the verify to run must skip rather than assert a pass. A `-p <crate>`
+/// build that does not compile the `newt-net-guard` bin and runs from a test
+/// harness (not `newt`) is exactly that case. Always `false` off Linux (DenyAll
+/// is unsupported there and fails closed).
+#[must_use]
+pub fn net_guard_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        for cand in [
+            exe.parent().map(|d| d.join("newt-net-guard")),
+            exe.parent()
+                .and_then(Path::parent)
+                .map(|d| d.join("newt-net-guard")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if cand.is_file() {
+                return true;
+            }
+        }
+        exe.file_name().and_then(|n| n.to_str()) == Some("newt")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
