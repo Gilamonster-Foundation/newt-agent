@@ -1373,10 +1373,14 @@ pub fn verify_network_confinement() -> Verification {
             && crate::confined_exec::kernel_fs_fence_available()
         {
             Verification::Verified {
-                evidence: "attacker-influenced children run under the seccomp egress-deny floor \
-                           (newt-net-guard: socket() deny for AF_INET/AF_INET6/AF_PACKET) beneath \
-                           the Landlock fs fence, by default and fail-closed; no TCP/UDP/DNS/raw \
-                           egress (net_guard_executor.rs)"
+                evidence: "every live attacker-exec path denies direct egress by default, \
+                           fail-closed: the ConstrainedExecutor callers (build_check / crew) run \
+                           under NetGrant::DenyAll -> newt-net-guard seccomp socket() deny for \
+                           AF_INET/AF_INET6/AF_PACKET (net_guard_executor.rs), and run_command's \
+                           agent-bridle shell installs the same seccomp deny at the spawn owner via \
+                           ChildNetworkPolicy::DenyDirect (agent-bridle 0.7.15), proven by \
+                           run_command_child_under_net_none_cannot_open_a_socket_b1 — all beneath \
+                           the Landlock fs fence; no TCP/UDP/DNS/raw egress on any path"
                     .into(),
             }
         } else {

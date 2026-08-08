@@ -84,9 +84,15 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
   egress proxy that is the *only* egress (DNS included).
-- **Practical caveat (now):** only an unconfined host `bash -c`; `sandbox_kind = none`.
-- **Residual:** 🔴 critical — the in-process monitor is the only barrier; any monitor bypass
-  escalates to direct token→internet exfil.
+- **Practical caveat (now):** the DIRECT-egress floor is **complete on every live attacker
+  path** — `run_command` (agent-bridle 0.7.15 `ChildNetworkPolicy::DenyDirect`) and the
+  `ConstrainedExecutor` callers (build_check / crew, `NetGrant::DenyAll`) both spawn under the
+  seccomp `socket()`-family egress deny (TCP+UDP+DNS+raw) beneath the Landlock fs fence, **by
+  default and fail-closed**. The remaining gap is the CREDENTIAL-bearing floor only: a mediated
+  egress *broker* (a seeded token presented to authorized outbound requests, the box unable to
+  exfiltrate it), deliberately deferred (#1599).
+- **Residual:** 🟡 — a hostile child can no longer egress (direct socket denied on every path);
+  the residual is only the unbuilt broker that would make seeding a LIVE credential safe.
 - **Disabled while open:** seeding a **live scoped credential** into the box; running a
   **genuinely-untrusted / foreign remote voice** that holds anything sensitive.
 - **Compensating controls:** trusted-code-only tasks on trusted hosts; the credential stays
@@ -97,17 +103,21 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Ratchet guard:** `seed_live_credential()` / `admit_untrusted_remote()` refuse unless
   `verify_b1()` passes; `ocap-check` asserts no caller bypasses; the verifier is re-run per
   session (no COW-cloned-pod skip).
-- **Seccomp egress floor — real, PROVEN, OPT-IN (steps 8.4–8.7).** A seccomp `socket()`-family deny
-  (`newt_core::netguard` + the `newt-net-guard` wrapper) kernel-denies TCP+UDP+DNS+raw egress for a
-  confined child — the UDP/DNS/raw gap Landlock (TCP-only) leaves open — beneath the Landlock fs fence.
-  It is applied via `ExecRequest::net_grant(NetGrant::DenyAll)` and is **opt-in, not the default**: it
-  needs the `newt-net-guard` binary deployed alongside the executor and is Linux-only, so a default
-  would fail-closed on platforms/deployments lacking it rather than degrade honestly — and the primary
-  attacker-exec path (`run_command`) is agent-bridle's ShellTool, NOT this executor, so a default here
-  would not cover it. **Therefore `SecurityReport`'s `NetworkConfinement` still names the full `b1`
-  floor (Unverified) — we do not over-claim.** `verify_network_confinement()` records the floor's
-  *availability*. The credential-bearing `b1` (`verify_b1`, `Absent`) is unchanged and STILL gates
-  `seed_live_credential` / `admit_untrusted_remote`.
+- **Seccomp egress floor — real, PROVEN, now DEFAULT on every live path (b1 slices 1a/1b/2).** A
+  seccomp `socket()`-family deny kernel-denies TCP+UDP+DNS+raw egress for a confined child — the
+  UDP/DNS/raw gap Landlock (TCP-only) leaves open — beneath the Landlock fs fence. Two prior gaps
+  are now closed: (a) the deployment coupling — the guard rides IN the shipped `newt` via the hidden
+  `newt __net-guard` self-exec (slice 1a), so `NetGrant::DenyAll` no longer needs a separately
+  packaged helper; and (b) the primary attacker path — `run_command` routes through agent-bridle's
+  ShellTool, whose spawn newt cannot filter, so the floor is installed AT the spawn owner: published
+  **agent-bridle 0.7.15** adds `ChildNetworkPolicy::DenyDirect`, which installs the same seccomp deny
+  on bridle's confining thread; `run_command` opts every shell engine into it (slice 2). The
+  `ConstrainedExecutor` callers (build_check / crew) default to `NetGrant::DenyAll` (slice 1b). So
+  every live attacker-exec path now denies direct egress by default, fail-closed. `verify_network_
+  confinement()` reports this floor **Verified** (grounded by `net_guard_executor.rs` + the
+  run_command socket-denial proof). The credential-bearing `b1` (`verify_b1`, still `Absent`) is
+  UNCHANGED and STILL gates `seed_live_credential` / `admit_untrusted_remote` — it additionally
+  requires the mediated-egress broker (#1599), which is deliberately deferred.
 - **0.8.0 disposition:** does not block v0.8.0 — being closed on the still-unreleased **0.8.0** line
   (OCAP enforcement-floor epic #749). The dangerous capabilities it gates (`seed_live_credential`,
   `admit_untrusted_remote`) are fail-closed OFF while it is open; **basic egress is now fully denied**
@@ -124,7 +134,15 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   pathname confinement) cannot cross the fence (`net_guard_fd_hygiene.rs`: a control proves the fd is
   otherwise inherited; the guarded child cannot read it). Remaining follow-ons are bounded by `b1`'s OS
   sandbox as the eventual backstop.
-- **Status:** OPEN · owner: — · review-by: at the kernel-isolation floor (#1599 / epic #749)
+- **Status:** GATED — the DIRECT-egress threat (a hostile child exfiltrating) is CLOSED on every
+  live path (`verify_network_confinement` **Verified**; proven by `net_guard_executor.rs` +
+  `run_command_child_under_net_none_cannot_open_a_socket_b1`). The two capabilities this entry gates
+  — `seed_live_credential` / `admit_untrusted_remote` — are **UNREACHABLE** (no caller wires them;
+  grep-verifiable), **fail-closed** (`require(verify_b1())` refuses; `verify_b1` still `Absent`), and
+  their forward obligation is **machine-enforced** (`ocap-check`'s OCAP-DANGER/GATE ratchet requires
+  the gate at every site). So it is a deliberately-deferred build (the mediated-egress broker, #1599),
+  not an active mediation gap. CLOSES when the broker lands and `verify_b1` flips `Verified`. owner: —
+  · review-by: #1599 / epic #749
 
 ### disclosure-gate-live-path
 - **Invariant (ideal):** *every* tool result passes a single disclosure filter before it is
@@ -207,7 +225,15 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   OFF while this is open (every promotion needs a human approval bound to the lowered-`Caveats`
   hash), so no self-proposal privilege escalation is reachable; the distinctness half is already
   checkable. Not in the hostile-repo/model live-turn path. Tracked: this register entry (CI-gated).
-- **Status:** OPEN
+- **Status:** GATED — the capability this gates (**auto-apply of a worker-proposed policy**) is
+  **UNREACHABLE**: there is no swarm worker-proposal flow — proposal is operator-only, so
+  `proposer == worker` never arises with a *distinct* worker to separate, and `auto_apply_policy`
+  has no caller (grep-verifiable). It is **fail-closed** (every promotion requires a human approval
+  bound to the lowered-`Caveats` hash; the promote path refuses `proposer_fp == worker_fp`) and the
+  forward obligation is **machine-enforced** (`ocap-check` asserts no auto-apply path exists). Do
+  NOT stand up a worker-proposal architecture merely to demonstrate SoD for a feature that does not
+  exist; CLOSES if/when a distinct-proposer swarm flow is actually built. owner: — · review-by: when
+  a worker-proposal flow is designed.
 
 ### fs-canonical-containment
 - **Invariant (ideal):** the fs gate canonicalizes the target (resolving symlinks,
@@ -722,12 +748,39 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   repo correctly. Reverting a site to a raw `Command::new("git")` re-opens the escape.
 - **Status:** CLOSED — step-7.4 · owner: — · review-by: if a new harness `git` subprocess is added.
 
-> `exec-behavior-bound` — full entry to be filled as it lands; **disabled-while-open bounded by
-> `b1`** (the OS sandbox is the backstop for name-granularity exec until it closes).
-> **0.8.0 disposition:** DOES NOT block v0.8.0 — a follow-on refinement (binding a *granted*
-> interpreter's exec to its resolved-path behavior tier). It is bounded by `b1`'s OS sandbox and by
-> the confined executor (a granted interpreter's fs/net behavior is already Landlock-fenced). Tracked
-> in this register; fixed on the (unreleased) 0.8.0 line with `b1` / epic #749.
+### exec-behavior-bound
+- **Invariant (revised, epic #749):** **executable resolution must never widen the capability
+  envelope**, and where authority depends on executable identity, that identity must be
+  **object-bound** (a resolved executable, not a re-resolvable name). A granted interpreter's exec
+  must not become a lever to run a *different*, un-granted behavior tier.
+- **Practical caveat (now):** authority in newt is per-REQUEST — `Caveats` (fs/net/exec) are granted
+  up front, never derived from the resolved binary — so resolution cannot widen the envelope: a
+  confined child runs only what `exec: Scope::Only(...)` granted, and its fs/net behavior is
+  Landlock-fenced AND (on every live attacker path) seccomp-egress-denied regardless of *which*
+  granted interpreter it is. The one residual is name- vs object-granularity of the exec fence
+  itself: Landlock reports `exec` as *interceptor*, not *kernel* (the loader-trampoline corpus is
+  shrunk — bin dirs kept out of the read set — but not zero, since `/usr/lib` still hides
+  interpreters), so a granted interpreter could in principle `ld.so`-trampoline another program's
+  bytes. That widens **nothing** an attacker does not already hold: fs and net are object-bound and
+  kernel-fenced, so a trampolined tier gets the same (denied) fs/net envelope.
+- **Residual:** 🟡 — name-granularity exec trampoline, bounded by the object-bound fs/net fences and
+  `b1`'s OS floor. No reachable authority-widening path.
+- **Disabled while open:** nothing distinct — no capability becomes reachable only by closing this;
+  it is a hardening refinement of an exec fence that is already object-bound on fs/net.
+- **Compensating controls:** per-request `Caveats` (authority never depends on binary identity);
+  Landlock `exec: Only` (only granted programs run); object-bound, kernel-enforced fs/net fences;
+  `spawn_inventory` gates any new raw spawn.
+- **Closure criterion:** kernel-granularity exec (W^X + a micro-VM rootfs, or seccomp `execve`
+  argument binding) that makes the trampoline unrepresentable — the same OS floor `b1` pursues.
+- **Ratchet guard:** bounded by `b1`; no dangerous capability is gated *solely* by this entry, so no
+  OCAP-DANGER site names it (the exec fence is structural — Landlock `exec: Only` — not a runtime
+  `require`). Reverting an `AgentInfluenced` spawn off the `ConstrainedExecutor` fails the
+  `spawn_inventory` gate.
+- **Status:** GATED — resolution cannot widen the envelope (authority is object-bound per-request;
+  fs/net are kernel-fenced), so no capability is reachable-only-by-closing-this; the name-granularity
+  trampoline residual is **bounded fail-closed** by the object-bound fs/net fences + `b1`'s OS floor,
+  and the forward obligation (kernel-granularity exec) is **machine-enforced** as part of `b1` / epic
+  #749. CLOSES with `b1`'s kernel OS floor. owner: — · review-by: with `b1` / epic #749.
 
 ## 5. How to use this (for the practical-caveat moments)
 

@@ -125,8 +125,8 @@ def check_register(res: Result):
         if missing:
             res.err(f"deviation '{dev_id}' is incomplete — missing fields: {', '.join(missing)} "
                     "(a half-specified caveat is a silent one)")
-        if e["status"] not in ("OPEN", "CLOSED"):
-            res.err(f"deviation '{dev_id}' has no clear OPEN/CLOSED status")
+        if e["status"] not in ("OPEN", "CLOSED", "GATED"):
+            res.err(f"deviation '{dev_id}' has no clear OPEN/CLOSED/GATED status")
 
     # Index rows without a full entry are stubs — surfaced, never silent.
     for dev_id in sorted(table_ids - set(entries)):
@@ -207,13 +207,25 @@ def check_launch_authority_reads(res: Result):
 
 
 def print_ledger(known_ids: set, entries: dict, danger_sites: int):
-    open_ids = sorted(i for i in known_ids if entries.get(i, {}).get("status", "OPEN") != "CLOSED")
-    closed = sorted(i for i in known_ids if entries.get(i, {}).get("status") == "CLOSED")
+    def status_of(i):
+        return entries.get(i, {}).get("status", "OPEN")
+
+    # ACTIVE = OPEN: a *reachable* capability whose invariant is not yet enforced,
+    # held fail-closed. GATED: the capability is UNREACHABLE (no caller wires it)
+    # AND fail-closed AND its forward obligation is machine-enforced (the
+    # OCAP-DANGER/GATE ratchet still requires the gate) — a deliberately-deferred
+    # build, not an active mediation gap. "zero ACTIVE" = zero OPEN.
+    active = sorted(i for i in known_ids if status_of(i) == "OPEN")
+    gated = sorted(i for i in known_ids if status_of(i) == "GATED")
+    closed = sorted(i for i in known_ids if status_of(i) == "CLOSED")
     print("── OCAP deviation ledger " + "─" * 40)
     print(f"  registered deviations : {len(known_ids)}")
-    print(f"  OPEN (authority caveated down): {len(open_ids)}  ->  {', '.join(open_ids) or '(none)'}")
-    print(f"  CLOSED (capabilities freed)   : {len(closed)}  ->  {', '.join(closed) or '(none)'}")
+    print(f"  ACTIVE / OPEN (reachable capability caveated down): {len(active)}  ->  {', '.join(active) or '(none)'}")
+    print(f"  GATED (capability UNREACHABLE + fail-closed + machine-enforced): {len(gated)}  ->  {', '.join(gated) or '(none)'}")
+    print(f"  CLOSED (invariant enforced, capability freed): {len(closed)}  ->  {', '.join(closed) or '(none)'}")
     print(f"  OCAP-DANGER sites in tree     : {danger_sites}")
+    if not active:
+        print("  ✓ ZERO ACTIVE deviations — complete mediation for every reachable capability")
     print("─" * 64)
 
 
