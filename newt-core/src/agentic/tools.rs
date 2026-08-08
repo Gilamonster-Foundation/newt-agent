@@ -12390,6 +12390,37 @@ mod disable_ocap_tests {
         }
     }
 
+    /// #1600 regression: the confined (safe-subset / brush / host) shell env is an
+    /// ALLOWLIST — `ConfinedCommand::env_clear` + a narrow passthrough of NAMES
+    /// (default `HOME`/`USER`) + explicit `~/.newt/shell-env/` file imports — never
+    /// an ambient copy. A parent-only secret whose name is NOT allowlisted must
+    /// not reach the confined child's environment (`venv_env_map` is the seam that
+    /// builds it). Proves the "degraded/SafeSubset path" does not leak, closing
+    /// the deviation with executable coverage.
+    #[tokio::test]
+    async fn confined_shell_env_does_not_leak_a_parent_only_secret_1600() {
+        let _lock = env_lock().await;
+        // Narrow default passthrough (no operator widening).
+        let _pt = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH");
+        // A secret only in newt's OWN process env, with a non-allowlisted name.
+        let _canary = EnvVar::set("NEWT_SAFESUBSET_ENV_CANARY_1600", "s3cr3t-parent-only-1600");
+        let env = venv_env_map();
+        assert!(
+            !env.contains_key("NEWT_SAFESUBSET_ENV_CANARY_1600"),
+            "the confined shell env leaked a parent-only secret NAME (#1600): {env:?}"
+        );
+        assert!(
+            !env.values().any(|v| v.contains("s3cr3t-parent-only-1600")),
+            "the confined shell env leaked a parent-only secret VALUE (#1600)"
+        );
+        // Sanity: the seam still builds a real env (the engine marker is set), so
+        // the assertions above are not vacuously true against an empty map.
+        assert_eq!(
+            env.get("SHELL").map(String::as_str),
+            Some(shell_engine().as_str())
+        );
+    }
+
     /// Workspace-fenced fs, NO exec, NO net — the shape under which the
     /// confined shell denies (real build) or fails closed (stub build).
     fn caveats_no_exec(ws: &std::path::Path) -> Caveats {
