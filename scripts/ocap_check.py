@@ -238,6 +238,69 @@ def _is_test_file(rel: Path) -> bool:
     return ("tests" in rel.parts) or rel.name.endswith(("_test.rs", "_tests.rs"))
 
 
+_LINE_COMMENT_RE = re.compile(r"//.*")
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_TEST_ATTR_RE = re.compile(r"#\[\s*(?:cfg\(\s*test\s*\)|test)\s*\]")
+
+
+def _strip_comments(text: str) -> str:
+    return _LINE_COMMENT_RE.sub("", _BLOCK_COMMENT_RE.sub("", text))
+
+
+def _strip_test_blocks(text: str) -> str:
+    """Remove every `#[cfg(test)]` / `#[test]`-guarded item (brace- or
+    semicolon-terminated) so a capability's OWN unit tests are not counted as
+    callers. Approximate brace-balance (does not model braces inside strings),
+    which is safe here: it can only remove MORE, never expose a hidden caller in
+    the production portion."""
+    out, last, n = [], 0, len(text)
+    for m in _TEST_ATTR_RE.finditer(text):
+        if m.start() < last:
+            continue
+        out.append(text[last:m.start()])
+        j, depth, started = m.end(), 0, False
+        while j < n:
+            c = text[j]
+            if c == "{":
+                depth += 1
+                started = True
+            elif c == "}":
+                depth -= 1
+                if started and depth == 0:
+                    j += 1
+                    break
+            elif c == ";" and not started:
+                j += 1
+                break
+            j += 1
+        last = j
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _capability_referenced_in(sym: str, texts: dict):
+    """Files where `sym` is REFERENCED in production code by ANY means — a direct
+    call, an alias import (`use … as`), a function item/pointer, a closure
+    capture, a callback registration, a UFCS/method path, a macro argument — i.e.
+    ANY word-occurrence that is not the `fn <sym>` definition line, a comment, or
+    test code. This closes the holes where a `<sym>(` -only regex, or excluding
+    the defining file, would let a contributor wire a GATED capability while
+    ocap-check stayed green.
+    """
+    ref_re = re.compile(rf"\b{re.escape(sym)}\b")
+    def_line_re = re.compile(rf"\bfn\s+{re.escape(sym)}\s*[<(]")
+    hits = []
+    for rel, t in texts.items():
+        if _is_test_file(rel):
+            continue
+        prod = _strip_test_blocks(_strip_comments(t))
+        for line in prod.splitlines():
+            if ref_re.search(line) and not def_line_re.search(line):
+                hits.append(str(rel))
+                break
+    return sorted(hits)
+
+
 def check_state_proofs(res: Result, entries: dict, texts=None):
     """The teeth for the non-ACTIVE states: a `Status:` label is NOT evidence.
 
@@ -275,16 +338,13 @@ def check_state_proofs(res: Result, entries: dict, texts=None):
                         "cannot prove unreachability of a symbol that does not exist."
                     )
                     continue
-                call_re = re.compile(rf"\b{re.escape(sym)}\s*\(")
-                callers = sorted(
-                    str(rel) for rel, t in texts.items()
-                    if rel not in def_files and not _is_test_file(rel) and call_re.search(t)
-                )
-                if callers:
+                refs = _capability_referenced_in(sym, texts)
+                if refs:
                     res.err(
-                        f"GATED '{dev_id}': guard symbol `{sym}` is CALLED (reachable) at "
-                        f"{', '.join(callers)} — a GATED capability must be UNREACHABLE. Make the "
-                        "deviation ACTIVE and gate the caller, or remove the call."
+                        f"GATED '{dev_id}': guard symbol `{sym}` is REFERENCED (reachable) in "
+                        f"{', '.join(refs)} — a GATED capability must be UNREACHABLE (no call, "
+                        "alias, function-item, pointer, callback, or macro wiring outside its "
+                        "definition + tests). Make the deviation ACTIVE and gate the caller."
                     )
         elif status == "BOUNDED":
             bys = _list_field(BOUNDED_BY_RE, body)
@@ -358,23 +418,42 @@ def run_self_tests() -> int:
         any("Unreachable-guard-symbols" in e for e in r.errors),
     )
 
-    # 2. GATED capability with a CALLER (reachable) MUST error (inverse mutation).
+    # 2. GATED unreachability must be robust to EVERY wiring form (review
+    #    concern 11) — a `<sym>(`-only regex, or excluding the defining file,
+    #    would let these through. Each MUST be rejected.
     md = "### x\n- **Unreachable-guard-symbols:** foo\n- **Status:** GATED\n"
-    texts = {
-        Path("a/def.rs"): "pub fn foo() {}",
-        Path("b/caller.rs"): "fn go() { foo(); }",
+    entries_x = _fixture_entries(md)
+    def_only = "pub fn foo() { let _ = 1; }"
+    holes = {
+        "direct-call": {Path("b/c.rs"): "fn go() { foo(); }"},
+        # a caller in the symbol's OWN defining file (was excluded before).
+        "same-file-caller": {Path("a/def.rs"): def_only + "\nfn go() { foo(); }"},
+        "alias-import": {Path("b/c.rs"): "use crate::a::foo as bar;\nfn go(){ bar(); }"},
+        "function-item": {Path("b/c.rs"): "fn go() { let f = foo; f(); }"},
+        "function-pointer": {Path("b/c.rs"): "fn go(x:&[i32]){ x.iter().for_each(foo); }"},
+        "closure-capture": {Path("b/c.rs"): "fn go() { let c = || foo(); c(); }"},
+        "callback-register": {Path("b/c.rs"): "fn go(r:&mut R){ r.on(foo); }"},
+        "macro-arg": {Path("b/c.rs"): "fn go() { register!(foo); }"},
     }
-    r = Result()
-    check_state_proofs(r, _fixture_entries(md), texts=texts)
-    expect("gated-with-a-caller-rejected", any("is CALLED (reachable)" in e for e in r.errors))
+    for name, extra in holes.items():
+        texts = {Path("a/def.rs"): def_only}
+        texts.update(extra)
+        r = Result()
+        check_state_proofs(r, entries_x, texts=texts)
+        expect(f"gated-{name}-rejected", any("is REFERENCED (reachable)" in e for e in r.errors))
 
-    # 3. GATED with the only reference in a TEST file MUST pass.
+    # 3. GATED with references only in a comment + an inline `#[cfg(test)]` mod +
+    #    a test file MUST pass (those are not production wiring).
     texts = {
-        Path("a/def.rs"): "pub fn foo() {}",
+        Path("a/def.rs"): (
+            "// foo is fail-closed; see foo() in tests\n"
+            "pub fn foo() {}\n"
+            "#[cfg(test)]\nmod tests { fn t() { foo(); } }\n"
+        ),
         Path("a/tests/t.rs"): "fn t() { foo(); }",
     }
     r = Result()
-    check_state_proofs(r, _fixture_entries(md), texts=texts)
+    check_state_proofs(r, entries_x, texts=texts)
     expect("gated-unreachable-accepted", not r.errors)
 
     # 4. BOUNDED whose bound is not CLOSED MUST error.
