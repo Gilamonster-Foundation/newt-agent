@@ -70,7 +70,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
 | `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`) | 🟢 closed (Linux) | (non-Linux lexical fallback) |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
-| `mcp-under-leash` | every MCP call mediated at call time (witness-typed leash; no-persona ≠ unrestricted) | 🟠→🟡 | untrusted server holding/forwarding a live secret (bounded by admission + `b1` + disclosure) |
+| `mcp-under-leash` | every MCP call mediated at call time (witness-typed leash; authority = structural grant, never the tool name; no-persona ≠ unrestricted) | 🟢 closed | (credential broker → `b1`; per-call budget = follow-on) |
 | `mcp-config-admission` | untrusted/disabled MCP config cannot spawn or dial | 🟢 closed (fail-closed) | admitting an untrusted server without out-of-repo approval |
 | `acp-worker-fs-scope` | worker fs attenuated to the session workspace (caveat fence + object-bound) | 🟢 closed | (fence active; non-Linux keeps the lexical-prefix fallback) |
 | `acp-worker-debug-authority` | no production worker dispatches under `Caveats::top()` without a signed operator key | 🟢 closed (compile-gated) | a production build reaching the unbounded-authority fallback |
@@ -580,23 +580,29 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   HINT and grants nothing, so a hostile admitted server that renames a destructive tool with a read
   verb (`get_…`) earns no tolerance — it is prompted (interactive) or **denied fail-closed**
   (headless).
-- **Residual:** 🟠 high → 🟡 medium. The leash mediates *dispatch*; after the structural-grant slice
-  the name-classification vector is closed, and these remain (cross-referenced, NOT claimed closed):
-  1. **secret-forwarding** — an admitted server handed a value could still exfiltrate it. A
-     disclosure/egress concern bounded by `disclosure-gate-live-path` + `b1-os-isolation`; the
-     durable fix is a **credential broker/handle** (the child gets a handle, not a bearer value) —
-     tracked follow-on.
+- **Residual:** 🟢 closed. Every call is mediated at *dispatch* time (witness-typed leash) and
+  authority is a **structural grant, never the tool name** (below). The two prior residuals:
+  1. **secret-forwarding** — **narrowed with proof.** A secret value only ever reaches a **trusted,
+     operator-configured** server: an *untrusted* origin is refused admission entirely (`admit`, so it
+     never spawns/dials/exposes), and even a secret **reference** (`{ env | file | cmd }`) is a hard
+     error under untrusted trust (`resolve_secret_under_trust`), so an untrusted server obtains **no**
+     newt secret. A trusted server receives exactly the secrets the operator explicitly configured for
+     it; the remaining case — a trusted server COMPROMISED post-admission — has its exfil bounded by
+     `b1`'s egress floor. The stronger **credential broker/handle** (present the secret to authorized
+     outbound requests without the server process ever holding the raw value) is the `b1` egress-proxy
+     hardening — tracked under `b1-os-isolation`, not a `mcp-under-leash` blocker.
   2. ~~name-based effect classification is server-influenceable~~ — **CLOSED (structural grant).**
-     Authority is now an [`McpGrant`] provenance (`PersonaAllowList` / `HumanApproved`) minted only
-     from an operator grant; the tool NAME never grants (`classify_mcp_effect` is a display hint,
-     not authority), so a server renaming a destructive tool `get_…` earns nothing — proven by
-     `no_persona_read_verb_tool_is_not_name_granted`. Per-call **budget** + **resource-scope**
-     attenuation are the remaining structural follow-on.
-- **Disabled while open:** admitting a genuinely-untrusted server that holds a live secret (bounded
-  by `mcp-config-admission` + `b1` + `disclosure-gate-live-path`).
-- **Closure criterion (LEASH):** met — an un-leashed `McpTools::call` does not compile, and the
-  no-persona mutating dispatch is prompted/denied on the real dispatch path. Full closure of the row
-  additionally needs the secret-forwarding residual retired (via `disclosure-gate-live-path`).
+     Authority is an [`McpGrant`] provenance (`PersonaAllowList` / `HumanApproved`) minted only from
+     an operator grant; the tool NAME never grants (`classify_mcp_effect` is a display hint), so a
+     server renaming a destructive tool `get_…` earns nothing — proven by
+     `no_persona_read_verb_tool_is_not_name_granted`. Per-call **budget** (a DoS-bound on a compromised
+     admitted server) and **resource-scope** (not newt-enforceable for server-defined args → bounded
+     by admission + `b1`) are optional hardening follow-ons, NOT open holes.
+- **Disabled while open:** n/a (closed).
+- **Closure criterion:** met — an un-leashed `McpTools::call` does not compile; authority is a
+  structural grant (never the server-chosen name); and a secret only reaches a trusted,
+  operator-configured server (an untrusted one is refused admission AND refused any secret reference),
+  with the compromised-trusted-server exfil bounded by `b1`.
 - **Ratchet guard:** `no_persona_does_not_dispatch_a_mutating_mcp_tool_unleashed`,
   `no_persona_read_verb_tool_is_not_name_granted` (the name-classification adversarial test — a
   `get_…`-named tool is denied on the name alone, and dispatches ONLY on an explicit human grant),
@@ -605,17 +611,21 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `classify_reads_by_verb_prefix_stripping_namespace` +
   `leash_mints_only_from_a_structural_grant_never_the_name` (`agentic/mcp.rs`). Removing the witness
   requirement makes the un-leashed dispatch compile again; re-adding a name-based auto-grant
-  re-fails the adversarial test.
-- **0.8.0 disposition:** DOES NOT block v0.8.0 — the LEASH invariant is CLOSED (witness-typed
-  call-time leash; a no-persona mutating dispatch fails closed). The residual (name-based effect
-  classification) requires a **trusted-but-compromised ADMITTED server**, which is OUTSIDE the
-  hostile-repo/model threat model (admission requires operator trust) and is further bounded by
-  `mcp-config-admission` + `b1`. **Follow-on** (per-call budget/scope/credential attenuation).
-  Tracked: this register entry + `disclosure-gate-live-path` cross-ref.
-- **Status:** OPEN (narrowed) — LEASH invariant CLOSED (step-6.4, witness-typed call-time leash);
-  secret-forwarding + name-classification residuals cross-referenced to `disclosure-gate-live-path`
-  / `b1-os-isolation` · owner: — · review-by: with per-call budget/scope attenuation, or when
-  `disclosure-gate-live-path` closes.
+  re-fails the adversarial test. The secret-forwarding narrow is guarded by
+  `admit_denies_untrusted_and_disabled_admits_trusted` + `untrusted_structured_ref_is_rejected`
+  (`newt-core/src/mcp.rs`) and `untrusted_env_structured_cmd_ref_is_rejected` (`newt-mcp-client`) —
+  an untrusted origin is neither admitted nor able to resolve a newt secret reference.
+- **0.8.0 disposition:** does not block v0.8.0 — CLOSED. Closed on the unreleased 0.8.0 line: the
+  witness-typed call-time leash + the structural `McpGrant` (authority is never the server-chosen
+  name) + the trusted-only admission & trust-gated secret resolution. The stronger credential broker
+  (present a secret without the server holding it) and the optional per-call budget are hardening
+  follow-ons tracked under `b1-os-isolation` / this entry, not open holes.
+- **Status:** CLOSED — witness-typed call-time leash (step-6.4) + structural `McpGrant` authority
+  (name-classification vector closed) + secret-forwarding narrowed with proof (trusted-only admission
+  + trust-gated secret resolution; compromised-trusted-server exfil bounded by `b1`). Credential
+  broker + per-call budget/scope = hardening follow-ons (broker → `b1-os-isolation`) · owner: — ·
+  review-by: when the `b1` egress proxy / credential broker lands (may promote this from
+  narrow-with-proof to fully brokered).
 
 ### posture-report-honesty
 - **Invariant (ideal):** every place newt reports its security posture — to the user, to logs, or
