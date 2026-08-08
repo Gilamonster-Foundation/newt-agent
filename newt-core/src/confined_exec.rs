@@ -439,12 +439,17 @@ impl ConstrainedExecutor {
             }
             #[cfg(target_os = "linux")]
             NetGrant::DenyAll => {
-                let guard = Self::resolve_net_guard(req)?;
+                // `(guard_program, prefix_args)`: a standalone `newt-net-guard`
+                // (tests) has no prefix; the production self-exec is
+                // `current_exe __net-guard`, so the guard rides in a released
+                // `newt`. Either way the child inherits the fs fence + gets the
+                // seccomp egress floor before the real program runs.
+                let (guard, prefix) = Self::resolve_net_guard(req)?;
                 let mut caveats = req.caveats.clone();
-                if let Some(dir) = guard.parent() {
+                if let Some(dir) = Path::new(&guard).parent() {
                     extend_read_root(&mut caveats, dir.to_string_lossy().into_owned());
                 }
-                let mut args: Vec<String> = Vec::new();
+                let mut args: Vec<String> = prefix;
                 if let Some(procs) = cgroup_procs {
                     // Grant write to the single cgroup.procs file so the guard can
                     // join the subtree under Landlock (it cannot escape to another
@@ -457,7 +462,7 @@ impl ConstrainedExecutor {
                 args.push("--".to_string());
                 args.push(req.program.clone());
                 args.extend(req.args.iter().cloned());
-                Ok((guard.to_string_lossy().into_owned(), args, caveats))
+                Ok((guard, args, caveats))
             }
             #[cfg(not(target_os = "linux"))]
             NetGrant::DenyAll => Err(ExecRefused::ConfinementUnenforceable(
@@ -467,15 +472,23 @@ impl ConstrainedExecutor {
         }
     }
 
-    /// Resolve the `newt-net-guard` binary: an explicit override, else a sibling
-    /// of the running executable (production) or one directory up (the cargo
-    /// `deps/` test layout). Refuses if it cannot be found — the egress floor
-    /// cannot be established without it.
+    /// Resolve how to invoke the child-side network guard as `(program,
+    /// prefix_args)`.
+    ///
+    /// An explicit `net_guard_bin` override (the crate's real-resource tests
+    /// point it at the Cargo-built `newt-net-guard`) runs standalone with no
+    /// prefix. Otherwise the guard is **self-exec'd through the running `newt`
+    /// binary** — `current_exe __net-guard …` — so a released `newt` always
+    /// carries the guard and there is no separately packaged helper to fall out
+    /// of the release archive / `cargo install` / package payload (the earlier
+    /// sibling-file lookup silently failed in every installed layout, forcing
+    /// `DenyAll` to fail closed in production). Refuses if `current_exe` cannot
+    /// be resolved — the egress floor cannot be established without a guard.
     #[cfg(target_os = "linux")]
-    fn resolve_net_guard(req: &ExecRequest) -> Result<PathBuf, ExecRefused> {
+    fn resolve_net_guard(req: &ExecRequest) -> Result<(String, Vec<String>), ExecRefused> {
         if let Some(p) = &req.net_guard_bin {
             return if p.is_file() {
-                Ok(p.clone())
+                Ok((p.to_string_lossy().into_owned(), Vec::new()))
             } else {
                 Err(ExecRefused::ConfinementUnenforceable(format!(
                     "net-guard binary not found at {}",
@@ -483,23 +496,15 @@ impl ConstrainedExecutor {
                 )))
             };
         }
-        if let Ok(exe) = std::env::current_exe() {
-            let candidates = [
-                exe.parent().map(|d| d.join("newt-net-guard")),
-                exe.parent()
-                    .and_then(Path::parent)
-                    .map(|d| d.join("newt-net-guard")),
-            ];
-            for cand in candidates.into_iter().flatten() {
-                if cand.is_file() {
-                    return Ok(cand);
-                }
-            }
+        match std::env::current_exe() {
+            Ok(exe) => Ok((
+                exe.to_string_lossy().into_owned(),
+                vec!["__net-guard".to_string()],
+            )),
+            Err(e) => Err(ExecRefused::ConfinementUnenforceable(format!(
+                "cannot resolve current executable to self-exec the net guard: {e}"
+            ))),
         }
-        Err(ExecRefused::ConfinementUnenforceable(
-            "newt-net-guard not found next to the executor — cannot establish the egress floor"
-                .into(),
-        ))
     }
 }
 

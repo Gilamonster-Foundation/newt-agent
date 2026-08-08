@@ -169,12 +169,107 @@ mod linux {
         unsafe { libc::close(su) };
         Ok(())
     }
+
+    /// The full child-side guard sequence — cgroup join, fd hygiene, seccomp
+    /// egress deny — then `exec`. This is the body shared by BOTH the standalone
+    /// `newt-net-guard` helper bin AND the `newt __net-guard` self-exec path
+    /// (`current_exe`), so a released `newt` carries everything the confined
+    /// executor needs without shipping a second binary.
+    ///
+    /// `args` is everything AFTER the guard selector:
+    /// `[--cgroup-procs PATH]? (--probe-egress | -- PROGRAM [ARGS...])`.
+    /// Never returns: it `exec`s the program or `exit`s with a diagnostic code.
+    /// Fail-closed: if the seccomp floor cannot be installed it exits `120`
+    /// rather than exec the program unconfined.
+    pub fn run_guard_and_exec<I>(args: I) -> !
+    where
+        I: IntoIterator<Item = std::ffi::OsString>,
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut args = args.into_iter().peekable();
+
+        // Optional leading `--cgroup-procs PATH`: join the cgroup-v2 subtree the
+        // executor created, BEFORE anything forks, so every descendant (incl. a
+        // setsid / double-fork daemon) is a member and the executor's
+        // `cgroup.kill` reaches the whole tree. Best-effort: a failure leaves the
+        // killpg fallback in place.
+        if args.peek().is_some_and(|a| a == "--cgroup-procs") {
+            args.next();
+            if let Some(path) = args.next() {
+                let pid = std::process::id().to_string();
+                if let Err(e) = std::fs::write(&path, &pid) {
+                    eprintln!("newt-net-guard: cgroup join failed (killpg fallback applies): {e}");
+                }
+            }
+        }
+
+        // Close any parent-left descriptor (>= 3): an inherited fd bypasses
+        // pathname confinement, so drop it before the program can observe it.
+        close_inherited_fds();
+
+        // Install the seccomp egress-deny floor on this soon-to-exec process.
+        if let Err(e) = install_egress_deny() {
+            eprintln!("newt-net-guard: seccomp install failed (fail-closed): {e}");
+            std::process::exit(120);
+        }
+
+        let first = args.next();
+
+        // Self-test: prove the floor is active on this process, exit with its code.
+        if first.as_deref().is_some_and(|s| s == "--probe-egress") {
+            match probe_egress_denied() {
+                Ok(()) => std::process::exit(0),
+                Err(code) => std::process::exit(code),
+            }
+        }
+
+        // Exec mode: `... -- PROGRAM ARGS...`
+        if first.as_deref().map(|s| s != "--").unwrap_or(true) {
+            eprintln!(
+                "newt-net-guard: usage: [--cgroup-procs PATH] (--probe-egress | -- PROGRAM ARGS...)"
+            );
+            std::process::exit(2);
+        }
+        let Some(prog) = args.next() else {
+            eprintln!("newt-net-guard: no program after --");
+            std::process::exit(2);
+        };
+
+        let c_prog = CString::new(prog.as_bytes()).expect("program path has no interior NUL");
+        let mut c_args: Vec<CString> = vec![c_prog.clone()];
+        for a in args {
+            c_args.push(CString::new(a.as_bytes()).expect("arg has no interior NUL"));
+        }
+        let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+        ptrs.push(std::ptr::null());
+
+        // SAFETY: `c_prog`/`ptrs` are valid, NUL-terminated, and outlive the
+        // call; `execvp` only returns on error.
+        unsafe {
+            libc::execvp(c_prog.as_ptr(), ptrs.as_ptr());
+        }
+        let e = std::io::Error::last_os_error();
+        eprintln!("newt-net-guard: exec {prog:?} failed: {e}");
+        std::process::exit(122);
+    }
 }
 
 #[cfg(target_os = "linux")]
 pub use linux::{
     close_inherited_fds, egress_deny_program, install_egress_deny, probe_code, probe_egress_denied,
+    run_guard_and_exec,
 };
+
+/// The child-side guard is a Linux-only mechanism; the confined executor fails
+/// closed on other platforms before a child would run, so this path is
+/// unreachable in production. Refuse loudly if invoked anyway.
+#[cfg(not(target_os = "linux"))]
+pub fn run_guard_and_exec<I: IntoIterator<Item = std::ffi::OsString>>(_args: I) -> ! {
+    eprintln!("newt __net-guard: unsupported platform — fail closed");
+    std::process::exit(121);
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
