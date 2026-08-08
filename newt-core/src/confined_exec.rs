@@ -79,6 +79,24 @@ impl ExecOrigin {
     }
 }
 
+/// The network floor a confined child runs under. The `Caveats.net` allow-list
+/// is a hostname-level intent; this decides the *kernel* mechanism that backs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetGrant {
+    /// The child's `Caveats.net` is honored by whatever the fs/net sandbox
+    /// provides (Landlock TCP-deny, Seatbelt SBPL, …) with no extra floor. The
+    /// historical default — kept for spawns that are not yet migrated to the
+    /// full egress floor.
+    #[default]
+    Unrestricted,
+    /// **Deny all egress**: the child is wrapped in `newt-net-guard`, which
+    /// installs the seccomp `socket()`-family deny (TCP/UDP/DNS/raw) *in addition
+    /// to* the inherited Landlock fs fence. On a platform without the seccomp
+    /// floor the spawn is **refused** (`ExecRefused::ConfinementUnenforceable`),
+    /// never run with a weaker net floor.
+    DenyAll,
+}
+
 /// A fully-specified request to run one confined subprocess. Every field is
 /// explicit: there is no ambient default that could widen the child's
 /// authority. The child starts env-EMPTY — [`env`](Self::env) grants are the
@@ -91,6 +109,12 @@ pub struct ExecRequest {
     cwd: PathBuf,
     caveats: Caveats,
     env: Vec<(String, String)>,
+    /// The kernel network floor (see [`NetGrant`]).
+    net_grant: NetGrant,
+    /// Explicit path to the `newt-net-guard` wrapper (tests set this; production
+    /// resolves it next to the running executable). Only consulted for
+    /// [`NetGrant::DenyAll`].
+    net_guard_bin: Option<PathBuf>,
     /// A wall-clock bound on the child. `None` = unbounded (the historical
     /// behavior, kept for long legitimate builds). When set, the executor
     /// SIGKILLs the child's whole process group at the deadline so a hostile
@@ -117,7 +141,26 @@ impl ExecRequest {
             caveats,
             env: Vec::new(),
             timeout: None,
+            net_grant: NetGrant::Unrestricted,
+            net_guard_bin: None,
         }
+    }
+
+    /// Set the kernel network floor. [`NetGrant::DenyAll`] wraps the child in
+    /// `newt-net-guard` (seccomp egress deny); if that floor cannot be
+    /// established the spawn is refused.
+    #[must_use]
+    pub fn net_grant(mut self, grant: NetGrant) -> Self {
+        self.net_grant = grant;
+        self
+    }
+
+    /// Override the `newt-net-guard` binary path (tests point this at the
+    /// Cargo-built guard; production resolves it next to the executor binary).
+    #[must_use]
+    pub fn net_guard_bin(mut self, path: impl Into<PathBuf>) -> Self {
+        self.net_guard_bin = Some(path.into());
+        self
     }
 
     /// Bound the child to `duration` of wall-clock time. At the deadline the
@@ -267,10 +310,15 @@ impl ConstrainedExecutor {
     /// kernel-enforced — so a platform/kernel without Landlock (or any OS fs
     /// backend) fails closed here rather than running the child unconfined.
     pub fn run(req: &ExecRequest) -> Result<ConfinedOutput, ExecRefused> {
-        let cx = mint_context(req.origin, &req.caveats)?;
+        // Apply the network floor: NetGrant::DenyAll rewrites the child to run
+        // under `newt-net-guard` (seccomp egress deny) with the guard's dir added
+        // to the fs fence's read set so it can be exec'd. Refuses if the floor
+        // cannot be established (never a weaker net floor).
+        let (program, args, caveats) = Self::resolve_net_floor(req)?;
+        let cx = mint_context(req.origin, &caveats)?;
 
-        let mut cmd = ConfinedCommand::new(&req.program)
-            .args(&req.args)
+        let mut cmd = ConfinedCommand::new(&program)
+            .args(&args)
             .current_dir(&req.cwd)
             // A fresh process group so a supervisor could kill the whole
             // descendant tree (the executor's own cancellation is a follow-up;
@@ -345,6 +393,79 @@ impl ConstrainedExecutor {
             timed_out,
         })
     }
+
+    /// Compute the effective `(program, args, caveats)` after applying the
+    /// request's [`NetGrant`]. [`NetGrant::DenyAll`] wraps the real program in
+    /// `newt-net-guard` and grants the fs fence read+exec on the guard's dir; if
+    /// the seccomp floor cannot be established it refuses (fail-closed).
+    fn resolve_net_floor(req: &ExecRequest) -> Result<(String, Vec<String>, Caveats), ExecRefused> {
+        match req.net_grant {
+            NetGrant::Unrestricted => {
+                Ok((req.program.clone(), req.args.clone(), req.caveats.clone()))
+            }
+            #[cfg(target_os = "linux")]
+            NetGrant::DenyAll => {
+                let guard = Self::resolve_net_guard(req)?;
+                let mut caveats = req.caveats.clone();
+                if let Some(dir) = guard.parent() {
+                    extend_read_root(&mut caveats, dir.to_string_lossy().into_owned());
+                }
+                let mut args = vec!["--".to_string(), req.program.clone()];
+                args.extend(req.args.iter().cloned());
+                Ok((guard.to_string_lossy().into_owned(), args, caveats))
+            }
+            #[cfg(not(target_os = "linux"))]
+            NetGrant::DenyAll => Err(ExecRefused::ConfinementUnenforceable(
+                "NetGrant::DenyAll needs the seccomp egress floor, unavailable on this platform"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Resolve the `newt-net-guard` binary: an explicit override, else a sibling
+    /// of the running executable (production) or one directory up (the cargo
+    /// `deps/` test layout). Refuses if it cannot be found — the egress floor
+    /// cannot be established without it.
+    #[cfg(target_os = "linux")]
+    fn resolve_net_guard(req: &ExecRequest) -> Result<PathBuf, ExecRefused> {
+        if let Some(p) = &req.net_guard_bin {
+            return if p.is_file() {
+                Ok(p.clone())
+            } else {
+                Err(ExecRefused::ConfinementUnenforceable(format!(
+                    "net-guard binary not found at {}",
+                    p.display()
+                )))
+            };
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            let candidates = [
+                exe.parent().map(|d| d.join("newt-net-guard")),
+                exe.parent()
+                    .and_then(Path::parent)
+                    .map(|d| d.join("newt-net-guard")),
+            ];
+            for cand in candidates.into_iter().flatten() {
+                if cand.is_file() {
+                    return Ok(cand);
+                }
+            }
+        }
+        Err(ExecRefused::ConfinementUnenforceable(
+            "newt-net-guard not found next to the executor — cannot establish the egress floor"
+                .into(),
+        ))
+    }
+}
+
+/// Add one read root to a caveats fs-read scope (the `lock_fs_to_workspace`
+/// pattern); `All` stays `All`.
+#[cfg(target_os = "linux")]
+fn extend_read_root(caveats: &mut Caveats, dir: String) {
+    caveats.fs_read = match &caveats.fs_read {
+        Scope::All => Scope::All,
+        Scope::Only(set) => Scope::only(set.iter().cloned().chain(std::iter::once(dir))),
+    };
 }
 
 /// Read a captured pipe to EOF (best-effort). Runs on its own thread so the
