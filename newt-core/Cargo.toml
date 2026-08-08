@@ -143,6 +143,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Stora
 # fail-closed-for-untrusted policy where openat2 is absent) lands with the
 # consumer rewire (step-52.2/52.3).
 rustix.workspace = true
+seccompiler = "0.5"
 
 [features]
 default = ["markdown"]
