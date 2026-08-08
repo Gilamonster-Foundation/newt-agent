@@ -740,6 +740,19 @@ async fn dispatch_bridled_shell(
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     let mut live = LiveOutputSession::start(sink);
+    // NOTE (cross-platform review, `unconfined-fallback-on-missing-backend`):
+    // run_command dispatches at the DEFAULT (Advisory) strength floor. On a
+    // supported platform whose native backend is present (Linux+Landlock,
+    // macOS+Seatbelt, Windows+AppContainer) the fs/net fence is kernel-enforced,
+    // so this is confined. But where a RESTRICTED fs/net axis has NO native
+    // backend at runtime (`best_available_sandbox` = advisory `NoopSandbox`) this
+    // route runs ADVISORY (host) rather than refusing — the ConstrainedExecutor
+    // callers fail closed there (Kernel floor). A blanket Kernel floor here is
+    // WRONG: run_command legitimately restricts `exec`, which Landlock enforces
+    // only as `interceptor` (the exec-behavior-bound BOUNDED residual), so a
+    // blanket Kernel floor would refuse every exec-restricted command even on
+    // Landlock. The correct fix is a PER-AXIS floor at the bridle boundary
+    // (fs/net = Kernel, exec = Interceptor-OK); tracked as an ACTIVE deviation.
     let result = bridle_registry(shell_engine(), live.as_ref().map(LiveOutputSession::relay))
         .dispatch("shell", args, caveats)
         .await;

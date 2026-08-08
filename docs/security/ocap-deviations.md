@@ -67,6 +67,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 |---|---|---|---|
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
 | `local-deputy-egress` | no indirect egress via a host AF_UNIX deputy | 🟠 ACTIVE | (a confinement limitation on run_command/build/crew — not a gated capability) |
+| `unconfined-fallback-on-missing-backend` | attacker-exec refuses (never runs advisory) when the native fs/net backend is unavailable | 🟠 ACTIVE | (run_command advisory-fallback; fixed by a per-axis bridle strength floor) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
 | `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`) | 🟢 closed (Linux) | (non-Linux lexical fallback) |
@@ -189,6 +190,39 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Status:** OPEN — reachable + unbounded; the netns / mediated-egress floor (#1599) closes it.
   This is a genuine ACTIVE deviation: the network confinement is INCOMPLETE for indirect egress.
   owner: — · review-by: #1599 / epic #749.
+
+### unconfined-fallback-on-missing-backend
+- **Invariant (ideal):** an attacker-exec route must, on EVERY supported platform, either enforce the
+  requested fs/net authority with a real OS boundary OR REFUSE before hostile code runs — never
+  silently fall back to advisory (host) execution because the native backend is unavailable.
+- **Practical caveat (now):** the `ConstrainedExecutor` callers (build_check / crew) mint under a
+  Kernel strength floor, so a missing fs/net backend REFUSES (`confinement_unenforceable`). The
+  `run_command` route (`dispatch_bridled_shell`) dispatches at the DEFAULT (Advisory) floor. Where the
+  native fs/net backend is present (Linux+Landlock, macOS+Seatbelt, Windows+AppContainer) the fence is
+  kernel-enforced and this is confined; but where a RESTRICTED fs/net axis has NO backend at runtime
+  (old Linux w/o Landlock; `sandbox-exec` missing on macOS; AppContainer unavailable on Windows →
+  `best_available_sandbox` = advisory `NoopSandbox`), run_command runs ADVISORY — a compiled hostile
+  child runs on the host (only the in-process L2 interceptor gates the brush engine's own exec
+  decisions). A blanket Kernel floor is the WRONG fix: run_command legitimately restricts `exec`,
+  which Landlock enforces only as `interceptor` (the `exec-behavior-bound` BOUNDED residual), so a
+  blanket Kernel floor refuses every exec-restricted command even on Landlock (empirically verified in
+  this pass).
+- **Residual:** 🟠 REACHABLE on all platforms when the native fs/net backend is unavailable at runtime.
+- **Disabled while open:** nothing — a confinement LIMITATION on the always-reachable run_command
+  route, not a gated capability.
+- **Compensating controls:** on the SUPPORTED platforms with the backend present (the normative case)
+  run_command IS kernel-confined; the only documented unconfined route is the operator
+  `--disable-ocap` / `--full-access` path, which is operator-frozen (`noninteractive-launch-policy`),
+  never repo/model selectable.
+- **Closure criterion:** a PER-AXIS strength floor at the agent-bridle boundary (fs/net = Kernel,
+  exec = Interceptor-OK) so run_command REFUSES when the fs/net fence cannot be kernel-enforced while
+  still tolerating the interceptor-level exec residual. Fix at the shared bridle boundary + consume a
+  bugfix release; do NOT add newt-local duplicate sandbox logic.
+- **Ratchet guard:** to land with the fix — a real-resource test that forces `backends.disable =
+  ["landlock"]` (an available-but-disabled native backend) and asserts run_command REFUSES rather than
+  running advisory.
+- **Status:** OPEN — reachable on any config where the native fs/net backend is unavailable; the
+  per-axis bridle floor closes it. owner: — · review-by: agent-bridle per-axis strength floor.
 
 ### disclosure-gate-live-path
 - **Invariant (ideal):** *every* tool result passes a single disclosure filter before it is
