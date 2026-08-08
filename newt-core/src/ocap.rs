@@ -78,19 +78,101 @@ fn require(v: Verification) -> Result<(), FailClosed> {
     }
 }
 
+/// The five layers of the **b1-os-isolation** floor (register ideal:
+/// uid-namespace + Landlock fs + seccomp + default-deny netns + an egress proxy
+/// that is the *only* egress, DNS included). This is a probe of what is
+/// *enforceable on this host* — NOT a claim that the live attacker-exec path
+/// (`run_command` → agent-bridle ShellTool) actually runs under them (wiring the
+/// live path + a per-session enforcement proof are later slices).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct B1Floor {
+    /// Landlock filesystem fence available (agent-bridle `ConfinedCommand`).
+    pub fs_fence: bool,
+    /// seccomp `socket()`-family egress deny available (`newt-net-guard`) —
+    /// TCP+UDP+DNS+raw, the leg Landlock (TCP-only) cannot provide.
+    pub seccomp_egress: bool,
+    /// uid / user-namespace isolation. Unbuilt: unprivileged userns is blocked
+    /// on hardened hosts (Ubuntu ≥ 23.10 `apparmor_restrict_unprivileged_userns`),
+    /// which is why the seccomp deny was chosen instead. Always `false` today.
+    pub user_namespace: bool,
+    /// default-deny network namespace. Unbuilt (same host-policy reason).
+    pub net_namespace: bool,
+    /// a mediated egress proxy that is the SOLE egress incl DNS (`#1599`) — the
+    /// layer that makes seeding a live credential safe (the token lives in a
+    /// broker, presented to authorized outbound requests, never in the box).
+    /// Unbuilt today.
+    pub sole_egress_proxy: bool,
+}
+
+impl B1Floor {
+    /// Probe the layers observable on this host. `fs_fence` / `seccomp_egress`
+    /// reflect the real primitives; `user_namespace` / `net_namespace` /
+    /// `sole_egress_proxy` are unbuilt (`#1599`) and report absent.
+    #[must_use]
+    pub fn probe() -> Self {
+        Self {
+            fs_fence: crate::confined_exec::kernel_fs_fence_available(),
+            seccomp_egress: crate::netguard::egress_deny_supported(),
+            user_namespace: false,
+            net_namespace: false,
+            sole_egress_proxy: false,
+        }
+    }
+
+    /// The first missing layer, named — in credential-safety order (the
+    /// sole-egress proxy first: it is the layer that keeps a seeded token from
+    /// leaving the box). `None` iff every layer is present.
+    #[must_use]
+    pub fn first_missing(self) -> Option<&'static str> {
+        if !self.fs_fence {
+            return Some("Landlock fs fence");
+        }
+        if !self.seccomp_egress {
+            return Some("seccomp egress deny");
+        }
+        if !self.sole_egress_proxy {
+            return Some("sole egress proxy incl DNS (#1599)");
+        }
+        if !self.net_namespace {
+            return Some("default-deny netns (#1599)");
+        }
+        if !self.user_namespace {
+            return Some("uid/user namespace (#1599)");
+        }
+        None
+    }
+}
+
 /// Verify **b1-os-isolation**: uid-namespace + Landlock fs + seccomp +
-/// default-deny netns + an egress proxy that is the *only* egress.
+/// default-deny netns + an egress proxy that is the *only* egress (DNS incl.).
 ///
-/// UNBUILT — always [`Verification::Absent`] (`sandbox_kind = none`; the
-/// in-process monitor is the only barrier). When the per-OS stack lands (Linux
-/// Landlock-net 6.7 / seccomp / netns, macOS Seatbelt, Windows AppContainer —
-/// `docs/design/captured-shell-cross-platform.md`), this returns `Verified` with
-/// the confirmed floor, re-run *per session* (no COW-cloned-pod skip).
+/// **Stays [`Verification::Absent`] by construction.** The mediated sole-egress
+/// proxy, netns, and uid-ns are unbuilt (`#1599`); and even were every host
+/// layer present, `verify_b1` has no per-session box handle, so it can only
+/// assert host *availability*, never live-session *enforcement* — the structural
+/// reason it must not flip. This probe is honest-*as-code* (it names the first
+/// missing layer via [`B1Floor`]) instead of honest-by-constant. It is the SOLE
+/// remaining runtime lock on [`seed_live_credential`] + [`admit_untrusted_remote`];
+/// flipping it hollowly would admit a live token into a still-reachable box. The
+/// flip is a later slice: the live `run_command` path fenced + a per-session
+/// canary grounding test (`docs/design/captured-shell-cross-platform.md`).
 #[must_use]
 pub fn verify_b1() -> Verification {
+    let reason = match B1Floor::probe().first_missing() {
+        Some(missing) => format!(
+            "b1 floor incomplete: {missing} not enforced (Landlock fs + the seccomp \
+             egress mechanism exist, but the mediated sole-egress proxy / netns / \
+             uid-ns are unbuilt, #1599)"
+        ),
+        // Unreachable today (proxy absent). Even so: no per-session enforcement
+        // seam exists, so a live box's confinement is unproven — stays Absent.
+        None => "b1 host layers present but live-session enforcement is unproven \
+                 (per-session box handle + canary grounding test pending)"
+            .to_string(),
+    };
     Verification::Absent {
         deviation: "b1-os-isolation",
-        reason: "no OS sandbox or egress proxy; the in-process monitor is the only barrier".into(),
+        reason,
     }
 }
 
@@ -179,6 +261,83 @@ mod tests {
         // b1 remains fail-closed until the kernel floor lands (P5).
         assert!(!verify_b1().is_verified());
         assert_eq!(verify_b1().deviation(), Some("b1-os-isolation"));
+    }
+
+    #[test]
+    fn b1floor_probe_reflects_primitives_and_unbuilt_layers() {
+        let floor = B1Floor::probe();
+        // fs-fence + seccomp-egress mirror the real host primitives.
+        assert_eq!(
+            floor.fs_fence,
+            crate::confined_exec::kernel_fs_fence_available()
+        );
+        assert_eq!(
+            floor.seccomp_egress,
+            crate::netguard::egress_deny_supported()
+        );
+        // uid-ns / netns / sole-egress-proxy are unbuilt (#1599) — always absent.
+        assert!(!floor.user_namespace);
+        assert!(!floor.net_namespace);
+        assert!(!floor.sole_egress_proxy);
+        // The floor is NEVER complete today (the proxy leg is unbuilt), so
+        // verify_b1 can never reach a Verified arm by host availability alone.
+        assert!(
+            floor.first_missing().is_some(),
+            "the b1 floor is incomplete by construction"
+        );
+    }
+
+    #[test]
+    fn verify_b1_names_the_first_missing_layer_not_a_blanket_reason() {
+        // Honest-as-code: the reason names the specific missing layer, never the
+        // old blanket "no OS sandbox".
+        let v = verify_b1();
+        assert!(!v.is_verified());
+        assert_eq!(v.deviation(), Some("b1-os-isolation"));
+        let Verification::Absent { reason, .. } = &v else {
+            unreachable!("b1 is Absent")
+        };
+        assert!(
+            reason.contains("#1599")
+                || reason.contains("Landlock fs fence")
+                || reason.contains("seccomp egress deny"),
+            "reason should name a specific missing layer: {reason}"
+        );
+        assert!(
+            !reason.contains("no OS sandbox"),
+            "reason must be layer-specific now, not the old constant: {reason}"
+        );
+    }
+
+    #[test]
+    fn b1floor_first_missing_orders_by_credential_safety() {
+        let full = B1Floor {
+            fs_fence: true,
+            seccomp_egress: true,
+            user_namespace: true,
+            net_namespace: true,
+            sole_egress_proxy: true,
+        };
+        assert_eq!(full.first_missing(), None, "a full floor has no gap");
+        // The fs fence is named first (the base of the floor).
+        assert_eq!(
+            B1Floor {
+                fs_fence: false,
+                ..full
+            }
+            .first_missing(),
+            Some("Landlock fs fence")
+        );
+        // With fs + seccomp present, the sole-egress proxy is the first gap (the
+        // credential-safety leg), ahead of netns / userns.
+        assert_eq!(
+            B1Floor {
+                sole_egress_proxy: false,
+                ..full
+            }
+            .first_missing(),
+            Some("sole egress proxy incl DNS (#1599)")
+        );
     }
 
     #[test]
