@@ -65,6 +65,18 @@ fn msgs() -> Vec<MemMessage> {
     ]
 }
 
+/// The MCP tests here exercise a remote tool's MECHANICS (delta parsing,
+/// parallel results, tool round-trip, spill) through `my_server__get_thing` —
+/// they are NOT about authorization. Post the `mcp-under-leash` name-grant
+/// closure, an MCP call needs a structural grant, so the shared ctx puts that
+/// operation on a persona allow-list. `NoMcp` tests are unaffected: they never
+/// dispatch an MCP call, and `persona_tools` gates only the MCP path.
+fn persona_allow() -> &'static [String] {
+    static ALLOW: std::sync::LazyLock<Vec<String>> =
+        std::sync::LazyLock::new(|| vec!["my_server__get_thing".to_string()]);
+    ALLOW.as_slice()
+}
+
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
         url: server_uri,
@@ -89,7 +101,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         experience_store: None,
         step_ledger: None,
         caveats,
-        persona_tools: None,
+        persona_tools: Some(persona_allow()),
         cognition: None,
         chat_completions_capability: Default::default(),
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
