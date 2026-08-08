@@ -9,12 +9,12 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
-### Security — OCAP enforcement-floor (0.8.1 line, epic #749)
+### Security — OCAP enforcement-floor (epic #749)
 
-Bug-fix hardening on the 0.8.0 line: closing the remaining OPEN deviations in
+Hardening on the still-unreleased 0.8.0 line: closing the remaining OPEN
+deviations in
 [`docs/security/ocap-deviations.md`](docs/security/ocap-deviations.md) toward
-*"zero deviations = full OCAP"*. Not new features — security fixes — hence a
-patch bump.
+*"zero deviations = full OCAP"*.
 
 - **`noninteractive-launch-policy` closed** (#1620). Launch authority
   (`--disable-ocap`/`--yolo`, `--full-access`, `--unsafe-host-exec`) is now a

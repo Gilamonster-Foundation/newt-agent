@@ -108,8 +108,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   floor (Unverified) — we do not over-claim.** `verify_network_confinement()` records the floor's
   *availability*. The credential-bearing `b1` (`verify_b1`, `Absent`) is unchanged and STILL gates
   `seed_live_credential` / `admit_untrusted_remote`.
-- **0.8.0 disposition:** DID NOT block v0.8.0 — now being fixed on the **0.8.1** bug-fix line (OCAP
-  enforcement-floor epic #749). The dangerous capabilities it gates (`seed_live_credential`,
+- **0.8.0 disposition:** does not block v0.8.0 — being closed on the still-unreleased **0.8.0** line
+  (OCAP enforcement-floor epic #749). The dangerous capabilities it gates (`seed_live_credential`,
   `admit_untrusted_remote`) are fail-closed OFF while it is open; **basic egress is now fully denied**
   (TCP+UDP+DNS+raw via seccomp — #1599's socket-level goal met on Linux; the netns/egress-proxy form
   remains for the credential-bearing floor). Bounded confinement-hardening follow-ons, each tracked and
@@ -477,7 +477,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **0.8.0 disposition:** already did not block v0.8.0; this now CLOSES the row entirely (the
   typed-authority follow-on is done, not deferred).
 - **Status:** CLOSED — `--non-interactive` decouple (step-3.1) + typed immutable `LaunchAuthority`
-  (frozen once, deep-read-free, inventory-gated). Fixed on the 0.8.1 line / epic #749 · owner: — · review-by:
+  (frozen once, deep-read-free, inventory-gated). Fixed on the (unreleased) 0.8.0 line / epic #749 · owner: — · review-by:
   if a new authority switch is added (route it through `LaunchAuthority`, not a fresh `env::var`).
 
 ### p4-constrained-executor
@@ -709,7 +709,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 > **0.8.0 disposition:** DOES NOT block v0.8.0 — a follow-on refinement (binding a *granted*
 > interpreter's exec to its resolved-path behavior tier). It is bounded by `b1`'s OS sandbox and by
 > the confined executor (a granted interpreter's fs/net behavior is already Landlock-fenced). Tracked
-> in this register; fixed on the 0.8.1 line with `b1` / epic #749.
+> in this register; fixed on the (unreleased) 0.8.0 line with `b1` / epic #749.
 
 ## 5. How to use this (for the practical-caveat moments)
 
