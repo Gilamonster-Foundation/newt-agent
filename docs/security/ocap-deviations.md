@@ -65,7 +65,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
-| `b1-os-isolation` | OS isolation + egress proxy | 🔴 critical | live credentials, untrusted-remote voices |
+| `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
+| `local-deputy-egress` | no indirect egress via a host AF_UNIX deputy | 🟠 ACTIVE | (a confinement limitation on run_command/build/crew — not a gated capability) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
 | `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`) | 🟢 closed (Linux) | (non-Linux lexical fallback) |
@@ -88,10 +89,13 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   path** — `run_command` (agent-bridle 0.7.15 `ChildNetworkPolicy::DenyDirect`) and the
   `ConstrainedExecutor` callers (build_check / crew, `NetGrant::DenyAll`) both spawn under the
   seccomp `socket()`-family egress deny (TCP+UDP+DNS+raw) beneath the Landlock fs fence, **by
-  default and fail-closed**. The remaining gap is the CREDENTIAL-bearing floor only: a mediated
-  egress *broker* (a seeded token presented to authorized outbound requests, the box unable to
-  exfiltrate it), deliberately deferred (#1599).
-- **Residual:** 🟡 — a hostile child can no longer egress (direct socket denied on every path);
+  default and fail-closed**. TWO gaps remain, both closed by the deferred netns / mediated-egress
+  floor (#1599): (1) the CREDENTIAL-bearing broker (a seeded token presented to authorized outbound
+  requests, the box unable to exfiltrate it) — gated here; and (2) INDIRECT egress via a host
+  AF_UNIX deputy (the seccomp floor allows AF_UNIX and Landlock does not govern unix-socket
+  `connect`) — a REACHABLE residual tracked as `local-deputy-egress`.
+- **Residual:** 🟡 — a hostile child can no longer create a DIRECT off-box socket (denied on every
+  path); it can still reach a local AF_UNIX deputy (`local-deputy-egress`);
   the residual is only the unbuilt broker that would make seeding a LIVE credential safe.
 - **Disabled while open:** seeding a **live scoped credential** into the box; running a
   **genuinely-untrusted / foreign remote voice** that holds anything sensitive.
@@ -134,15 +138,57 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   pathname confinement) cannot cross the fence (`net_guard_fd_hygiene.rs`: a control proves the fd is
   otherwise inherited; the guarded child cannot read it). Remaining follow-ons are bounded by `b1`'s OS
   sandbox as the eventual backstop.
-- **Status:** GATED — the DIRECT-egress threat (a hostile child exfiltrating) is CLOSED on every
-  live path (`verify_network_confinement` **Verified**; proven by `net_guard_executor.rs` +
-  `run_command_child_under_net_none_cannot_open_a_socket_b1`). The two capabilities this entry gates
-  — `seed_live_credential` / `admit_untrusted_remote` — are **UNREACHABLE** (no caller wires them;
-  grep-verifiable), **fail-closed** (`require(verify_b1())` refuses; `verify_b1` still `Absent`), and
-  their forward obligation is **machine-enforced** (`ocap-check`'s OCAP-DANGER/GATE ratchet requires
-  the gate at every site). So it is a deliberately-deferred build (the mediated-egress broker, #1599),
-  not an active mediation gap. CLOSES when the broker lands and `verify_b1` flips `Verified`. owner: —
-  · review-by: #1599 / epic #749
+- **Unreachable-guard-symbols:** `seed_live_credential`, `admit_untrusted_remote` — the two
+  capabilities this entry gates. `ocap-check` proves (`check_state_proofs`) that neither is CALLED
+  anywhere outside its defining file + tests, so a future contributor who wires either (e.g. a
+  `pa login`) trips CI until `verify_b1` flips `Verified`.
+- **Status:** GATED — this entry is scoped to the **CREDENTIAL-bearing** floor only: seeding a live
+  scoped credential / admitting an untrusted remote. Both are UNREACHABLE (guard-symbols above,
+  machine-checked), fail-closed (`require(verify_b1())` refuses; `verify_b1` is `Absent`), and
+  forward-ratcheted (the OCAP-DANGER/GATE gate is required at every site). They need the deliberately
+  deferred mediated-egress broker (#1599); CLOSES when it lands + `verify_b1` flips.
+  **Scope note (do not over-read):** the DIRECT off-box socket floor (AF_INET/AF_INET6/AF_PACKET) is
+  complete + Verified (`verify_network_confinement`), but that is NOT the same as complete network
+  confinement — a confined child can still reach a host AF_UNIX deputy (pathname **and** abstract;
+  Landlock does not govern unix-socket `connect`, proven by `af_unix_deputy.rs`). That INDIRECT-egress
+  residual is REACHABLE and is tracked as its own **ACTIVE** deviation `local-deputy-egress` (below),
+  closed by the same deferred netns/#1599. owner: — · review-by: #1599 / epic #749
+
+### local-deputy-egress
+- **Invariant (ideal):** a confined attacker-exec child cannot cause network egress by ANY path —
+  neither a direct off-box socket NOR an indirect relay through an ambient local deputy (a host
+  process reachable over local IPC that performs network on the child's behalf).
+- **Practical caveat (now):** the DIRECT half is enforced — the seccomp floor denies
+  `socket(AF_INET/AF_INET6/AF_PACKET)` on every live path. The INDIRECT half is NOT: the floor
+  deliberately allows `AF_UNIX`, and Landlock's `AccessFs` rights include no unix-socket-connect
+  right, so a confined child can `connect()` to ANY host AF_UNIX socket it can address — BOTH pathname
+  (outside the fs fence) AND abstract-namespace. Proven by `af_unix_deputy.rs` (control: an
+  out-of-fence file read is EACCES-denied while both socket forms CONNECT) and, on the run_command
+  route, `run_command_child_can_reach_an_af_unix_abstract_deputy`. If a network-relaying deputy is
+  reachable (e.g. an exposed container-runtime socket), indirect egress is possible.
+- **Residual:** 🟠 REACHABLE — this is exactly why the public claim is "direct AF_INET/AF_INET6/
+  AF_PACKET socket creation is denied", NOT "hostile code cannot exfiltrate over the network".
+- **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable
+  `run_command` / build_check / crew paths, not a gated capability: there is no fail-closed toggle
+  (the child runs with the incomplete confinement). It is therefore honestly **ACTIVE**, not
+  GATED/BOUNDED — reachable, and not bounded by any CLOSED invariant (the fs fence does not govern
+  socket connect, so it cannot bound which deputies the child reaches).
+- **Compensating controls:** the DIRECT-egress floor stands (no self-opened off-box socket); the
+  child is fs- and exec-fenced, limiting what it can DO with a deputy but not stopping it reaching
+  one; a hardened host removes ambient network-relaying deputies (not a hard guarantee). FD-hygiene
+  note: the run_command route's inherited-FD hygiene is CLOEXEC-based (std default + agent-bridle
+  `set_cloexec`), NOT the explicit `close_range(3,~0)` the DenyAll `newt-net-guard` route performs
+  (`run_command_route_fd_hygiene_is_cloexec_based_not_explicit_close`) — a non-CLOEXEC network fd
+  would be inherited, so "no pre-opened-fd bypass of the socket() filter" holds only because newt
+  opens its real fds via std (CLOEXEC).
+- **Closure criterion:** a network namespace (unprivileged netns — blocked by host policy on Ubuntu
+  ≥ 23.10) or an equivalent that isolates BOTH the abstract unix namespace AND pathname reachability
+  — the mediated-egress / netns floor of #1599 — making the only egress an explicit broker capability.
+- **Ratchet guard:** `af_unix_deputy.rs` PINS the current reachability, so a future fence that closes
+  it trips CI and forces this entry + the `verify_network_confinement` claim to widen honestly.
+- **Status:** OPEN — reachable + unbounded; the netns / mediated-egress floor (#1599) closes it.
+  This is a genuine ACTIVE deviation: the network confinement is INCOMPLETE for indirect egress.
+  owner: — · review-by: #1599 / epic #749.
 
 ### disclosure-gate-live-path
 - **Invariant (ideal):** *every* tool result passes a single disclosure filter before it is
@@ -221,6 +267,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   taint-aware proposal that down-weights worker-controlled transcript.
 - **Ratchet guard:** the promote path refuses if `proposer_fp == worker_fp`; `ocap-check`
   asserts no auto-apply path exists.
+- **Unreachable-guard-symbols:** `auto_apply_policy` — `ocap-check` (`check_state_proofs`) proves it
+  has no caller outside its defining file + tests, so wiring an auto-apply flow trips CI.
 - **0.8.0 disposition:** DOES NOT block v0.8.0 — **follow-on**. `auto_apply_policy` is fail-closed
   OFF while this is open (every promotion needs a human approval bound to the lowered-`Caveats`
   hash), so no self-proposal privilege escalation is reachable; the distinctness half is already
@@ -776,11 +824,17 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   OCAP-DANGER site names it (the exec fence is structural — Landlock `exec: Only` — not a runtime
   `require`). Reverting an `AgentInfluenced` spawn off the `ConstrainedExecutor` fails the
   `spawn_inventory` gate.
-- **Status:** GATED — resolution cannot widen the envelope (authority is object-bound per-request;
-  fs/net are kernel-fenced), so no capability is reachable-only-by-closing-this; the name-granularity
-  trampoline residual is **bounded fail-closed** by the object-bound fs/net fences + `b1`'s OS floor,
-  and the forward obligation (kernel-granularity exec) is **machine-enforced** as part of `b1` / epic
-  #749. CLOSES with `b1`'s kernel OS floor. owner: — · review-by: with `b1` / epic #749.
+- **Bounded-by:** `p4-constrained-executor`, `fs-canonical-containment` — the CLOSED invariants that
+  make the residual harmless: every `AgentInfluenced` exec is routed through the kernel-fenced
+  `ConstrainedExecutor` (object-bound fs/net), and fs authority is canonical-path object-bound. A
+  trampolined tier inherits that same (denied) fs/net envelope. `ocap-check` (`check_state_proofs`)
+  requires both bounds to be CLOSED, so if either reopens, this BOUNDED claim fails.
+- **Status:** BOUNDED — unlike a GATED entry this capability (executing a granted interpreter) IS
+  reachable; it is not *unreachable*. What holds is that binary resolution cannot WIDEN the already
+  object-bound authority envelope: the name-granularity exec-trampoline residual is bounded by the
+  CLOSED fs/net invariants named above (`Bounded-by`), so a trampolined tier gets no authority the
+  child did not already hold. CLOSES to a kernel-granularity exec fence with `b1`'s OS floor. owner: —
+  · review-by: with `b1` / epic #749.
 
 ## 5. How to use this (for the practical-caveat moments)
 

@@ -371,6 +371,7 @@ cov-ci:
 # PIPELINE PARITY: mirrored by the "OCAP register honesty" step in
 # .github/workflows/ci.yml (Rust lint job).
 ocap-check:
+    python3 scripts/ocap_check.py --self-test
     python3 scripts/ocap_check.py
 
 # Automated process-spawn inventory gate (P4 `p4-constrained-executor`): fails on
