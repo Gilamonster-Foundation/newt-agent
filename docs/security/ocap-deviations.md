@@ -574,30 +574,38 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `mcp-config-admission`'s `AdmittedServer`. At the sole dispatch choke
   (`agentic/tools.rs`, `execute_tool_inner`) the grant is computed and the witness minted: the
   persona allow-list path is unchanged (allow-listed dispatches; out-of-list is prompted, a deny
-  hard-stops), and the previously-**unleashed** no-persona path is closed — a read-class tool (by
-  `classify_mcp_effect`, a droppable name convention, NEVER the server's own `readOnlyHint`) passes,
-  a mutating/unknown one is prompted (interactive) or **denied fail-closed** (headless).
-- **Residual:** 🟠 high → 🟡 medium. The leash mediates *dispatch*; two residuals remain, both
-  cross-referenced, NOT claimed closed here:
-  1. **secret-forwarding** — an admitted server handed a value could still exfiltrate it. That is a
-     disclosure/egress concern bounded by `disclosure-gate-live-path` + `b1-os-isolation`, not by
-     this leash.
-  2. **name-based effect classification is server-influenceable** — a hostile server could name a
-     destructive tool with a read verb (`get_…`) to earn read-class tolerance. The real containment
-     for a genuinely-hostile server is admission (only trusted servers connect) + `b1` (OS sandbox),
-     with the name convention as defense-in-depth. Per-call budget + resource-scope + credential-
-     handle attenuation are the follow-on that tightens this.
+  hard-stops). **Authority is a structural [`McpGrant`]** (`PersonaAllowList` | `HumanApproved`),
+  minted ONLY from an operator grant — never from the server-chosen tool name. The no-persona path
+  is now fully human-gated: a name-classified effect (`classify_mcp_effect`) is shown only as a
+  HINT and grants nothing, so a hostile admitted server that renames a destructive tool with a read
+  verb (`get_…`) earns no tolerance — it is prompted (interactive) or **denied fail-closed**
+  (headless).
+- **Residual:** 🟠 high → 🟡 medium. The leash mediates *dispatch*; after the structural-grant slice
+  the name-classification vector is closed, and these remain (cross-referenced, NOT claimed closed):
+  1. **secret-forwarding** — an admitted server handed a value could still exfiltrate it. A
+     disclosure/egress concern bounded by `disclosure-gate-live-path` + `b1-os-isolation`; the
+     durable fix is a **credential broker/handle** (the child gets a handle, not a bearer value) —
+     tracked follow-on.
+  2. ~~name-based effect classification is server-influenceable~~ — **CLOSED (structural grant).**
+     Authority is now an [`McpGrant`] provenance (`PersonaAllowList` / `HumanApproved`) minted only
+     from an operator grant; the tool NAME never grants (`classify_mcp_effect` is a display hint,
+     not authority), so a server renaming a destructive tool `get_…` earns nothing — proven by
+     `no_persona_read_verb_tool_is_not_name_granted`. Per-call **budget** + **resource-scope**
+     attenuation are the remaining structural follow-on.
 - **Disabled while open:** admitting a genuinely-untrusted server that holds a live secret (bounded
   by `mcp-config-admission` + `b1` + `disclosure-gate-live-path`).
 - **Closure criterion (LEASH):** met — an un-leashed `McpTools::call` does not compile, and the
   no-persona mutating dispatch is prompted/denied on the real dispatch path. Full closure of the row
   additionally needs the secret-forwarding residual retired (via `disclosure-gate-live-path`).
 - **Ratchet guard:** `no_persona_does_not_dispatch_a_mutating_mcp_tool_unleashed`,
-  `no_persona_read_class_mcp_tool_still_dispatches`,
+  `no_persona_read_verb_tool_is_not_name_granted` (the name-classification adversarial test — a
+  `get_…`-named tool is denied on the name alone, and dispatches ONLY on an explicit human grant),
   `no_persona_mutating_mcp_tool_dispatches_when_human_grants`,
   `remote_tool_outside_allow_list_is_prompted_not_hard_vetoed` (`agentic/tools.rs`), and
-  `classify_reads_by_verb_prefix_stripping_namespace` + `leash_mints_only_when_granted`
-  (`agentic/mcp.rs`). Removing the witness requirement makes the un-leashed dispatch compile again.
+  `classify_reads_by_verb_prefix_stripping_namespace` +
+  `leash_mints_only_from_a_structural_grant_never_the_name` (`agentic/mcp.rs`). Removing the witness
+  requirement makes the un-leashed dispatch compile again; re-adding a name-based auto-grant
+  re-fails the adversarial test.
 - **0.8.0 disposition:** DOES NOT block v0.8.0 — the LEASH invariant is CLOSED (witness-typed
   call-time leash; a no-persona mutating dispatch fails closed). The residual (name-based effect
   classification) requires a **trusted-but-compromised ADMITTED server**, which is OUTSIDE the

@@ -91,14 +91,31 @@ pub fn classify_mcp_effect(tool: &str) -> McpEffect {
     }
 }
 
+/// WHY a call is authorized to dispatch — the structural grant *provenance*,
+/// NOT the server's own tool name or metadata hints. Authority is bound to how
+/// the OPERATOR granted THIS operation; a server-chosen tool name can never mint
+/// one. This is the `mcp-under-leash` closure of the name-classification vector:
+/// a hostile admitted server that names a destructive tool with a read verb
+/// (`get_…`) earns NOTHING here, because a read verb is not a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpGrant {
+    /// The active persona's tool allow-list explicitly names this operation.
+    PersonaAllowList,
+    /// A present human `PermissionGate` approved THIS specific call.
+    HumanApproved,
+}
+
 /// Witness that a single MCP tool call passed the call-time leash. The private
 /// `_seal` field makes it unconstructable outside this module, so the only way
 /// to obtain one is a successful [`leash_mcp_call`]; [`McpTools::call`] requires
-/// a `&LeasedMcpCall`, so an un-leashed dispatch does not compile.
+/// a `&LeasedMcpCall`, so an un-leashed dispatch does not compile. It carries the
+/// structural [`McpGrant`] that authorized it, so the authority is bound to the
+/// grant, never to the server-controlled tool name.
 #[derive(Debug)]
 pub struct LeasedMcpCall<'a> {
     tool: &'a str,
     args: &'a Value,
+    grant: McpGrant,
     _seal: (),
 }
 
@@ -113,6 +130,19 @@ impl<'a> LeasedMcpCall<'a> {
     pub fn args(&self) -> &Value {
         self.args
     }
+    /// How this call was authorized — the structural provenance, never the
+    /// server's say-so.
+    #[must_use]
+    pub fn grant(&self) -> McpGrant {
+        self.grant
+    }
+    /// The admitted server this operation routes to: the namespace prefix newt
+    /// assigns at admission (`server__tool`), NOT a value the server supplies in
+    /// its tool metadata. Empty if the tool is un-namespaced.
+    #[must_use]
+    pub fn server(&self) -> &str {
+        self.tool.rsplit_once("__").map_or("", |(server, _)| server)
+    }
 }
 
 /// Refusal of an MCP call by the call-time leash.
@@ -124,32 +154,30 @@ pub struct LeashDenied {
     pub reason: String,
 }
 
-/// Mint a [`LeasedMcpCall`] iff the call-time leash admits it — the SOLE minter
-/// of the witness [`McpTools::call`] requires.
+/// Mint a [`LeasedMcpCall`] iff a structural [`McpGrant`] authorizes it — the
+/// SOLE minter of the witness [`McpTools::call`] requires.
 ///
-/// `granted` folds in every EXPLICIT authorization the caller has already
-/// resolved: the active persona's tool allow-list, or a human `PermissionGate`
-/// decision. The caller is responsible for computing `granted` truthfully; the
-/// leash then makes the dispatch structurally impossible without it — a `false`
-/// `granted` fails closed, no matter the effect class. (Read-class tolerance for
-/// the no-persona case is applied by the caller when it computes `granted`, so a
-/// persona's explicit *deny* is never overridden here.)
+/// `grant` is the provenance the caller resolved: the active persona's tool
+/// allow-list ([`McpGrant::PersonaAllowList`]) or a present human's decision
+/// ([`McpGrant::HumanApproved`]). `None` fails closed. Authority NEVER comes from
+/// the tool NAME — a read-verb name is not a grant (the name-classification
+/// vector a hostile admitted server could otherwise exploit).
 pub fn leash_mcp_call<'a>(
     tool: &'a str,
     args: &'a Value,
-    granted: bool,
+    grant: Option<McpGrant>,
 ) -> Result<LeasedMcpCall<'a>, LeashDenied> {
-    if granted {
-        Ok(LeasedMcpCall {
+    match grant {
+        Some(grant) => Ok(LeasedMcpCall {
             tool,
             args,
+            grant,
             _seal: (),
-        })
-    } else {
-        Err(LeashDenied {
+        }),
+        None => Err(LeashDenied {
             tool: tool.to_string(),
             reason: format!("remote tool `{tool}` refused by the call-time leash (no grant)"),
-        })
+        }),
     }
 }
 
@@ -181,13 +209,25 @@ mod leash_tests {
     }
 
     #[test]
-    fn leash_mints_only_when_granted() {
+    fn leash_mints_only_from_a_structural_grant_never_the_name() {
         let args = serde_json::json!({});
-        // Granted → witness carrying the tool + args.
-        let leased = leash_mcp_call("srv__delete", &args, true).expect("granted mints");
+        // A structural grant mints a witness carrying tool + args + provenance +
+        // the server identity (the namespace prefix, not server metadata).
+        let leased = leash_mcp_call("srv__delete", &args, Some(McpGrant::PersonaAllowList))
+            .expect("a grant mints");
         assert_eq!(leased.tool(), "srv__delete");
         assert_eq!(leased.args(), &args);
-        // Not granted → refusal (the caller folds read-tolerance into `granted`).
-        assert!(leash_mcp_call("srv__delete", &args, false).is_err());
+        assert_eq!(leased.grant(), McpGrant::PersonaAllowList);
+        assert_eq!(leased.server(), "srv");
+        // A human decision is a distinct provenance.
+        assert_eq!(
+            leash_mcp_call("srv__delete", &args, Some(McpGrant::HumanApproved))
+                .unwrap()
+                .grant(),
+            McpGrant::HumanApproved
+        );
+        // No grant → refusal. There is no `bool`/name path: a server-chosen
+        // read-verb name can never stand in for a grant.
+        assert!(leash_mcp_call("srv__get_wipe_everything", &args, None).is_err());
     }
 }

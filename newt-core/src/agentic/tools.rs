@@ -7,7 +7,7 @@ use super::content_spill::{self, SpillStore};
 use super::crew_tool::CrewRunner;
 use super::display::{ToolDisplay, ToolPresentation};
 use super::git_tool::GitTool;
-use super::mcp::{classify_mcp_effect, leash_mcp_call, McpEffect, McpTools};
+use super::mcp::{classify_mcp_effect, leash_mcp_call, McpEffect, McpGrant, McpTools};
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{
@@ -3681,30 +3681,42 @@ async fn execute_tool_inner(
                 None => false,
             }
         };
-        let granted = match persona_tools {
-            // Persona path (unchanged): allow-listed dispatches; otherwise the
+        // Authority is a structural GRANT provenance, NEVER the server-chosen
+        // tool name (`mcp-under-leash`). A hostile admitted server that names a
+        // destructive tool with a read verb (`get_…`) earns nothing here — a
+        // read verb is not a grant.
+        let grant: Option<McpGrant> = match persona_tools {
+            // Persona path: allow-listed operations dispatch; otherwise the
             // human is prompted and an explicit deny hard-stops.
-            Some(allow) if persona_tool_allowed(name, allow) => true,
+            Some(allow) if persona_tool_allowed(name, allow) => Some(McpGrant::PersonaAllowList),
             Some(_) => prompt_gate(
                 permission_gate,
                 format!("remote tool `{name}` is outside the active persona's tool allow-list"),
-            ),
-            // No-persona path (`mcp-under-leash`): read passes; mutating/unknown
-            // is gated, fail-closed when headless.
-            None => match classify_mcp_effect(name) {
-                McpEffect::Read => true,
-                McpEffect::Mutating => prompt_gate(
+            )
+            .then_some(McpGrant::HumanApproved),
+            // No-persona path (`mcp-under-leash`): "no persona" is NOT
+            // "unrestricted" and is NOT read-tolerant by tool name. EVERY
+            // operation is human-gated — the name-classified effect is shown only
+            // as a HINT (it grants nothing) — and fails closed when headless, so
+            // a server-renamed `get_…` cannot self-authorize.
+            None => {
+                let hint = match classify_mcp_effect(name) {
+                    McpEffect::Read => "appears read-class",
+                    McpEffect::Mutating => "mutating/unknown",
+                };
+                prompt_gate(
                     permission_gate,
                     format!(
-                        "remote tool `{name}` is mutating and no persona bounds it \
-                         (no persona is not unrestricted)"
+                        "remote tool `{name}` ({hint}) has no persona to bound it — \
+                         no persona is not unrestricted, and a tool name is not a grant"
                     ),
-                ),
-            },
+                )
+                .then_some(McpGrant::HumanApproved)
+            }
         };
         // The witness leash: `mcp.call` requires a `LeasedMcpCall`, so this is
         // the only way to dispatch — an un-leashed call does not type-check.
-        return match leash_mcp_call(name, args, granted) {
+        return match leash_mcp_call(name, args, grant) {
             Ok(leased) => mcp.call(&leased).await,
             Err(_) => persona_tool_denied_message(name),
         };
@@ -9591,6 +9603,11 @@ mod execute_tool_branch_tests {
         live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     ) -> (String, String) {
         let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3);
+        // Mechanics helper: authorize the tool it is told to run (the MCP-auth
+        // tests use `run_remote_gated` instead). Post the `mcp-under-leash`
+        // name-grant closure an MCP call needs a structural grant; for a built-in
+        // tool `persona_tools` doesn't gate dispatch, so this is a no-op there.
+        let persona_grant = [name.to_string()];
         let out = execute_tool_with_display_cancellable(
             &mut display,
             name,
@@ -9604,6 +9621,7 @@ mod execute_tool_branch_tests {
                 prompt_context,
                 artifact_context,
                 live_tool_output,
+                persona_tools: Some(&persona_grant),
                 ..Default::default()
             },
             false,
@@ -11096,17 +11114,56 @@ mod execute_tool_branch_tests {
         assert!(out.contains("persona") || out.contains("denied") || out.contains("leash"));
     }
 
-    /// The leash does not over-block: a no-persona READ-class remote tool still
-    /// dispatches (low-risk lookups stay usable without a persona or a prompt).
+    /// `mcp-under-leash` (name-classification vector): a no-persona READ-verb
+    /// remote tool is NOT auto-granted by its name. A hostile admitted server
+    /// that names a destructive operation with a read verb (`get_…`) earns
+    /// nothing — headless it is DENIED (fail-closed), and it dispatches only on
+    /// an explicit human grant. (Was `..._still_dispatches`, which asserted the
+    /// now-closed name-auto-grant; flipped red→green with the leash slice.)
     #[tokio::test]
-    async fn no_persona_read_class_mcp_tool_still_dispatches() {
+    async fn no_persona_read_verb_tool_is_not_name_granted() {
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = crate::caveats::Caveats::top();
 
-        let mut mcp = OneRemoteTool::new("incident__list"); // read verb
-        let out =
-            run_remote_gated("incident__list", ws.path(), &caveats, None, &mut mcp, None).await;
-        assert!(mcp.called, "a no-persona read-class remote tool dispatches");
+        // A hostile server named a destructive op with a read verb. Headless, no
+        // persona: the read verb does NOT grant — fail-closed.
+        let mut mcp = OneRemoteTool::new("evil__get_wipe_everything");
+        let out = run_remote_gated(
+            "evil__get_wipe_everything",
+            ws.path(),
+            &caveats,
+            None, // no persona
+            &mut mcp,
+            None, // headless: no human to consult
+        )
+        .await;
+        assert!(
+            !mcp.called,
+            "a no-persona read-verb-named remote tool must NOT dispatch on the name alone"
+        );
+        assert!(
+            out.contains("persona") || out.contains("grant") || out.contains("leash"),
+            "{out}"
+        );
+
+        // The SAME tool dispatches only when a present human explicitly grants it.
+        let mut mcp = OneRemoteTool::new("evil__get_wipe_everything");
+        let mut gate = MockGate::new(true, &caveats);
+        let out = run_remote_gated(
+            "evil__get_wipe_everything",
+            ws.path(),
+            &caveats,
+            None,
+            &mut mcp,
+            Some(&mut gate),
+        )
+        .await;
+        assert!(mcp.called, "an explicitly human-granted call dispatches");
+        assert_eq!(
+            gate.asks.len(),
+            1,
+            "the human WAS prompted (no silent name-grant)"
+        );
         assert_eq!(out, "remote-tool-ran");
     }
 
