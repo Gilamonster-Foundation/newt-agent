@@ -474,6 +474,25 @@ fn shell_engine() -> crate::ShellEngine {
 /// unchanged. Mirrors `agent_bridle::registry()` but swaps the shell engine so
 /// `[shell] engine = "host"` (or `--full-access`) routes `run_command` to the
 /// full-grammar, kernel-jailed sandbox-host engine instead of the safe subset.
+/// The b1 sandbox policy every `run_command` shell engine runs under: the
+/// default backend confinement PLUS [`agent_bridle::ChildNetworkPolicy::DenyDirect`]
+/// — the seccomp `socket()`-family egress deny (agent-bridle 0.7.15) that closes
+/// the UDP/DNS/raw/packet leg the Landlock TCP-only net rule misses.
+///
+/// Applied unconditionally, but **inert unless the caller's `net` caveat is
+/// already deny-all** (`net: none`): a granted net scope leaves it untouched (the
+/// caller asked for egress), while a hostile / confined `run_command` under
+/// `net: none` gets NO off-box socket of any protocol — the live attacker-exec
+/// path finally inheriting the same complete egress floor as the
+/// `ConstrainedExecutor` callers. Fail-closed: if the seccomp floor cannot be
+/// installed, the spawn is refused rather than run with a weaker floor.
+fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
+    agent_bridle::SandboxPolicy {
+        child_network: agent_bridle::ChildNetworkPolicy::DenyDirect,
+        ..agent_bridle::SandboxPolicy::default()
+    }
+}
+
 fn bridle_registry(
     engine: crate::ShellEngine,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
@@ -481,14 +500,16 @@ fn bridle_registry(
     use std::sync::Arc;
     let shell: Arc<dyn agent_bridle::Tool> = match engine {
         crate::ShellEngine::SafeSubset => {
-            let mut tool = agent_bridle::ShellTool::new();
+            let mut tool =
+                agent_bridle::ShellTool::new().with_sandbox_policy(b1_run_command_sandbox_policy());
             if let Some(observer) = live.clone() {
                 tool = tool.with_output_observer(observer);
             }
             Arc::new(tool)
         }
         crate::ShellEngine::Host => {
-            let mut tool = agent_bridle::HostShellTool::new();
+            let mut tool = agent_bridle::HostShellTool::new()
+                .sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
             if let Some(observer) = live.clone() {
                 tool = tool.with_output_observer(observer);
             }
@@ -502,7 +523,8 @@ fn bridle_registry(
             // harness; the real binary path remains Brush unchanged.
             #[cfg(test)]
             let shell = {
-                let mut tool = agent_bridle::ShellTool::new();
+                let mut tool = agent_bridle::ShellTool::new()
+                    .with_sandbox_policy(b1_run_command_sandbox_policy());
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
                 }
@@ -527,7 +549,8 @@ fn bridle_registry(
                         );
                     });
                 }
-                let mut tool = agent_bridle::BrushShellTool::new();
+                let mut tool = agent_bridle::BrushShellTool::new()
+                    .with_sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
                 }
@@ -5712,6 +5735,52 @@ mod tests {
         assert_eq!(
             *sink.events.lock().unwrap(),
             ["start", "Stdout:observed\n", "finish"]
+        );
+    }
+
+    /// b1 slice 2 — the LIVE attacker-exec path proof: `run_command` →
+    /// `dispatch_bridled_shell` → agent-bridle `ShellTool` (child_network =
+    /// `DenyDirect`, 0.7.15) → spawn. Under `net: none` the seccomp egress floor
+    /// denies the child's AF_INET socket, so a hostile `run_command` has NO
+    /// off-box socket of any protocol — the shell path finally inheriting the
+    /// same complete egress floor as the `ConstrainedExecutor` callers. Skips
+    /// where Landlock / python3 are unavailable (there the confined spawn fails
+    /// closed — nothing runs unconfined). Real-resource; grounds the mocked
+    /// bridle-policy wiring in `bridle_registry`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_command_child_under_net_none_cannot_open_a_socket_b1() {
+        if !crate::confined_exec::kernel_fs_fence_available()
+            || !std::path::Path::new("/usr/bin/python3").exists()
+        {
+            return;
+        }
+        let caveats = crate::caveats::Caveats {
+            exec: crate::caveats::Scope::only(["python3".to_string()]),
+            net: crate::caveats::Scope::none(),
+            ..crate::caveats::Caveats::top()
+        };
+        let envelope = dispatch_bridled_shell(
+            serde_json::json!({
+                "cmd": r#"python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)""#,
+                "cwd": "."
+            }),
+            &caveats,
+            None,
+        )
+        .await
+        .expect("dispatch");
+        // The confined path must actually have been taken (else the floor never ran).
+        assert_eq!(
+            envelope["sandbox_kind"], "landlock",
+            "run_command child must be kernel-confined: {envelope}"
+        );
+        // AF_INET socket creation is seccomp-denied → PermissionError → exit 1.
+        // (A net-GRANTED run_command leaves DenyDirect inert; this proves the
+        // net:none case is fully fenced — no direct egress of any protocol.)
+        assert_ne!(
+            envelope["exit_code"], 0,
+            "run_command under net:none must deny the child's AF_INET socket (b1): {envelope}"
         );
     }
 
