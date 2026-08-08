@@ -68,7 +68,13 @@ exclude = ["newt-mesh", "newt-web"]
 # accepted-round usage learning, strict typed wire validation, behavioral-registry
 # integration), the main↔production reconciliation, and the #1529 behavioral
 # constitution. Landed on main via #1526 + #1544.
-version = "0.8.0"
+# 0.8.1 is the OCAP enforcement-floor bug-fix line (epic #749): closing the
+# remaining OPEN deviations in `docs/security/ocap-deviations.md` toward
+# "zero deviations = full OCAP" — noninteractive-launch-policy (typed frozen
+# LaunchAuthority, #1620) first, then exec-behavior-bound / mcp-under-leash /
+# sod-proposer-not-worker / b1-os-isolation. Security fixes on the 0.8.0 line,
+# not new features — hence a PATCH bump, not 0.9.0.
+version = "0.8.1"
 edition = "2021"
 # MSRV 1.75 -> 1.88. The old "1.75" was already STALE: the current lock needs
 # 1.88 (darling 0.23 + instability 0.3.12, pulled in by the ratatui/rich-tui
@@ -261,23 +267,23 @@ tests-pty = { path = "tests/pty" }
 agent-mesh-protocol = "0.6"
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.8.0" }
-newt-data         = { path = "newt-data",         version = "=0.8.0" }
-newt-git          = { path = "newt-git",          version = "=0.8.0" }
-newt-inference    = { path = "newt-inference",    version = "=0.8.0" }
-newt-scheduler    = { path = "newt-scheduler",    version = "=0.8.0" }
-newt-tools        = { path = "newt-tools",        version = "=0.8.0" }
-newt-skills       = { path = "newt-skills",       version = "=0.8.0" }
-newt-tui          = { path = "newt-tui",          version = "=0.8.0" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.8.0" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.8.0" }
-newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.8.0" }
-newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.8.0" }
-newt-coder        = { path = "newt-coder",        version = "=0.8.0" }
-newt-identity     = { path = "newt-identity",     version = "=0.8.0" }
-newt-tuner        = { path = "crates/newt-tuner", version = "=0.8.0" }
-newt-eval         = { path = "newt-eval",         version = "=0.8.0" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.8.0" }
+newt-core         = { path = "newt-core",         version = "=0.8.1" }
+newt-data         = { path = "newt-data",         version = "=0.8.1" }
+newt-git          = { path = "newt-git",          version = "=0.8.1" }
+newt-inference    = { path = "newt-inference",    version = "=0.8.1" }
+newt-scheduler    = { path = "newt-scheduler",    version = "=0.8.1" }
+newt-tools        = { path = "newt-tools",        version = "=0.8.1" }
+newt-skills       = { path = "newt-skills",       version = "=0.8.1" }
+newt-tui          = { path = "newt-tui",          version = "=0.8.1" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.8.1" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.8.1" }
+newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.8.1" }
+newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.8.1" }
+newt-coder        = { path = "newt-coder",        version = "=0.8.1" }
+newt-identity     = { path = "newt-identity",     version = "=0.8.1" }
+newt-tuner        = { path = "crates/newt-tuner", version = "=0.8.1" }
+newt-eval         = { path = "newt-eval",         version = "=0.8.1" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.8.1" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level
