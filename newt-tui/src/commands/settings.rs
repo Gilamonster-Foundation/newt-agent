@@ -195,12 +195,14 @@ fn tenacity_command(arg: &str) -> String {
         "list" => {
             let mut out = String::from("tenacity levels (patient → forcing):");
             out.push_str("\n  auto       inherit from the persona / config / model family");
+            // Snapshot the active level ONCE. Re-reading `effective_tenacity()`
+            // inside the loop let a concurrent override change (another thread /
+            // test mutating the process-global) slip the "← active" marker off
+            // every row — zero levels marked — because the compared value moved
+            // between iterations. One read keeps the render internally consistent.
+            let active_level = effective_tenacity();
             for t in Tenacity::all() {
-                let active = if t == effective_tenacity() {
-                    " ← active"
-                } else {
-                    ""
-                };
+                let active = if t == active_level { " ← active" } else { "" };
                 out.push_str(&format!("\n  {:<10} {}{active}", t.label(), t.describe()));
             }
             out
@@ -434,6 +436,14 @@ mod tests {
 
     #[test]
     fn tenacity_status_and_list_and_error_are_informative() {
+        use newt_core::tenacity::{set_cli_tenacity, Tenacity};
+        // Hold the global-settings lock and pin a known level: sibling tests
+        // mutate the process-global tenacity override, and `list` marks whichever
+        // level is *active*. Without the guard this read raced the mutators and
+        // the "← active" marker intermittently vanished once the hosted runners
+        // upped test parallelism (the CPU-capped self-hosted pods never hit it).
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        set_cli_tenacity(Tenacity::Standard);
         // Status names the active level and the usage hint (no mutation).
         let status = tenacity_command("");
         assert!(status.starts_with("tenacity: "), "{status}");
