@@ -173,24 +173,30 @@ impl B1Floor {
     /// `dispatch_bridled_shell` → agent-bridle shell) today.
     ///
     /// That path spawns through agent-bridle's `ShellTool`, which applies a
-    /// Landlock filesystem fence + a Landlock **TCP-only** connect deny — and
-    /// nothing else. So of the required properties:
+    /// Landlock filesystem fence + the seccomp `socket()`-family egress deny
+    /// (agent-bridle 0.7.15 `ChildNetworkPolicy::DenyDirect`, wired in slice 2).
+    /// So of the required properties, as of the b1 slice stack:
     ///
-    /// * [`DirectNetworkEgressDenied`] is **not** proven — UDP, DNS, raw and
-    ///   packet sockets remain openable; Landlock cannot filter them, and the
-    ///   seccomp `socket()`-family floor is not installed on bridle's spawn
-    ///   thread (agent-bridle exposes no seam for it until the `0.7.15` security
-    ///   patch that adds a declarative child-network policy).
-    /// * [`MediatedEgressOnly`], [`InheritedHandleIsolation`], and
-    ///   [`ProcessTreeContainment`] are wired only into the opt-in
-    ///   `ConstrainedExecutor` lane (via `newt-net-guard` / cgroup subtree),
-    ///   never this shell path.
+    /// * [`DirectNetworkEgressDenied`] IS now proven on this path — no
+    ///   AF_INET/AF_INET6/AF_PACKET socket can be created (seccomp), grounded by
+    ///   `run_command_child_under_net_none_cannot_open_a_socket_b1`. (Not in the
+    ///   unmet set below.)
+    /// * [`MediatedEgressOnly`] is **not** proven — there is no mediated egress
+    ///   broker (deferred, #1599), and worse, a confined child can still reach a
+    ///   host AF_UNIX deputy (pathname + abstract; `af_unix_deputy.rs`), so egress
+    ///   is not broker-only. This is the property `local-deputy-egress` tracks.
+    /// * [`InheritedHandleIsolation`] is **not** proven on this path — the
+    ///   run_command route's fd hygiene is CLOEXEC-based, not the explicit
+    ///   `close_range(3,~0)` the `ConstrainedExecutor` `DenyAll` lane performs
+    ///   (`run_command_route_fd_hygiene_is_cloexec_based_not_explicit_close`).
+    /// * [`ProcessTreeContainment`] is **not** proven on this path — cgroup
+    ///   subtree-kill is wired into the `ConstrainedExecutor` lane, not this shell
+    ///   path.
     ///
-    /// The remaining properties cannot be asserted from this constructor either:
-    /// proof requires **per-session runtime evidence** that the child inherited
-    /// the enforcement, and no such evidence seam exists yet (a later slice).
-    /// This constructor reports the *known structural* gaps; it never
-    /// manufactures a proof.
+    /// So `verify_b1` stays `Absent` naming [`MediatedEgressOnly`] — the
+    /// credential-bearing floor genuinely still absent — never the (now-met)
+    /// direct-egress property. This constructor reports the *known structural*
+    /// gaps; it never manufactures a proof.
     ///
     /// [`DirectNetworkEgressDenied`]: B1Property::DirectNetworkEgressDenied
     /// [`MediatedEgressOnly`]: B1Property::MediatedEgressOnly
@@ -200,7 +206,6 @@ impl B1Floor {
     pub fn live_attacker_path() -> Self {
         Self {
             unmet: vec![
-                B1Property::DirectNetworkEgressDenied,
                 B1Property::MediatedEgressOnly,
                 B1Property::InheritedHandleIsolation,
                 B1Property::ProcessTreeContainment,
@@ -250,13 +255,14 @@ pub fn verify_b1() -> Verification {
     let floor = B1Floor::live_attacker_path();
     let reason = match floor.first_unmet() {
         Some(p) => format!(
-            "b1 property not proven on the live attacker-exec path (run_command → \
-             agent-bridle shell): {} — that path applies only a Landlock fs fence + \
-             TCP-only connect deny, so the seccomp egress floor / mediated broker / \
-             fd hygiene / process-tree containment are not established here, and no \
-             per-session evidence seam records live enforcement. b1 is a set of \
-             PROVEN properties, each met by ANY sufficient mechanism, not a fixed \
-             uid-ns/netns stack",
+            "b1 credential-floor property not proven on the live attacker-exec path \
+             (run_command → agent-bridle shell): {} — DIRECT off-box socket creation \
+             IS now denied there (seccomp, agent-bridle 0.7.15 DenyDirect), but there \
+             is no mediated-egress broker (deferred, #1599) and a confined child can \
+             still reach a host AF_UNIX deputy (local-deputy-egress), so egress is not \
+             broker-only; fd hygiene on this path is CLOEXEC-based and cgroup \
+             subtree-kill is not wired here. b1 is a set of PROVEN properties, each met \
+             by ANY sufficient mechanism, not a fixed uid-ns/netns stack",
             p.name()
         ),
         // Unreachable today (the live path has unmet properties). Even a complete
@@ -361,16 +367,21 @@ mod tests {
     #[test]
     fn b1floor_live_path_reports_network_egress_properties_unmet() {
         let floor = B1Floor::live_attacker_path();
-        // The live run_command -> bridle-shell path proves neither direct-egress
-        // denial nor mediated-egress-only today (Landlock fs + TCP-only deny).
+        // The live run_command -> bridle-shell path now PROVES direct-egress denial
+        // (seccomp, slice 2), so it is no longer in the unmet set; the first
+        // genuinely-absent property is mediated-egress-only (the deferred broker).
         assert!(
             !floor.is_complete(),
             "the live path is not fully fenced yet"
         );
+        assert!(
+            !floor.unmet.contains(&B1Property::DirectNetworkEgressDenied),
+            "direct-egress denial is proven on the live path now — it must not be unmet"
+        );
         assert_eq!(
             floor.first_unmet(),
-            Some(B1Property::DirectNetworkEgressDenied),
-            "direct-egress denial is the first (clearest) gap on the live path"
+            Some(B1Property::MediatedEgressOnly),
+            "the credential-floor broker (mediated-egress-only) is the first remaining gap"
         );
     }
 
@@ -386,8 +397,13 @@ mod tests {
             unreachable!("b1 is Absent")
         };
         assert!(
-            reason.contains(B1Property::DirectNetworkEgressDenied.name()),
-            "reason should name the unmet property: {reason}"
+            reason.contains(B1Property::MediatedEgressOnly.name()),
+            "reason should name the unmet credential-floor property (mediated-egress-only): {reason}"
+        );
+        assert!(
+            !reason.contains("seccomp egress floor / mediated broker / fd hygiene"),
+            "reason must not carry the stale 'seccomp floor not established' wording — direct \
+             egress IS proven now: {reason}"
         );
         assert!(
             reason.contains("not a fixed uid-ns/netns stack"),
@@ -1344,27 +1360,29 @@ pub fn verify_fail_closed_execution() -> Verification {
     }
 }
 
-/// Verify **untrusted-child network confinement** — the property that an
-/// attacker-influenced child cannot reach the network. This is the *basic*
-/// network floor, split out from the stronger credential-bearing [`verify_b1`]:
-/// the confined executor runs every `AgentInfluenced` child under the seccomp
-/// egress-deny floor by default ([`crate::confined_exec::NetGrant::DenyAll`] →
-/// `newt-net-guard`), which denies `socket()` for TCP/UDP/DNS/raw *in addition
-/// to* the Landlock TCP-deny, and REFUSES the spawn if the floor cannot be
-/// established.
+/// Verify **untrusted-child DIRECT network confinement** — the *narrow*,
+/// provable property that an attacker-influenced child cannot create a DIRECT
+/// off-box socket (`AF_INET` / `AF_INET6` / `AF_PACKET` → `EACCES`). This is the
+/// basic network floor, split out from the stronger credential-bearing
+/// [`verify_b1`]: every `AgentInfluenced` child runs under the seccomp
+/// egress-deny floor by default (the `ConstrainedExecutor` `DenyAll` lane via
+/// `newt-net-guard`; the `run_command` shell via agent-bridle 0.7.15
+/// `ChildNetworkPolicy::DenyDirect`), and the spawn is REFUSED if the floor
+/// cannot be established.
 ///
-/// `Verified` iff both halves of that floor are enforceable on this host: the
-/// seccomp filter ([`crate::netguard::egress_deny_supported`]) and the Landlock
-/// fs fence the guard runs under ([`crate::confined_exec::kernel_fs_fence_available`]).
-/// Either way an attacker child never egresses — it is denied if it runs, or the
-/// spawn is refused. Where the floor is unenforceable this is fail-closed
-/// `Absent`.
+/// `Verified` iff both halves are enforceable on this host: the seccomp filter
+/// ([`crate::netguard::egress_deny_supported`]) and the Landlock fs fence
+/// ([`crate::confined_exec::kernel_fs_fence_available`]).
 ///
-/// This is deliberately WEAKER than `verify_b1`: it does NOT provide a mediated
-/// egress proxy, credential brokering, or the full OS floor, so it must not
-/// unlock credential-seeding capabilities (those still require `verify_b1`).
-/// Grounded by `newt-core/tests/net_guard_executor.rs` (a live child + its
-/// descendants cannot open a socket).
+/// **This does NOT claim the child cannot reach the network at all.** The
+/// seccomp floor deliberately allows `AF_UNIX`, and Landlock does not govern
+/// unix-socket `connect`, so a confined child can still reach a host AF_UNIX
+/// deputy (`af_unix_deputy.rs`) — an INDIRECT-egress residual tracked as the
+/// ACTIVE `local-deputy-egress` deviation. This verifier asserts only the
+/// direct-socket denial, and must not unlock credential-seeding (that needs
+/// [`verify_b1`], which additionally requires the deferred mediated-egress
+/// broker). Grounded by `net_guard_executor.rs` +
+/// `run_command_child_under_net_none_cannot_open_a_socket_b1`.
 #[must_use]
 pub fn verify_network_confinement() -> Verification {
     #[cfg(target_os = "linux")]
@@ -1380,7 +1398,10 @@ pub fn verify_network_confinement() -> Verification {
                            agent-bridle shell installs the same seccomp deny at the spawn owner via \
                            ChildNetworkPolicy::DenyDirect (agent-bridle 0.7.15), proven by \
                            run_command_child_under_net_none_cannot_open_a_socket_b1 — all beneath \
-                           the Landlock fs fence; no TCP/UDP/DNS/raw egress on any path"
+                           the Landlock fs fence. NARROW claim: no DIRECT off-box socket (AF_INET/\
+                           AF_INET6/AF_PACKET) can be created on any path. NOT a no-egress claim — \
+                           AF_UNIX local-deputy egress is a separate ACTIVE residual \
+                           (local-deputy-egress)"
                     .into(),
             }
         } else {

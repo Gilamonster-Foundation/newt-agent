@@ -16,10 +16,15 @@
 //! `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu ≥ 23.10) — seccomp
 //! is host-policy-independent.
 //!
-//! `AF_UNIX` (local IPC) is deliberately allowed: a *path*-named unix socket is
-//! already governed by the Landlock fs fence. Abstract-namespace unix sockets
-//! (which a netns would isolate) remain a bounded residual, tracked with the b1
-//! entry.
+//! `AF_UNIX` (local IPC) is deliberately allowed. **Correction (closure-proof,
+//! `af_unix_deputy.rs`):** contrary to an earlier note here, Landlock does NOT
+//! govern unix-socket `connect` — its `AccessFs` rights have no such right — so a
+//! confined child can `connect()` to a host AF_UNIX deputy at BOTH a pathname
+//! (outside the fs fence) AND an abstract name. So allowing `AF_UNIX` leaves an
+//! INDIRECT-egress residual (a network-relaying local deputy), tracked as the
+//! ACTIVE `local-deputy-egress` deviation and closed only by the deferred netns /
+//! mediated-egress floor (#1599). The direct-socket floor here still stands: no
+//! `AF_INET`/`AF_INET6`/`AF_PACKET` socket can be created.
 
 /// Whether the seccomp egress-deny floor can be built and installed on this
 /// platform. Linux-only; elsewhere the confined executor fails closed before a

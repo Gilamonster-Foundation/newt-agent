@@ -125,8 +125,8 @@ def check_register(res: Result):
         if missing:
             res.err(f"deviation '{dev_id}' is incomplete — missing fields: {', '.join(missing)} "
                     "(a half-specified caveat is a silent one)")
-        if e["status"] not in ("OPEN", "CLOSED", "GATED"):
-            res.err(f"deviation '{dev_id}' has no clear OPEN/CLOSED/GATED status")
+        if e["status"] not in ("OPEN", "CLOSED", "GATED", "BOUNDED"):
+            res.err(f"deviation '{dev_id}' has no clear OPEN/CLOSED/GATED/BOUNDED status")
 
     # Index rows without a full entry are stubs — surfaced, never silent.
     for dev_id in sorted(table_ids - set(entries)):
@@ -206,6 +206,104 @@ def check_launch_authority_reads(res: Result):
                 )
 
 
+# Machine-checkable evidence fields that turn a Status label into a proven state.
+GUARD_SYMBOLS_RE = re.compile(r"Unreachable-guard-symbols:\**\s*`?([A-Za-z0-9_,\s`]+)")
+BOUNDED_BY_RE = re.compile(r"Bounded-by:\**\s*`?([a-z0-9,\-\s`]+)")
+
+
+def _list_field(field_re, body):
+    m = field_re.search(body)
+    if not m:
+        return []
+    raw = m.group(1).replace("`", "").strip()
+    # Stop at the first line break — the field is a single line.
+    raw = raw.splitlines()[0] if raw else raw
+    return [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
+
+
+def _rust_texts():
+    out = {}
+    for path in REPO.rglob("*.rs"):
+        rel = path.relative_to(REPO)
+        if any(part in SKIP_DIRS for part in rel.parts):
+            continue
+        try:
+            out[rel] = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            out[rel] = ""
+    return out
+
+
+def _is_test_file(rel: Path) -> bool:
+    return ("tests" in rel.parts) or rel.name.endswith(("_test.rs", "_tests.rs"))
+
+
+def check_state_proofs(res: Result, entries: dict, texts=None):
+    """The teeth for the non-ACTIVE states: a `Status:` label is NOT evidence.
+
+    GATED must name the Rust capability symbols it gates (`Unreachable-guard-
+    symbols:`) and ocap-check proves they have NO caller outside their defining
+    file + tests — so a future contributor who wires the capability makes CI fail.
+    BOUNDED must name the CLOSED deviations that bound the reachable residual's
+    authority (`Bounded-by:`) — a bound that is not itself enforced bounds nothing.
+    A cosmetic OPEN->GATED/BOUNDED relabel therefore cannot pass.
+
+    `texts` (rel-path -> source) is injectable so the self-test can drive the
+    unreachability check over a fixture tree instead of the real repo.
+    """
+    if texts is None:
+        texts = _rust_texts()
+    for dev_id, e in entries.items():
+        status, body = e["status"], e["body"]
+        if status == "GATED":
+            syms = _list_field(GUARD_SYMBOLS_RE, body)
+            if not syms:
+                res.err(
+                    f"GATED '{dev_id}' declares no `Unreachable-guard-symbols:` — GATED needs a "
+                    "MACHINE-CHECKABLE unreachability proof, not a label. Name the Rust capability "
+                    "functions it gates (they must have no caller)."
+                )
+                continue
+            for sym in syms:
+                def_files = {
+                    rel for rel, t in texts.items()
+                    if re.search(rf"\bfn\s+{re.escape(sym)}\s*[<(]", t)
+                }
+                if not def_files:
+                    res.err(
+                        f"GATED '{dev_id}': guard symbol `{sym}` has no `fn {sym}` in the tree — "
+                        "cannot prove unreachability of a symbol that does not exist."
+                    )
+                    continue
+                call_re = re.compile(rf"\b{re.escape(sym)}\s*\(")
+                callers = sorted(
+                    str(rel) for rel, t in texts.items()
+                    if rel not in def_files and not _is_test_file(rel) and call_re.search(t)
+                )
+                if callers:
+                    res.err(
+                        f"GATED '{dev_id}': guard symbol `{sym}` is CALLED (reachable) at "
+                        f"{', '.join(callers)} — a GATED capability must be UNREACHABLE. Make the "
+                        "deviation ACTIVE and gate the caller, or remove the call."
+                    )
+        elif status == "BOUNDED":
+            bys = _list_field(BOUNDED_BY_RE, body)
+            if not bys:
+                res.err(
+                    f"BOUNDED '{dev_id}' declares no `Bounded-by:` — a reachable residual counts as "
+                    "BOUNDED only when its authority cannot exceed other INDEPENDENTLY-ENFORCED "
+                    "(CLOSED) invariants. Name them."
+                )
+                continue
+            for b in bys:
+                bstat = entries.get(b, {}).get("status")
+                if bstat != "CLOSED":
+                    res.err(
+                        f"BOUNDED '{dev_id}': bound `{b}` is not CLOSED (status={bstat or 'MISSING'}) "
+                        "— a bound that is not itself enforced bounds nothing."
+                    )
+
+
 def print_ledger(known_ids: set, entries: dict, danger_sites: int):
     def status_of(i):
         return entries.get(i, {}).get("status", "OPEN")
@@ -217,22 +315,100 @@ def print_ledger(known_ids: set, entries: dict, danger_sites: int):
     # build, not an active mediation gap. "zero ACTIVE" = zero OPEN.
     active = sorted(i for i in known_ids if status_of(i) == "OPEN")
     gated = sorted(i for i in known_ids if status_of(i) == "GATED")
+    bounded = sorted(i for i in known_ids if status_of(i) == "BOUNDED")
     closed = sorted(i for i in known_ids if status_of(i) == "CLOSED")
     print("── OCAP deviation ledger " + "─" * 40)
     print(f"  registered deviations : {len(known_ids)}")
-    print(f"  ACTIVE / OPEN (reachable capability caveated down): {len(active)}  ->  {', '.join(active) or '(none)'}")
-    print(f"  GATED (capability UNREACHABLE + fail-closed + machine-enforced): {len(gated)}  ->  {', '.join(gated) or '(none)'}")
+    print(f"  ACTIVE / OPEN (reachable capability, invariant NOT enforced NOR bounded): {len(active)}  ->  {', '.join(active) or '(none)'}")
+    print(f"  GATED (capability mechanically UNREACHABLE + fail-closed + ratcheted): {len(gated)}  ->  {', '.join(gated) or '(none)'}")
+    print(f"  BOUNDED (reachable, authority cannot exceed CLOSED invariants): {len(bounded)}  ->  {', '.join(bounded) or '(none)'}")
     print(f"  CLOSED (invariant enforced, capability freed): {len(closed)}  ->  {', '.join(closed) or '(none)'}")
     print(f"  OCAP-DANGER sites in tree     : {danger_sites}")
     if not active:
-        print("  ✓ ZERO ACTIVE deviations — complete mediation for every reachable capability")
+        print("  ✓ ZERO ACTIVE deviations — every reachable capability is enforced (CLOSED), "
+              "bounded by CLOSED invariants (BOUNDED), or mechanically unreachable (GATED)")
     print("─" * 64)
 
 
+def _fixture_entries(md: str) -> dict:
+    return parse_register(md)[1]
+
+
+def run_self_tests() -> int:
+    """Adversarial mutation tests proving the state machinery is GROUNDED, not a
+    label (review concern 1). Wired into CI beside the real check.
+
+    - a cosmetic OPEN->GATED relabel (no guard-symbols) is rejected;
+    - a GATED capability that has ANY caller (made reachable) is rejected;
+    - a GATED capability with no caller is accepted;
+    - a BOUNDED bound that is not itself CLOSED is rejected.
+    """
+    failures = []
+
+    def expect(name, cond):
+        if not cond:
+            failures.append(name)
+
+    # 1. Cosmetic relabel OPEN->GATED with no proof MUST error.
+    md = "### x\n- **Status:** GATED — relabelled with no proof\n"
+    r = Result()
+    check_state_proofs(r, _fixture_entries(md), texts={})
+    expect(
+        "cosmetic-gated-relabel-rejected",
+        any("Unreachable-guard-symbols" in e for e in r.errors),
+    )
+
+    # 2. GATED capability with a CALLER (reachable) MUST error (inverse mutation).
+    md = "### x\n- **Unreachable-guard-symbols:** foo\n- **Status:** GATED\n"
+    texts = {
+        Path("a/def.rs"): "pub fn foo() {}",
+        Path("b/caller.rs"): "fn go() { foo(); }",
+    }
+    r = Result()
+    check_state_proofs(r, _fixture_entries(md), texts=texts)
+    expect("gated-with-a-caller-rejected", any("is CALLED (reachable)" in e for e in r.errors))
+
+    # 3. GATED with the only reference in a TEST file MUST pass.
+    texts = {
+        Path("a/def.rs"): "pub fn foo() {}",
+        Path("a/tests/t.rs"): "fn t() { foo(); }",
+    }
+    r = Result()
+    check_state_proofs(r, _fixture_entries(md), texts=texts)
+    expect("gated-unreachable-accepted", not r.errors)
+
+    # 4. BOUNDED whose bound is not CLOSED MUST error.
+    md = "### x\n- **Bounded-by:** y\n- **Status:** BOUNDED\n\n### y\n- **Status:** OPEN\n"
+    r = Result()
+    check_state_proofs(r, _fixture_entries(md), texts={})
+    expect("bounded-by-open-rejected", any("is not CLOSED" in e for e in r.errors))
+
+    # 5. BOUNDED whose bound IS CLOSED MUST pass.
+    md = "### x\n- **Bounded-by:** y\n- **Status:** BOUNDED\n\n### y\n- **Status:** CLOSED\n"
+    r = Result()
+    check_state_proofs(r, _fixture_entries(md), texts={})
+    expect("bounded-by-closed-accepted", not r.errors)
+
+    if failures:
+        for f in failures:
+            print(f"  SELF-TEST FAIL: {f}", file=sys.stderr)
+        print(
+            f"\nocap-check --self-test FAILED ({len(failures)}) — the GATED/BOUNDED machinery is "
+            "not grounded; a cosmetic relabel could pass. Fix check_state_proofs.",
+            file=sys.stderr,
+        )
+        return 1
+    print("ocap-check --self-test OK — cosmetic relabels + reachable-capability mutations rejected.")
+    return 0
+
+
 def main() -> int:
+    if "--self-test" in sys.argv:
+        return run_self_tests()
     res = Result()
     known_ids, entries = check_register(res)
     danger_sites = check_code_guards(res, known_ids, entries)
+    check_state_proofs(res, entries)
     check_launch_authority_reads(res)
     print_ledger(known_ids, entries, danger_sites)
 

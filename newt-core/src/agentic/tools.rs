@@ -5793,6 +5793,107 @@ mod tests {
         );
     }
 
+    /// Closure-proof: the run_command route allows AF_UNIX (deliberately) and
+    /// does NOT fence an abstract-namespace `connect()`, so a confined child CAN
+    /// reach a host abstract-namespace unix-domain deputy — the local-deputy
+    /// egress path the direct-socket seccomp floor does not close. Pinned so a
+    /// future fence (netns) that closes it forces the register + public claim to
+    /// be revisited. (Grounds the honest narrowing: "direct AF_INET/INET6/PACKET
+    /// denied", NOT "no network egress".)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_command_child_can_reach_an_af_unix_abstract_deputy() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        if !crate::confined_exec::kernel_fs_fence_available()
+            || !std::path::Path::new("/usr/bin/python3").exists()
+        {
+            return;
+        }
+        let name = format!("newt-rc-afunix-{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let _listener = UnixListener::bind_addr(&addr).unwrap();
+        let caveats = crate::caveats::Caveats {
+            exec: crate::caveats::Scope::only(["python3".to_string()]),
+            net: crate::caveats::Scope::none(),
+            ..crate::caveats::Caveats::top()
+        };
+        let cmd = format!(
+            r#"python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('\0{name}'); print('DEPUTY-REACHED'); s.close()""#
+        );
+        let envelope =
+            dispatch_bridled_shell(serde_json::json!({"cmd": cmd, "cwd": "."}), &caveats, None)
+                .await
+                .expect("dispatch");
+        assert_eq!(
+            envelope["sandbox_kind"], "landlock",
+            "child must be kernel-confined: {envelope}"
+        );
+        assert!(
+            envelope["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("DEPUTY-REACHED"),
+            "run_command child reached an AF_UNIX abstract deputy — the ambient-deputy egress \
+             residual is REAL on the run_command route (register it; narrow the claim): {envelope}"
+        );
+    }
+
+    /// Closure-proof: the run_command route's FD hygiene is CLOEXEC-based (std's
+    /// default + agent-bridle `set_cloexec`), NOT the explicit `close_range(3,~0)`
+    /// the `NetGrant::DenyAll` `newt-net-guard` route performs. This pins that a
+    /// deliberately-NON-CLOEXEC descriptor IS inherited by the run_command child
+    /// — so the guarantee "a pre-opened network descriptor cannot bypass the
+    /// socket() filter" holds ONLY because newt opens its real fds via std
+    /// (CLOEXEC); a non-CLOEXEC fd would cross. Documents the asymmetry honestly.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_command_route_fd_hygiene_is_cloexec_based_not_explicit_close() {
+        use std::os::fd::AsRawFd;
+        if !crate::confined_exec::kernel_fs_fence_available() {
+            return;
+        }
+        // A marker fd with CLOEXEC deliberately CLEARED (the case std never
+        // produces, but a raw-libc caller could).
+        let marker = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = marker.as_raw_fd();
+        // SAFETY: fcntl on a valid owned fd; clears the close-on-exec flag.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        }
+        if !std::path::Path::new("/usr/bin/python3").exists() {
+            return;
+        }
+        let caveats = crate::caveats::Caveats {
+            exec: crate::caveats::Scope::only(["python3".to_string()]),
+            net: crate::caveats::Scope::none(),
+            ..crate::caveats::Caveats::top()
+        };
+        let cmd = format!(
+            r#"python3 -c "import os; print('FD-INHERITED' if os.path.exists('/proc/self/fd/{fd}') else 'fd-closed')""#
+        );
+        let envelope =
+            dispatch_bridled_shell(serde_json::json!({"cmd": cmd, "cwd": "."}), &caveats, None)
+                .await
+                .expect("dispatch");
+        drop(marker);
+        let stdout = envelope["stdout"].as_str().unwrap_or_default().to_string();
+        // Ground truth: a non-CLOEXEC fd crosses into the run_command child (the
+        // route does not explicitly close fds ≥ 3). If this ever flips to
+        // fd-closed, the route gained explicit fd-closing — a strict improvement;
+        // update the doc/register. Skipped-outcome tolerated where the confined
+        // spawn could not run.
+        if envelope["sandbox_kind"] == "landlock" {
+            assert!(
+                stdout.contains("FD-INHERITED"),
+                "expected a non-CLOEXEC fd to be inherited (run_command FD hygiene is CLOEXEC-based, \
+                 not explicit close). If now fd-closed, the route added explicit closing — update \
+                 docs + register: {envelope}"
+            );
+        }
+    }
+
     // ---- #717: classify_phantom_reach (pure, no fs) ----
 
     #[test]
