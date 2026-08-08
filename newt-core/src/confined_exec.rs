@@ -310,11 +310,27 @@ impl ConstrainedExecutor {
     /// kernel-enforced — so a platform/kernel without Landlock (or any OS fs
     /// backend) fails closed here rather than running the child unconfined.
     pub fn run(req: &ExecRequest) -> Result<ConfinedOutput, ExecRefused> {
+        // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
+        // the whole descendant TREE — including a setsid / double-fork daemon that
+        // escapes the process group — can be terminated with one `cgroup.kill`.
+        // Best-effort: `None` where cgroup delegation is unavailable (killpg
+        // fallback + the b1 residual).
+        #[cfg(target_os = "linux")]
+        let cgroup = if req.net_grant == NetGrant::DenyAll {
+            CgroupHandle::create()
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let cgroup_procs = cgroup.as_ref().map(CgroupHandle::procs);
+        #[cfg(not(target_os = "linux"))]
+        let cgroup_procs: Option<PathBuf> = None;
+
         // Apply the network floor: NetGrant::DenyAll rewrites the child to run
         // under `newt-net-guard` (seccomp egress deny) with the guard's dir added
         // to the fs fence's read set so it can be exec'd. Refuses if the floor
         // cannot be established (never a weaker net floor).
-        let (program, args, caveats) = Self::resolve_net_floor(req)?;
+        let (program, args, caveats) = Self::resolve_net_floor(req, cgroup_procs.as_deref())?;
         let cx = mint_context(req.origin, &caveats)?;
 
         let mut cmd = ConfinedCommand::new(&program)
@@ -365,6 +381,10 @@ impl ConstrainedExecutor {
             }
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
+                    #[cfg(target_os = "linux")]
+                    if let Some(cg) = &cgroup {
+                        cg.kill();
+                    }
                     kill_process_group(pgid);
                     timed_out = true;
                     break child.child.wait().map_err(ExecRefused::Spawn)?;
@@ -373,10 +393,13 @@ impl ConstrainedExecutor {
             std::thread::sleep(Duration::from_millis(20));
         };
 
-        // Sweep any descendant the child left running in its group (a background
-        // `cmd &` that stayed in-group). A double-fork/`setsid` daemon escapes
-        // the group and is bounded by b1's PID namespace (open residual);
-        // killpg contains the common same-group case.
+        // Sweep the whole descendant tree. `cgroup.kill` catches a setsid /
+        // double-fork daemon that escaped the process group; `killpg` is the
+        // fallback where cgroup delegation was unavailable.
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &cgroup {
+            cg.kill();
+        }
         kill_process_group(pgid);
 
         let stdout = out_thread.join().unwrap_or_default();
@@ -397,8 +420,19 @@ impl ConstrainedExecutor {
     /// Compute the effective `(program, args, caveats)` after applying the
     /// request's [`NetGrant`]. [`NetGrant::DenyAll`] wraps the real program in
     /// `newt-net-guard` and grants the fs fence read+exec on the guard's dir; if
-    /// the seccomp floor cannot be established it refuses (fail-closed).
-    fn resolve_net_floor(req: &ExecRequest) -> Result<(String, Vec<String>, Caveats), ExecRefused> {
+    /// the seccomp floor cannot be established it refuses (fail-closed). When
+    /// `cgroup_procs` is `Some`, the guard is told to join that cgroup (its
+    /// `cgroup.procs` is added to the write fence) before it execs.
+    fn resolve_net_floor(
+        req: &ExecRequest,
+        cgroup_procs: Option<&Path>,
+    ) -> Result<(String, Vec<String>, Caveats), ExecRefused> {
+        // Only the Linux `DenyAll` arm reads `cgroup_procs`; on other platforms
+        // that arm is `#[cfg]`'d out and `DenyAll` fails closed, so the parameter
+        // is genuinely unused there. Consume it to keep `-D warnings` happy
+        // without weakening the Linux signature both callers share.
+        #[cfg(not(target_os = "linux"))]
+        let _ = cgroup_procs;
         match req.net_grant {
             NetGrant::Unrestricted => {
                 Ok((req.program.clone(), req.args.clone(), req.caveats.clone()))
@@ -410,7 +444,18 @@ impl ConstrainedExecutor {
                 if let Some(dir) = guard.parent() {
                     extend_read_root(&mut caveats, dir.to_string_lossy().into_owned());
                 }
-                let mut args = vec!["--".to_string(), req.program.clone()];
+                let mut args: Vec<String> = Vec::new();
+                if let Some(procs) = cgroup_procs {
+                    // Grant write to the single cgroup.procs file so the guard can
+                    // join the subtree under Landlock (it cannot escape to another
+                    // cgroup — only its own procs file is writable).
+                    let procs = procs.to_string_lossy().into_owned();
+                    extend_write_root(&mut caveats, procs.clone());
+                    args.push("--cgroup-procs".to_string());
+                    args.push(procs);
+                }
+                args.push("--".to_string());
+                args.push(req.program.clone());
                 args.extend(req.args.iter().cloned());
                 Ok((guard.to_string_lossy().into_owned(), args, caveats))
             }
@@ -466,6 +511,100 @@ fn extend_read_root(caveats: &mut Caveats, dir: String) {
         Scope::All => Scope::All,
         Scope::Only(set) => Scope::only(set.iter().cloned().chain(std::iter::once(dir))),
     };
+}
+
+/// Add one write path to a caveats fs-write scope; `All` stays `All`.
+#[cfg(target_os = "linux")]
+fn extend_write_root(caveats: &mut Caveats, path: String) {
+    caveats.fs_write = match &caveats.fs_write {
+        Scope::All => Scope::All,
+        Scope::Only(set) => Scope::only(set.iter().cloned().chain(std::iter::once(path))),
+    };
+}
+
+/// A child-lifetime cgroup-v2 subtree: the confined child (and EVERY descendant,
+/// including a `setsid` / double-fork daemon that escapes the process group) is
+/// placed in it, so one write to `cgroup.kill` terminates the whole tree —
+/// containment `killpg` alone cannot provide.
+///
+/// Best-effort and unprivileged: [`create`](Self::create) makes a fresh directory
+/// under this process's OWN delegated cgroup and returns `None` where cgroup-v2
+/// delegation is unavailable (the executor then keeps the killpg fallback and the
+/// full-tree containment stays a `b1` residual). Dropping it kills + removes the
+/// subtree.
+#[cfg(target_os = "linux")]
+pub struct CgroupHandle {
+    dir: PathBuf,
+}
+
+/// Whether a delegated cgroup-v2 subtree with `cgroup.kill` can be created on
+/// this host (the mechanism that contains a `setsid` / double-fork escape).
+/// `false` where cgroup-v2 delegation is unavailable — e.g. an unprivileged
+/// container/pod without a delegated subtree — in which case the executor falls
+/// back to `killpg` and full-tree containment stays a `b1` residual. Real-resource
+/// tests use this to skip the stronger assertion where the primitive is absent.
+#[must_use]
+pub fn cgroup_subtree_kill_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        CgroupHandle::create().is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CgroupHandle {
+    /// Create a fresh sub-cgroup under this process's delegated cgroup, or `None`
+    /// if cgroup-v2 delegation (`cgroup.kill`) is unavailable here.
+    fn create() -> Option<Self> {
+        let self_cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        // The unified (v2) line is `0::<relative-path>`.
+        let rel = self_cg
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))?
+            .trim()
+            .trim_start_matches('/');
+        let pid = std::process::id();
+        // A per-process counter disambiguates concurrent runs (no rng available).
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/sys/fs/cgroup/{rel}/newt-exec-{pid}-{n}"));
+        std::fs::create_dir(&dir).ok()?;
+        if dir.join("cgroup.kill").exists() {
+            Some(Self { dir })
+        } else {
+            let _ = std::fs::remove_dir(&dir);
+            None
+        }
+    }
+
+    /// The `cgroup.procs` file a joining child writes its pid into.
+    fn procs(&self) -> PathBuf {
+        self.dir.join("cgroup.procs")
+    }
+
+    /// Kill every process in the subtree (setsid escapes included). Best-effort.
+    fn kill(&self) {
+        let _ = std::fs::write(self.dir.join("cgroup.kill"), "1");
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CgroupHandle {
+    fn drop(&mut self) {
+        self.kill();
+        // rmdir needs the cgroup empty; the kill above drains it, but reaping is
+        // asynchronous, so retry briefly.
+        for _ in 0..50 {
+            if std::fs::remove_dir(&self.dir).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// Read a captured pipe to EOF (best-effort). Runs on its own thread so the
