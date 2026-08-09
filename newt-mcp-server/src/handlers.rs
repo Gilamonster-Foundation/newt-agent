@@ -759,14 +759,29 @@ mod tests {
         serde_json::from_str(text.trim()).unwrap()
     }
 
-    /// A restrictive grant: only `echo` may exec, capped call budget. Used by
-    /// the superseded-`shell_run` regression tests below.
+    /// A restrictive grant: only the platform echo carrier may exec, capped
+    /// call budget. Used by the superseded-`shell_run` regression tests below.
     fn echo_only_grant() -> Caveats {
         use agent_bridle::{CountBound, Scope};
+        #[cfg(windows)]
+        let exec = Scope::only(["cmd.exe".to_string()]);
+        #[cfg(not(windows))]
+        let exec = Scope::only(["echo".to_string()]);
         Caveats {
-            exec: Scope::only(["echo".to_string()]),
+            exec,
             max_calls: CountBound::AtMost(8),
             ..Caveats::top()
+        }
+    }
+
+    fn echo_command() -> &'static str {
+        #[cfg(windows)]
+        {
+            "cmd.exe /c echo bridled"
+        }
+        #[cfg(not(windows))]
+        {
+            "echo bridled"
         }
     }
 
@@ -1217,7 +1232,7 @@ mod tests {
                 "jsonrpc": "2.0", "id": 60, "method": "tools/call",
                 "params": {
                     "name": "shell_run",
-                    "arguments": { "cmd": "echo bridled" }
+                    "arguments": { "cmd": echo_command() }
                 }
             }),
         )

@@ -15,6 +15,8 @@
 
 set windows-shell := ["powershell.exe", "-NoProfile", "-Command"]
 
+PYTHON := if os() == "windows" { "python" } else { "python3" }
+
 default:
     @just --list
 
@@ -371,16 +373,16 @@ cov-ci:
 # PIPELINE PARITY: mirrored by the "OCAP register honesty" step in
 # .github/workflows/ci.yml (Rust lint job).
 ocap-check:
-    python3 scripts/ocap_check.py --self-test
-    python3 scripts/ocap_check.py
+    {{PYTHON}} scripts/ocap_check.py --self-test
+    {{PYTHON}} scripts/ocap_check.py
 
 # Automated process-spawn inventory gate (P4 `p4-constrained-executor`): fails on
 # any NEW/unreviewed `Command`/`process::Command` site vs docs/security/spawn-inventory.toml.
 # PIPELINE PARITY: mirrored by the "process-spawn inventory" step in
 # .github/workflows/ci.yml (Rust lint job).
 spawn-inventory:
-    python3 scripts/spawn_inventory.py --self-test
-    python3 scripts/spawn_inventory.py
+    {{PYTHON}} scripts/spawn_inventory.py --self-test
+    {{PYTHON}} scripts/spawn_inventory.py
 
 #
 # `main`/release MUST stay on agent-bridle's `feat/step-up-decision-mvp` branch

@@ -3156,7 +3156,9 @@ mod tests {
             token_ref.ends_with(".token.age"),
             "encrypted ref: {token_ref}"
         );
-        let token_path = std::path::PathBuf::from(token_ref);
+        let token_path = path
+            .with_file_name("backends")
+            .join(format!("{name}.token.age"));
         let body = std::fs::read_to_string(&token_path).unwrap();
         assert!(
             body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"),

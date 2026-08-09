@@ -66,8 +66,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
-| `local-deputy-egress` | no indirect egress via a host AF_UNIX deputy | 🟠 ACTIVE (linux) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
+| `local-deputy-egress` | no indirect egress via a host AF_UNIX / Windows named-pipe deputy | 🟠 ACTIVE (linux/windows) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
 | `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
+| `windows-inheritable-handle-leak` | no ambient inherited OS object handles cross into an AppContainer child | 🟠 ACTIVE (Windows) | (a Windows confinement limitation on attacker-exec children — not a gated capability) |
+| `windows-shelltool-env-inheritance` | confined Windows `run_command` children start from an explicit env allow-list, not the Newt parent's ambient env | 🟠 ACTIVE (Windows run_command) | (provider-bearing Newt processes must not rely on `run_command` env isolation until agent-bridle env-clear parity lands) |
 | `unconfined-fallback-on-missing-backend` | attacker-exec refuses (never runs advisory) when the native fs/net backend is unavailable | 🟠 ACTIVE | (run_command advisory-fallback; fixed by a per-axis bridle strength floor) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
@@ -130,10 +132,14 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   (TCP+UDP+DNS+raw via seccomp — #1599's socket-level goal met on Linux; the netns/egress-proxy form
   remains for the credential-bearing floor). Bounded confinement-hardening follow-ons, each tracked and
   NONE blocking v0.8.0: **#1599** (mediated egress proxy / netns for the credential floor). **#1600
-  (SafeSubset/confined-shell env inheritance) is CLOSED** (step-8.9): the confined shell env
-  (`venv_env_map`) is an allowlist — `ConfinedCommand::env_clear` + a narrow name passthrough
+  (SafeSubset/confined-shell env inheritance) is CLOSED** (step-8.9) for Newt's env-seam input:
+  `venv_env_map` is an allowlist — `ConfinedCommand::env_clear` + a narrow name passthrough
   (default `HOME`/`USER`) + explicit `~/.newt/shell-env/` file imports — never an ambient copy; a
-  regression test proves a parent-only secret (non-allowlisted name) never reaches the confined child.
+  regression test proves a parent-only secret (non-allowlisted name) never reaches that env seam.
+  Windows #1633 separately grounds the actual `run_command` child path and exposes a shared
+  agent-bridle `ShellTool` Windows spawn residual: the child process still inherits the parent's
+  ambient environment, including provider-shaped secrets, before Newt can observe it. That is tracked
+  as ACTIVE under `windows-shelltool-env-inheritance`; no Newt-local compatibility shim is installed.
   **#1601 (inherited-fd hygiene) is CLOSED** (step-8.8):
   `newt-net-guard` calls `close_inherited_fds()` (`close_range(3, ~0)`) before exec, so every
   attacker-influenced child has all fds ≥ 3 closed — an inherited fd (a capability that bypasses
@@ -166,8 +172,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   right, so a confined child can `connect()` to ANY host AF_UNIX socket it can address — BOTH pathname
   (outside the fs fence) AND abstract-namespace. Proven by `af_unix_deputy.rs` (control: an
   out-of-fence file read is EACCES-denied while both socket forms CONNECT) and, on the run_command
-  route, `run_command_child_can_reach_an_af_unix_abstract_deputy`. If a network-relaying deputy is
-  reachable (e.g. an exposed container-runtime socket), indirect egress is possible.
+  route, `run_command_child_can_reach_an_af_unix_abstract_deputy`. On Windows the analogous local
+  deputy is a host named pipe whose DACL admits `ALL APPLICATION PACKAGES`: direct AppContainer
+  loopback is denied, but `appcontainer_named_pipe_deputy`
+  (`newt-core/tests/windows_appcontainer_adversarial.rs`) proves the child can send a payload to the
+  pipe and cause the host deputy to relay over loopback. If a network-relaying local deputy is
+  reachable (e.g. an exposed container-runtime socket or pipe), indirect egress is possible.
 - **Residual:** 🟠 REACHABLE — this is exactly why the public claim is "direct AF_INET/AF_INET6/
   AF_PACKET socket creation is denied", NOT "hostile code cannot exfiltrate over the network".
 - **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable
@@ -185,9 +195,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   opens its real fds via std (CLOEXEC).
 - **Closure criterion:** a network namespace (unprivileged netns — blocked by host policy on Ubuntu
   ≥ 23.10) or an equivalent that isolates BOTH the abstract unix namespace AND pathname reachability
-  — the mediated-egress / netns floor of #1599 — making the only egress an explicit broker capability.
-- **Ratchet guard:** `af_unix_deputy.rs` PINS the current reachability, so a future fence that closes
-  it trips CI and forces this entry + the `verify_network_confinement` claim to widen honestly.
+  — the mediated-egress / netns floor of #1599 — plus the Windows named-pipe/local-IPC deputy
+  surface, making the only egress an explicit broker capability.
+- **Ratchet guard:** `af_unix_deputy.rs` and `appcontainer_named_pipe_deputy` PIN the current
+  reachability, so a future fence that closes either platform's local-deputy path trips CI and
+  forces this entry + the `verify_network_confinement` claim to widen honestly.
 - **Platform scope (macOS — #1632):** `macos: DENIED`. Unlike Linux (seccomp allows AF_UNIX,
   Landlock does not govern unix-socket connect), macOS Seatbelt's `(deny network*)` governs the
   AF_UNIX `connect` **itself**, so a confined child cannot reach a pathname host deputy at all —
@@ -195,9 +207,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `macos_seatbelt_adversarial::seatbelt_pathname_af_unix_deputy` (macOS 26.5.2). This does NOT
   close the entry: the **Linux** residual is unfixed, so the overall status stays OPEN. See
   `docs/security/platform/macos-evidence.md`.
-- **Status:** OPEN — reachable + unbounded ON LINUX; the netns / mediated-egress floor (#1599)
-  closes the Linux half. This is a genuine ACTIVE deviation on Linux; on macOS it is DENIED (above).
-  A macOS result must not cosmetically close the Linux residual. owner: — · review-by: #1599 / epic #749.
+- **Status:** OPEN — reachable + unbounded ON LINUX AND WINDOWS; the netns / mediated-egress floor
+  (#1599) closes the Linux half, while Windows requires an equivalent local-IPC boundary. This is a
+  genuine ACTIVE deviation on Linux and Windows; on macOS it is DENIED (above). A macOS result must
+  not cosmetically close either residual. owner: — · review-by: #1599 / epic #749.
 
 ### mach-xpc-ambient-deputy
 - **Invariant (ideal):** a confined child reaches NO ambient host service (Mach/XPC) that could act
@@ -224,8 +237,75 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Ratchet guard:** `macos_seatbelt_adversarial::seatbelt_mach_xpc_deputy_surface` PINS the current
   ambient surface (`(allow default)`, no `(deny mach…)`), so a future profile that closes it trips
   the test and forces this entry to widen honestly.
-- **Status:** OPEN — reachable + unbounded on macOS; a Linux build is unaffected (no Mach). This is a
+- **Status:** OPEN — reachable + unbounded on macOS; Linux and Windows builds are unaffected (no Mach). This is a
   macOS-scoped ACTIVE deviation discovered by #1632. owner: — · review-by: #1599 / epic #749.
+
+### windows-inheritable-handle-leak
+- **Invariant (ideal):** an attacker-exec child receives only explicitly granted capabilities; arbitrary
+  inheritable OS object handles already open in the Newt parent cannot cross the AppContainer launcher
+  chain and remain usable inside the child.
+- **Practical caveat (now):** Windows AppContainer confines path and network reach, but it does not
+  automatically erase every inheritable handle the parent process has marked inheritable. The real
+  Windows proof `appcontainer_inheritable_handle_inheritance`
+  (`newt-core/tests/windows_appcontainer_adversarial.rs`) creates an inheritable file handle in the
+  parent, launches a PowerShell child through `ConstrainedExecutor`/AppContainer, and the child writes
+  through that raw handle value. That is ambient object authority, separate from the filesystem path
+  fence: the path policy can deny opening a file while a pre-opened inheritable handle still grants
+  access to that object.
+- **Residual:** 🟠 ACTIVE (Windows) — reachable for any parent handle accidentally or deliberately left
+  inheritable before an attacker-influenced AppContainer spawn. It is not a Linux AF_UNIX deputy, and
+  it is not closed by AppContainer path ACLs.
+- **Disabled while open:** nothing — this is a confinement limitation on attacker-exec children, not a
+  gated feature. The child runs; the residual is bounded only by the discipline of not creating
+  inheritable sensitive handles before the spawn.
+- **Compensating controls:** most ordinary Rust/std handles are non-inheritable or CLOEXEC-equivalent
+  by default; Newt does not intentionally grant sensitive inheritable handles to attacker-exec
+  children. That is not a hard guarantee, so the row remains ACTIVE until the spawn path explicitly
+  clears or constrains handle inheritance.
+- **Closure criterion:** the Windows spawn path must prevent arbitrary inherited handles from crossing
+  into AppContainer children, either by using a handle allow-list (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+  / `STARTUPINFOEX`) or by setting `bInheritHandles = false` through the launcher chain, with a
+  positive control proving an intentionally allowed stdio/pipe handle still works when needed.
+- **Ratchet guard:** `appcontainer_inheritable_handle_inheritance` pins the current leak. When the fix
+  lands, flip the test to require the marker write to fail and keep a positive control for explicitly
+  allowed handles.
+- **Status:** OPEN — Windows-only ACTIVE residual; owner: — · review-by: Windows AppContainer handle
+  hygiene follow-up.
+
+### windows-shelltool-env-inheritance
+- **Invariant (ideal):** every confined `run_command` child on Windows starts from an explicit
+  environment allow-list: Newt's structured env seam plus any operator-granted shell env imports, never
+  an ambient copy of the Newt parent process. Provider credentials such as `OPENAI_API_KEY` and
+  `OPENAI_BASE_URL` must not cross unless explicitly granted for that child.
+- **Practical caveat (now):** the actual Windows `run_command` route is
+  `dispatch_bridled_shell` -> agent-bridle `ShellTool` -> `agent-bridle-aclaunch.exe`. In published
+  agent-bridle 0.7.15, `agent-bridle-tool-shell` clears the ambient child env only under the Unix
+  implementation; the Windows child env contract is still inherited. The route-level proof
+  `run_command_windows_provider_env_inheritance_is_active`
+  (`newt-core/src/agentic/tools.rs`) launches through the real AppContainer backend and proves a
+  parent-only `OPENAI_API_KEY` reaches the child. The separate `ConstrainedExecutor` seam does not have
+  this leak: `appcontainer_child_does_not_inherit_provider_credentials`
+  (`newt-core/tests/windows_appcontainer_adversarial.rs`) proves only explicitly granted env crosses
+  there.
+- **Residual:** 🟠 ACTIVE (Windows `run_command`) — reachable when Newt itself holds provider
+  credentials in its process environment and then runs model-influenced `run_command` through the
+  shared ShellTool path.
+- **Disabled while open:** nothing automatic — this is a shared spawn-abstraction defect on an
+  always-reachable attacker-exec route, not a gated capability. Operators who run Newt with live
+  provider credentials should treat Windows `run_command` env isolation as unproven until the shared
+  fix lands.
+- **Compensating controls:** the AppContainer fs/net boundary still holds; this residual is env
+  authority only. ConstrainedExecutor callers already strip ambient env. The correct fix belongs in
+  agent-bridle's Windows ShellTool spawn path (or a shared ShellTool env policy), not in a Newt-local
+  Windows wrapper around bridle.
+- **Closure criterion:** consume an agent-bridle release whose Windows ShellTool starts from an empty
+  or explicitly minimal environment, with a real Windows regression test proving a parent-only
+  provider credential is absent while explicitly granted env still appears. Tracked upstream as
+  Gilamonster-Foundation/agent-bridle#323.
+- **Ratchet guard:** `run_command_windows_provider_env_inheritance_is_active` pins the current leak.
+  When the shared fix lands, flip the test to require `EMPTY` and rename it back to a denial proof.
+- **Status:** OPEN — Windows-only ACTIVE residual in the shared `ShellTool` route; owner:
+  agent-bridle#323.
 
 ### unconfined-fallback-on-missing-backend
 - **Invariant (ideal):** an attacker-exec route must, on EVERY supported platform, either enforce the
@@ -235,19 +315,25 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   Kernel strength floor, so a missing fs/net backend REFUSES (`confinement_unenforceable`). The
   `run_command` route (`dispatch_bridled_shell`) dispatches at the DEFAULT (Advisory) floor. Where the
   native fs/net backend is present (Linux+Landlock, macOS+Seatbelt, Windows+AppContainer) the fence is
-  kernel-enforced and this is confined; but where a RESTRICTED fs/net axis has NO backend at runtime
-  (old Linux w/o Landlock; `sandbox-exec` missing on macOS; AppContainer unavailable on Windows →
-  `best_available_sandbox` = advisory `NoopSandbox`), run_command runs ADVISORY — a compiled hostile
-  child runs on the host (only the in-process L2 interceptor gates the brush engine's own exec
-  decisions). A blanket Kernel floor is the WRONG fix: run_command legitimately restricts `exec`,
+  kernel-enforced and this is confined. Windows feature-path update (#1633): with
+  `windows-appcontainer` compiled in, hiding `agent-bridle-aclaunch.exe` from PATH now refuses before
+  the hostile command runs (`run_command_windows_missing_launcher_refuses_not_host_fallback` and
+  `appcontainer_missing_backend_refuses_not_host`). But where a RESTRICTED fs/net axis has NO backend
+  at runtime or in the compiled feature set (old Linux w/o Landlock; `sandbox-exec` missing on macOS;
+  Windows builds without the AppContainer backend), run_command can still collapse to ADVISORY — a
+  compiled hostile child runs on the host (only the in-process L2 interceptor gates the brush engine's
+  own exec decisions). A blanket Kernel floor is the WRONG fix: run_command legitimately restricts `exec`,
   which Landlock enforces only as `interceptor` (the `exec-behavior-bound` BOUNDED residual), so a
   blanket Kernel floor refuses every exec-restricted command even on Landlock (empirically verified in
   this pass).
-- **Residual:** 🟠 REACHABLE on all platforms when the native fs/net backend is unavailable at runtime.
+- **Residual:** 🟠 REACHABLE on platforms/builds where the native fs/net backend is unavailable or not
+  compiled in. The Windows `windows-appcontainer` feature path has a missing-launcher refusal proof,
+  but that does not close the cross-platform/per-axis floor debt.
 - **Disabled while open:** nothing — a confinement LIMITATION on the always-reachable run_command
   route, not a gated capability.
 - **Compensating controls:** on the SUPPORTED platforms with the backend present (the normative case)
-  run_command IS kernel-confined; the only documented unconfined route is the operator
+  run_command IS kernel-confined; Windows #1633 additionally proves missing-launcher refusal for the
+  AppContainer feature path. The only documented unconfined route is the operator
   `--disable-ocap` / `--full-access` path, which is operator-frozen (`noninteractive-launch-policy`),
   never repo/model selectable.
 - **Closure criterion:** a PER-AXIS strength floor at the agent-bridle boundary (fs/net = Kernel,
@@ -678,7 +764,13 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   timeout AND completion — so a descendant that escapes the process group is still killed
   (`net_guard_descendant_lifetime.rs`, real-resource: a setsid session that killpg cannot reach never
   fires). Best-effort/fail-open to `killpg` only where cgroup-v2 delegation is unavailable (that host's
-  full-tree containment stays a `b1` residual). Does NOT block v0.8.0.
+  full-tree containment stays a `b1` residual). Windows #1633 adds the analogous cleanup evidence for
+  AppContainer launches: `ConstrainedExecutor` attaches the child to a Job Object with
+  `KILL_ON_JOB_CLOSE`, calls `TerminateJobObject` on timeout/completion, and falls back to killing the
+  immediate launcher if job assignment is unavailable; `appcontainer_timeout_cleanup_is_distinct_from_authority`
+  proves a timed-out PowerShell child returns promptly and does not write a late marker. This is
+  lifetime cleanup only, not an authority claim; Windows inherited-handle hygiene remains the separate
+  ACTIVE residual `windows-inheritable-handle-leak`. Does NOT block v0.8.0.
 - **Disabled while open:** (closed for the routing/confinement bound) — the process-tree-cancel
   residual is bounded by `b1`'s OS sandbox as the backstop.
 - **Closure criterion:** met for the migration + confinement bound — `spawn-inventory` shows ZERO
@@ -689,7 +781,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Ratchet guard:** `scripts/spawn_inventory.py` (self-tested; CI-gated) — a new or moved
   `Command`/`process::Command` site fails the build until it is inventoried + classified, and a NEW
   `agent-exec-todo-p4` classification re-opens the migration debt; plus
-  `newt-core/tests/confined_exec_landlock.rs` (real-resource), the `confined_exec` unit tests, and
+  `newt-core/tests/confined_exec_landlock.rs` (real-resource), the Windows AppContainer evidence test
+  `appcontainer_timeout_cleanup_is_distinct_from_authority`, the `confined_exec` unit tests, and
   `host_shell_command_strips_authority_env` (asserts the whole `CHILD_STRIPPED_AUTHORITY_ENV` set is
   excised), which fail if the executor stops confining/failing-closed or the yolo lane stops stripping.
 - **Live verifier (register↔verifier↔gate must agree):** `newt_core::ocap::verify_constrained_executor()`

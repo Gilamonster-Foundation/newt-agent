@@ -292,6 +292,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows
+      - name: Install AppContainer launcher
+        run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings
       - name: cargo test
@@ -301,3 +303,11 @@ jobs:
         # tests on Windows too (the websocket/TLS stack must build there).
         if: always()
         run: cargo test --workspace --features newt-data/kernel
+      - name: Windows AppContainer evidence
+        if: always()
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+          BRIDLE_REQUIRE_UNC_CONTROL: "1"
+        run: |
+          cargo test -p newt-core --features windows-appcontainer --lib run_command_windows_ -- --test-threads=1
+          cargo test -p newt-core --features windows-appcontainer --test windows_appcontainer_adversarial -- --ignored --test-threads=1

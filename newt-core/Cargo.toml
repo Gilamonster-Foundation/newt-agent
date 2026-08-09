@@ -138,7 +138,7 @@ pyo3 = { workspace = true, optional = true }
 # 0)` check above. windows-sys is the official zero-cost sys-binding crate;
 # only the API surfaces actually used are enabled to keep the Windows-only
 # build graph addition minimal.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [target."cfg(target_os = \"linux\")".dependencies]
 # Object-bound workspace fs capability (src/fs_cap.rs, step-52.1). `openat2` is a
@@ -164,6 +164,7 @@ markdown-table-formatter = ["dep:markdown-table-formatter"]
 # Off by default to keep the binary lean.
 markdown-syntect = ["markdown", "dep:syntect"]
 pyo3 = ["dep:pyo3"]
+windows-appcontainer = ["agent-bridle/windows-appcontainer"]
 # Exposes `tty::PromptWindow::test_stub()` to DOWNSTREAM crates' tests. The
 # window is a sealed capability with no public constructor — that is the point —
 # so a crate whose prompt functions now require one needs a sanctioned inert

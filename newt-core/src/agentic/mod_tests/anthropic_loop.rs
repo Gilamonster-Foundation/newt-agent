@@ -728,9 +728,10 @@ impl Respond for SystemShapeResponder {
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
         let no_system_roles = !messages.iter().any(|m| m["role"] == "system");
         let first_is_user = messages.first().is_some_and(|m| m["role"] == "user");
-        if !(system.contains("sys one") && system.contains("sys two"))
-            || !no_system_roles
-            || !first_is_user
+        if !(system.contains("sys one")
+            && system.contains("sys two")
+            && no_system_roles
+            && first_is_user)
         {
             return ResponseTemplate::new(400).set_body_json(serde_json::json!({
                 "type": "error",

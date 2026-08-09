@@ -20,6 +20,10 @@ import re
 import sys
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 REPO = Path(__file__).resolve().parent.parent
 ALLOWLIST = REPO / "docs" / "security" / "spawn-inventory.toml"
 
@@ -68,7 +72,7 @@ def scan(repo: Path) -> dict[str, int]:
         for path in base.rglob("*.rs"):
             n = count_spawns(path.read_text(encoding="utf-8", errors="ignore"))
             if n:
-                found[str(path.relative_to(repo))] = n
+                found[path.relative_to(repo).as_posix()] = n
     return found
 
 
