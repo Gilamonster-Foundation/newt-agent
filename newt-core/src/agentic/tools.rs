@@ -6071,20 +6071,11 @@ mod tests {
     }
 
     #[cfg(all(windows, feature = "windows-appcontainer"))]
-    fn windows_ps_quote(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "''"))
-    }
-
-    #[cfg(all(windows, feature = "windows-appcontainer"))]
-    fn powershell_set_content(path: &std::path::Path, value: &str) -> serde_json::Value {
-        let script = format!(
-            "Set-Content -LiteralPath {} -Value {}",
-            windows_ps_quote(&windows_path(path)),
-            windows_ps_quote(value)
-        );
+    fn cmd_set_content(path: &std::path::Path, value: &str) -> serde_json::Value {
+        let command = format!("echo {value}>{}", windows_path(path));
         serde_json::json!({
-            "program": "powershell.exe",
-            "args": ["-NoProfile", "-Command", script],
+            "program": "cmd.exe",
+            "args": ["/d", "/c", command],
         })
     }
 
@@ -6157,7 +6148,7 @@ mod tests {
             valid_for_generation: crate::caveats::Scope::All,
         };
 
-        let mut granted_args = powershell_set_content(&granted, "GRANTED");
+        let mut granted_args = cmd_set_content(&granted, "GRANTED");
         granted_args["cwd"] = serde_json::Value::String(windows_path(&workspace));
         let ok = dispatch_bridled_shell(granted_args, &caveats, None)
             .await
@@ -6174,7 +6165,7 @@ mod tests {
             std::fs::read_to_string(&granted).unwrap_or_default()
         );
 
-        let mut denied_args = powershell_set_content(&denied, "DENIED");
+        let mut denied_args = cmd_set_content(&denied, "DENIED");
         denied_args["cwd"] = serde_json::Value::String(windows_path(&workspace));
         let no = dispatch_bridled_shell(denied_args, &caveats, None)
             .await
@@ -6271,7 +6262,6 @@ mod tests {
         }
         let workspace = windows_low_dir("env");
         windows_grant_all_appcontainers(workspace.path());
-        let marker = workspace.path().join("env.txt");
         let caveats = crate::caveats::Caveats {
             fs_read: crate::caveats::Scope::only([windows_path(workspace.path())]),
             fs_write: crate::caveats::Scope::only([windows_path(workspace.path())]),
@@ -6280,15 +6270,14 @@ mod tests {
             max_calls: crate::caveats::CountBound::Unlimited,
             valid_for_generation: crate::caveats::Scope::All,
         };
-        let script = format!(
-            "if ($env:OPENAI_API_KEY) {{ Set-Content -LiteralPath {} -Value $env:OPENAI_API_KEY }} else {{ Set-Content -LiteralPath {} -Value 'EMPTY' }}",
-            windows_ps_quote(&windows_path(&marker)),
-            windows_ps_quote(&windows_path(&marker))
-        );
         let envelope = dispatch_bridled_shell(
             serde_json::json!({
-                "program": "powershell.exe",
-                "args": ["-NoProfile", "-Command", script],
+                "program": "cmd.exe",
+                "args": [
+                    "/d",
+                    "/c",
+                    "if defined OPENAI_API_KEY (echo %OPENAI_API_KEY%) else (echo EMPTY)"
+                ],
                 "cwd": windows_path(workspace.path()),
             }),
             &caveats,
@@ -6304,10 +6293,10 @@ mod tests {
             envelope["exit_code"], 0,
             "env probe must execute, not pass by failing to spawn: {envelope}"
         );
-        let text = std::fs::read_to_string(&marker).unwrap_or_default();
+        let text = envelope["stdout"].as_str().unwrap_or_default();
         assert!(
             text.contains("sk-run-command-windows-secret"),
-            "expected to prove the ACTIVE shared bridle Windows env-inheritance residual; stdout marker was {text:?}. Flip this test to denial when agent-bridle grows Windows env_clear parity."
+            "expected to prove the ACTIVE shared bridle Windows env-inheritance residual; stdout was {text:?}. Flip this test to denial when agent-bridle grows Windows env_clear parity."
         );
     }
 

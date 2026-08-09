@@ -1302,12 +1302,11 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
 
     let quick = constrained_run(
         workspace.path(),
-        "powershell.exe",
+        "cmd.exe",
         vec![
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            "Start-Sleep -Milliseconds 50; Write-Output QUICK-RAN".to_string(),
+            "/d".to_string(),
+            "/c".to_string(),
+            "echo QUICK-RAN".to_string(),
         ],
         Duration::from_secs(5),
         Vec::new(),
@@ -1323,12 +1322,11 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
     let started = Instant::now();
     let slow = constrained_run(
         workspace.path(),
-        "powershell.exe",
+        "cmd.exe",
         vec![
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            "Start-Sleep -Seconds 5; Write-Output LATE".to_string(),
+            "/d".to_string(),
+            "/c".to_string(),
+            "for /L %I in (1,1,100000000) do @rem.".to_string(),
         ],
         Duration::from_millis(500),
         Vec::new(),
@@ -1344,8 +1342,8 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
         "timeout cleanup must not block behind the Windows child wait"
     );
     assert!(
-        !String::from_utf8_lossy(&slow.stdout).contains("LATE"),
-        "timed-out child must not run to its post-timeout output point: {slow:?}"
+        slow.stdout.is_empty(),
+        "timed-out CPU-only child must not produce output: {slow:?}"
     );
 }
 

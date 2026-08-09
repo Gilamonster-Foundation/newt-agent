@@ -38,8 +38,9 @@ silent skip. GitHub-hosted runners have a different temp-directory DACL shape
 than the local Windows host, so route-level positive write controls explicitly
 grant only their test workspace to AppContainer package SIDs. Filesystem denial
 fixtures keep their sibling/outside targets ungranted, and the timeout cleanup
-fixture uses stdout rather than filesystem writes so lifecycle remains separate
-from authority.
+fixture uses `cmd.exe` stdout plus a CPU-only timed command rather than
+filesystem writes or PowerShell filesystem providers, so lifecycle remains
+separate from authority.
 
 Manual token snapshot:
 
@@ -82,7 +83,7 @@ the stable two-generation AppContainer signal: both child and grandchild report
 | inheritable HANDLE inheritance | ACTIVE residual on this Windows host: `appcontainer_inheritable_handle_inheritance` deliberately creates an inheritable parent file handle and records whether the AppContainer child can use it. The local host produced `HANDLE-LEAK`; GitHub-hosted runner behavior may close this specific raw handle, but the platform row remains ACTIVE until the shared Windows spawn path proves arbitrary inheritable handles are blocked on every supported launcher chain. |
 | child/grandchild token escape | DENIED: `appcontainer_descendants_stay_in_the_same_token` shows cmd and PowerShell descendants report low/restricted token evidence at two generations. |
 | shell/helper follows process tree | DENIED for tested helpers: cmd, PowerShell, and staged workspace `.exe` stay under AppContainer. Git is evidence-only because installed Git ACLs vary. |
-| timeout/cancellation cleanup | BOUNDED cleanup, not authority: `appcontainer_timeout_cleanup_is_distinct_from_authority` proves a timed-out PowerShell child returns promptly and does not write a late marker after the timeout. This is implemented with a Windows Job Object plus immediate-child kill fallback. |
+| timeout/cancellation cleanup | BOUNDED cleanup, not authority: `appcontainer_timeout_cleanup_is_distinct_from_authority` proves a fast `cmd.exe` AppContainer child captures stdout and a CPU-only timed child returns promptly on the deadline. This is implemented with a Windows Job Object plus immediate-child kill fallback. |
 | missing-backend fallback | CLOSED for the `windows-appcontainer` feature path: both run_command and `ConstrainedExecutor` refuse when `agent-bridle-aclaunch.exe` is hidden from PATH. |
 | repo-controlled sandbox downgrade | CLOSED by existing config-plane stripping plus route-level missing-backend refusal; this PR adds no repo-controlled switch that can disable AppContainer. |
 | model-controlled sandbox downgrade | CLOSED for tested routes: model/tool input cannot hide the launcher or request host fallback; explicit operator opt-out remains the separate `--disable-ocap` / `--full-access` lane. |
