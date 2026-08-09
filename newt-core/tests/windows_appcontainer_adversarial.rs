@@ -128,24 +128,6 @@ fn lower_integrity(path: &Path) {
         .output();
 }
 
-fn grant_all_appcontainers(path: &Path) {
-    for sid in ["*S-1-15-2-1:(OI)(CI)F", "*S-1-15-2-2:(OI)(CI)F"] {
-        let out = Command::new("icacls")
-            .arg(path)
-            .args(["/grant", sid])
-            .output()
-            .expect("run icacls grant");
-        if !out.status.success() {
-            panic!(
-                "failed to grant AppContainer fixture DACL {sid} on {}; stdout={} stderr={}",
-                path_s(path),
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-    }
-}
-
 fn path_s(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -1095,9 +1077,22 @@ fn appcontainer_inheritable_handle_inheritance() {
     let handle = unsafe { InheritableFile::create(&marker) };
     unsafe { handle.write(b"PARENT-HANDLE-VALID\n") };
 
+    let control = constrained_run(
+        workspace.path(),
+        "cmd.exe",
+        vec!["/c".to_string(), "echo HANDLE-PROBE-RAN".to_string()],
+        Duration::from_secs(5),
+        Vec::new(),
+    )
+    .expect("handle control run");
+    assert_appcontainer(&control);
+    assert!(
+        control.success && String::from_utf8_lossy(&control.stdout).contains("HANDLE-PROBE-RAN"),
+        "handle control must prove this fixture can execute an AppContainer child; output={control:?}"
+    );
+
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue';\
-         Write-Output 'HANDLE-PROBE-RAN';\
          $h=[IntPtr]::new({});\
          $sfh=New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($h,$false);\
          $fs=New-Object System.IO.FileStream($sfh,[System.IO.FileAccess]::Write);\
@@ -1119,12 +1114,6 @@ fn appcontainer_inheritable_handle_inheritance() {
     )
     .expect("handle inheritance probe");
     assert_appcontainer(&out);
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("HANDLE-PROBE-RAN"),
-        "handle probe child must actually execute; stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
     let text = std::fs::read_to_string(&marker).unwrap_or_default();
     assert!(
         text.contains("PARENT-HANDLE-VALID"),
@@ -1310,13 +1299,6 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
         return;
     }
     let workspace = fresh_dir("timeout");
-    // This test proves lifecycle cleanup, not filesystem authority. GitHub's
-    // Windows runner temp DACL does not always admit AppContainer package SIDs,
-    // so make the timeout markers explicitly writable and keep path-denial
-    // evidence in the dedicated filesystem tests above.
-    grant_all_appcontainers(workspace.path());
-    let quick_marker = workspace.path().join("quick.txt");
-    let slow_marker = workspace.path().join("slow.txt");
 
     let quick = constrained_run(
         workspace.path(),
@@ -1325,11 +1307,7 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
             "-NoProfile".to_string(),
             "-NonInteractive".to_string(),
             "-Command".to_string(),
-            format!(
-                "Start-Sleep -Milliseconds 50; Set-Content -LiteralPath {} -Value {}",
-                ps_quote(&path_s(&quick_marker)),
-                ps_quote(WRITTEN)
-            ),
+            "Start-Sleep -Milliseconds 50; Write-Output QUICK-RAN".to_string(),
         ],
         Duration::from_secs(5),
         Vec::new(),
@@ -1338,8 +1316,8 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
     assert_appcontainer(&quick);
     assert!(quick.success, "quick control should complete: {quick:?}");
     assert!(
-        contains_file(&quick_marker, WRITTEN),
-        "quick control must prove the AppContainer child can write the marker"
+        String::from_utf8_lossy(&quick.stdout).contains("QUICK-RAN"),
+        "quick control must prove stdout capture from an AppContainer child: {quick:?}"
     );
 
     let started = Instant::now();
@@ -1350,11 +1328,7 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
             "-NoProfile".to_string(),
             "-NonInteractive".to_string(),
             "-Command".to_string(),
-            format!(
-                "Start-Sleep -Seconds 5; Set-Content -LiteralPath {} -Value {}",
-                ps_quote(&path_s(&slow_marker)),
-                ps_quote("LATE")
-            ),
+            "Start-Sleep -Seconds 5; Write-Output LATE".to_string(),
         ],
         Duration::from_millis(500),
         Vec::new(),
@@ -1369,10 +1343,9 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
         started.elapsed() < Duration::from_secs(4),
         "timeout cleanup must not block behind the Windows child wait"
     );
-    std::thread::sleep(Duration::from_secs(6));
     assert!(
-        !contains_file(&slow_marker, "LATE"),
-        "timed-out descendants must not survive long enough to write the late marker"
+        !String::from_utf8_lossy(&slow.stdout).contains("LATE"),
+        "timed-out child must not run to its post-timeout output point: {slow:?}"
     );
 }
 

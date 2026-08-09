@@ -5983,6 +5983,24 @@ mod tests {
     }
 
     #[cfg(all(windows, feature = "windows-appcontainer"))]
+    fn windows_grant_all_appcontainers(path: &std::path::Path) {
+        for sid in ["*S-1-15-2-1:(OI)(CI)F", "*S-1-15-2-2:(OI)(CI)F"] {
+            let out = std::process::Command::new("icacls")
+                .arg(path)
+                .args(["/grant", sid])
+                .output()
+                .expect("run icacls grant");
+            assert!(
+                out.status.success(),
+                "failed to grant AppContainer fixture DACL {sid} on {}; stdout={} stderr={}",
+                windows_path(path),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    #[cfg(all(windows, feature = "windows-appcontainer"))]
     fn windows_path(path: &std::path::Path) -> String {
         path.to_string_lossy().into_owned()
     }
@@ -6117,6 +6135,7 @@ mod tests {
             .arg(&workspace)
             .args(["/setintegritylevel", "(OI)(CI)Low"])
             .output();
+        windows_grant_all_appcontainers(&workspace);
         let _ = std::process::Command::new("icacls")
             .arg(&sibling)
             .args(["/setintegritylevel", "(OI)(CI)Low"])
@@ -6251,6 +6270,7 @@ mod tests {
             return;
         }
         let workspace = windows_low_dir("env");
+        windows_grant_all_appcontainers(workspace.path());
         let marker = workspace.path().join("env.txt");
         let caveats = crate::caveats::Caveats {
             fs_read: crate::caveats::Scope::only([windows_path(workspace.path())]),

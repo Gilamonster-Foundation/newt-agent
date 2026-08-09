@@ -35,10 +35,11 @@ CI runs the same evidence commands on `windows-latest` with
 `BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_UNC_CONTROL=1`, so a missing
 launcher/probe or missing UNC positive control is a hard failure rather than a
 silent skip. GitHub-hosted runners have a different temp-directory DACL shape
-than the local Windows host, so the timeout cleanup fixture explicitly grants
-the marker directory to AppContainer package SIDs. That fixture is lifecycle
-evidence only; filesystem authority remains covered by the separate denial
-fixtures that do not use the broad marker DACL.
+than the local Windows host, so route-level positive write controls explicitly
+grant only their test workspace to AppContainer package SIDs. Filesystem denial
+fixtures keep their sibling/outside targets ungranted, and the timeout cleanup
+fixture uses stdout rather than filesystem writes so lifecycle remains separate
+from authority.
 
 Manual token snapshot:
 
