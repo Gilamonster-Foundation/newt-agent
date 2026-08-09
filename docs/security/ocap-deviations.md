@@ -244,17 +244,18 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Invariant (ideal):** an attacker-exec child receives only explicitly granted capabilities; arbitrary
   inheritable OS object handles already open in the Newt parent cannot cross the AppContainer launcher
   chain and remain usable inside the child.
-- **Practical caveat (now):** Windows AppContainer confines path and network reach, but it does not
-  automatically erase every inheritable handle the parent process has marked inheritable. The real
-  Windows proof `appcontainer_inheritable_handle_inheritance`
-  (`newt-core/tests/windows_appcontainer_adversarial.rs`) creates an inheritable file handle in the
-  parent, launches a PowerShell child through `ConstrainedExecutor`/AppContainer, and the child writes
-  through that raw handle value. That is ambient object authority, separate from the filesystem path
-  fence: the path policy can deny opening a file while a pre-opened inheritable handle still grants
-  access to that object.
-- **Residual:** 🟠 ACTIVE (Windows) — reachable for any parent handle accidentally or deliberately left
-  inheritable before an attacker-influenced AppContainer spawn. It is not a Linux AF_UNIX deputy, and
-  it is not closed by AppContainer path ACLs.
+- **Practical caveat (now):** Windows AppContainer confines path and network reach, but the current
+  shared spawn proof does not establish that every inheritable parent handle is stripped before the
+  AppContainer child starts. The real Windows proof `appcontainer_inheritable_handle_inheritance`
+  (`newt-core/tests/windows_appcontainer_adversarial.rs`) deliberately creates an inheritable file
+  handle in the parent, launches a PowerShell child through `ConstrainedExecutor`/AppContainer, and
+  records whether the child can write through that raw handle value. The local Windows host produced
+  `HANDLE-LEAK`; GitHub-hosted runner behavior may close this specific raw handle. Because one
+  supported Windows host/launcher chain produced usable ambient object authority, this row remains
+  ACTIVE until the shared spawn path proves arbitrary inheritable handles are blocked everywhere.
+- **Residual:** ACTIVE (Windows) - host-sensitive but real. A path policy can deny opening a file while
+  a pre-opened inheritable handle still grants access to that object on at least one supported Windows
+  host.
 - **Disabled while open:** nothing — this is a confinement limitation on attacker-exec children, not a
   gated feature. The child runs; the residual is bounded only by the discipline of not creating
   inheritable sensitive handles before the spawn.
@@ -266,9 +267,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   into AppContainer children, either by using a handle allow-list (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
   / `STARTUPINFOEX`) or by setting `bInheritHandles = false` through the launcher chain, with a
   positive control proving an intentionally allowed stdio/pipe handle still works when needed.
-- **Ratchet guard:** `appcontainer_inheritable_handle_inheritance` pins the current leak. When the fix
-  lands, flip the test to require the marker write to fail and keep a positive control for explicitly
-  allowed handles.
+- **Ratchet guard:** `appcontainer_inheritable_handle_inheritance` always proves the child actually ran
+  under AppContainer and records the observed inheritable-handle classification. When the shared fix
+  lands, flip the test to require the marker write to fail on all Windows runners and keep a positive
+  control for explicitly allowed handles.
 - **Status:** OPEN — Windows-only ACTIVE residual; owner: — · review-by: Windows AppContainer handle
   hygiene follow-up.
 

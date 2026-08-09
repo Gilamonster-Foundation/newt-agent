@@ -840,13 +840,13 @@ fn kill_child_tree(child: &mut std::process::Child, _pgid: u32, job: Option<&Win
 }
 
 #[cfg(not(target_os = "windows"))]
-fn kill_child_tree(child: &mut std::process::Child, pgid: u32) {
+fn kill_child_tree(_child: &mut std::process::Child, pgid: u32) {
     #[cfg(unix)]
     kill_process_group(pgid);
     #[cfg(not(unix))]
     {
         let _ = pgid;
-        let _ = child.kill();
+        let _ = _child.kill();
     }
 }
 

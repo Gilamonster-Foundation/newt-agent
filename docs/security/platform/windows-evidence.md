@@ -34,7 +34,11 @@ Required local tools:
 CI runs the same evidence commands on `windows-latest` with
 `BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_UNC_CONTROL=1`, so a missing
 launcher/probe or missing UNC positive control is a hard failure rather than a
-silent skip.
+silent skip. GitHub-hosted runners have a different temp-directory DACL shape
+than the local Windows host, so the timeout cleanup fixture explicitly grants
+the marker directory to AppContainer package SIDs. That fixture is lifecycle
+evidence only; filesystem authority remains covered by the separate denial
+fixtures that do not use the broad marker DACL.
 
 Manual token snapshot:
 
@@ -45,7 +49,9 @@ agent-bridle-aclaunch.exe --name newt-manual-token-groups cmd.exe /c "whoami /gr
 Both the direct `cmd.exe` child and PowerShell grandchild reported
 `Mandatory Label\Low Mandatory Level` (`S-1-16-4096`) and showed
 `BUILTIN\Administrators` / local-admin groups as `Group used for deny only`.
-That is the observed two-generation restricted-token evidence for this host.
+GitHub-hosted runner token output is not identical, but the native suite checks
+the stable two-generation AppContainer signal: both child and grandchild report
+`Low Mandatory Level`.
 
 ## Route Matrix
 
@@ -72,7 +78,7 @@ That is the observed two-generation restricted-token evidence for this host.
 | direct UDP | DENIED: host PowerShell sends a UDP datagram; AppContainer PowerShell runs and writes a marker, but the datagram is not delivered. |
 | loopback | DENIED by default: loopback TCP is blocked without the exemption. Positive exemption proof is `UNSUPPORTED_FAIL_CLOSED` on this non-elevated token; set `BRIDLE_REQUIRE_ELEVATED=1` on an elevated runner to force that positive control. |
 | named-pipe / local IPC deputy | ACTIVE residual: `appcontainer_named_pipe_deputy` proves an AppContainer child can connect to an `ALL APPLICATION PACKAGES` named pipe and cause a host deputy to relay over loopback. |
-| inheritable HANDLE inheritance | ACTIVE residual: `appcontainer_inheritable_handle_inheritance` proves an arbitrary inheritable parent file handle crosses the launcher chain and remains usable by the child. |
+| inheritable HANDLE inheritance | ACTIVE residual on this Windows host: `appcontainer_inheritable_handle_inheritance` deliberately creates an inheritable parent file handle and records whether the AppContainer child can use it. The local host produced `HANDLE-LEAK`; GitHub-hosted runner behavior may close this specific raw handle, but the platform row remains ACTIVE until the shared Windows spawn path proves arbitrary inheritable handles are blocked on every supported launcher chain. |
 | child/grandchild token escape | DENIED: `appcontainer_descendants_stay_in_the_same_token` shows cmd and PowerShell descendants report low/restricted token evidence at two generations. |
 | shell/helper follows process tree | DENIED for tested helpers: cmd, PowerShell, and staged workspace `.exe` stay under AppContainer. Git is evidence-only because installed Git ACLs vary. |
 | timeout/cancellation cleanup | BOUNDED cleanup, not authority: `appcontainer_timeout_cleanup_is_distinct_from_authority` proves a timed-out PowerShell child returns promptly and does not write a late marker after the timeout. This is implemented with a Windows Job Object plus immediate-child kill fallback. |
@@ -90,5 +96,5 @@ runs. `ConstrainedExecutor` additionally strips parent provider credentials and
 has bounded timeout cleanup. The shared `run_command`/agent-bridle `ShellTool`
 path still inherits ambient Windows environment, so provider credential stripping
 is ACTIVE there until agent-bridle grows Windows env-clear parity. The other
-remaining Windows residuals are named-pipe local-deputy egress and inheritable
-HANDLE inheritance.
+remaining Windows residuals are named-pipe local-deputy egress and host-sensitive
+inheritable HANDLE inheritance.

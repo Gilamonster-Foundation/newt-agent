@@ -3,5 +3,3 @@ error: cannot construct `PromptWindow` with struct literal syntax due to private
   |
 4 |     let _w = newt_core::tty::PromptWindow {};
   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: private fields `_seal`, `stdin`, `resume` and `live` that were not provided
