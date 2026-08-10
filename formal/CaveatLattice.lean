@@ -3,3 +3,4 @@
 import CaveatLattice.Basic
 import CaveatLattice.IdentityLaw
 import CaveatLattice.ResolvedLattice
+import CaveatLattice.AuthorityLaws
