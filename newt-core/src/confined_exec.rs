@@ -89,11 +89,22 @@ pub enum NetGrant {
     /// full egress floor.
     #[default]
     Unrestricted,
-    /// **Deny all egress**: the child is wrapped in `newt-net-guard`, which
-    /// installs the seccomp `socket()`-family deny (TCP/UDP/DNS/raw) *in addition
-    /// to* the inherited Landlock fs fence. On a platform without the seccomp
-    /// floor the spawn is **refused** (`ExecRefused::ConfinementUnenforceable`),
-    /// never run with a weaker net floor.
+    /// **Deny all egress**, by the strongest kernel mechanism the platform has:
+    ///
+    /// * **Linux** — the child is wrapped in `newt-net-guard`, which installs
+    ///   the seccomp `socket()`-family deny (TCP/UDP/DNS/raw) *in addition to*
+    ///   the inherited Landlock fs fence.
+    /// * **macOS** — the child's `net` caveat is narrowed to deny-all, so the
+    ///   Seatbelt fence is generated with `(deny network*)` — kernel-denies
+    ///   TCP/UDP/loopback **and AF_UNIX `connect`** (strictly stronger than the
+    ///   Linux seccomp deny, which allows AF_UNIX). Proven by the
+    ///   `macos_seatbelt_adversarial` suite; see
+    ///   `docs/security/platform/macos-evidence.md`.
+    ///
+    /// On a platform with neither floor the spawn is **refused**
+    /// (`ExecRefused::ConfinementUnenforceable`), never run with a weaker net
+    /// floor — and macOS refuses the same way if the Seatbelt backend
+    /// (`sandbox-exec`) is unavailable.
     DenyAll,
 }
 
@@ -464,9 +475,34 @@ impl ConstrainedExecutor {
                 args.extend(req.args.iter().cloned());
                 Ok((guard, args, caveats))
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            NetGrant::DenyAll => {
+                // macOS has no seccomp guard, but it has a KERNEL egress denial
+                // of its own: the Seatbelt fence generated from an empty `net`
+                // scope is `(deny network*)`, which denies TCP/UDP/loopback AND
+                // AF_UNIX `connect` — strictly stronger than the Linux
+                // socket()-family deny (macos-evidence §2). Narrow the net axis
+                // to deny-all and let Seatbelt back it; the caller's strength
+                // floor (Kernel for AgentInfluenced) then verifies at mint that
+                // the fence really is kernel-grade. Fail-closed: no Seatbelt on
+                // this host → refuse, never run with a weaker floor than asked.
+                if !agent_bridle::seatbelt_is_supported() {
+                    return Err(ExecRefused::ConfinementUnenforceable(
+                        "NetGrant::DenyAll needs a kernel egress floor; the Seatbelt \
+                         backend (sandbox-exec) is unavailable on this host"
+                            .into(),
+                    ));
+                }
+                Ok((
+                    req.program.clone(),
+                    req.args.clone(),
+                    deny_all_net(&req.caveats),
+                ))
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             NetGrant::DenyAll => Err(ExecRefused::ConfinementUnenforceable(
-                "NetGrant::DenyAll needs the seccomp egress floor, unavailable on this platform"
+                "NetGrant::DenyAll needs a kernel egress floor (Linux seccomp guard or \
+                 macOS Seatbelt), unavailable on this platform"
                     .into(),
             )),
         }
@@ -578,6 +614,16 @@ pub fn net_guard_available() -> bool {
     {
         false
     }
+}
+
+/// Narrow a caveat set's `net` axis to deny-all (a pure attenuation — never
+/// widens). This is the macOS [`NetGrant::DenyAll`] floor: an empty net scope
+/// makes the Seatbelt profile `(deny network*)`.
+#[cfg(any(target_os = "macos", test))]
+fn deny_all_net(caveats: &Caveats) -> Caveats {
+    let mut narrowed = caveats.clone();
+    narrowed.net = Scope::only([] as [String; 0]);
+    narrowed
 }
 
 /// Add one read root to a caveats fs-read scope (the `lock_fs_to_workspace`
@@ -812,6 +858,23 @@ mod tests {
         assert_eq!(agent_cx.strength_floor(), AxisEnforcement::Kernel);
         let trusted_cx = mint_context(ExecOrigin::TrustedInfra, &caveats).unwrap();
         assert_ne!(trusted_cx.strength_floor(), AxisEnforcement::Kernel);
+    }
+
+    #[test]
+    fn deny_all_net_is_a_pure_attenuation_of_the_net_axis_only() {
+        // The macOS DenyAll floor rests on this narrowing: the net axis becomes
+        // deny-all (→ Seatbelt `(deny network*)`), and NOTHING else moves — a
+        // widened fs/exec axis here would be authority the caller never asked
+        // for. Grounded by `macos_seatbelt_adversarial::
+        // seatbelt_net_deny_all_runs_kernel_denied` (the real Seatbelt run).
+        let base = workspace_confined_caveats(Path::new("/ws"));
+        let narrowed = deny_all_net(&base);
+        assert_eq!(narrowed.net, Scope::only([] as [String; 0]));
+        assert_eq!(narrowed.fs_read, base.fs_read);
+        assert_eq!(narrowed.fs_write, base.fs_write);
+        assert_eq!(narrowed.exec, base.exec);
+        // Idempotent, and already-deny-all stays deny-all.
+        assert_eq!(deny_all_net(&narrowed), narrowed);
     }
 
     #[test]

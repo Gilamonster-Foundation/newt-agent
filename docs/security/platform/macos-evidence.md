@@ -26,15 +26,17 @@ command-not-found or a silent advisory downgrade.
 | route | launcher (concrete spawn) | fs boundary | net boundary | env policy | failure behavior (missing backend) |
 |---|---|---|---|---|---|
 | `run_command` | `dispatch_bridled_shell` → `agent_bridle::{ShellTool,HostShellTool,BrushShellTool}` with `b1_run_command_sandbox_policy()` (`ChildNetworkPolicy::DenyDirect`) → **Seatbelt** wrapper | **Seatbelt** SBPL `(deny file-write*/read*)` + re-allow workspace (caveat-driven) | **Seatbelt** `(deny network*)` under `net:none`; the b1 `DenyDirect` seccomp add-on is Linux-only (inert on macOS — Seatbelt already kernel-denies egress) | bridle shell tool starts env-scrubbed | **Advisory** strength floor (default `Gate`); but `command_prefix` still **fails closed** (`Denied`) for a governed axis if `sandbox-exec` is absent. `sandbox-exec` is a SIP binary, always present on macOS. *(Traced from source + shares the proven Seatbelt backend; an independent `run_command` lib test is the tracked follow-up.)* |
-| `run_build_check` | `ConstrainedExecutor::run`, `ExecOrigin::AgentInfluenced`, **`NetGrant::DenyAll`** | Seatbelt (proven, §2) | **REFUSES on macOS** — `NetGrant::DenyAll` needs the Linux seccomp `newt-net-guard`; `resolve_net_floor` returns `ConfinementUnenforceable` | env-empty + explicit grants (`HOME`/`TMPDIR`/`PATH`) | **fail-closed UNAVAILABLE** (proven: `seatbelt_net_deny_all_grant_refuses_fail_closed`) |
-| crew execution | `ConstrainedExecutor::run`, `AgentInfluenced` (shares §2 mechanism) | Seatbelt (proven, §2) | Seatbelt `(deny network*)` via `net:none` (proven); `NetGrant::DenyAll` callers refuse (above) | env-empty + grants | fail-closed (`ConfinementUnenforceable`) |
+| `run_build_check` | `ConstrainedExecutor::run`, `ExecOrigin::AgentInfluenced`, **`NetGrant::DenyAll`** | Seatbelt (proven, §2) | **Seatbelt `(deny network*)`** — `resolve_net_floor` narrows the net caveat to deny-all on macOS, so the SAME kernel denial the direct-TCP/UDP/loopback tests prove backs the grant (stronger than Linux seccomp: AF_UNIX connect is denied too) | env-empty + explicit grants (`HOME`/`TMPDIR`/`PATH`) | **fail-closed** — no Seatbelt (`sandbox-exec` absent) → `ConfinementUnenforceable` refusal, never a weaker floor (proven: `seatbelt_net_deny_all_runs_kernel_denied`, `seatbelt_net_deny_all_keeps_the_fs_fence`) |
+| crew execution | `ConstrainedExecutor::run`, `AgentInfluenced` (shares §2 mechanism) | Seatbelt (proven, §2) | Seatbelt `(deny network*)` via `net:none` (proven); `NetGrant::DenyAll` callers get the same denial via the narrowed caveat (above) | env-empty + grants | fail-closed (`ConfinementUnenforceable`) |
 | MCP/ACP worker | `ConstrainedExecutor` / bridle spawn, `AgentInfluenced` | Seatbelt (proven, §2) | Seatbelt `(deny network*)` via `net:none` | env-empty + grants | fail-closed |
 | git/helper subprocess | `hardened_git` argv → confined spawn (Seatbelt backend) | Seatbelt (proven: `seatbelt_follows_interpreters_and_helpers`) | Seatbelt via caveat | env-empty + grants | fail-closed |
 | host-shell engine | `agent_bridle::HostShellTool` + b1 policy → Seatbelt wrapper | Seatbelt SBPL (caveat-driven) | Seatbelt `(deny network*)`; DenyDirect inert on macOS | env-scrubbed | Advisory floor; `command_prefix` fail-closed on absent `sandbox-exec` |
 
 Every attacker-exec cell terminates in a **proven Seatbelt launcher** or an
-**explicit refusal** — no silent third state. The one functional gap is
-`NetGrant::DenyAll`, which fail-closed refuses on macOS (see §3, follow-up).
+**explicit refusal** — no silent third state. The former `NetGrant::DenyAll`
+functional gap is closed: the grant is satisfied by the Seatbelt kernel net
+denial (net caveat narrowed to deny-all), so `run_build_check` is available on
+macOS with an equal-or-stronger floor than Linux.
 
 ## 2. Adversarial matrix (real results)
 
@@ -54,7 +56,7 @@ Every attacker-exec cell terminates in a **proven Seatbelt launcher** or an
 | child/grandchild escape | **DENIED + evidence** (boundary inherited ≥2 generations) | `seatbelt_descendants_stay_confined` |
 | interpreter/helper follows process tree | **DENIED + evidence** (python3 net, git fs) | `seatbelt_follows_interpreters_and_helpers` |
 | missing-backend fallback | **UNSUPPORTED_FAIL_CLOSED + refusal proof** — governed-axis `command_prefix` never returns an empty (silently-unconfined) prefix; `sandbox-exec` is SIP-guaranteed so the absent branch is unreachable on a real host (covered by agent-bridle's own unit tests) | `seatbelt_missing_backend_refuses_not_host` |
-| `NetGrant::DenyAll` kernel net floor | **UNSUPPORTED_FAIL_CLOSED + refusal proof** — Linux-seccomp-only; refuses on macOS (net denial is instead available via `net:none` → Seatbelt) | `seatbelt_net_deny_all_grant_refuses_fail_closed` |
+| `NetGrant::DenyAll` kernel net floor | **DENIED + evidence** — satisfied by Seatbelt `(deny network*)` via the narrowed net caveat; a real TCP connect inside the DenyAll child is kernel-denied, the fs fence is preserved, and an absent `sandbox-exec` refuses fail-closed | `seatbelt_net_deny_all_runs_kernel_denied`, `seatbelt_net_deny_all_keeps_the_fs_fence` |
 | repo-controlled sandbox downgrade | **BOUNDED** — the SBPL profile is generated from the effective `Caveats`, pinned by `seatbelt_generated_profile_pins_the_boundary`; a repo cannot widen it without failing the pin | `seatbelt_generated_profile_pins_the_boundary` |
 | model-controlled sandbox downgrade | **BOUNDED** — same pin; the model influences only the confined argv, never the profile | `seatbelt_generated_profile_pins_the_boundary` |
 
@@ -87,11 +89,12 @@ canonicalized workspace write-root re-allow, and the **absence** of any
 - `mach-xpc-ambient-deputy` (**NEW**, macOS-scoped, OPEN/ACTIVE): the SBPL
   `(allow default)` base leaves Mach/XPC service lookup ambient — a confined
   child can reach host XPC services that could act as deputies.
-- `b1-os-isolation`: note that on macOS the direct-egress floor is provided by
-  **Seatbelt `(deny network*)`**, not the Linux seccomp `newt-net-guard`; the
-  `NetGrant::DenyAll` executor floor is fail-closed-unavailable on macOS (a
-  per-axis strength floor that accepts the Seatbelt net witness is the
-  coordinated follow-up with the Linux maintainer — see §1 `run_build_check`).
+- `b1-os-isolation`: on macOS the direct-egress floor is provided by
+  **Seatbelt `(deny network*)`**, not the Linux seccomp `newt-net-guard`. The
+  `NetGrant::DenyAll` executor floor now consumes that witness directly
+  (`resolve_net_floor` narrows the net caveat to deny-all and requires the
+  Seatbelt backend, fail-closed) — the follow-up that unblocked
+  `run_build_check` on macOS.
 
 ## 4. The macOS theorem
 > On macOS (Seatbelt), every supported Newt attacker-exec route that reaches the
@@ -100,7 +103,7 @@ canonicalized workspace write-root re-allow, and the **absence** of any
 > symlink-realpath), network (direct TCP/UDP, loopback, **and the pathname
 > AF_UNIX local deputy**), credential-inheritance, descriptor-hygiene, and
 > process-tree-descendant boundaries are all kernel-DENIED with adversarial
-> evidence — with two axes honestly reported UNSUPPORTED and **fail-closed**
-> (the `NetGrant::DenyAll` seccomp floor, and any absent `sandbox-exec` backend)
-> and one named residual still ACTIVE (`mach-xpc-ambient-deputy`), so no route
-> ever runs hostile code unconfined.
+> evidence — the `NetGrant::DenyAll` floor is satisfied by the Seatbelt kernel
+> net denial, an absent `sandbox-exec` backend is honestly reported UNSUPPORTED
+> and **fail-closed**, and one named residual stays ACTIVE
+> (`mach-xpc-ambient-deputy`), so no route ever runs hostile code unconfined.
