@@ -2,3 +2,4 @@
 -- The specification + proofs live in CaveatLattice.Basic.
 import CaveatLattice.Basic
 import CaveatLattice.ResolvedLattice
+import CaveatLattice.AuthorityLaws
