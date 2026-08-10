@@ -8399,7 +8399,9 @@ mod execute_tool_branch_tests {
             artifacts[0].clone()
         }
 
-        #[cfg(unix)]
+        // Matches its only caller (`physical_symlink_escape_write_is_denied_
+        // object_bound`, Linux-only) — `cfg(unix)` left it dead-code on macOS.
+        #[cfg(target_os = "linux")]
         fn is_empty(&self) -> bool {
             self.artifacts.lock().unwrap().is_empty()
         }

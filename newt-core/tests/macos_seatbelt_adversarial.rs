@@ -548,36 +548,70 @@ fn seatbelt_missing_backend_refuses_not_host() {
 
 #[test]
 #[serial]
-#[ignore = "contract: NetGrant::DenyAll is Linux-seccomp-only → fail-closed on macOS"]
-fn seatbelt_net_deny_all_grant_refuses_fail_closed() {
-    // The `NetGrant::DenyAll` KERNEL net floor is the Linux `newt-net-guard`
-    // (seccomp) wrapper — there is no macOS equivalent, so `resolve_net_floor`
-    // REFUSES it (`ConfinementUnenforceable`) rather than run with a weaker floor.
-    // `run_build_check` requests exactly this grant, so the build-check route is
-    // fail-closed-UNAVAILABLE on macOS today: nothing runs unconfined. (The
-    // equivalent egress denial IS available via `Caveats.net = none` → Seatbelt
-    // `(deny network*)`, proven by the direct-TCP/UDP/loopback tests; wiring the
-    // executor's net floor to accept the Seatbelt witness on macOS is the tracked
-    // follow-up — a per-axis strength floor in agent-bridle.)
+#[ignore = "real resource: NetGrant::DenyAll on macOS = Seatbelt (deny network*) kernel floor"]
+fn seatbelt_net_deny_all_runs_kernel_denied() {
+    // `NetGrant::DenyAll` is now satisfied on macOS by the platform's OWN
+    // kernel egress floor: `resolve_net_floor` narrows the net caveat to
+    // deny-all, so the Seatbelt profile carries `(deny network*)` — proven by
+    // the direct-TCP/UDP/loopback tests to deny every socket family INCLUDING
+    // AF_UNIX `connect` (strictly stronger than the Linux seccomp guard this
+    // grant uses there). This unblocks the `run_build_check` route on macOS.
+    //
+    // Two proofs in one run, against real `sandbox-exec`:
+    //   1. the DenyAll spawn RUNS (no ConfinementUnenforceable refusal) under
+    //      SandboxKind::Seatbelt (never a weaker/absent sandbox), and
+    //   2. a real TCP connect attempt inside that child is kernel-DENIED.
     let ws = tempdir().unwrap();
     let req = ExecRequest::new(
         ExecOrigin::AgentInfluenced,
-        "/bin/echo",
-        ["hi"],
+        "/usr/bin/nc",
+        ["-G", "2", "-z", "1.1.1.1", "443"],
+        ws.path(),
+        // Net-only caveats (fs unrestricted): DenyAll must impose the net
+        // denial ITSELF via the narrowed caveat — nothing here denies net.
+        net_only_caveats(),
+    )
+    .net_grant(NetGrant::DenyAll)
+    .env("PATH", "/usr/bin:/bin");
+    let out = ConstrainedExecutor::run(&req).expect(
+        "NetGrant::DenyAll must RUN on macOS via the Seatbelt kernel net floor \
+         (it fail-closed-refused before the Seatbelt witness was wired)",
+    );
+    assert_seatbelt(&out);
+    assert!(
+        !out.success,
+        "TCP connect must be kernel-denied under DenyAll: stdout={:?} stderr={:?}",
+        out.stdout, out.stderr
+    );
+}
+
+#[test]
+#[serial]
+#[ignore = "real resource: DenyAll preserves the caller's fs fence while denying net"]
+fn seatbelt_net_deny_all_keeps_the_fs_fence() {
+    // The DenyAll narrowing must be net-axis-only: the workspace fs fence the
+    // caller granted still confines the child (no silent fs widening riding in
+    // on the net floor).
+    let ws = tempdir().unwrap();
+    let secret_dir = tempdir().unwrap();
+    let secret = secret_dir.path().join("api-key.txt");
+    std::fs::write(&secret, "SUPER-SECRET-TOKEN").unwrap();
+    let req = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        "/bin/cat",
+        [secret.to_str().unwrap()],
         ws.path(),
         workspace_confined_caveats(ws.path()),
     )
     .net_grant(NetGrant::DenyAll)
     .env("PATH", "/usr/bin:/bin");
-    match ConstrainedExecutor::run(&req) {
-        Err(ExecRefused::ConfinementUnenforceable(_)) => {} // fail-closed: correct
-        Ok(out) => panic!(
-            "NetGrant::DenyAll RAN on macOS (sandbox_kind={:?}) — it must fail closed, the \
-             seccomp net floor does not exist here",
-            out.sandbox_kind
-        ),
-        Err(e) => panic!("expected ConfinementUnenforceable, got: {e}"),
-    }
+    let out = ConstrainedExecutor::run(&req).expect("DenyAll spawn must run on macOS");
+    assert_seatbelt(&out);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("SUPER-SECRET-TOKEN"),
+        "the out-of-fence secret content leaked under DenyAll",
+    );
+    assert_denied(&out, "cat outside-workspace read under DenyAll");
 }
 
 // ── Profile pinning (a profile change cannot silently widen authority) ───────
