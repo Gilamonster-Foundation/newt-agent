@@ -1,0 +1,18 @@
+{
+  "name": "newt-agent",
+  "version": "0.0.0",
+  "description": "Umbrella installer for newt-agent (Gilamonster). Installs the `newt` CLI binary for your platform; no Rust toolchain or pip required.",
+  "keywords": ["newt", "newt-agent", "gilamonster", "cli", "agent", "mcp"],
+  "homepage": "https://github.com/Gilamonster-Foundation/newt-agent#readme",
+  "bugs": "https://github.com/Gilamonster-Foundation/newt-agent/issues",
+  "repository": { "type": "git", "url": "git+https://github.com/Gilamonster-Foundation/newt-agent.git", "directory": "npm/newt-agent" },
+  "license": "Apache-2.0",
+  "author": "Shawn Hartsock",
+  "type": "commonjs",
+  "bin": { "newt": "bin/run.cjs" },
+  "files": ["bin/", "README.md"],
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@gilamonster/newt": "0.0.0"
+  }
+}

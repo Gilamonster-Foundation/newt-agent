@@ -623,3 +623,114 @@ jobs:
           # account-scoped API token, so attestations MUST be disabled here.
           attestations: false
           skip-existing: true
+
+  # ── npm binary shim (@gilamonster/<bin> + newt-agent umbrella) ────────────
+  #
+  # Delivers the `newt` + `newt-mcp-server` binaries to npm users the uv/esbuild
+  # way (newt-agent#1221): one tiny per-platform package carrying just the
+  # prebuilt binary + os/cpu, per-binary umbrellas `@gilamonster/<bin>` listing
+  # them as optionalDependencies, and the unscoped `newt-agent` umbrella
+  # (`npm i -g newt-agent` -> `newt`). No postinstall. Sources + design: npm/.
+  #
+  # Ships only what build-binaries produces (-p newt-agent -p newt-mcp-server);
+  # newt-mcp-data / newt-provider-openai names are reserved but not built yet.
+  #
+  # Auth: npm OIDC trusted publishing (NO stored token) — each of the 21 packages
+  # has a trusted publisher configured on npmjs pointing at
+  # Gilamonster-Foundation/newt-agent -> release.yml, and id-token: write + npm
+  # >= 11.5.1 mints a short-lived token. NOTE: this diverges from the PyPI/crates
+  # jobs above, which deliberately use account-scoped tokens; the maintainer
+  # chose OIDC for npm. Tag-only (an npm version can't be republished).
+
+  build-npm:
+    name: npm binary (${{ matrix.key }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write        # npm provenance + OIDC trusted publishing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { key: darwin-arm64, os: macos-latest,   target: aarch64-apple-darwin }
+          - { key: linux-x64,    os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { key: win32-x64,    os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: npm-${{ matrix.key }}
+
+      - name: Derive version from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p newt-agent -p newt-mcp-server
+
+      - name: Wrap + publish platform packages
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          for shim in "@gilamonster/newt" "@gilamonster/newt-mcp-server"; do
+            bin="${shim##*/}"
+            out="dist-npm/${bin}-${{ matrix.key }}"
+            node npm/scripts/build-platform-package.mjs \
+              --name "$shim" \
+              --binary "target/${{ matrix.target }}/release/${bin}${ext}" \
+              --key "${{ matrix.key }}" --version "$VERSION" --out "$out"
+            ( cd "$out"
+              PKG=$(node -p "require('./package.json').name")
+              if npm view "$PKG@$VERSION" version >/dev/null 2>&1; then
+                echo "$PKG@$VERSION already published — skipping"
+              else
+                npm publish --provenance --access public
+              fi )
+          done
+
+  publish-npm-meta:
+    name: npm shims + umbrella
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-npm]     # platform packages must be published first
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Derive version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Stamp versions across the shim packages
+        run: node npm/scripts/sync-versions.mjs --version "$VERSION"
+
+      - name: Publish shims + umbrella
+        shell: bash
+        # Order matters: the newt-agent umbrella depends on @gilamonster/newt.
+        run: |
+          for dir in npm/newt npm/newt-mcp-server npm/newt-agent; do
+            ( cd "$dir"
+              PKG=$(node -p "require('./package.json').name")
+              if npm view "$PKG@$VERSION" version >/dev/null 2>&1; then
+                echo "$PKG@$VERSION already published — skipping"
+              else
+                npm publish --provenance --access public
+              fi )
+          done
