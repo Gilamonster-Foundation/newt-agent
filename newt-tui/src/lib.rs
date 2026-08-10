@@ -277,7 +277,7 @@ impl<F: FnMut()> Drop for RestoreOnDrop<F> {
 ///
 /// **#1411.** The splash used to enable raw mode and restore it ~30 lines
 /// later, with *three* fallible `?` operators in between: the `execute!` that
-/// enters the alternate screen, `run_setup_screen`, and `show_splash`. Any I/O
+/// enters the alternate screen and `show_splash`. Any I/O
 /// error in that window returned early past the restore and left the operator
 /// in the alternate screen, in raw mode, with the cursor hidden — a terminal
 /// that echoes nothing and shows no cursor, recoverable only via `reset`. A
@@ -371,8 +371,7 @@ mod splash_guard_tests {
     }
 
     /// The path that actually bit: an inner `?` returns early, jumping over
-    /// every statement below it. `run_setup_screen(..)?` and
-    /// `show_splash(..)?` are both this shape.
+    /// every statement below it. `show_splash(..)?` is this shape.
     #[test]
     fn restore_runs_when_an_inner_question_mark_returns_early() {
         let ran = Cell::new(0);
@@ -381,7 +380,7 @@ mod splash_guard_tests {
             let _g = RestoreOnDrop {
                 restore: || ran.set(ran.get() + 1),
             };
-            // Stands in for a failing `run_setup_screen` / `show_splash`.
+            // Stands in for a failing `show_splash`.
             Err(std::io::Error::other("splash step failed"))?;
             unreachable!("the ? above returns");
         }
@@ -527,19 +526,27 @@ pub fn run_code(
         // its backend probe while the logo shows; run_chat consumes the result
         // when (and only when) the resolved choice still matches.
         let prewarm = spawn_backend_prewarm();
-        // First-run setup, COVERED by the splash (#985): a spinner + status under
-        // the logo while the model provisions on a background thread; input is
-        // blocked except a triple abort. Then the Enter-to-continue splash —
-        // which always shows its own spinner so a launch never looks hung.
-        if let Some(setup) = setup {
-            run_setup_screen(&mut stdout, color, setup)?;
-        }
+        // The unboxed state names the splash context ("initial setup") —
+        // computed before `setup` is consumed below.
+        let unconfigured = newt_core::Config::resolve()
+            .map(|c| c.is_unconfigured())
+            .unwrap_or(true);
+        let context = if unconfigured || setup.is_some() {
+            "initial setup"
+        } else {
+            "starting"
+        };
+        // ONE splash covers everything (field note: two consecutive splash
+        // screens read as a bug): a first-run provision (#985) renders as an
+        // extra spinner line on this same screen — input blocked except a
+        // triple abort while it runs — and the splash's own spinner keeps a
+        // launch from ever looking hung.
         let status = if prewarm.is_some() {
             "warming up backend…"
         } else {
             "initializing…"
         };
-        let cont = splash::show_splash(&mut stdout, &workspace, color, status)?;
+        let cont = splash::show_splash(&mut stdout, &workspace, color, status, context, setup)?;
         // Give the terminal back before anything else prints: chat must not run
         // inside the alternate screen. Explicit rather than implicit at the end
         // of the block so the ordering stays visible to a reader.
@@ -550,8 +557,12 @@ pub fn run_code(
             }
             return Ok(());
         }
-        // First-run wizard: silent no-op when configured — otherwise its menus
-        // print here, in cooked scrollback beneath where the splash was.
+        // The branded crawl header opens the post-splash scrollback (the seam
+        // inheriting agents override — see brand::crawl_header), then the
+        // first-run wizard's menus roll underneath it when unconfigured.
+        if unconfigured {
+            print!("{}", brand::crawl_header(Some("initial setup")));
+        }
         wizard::maybe_run(color)?;
         print_inline_header(&workspace, color);
         return run_chat(&workspace, color, persona, altitude, crew_runner, prewarm);
@@ -590,6 +601,18 @@ pub(crate) fn prewarm_applies(choice_url: &str, prewarm_url: &str) -> bool {
     choice_url.trim_end_matches('/') == prewarm_url.trim_end_matches('/')
 }
 
+/// Whole-request bound for the session's endpoint probes. LAN boxes answer in
+/// well under a second; a hosted HTTPS gateway needs DNS + TLS + auth and
+/// real-world jitter — field testing showed api.openai.com blowing a 3 s
+/// bound while being perfectly healthy, so the remote beat is a patient 10 s.
+pub(crate) fn probe_timeout_secs(url: &str) -> u64 {
+    if url.starts_with("https://") {
+        10
+    } else {
+        1
+    }
+}
+
 /// Start the pre-warm probe for the resolved backend choice, if this box is
 /// configured (an unconfigured box has nothing real to probe — the wizard is
 /// about to change everything) and a tokio runtime is available.
@@ -604,7 +627,7 @@ fn spawn_backend_prewarm() -> Option<Prewarm> {
     let api_key = choice.api_key.clone();
     let needs_probe = choice.kind_needs_probe;
     let kind = choice.kind;
-    let secs = if url.starts_with("https://") { 3 } else { 1 };
+    let secs = probe_timeout_secs(&url);
     let task_url = url.clone();
     let handle = runtime.spawn(async move {
         let client = reqwest::Client::builder()
@@ -716,7 +739,7 @@ use crate::permissions::{
     permission_prompting_configured, production_danger_table, prompt_permission_choice,
     should_prompt_permissions, PermissionPromptState, PromptChoice, PromptPermissionGate,
 };
-use crate::setup_tui::{run_setup_inline, run_setup_screen};
+use crate::setup_tui::run_setup_inline;
 pub use crate::setup_tui::{SetupEvent, SetupHandle};
 
 // ---------------------------------------------------------------------------
@@ -3433,14 +3456,7 @@ fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) ->
         };
         return finish_adoption(choice, lines, probe.models, probe.warm, detected);
     }
-    // Local endpoints answer in well under a second; a remote authenticated
-    // HTTPS gateway needs a TLS + auth round-trip — still a bounded beat,
-    // just a wider one.
-    let secs = if choice.url.starts_with("https://") {
-        3
-    } else {
-        1
-    };
+    let secs = probe_timeout_secs(&choice.url);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(secs))
         .build()
@@ -3508,11 +3524,7 @@ fn finish_adoption(
     detected_kind: Option<newt_core::BackendKind>,
 ) -> Vec<String> {
     use newt_core::backend_probe::{self, Served};
-    let secs = if choice.url.starts_with("https://") {
-        3
-    } else {
-        1
-    };
+    let secs = probe_timeout_secs(&choice.url);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(secs))
         .build()
@@ -3588,9 +3600,14 @@ fn finish_adoption(
             // OpenAI surface probe: absent `api` → try chat/completions, adopt
             // `responses` when the server says the model is responses-only.
             let mut api_was_probed = false;
+            // Hosted (https) endpoints only: Responses-only models are an
+            // OpenAI-cloud phenomenon, and on a plain-HTTP LAN multiplexer
+            // (llama-swap) the probe completion can trigger a full model load
+            // that always outlives the probe timeout — pure noise.
             if choice.kind == newt_core::BackendKind::Openai
                 && choice.api_needs_probe
                 && !choice.model.is_empty()
+                && choice.url.starts_with("https://")
             {
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
@@ -3615,7 +3632,7 @@ fn finish_adoption(
                         ));
                     }
                     Err(e) => lines.push(format!(
-                        "api probe failed ({e}) — using chat_completions until it answers"
+                        "api probe failed ({e:#}) — using chat_completions until it answers"
                     )),
                 }
             }
@@ -3654,12 +3671,12 @@ fn offline_adoption(
 ) -> Vec<String> {
     if choice.model.is_empty() {
         lines.push(format!(
-            "{} is unreachable ({e}) and no model is configured — check the                      endpoint, then /backends",
+            "{} is unreachable ({e:#}) and no model is configured — check the                      endpoint, then /backends",
             choice.url
         ));
     } else {
         lines.push(format!(
-            "{} is unreachable ({e}) — using configured model {} until it answers",
+            "{} is unreachable ({e:#}) — using configured model {} until it answers",
             choice.url, choice.model
         ));
     }

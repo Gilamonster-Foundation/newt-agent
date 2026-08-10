@@ -23,6 +23,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Env-mutating regression test (config-root leak): one serialized lane.
+serial_test = "3"
 
 [lints]
 workspace = true

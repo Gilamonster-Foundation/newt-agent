@@ -953,8 +953,36 @@ fn resolve_backend_choice_explicit_kind_skips_probe_flag() {
     assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
 }
 
+/// Pin NEWT_CONFIG_DIR to a throwaway dir for the adopt tests: their probe
+/// write-back path (`writeback_probed_backend`) writes REAL drop-ins under
+/// the user config dir — unpinned, these tests polluted the developer's
+/// actual ~/.newt/backends with wiremock-port backends (field-caught: a
+/// session adopted `nemotron @ 127.0.0.1:58762` from a leaked test file).
+struct ConfigDirPin {
+    _dir: tempfile::TempDir,
+    prev: Option<std::ffi::OsString>,
+}
+impl ConfigDirPin {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("NEWT_CONFIG_DIR");
+        std::env::set_var("NEWT_CONFIG_DIR", dir.path());
+        Self { _dir: dir, prev }
+    }
+}
+impl Drop for ConfigDirPin {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var("NEWT_CONFIG_DIR", v),
+            None => std::env::remove_var("NEWT_CONFIG_DIR"),
+        }
+    }
+}
+
+#[serial_test::serial(real_fs)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopt_detects_openai_when_kind_absent() {
+    let _pin = ConfigDirPin::new();
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -992,8 +1020,10 @@ async fn adopt_detects_openai_when_kind_absent() {
     );
 }
 
+#[serial_test::serial(real_fs)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopt_detects_ollama_when_kind_absent() {
+    let _pin = ConfigDirPin::new();
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1025,8 +1055,10 @@ async fn adopt_detects_ollama_when_kind_absent() {
     assert_eq!(choice.model, "llama3.1:8b");
 }
 
+#[serial_test::serial(real_fs)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopt_respects_explicit_kind_without_detect() {
+    let _pin = ConfigDirPin::new();
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1066,8 +1098,10 @@ async fn adopt_respects_explicit_kind_without_detect() {
     );
 }
 
+#[serial_test::serial(real_fs)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopt_detects_authenticated_openai_with_bearer() {
+    let _pin = ConfigDirPin::new();
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

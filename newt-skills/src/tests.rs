@@ -656,3 +656,24 @@ mod grounding {
             .is_symlink());
     }
 }
+
+/// The config-root leak regression (field-caught): a redirected
+/// $NEWT_CONFIG_DIR must own the skills dir — the seeder previously wrote
+/// ~/.newt/skills on the REAL home even when the root was redirected.
+#[test]
+#[serial_test::serial(skills_env)]
+fn default_skills_dir_honors_newt_config_dir() {
+    let prev = std::env::var_os("NEWT_CONFIG_DIR");
+    std::env::set_var("NEWT_CONFIG_DIR", "/tmp/redirected-root");
+    let dir = default_skills_dir().expect("resolvable");
+    assert_eq!(dir, std::path::PathBuf::from("/tmp/redirected-root/skills"));
+    std::env::remove_var("NEWT_CONFIG_DIR");
+    let fallback = default_skills_dir();
+    if let Some(f) = &fallback {
+        assert!(f.ends_with(".newt/skills"), "home fallback: {f:?}");
+    }
+    match prev {
+        Some(v) => std::env::set_var("NEWT_CONFIG_DIR", v),
+        None => std::env::remove_var("NEWT_CONFIG_DIR"),
+    }
+}

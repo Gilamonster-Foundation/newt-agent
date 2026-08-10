@@ -337,6 +337,23 @@ fn tui_retry_policy() -> RetryPolicy {
     RetryPolicy::for_local_inference()
 }
 
+/// `Authorization: Bearer <key>` as client default headers for the Ollama
+/// wire (Ollama Cloud enforces auth; LAN Ollama ignores the header). Baking
+/// it into the client authenticates every request the client ever makes —
+/// the un-forgettable form — instead of relying on each call site to
+/// remember `.bearer_auth()`. Empty/absent key → empty map (no header).
+/// The value is marked sensitive so debug logging never prints it.
+fn ollama_auth_headers(api_key: Option<&str>) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
+        if let Ok(mut value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+    }
+    headers
+}
+
 /// Tightest whole-request ceiling that carries authoritative semantics for
 /// this turn. A proven-good high-water mark by itself is deliberately not a
 /// ceiling; configured token thresholds and believed/declared windows are.
@@ -1541,7 +1558,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         url,
         model,
         kind: _,
-        api_key: _,
+        api_key,
         messages: mem_messages,
         task,
         workspace,
@@ -1622,7 +1639,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         Some(s) => s,
         None => &mut local_compress_state,
     };
+    // Ollama Cloud speaks the same wire as LAN Ollama but behind bearer auth.
+    // The key is baked into BOTH clients' default headers so every request on
+    // this path (tool-round probe, streaming re-issue, `/api/show`, the
+    // cap-exit summary) authenticates — a per-site `.bearer_auth()` would be
+    // the N-call-sites trap (#1312) that produced the silent 401 this fixes.
+    let auth = ollama_auth_headers(api_key);
     let client = reqwest::Client::builder()
+        .default_headers(auth.clone())
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
@@ -1637,6 +1661,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // `inference_timeout_secs` of silence. The one-shot `stream:false` probe below
     // keeps `client` (a whole-request bound is correct for a single-shot response).
     let stream_client = reqwest::Client::builder()
+        .default_headers(auth)
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
@@ -11032,6 +11057,59 @@ mod tool_round_cap_tests {
             policy_seen.load(Ordering::SeqCst),
             "the cap-exit request must retain cognition policy and omit tool-only fields"
         );
+    }
+
+    #[test]
+    fn ollama_auth_headers_builds_sensitive_bearer_or_nothing() {
+        let h = ollama_auth_headers(Some("ol-cloud-key"));
+        let v = h.get(reqwest::header::AUTHORIZATION).expect("header set");
+        assert_eq!(v.to_str().unwrap(), "Bearer ol-cloud-key");
+        assert!(v.is_sensitive(), "token must never reach debug logs");
+        assert!(ollama_auth_headers(None).is_empty());
+        assert!(ollama_auth_headers(Some("   ")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ollama_loop_sends_bearer_auth_on_every_request_when_key_configured() {
+        // Field regression (Ollama Cloud 401): the wire spoke plain HTTP with
+        // the key dropped on the floor. Every request the loop makes — tool
+        // rounds AND the final summary — must now carry the bearer.
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaResponder {
+                tool_rounds_served: served.clone(),
+                final_answer: "authed answer".into(),
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(
+            &uri,
+            &messages,
+            &caveats,
+            "do the thing",
+            BackendKind::Ollama,
+        );
+        ctx.api_key = Some("ol-cloud-key");
+        ctx.safe_context = None;
+        let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect("turn completes");
+        assert_eq!(reply, "authed answer");
+        let reqs = server.received_requests().await.expect("journal");
+        assert!(!reqs.is_empty());
+        for r in &reqs {
+            assert_eq!(
+                r.headers.get("authorization").map(|v| v.to_str().unwrap()),
+                Some("Bearer ol-cloud-key"),
+                "unauthenticated request slipped through to {}",
+                r.url
+            );
+        }
     }
 
     #[tokio::test]

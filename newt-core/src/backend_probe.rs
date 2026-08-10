@@ -885,7 +885,12 @@ pub fn is_responses_only_error(body: &str) -> bool {
     lower.contains("v1/responses")
         && (lower.contains("only supported")
             || lower.contains("only available")
-            || lower.contains("unsupported_api"))
+            || lower.contains("unsupported_api")
+            // gpt-5.6-era phrasing: "Function tools with reasoning_effort are
+            // not supported for <model> in /v1/chat/completions. To use
+            // function tools, use /v1/responses …" — the server naming
+            // /v1/responses as the fix IS the responses-only signal.
+            || lower.contains("not supported"))
 }
 
 /// Detect which OpenAI HTTP surface `endpoint` wants for `model`.
@@ -904,11 +909,25 @@ pub async fn detect_openai_api(
 ) -> anyhow::Result<OpenAiApiSurface> {
     let base = endpoint.trim_end_matches('/');
     let chat_url = format!("{base}/v1/chat/completions");
+    // The probe must look like a real agent request or it lies: gpt-5.6-class
+    // models accept a bare chat completion yet reject FUNCTION TOOLS outside
+    // /v1/responses, so a tool-free probe adopts chat_completions and every
+    // actual turn then 400s. One inert tool makes the server show its hand.
+    // `max_completion_tokens` (not the deprecated `max_tokens`) for the same
+    // reason — reasoning models reject `max_tokens` before evaluating tools.
     let chat_body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
+        "max_completion_tokens": 1,
         "stream": false,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "probe_noop",
+                "description": "capability probe — never called",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
     });
     let mut req = client.post(&chat_url).json(&chat_body);
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
@@ -1757,10 +1776,63 @@ mod tests {
         assert!(is_responses_only_error(
             r#"{"error":{"message":"This model is only supported in v1/responses","code":"unsupported_api"}}"#
         ));
+        // gpt-5.6-era phrasing, hit in field testing: tools work, but only on
+        // the Responses surface.
+        assert!(is_responses_only_error(
+            r#"{"error":{"message":"Function tools with reasoning_effort are not supported for gpt-5.6-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.","type":"invalid_request_error","param":"reasoning_effort"}}"#
+        ));
         assert!(!is_responses_only_error(
             r#"{"error":{"message":"model not found"}}"#
         ));
+        // "not supported" alone (no mention of /v1/responses) must NOT flip
+        // the surface — plain tools-unsupported models stay on chat.
+        assert!(!is_responses_only_error(
+            r#"{"error":{"message":"tools are not supported by this model"}}"#
+        ));
         assert!(!is_responses_only_error("HTTP 404"));
+    }
+
+    #[tokio::test]
+    async fn detect_openai_api_probe_carries_a_tool_and_no_legacy_max_tokens() {
+        // The probe must look like a real agent request (tools present,
+        // `max_completion_tokens` not the deprecated `max_tokens`) or
+        // tools-require-responses models pass it and 400 on real turns.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            })))
+            .mount(&server)
+            .await;
+        detect_openai_api(&reqwest::Client::new(), &server.uri(), "m", None)
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.expect("journal");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert!(body["tools"].is_array() && !body["tools"].as_array().unwrap().is_empty());
+        assert_eq!(body["max_completion_tokens"], serde_json::json!(1));
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_openai_api_adopts_responses_on_gpt56_tools_rejection() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "Function tools with reasoning_effort are not supported for gpt-5.6-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+                    "type": "invalid_request_error",
+                    "param": "reasoning_effort",
+                }
+            })))
+            .mount(&server)
+            .await;
+        let api = detect_openai_api(&reqwest::Client::new(), &server.uri(), "gpt-5.6-sol", None)
+            .await
+            .unwrap();
+        assert_eq!(api, OpenAiApiSurface::Responses);
     }
 
     #[tokio::test]
