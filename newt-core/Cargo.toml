@@ -170,6 +170,15 @@ pyo3 = ["dep:pyo3"]
 # stand-in. Enable it in `[dev-dependencies]`, never in `[dependencies]`.
 test-util = []
 
+# macOS Seatbelt OCAP evidence (#1632). agent-bridle's `os-sandbox` (a default
+# dependency feature) already compiles the Seatbelt backend in on macOS; this is
+# a MARKER feature that gates the real-resource adversarial suite
+# (`tests/macos_seatbelt_adversarial.rs`) so it stays opt-in and off the per-PR
+# unit run — enable it on the macOS real-resource / weekly job:
+#   cargo test -p newt-core --features macos-seatbelt --test macos_seatbelt_adversarial -- --ignored --test-threads=1
+# Forwarding to agent-bridle's own feature keeps the two names in lock-step.
+macos-seatbelt = ["agent-bridle/macos-seatbelt"]
+
 # The shared pty harness for the real-resource tier (#1410) — replaces the
 # byte-identical copy `tty::pty_notice_test` used to carry. It is libc-only ON
 # PURPOSE: `tests-common` depends on this crate (and on newt-inference/candle),

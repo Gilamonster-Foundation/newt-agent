@@ -66,7 +66,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
-| `local-deputy-egress` | no indirect egress via a host AF_UNIX deputy | 🟠 ACTIVE | (a confinement limitation on run_command/build/crew — not a gated capability) |
+| `local-deputy-egress` | no indirect egress via a host AF_UNIX deputy | 🟠 ACTIVE (linux) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
+| `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
 | `unconfined-fallback-on-missing-backend` | attacker-exec refuses (never runs advisory) when the native fs/net backend is unavailable | 🟠 ACTIVE | (run_command advisory-fallback; fixed by a per-axis bridle strength floor) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
@@ -187,9 +188,44 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   — the mediated-egress / netns floor of #1599 — making the only egress an explicit broker capability.
 - **Ratchet guard:** `af_unix_deputy.rs` PINS the current reachability, so a future fence that closes
   it trips CI and forces this entry + the `verify_network_confinement` claim to widen honestly.
-- **Status:** OPEN — reachable + unbounded; the netns / mediated-egress floor (#1599) closes it.
-  This is a genuine ACTIVE deviation: the network confinement is INCOMPLETE for indirect egress.
-  owner: — · review-by: #1599 / epic #749.
+- **Platform scope (macOS — #1632):** `macos: DENIED`. Unlike Linux (seccomp allows AF_UNIX,
+  Landlock does not govern unix-socket connect), macOS Seatbelt's `(deny network*)` governs the
+  AF_UNIX `connect` **itself**, so a confined child cannot reach a pathname host deputy at all —
+  a STRONGER guarantee than the fs fence alone. Proven on real `sandbox-exec` by
+  `macos_seatbelt_adversarial::seatbelt_pathname_af_unix_deputy` (macOS 26.5.2). This does NOT
+  close the entry: the **Linux** residual is unfixed, so the overall status stays OPEN. See
+  `docs/security/platform/macos-evidence.md`.
+- **Status:** OPEN — reachable + unbounded ON LINUX; the netns / mediated-egress floor (#1599)
+  closes the Linux half. This is a genuine ACTIVE deviation on Linux; on macOS it is DENIED (above).
+  A macOS result must not cosmetically close the Linux residual. owner: — · review-by: #1599 / epic #749.
+
+### mach-xpc-ambient-deputy
+- **Invariant (ideal):** a confined child reaches NO ambient host service (Mach/XPC) that could act
+  as a filesystem or network deputy on its behalf — the macOS analog of `local-deputy-egress`.
+- **Practical caveat (now):** the generated Seatbelt SBPL profile starts from `(allow default)` and
+  governs only `file-read*` / `file-write*` / `network*` / `process-exec*` (the axes Newt's `Caveats`
+  express). **Mach service lookup (`bootstrap_look_up`, XPC discovery) stays AMBIENT** — a confined
+  child can talk to host XPC/Mach services that a hostile deputy could expose (an XPC helper that
+  performs fs or network on the caller's behalf would bypass the fs/net fences). Pinned by
+  `macos_seatbelt_adversarial::seatbelt_mach_xpc_deputy_surface`, which asserts the profile does NOT
+  yet deny mach-lookup, so containment is never over-reported.
+- **Residual:** 🟠 REACHABLE (macOS only) — bounded in practice by what ambient XPC services exist on
+  the host, but not by any Newt-enforced kernel rule.
+- **Disabled while open:** nothing — a Seatbelt confinement LIMITATION on the always-reachable
+  `run_command` / build_check / crew paths, not a gated capability (no fail-closed toggle; the child
+  runs with the incomplete confinement). Honestly ACTIVE — reachable, not bounded by any CLOSED
+  invariant (the fs/net fences do not govern mach-lookup).
+- **Compensating controls:** the fs, exec, and direct-egress (`(deny network*)`) fences all stand,
+  limiting what the child can DO with a deputy; a hardened host removes unnecessary ambient XPC
+  services (not a hard guarantee); Newt tasks are trusted-code-on-trusted-host today.
+- **Closure criterion:** the SBPL profile emits `(deny mach*)` (or an explicit mach-lookup
+  allowlist) for a confined request, and a real-resource test proves an ambient XPC lookup is denied
+  — mirroring the AF_UNIX closure on the network axis.
+- **Ratchet guard:** `macos_seatbelt_adversarial::seatbelt_mach_xpc_deputy_surface` PINS the current
+  ambient surface (`(allow default)`, no `(deny mach…)`), so a future profile that closes it trips
+  the test and forces this entry to widen honestly.
+- **Status:** OPEN — reachable + unbounded on macOS; a Linux build is unaffected (no Mach). This is a
+  macOS-scoped ACTIVE deviation discovered by #1632. owner: — · review-by: #1599 / epic #749.
 
 ### unconfined-fallback-on-missing-backend
 - **Invariant (ideal):** an attacker-exec route must, on EVERY supported platform, either enforce the
