@@ -29,6 +29,21 @@ pub(crate) struct DockedSession {
     pub live: bool,
 }
 
+/// A remote session's transcript, mirrored read-only over the dock (D2). The
+/// same shape a peer's `GET /api/sessions/:id/transcript` emits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DockedTranscript {
+    pub title: String,
+    pub turns: Vec<DockedTurn>,
+}
+
+/// One `(user, assistant)` turn pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DockedTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
 /// A configured dock peer: an operator-supplied label + its cockpit base URL.
 #[derive(Debug, Clone)]
 pub(crate) struct DockPeer {
@@ -36,13 +51,37 @@ pub(crate) struct DockPeer {
     pub base_url: String,
 }
 
-/// Parse `NEWT_WEB_DOCK_PEERS` into peers. Empty/unset ⇒ no docks (the common
-/// single-box case). A bare URL gets its host as the label.
+/// Percent-encode a value for a query string (peer label / conversation id).
+fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Find a configured peer by its label (the hub panel route resolves the peer
+/// the operator clicked). `None` ⇒ an unknown/removed peer, refused fail-closed.
+pub(crate) fn peer_by_label(label: &str) -> Option<DockPeer> {
+    configured_peers().into_iter().find(|p| p.label == label)
+}
+
+/// The configured dock peers, from `NEWT_WEB_DOCK_PEERS`. Empty/unset ⇒ no docks
+/// (the common single-box case).
 pub(crate) fn configured_peers() -> Vec<DockPeer> {
-    let raw = match std::env::var("NEWT_WEB_DOCK_PEERS") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => return Vec::new(),
-    };
+    std::env::var("NEWT_WEB_DOCK_PEERS")
+        .map(|raw| parse_peers(&raw))
+        .unwrap_or_default()
+}
+
+/// Parse a `NEWT_WEB_DOCK_PEERS` value (`label=url,url2,…`) into peers — pure, so
+/// the tests need not mutate process env. A bare URL gets its host as the label.
+fn parse_peers(raw: &str) -> Vec<DockPeer> {
     raw.split(',')
         .filter_map(|entry| {
             let entry = entry.trim();
@@ -76,9 +115,11 @@ pub(crate) fn configured_peers() -> Vec<DockPeer> {
 pub(crate) trait DockSource: Send + Sync {
     /// The remote sessions this dock exposes (mirror-only for the MVP).
     fn sessions(&self) -> Result<Vec<DockedSession>, String>;
+    /// One remote session's transcript, mirrored read-only (the "select" path).
+    fn transcript(&self, conv_id: &str) -> Result<DockedTranscript, String>;
 }
 
-/// The MVP HTTP dock source: `GET {base_url}/api/sessions`.
+/// The MVP HTTP dock source: `GET {base_url}/api/sessions[/{id}/transcript]`.
 pub(crate) struct HttpDockSource {
     pub peer: DockPeer,
 }
@@ -93,6 +134,51 @@ impl DockSource for HttpDockSource {
         resp.into_json::<Vec<DockedSession>>()
             .map_err(|e| format!("bad /api/sessions payload: {e}"))
     }
+
+    fn transcript(&self, conv_id: &str) -> Result<DockedTranscript, String> {
+        let url = format!(
+            "{}/api/sessions/{}/transcript",
+            self.peer.base_url,
+            pct(conv_id)
+        );
+        let resp = ureq::get(&url)
+            .timeout(std::time::Duration::from_secs(3))
+            .call()
+            .map_err(|e| format!("unreachable: {e}"))?;
+        resp.into_json::<DockedTranscript>()
+            .map_err(|e| format!("bad transcript payload: {e}"))
+    }
+}
+
+/// Render a docked remote session's transcript as a **read-only** panel (the
+/// mirror side of D2 — no prompt form; inject over a dock is a later
+/// refinement). Reuses the cockpit's own transcript renderer so a remote
+/// session looks identical to a local one, just marked remote.
+pub(crate) fn dock_panel(peer_label: &str, transcript: &DockedTranscript) -> String {
+    let snap = crate::agents::Snapshot {
+        messages: transcript
+            .turns
+            .iter()
+            .flat_map(|t| {
+                [
+                    ("user".to_string(), t.user.clone()),
+                    ("assistant".to_string(), t.assistant.clone()),
+                ]
+            })
+            .collect(),
+        busy: false,
+        closed: false,
+    };
+    format!(
+        r#"<section class="agent dock-remote">
+<h2><span>{title} <small>· {label} · remote (read-only)</small></span></h2>
+<div class="transcript">{fragment}</div>
+<p class="hint">Mirrored over the dock (D2 — the remote host stays the sole writer). Inject over a dock is a refinement.</p>
+</section>"#,
+        title = crate::shell::escape(&transcript.title),
+        label = crate::shell::escape(peer_label),
+        fragment = crate::shell::transcript_fragment(&snap),
+    )
 }
 
 /// Render the "docked peers" cockpit section: each configured peer with its
@@ -134,8 +220,13 @@ pub(crate) async fn docked_section() -> String {
                 ));
                 for s in sessions.iter().take(30) {
                     let dot = if s.live { "▶" } else { "○" };
+                    // Selectable: clicking mirrors the remote transcript into the
+                    // shared #panel (the "select any docked session" path). The
+                    // hub resolves (peer,conv) → the peer's transcript endpoint.
                     out.push_str(&format!(
-                        r#"<li><span class="s-title">{dot} {title}</span> <small>({n} turns · {label})</small></li>"#,
+                        r##"<li><button class="dock-open" hx-get="/dock/panel?peer={plabel}&conv={pconv}" hx-target="#panel" hx-swap="innerHTML">{dot} {title}</button> <small>({n} turns · {label})</small></li>"##,
+                        plabel = pct(&peer.label),
+                        pconv = pct(&s.id),
                         dot = dot,
                         title = crate::shell::escape(&s.title),
                         n = s.turns,
@@ -163,12 +254,7 @@ mod tests {
 
     #[test]
     fn peers_parse_labelled_and_bare_and_trim() {
-        std::env::set_var(
-            "NEWT_WEB_DOCK_PEERS",
-            " lab-b=http://127.0.0.1:8898/ , http://10.0.0.4:8880 ,, ",
-        );
-        let peers = configured_peers();
-        std::env::remove_var("NEWT_WEB_DOCK_PEERS");
+        let peers = parse_peers(" lab-b=http://127.0.0.1:8898/ , http://10.0.0.4:8880 ,, ");
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].label, "lab-b");
         assert_eq!(peers[0].base_url, "http://127.0.0.1:8898"); // trailing / trimmed
@@ -177,8 +263,25 @@ mod tests {
     }
 
     #[test]
-    fn unset_peers_is_empty() {
-        std::env::remove_var("NEWT_WEB_DOCK_PEERS");
-        assert!(configured_peers().is_empty());
+    fn empty_peers_value_is_no_docks() {
+        assert!(parse_peers("").is_empty());
+        assert!(parse_peers("   ").is_empty());
+    }
+
+    #[test]
+    fn dock_panel_mirrors_turns_read_only() {
+        let t = DockedTranscript {
+            title: "remote work".into(),
+            turns: vec![DockedTurn {
+                user: "hi".into(),
+                assistant: "STUB_REPLY ok".into(),
+            }],
+        };
+        let html = dock_panel("laptop-b", &t);
+        assert!(html.contains("remote (read-only)"));
+        assert!(html.contains("laptop-b"));
+        assert!(html.contains("STUB_REPLY ok"));
+        // Mirror-only: no prompt/inject form in a docked panel.
+        assert!(!html.contains("hx-post"));
     }
 }

@@ -19,7 +19,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NEWT_BIN="${NEWT_BIN:-$HOME/bin/newt}"
 WEB_BIN="${WEB_BIN:-$HOME/.cargo-target/newtweb/debug/newt-web}"
-SESS="drive-$$"
+SESS="drive-$$"      # peer 1 TUI session
+SESS2="drive2-$$"    # peer 2 TUI session (multi-dock)
 PASS=0
 FAIL=0
 
@@ -33,7 +34,9 @@ wait_ms() { perl -e "select(undef,undef,undef,$1)"; }
 STUB_PID=""; WEB_PID=""
 teardown() {
   tmux kill-session -t "$SESS" 2>/dev/null || true
+  tmux kill-session -t "$SESS2" 2>/dev/null || true
   [ -n "$HUB_PID" ] && kill "$HUB_PID" 2>/dev/null || true
+  [ -n "$PEER2_PID" ] && kill "$PEER2_PID" 2>/dev/null || true
   [ -n "$WEB_PID" ] && kill "$WEB_PID" 2>/dev/null || true
   [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null || true
   [ -n "${WORK:-}" ] && rm -rf "$WORK" 2>/dev/null || true
@@ -51,53 +54,57 @@ start_stub() {
   [ -n "$STUB_URL" ] || { echo "stub failed to start"; cat "$WORK/stub.err"; exit 2; }
 }
 
-# --- TUI (newt in tmux) ----------------------------------------------------
-tui_capture() { tmux capture-pane -t "$SESS" -p 2>/dev/null; }
-tui_wait()    { local pat="$1" n="${2:-30}"; for _ in $(seq 1 "$n"); do wait_ms 0.5; tui_capture | grep -q "$pat" && return 0; done; return 1; }
-tui_send()    { tmux send-keys -t "$SESS" "$1" C-m; }
+# --- TUI (newt in tmux), session-parameterized so we can run >1 peer --------
+tui_capture() { tmux capture-pane -t "$1" -p 2>/dev/null; }
+tui_wait()    { local sess="$1" pat="$2" n="${3:-30}"; for _ in $(seq 1 "$n"); do wait_ms 0.5; tui_capture "$sess" | grep -q "$pat" && return 0; done; return 1; }
+tui_send()    { tmux send-keys -t "$1" "$2" C-m; }
 
-start_tui() {
-  tmux new-session -d -s "$SESS" -x 120 -y 40
-  tmux send-keys -t "$SESS" \
-    "cd '$WORK/ws' && NEWT_CONFIG_DIR='$WORK/cfg' NEWT_DGX_OLLAMA_URL='$STUB_URL' '$NEWT_BIN' 2>&1 | tee '$WORK/tui.log'" C-m
-  tui_wait 'start coder' 20 || { echo "newt never showed the splash"; tui_capture; exit 2; }
-  tmux send-keys -t "$SESS" Enter          # dismiss the splash → chat
-  tui_wait '❯' 30 || { echo "newt never reached the chat prompt"; tui_capture; exit 2; }
+start_tui() { # start_tui <tmux-session> <cfg-dir> <ws-dir>
+  local sess="$1" cfg="$2" ws="$3"
+  mkdir -p "$cfg" "$ws"
+  tmux new-session -d -s "$sess" -x 120 -y 40
+  tmux send-keys -t "$sess" \
+    "cd '$ws' && NEWT_CONFIG_DIR='$cfg' NEWT_DGX_OLLAMA_URL='$STUB_URL' '$NEWT_BIN' 2>&1 | tee '$cfg/tui.log'" C-m
+  tui_wait "$sess" 'start coder' 20 || { echo "newt ($sess) never showed the splash"; tui_capture "$sess"; exit 2; }
+  tmux send-keys -t "$sess" Enter          # dismiss the splash → chat
+  tui_wait "$sess" '❯' 30 || { echo "newt ($sess) never reached the chat prompt"; tui_capture "$sess"; exit 2; }
 }
 
 # --- web (newt-web cockpit) ------------------------------------------------
-# The PEER cockpit shares the TUI's store (so it exposes the TUI's session at
-# /api/sessions). The HUB cockpit has its own empty store and DOCKS the peer.
-WEB_PORT=""; HUB_PORT=""; HUB_PID=""
-start_web() {
+# Two PEER cockpits (each fronting a store with a session) + one HUB cockpit
+# (own empty store) that DOCKS both peers — the multi-dock overview.
+WEB_PORT=""; WEB_PID=""; PEER2_PORT=""; PEER2_PID=""; HUB_PORT=""; HUB_PID=""; DOCK_PEERS=""
+_wait_web() { local port="$1" what="$2" log="$3"; for _ in $(seq 1 40); do wait_ms 0.3; curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && return 0; done; echo "newt-web ($what) never became ready"; cat "$log"; exit 2; }
+start_web() { # peer 1, shares the peer-1 store
   WEB_PORT="$(free_port)"
   NEWT_WEB_BIND="127.0.0.1:$WEB_PORT" NEWT_WEB_AUTH_HEADER="" \
     NEWT_WEB_STATE_DIR="$WORK/cfg" NEWT_WEB_WORKSPACE="$WORK/ws" \
     "$WEB_BIN" > "$WORK/web.log" 2>&1 &
-  WEB_PID=$!
-  for _ in $(seq 1 40); do wait_ms 0.3; curl -fsS "http://127.0.0.1:$WEB_PORT/healthz" >/dev/null 2>&1 && return 0; done
-  echo "newt-web (peer) never became ready"; cat "$WORK/web.log"; exit 2
+  WEB_PID=$!; _wait_web "$WEB_PORT" peer1 "$WORK/web.log"
 }
-start_hub() {
-  HUB_PORT="$(free_port)"
-  mkdir -p "$WORK/hub"
+start_peer2() { # peer 2, its own store
+  PEER2_PORT="$(free_port)"
+  NEWT_WEB_BIND="127.0.0.1:$PEER2_PORT" NEWT_WEB_AUTH_HEADER="" \
+    NEWT_WEB_STATE_DIR="$WORK/cfg2" NEWT_WEB_WORKSPACE="$WORK/ws2" \
+    "$WEB_BIN" > "$WORK/peer2.log" 2>&1 &
+  PEER2_PID=$!; _wait_web "$PEER2_PORT" peer2 "$WORK/peer2.log"
+}
+start_hub() { # docks whatever is in DOCK_PEERS
+  HUB_PORT="$(free_port)"; mkdir -p "$WORK/hub"
   NEWT_WEB_BIND="127.0.0.1:$HUB_PORT" NEWT_WEB_AUTH_HEADER="" \
     NEWT_WEB_STATE_DIR="$WORK/hub" NEWT_WEB_WORKSPACE="$WORK/hub" \
-    NEWT_WEB_DOCK_PEERS="laptop-b=http://127.0.0.1:$WEB_PORT" \
+    NEWT_WEB_DOCK_PEERS="$DOCK_PEERS" \
     "$WEB_BIN" > "$WORK/hub.log" 2>&1 &
-  HUB_PID=$!
-  for _ in $(seq 1 40); do wait_ms 0.3; curl -fsS "http://127.0.0.1:$HUB_PORT/healthz" >/dev/null 2>&1 && return 0; done
-  echo "newt-web (hub) never became ready"; cat "$WORK/hub.log"; exit 2
+  HUB_PID=$!; _wait_web "$HUB_PORT" hub "$WORK/hub.log"
 }
 hub_get() { curl -fsS "http://127.0.0.1:$HUB_PORT$1"; }
 web_get()  { curl -fsS "http://127.0.0.1:$WEB_PORT$1"; }
 web_post() { local path="$1"; shift; curl -fsS -X POST "http://127.0.0.1:$WEB_PORT$path" "$@"; }
 
-# --- store probe -----------------------------------------------------------
-db() { python3 - "$WORK/cfg/conversations.db" "$@"; }
-store_conv()  { python3 -c "import sqlite3;r=sqlite3.connect('$WORK/cfg/conversations.db').execute('select id from conversations').fetchone();print(r[0] if r else '')"; }
-store_wspath(){ python3 -c "import sqlite3;r=sqlite3.connect('$WORK/cfg/conversations.db').execute('select workspace_path from conversations').fetchone();print(r[0] if r else '')"; }
-store_inbox() { python3 -c "import sqlite3;print(len(sqlite3.connect('$WORK/cfg/conversations.db').execute('select 1 from conversation_inbox').fetchall()))"; }
+# --- store probe (arg 1 = config dir holding conversations.db) -------------
+store_conv()  { python3 -c "import sqlite3;r=sqlite3.connect('$1/conversations.db').execute('select id from conversations').fetchone();print(r[0] if r else '')"; }
+store_wspath(){ python3 -c "import sqlite3;r=sqlite3.connect('$1/conversations.db').execute('select workspace_path from conversations').fetchone();print(r[0] if r else '')"; }
+store_inbox() { python3 -c "import sqlite3;print(len(sqlite3.connect('$1/conversations.db').execute('select 1 from conversation_inbox').fetchall()))"; }
 
 # ===========================================================================
 main() {
@@ -105,70 +112,79 @@ main() {
   [ -x "$WEB_BIN" ]  || { echo "no newt-web binary at $WEB_BIN (build it or set WEB_BIN=)"; exit 2; }
   WORK="$(mktemp -d)/drive"; mkdir -p "$WORK"/{cfg,ws}
 
-  say "boot: stub Ollama + newt TUI (tmux) + a first claimed turn"
+  say "boot: stub Ollama + two peer newt TUIs (tmux), each a claimed turn"
   start_stub
-  start_tui
-  tui_send "hello from the driver"
-  tui_wait 'STUB_REPLY' 30 && ok "TUI completes a turn against the stub (claims a conversation)" \
-    || bad "TUI turn did not complete"
-  CONV="$(store_conv)"; WSP="$(store_wspath)"
-  [ -n "$CONV" ] && ok "store has the claimed conversation ($CONV)" || bad "no conversation in the store"
+  start_tui "$SESS" "$WORK/cfg" "$WORK/ws"
+  tui_send "$SESS" "hello from the driver"
+  tui_wait "$SESS" 'STUB_REPLY' 30 && ok "peer-1 TUI completes a turn (claims a conversation)" \
+    || bad "peer-1 TUI turn did not complete"
+  CONV="$(store_conv "$WORK/cfg")"; WSP="$(store_wspath "$WORK/cfg")"
+  [ -n "$CONV" ] && ok "peer-1 store has the claimed conversation ($CONV)" || bad "no conversation in peer-1 store"
+  start_tui "$SESS2" "$WORK/cfg2" "$WORK/ws2"
+  tui_send "$SESS2" "second peer working on kyln"
+  tui_wait "$SESS2" 'STUB_REPLY' 30 && ok "peer-2 TUI completes a turn (a DISTINCT session)" \
+    || bad "peer-2 TUI turn did not complete"
 
-  say "web cockpit against the SAME store: multi-session SELECT"
+  say "peer-1 web against its store: multi-session SELECT + coequal INJECT (D2)"
   start_web
   web_get "/" | grep -q 'hello from the driver' \
-    && ok "cockpit lists the session (select/overview sees it)" \
-    || bad "cockpit did not list the session"
-
-  say "coequal mirror + INJECT through the web (D2: hub enqueues, TUI stays sole writer)"
+    && ok "peer-1 cockpit lists the session (select/overview sees it)" \
+    || bad "peer-1 cockpit did not list the session"
   FOLLOW="$(web_post /follow --data-urlencode "conv_id=$CONV" --data-urlencode "title=hello from the driver" --data-urlencode "workspace=$WSP")"
   AID="$(printf '%s' "$FOLLOW" | grep -oE '/agents/[0-9]+/' | head -1 | grep -oE '[0-9]+')"
   [ -n "$AID" ] && ok "web follow/attach created a tab (agent $AID)" || bad "follow did not create a tab"
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$WEB_PORT/agents/$AID/prompt" --data-urlencode "text=INJECTED_VIA_WEB run the tests")"
   [ "$code" = "204" ] && ok "inject accepted (204)" || bad "inject returned $code"
-  [ "$(store_inbox)" -ge 1 ] && ok "inbox row landed in the shared store" || bad "no inbox row"
+  [ "$(store_inbox "$WORK/cfg")" -ge 1 ] && ok "inbox row landed in the shared store" || bad "no inbox row"
 
   say "the Phase-1b idle-wake gap (headless, reproducible)"
   wait_ms 1.5
-  if tui_capture | grep -q 'echo: INJECTED_VIA_WEB'; then
+  if tui_capture "$SESS" | grep -q 'echo: INJECTED_VIA_WEB'; then
     ok "TUI consumed the inject WHILE IDLE — Phase 1b is live"
   else
     skip "TUI did NOT consume the inject while idle (pre-1b: only drains at a turn boundary)"
-    tui_send ""   # a keypress triggers the turn-boundary drain
-    tui_wait 'echo: INJECTED_VIA_WEB' 30 \
+    tui_send "$SESS" ""   # a keypress triggers the turn-boundary drain
+    tui_wait "$SESS" 'echo: INJECTED_VIA_WEB' 30 \
       && ok "…and the inject is consumed after a keypress (baseline mirror+inject works)" \
       || bad "inject never consumed even after a keypress"
   fi
 
-  say "DOCK (MVP, HTTP transport): a hub cockpit surfaces a peer's sessions"
-  # /api/sessions on the peer is the machine-readable surface a hub reads.
+  say "DOCK (MVP, HTTP transport): the peer exposes /api/sessions"
   SESSJSON="$(web_get /api/sessions)"
   printf '%s' "$SESSJSON" | grep -q '"title":"hello from the driver"' \
     && ok "peer exposes GET /api/sessions (JSON) with its session" \
     || bad "peer /api/sessions did not list the session"
   printf '%s' "$SESSJSON" | grep -q '"live":true' \
-    && ok "peer reports the session LIVE (the 'Connected' signal — a running owner)" \
+    && ok "peer reports the session LIVE (the 'Connected' signal)" \
     || bad "peer did not report the live-owner status"
+
+  say "MULTI-DOCK: a hub cockpit docks BOTH peers into one overview"
+  start_peer2
+  DOCK_PEERS="laptop-b=http://127.0.0.1:$WEB_PORT,nuc=http://127.0.0.1:$PEER2_PORT"
   start_hub
   HUBHOME="$(hub_get /)"
   printf '%s' "$HUBHOME" | grep -q 'docked peers' \
-    && ok "hub cockpit renders a 'docked peers' section" \
-    || bad "hub has no docked section"
-  printf '%s' "$HUBHOME" | grep -q 'laptop-b' \
-    && ok "hub shows the configured peer (laptop-b)" \
-    || bad "hub did not show the peer label"
-  printf '%s' "$HUBHOME" | grep -q 'hello from the driver' \
-    && ok "hub MIRRORS the peer's remote session into its overview (dock works)" \
-    || bad "hub did not surface the peer's session"
+    && ok "hub renders a 'docked peers' overview" || bad "hub has no docked section"
+  printf '%s' "$HUBHOME" | grep -q 'laptop-b' && printf '%s' "$HUBHOME" | grep -q 'nuc' \
+    && ok "overview groups BOTH peers (laptop-b + nuc)" || bad "hub did not show both peers"
+  printf '%s' "$HUBHOME" | grep -q 'hello from the driver' && printf '%s' "$HUBHOME" | grep -q 'second peer working on kyln' \
+    && ok "hub mirrors each peer's distinct session (multi-dock works)" \
+    || bad "hub did not surface both peers' sessions"
   printf '%s' "$HUBHOME" | grep -q '▶ hello from the driver' \
-    && ok "hub marks the remote session Connected (▶ live)" \
-    || bad "hub did not render the live/connected marker"
+    && ok "docked sessions carry the ▶ Connected marker" || bad "no live marker"
 
-  say "undock / multi-dock (Phases 4/5 refinements)"
-  skip "multi-dock N peers into the overview          (repeat NEWT_WEB_DOCK_PEERS; overview groups by peer)"
-  skip "remote transcript mirror + inject over a dock (refine: /api/sessions/:id/transcript + SessionInput)"
-  skip "undock <peer> / undock all from the TUI       (Phase 5 kill-switch)"
-  skip "swap HTTP transport → agent-mesh session_streams (Phase 2, behind dock::DockSource)"
+  say "SELECT: click a docked session → its transcript mirrors into the hub panel"
+  PANEL="$(hub_get "/dock/panel?peer=laptop-b&conv=$CONV")"
+  printf '%s' "$PANEL" | grep -q 'remote (read-only)' \
+    && ok "hub renders a read-only docked panel (mirror, D2)" || bad "docked panel not rendered"
+  printf '%s' "$PANEL" | grep -q 'STUB_REPLY ok — echo: hello from the driver' \
+    && ok "the docked panel MIRRORS the remote transcript (select works)" \
+    || bad "docked panel did not carry the remote transcript"
+
+  say "still pending (later phases)"
+  skip "inject over a dock (remote host stays sole writer)   (refine: SessionInput on /dock)"
+  skip "undock <peer> / undock all from the TUI              (Phase 5 kill-switch)"
+  skip "swap HTTP transport → agent-mesh session_streams     (Phase 2, behind dock::DockSource)"
 
   echo
   say "result: $PASS passed, $FAIL failed"

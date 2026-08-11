@@ -5,7 +5,7 @@
 //! (`agents.rs`); the front end is server-rendered HTML (`shell.rs`); this
 //! file is the composition root — routes, state, and the SSE bridge only.
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -106,7 +106,9 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/agents/:id/decision", post(decide_route))
         .route("/agents/:id/events", get(agent_events))
         .route("/agents/:id", axum::routing::delete(delete_agent))
-        .route("/api/sessions", get(api_sessions));
+        .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/:id/transcript", get(api_transcript))
+        .route("/dock/panel", get(dock_panel_route));
     if let Some(header) = auth_header {
         gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
     }
@@ -432,6 +434,75 @@ async fn api_sessions() -> impl IntoResponse {
     .await
     .unwrap_or_default();
     axum::Json(sessions)
+}
+
+/// `GET /api/sessions/:id/transcript` — one session's transcript as JSON, the
+/// surface a hub reads to MIRROR a docked session (mirror-only, D2). Resolves
+/// the conversation's own workspace (store `load` is workspace-fenced) so the
+/// caller need not know it. 404 if the conversation is unknown here.
+async fn api_transcript(Path(id): Path<String>) -> impl IntoResponse {
+    let (state, ws) = store_paths();
+    let transcript = tokio::task::spawn_blocking(move || {
+        let store = newt_core::ConversationStore::new(&state, &ws, 1000).ok()?;
+        let wspath = store
+            .list_all()
+            .ok()?
+            .into_iter()
+            .find(|(c, _)| c.id == id)
+            .map(|(_, w)| w)?;
+        let fenced =
+            newt_core::ConversationStore::new(&state, std::path::PathBuf::from(&wspath), 1000)
+                .ok()?;
+        let rec = fenced.load(&id).ok()?;
+        Some(dock::DockedTranscript {
+            title: rec.title,
+            turns: rec
+                .turns
+                .iter()
+                .map(|t| dock::DockedTurn {
+                    user: t.user.clone(),
+                    assistant: t.assistant.clone(),
+                })
+                .collect(),
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+    match transcript {
+        Some(t) => axum::Json(t).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DockPanelQuery {
+    peer: String,
+    conv: String,
+}
+
+/// `GET /dock/panel?peer=&conv=` — the hub side of SELECT: resolve the clicked
+/// peer, mirror its session's transcript into the shared `#panel` read-only. An
+/// unknown peer is refused (fail-closed); an unreachable one renders a notice.
+async fn dock_panel_route(Query(q): Query<DockPanelQuery>) -> impl IntoResponse {
+    let Some(peer) = dock::peer_by_label(&q.peer) else {
+        return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
+    };
+    let conv = q.conv.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use dock::DockSource;
+        dock::HttpDockSource { peer }.transcript(&conv)
+    })
+    .await
+    .unwrap_or_else(|_| Err("join error".into()));
+    match result {
+        Ok(t) => Html(dock::dock_panel(&q.peer, &t)).into_response(),
+        Err(e) => Html(format!(
+            r#"<p class="empty">dock unreachable: {}</p>"#,
+            shell::escape(&e)
+        ))
+        .into_response(),
+    }
 }
 
 /// The "sessions on this box" section: conversations in the shared store,
