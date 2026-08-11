@@ -16,6 +16,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 mod agents;
+mod dock;
 mod shell;
 
 use agents::{Registry, Spec};
@@ -104,7 +105,8 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/agents/:id/pending", get(pending_decision_route))
         .route("/agents/:id/decision", post(decide_route))
         .route("/agents/:id/events", get(agent_events))
-        .route("/agents/:id", axum::routing::delete(delete_agent));
+        .route("/agents/:id", axum::routing::delete(delete_agent))
+        .route("/api/sessions", get(api_sessions));
     if let Some(header) = auth_header {
         gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
     }
@@ -393,6 +395,43 @@ fn store_paths() -> (std::path::PathBuf, std::path::PathBuf) {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     (state, ws)
+}
+
+/// `GET /api/sessions` — this cockpit's sessions as JSON, the machine-readable
+/// twin of `sessions_section`. It is the surface a **hub** reads to dock this
+/// instance's sessions (`dock::HttpDockSource`); a hub and a peer speak one wire
+/// type ([`dock::DockedSession`]). Behind the same auth gate as the rest — a
+/// dock must authenticate. Store errors render an empty list, never a 500.
+async fn api_sessions() -> impl IntoResponse {
+    let (state, ws) = store_paths();
+    let sessions = tokio::task::spawn_blocking(move || {
+        let Ok(store) = newt_core::ConversationStore::new(&state, &ws, 1000) else {
+            return Vec::new();
+        };
+        store
+            .list_all()
+            .unwrap_or_default()
+            .into_iter()
+            .take(30)
+            .map(|(c, workspace)| {
+                let live = store
+                    .live_owner(&c.id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|owner| store.is_owner_live(&owner));
+                dock::DockedSession {
+                    id: c.id,
+                    title: c.title,
+                    workspace,
+                    turns: c.turn_count,
+                    live,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    axum::Json(sessions)
 }
 
 /// The "sessions on this box" section: conversations in the shared store,

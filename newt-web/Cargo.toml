@@ -31,6 +31,11 @@ base64 = "0.22"
 serde_json = "1"
 async-stream = "0.3"
 futures-core = "0.3"
+# Tiny blocking HTTP client for the MVP dock transport (pull a peer cockpit's
+# GET /api/sessions). default-features off = no TLS stack — loopback/LAN http
+# only; the agent-mesh session_streams transport replaces this behind the
+# `dock::DockSource` seam. Called inside spawn_blocking.
+ureq = { version = "2.12", default-features = false, features = ["json"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -282,6 +282,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
         None => r#"<p class="empty">No agents yet. Spawn one above.</p>"#.to_string(),
     };
     let sessions = crate::sessions_section().await;
+    let docked = crate::dock::docked_section().await;
 
     Html(format!(
         r##"<!doctype html>
@@ -298,7 +299,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <body>
 <header><h1>newt-web</h1></header>
 <main id="content">
-{sessions}
+{docked}{sessions}
 <details class="spawn-wrap">
 <summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
 <form class="spawn" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
@@ -320,6 +321,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
         url = escape(&default_url),
         model = escape(&default_model),
         ws = escape(&default_ws),
+        docked = docked,
         sessions = sessions,
         strip = strip,
         panel = panel,

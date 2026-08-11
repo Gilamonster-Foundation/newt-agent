@@ -33,6 +33,7 @@ wait_ms() { perl -e "select(undef,undef,undef,$1)"; }
 STUB_PID=""; WEB_PID=""
 teardown() {
   tmux kill-session -t "$SESS" 2>/dev/null || true
+  [ -n "$HUB_PID" ] && kill "$HUB_PID" 2>/dev/null || true
   [ -n "$WEB_PID" ] && kill "$WEB_PID" 2>/dev/null || true
   [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null || true
   [ -n "${WORK:-}" ] && rm -rf "$WORK" 2>/dev/null || true
@@ -65,7 +66,9 @@ start_tui() {
 }
 
 # --- web (newt-web cockpit) ------------------------------------------------
-WEB_PORT=""
+# The PEER cockpit shares the TUI's store (so it exposes the TUI's session at
+# /api/sessions). The HUB cockpit has its own empty store and DOCKS the peer.
+WEB_PORT=""; HUB_PORT=""; HUB_PID=""
 start_web() {
   WEB_PORT="$(free_port)"
   NEWT_WEB_BIND="127.0.0.1:$WEB_PORT" NEWT_WEB_AUTH_HEADER="" \
@@ -73,8 +76,20 @@ start_web() {
     "$WEB_BIN" > "$WORK/web.log" 2>&1 &
   WEB_PID=$!
   for _ in $(seq 1 40); do wait_ms 0.3; curl -fsS "http://127.0.0.1:$WEB_PORT/healthz" >/dev/null 2>&1 && return 0; done
-  echo "newt-web never became ready"; cat "$WORK/web.log"; exit 2
+  echo "newt-web (peer) never became ready"; cat "$WORK/web.log"; exit 2
 }
+start_hub() {
+  HUB_PORT="$(free_port)"
+  mkdir -p "$WORK/hub"
+  NEWT_WEB_BIND="127.0.0.1:$HUB_PORT" NEWT_WEB_AUTH_HEADER="" \
+    NEWT_WEB_STATE_DIR="$WORK/hub" NEWT_WEB_WORKSPACE="$WORK/hub" \
+    NEWT_WEB_DOCK_PEERS="laptop-b=http://127.0.0.1:$WEB_PORT" \
+    "$WEB_BIN" > "$WORK/hub.log" 2>&1 &
+  HUB_PID=$!
+  for _ in $(seq 1 40); do wait_ms 0.3; curl -fsS "http://127.0.0.1:$HUB_PORT/healthz" >/dev/null 2>&1 && return 0; done
+  echo "newt-web (hub) never became ready"; cat "$WORK/hub.log"; exit 2
+}
+hub_get() { curl -fsS "http://127.0.0.1:$HUB_PORT$1"; }
 web_get()  { curl -fsS "http://127.0.0.1:$WEB_PORT$1"; }
 web_post() { local path="$1"; shift; curl -fsS -X POST "http://127.0.0.1:$WEB_PORT$path" "$@"; }
 
@@ -125,10 +140,28 @@ main() {
       || bad "inject never consumed even after a keypress"
   fi
 
-  say "dock / undock / multi-dock (Phases 2–5)"
-  skip "dock a same-operator remote session          (Phase 2/4 — mesh session_streams + hub Dock tab)"
-  skip "multi-dock N peers into the overview          (Phase 4/6)"
+  say "DOCK (MVP, HTTP transport): a hub cockpit surfaces a peer's sessions"
+  # /api/sessions on the peer is the machine-readable surface a hub reads.
+  web_get "/api/sessions" | grep -q '"title":"hello from the driver"' \
+    && ok "peer exposes GET /api/sessions (JSON) with its session" \
+    || bad "peer /api/sessions did not list the session"
+  start_hub
+  HUBHOME="$(hub_get /)"
+  printf '%s' "$HUBHOME" | grep -q 'docked peers' \
+    && ok "hub cockpit renders a 'docked peers' section" \
+    || bad "hub has no docked section"
+  printf '%s' "$HUBHOME" | grep -q 'laptop-b' \
+    && ok "hub shows the configured peer (laptop-b)" \
+    || bad "hub did not show the peer label"
+  printf '%s' "$HUBHOME" | grep -q 'hello from the driver' \
+    && ok "hub MIRRORS the peer's remote session into its overview (dock works)" \
+    || bad "hub did not surface the peer's session"
+
+  say "undock / multi-dock (Phases 4/5 refinements)"
+  skip "multi-dock N peers into the overview          (repeat NEWT_WEB_DOCK_PEERS; overview groups by peer)"
+  skip "remote transcript mirror + inject over a dock (refine: /api/sessions/:id/transcript + SessionInput)"
   skip "undock <peer> / undock all from the TUI       (Phase 5 kill-switch)"
+  skip "swap HTTP transport → agent-mesh session_streams (Phase 2, behind dock::DockSource)"
 
   echo
   say "result: $PASS passed, $FAIL failed"
