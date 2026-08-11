@@ -320,10 +320,64 @@ mod tests {
         PeerEndpoint::from_parts(pubkey, IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 
+    /// Pure dock-request handling against a seeded store — the DETERMINISTIC
+    /// per-PR gate (no bus, no network), the twin of `service.rs`'s
+    /// `handle_inference_*` unit tests. Grounds the protocol logic; the live
+    /// transport is grounded by the ignored loopback-QUIC test below.
+    #[test]
+    fn handle_dock_lists_mirrors_and_injects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(dir.path(), dir.path(), 100).unwrap();
+        let conv = store.create("a session", None).unwrap();
+        store.append_turn(&conv, "q", "answer text").unwrap();
+
+        match handle_dock(dir.path(), DockRequest::ListSessions) {
+            DockReply::Sessions(s) => {
+                assert!(s.iter().any(|x| x.title == "a session"));
+            }
+            other => panic!("expected Sessions, got {other:?}"),
+        }
+        match handle_dock(dir.path(), DockRequest::Transcript { conv: conv.clone() }) {
+            DockReply::Transcript(t) => {
+                assert!(t.turns.iter().any(|x| x.assistant == "answer text"));
+            }
+            other => panic!("expected Transcript, got {other:?}"),
+        }
+        match handle_dock(
+            dir.path(),
+            DockRequest::Inject {
+                conv: conv.clone(),
+                text: "INJ".into(),
+            },
+        ) {
+            DockReply::Injected => {}
+            other => panic!("expected Injected, got {other:?}"),
+        }
+        // D2: the inject landed in the peer's own inbox.
+        assert_eq!(
+            store.take_injected_prompt(&conv).unwrap().map(|p| p.body),
+            Some("INJ".to_string())
+        );
+        // Unknown conversation → NotFound, never a panic.
+        assert!(matches!(
+            handle_dock(
+                dir.path(),
+                DockRequest::Transcript {
+                    conv: "nope".into()
+                }
+            ),
+            DockReply::NotFound
+        ));
+    }
+
     /// The full dock lifecycle over a REAL loopback bus (real envelopes,
     /// handshake, QUIC): list, mirror, and inject — the last one landing in the
     /// peer's own store inbox (D2). Same operator, so the handshake auto-teams.
+    /// Ignored per the repo's live-transport convention (see
+    /// `conversation_contract.rs`) — runs in the nightly / `--include-ignored`
+    /// tier of `mesh-integration.yml`, not the per-PR gate.
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live transport — nightly/full mesh-integration tier only"]
     async fn dock_lifecycle_over_loopback_mesh() {
         let user = UserKey::generate();
 
