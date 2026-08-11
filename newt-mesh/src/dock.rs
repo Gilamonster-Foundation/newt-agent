@@ -77,6 +77,13 @@ pub struct DockTurn {
 /// Service a single decoded dock request against the store at `state_dir`.
 /// Synchronous (SQLite); the async handler runs it on a blocking thread.
 fn handle_dock(state_dir: &Path, req: DockRequest) -> DockReply {
+    // The operator's dock-exposure kill-switch (requirement 7): a marker file in
+    // the state dir. Fail-closed — while present, every dock request is refused
+    // over the MESH too, not only over HTTP, so a forcible undock is complete
+    // across transports.
+    if state_dir.join("dock-exposure-disabled").exists() {
+        return DockReply::Error("dock exposure disabled by the operator".into());
+    }
     use newt_core::ConversationStore;
     // `list_all` is cross-workspace, so the workspace arg here is irrelevant; the
     // transcript/inject paths re-open FENCED at the conversation's own workspace.
@@ -368,6 +375,45 @@ mod tests {
             ),
             DockReply::NotFound
         ));
+    }
+
+    /// The operator's kill-switch (requirement 7) must fail-closed over the
+    /// MESH, not only over HTTP: with the `dock-exposure-disabled` marker in the
+    /// state dir, every dock request is refused, so a forcible undock is complete
+    /// across transports. Grounds the drive harness's "forcibly undocked" mesh
+    /// assertion at the per-PR tier.
+    #[test]
+    fn a_disabled_marker_refuses_every_dock_request_over_the_mesh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(dir.path(), dir.path(), 100).unwrap();
+        let conv = store.create("a session", None).unwrap();
+        store.append_turn(&conv, "q", "answer text").unwrap();
+
+        // Without the marker the peer lists its session.
+        assert!(matches!(
+            handle_dock(dir.path(), DockRequest::ListSessions),
+            DockReply::Sessions(_)
+        ));
+
+        // The operator flips the kill-switch.
+        std::fs::write(dir.path().join("dock-exposure-disabled"), b"").unwrap();
+
+        for req in [
+            DockRequest::ListSessions,
+            DockRequest::Transcript { conv: conv.clone() },
+            DockRequest::Inject {
+                conv: conv.clone(),
+                text: "INJ".into(),
+            },
+        ] {
+            match handle_dock(dir.path(), req) {
+                DockReply::Error(msg) => assert!(msg.contains("disabled")),
+                other => panic!("disabled dock must refuse with Error, got {other:?}"),
+            }
+        }
+
+        // The refused inject never reached the peer's inbox.
+        assert!(store.take_injected_prompt(&conv).unwrap().is_none());
     }
 
     /// The full dock lifecycle over a REAL loopback bus (real envelopes,

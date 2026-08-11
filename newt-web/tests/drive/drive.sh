@@ -74,13 +74,19 @@ start_tui() { # start_tui <tmux-session> <cfg-dir> <ws-dir>
 # Two PEER cockpits (each fronting a store with a session) + one HUB cockpit
 # (own empty store) that DOCKS both peers — the multi-dock overview.
 WEB_PORT=""; WEB_PID=""; PEER2_PORT=""; PEER2_PID=""; HUB_PORT=""; HUB_PID=""; DOCK_PEERS=""
+MESH_PUBKEY=""; MESH_PORT=""
 _wait_web() { local port="$1" what="$2" log="$3"; for _ in $(seq 1 40); do wait_ms 0.3; curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && return 0; done; echo "newt-web ($what) never became ready"; cat "$log"; exit 2; }
-start_web() { # peer 1, shares the peer-1 store
+start_web() { # peer 1, shares the peer-1 store; ALSO exposes over the mesh
   WEB_PORT="$(free_port)"
   NEWT_WEB_BIND="127.0.0.1:$WEB_PORT" NEWT_WEB_AUTH_HEADER="" \
     NEWT_WEB_STATE_DIR="$WORK/cfg" NEWT_WEB_WORKSPACE="$WORK/ws" \
+    NEWT_WEB_MESH_BIND="0" \
     "$WEB_BIN" > "$WORK/web.log" 2>&1 &
   WEB_PID=$!; _wait_web "$WEB_PORT" peer1 "$WORK/web.log"
+  # The mesh responder binds before the HTTP server accepts, so its line is in
+  # the log by now: "mesh dock service on udp/<port> (agent …, pubkey <hex>)".
+  MESH_PORT="$(grep -oE 'udp/[0-9]+' "$WORK/web.log" | head -1 | cut -d/ -f2)"
+  MESH_PUBKEY="$(grep -oE 'pubkey [0-9a-f]{64}' "$WORK/web.log" | head -1 | awk '{print $2}')"
 }
 start_peer2() { # peer 2, its own store
   PEER2_PORT="$(free_port)"
@@ -160,7 +166,9 @@ main() {
 
   say "MULTI-DOCK: a hub cockpit docks BOTH peers into one overview"
   start_peer2
-  DOCK_PEERS="laptop-b=http://127.0.0.1:$WEB_PORT,nuc=http://127.0.0.1:$PEER2_PORT"
+  # The hub shares the operator identity so a same-user mesh dock auto-teams.
+  mkdir -p "$WORK/hub"; cp "$WORK/cfg/identity.pem" "$WORK/hub/identity.pem"
+  DOCK_PEERS="laptop-b=http://127.0.0.1:$WEB_PORT,nuc=http://127.0.0.1:$PEER2_PORT,meshpeer=mesh:$MESH_PUBKEY@127.0.0.1:$MESH_PORT"
   start_hub
   HUBHOME="$(hub_get /)"
   printf '%s' "$HUBHOME" | grep -q 'docked peers' \
@@ -180,6 +188,19 @@ main() {
   printf '%s' "$PANEL" | grep -q 'STUB_REPLY ok — echo: hello from the driver' \
     && ok "the docked panel MIRRORS the remote transcript (select works)" \
     || bad "docked panel did not carry the remote transcript"
+
+  say "MESH TRANSPORT: the hub also docks a peer over agent-mesh (not HTTP)"
+  [ -n "$MESH_PUBKEY" ] && [ -n "$MESH_PORT" ] \
+    && ok "the peer bound a mesh dock service (pubkey ${MESH_PUBKEY:0:12}…, udp/$MESH_PORT)" \
+    || bad "the peer did not bind a mesh dock service (no identity?)"
+  # A peer h3 with sessions renders '· mesh · remote'; a failed mesh fetch would
+  # render '· mesh · <error>' instead — so this proves a real mesh round-trip.
+  printf '%s' "$HUBHOME" | grep -q '· mesh · remote' \
+    && ok "hub lists the mesh peer's session OVER THE MESH (agent-mesh transport works in newt-web)" \
+    || bad "hub did not surface the mesh peer's session over the mesh"
+  hub_get "/dock/panel?peer=meshpeer&conv=$CONV" | grep -q 'echo: hello from the driver' \
+    && ok "SELECT over the MESH mirrors the remote transcript (full dock over agent-mesh)" \
+    || bad "mesh select did not mirror the transcript"
 
   say "INJECT OVER A DOCK (D2 across the dock: the remote host stays sole writer)"
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$HUB_PORT/dock/inject?peer=laptop-b&conv=$CONV" --data-urlencode "text=DOCK_INJECT check the lints")"
