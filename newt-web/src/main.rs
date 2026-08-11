@@ -511,14 +511,7 @@ async fn dock_panel_route(Query(q): Query<DockPanelQuery>) -> impl IntoResponse 
     let Some(peer) = dock::peer_by_label(&q.peer) else {
         return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
     };
-    let conv = q.conv.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        use dock::DockSource;
-        dock::HttpDockSource { peer }.transcript(&conv)
-    })
-    .await
-    .unwrap_or_else(|_| Err("join error".into()));
-    match result {
+    match dock::fetch_transcript(&peer, &q.conv).await {
         Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
         Err(e) => Html(format!(
             r#"<p class="empty">dock unreachable: {}</p>"#,
@@ -578,30 +571,16 @@ async fn dock_inject_route(
     let Some(peer) = dock::peer_by_label(&q.peer) else {
         return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
     };
-    let (conv, text) = (q.conv.clone(), form.text.clone());
-    let injected = tokio::task::spawn_blocking(move || {
-        use dock::DockSource;
-        dock::HttpDockSource { peer }.inject(&conv, &text).is_ok()
-    })
-    .await
-    .unwrap_or(false);
-    if !injected {
-        return Html(r#"<p class="empty">dock inject failed (peer unreachable?)</p>"#.to_string())
-            .into_response();
+    if let Err(e) = dock::peer_inject(&peer, &q.conv, &form.text).await {
+        return Html(format!(
+            r#"<p class="empty">dock inject failed: {}</p>"#,
+            shell::escape(&e)
+        ))
+        .into_response();
     }
     // Re-mirror: the remote may not have consumed yet; the operator sees the ask
     // land and the transcript catches up on the next select/refresh.
-    let Some(peer2) = dock::peer_by_label(&q.peer) else {
-        return Html(String::new()).into_response();
-    };
-    let conv2 = q.conv.clone();
-    let re = tokio::task::spawn_blocking(move || {
-        use dock::DockSource;
-        dock::HttpDockSource { peer: peer2 }.transcript(&conv2)
-    })
-    .await
-    .unwrap_or_else(|_| Err("join error".into()));
-    match re {
+    match dock::fetch_transcript(&peer, &q.conv).await {
         Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
         Err(e) => Html(format!(r#"<p class="empty">{}</p>"#, shell::escape(&e))).into_response(),
     }
@@ -689,6 +668,83 @@ async fn follow_session(
     Html(format!("{panel}\n{strip}"))
 }
 
+/// Mint a short-lived agent key for a mesh role under the operator's `UserKey`.
+fn mint_agent(
+    user: &agent_mesh_core::UserKey,
+    role: &str,
+    caps: Vec<String>,
+) -> agent_mesh_core::AgentKey {
+    agent_mesh_core::AgentKey::issue(
+        user,
+        agent_mesh_core::AgentMetadata {
+            role: role.into(),
+            host: "newt-web".into(),
+            capabilities: caps,
+            issued_at: "2026-01-01T00:00:00Z".into(), // a claim; expiry is generation-based
+            expires_at: None,
+            caveats: agent_mesh_core::Caveats::top(),
+        },
+    )
+}
+
+/// Bring up the agent-mesh dock (Phase 2). Loads the operator `UserKey` from the
+/// state dir (the SAME identity the TUI signs under, so a same-operator peer
+/// auto-teams); binds a dial `DockClient` so `/dock` can reach mesh peers; and,
+/// if `NEWT_WEB_MESH_BIND` is set, binds a `NewtDockService` responder so THIS
+/// cockpit's sessions are dockable over the mesh. Returns the responder to keep
+/// it alive. Fail-soft: no identity ⇒ mesh dock disabled (HTTP docks still work).
+async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
+    let (state, _) = store_paths();
+    let id_path = state.join("identity.pem");
+    let user = match agent_mesh_core::UserKey::load(&id_path) {
+        Ok(u) => u,
+        Err(why) => {
+            eprintln!(
+                "newt-web: mesh dock DISABLED — no operator identity at {} ({why})",
+                id_path.display()
+            );
+            return None;
+        }
+    };
+    match newt_mesh::DockClient::bind(&user, mint_agent(&user, "newt-web-dock-client", vec![]), 0)
+        .await
+    {
+        Ok(client) => {
+            dock::set_dock_client(std::sync::Arc::new(client));
+            eprintln!("newt-web: mesh dock dial client bound");
+        }
+        Err(why) => eprintln!("newt-web: mesh dock client bind failed: {why}"),
+    }
+    let Ok(port_str) = std::env::var("NEWT_WEB_MESH_BIND") else {
+        return None; // not opted in to being dockable over the mesh
+    };
+    let port: u16 = port_str.trim().parse().unwrap_or(0);
+    let agent = mint_agent(
+        &user,
+        "newt-web-dock",
+        vec![newt_mesh::DOCK_CAPABILITY_TAG.to_string()],
+    );
+    match newt_mesh::NewtDockService::bind(&user, agent, state.clone(), port).await {
+        Ok(svc) => {
+            eprintln!(
+                "newt-web: mesh dock service on udp/{} (agent {}, pubkey {})",
+                svc.local_port(),
+                svc.agent_fingerprint().short(),
+                hex_lower(&svc.agent_pubkey()),
+            );
+            Some(svc)
+        }
+        Err(why) => {
+            eprintln!("newt-web: mesh dock service bind failed: {why}");
+            None
+        }
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[tokio::main]
 async fn main() {
     // D3 (LAN-bind posture): bind address comes from NEWT_WEB_BIND, defaulting
@@ -709,6 +765,9 @@ async fn main() {
         ),
         Err(why) => eprintln!("newt-web: passkey verification DISABLED — {why}"),
     }
+    // Phase 2: bring up the agent-mesh dock; hold the responder alive for the
+    // life of the process (dropping it would tear the bus down).
+    let _dock_service = init_mesh_dock().await;
     axum::serve(listener, app()).await.expect("serve");
 }
 

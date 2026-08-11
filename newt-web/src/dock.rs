@@ -1,54 +1,78 @@
 //! dock — surface OTHER newt-agents' sessions in this cockpit (requirement 2).
 //!
-//! MVP transport: a loopback/LAN **HTTP** pull. A peer newt-web exposes its
-//! sessions at `GET /api/sessions`; this hub fetches each configured peer's list
-//! and renders them **read-only** (mirror-only, D2 — the hub never writes a
-//! remote transcript). Peers are configured with `NEWT_WEB_DOCK_PEERS`, a
-//! comma-separated list of `label=base_url` (or bare `base_url`), e.g.
-//! `NEWT_WEB_DOCK_PEERS="laptop-b=http://127.0.0.1:8898,nuc=http://10.0.0.4:8880"`.
+//! Two transports behind one seam:
+//!   * **HTTP** (the MVP): a peer newt-web exposes `GET /api/sessions[…]`; a hub
+//!     pulls it. Loopback/LAN, no identity.
+//!   * **agent-mesh** (Phase 2): a peer runs a [`newt_mesh::NewtDockService`]
+//!     responder; a hub dials it with a [`newt_mesh::DockClient`] over the bus
+//!     (same-operator trust = the bus handshake). This is the real cross-machine
+//!     transport.
 //!
-//! The [`DockSource`] trait is the seam the eventual agent-mesh `session_streams`
-//! transport slots behind without touching the Registry, the cockpit render, or
-//! the drive harness — the HTTP source is the MVP, the mesh source is the
-//! refinement (`docs/decisions/newt_web_docking.md` K7).
+//! Peers are configured with `NEWT_WEB_DOCK_PEERS`, comma-separated:
+//!   * `label=http://host:port`  (or a bare URL) — an HTTP peer
+//!   * `label=mesh:<agent_pubkey_hex>@<ip>:<port>` — a mesh peer (direct-dial)
+//!
+//! Mirror-only for the transcript (D2 — the hub never writes a remote
+//! transcript); Inject ENQUEUES to the remote, which runs it and stays the sole
+//! writer. `docs/decisions/newt_web_docking` K7.
+
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-/// One remote session as exposed by a peer's `GET /api/sessions`. The same shape
-/// this instance emits for its own sessions (see `main::api_sessions`), so a hub
-/// and a peer speak one wire type.
+/// One remote session (the wire twin of `newt_mesh::DockSessionInfo` and of a
+/// peer's HTTP `/api/sessions` row).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DockedSession {
     pub id: String,
     pub title: String,
     pub workspace: String,
     pub turns: usize,
-    /// Whether a live process currently owns the conversation (the "Connected"
-    /// signal). Best-effort; a peer that can't tell reports `false`.
     #[serde(default)]
     pub live: bool,
 }
 
-/// A remote session's transcript, mirrored read-only over the dock (D2). The
-/// same shape a peer's `GET /api/sessions/:id/transcript` emits.
+/// A mirrored transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DockedTranscript {
     pub title: String,
     pub turns: Vec<DockedTurn>,
 }
 
-/// One `(user, assistant)` turn pair.
+/// One `(user, assistant)` turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DockedTurn {
     pub user: String,
     pub assistant: String,
 }
 
-/// A configured dock peer: an operator-supplied label + its cockpit base URL.
+/// How to reach a peer.
+#[derive(Debug, Clone)]
+pub(crate) enum DockKind {
+    /// The MVP HTTP transport: the peer's cockpit base URL.
+    Http { base_url: String },
+    /// The agent-mesh transport: the peer agent's pubkey + a direct-dial addr.
+    Mesh { pubkey: [u8; 32], addr: SocketAddr },
+}
+
+/// A configured dock peer: an operator label + how to reach it.
 #[derive(Debug, Clone)]
 pub(crate) struct DockPeer {
     pub label: String,
-    pub base_url: String,
+    pub kind: DockKind,
+}
+
+// ── the shared mesh dial client (bound once at startup) ─────────────────────
+static DOCK_CLIENT: OnceLock<Arc<newt_mesh::DockClient>> = OnceLock::new();
+
+/// Install the process-wide mesh dial client (called once at startup when the
+/// operator identity is available). A second call is ignored.
+pub(crate) fn set_dock_client(client: Arc<newt_mesh::DockClient>) {
+    let _ = DOCK_CLIENT.set(client);
+}
+fn dock_client() -> Option<Arc<newt_mesh::DockClient>> {
+    DOCK_CLIENT.get().cloned()
 }
 
 /// Percent-encode a value for a query string (peer label / conversation id).
@@ -65,22 +89,20 @@ fn pct(s: &str) -> String {
     out
 }
 
-/// Find a configured peer by its label (the hub panel route resolves the peer
-/// the operator clicked). `None` ⇒ an unknown/removed peer, refused fail-closed.
+/// Find a configured peer by its label (fail-closed on an unknown one).
 pub(crate) fn peer_by_label(label: &str) -> Option<DockPeer> {
     configured_peers().into_iter().find(|p| p.label == label)
 }
 
-/// The configured dock peers, from `NEWT_WEB_DOCK_PEERS`. Empty/unset ⇒ no docks
-/// (the common single-box case).
+/// The configured dock peers, from `NEWT_WEB_DOCK_PEERS`.
 pub(crate) fn configured_peers() -> Vec<DockPeer> {
     std::env::var("NEWT_WEB_DOCK_PEERS")
         .map(|raw| parse_peers(&raw))
         .unwrap_or_default()
 }
 
-/// Parse a `NEWT_WEB_DOCK_PEERS` value (`label=url,url2,…`) into peers — pure, so
-/// the tests need not mutate process env. A bare URL gets its host as the label.
+/// Parse a `NEWT_WEB_DOCK_PEERS` value into peers — pure (tests need no env). An
+/// unparseable mesh entry is dropped (fail-closed), never docked as HTTP.
 fn parse_peers(raw: &str) -> Vec<DockPeer> {
     raw.split(',')
         .filter_map(|entry| {
@@ -88,7 +110,7 @@ fn parse_peers(raw: &str) -> Vec<DockPeer> {
             if entry.is_empty() {
                 return None;
             }
-            let (label, url) = match entry.split_once('=') {
+            let (label, target) = match entry.split_once('=') {
                 Some((l, u)) => (l.trim().to_string(), u.trim().to_string()),
                 None => {
                     let host = entry
@@ -98,82 +120,152 @@ fn parse_peers(raw: &str) -> Vec<DockPeer> {
                     (host, entry.to_string())
                 }
             };
-            if url.is_empty() {
-                None
+            let kind = if let Some(rest) = target.strip_prefix("mesh:") {
+                parse_mesh(rest)?
+            } else if target.is_empty() {
+                return None;
             } else {
-                Some(DockPeer {
-                    label,
-                    base_url: url.trim_end_matches('/').to_string(),
-                })
-            }
+                DockKind::Http {
+                    base_url: target.trim_end_matches('/').to_string(),
+                }
+            };
+            Some(DockPeer { label, kind })
         })
         .collect()
 }
 
-/// The dock transport seam. The MVP is [`HttpDockSource`]; the agent-mesh
-/// `session_streams` source implements the same trait later.
-pub(crate) trait DockSource: Send + Sync {
-    /// The remote sessions this dock exposes (mirror-only for the MVP).
-    fn sessions(&self) -> Result<Vec<DockedSession>, String>;
-    /// One remote session's transcript, mirrored read-only (the "select" path).
-    fn transcript(&self, conv_id: &str) -> Result<DockedTranscript, String>;
-    /// ENQUEUE a prompt into the remote session (D2 across the dock): the remote
-    /// host injects it into its own store inbox and stays the sole writer — the
-    /// hub never writes the remote transcript, it only asks.
-    fn inject(&self, conv_id: &str, text: &str) -> Result<(), String>;
+/// Parse `<agent_pubkey_hex>@<ip>:<port>` into a mesh dial route.
+fn parse_mesh(spec: &str) -> Option<DockKind> {
+    let (pubkey_hex, addr_str) = spec.split_once('@')?;
+    if pubkey_hex.len() != 64 {
+        return None;
+    }
+    let mut pubkey = [0u8; 32];
+    for (i, byte) in pubkey.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(pubkey_hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    let addr: SocketAddr = addr_str.parse().ok()?;
+    Some(DockKind::Mesh { pubkey, addr })
 }
 
-/// The MVP HTTP dock source: `GET {base_url}/api/sessions[/{id}/transcript]`.
-pub(crate) struct HttpDockSource {
-    pub peer: DockPeer,
+// ── transport-agnostic peer operations (dispatch on kind) ───────────────────
+
+fn mesh_to_docked(s: newt_mesh::DockSessionInfo) -> DockedSession {
+    DockedSession {
+        id: s.id,
+        title: s.title,
+        workspace: s.workspace,
+        turns: s.turns,
+        live: s.live,
+    }
 }
 
-impl DockSource for HttpDockSource {
-    fn sessions(&self) -> Result<Vec<DockedSession>, String> {
-        let url = format!("{}/api/sessions", self.peer.base_url);
-        let resp = ureq::get(&url)
-            .timeout(std::time::Duration::from_secs(3))
-            .call()
-            .map_err(|e| format!("unreachable: {e}"))?;
-        resp.into_json::<Vec<DockedSession>>()
-            .map_err(|e| format!("bad /api/sessions payload: {e}"))
+/// A peer's sessions, over whichever transport the peer uses.
+async fn peer_sessions(peer: &DockPeer) -> Result<Vec<DockedSession>, String> {
+    match &peer.kind {
+        DockKind::Http { base_url } => {
+            let url = format!("{base_url}/api/sessions");
+            tokio::task::spawn_blocking(move || {
+                ureq::get(&url)
+                    .timeout(std::time::Duration::from_secs(3))
+                    .call()
+                    .map_err(|e| format!("unreachable: {e}"))?
+                    .into_json::<Vec<DockedSession>>()
+                    .map_err(|e| format!("bad /api/sessions payload: {e}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        }
+        DockKind::Mesh { pubkey, addr } => {
+            let client = dock_client().ok_or("mesh dock unavailable (no operator identity)")?;
+            let ep = newt_mesh::PeerEndpoint::new(*pubkey, *addr);
+            client
+                .list_sessions(ep)
+                .await
+                .map(|v| v.into_iter().map(mesh_to_docked).collect())
+                .map_err(|e| format!("mesh: {e}"))
+        }
     }
+}
 
-    fn transcript(&self, conv_id: &str) -> Result<DockedTranscript, String> {
-        let url = format!(
-            "{}/api/sessions/{}/transcript",
-            self.peer.base_url,
-            pct(conv_id)
-        );
-        let resp = ureq::get(&url)
-            .timeout(std::time::Duration::from_secs(3))
-            .call()
-            .map_err(|e| format!("unreachable: {e}"))?;
-        resp.into_json::<DockedTranscript>()
-            .map_err(|e| format!("bad transcript payload: {e}"))
+/// A peer session's transcript, over whichever transport.
+async fn peer_transcript(peer: &DockPeer, conv: &str) -> Result<DockedTranscript, String> {
+    match &peer.kind {
+        DockKind::Http { base_url } => {
+            let url = format!("{base_url}/api/sessions/{}/transcript", pct(conv));
+            tokio::task::spawn_blocking(move || {
+                ureq::get(&url)
+                    .timeout(std::time::Duration::from_secs(3))
+                    .call()
+                    .map_err(|e| format!("unreachable: {e}"))?
+                    .into_json::<DockedTranscript>()
+                    .map_err(|e| format!("bad transcript payload: {e}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        }
+        DockKind::Mesh { pubkey, addr } => {
+            let client = dock_client().ok_or("mesh dock unavailable")?;
+            let ep = newt_mesh::PeerEndpoint::new(*pubkey, *addr);
+            client
+                .transcript(ep, conv)
+                .await
+                .map(|t| DockedTranscript {
+                    title: t.title,
+                    turns: t
+                        .turns
+                        .into_iter()
+                        .map(|x| DockedTurn {
+                            user: x.user,
+                            assistant: x.assistant,
+                        })
+                        .collect(),
+                })
+                .map_err(|e| format!("mesh: {e}"))
+        }
     }
+}
 
-    fn inject(&self, conv_id: &str, text: &str) -> Result<(), String> {
-        let url = format!(
-            "{}/api/sessions/{}/inject",
-            self.peer.base_url,
-            pct(conv_id)
-        );
-        ureq::post(&url)
-            .timeout(std::time::Duration::from_secs(3))
-            .send_form(&[("text", text)])
-            .map_err(|e| format!("unreachable: {e}"))?;
-        Ok(())
+/// Enqueue a prompt into a peer session (D2 — the peer runs it), over whichever
+/// transport.
+pub(crate) async fn peer_inject(peer: &DockPeer, conv: &str, text: &str) -> Result<(), String> {
+    match &peer.kind {
+        DockKind::Http { base_url } => {
+            let url = format!("{base_url}/api/sessions/{}/inject", pct(conv));
+            let text = text.to_string();
+            tokio::task::spawn_blocking(move || {
+                ureq::post(&url)
+                    .timeout(std::time::Duration::from_secs(3))
+                    .send_form(&[("text", &text)])
+                    .map(|_| ())
+                    .map_err(|e| format!("unreachable: {e}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        }
+        DockKind::Mesh { pubkey, addr } => {
+            let client = dock_client().ok_or("mesh dock unavailable")?;
+            let ep = newt_mesh::PeerEndpoint::new(*pubkey, *addr);
+            client
+                .inject(ep, conv, text)
+                .await
+                .map_err(|e| format!("mesh: {e}"))
+        }
     }
+}
+
+/// Mirror a docked session's transcript (the "select" path) — used by the hub's
+/// `/dock/panel` route.
+pub(crate) async fn fetch_transcript(
+    peer: &DockPeer,
+    conv: &str,
+) -> Result<DockedTranscript, String> {
+    peer_transcript(peer, conv).await
 }
 
 /// Render a docked remote session as a panel: the transcript **mirrored**
-/// read-only, plus an **inject** form (D2 across the dock — the form ENQUEUES a
-/// prompt to the remote host, which runs it and stays the sole writer; the hub
-/// never writes the remote transcript). Reuses the cockpit's own transcript
-/// renderer so a remote session looks identical to a local one, just marked
-/// remote. The form re-renders the panel (the transcript catches up as the
-/// remote consumes the inject).
+/// read-only, plus an **inject** form (D2 — enqueue to the remote; the remote
+/// runs it and stays sole writer).
 pub(crate) fn dock_panel(peer_label: &str, conv_id: &str, transcript: &DockedTranscript) -> String {
     let snap = crate::agents::Snapshot {
         messages: transcript
@@ -207,47 +299,35 @@ pub(crate) fn dock_panel(peer_label: &str, conv_id: &str, transcript: &DockedTra
 }
 
 /// Render the "docked peers" cockpit section: each configured peer with its
-/// remote sessions (read-only, mirror-only). An unreachable peer renders a
-/// notice rather than dropping — the operator sees the dock is down, not that it
-/// vanished. Sessions are fetched off the async runtime (blocking HTTP).
+/// remote sessions (read-only + selectable). An unreachable peer renders a
+/// notice, not a gap. Fetched over each peer's own transport.
 pub(crate) async fn docked_section() -> String {
     let peers = configured_peers();
     if peers.is_empty() {
-        return String::new(); // no docks configured — render nothing
+        return String::new();
     }
-    let fetched = tokio::task::spawn_blocking(move || {
-        peers
-            .into_iter()
-            .map(|peer| {
-                let result = HttpDockSource { peer: peer.clone() }.sessions();
-                (peer, result)
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
-
     let mut out = String::from(
-        r#"<section class="docked"><h2>docked peers</h2><p class="hint">Remote newt-agents' sessions, mirrored read-only (D2). MVP transport: HTTP; agent-mesh next.</p>"#,
+        r#"<section class="docked"><h2>docked peers</h2><p class="hint">Remote newt-agents' sessions (D2 mirror + inject). Transport: HTTP or agent-mesh.</p>"#,
     );
-    for (peer, result) in &fetched {
-        match result {
+    for peer in &peers {
+        let transport = match peer.kind {
+            DockKind::Http { .. } => "http",
+            DockKind::Mesh { .. } => "mesh",
+        };
+        match peer_sessions(peer).await {
             Ok(sessions) if sessions.is_empty() => {
                 out.push_str(&format!(
-                    r#"<div class="peer"><h3>● {label}</h3><p class="empty">no sessions</p></div>"#,
+                    r#"<div class="peer"><h3>● {label} <small>· {transport}</small></h3><p class="empty">no sessions</p></div>"#,
                     label = crate::shell::escape(&peer.label),
                 ));
             }
             Ok(sessions) => {
                 out.push_str(&format!(
-                    r#"<div class="peer"><h3>● {label} <small>· remote</small></h3><ul>"#,
+                    r#"<div class="peer"><h3>● {label} <small>· {transport} · remote</small></h3><ul>"#,
                     label = crate::shell::escape(&peer.label),
                 ));
                 for s in sessions.iter().take(30) {
                     let dot = if s.live { "▶" } else { "○" };
-                    // Selectable: clicking mirrors the remote transcript into the
-                    // shared #panel (the "select any docked session" path). The
-                    // hub resolves (peer,conv) → the peer's transcript endpoint.
                     out.push_str(&format!(
                         r##"<li><button class="dock-open" hx-get="/dock/panel?peer={plabel}&conv={pconv}" hx-target="#panel" hx-swap="innerHTML">{dot} {title}</button> <small>({n} turns · {label})</small></li>"##,
                         plabel = pct(&peer.label),
@@ -262,9 +342,9 @@ pub(crate) async fn docked_section() -> String {
             }
             Err(err) => {
                 out.push_str(&format!(
-                    r#"<div class="peer"><h3>○ {label} <small>· {err}</small></h3></div>"#,
+                    r#"<div class="peer"><h3>○ {label} <small>· {transport} · {err}</small></h3></div>"#,
                     label = crate::shell::escape(&peer.label),
-                    err = crate::shell::escape(err),
+                    err = crate::shell::escape(&err),
                 ));
             }
         }
@@ -278,13 +358,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peers_parse_labelled_and_bare_and_trim() {
-        let peers = parse_peers(" lab-b=http://127.0.0.1:8898/ , http://10.0.0.4:8880 ,, ");
-        assert_eq!(peers.len(), 2);
+    fn parse_http_and_mesh_and_bare() {
+        let peers = parse_peers(&format!(
+            " lab-b=http://127.0.0.1:8898/ , nuc=mesh:{}@10.0.0.4:9000 , http://10.0.0.9:8880 ,, ",
+            "aa".repeat(32)
+        ));
+        assert_eq!(peers.len(), 3);
         assert_eq!(peers[0].label, "lab-b");
-        assert_eq!(peers[0].base_url, "http://127.0.0.1:8898"); // trailing / trimmed
-        assert_eq!(peers[1].label, "10.0.0.4:8880"); // bare URL → host label
-        assert_eq!(peers[1].base_url, "http://10.0.0.4:8880");
+        assert!(
+            matches!(&peers[0].kind, DockKind::Http { base_url } if base_url == "http://127.0.0.1:8898")
+        );
+        assert_eq!(peers[1].label, "nuc");
+        assert!(matches!(&peers[1].kind, DockKind::Mesh { pubkey, addr }
+            if pubkey == &[0xaau8; 32] && addr.to_string() == "10.0.0.4:9000"));
+        assert!(matches!(&peers[2].kind, DockKind::Http { .. }));
+    }
+
+    #[test]
+    fn a_malformed_mesh_entry_is_dropped_not_docked_as_http() {
+        assert!(parse_peers("bad=mesh:short@1.2.3.4:5").is_empty());
+        assert!(parse_peers("bad=mesh:nohost").is_empty());
     }
 
     #[test]
@@ -294,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn dock_panel_mirrors_turns_read_only() {
+    fn dock_panel_mirrors_turns_with_an_inject_form() {
         let t = DockedTranscript {
             title: "remote work".into(),
             turns: vec![DockedTurn {
@@ -304,10 +397,7 @@ mod tests {
         };
         let html = dock_panel("laptop-b", "conv-123", &t);
         assert!(html.contains("mirror + inject"));
-        assert!(html.contains("laptop-b"));
         assert!(html.contains("STUB_REPLY ok"));
-        // Inject over the dock ENQUEUES to the remote (D2) — the form posts to
-        // /dock/inject, never a local turn-write path.
         assert!(html.contains("hx-post=\"/dock/inject?peer=laptop-b&conv=conv-123\""));
     }
 }
