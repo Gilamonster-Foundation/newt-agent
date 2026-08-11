@@ -54,6 +54,7 @@
 
 pub mod ask;
 pub mod caveats;
+pub mod dock;
 pub mod error;
 pub mod plugin_envelope;
 pub mod protocol;
@@ -61,6 +62,10 @@ pub mod service;
 
 pub use ask::MeshAsker;
 pub use caveats::{caveats_for_peer, caveats_for_peer_at, CaveatsError};
+pub use dock::{
+    DockClient, DockReply, DockRequest, DockSessionInfo, DockTranscript, DockTurn, NewtDockService,
+    DOCK_CAPABILITY_TAG, DOCK_TOPIC,
+};
 pub use error::MeshIntegrationError;
 pub use plugin_envelope::{caveats_from_envelope, serialize_for_plugin, EnvelopeError};
 pub use protocol::{InferenceReply, InferenceRequest, TokenUsage, CAPABILITY_TAG, INFERENCE_TOPIC};
