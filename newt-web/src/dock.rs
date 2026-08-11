@@ -117,6 +117,10 @@ pub(crate) trait DockSource: Send + Sync {
     fn sessions(&self) -> Result<Vec<DockedSession>, String>;
     /// One remote session's transcript, mirrored read-only (the "select" path).
     fn transcript(&self, conv_id: &str) -> Result<DockedTranscript, String>;
+    /// ENQUEUE a prompt into the remote session (D2 across the dock): the remote
+    /// host injects it into its own store inbox and stays the sole writer — the
+    /// hub never writes the remote transcript, it only asks.
+    fn inject(&self, conv_id: &str, text: &str) -> Result<(), String>;
 }
 
 /// The MVP HTTP dock source: `GET {base_url}/api/sessions[/{id}/transcript]`.
@@ -148,13 +152,29 @@ impl DockSource for HttpDockSource {
         resp.into_json::<DockedTranscript>()
             .map_err(|e| format!("bad transcript payload: {e}"))
     }
+
+    fn inject(&self, conv_id: &str, text: &str) -> Result<(), String> {
+        let url = format!(
+            "{}/api/sessions/{}/inject",
+            self.peer.base_url,
+            pct(conv_id)
+        );
+        ureq::post(&url)
+            .timeout(std::time::Duration::from_secs(3))
+            .send_form(&[("text", text)])
+            .map_err(|e| format!("unreachable: {e}"))?;
+        Ok(())
+    }
 }
 
-/// Render a docked remote session's transcript as a **read-only** panel (the
-/// mirror side of D2 — no prompt form; inject over a dock is a later
-/// refinement). Reuses the cockpit's own transcript renderer so a remote
-/// session looks identical to a local one, just marked remote.
-pub(crate) fn dock_panel(peer_label: &str, transcript: &DockedTranscript) -> String {
+/// Render a docked remote session as a panel: the transcript **mirrored**
+/// read-only, plus an **inject** form (D2 across the dock — the form ENQUEUES a
+/// prompt to the remote host, which runs it and stays the sole writer; the hub
+/// never writes the remote transcript). Reuses the cockpit's own transcript
+/// renderer so a remote session looks identical to a local one, just marked
+/// remote. The form re-renders the panel (the transcript catches up as the
+/// remote consumes the inject).
+pub(crate) fn dock_panel(peer_label: &str, conv_id: &str, transcript: &DockedTranscript) -> String {
     let snap = crate::agents::Snapshot {
         messages: transcript
             .turns
@@ -170,14 +190,19 @@ pub(crate) fn dock_panel(peer_label: &str, transcript: &DockedTranscript) -> Str
         closed: false,
     };
     format!(
-        r#"<section class="agent dock-remote">
-<h2><span>{title} <small>· {label} · remote (read-only)</small></span></h2>
+        r##"<section class="agent dock-remote">
+<h2><span>{title} <small>· {label} · remote (mirror + inject, D2)</small></span></h2>
 <div class="transcript">{fragment}</div>
-<p class="hint">Mirrored over the dock (D2 — the remote host stays the sole writer). Inject over a dock is a refinement.</p>
-</section>"#,
+<form class="prompt" hx-post="/dock/inject?peer={plabel}&conv={pconv}" hx-target="#panel" hx-swap="innerHTML">
+<input name="text" placeholder="prompt the remote session…" autocomplete="off" required>
+<button>send</button></form>
+<p class="hint">Injected over the dock — the remote host runs it and stays the sole writer (D2).</p>
+</section>"##,
         title = crate::shell::escape(&transcript.title),
         label = crate::shell::escape(peer_label),
         fragment = crate::shell::transcript_fragment(&snap),
+        plabel = pct(peer_label),
+        pconv = pct(conv_id),
     )
 }
 
@@ -277,11 +302,12 @@ mod tests {
                 assistant: "STUB_REPLY ok".into(),
             }],
         };
-        let html = dock_panel("laptop-b", &t);
-        assert!(html.contains("remote (read-only)"));
+        let html = dock_panel("laptop-b", "conv-123", &t);
+        assert!(html.contains("mirror + inject"));
         assert!(html.contains("laptop-b"));
         assert!(html.contains("STUB_REPLY ok"));
-        // Mirror-only: no prompt/inject form in a docked panel.
-        assert!(!html.contains("hx-post"));
+        // Inject over the dock ENQUEUES to the remote (D2) — the form posts to
+        // /dock/inject, never a local turn-write path.
+        assert!(html.contains("hx-post=\"/dock/inject?peer=laptop-b&conv=conv-123\""));
     }
 }

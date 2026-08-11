@@ -175,14 +175,27 @@ main() {
 
   say "SELECT: click a docked session → its transcript mirrors into the hub panel"
   PANEL="$(hub_get "/dock/panel?peer=laptop-b&conv=$CONV")"
-  printf '%s' "$PANEL" | grep -q 'remote (read-only)' \
-    && ok "hub renders a read-only docked panel (mirror, D2)" || bad "docked panel not rendered"
+  printf '%s' "$PANEL" | grep -q 'dock-remote' \
+    && ok "hub renders a docked panel (mirror + D2 inject)" || bad "docked panel not rendered"
   printf '%s' "$PANEL" | grep -q 'STUB_REPLY ok — echo: hello from the driver' \
     && ok "the docked panel MIRRORS the remote transcript (select works)" \
     || bad "docked panel did not carry the remote transcript"
 
+  say "INJECT OVER A DOCK (D2 across the dock: the remote host stays sole writer)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$HUB_PORT/dock/inject?peer=laptop-b&conv=$CONV" --data-urlencode "text=DOCK_INJECT check the lints")"
+  [ "$code" = "200" ] && ok "hub /dock/inject accepted (re-mirrors the panel)" || bad "dock inject returned $code"
+  [ "$(store_inbox "$WORK/cfg")" -ge 2 ] \
+    && ok "the inject landed in the REMOTE peer's store inbox (the hub only enqueued)" \
+    || bad "remote inbox did not receive the dock inject"
+  tui_send "$SESS" ""   # nudge the remote TUI to drain its inbox
+  tui_wait "$SESS" 'echo: DOCK_INJECT' 30 \
+    && ok "the REMOTE host ran the injected prompt (it — not the hub — wrote the turn)" \
+    || bad "remote did not run the dock inject"
+  hub_get "/dock/panel?peer=laptop-b&conv=$CONV" | grep -q 'echo: DOCK_INJECT' \
+    && ok "hub re-mirrors the remote turn the dock inject produced (full D2 loop over a dock)" \
+    || bad "hub did not mirror the remote turn"
+
   say "still pending (later phases)"
-  skip "inject over a dock (remote host stays sole writer)   (refine: SessionInput on /dock)"
   skip "undock <peer> / undock all from the TUI              (Phase 5 kill-switch)"
   skip "swap HTTP transport → agent-mesh session_streams     (Phase 2, behind dock::DockSource)"
 

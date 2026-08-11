@@ -108,7 +108,9 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/agents/:id", axum::routing::delete(delete_agent))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/:id/transcript", get(api_transcript))
-        .route("/dock/panel", get(dock_panel_route));
+        .route("/api/sessions/:id/inject", post(api_inject))
+        .route("/dock/panel", get(dock_panel_route))
+        .route("/dock/inject", post(dock_inject_route));
     if let Some(header) = auth_header {
         gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
     }
@@ -496,12 +498,88 @@ async fn dock_panel_route(Query(q): Query<DockPanelQuery>) -> impl IntoResponse 
     .await
     .unwrap_or_else(|_| Err("join error".into()));
     match result {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &t)).into_response(),
+        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
         Err(e) => Html(format!(
             r#"<p class="empty">dock unreachable: {}</p>"#,
             shell::escape(&e)
         ))
         .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct InjectForm {
+    text: String,
+}
+
+/// `POST /api/sessions/:id/inject` — enqueue a prompt into THIS instance's
+/// session (the remote side of a dock inject). It is the exact D2 seam the local
+/// attach uses (`ConversationStore::inject_prompt`), exposed over HTTP: the
+/// running REPL here stays the sole writer, this only enqueues. Resolves the
+/// conversation's own workspace (inject is workspace-fenced). 404 if unknown.
+async fn api_inject(Path(id): Path<String>, Form(form): Form<InjectForm>) -> impl IntoResponse {
+    let (state, ws) = store_paths();
+    let ok = tokio::task::spawn_blocking(move || {
+        let store = newt_core::ConversationStore::new(&state, &ws, 1000).ok()?;
+        let wspath = store
+            .list_all()
+            .ok()?
+            .into_iter()
+            .find(|(c, _)| c.id == id)
+            .map(|(_, w)| w)?;
+        let fenced =
+            newt_core::ConversationStore::new(&state, std::path::PathBuf::from(&wspath), 1000)
+                .ok()?;
+        fenced.inject_prompt(&id, &form.text, None).ok().map(|_| ())
+    })
+    .await
+    .ok()
+    .flatten()
+    .is_some();
+    if ok {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// `POST /dock/inject?peer=&conv=` — the hub side of inject-over-dock: ask the
+/// clicked peer to enqueue a prompt into its session (D2 — the remote host runs
+/// it and stays sole writer), then re-mirror the docked panel so the operator
+/// sees the enqueue land and the transcript catch up as the remote consumes it.
+async fn dock_inject_route(
+    Query(q): Query<DockPanelQuery>,
+    Form(form): Form<InjectForm>,
+) -> impl IntoResponse {
+    let Some(peer) = dock::peer_by_label(&q.peer) else {
+        return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
+    };
+    let (conv, text) = (q.conv.clone(), form.text.clone());
+    let injected = tokio::task::spawn_blocking(move || {
+        use dock::DockSource;
+        dock::HttpDockSource { peer }.inject(&conv, &text).is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if !injected {
+        return Html(r#"<p class="empty">dock inject failed (peer unreachable?)</p>"#.to_string())
+            .into_response();
+    }
+    // Re-mirror: the remote may not have consumed yet; the operator sees the ask
+    // land and the transcript catches up on the next select/refresh.
+    let Some(peer2) = dock::peer_by_label(&q.peer) else {
+        return Html(String::new()).into_response();
+    };
+    let conv2 = q.conv.clone();
+    let re = tokio::task::spawn_blocking(move || {
+        use dock::DockSource;
+        dock::HttpDockSource { peer: peer2 }.transcript(&conv2)
+    })
+    .await
+    .unwrap_or_else(|_| Err("join error".into()));
+    match re {
+        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
+        Err(e) => Html(format!(r#"<p class="empty">{}</p>"#, shell::escape(&e))).into_response(),
     }
 }
 
