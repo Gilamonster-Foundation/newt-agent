@@ -401,12 +401,30 @@ fn store_paths() -> (std::path::PathBuf, std::path::PathBuf) {
     (state, ws)
 }
 
+/// The operator's "stop exposing my sessions to any hub" kill-switch
+/// (requirement 7 / `newt_web_docking` K5). MVP: a marker file in the state dir
+/// that the operator (the TUI `/dock disable`) creates; **fail-closed** — while
+/// present, every dock-read surface (`/api/sessions*`) refuses. The signed,
+/// root-key + `PromptWindow`-gated, live-terminating version is the Phase-5
+/// hardening; the mechanism (the peer refusing to be docked) is proven here.
+fn dock_exposure_disabled() -> bool {
+    let (state, _) = store_paths();
+    state.join("dock-exposure-disabled").exists()
+}
+
 /// `GET /api/sessions` — this cockpit's sessions as JSON, the machine-readable
 /// twin of `sessions_section`. It is the surface a **hub** reads to dock this
 /// instance's sessions (`dock::HttpDockSource`); a hub and a peer speak one wire
 /// type ([`dock::DockedSession`]). Behind the same auth gate as the rest — a
 /// dock must authenticate. Store errors render an empty list, never a 500.
-async fn api_sessions() -> impl IntoResponse {
+async fn api_sessions() -> axum::response::Response {
+    if dock_exposure_disabled() {
+        return (
+            StatusCode::FORBIDDEN,
+            "dock exposure disabled by the operator",
+        )
+            .into_response();
+    }
     let (state, ws) = store_paths();
     let sessions = tokio::task::spawn_blocking(move || {
         let Ok(store) = newt_core::ConversationStore::new(&state, &ws, 1000) else {
@@ -435,7 +453,7 @@ async fn api_sessions() -> impl IntoResponse {
     })
     .await
     .unwrap_or_default();
-    axum::Json(sessions)
+    axum::Json(sessions).into_response()
 }
 
 /// `GET /api/sessions/:id/transcript` — one session's transcript as JSON, the
@@ -443,6 +461,9 @@ async fn api_sessions() -> impl IntoResponse {
 /// the conversation's own workspace (store `load` is workspace-fenced) so the
 /// caller need not know it. 404 if the conversation is unknown here.
 async fn api_transcript(Path(id): Path<String>) -> impl IntoResponse {
+    if dock_exposure_disabled() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let (state, ws) = store_paths();
     let transcript = tokio::task::spawn_blocking(move || {
         let store = newt_core::ConversationStore::new(&state, &ws, 1000).ok()?;
@@ -518,6 +539,9 @@ struct InjectForm {
 /// running REPL here stays the sole writer, this only enqueues. Resolves the
 /// conversation's own workspace (inject is workspace-fenced). 404 if unknown.
 async fn api_inject(Path(id): Path<String>, Form(form): Form<InjectForm>) -> impl IntoResponse {
+    if dock_exposure_disabled() {
+        return StatusCode::FORBIDDEN;
+    }
     let (state, ws) = store_paths();
     let ok = tokio::task::spawn_blocking(move || {
         let store = newt_core::ConversationStore::new(&state, &ws, 1000).ok()?;

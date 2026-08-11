@@ -195,9 +195,26 @@ main() {
     && ok "hub re-mirrors the remote turn the dock inject produced (full D2 loop over a dock)" \
     || bad "hub did not mirror the remote turn"
 
+  say "UNDOCK / kill-switch (req 7: the operator forcibly stops exposing to any hub)"
+  touch "$WORK/cfg/dock-exposure-disabled"   # simulates the peer-1 TUI '/dock disable'
+  c="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/api/sessions")"
+  [ "$c" = "403" ] && ok "disabled peer refuses the dock read fail-closed (/api/sessions → 403)" \
+    || bad "peer did not refuse while disabled ($c)"
+  HUB2="$(hub_get /)"
+  printf '%s' "$HUB2" | grep -q 'hello from the driver' \
+    && bad "hub still surfaces the undocked peer's session" \
+    || ok "hub no longer surfaces peer-1's sessions (forcibly undocked)"
+  printf '%s' "$HUB2" | grep -q 'second peer working on kyln' \
+    && ok "the OTHER peer (nuc) is unaffected — undock is per-peer" \
+    || bad "undocking peer-1 wrongly dropped peer-2"
+  rm -f "$WORK/cfg/dock-exposure-disabled"   # '/dock enable'
+  hub_get / | grep -q 'hello from the driver' \
+    && ok "re-enabling exposure re-docks the peer" || bad "re-enable did not restore the dock"
+
   say "still pending (later phases)"
-  skip "undock <peer> / undock all from the TUI              (Phase 5 kill-switch)"
-  skip "swap HTTP transport → agent-mesh session_streams     (Phase 2, behind dock::DockSource)"
+  skip "wire /dock disable|enable as a TUI slash command      (newt-tui; sets the marker headlessly proven above)"
+  skip "sign + root-key/PromptWindow-gate + terminate live docks (Phase 5 hardening of the kill-switch)"
+  skip "swap HTTP transport → agent-mesh session_streams      (Phase 2, behind dock::DockSource)"
 
   echo
   say "result: $PASS passed, $FAIL failed"
