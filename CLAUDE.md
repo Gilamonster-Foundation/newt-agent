@@ -84,11 +84,13 @@ explain what the existing abstraction could not be widened to cover.
 - **Acceptable PR shape:** branch name `step-NN.M-short-kebab-name`,
   body must list "What this PR does" / "Test plan" / "Out of scope".
 - **TUI scope:** `docs/decisions/plain_scroller_tui.md` — newt is
-  amphibious (human CLI + headless swarm) and the chat surface is
-  deliberately a plain scroller. Do NOT add alternate-screen, ratatui,
-  or widget surfaces to the chat path; advanced TUI belongs in
-  gilamonster-agent / monitor repos, and the headless flight tier
-  (wyvern-agent) strips the TUI entirely.
+  amphibious (human CLI + headless swarm). The plain-scroller rule is
+  **scoped to the LEAN (default) surface + the piped/headless/wyvern path**
+  (2026-08-11 amendment): do NOT add alternate-screen, ratatui, panes, or
+  widget surfaces to the LEAN chat path. The feature-gated, severable,
+  TTY-gated **RichTUI** surface MAY host panes / a live dock overview.
+  Advanced always-on TUI still belongs in gilamonster-agent / monitor repos,
+  and the headless flight tier (wyvern-agent) strips the TUI entirely.
 
 ## Build commands
 

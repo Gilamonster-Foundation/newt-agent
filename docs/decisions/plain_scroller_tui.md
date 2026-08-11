@@ -7,9 +7,13 @@ chat surface now wears two presentation morphologies (LeanTUI / RichTUI), see
 `docs/decisions/lean_rich_tui_morphologies.md`; **partially superseded
 2026-07-16** by `docs/decisions/live_spill_viewport.md` for one TTY-only,
 turn-scoped active-tool output block. The plain-scroller rule still governs the
-piped/headless path and all committed output.
+piped/headless path and all committed output; **amended 2026-08-11** by the
+newt-web docking work — the plain-scroller constraints are **scoped to the LEAN
+(default) surface + the headless/wyvern path**, and the feature-gated `rich-tui`
+surface may now host panes / a live dock-and-session overview (see the amendment
+right after the TL;DR).
 **Date:** 2026-06-12 (amended 2026-06-17, refined 2026-06-20, partially
-superseded 2026-07-16)
+superseded 2026-07-16, amended 2026-08-11)
 **Related:** newt-agent#89 ("is a rich interactive TUI in-scope for newt's
 'sharp minimal binary' identity?" — closed by the newt / gilamonster-agent
 split; this doc records the standing answer), PR #301 (the preamble always
@@ -36,6 +40,53 @@ This is not a temporary limitation. It is a load-bearing design choice:
 **newt is amphibious** — the same agent serves a human at a terminal *and*
 runs headless where wyvern-agent flies. Advanced TUI bells and whistles
 belong in the **gilamonster-agent** and **monitor-agent** repos, not here.
+
+## Amendment (2026-08-11): the plain-scroller rule is scoped to the LEAN surface
+
+The morphology split (#527, `lean_rich_tui_morphologies.md`) already gives newt two
+presentation surfaces behind one `InputSurface` seam (PR #419): the **LeanTUI** (the
+default, and the shape the piped/headless/wyvern path always sees) and the
+feature-gated **RichTUI** (opt-in, runtime-TTY-gated, compile-time severable). This
+amendment draws the plain-scroller line **between those two surfaces** rather than
+across the whole chat path:
+
+- **The LEAN surface stays a strict plain scroller.** Everything above — no alternate
+  screen, no panes, no status bars, no widgets, no mouse, no live-updating dashboards —
+  governs the LeanTUI surface **and all committed output and the piped/headless path**,
+  unchanged. This is the surface that must stay amphibious, so it stays plain.
+- **The RichTUI surface is no longer limited to the input widget.** It **may** host
+  advanced surfaces — panes, a **live dock-and-session overview** (the terminal peer of
+  the newt-web docking cockpit), status regions, and live-updating views — because it is
+  already **compile-time severable** (wyvern strips it entirely) and **runtime-TTY-gated**
+  (a pipe / `TERM=dumb` / a headless flight never receives its cursor controls). The
+  "strippability is a requirement" rule (4) and the amphibious rationale are therefore
+  **preserved, not bent**: the only path that gains richness is the one that was already
+  opt-in and severable.
+
+**What is unchanged.** The four standing carve-outs below and the revisit trigger still
+govern the LEAN surface. Canonical *output* stays GFM-Markdown printed lines on every
+surface (a RichTUI pane is a projection of that same source, never a second conversation
+format — the presentation contract in `newt_web_htmx.md`). A headless flight still
+receives exactly the printed lines, no pane. Anything the LEAN surface cannot express as
+scrolled lines still triggers the revisit rule — a new decision doc, not a surface change
+landed first.
+
+**Why now.** The newt-web docking work
+(`docs/decisions/newt_web_docking.md`) surfaces remote agents' sessions in a web cockpit;
+its terminal peer wants a live dock/overview pane so a RichTUI operator can watch and
+navigate docked sessions coequally with the web. That pane is exactly the kind of
+severable, TTY-gated rich surface this amendment permits on RichTUI while the LEAN path
+stays plain.
+
+**Forward direction (recorded 2026-08-11, not yet actioned).** The LEAN surface is, in the
+end, the **headless/wyvern surface wearing a thin interactive skin** — a plain scroller is
+exactly what a stripped flight needs and exactly what a pipe receives. Its natural home is
+therefore the **wyvern-agent** repo, and this code is expected to **migrate there over
+time**. As it does, newt's *resident* interactive surface trends toward the RichTUI (which
+this amendment frees to go rich), while wyvern owns the stripped plain-scroller path. That
+migration is a separate effort; nothing in the docking work depends on it, and until it
+happens the LEAN surface stays in this repo under the plain-scroller rule above. This note
+records the intended destination so a future extraction has a decision to cite.
 
 ## Context — the three tiers
 
