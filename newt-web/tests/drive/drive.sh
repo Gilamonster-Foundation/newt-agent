@@ -142,9 +142,13 @@ main() {
 
   say "DOCK (MVP, HTTP transport): a hub cockpit surfaces a peer's sessions"
   # /api/sessions on the peer is the machine-readable surface a hub reads.
-  web_get "/api/sessions" | grep -q '"title":"hello from the driver"' \
+  SESSJSON="$(web_get /api/sessions)"
+  printf '%s' "$SESSJSON" | grep -q '"title":"hello from the driver"' \
     && ok "peer exposes GET /api/sessions (JSON) with its session" \
     || bad "peer /api/sessions did not list the session"
+  printf '%s' "$SESSJSON" | grep -q '"live":true' \
+    && ok "peer reports the session LIVE (the 'Connected' signal — a running owner)" \
+    || bad "peer did not report the live-owner status"
   start_hub
   HUBHOME="$(hub_get /)"
   printf '%s' "$HUBHOME" | grep -q 'docked peers' \
@@ -156,6 +160,9 @@ main() {
   printf '%s' "$HUBHOME" | grep -q 'hello from the driver' \
     && ok "hub MIRRORS the peer's remote session into its overview (dock works)" \
     || bad "hub did not surface the peer's session"
+  printf '%s' "$HUBHOME" | grep -q '▶ hello from the driver' \
+    && ok "hub marks the remote session Connected (▶ live)" \
+    || bad "hub did not render the live/connected marker"
 
   say "undock / multi-dock (Phases 4/5 refinements)"
   skip "multi-dock N peers into the overview          (repeat NEWT_WEB_DOCK_PEERS; overview groups by peer)"
