@@ -93,3 +93,35 @@ mesh's QUIC stack never enter the agent workspace graph (D1). Dockability is adv
 - The dormant multi-attach model in `newt-core/src/session.rs` finally gets its first consumer.
 - Revocation latency is bounded by the pull-check cadence; if that proves too slow, an explicit
   session-close signal is added.
+
+## As-built (2026-08 security closure, PR #1643 + agent-mesh #75)
+
+This section is authoritative where it differs from the aspirational K-text above.
+
+- **K2 restated — same operator is *authentication*, not *authorization*.** One `UserKey` proves
+  the caller is the operator; it does **not** grant access. Distinct `AgentKey` principals under one
+  `UserKey` carry distinct authority: an unapproved sibling agent is denied even though the
+  handshake admits it.
+- **K3 as-built — authorization is at the RESPONDER, per request.** The transport is request/reply
+  (not `session_streams` yet), so `NewtDockService` resolves the **verified caller agent
+  fingerprint** — from `agent-mesh`'s `RequestContext` (the envelope signer, authenticated by
+  `env.verify()`), never a value in the request body — against **its own** signed dock registry on
+  every request, before any disclosure or side effect. The hub-side gate remains as defense in
+  depth, but is no longer the sole check. **Fail-closed by default**; `NEWT_INSECURE_DOCK_NO_APPROVAL`
+  is the one named, unsafe opt-out. The registry additionally enforces `fingerprint == BLAKE3(pubkey)`
+  (no decoupled label) and is written crash-safely under a lock (`newt-core::atomic_fs`).
+- **K3 scope — `DockScope` is typed authority, enforced per operation.** `Mirror` may list + read
+  transcript; `MirrorInject` may also inject (D2). An unknown scope token fails to deserialize
+  (fail-closed). CLI defaults to least authority (`--scope mirror`).
+- **K4 as-built — the "SAS" is an honest pubkey cross-check, not a two-party ceremony (yet).** The
+  6 words are derived from the peer **pubkey alone** (`dock_registry::pubkey_words`), so the peer's
+  own newt-web prints the identical words for the operator to compare — a real fingerprint
+  cross-check with no exchanged secret. A genuine two-party commit-reveal SAS (each side contributes
+  entropy) is the cross-operator Phase-6 work; the earlier "compare the SAS across two terminals"
+  framing described a comparison the peer could not satisfy and is retired.
+- **K5 as-built — revocation linearization.** There is no live `session_streams` to close; the
+  responder re-reads the registry per request, so once a revocation commits, the next request from
+  that caller is denied (`approved()` excludes revoked rows). The `verify_at(gen)` pull-check the
+  older text implied does not exist and its doc claim was removed.
+- **K7 as-built — transport is request/reply over the bus.** `session_streams` (live duplex push)
+  remains the future refinement; list / mirror / inject are covered by request/reply today.

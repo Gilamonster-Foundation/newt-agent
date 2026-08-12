@@ -79,7 +79,6 @@ pub struct DockTurn {
     pub assistant: String,
 }
 
-/// Service a single decoded dock request against the store at `state_dir`.
 /// The caller's authorization on THIS responder. `None` means enforcement is
 /// off (the explicit unsafe opt-out — serve any same-operator caller); `Some` is
 /// the scope the caller's approved dock is limited to, enforced per operation.

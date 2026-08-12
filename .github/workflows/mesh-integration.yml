@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Gilamonster-Foundation/agent-mesh
-          ref: main
+          ref: feat/request-context-seam  # PIN: agent-mesh#75 (RequestContext seam); revert to main on merge
           path: agent-mesh
 
       - uses: dtolnay/rust-toolchain@stable
