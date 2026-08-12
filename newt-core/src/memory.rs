@@ -158,6 +158,10 @@ pub trait MemoryProvider: Send + Sync {
         self.sync_turn(user, assistant, metrics).await;
     }
 
+    /// Rebind context-sensitive providers when the active model changes.
+    /// Providers without a token budget ignore the update.
+    fn set_context_tokens(&mut self, _tokens: u32) {}
+
     /// Clear conversation-local history while preserving provider configuration
     /// and system-prompt state. Used when the TUI starts a fresh conversation
     /// inside the same running process.
@@ -255,6 +259,14 @@ impl MemoryManager {
     /// Register a provider. Providers are consulted in registration order.
     pub fn add_provider(&mut self, p: impl MemoryProvider + 'static) {
         self.providers.push(Box::new(p));
+    }
+
+    /// Apply the currently selected model's context budget without rebuilding
+    /// providers or losing their conversation-local history.
+    pub fn set_context_tokens(&mut self, tokens: u32) {
+        for provider in &mut self.providers {
+            provider.set_context_tokens(tokens);
+        }
     }
 
     /// Initialize all providers. Called once at session start.
@@ -605,19 +617,18 @@ fn restored_token_anchor(
 /// 20), which forced spurious pruning. Without any backend report the figure
 /// falls back to summing per-turn content estimates (each turn counted once).
 ///
-/// Configure via `[memory] provider = "token_budget"`. The budget is a
-/// construction-time value injected by the caller (Step 18.2, #247) with
-/// this precedence:
+/// Configure via `[memory] provider = "token_budget"`. The caller injects the
+/// initial budget (Step 18.2, #247) with this precedence:
 ///
 /// 1. explicit `[memory] context_tokens` (a deliberate user override),
-/// 2. capability-derived (`max_ok_input` else `safe_context` from the
+/// 2. the active model's declared window,
+/// 3. capability-derived (`max_ok_input` else `safe_context` from the
 ///    caller's probe cache — newt-core deliberately has no dependency on
 ///    the probe types, mirroring the `with_summarizer` injection),
-/// 3. [`DEFAULT_CONTEXT_TOKENS`] when neither exists (fresh model).
+/// 4. [`DEFAULT_CONTEXT_TOKENS`] when neither exists (fresh model).
 ///
-/// The value is fixed for the provider's lifetime: budgets refresh per
-/// session; mid-session capability ratchets are tracked live by the
-/// agentic loop's own pre-send guard, not by this provider.
+/// The TUI rebinds the value in place before every turn, preserving history
+/// while following mid-conversation model/backend changes.
 pub struct TokenBudget {
     /// Maximum context tokens (model's `num_ctx`; can be overridden).
     max_tokens: u32,
@@ -699,6 +710,10 @@ impl TokenBudget {
 impl MemoryProvider for TokenBudget {
     fn name(&self) -> &str {
         "token_budget"
+    }
+
+    fn set_context_tokens(&mut self, tokens: u32) {
+        self.max_tokens = tokens.max(512);
     }
 
     fn build_messages(&self, system_prompt: &str, new_task: &str) -> Vec<MemMessage> {
@@ -1028,11 +1043,11 @@ fn wire_to_history(
 ///
 /// Configure: `[memory] provider = "summarizing"`, plus an optional explicit
 /// `context_tokens` override. The compression budget (`max_tokens`) is a
-/// construction-time value injected by the caller with the same precedence
+/// initial value injected by the caller with the same precedence
 /// as [`TokenBudget`] (Step 18.2, #247): explicit config override →
 /// capability-derived (`max_ok_input` else `safe_context`) →
-/// [`DEFAULT_CONTEXT_TOKENS`]. Fixed per session; the loop's pre-send guard
-/// tracks mid-session capability ratchets live.
+/// [`DEFAULT_CONTEXT_TOKENS`]. The TUI rebinds it before every turn when the
+/// active model's resolved budget changes.
 pub struct Summarizing {
     max_tokens: u32,
     threshold_pct: f32,
@@ -1235,6 +1250,10 @@ impl Summarizing {
 impl MemoryProvider for Summarizing {
     fn name(&self) -> &str {
         "summarizing"
+    }
+
+    fn set_context_tokens(&mut self, tokens: u32) {
+        self.max_tokens = tokens.max(1);
     }
 
     fn build_messages(&self, system_prompt: &str, new_task: &str) -> Vec<MemMessage> {
@@ -2509,6 +2528,24 @@ mod tests {
         let mut mgr = MemoryManager::new();
         mgr.add_provider(RollingWindow::new(5));
         mgr.on_session_end(&[]).await; // must not panic
+    }
+
+    #[test]
+    fn memory_manager_rebinds_context_budget_without_losing_history() {
+        let mut manager = MemoryManager::new();
+        let mut provider = TokenBudget::new(16_384, 0.80);
+        provider.history.push(TurnRecord {
+            user: "kept question".to_string(),
+            assistant: "kept answer".to_string(),
+            est_tokens: 10,
+        });
+        manager.add_provider(provider);
+
+        manager.set_context_tokens(1_000_000);
+
+        let messages = manager.build_messages("system", "next question");
+        assert!(messages.iter().any(|m| m.content == "kept question"));
+        assert_eq!(manager.usage()[0].2, 800_000);
     }
 
     #[tokio::test]

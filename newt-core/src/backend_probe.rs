@@ -1010,7 +1010,17 @@ pub fn parse_ollama_show_window(json: &serde_json::Value) -> Option<u32> {
 /// window (a single-model vLLM instance). Pure.
 pub fn parse_openai_models_window(json: &serde_json::Value, model: &str) -> Option<u32> {
     let data = json["data"].as_array()?;
-    let window_of = |e: &serde_json::Value| e["max_model_len"].as_u64().map(|v| v as u32);
+    let window_of = |e: &serde_json::Value| {
+        [
+            "max_model_len",
+            "context_window",
+            "context_length",
+            "max_input_tokens",
+        ]
+        .into_iter()
+        .find_map(|field| e[field].as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+    };
     if let Some(w) = data
         .iter()
         .find(|e| e["id"].as_str() == Some(model))
@@ -1661,6 +1671,20 @@ mod tests {
             parse_openai_models_window(&serde_json::json!({"data":[{"id":"m"}]}), "m"),
             None
         );
+    }
+
+    #[test]
+    fn openai_window_accepts_common_gateway_metadata_fields() {
+        for field in ["context_window", "context_length", "max_input_tokens"] {
+            let mut entry = serde_json::json!({"id": "hosted/model"});
+            entry[field] = serde_json::json!(1_000_000u64);
+            let json = serde_json::json!({"data": [entry]});
+            assert_eq!(
+                parse_openai_models_window(&json, "hosted/model"),
+                Some(1_000_000),
+                "field {field}"
+            );
+        }
     }
 
     #[test]

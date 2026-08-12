@@ -380,6 +380,20 @@ fn authoritative_request_budget(
     }
 }
 
+/// Whether the message-count fallback may stand down. A real ceiling always
+/// delegates to the token/send guards. With no ceiling, a model-specific
+/// accepted-prompt high-water mark still proves that the current request fits
+/// when it is at or below that mark; treating that proof as no headroom causes
+/// needless count-only compaction on hosted large-context models.
+fn count_guard_has_headroom(
+    current_tokens: usize,
+    authoritative_budget: Option<usize>,
+    max_ok_input: Option<u32>,
+) -> bool {
+    authoritative_budget.is_some()
+        || max_ok_input.is_some_and(|accepted| current_tokens <= accepted as usize)
+}
+
 fn capped_accepted_prompt_tokens(
     accepted_prompt_tokens: u32,
     declared_ceiling: Option<usize>,
@@ -1981,12 +1995,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // context-window ceiling. Only a configured token cap or a
             // budget backed by a known/recovered window suppresses a
             // count-only compaction under the default policy.
-            let has_authoritative_headroom = authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            )
-            .is_some();
+            let has_authoritative_headroom = count_guard_has_headroom(
+                current,
+                authoritative_request_budget(
+                    send_budget,
+                    send_budget_authoritative,
+                    mid_loop_trim_tokens,
+                ),
+                max_ok_input,
+            );
             if let Some(trigger) = compression_trigger(
                 messages.len(),
                 current,
@@ -5514,12 +5531,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // Count-only budget priced in message-token space (F1) — mirrors
             // the Ollama path.
             let message_tokens = estimate_tokens(&messages, estimation);
-            let has_authoritative_headroom = authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            )
-            .is_some();
+            let has_authoritative_headroom = count_guard_has_headroom(
+                current,
+                authoritative_request_budget(
+                    send_budget,
+                    send_budget_authoritative,
+                    mid_loop_trim_tokens,
+                ),
+                max_ok_input,
+            );
             let reasoning_tail_len =
                 compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
             if let Some(trigger) = compression_trigger(
@@ -7425,12 +7445,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         {
             let current = prompt_tracker.current(&messages, Some(&tools), cal, estimation);
             let message_tokens = estimate_tokens(&messages, estimation);
-            let has_authoritative_headroom = authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            )
-            .is_some();
+            let has_authoritative_headroom = count_guard_has_headroom(
+                current,
+                authoritative_request_budget(
+                    send_budget,
+                    send_budget_authoritative,
+                    mid_loop_trim_tokens,
+                ),
+                max_ok_input,
+            );
             let reasoning_tail_len =
                 compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
             if let Some(trigger) = compression_trigger(
@@ -11777,6 +11800,13 @@ mod tool_round_cap_tests {
     fn authoritative_zero_input_budget_is_not_erased() {
         assert_eq!(authoritative_request_budget(Some(0), true, None), Some(0));
         assert_eq!(authoritative_request_budget(Some(0), false, None), None);
+    }
+
+    #[test]
+    fn accepted_prompt_proof_suppresses_count_fallback_only_while_it_covers_current() {
+        assert!(count_guard_has_headroom(16_261, None, Some(23_799)));
+        assert!(!count_guard_has_headroom(24_000, None, Some(23_799)));
+        assert!(count_guard_has_headroom(24_000, Some(800_000), None));
     }
 
     /// Prove the regression fixture isolates the live-tail duplicate — the
