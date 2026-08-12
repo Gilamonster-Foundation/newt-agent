@@ -100,8 +100,13 @@ start_peer2() { # peer 2, its own store
 }
 start_hub() { # docks whatever is in DOCK_PEERS
   HUB_PORT="$(free_port)"; mkdir -p "$WORK/hub"
+  # This hub tests raw transport/dock MECHANICS (dock, multi-dock, select,
+  # inject, undock) — the approved-dock ceremony is exercised by the SEPARATE
+  # gated hub below. The gate is fail-closed by default now, so this hub takes
+  # the explicit, named unsafe opt-out to reach the mechanics under test.
   NEWT_WEB_BIND="127.0.0.1:$HUB_PORT" NEWT_WEB_AUTH_HEADER="" \
     NEWT_WEB_STATE_DIR="$WORK/hub" NEWT_WEB_WORKSPACE="$WORK/hub" \
+    NEWT_INSECURE_DOCK_NO_APPROVAL=1 \
     NEWT_WEB_DOCK_PEERS="$DOCK_PEERS" \
     "$WEB_BIN" > "$WORK/hub.log" 2>&1 &
   HUB_PID=$!; _wait_web "$HUB_PORT" hub "$WORK/hub.log"
@@ -111,9 +116,10 @@ start_hub() { # docks whatever is in DOCK_PEERS
 start_gated_hub() {
   GHUB_PORT="$(free_port)"; mkdir -p "$WORK/ghub"
   cp "$WORK/cfg/identity.pem" "$WORK/ghub/identity.pem"   # same operator → mesh auto-teams
+  # No opt-out here: the approved-dock gate is fail-closed BY DEFAULT, which is
+  # exactly what this hub exists to prove.
   NEWT_WEB_BIND="127.0.0.1:$GHUB_PORT" NEWT_WEB_AUTH_HEADER="" \
     NEWT_WEB_STATE_DIR="$WORK/ghub" NEWT_WEB_WORKSPACE="$WORK/ghub" \
-    NEWT_WEB_REQUIRE_DOCK_APPROVAL=1 \
     NEWT_WEB_DOCK_PEERS="meshpeer=mesh:$MESH_PUBKEY@127.0.0.1:$MESH_PORT" \
     "$WEB_BIN" > "$WORK/ghub.log" 2>&1 &
   GHUB_PID=$!; _wait_web "$GHUB_PORT" ghub "$WORK/ghub.log"

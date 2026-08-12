@@ -95,11 +95,20 @@ pub(crate) fn set_dock_identity(config_path: std::path::PathBuf, identity_pem: s
 }
 
 /// Whether the hub enforces the approved-dock registry before a mesh dial.
-/// Opt-in (`NEWT_WEB_REQUIRE_DOCK_APPROVAL=1`) so loopback dev and the existing
-/// mesh smoke path keep working; the deployment turns it on to require a
-/// completed docking ceremony (requirement 5).
+/// **Fail-closed by default** (requirement 5): a security ceremony that defaults
+/// OFF is theater, so a mesh peer is refused unless the operator has approved it
+/// — the ceremony is the boundary, not an opt-in. The ONLY way off is an
+/// explicit, greppable, unsafe opt-out.
 fn require_dock_approval() -> bool {
-    std::env::var("NEWT_WEB_REQUIRE_DOCK_APPROVAL")
+    !dock_approval_disabled()
+}
+
+/// The one unsafe escape hatch: `NEWT_INSECURE_DOCK_NO_APPROVAL=1` turns the
+/// approved-dock gate off (loopback dev / raw-transport testing only). Named so
+/// it surfaces in any `grep INSECURE` audit; disabling the ceremony is a
+/// deliberate act, never the absence of a flag.
+fn dock_approval_disabled() -> bool {
+    std::env::var("NEWT_INSECURE_DOCK_NO_APPROVAL")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -450,6 +459,22 @@ mod tests {
     fn empty_peers_value_is_no_docks() {
         assert!(parse_peers("").is_empty());
         assert!(parse_peers("   ").is_empty());
+    }
+
+    #[serial_test::serial(newt_web_env)]
+    #[test]
+    fn dock_approval_is_fail_closed_by_default() {
+        std::env::remove_var("NEWT_INSECURE_DOCK_NO_APPROVAL");
+        assert!(
+            require_dock_approval(),
+            "the approved-dock gate must be ON by default (fail-closed)"
+        );
+        std::env::set_var("NEWT_INSECURE_DOCK_NO_APPROVAL", "1");
+        assert!(
+            !require_dock_approval(),
+            "only the explicit unsafe opt-out disables enforcement"
+        );
+        std::env::remove_var("NEWT_INSECURE_DOCK_NO_APPROVAL");
     }
 
     #[test]
