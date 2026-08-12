@@ -113,14 +113,30 @@ fn dock_approval_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// The capability a mesh dial requires. The hub declares it up front so the
+/// approved-dock gate can refuse an under-scoped dock **before dialing** — a
+/// Mirror dock may be mirrored (list/transcript) but never injected into. The
+/// responder enforces the same rule per request (`newt_mesh`'s `handle_dock`);
+/// this is the hub-side belt-and-suspenders so an inject over a read-only grant
+/// never even opens the session (D2, `docs/decisions/newt_web_docking` K7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockOp {
+    /// list_sessions / transcript — needs `DockScope::allows_read`.
+    Read,
+    /// inject — needs `DockScope::allows_inject`.
+    Inject,
+}
+
 /// The approval decision, pure over its inputs so it is testable without the
 /// process-global identity/env. `enforce` off ⇒ always Ok (dev). On ⇒ the
-/// registry at `identity` must hold a live approval for `BLAKE3(pubkey)`;
-/// missing identity, unapproved, or revoked all refuse.
+/// registry at `identity` must hold a live approval for `BLAKE3(pubkey)` whose
+/// signed scope covers `op`; missing identity, unapproved, revoked, or
+/// under-scoped all refuse.
 fn check_dock_approval(
     enforce: bool,
     identity: Option<&(std::path::PathBuf, std::path::PathBuf)>,
     pubkey: &[u8; 32],
+    op: DockOp,
 ) -> Result<(), String> {
     if !enforce {
         return Ok(());
@@ -130,10 +146,24 @@ fn check_dock_approval(
     let fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(pubkey);
     let (registry, _warnings) =
         newt_core::dock_registry::load_docks_with_identity(config, identity);
-    if registry.approved(&fp).is_none() {
+    let Some(record) = registry.approved(&fp) else {
         return Err(format!(
             "peer {}… is not approved — run `newt dock approve`",
             &fp[..fp.len().min(12)]
+        ));
+    };
+    // Refuse an under-scoped dock at the hub, before any dial (D2): the
+    // responder also enforces this per request, but a Mirror grant should never
+    // even be dialed for an inject.
+    let permitted = match op {
+        DockOp::Read => record.scope.allows_read(),
+        DockOp::Inject => record.scope.allows_inject(),
+    };
+    if !permitted {
+        return Err(format!(
+            "peer {}… is approved for scope `{}`, which does not permit this operation",
+            &fp[..fp.len().min(12)],
+            record.scope.as_wire()
         ));
     }
     Ok(())
@@ -145,8 +175,9 @@ fn check_dock_approval(
 fn approved_endpoint(
     pubkey: &[u8; 32],
     addr: &SocketAddr,
+    op: DockOp,
 ) -> Result<newt_mesh::PeerEndpoint, String> {
-    check_dock_approval(require_dock_approval(), DOCK_IDENTITY.get(), pubkey)?;
+    check_dock_approval(require_dock_approval(), DOCK_IDENTITY.get(), pubkey, op)?;
     Ok(newt_mesh::PeerEndpoint::new(*pubkey, *addr))
 }
 
@@ -253,7 +284,7 @@ async fn peer_sessions(peer: &DockPeer) -> Result<Vec<DockedSession>, String> {
         }
         DockKind::Mesh { pubkey, addr } => {
             let client = dock_client().ok_or("mesh dock unavailable (no operator identity)")?;
-            let ep = approved_endpoint(pubkey, addr)?;
+            let ep = approved_endpoint(pubkey, addr, DockOp::Read)?;
             client
                 .list_sessions(ep)
                 .await
@@ -281,7 +312,7 @@ async fn peer_transcript(peer: &DockPeer, conv: &str) -> Result<DockedTranscript
         }
         DockKind::Mesh { pubkey, addr } => {
             let client = dock_client().ok_or("mesh dock unavailable")?;
-            let ep = approved_endpoint(pubkey, addr)?;
+            let ep = approved_endpoint(pubkey, addr, DockOp::Read)?;
             client
                 .transcript(ep, conv)
                 .await
@@ -320,7 +351,7 @@ pub(crate) async fn peer_inject(peer: &DockPeer, conv: &str, text: &str) -> Resu
         }
         DockKind::Mesh { pubkey, addr } => {
             let client = dock_client().ok_or("mesh dock unavailable")?;
-            let ep = approved_endpoint(pubkey, addr)?;
+            let ep = approved_endpoint(pubkey, addr, DockOp::Inject)?;
             client
                 .inject(ep, conv, text)
                 .await
@@ -491,11 +522,11 @@ mod tests {
         let pubkey = [9u8; 32];
 
         // Enforcement off ⇒ dev/loopback dials freely.
-        assert!(check_dock_approval(false, None, &pubkey).is_ok());
+        assert!(check_dock_approval(false, None, &pubkey, DockOp::Read).is_ok());
         // On but no identity configured ⇒ fail closed.
-        assert!(check_dock_approval(true, None, &pubkey).is_err());
+        assert!(check_dock_approval(true, None, &pubkey, DockOp::Read).is_err());
         // On, identity present, peer not yet approved ⇒ refused.
-        assert!(check_dock_approval(true, Some(&ident), &pubkey).is_err());
+        assert!(check_dock_approval(true, Some(&ident), &pubkey, DockOp::Read).is_err());
 
         // The operator approves this exact pubkey.
         let fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(&pubkey);
@@ -511,9 +542,59 @@ mod tests {
         )
         .unwrap();
 
-        // Now the approved peer is admitted; a different pubkey still is not.
-        assert!(check_dock_approval(true, Some(&ident), &pubkey).is_ok());
-        assert!(check_dock_approval(true, Some(&ident), &[8u8; 32]).is_err());
+        // Now the approved peer is admitted (MirrorInject covers both ops); a
+        // different pubkey still is not.
+        assert!(check_dock_approval(true, Some(&ident), &pubkey, DockOp::Read).is_ok());
+        assert!(check_dock_approval(true, Some(&ident), &pubkey, DockOp::Inject).is_ok());
+        assert!(check_dock_approval(true, Some(&ident), &[8u8; 32], DockOp::Read).is_err());
+    }
+
+    /// Belt-and-suspenders (D2): a Mirror-scope grant may be mirrored but the
+    /// hub refuses to even DIAL it for an inject — the under-scoped operation is
+    /// rejected before `approved_endpoint` constructs a `PeerEndpoint`, so no
+    /// session is opened. The responder enforces the same rule per request; this
+    /// is the hub-side half. Regression for PR #1643's deferred inject-scope
+    /// hardening.
+    #[test]
+    fn a_mirror_scope_dock_is_refused_for_inject_before_dialing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let identity = dir.path().join("identity.pem");
+        agent_mesh_core::UserKey::generate()
+            .save(&identity)
+            .unwrap();
+        let ident = (config.clone(), identity.clone());
+        let pubkey = [7u8; 32];
+
+        // The operator approves this peer for READ-ONLY mirror (no inject).
+        let fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(&pubkey);
+        let pubkey_hex: String = pubkey.iter().map(|b| format!("{b:02x}")).collect();
+        newt_core::dock_registry::approve_dock_with_identity(
+            &config,
+            &identity,
+            &fp,
+            "mirror-only-peer",
+            &pubkey_hex,
+            newt_core::dock_registry::DockScope::Mirror,
+            "tx-mirror",
+        )
+        .unwrap();
+
+        // Read (list/transcript) is permitted…
+        assert!(
+            check_dock_approval(true, Some(&ident), &pubkey, DockOp::Read).is_ok(),
+            "a Mirror grant must still permit reads"
+        );
+        // …but inject is refused at the hub, before any dial.
+        let denied = check_dock_approval(true, Some(&ident), &pubkey, DockOp::Inject);
+        assert!(
+            denied.is_err(),
+            "a Mirror grant must refuse inject at the hub"
+        );
+        assert!(
+            denied.unwrap_err().contains("mirror"),
+            "the refusal must name the offending scope"
+        );
     }
 
     #[test]
