@@ -1255,6 +1255,56 @@ async fn chat_complete_dispatches_openai_kind_and_returns_first_round_answer() {
     assert_eq!(hallu, 0);
 }
 
+/// Regression for the live full-access incident: the model narrated an exec
+/// denial without ever calling the advertised tool. The harness must spend one
+/// bounded round demanding a real probe instead of presenting that invention
+/// as the final answer.
+#[tokio::test]
+async fn openai_unverified_run_command_blocker_gets_ground_truth_retry() {
+    let server = MockServer::start().await;
+    let round = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedOpenAi {
+            round: round.clone(),
+            script: vec![
+                serde_json::json!({
+                    "content": "I hit a capability wall: run_command is permission-denied; exec not granted."
+                }),
+                serde_json::json!({
+                    "content": "I will inspect an actual run_command result before reporting a denial."
+                }),
+            ],
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.max_tool_rounds = 2;
+    let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+
+    assert_eq!(round.load(Ordering::SeqCst), 2, "one corrective retry");
+    assert!(
+        reply.contains("actual run_command result"),
+        "final reply: {reply}"
+    );
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    let second = body_json(&requests[1]).to_string();
+    assert!(
+        second.contains("no returned run_command result this turn contains an exec denial"),
+        "corrective request: {second}"
+    );
+    assert!(
+        second.contains("Report a denial only when an actual returned result contains one"),
+        "corrective request: {second}"
+    );
+}
+
 /// Mirrors vLLM chat templates that accept exactly one system message and
 /// require it to be the first message in the request.
 struct StrictVllmSystemResponder;
