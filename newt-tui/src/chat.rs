@@ -223,6 +223,30 @@ fn selected_model_context_window(
     live.or(configured).or(community)
 }
 
+/// The canonical [`probe::CapKey`] for the active serving principal — the ONE
+/// place the serving-default rule lives (three-Cs: the broken "key by bare
+/// model" call is unrepresentable once every site takes this key).
+///
+/// `serving` comes from the resolved [`BackendChoice`] (`Some` after a
+/// successful adopt). When it is `None` — an offline endpoint that could not be
+/// probed, or a not-yet-adopted route — we default to `Multiplexer`, which keys
+/// by bare model exactly as the pre-`cap_key` code did, so the fallback is
+/// byte-for-byte backward compatible with existing `model-capabilities.json`
+/// and never *newly* backend-keys anything. An instance backend that wants
+/// isolation even while offline should declare `serving = "instance"` in its
+/// backend TOML so adopt resolves it to `Some(Instance)`.
+fn session_cap_id(
+    serving: Option<newt_core::Serving>,
+    backend_name: &str,
+    model: &str,
+) -> probe::CapKey {
+    probe::cap_key(
+        serving.unwrap_or(newt_core::Serving::Multiplexer),
+        backend_name,
+        model,
+    )
+}
+
 /// A numbered server rejection is an authoritative upper bound on later
 /// turns. It may tighten an explicit/session window but never raise a tighter
 /// operator choice. An ordinary discovered window is deliberately not passed
@@ -850,7 +874,8 @@ pub(crate) fn run_chat(
     // fetch has been ATTEMPTED this session — successful or not. Without it,
     // an endpoint that reports no context length was re-queried every single
     // turn (`ensure_context_window` only early-outs on success).
-    let mut ctx_window_probed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ctx_window_probed: std::collections::HashSet<probe::CapKey> =
+        std::collections::HashSet::new();
 
     // The OPERATOR's backend baseline: what a `/persona clear` (or a switch to a
     // persona that declares no backend) reverts to — the operator's own latest
@@ -873,6 +898,13 @@ pub(crate) fn run_chat(
         print_newt(&line, color, verbose);
     }
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+    // The canonical capability identity for the ACTIVE serving principal — the
+    // single key for every empirical-capability lookup/observation below
+    // (multiplexer → model, instance → backend; see `probe::cap_key`). Recomputed
+    // in lockstep with the route after every switch funnel (`refresh_backend` /
+    // `apply_persona_backend`), so two vLLM instances serving the same model name
+    // never share (or poison) each other's tuning evidence.
+    let mut cap_id = session_cap_id(choice.serving, &choice.name, &inf_model);
     // #1139: attribute the resolved model's family so per-family `[tenacity]`
     // config defaults apply in CHAT, exactly as they do in solve. This was the
     // ACTIVE_FAMILY gap — `set_active_model_family` was called ONLY in solve, so
@@ -885,7 +917,7 @@ pub(crate) fn run_chat(
     // Numbered hard-window rejections are stronger than ordinary probes and
     // must survive into later turns. Keep their provenance separate so a
     // normal discovered window does not defeat an explicit experimental raise.
-    let mut recovered_context_windows = std::collections::HashMap::<String, u32>::new();
+    let mut recovered_context_windows = std::collections::HashMap::<probe::CapKey, u32>::new();
 
     // Resolve + validate the active profile against config, now that the model is
     // known. Precedence: --profile (explicit) > --bundle > a bundle inferred from
@@ -1259,6 +1291,9 @@ pub(crate) fn run_chat(
         if url_changed && verbose {
             dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url).map(|d| d.into_sampler(2));
         }
+        // A startup persona may have switched the backend/model; re-derive the
+        // capability identity so the budget block below keys the resolved route.
+        cap_id = session_cap_id(choice.serving, &choice.name, &inf_model);
     }
 
     // Pluggable memory manager — replaces the old conv Vec.
@@ -1271,10 +1306,10 @@ pub(crate) fn run_chat(
     // fallback. This seeds construction; the turn loop rebinds the providers
     // in place whenever the selected model's resolution changes.
     let mem_budget = {
-        let entry = cap_cache.entry(inf_model.clone()).or_default();
+        let entry = cap_cache.entry(cap_id.clone()).or_default();
         // Once per model per session, even on failure (Phase 20): the set
         // insert returning true means this is the first attempt.
-        let updated = ctx_window_probed.insert(inf_model.clone())
+        let updated = ctx_window_probed.insert(cap_id.clone())
             && probe::ensure_context_window(
                 entry,
                 &inf_url,
@@ -1296,8 +1331,7 @@ pub(crate) fn run_chat(
         probe::resolve_memory_budget(
             mem_cfg.context_tokens,
             declared_window,
-            &cap_cache,
-            &inf_model,
+            cap_cache.get(&cap_id),
         )
     };
     let mut memory = {
@@ -1400,6 +1434,16 @@ pub(crate) fn run_chat(
         }
         mgr
     };
+    // Summarizer ownership (the split-brain fix): decide ONCE whether the memory
+    // provider's summarizer INHERITS the session backend (degraded fallback or a
+    // partial override that reuses `inf_url`) — in which case it must follow a
+    // live `/model` / `/backend` switch — or is explicitly PINNED (a dedicated
+    // endpoint / embedded engine) and stays fixed across switches. `last_route`
+    // is the (url, model, kind) the current summarizer was built for, so a rebind
+    // happens ONLY when the route actually changes (never per turn).
+    let summarizer_follows_route =
+        summarizer_follows_session(&sum_cfg, embedded_summarizer_default());
+    let mut last_summarizer_route = (inf_url.clone(), inf_model.clone(), inf_kind);
     // Turn-counted memory nudge (Step 19.3, #248): owned per session, lent to
     // the loop each turn. `[memory] note_nudge_interval` (default 10, 0 = off).
     let mut note_nudge = newt_core::NoteNudge::new(mem_cfg.note_nudge_interval);
@@ -4227,6 +4271,16 @@ pub(crate) fn run_chat(
                     print_thinking(color);
                     let t0 = std::time::Instant::now();
 
+                    // The active route may have changed since the previous turn
+                    // (`/model`, `/backend`, a persona switch — all of which
+                    // update `choice` + `inf_model` before `continue`ing). Re-derive
+                    // the canonical capability identity here, at the head of the
+                    // inference path, so every empirical lookup, observation, and
+                    // rebudget below keys the CURRENT serving principal — never the
+                    // previous model's evidence, and never poisoning a sibling
+                    // instance that happens to share a model name.
+                    cap_id = session_cap_id(choice.serving, &choice.name, &inf_model);
+
                     // Per-model tuning: explicit config overrides global defaults.
                     let model_tune = cfg.find_model_tuning(&inf_model);
                     let configured_max_tool_rounds = model_tune
@@ -4281,7 +4335,7 @@ pub(crate) fn run_chat(
                         eff_estimate_ratio,
                         eff_recovered_hard_window,
                     ) = {
-                        let entry = cap_cache.entry(inf_model.clone()).or_default();
+                        let entry = cap_cache.entry(cap_id.clone()).or_default();
                         // #1199: the server-declared window from session-start
                         // adopt (`inf_context_window`) is authoritative and
                         // cache-independent. Only fall back to the cache-side
@@ -4291,7 +4345,7 @@ pub(crate) fn run_chat(
                         // window. The cache still holds the LEARNED facts
                         // (max_ok_input, estimate_ratio).
                         let updated = inf_context_window.is_none()
-                            && ctx_window_probed.insert(inf_model.clone())
+                            && ctx_window_probed.insert(cap_id.clone())
                             && probe::ensure_context_window(
                                 entry,
                                 &inf_url,
@@ -4319,7 +4373,7 @@ pub(crate) fn run_chat(
                                 .and_then(|profile| profile.context_window),
                         );
                         let recovered_hard_window = cap_context_window_by_recovery(
-                            recovered_context_windows.get(&inf_model).copied(),
+                            recovered_context_windows.get(&cap_id).copied(),
                             cached_hard_window,
                         );
                         let full_window = cap_context_window_by_recovery(
@@ -4367,10 +4421,34 @@ pub(crate) fn run_chat(
                     let active_memory_budget = probe::resolve_memory_budget(
                         mem_cfg.context_tokens,
                         eff_context_window,
-                        &cap_cache,
-                        &inf_model,
+                        cap_cache.get(&cap_id),
                     );
                     memory.set_context_tokens(active_memory_budget);
+                    // A SESSION-INHERITING summarizer must follow the switch too —
+                    // otherwise the history provider says "backend B, smaller
+                    // window" while the embedded summarizer still targets backend A
+                    // (the split-brain #1647 left open). Rebuild it from the CURRENT
+                    // route, but only when that route actually changed, and only
+                    // when it is not pinned. `set_summarizer` builds at most once
+                    // and only if a Summarizing provider is present.
+                    if summarizer_follows_route {
+                        let route = (inf_url.clone(), inf_model.clone(), inf_kind);
+                        if route != last_summarizer_route {
+                            memory.set_summarizer(|| {
+                                build_session_summarizer(
+                                    &sum_cfg,
+                                    &cfg,
+                                    &inf_url,
+                                    &inf_model,
+                                    inf_kind,
+                                    &inf_key,
+                                    Some(active_memory_budget),
+                                    color,
+                                )
+                            });
+                            last_summarizer_route = route;
+                        }
+                    }
 
                     // Context-window resolution: explicit num_ctx first. For
                     // OpenAI, hand core the full window so its input percentage
@@ -4849,7 +4927,7 @@ pub(crate) fn run_chat(
                         // Inner block: the `entry` borrow must end before
                         // `save_cache` takes its shared borrow of the map.
                         let (dirty, persisted_hard_window) = {
-                            let entry = cap_cache.entry(inf_model.clone()).or_default();
+                            let entry = cap_cache.entry(cap_id.clone()).or_default();
                             let dirty = probe::apply_observation_with_input_ceiling_pct(
                                 entry,
                                 &obs,
@@ -4861,7 +4939,7 @@ pub(crate) fn run_chat(
                         if matches!(obs, newt_core::RoundObservation::ContextWindow400 { .. }) {
                             let hard_window = persisted_hard_window
                                 .expect("a numbered context-window observation persists its cap");
-                            recovered_context_windows.insert(inf_model.clone(), hard_window);
+                            recovered_context_windows.insert(cap_id.clone(), hard_window);
                             inf_context_window = Some(hard_window);
                             recovered_context_window.set(Some(hard_window));
                         };
@@ -5523,7 +5601,7 @@ pub(crate) fn run_chat(
                                 // truthful per-round number.
                                 if let Some(input_tokens) = usage.map(|u| u.input_tokens) {
                                     if turn_saw_accepted.get() {
-                                        let entry = cap_cache.entry(inf_model.clone()).or_default();
+                                        let entry = cap_cache.entry(cap_id.clone()).or_default();
                                         let dirty = entry.record_success(input_tokens, &today);
                                         if dirty {
                                             probe::save_cache(&cap_cache);
@@ -5536,7 +5614,7 @@ pub(crate) fn run_chat(
                                     // Then use core's send-budget resolver so the visible
                                     // number includes the same cognition output reserve as
                                     // preflight, compaction, and context_remaining.
-                                    let observed = cap_cache.get(&inf_model);
+                                    let observed = cap_cache.get(&cap_id);
                                     let (gauge_max_ok, gauge_safe) = match context_size_override {
                                         Some(n) => (Some(n), Some(n)),
                                         None => (

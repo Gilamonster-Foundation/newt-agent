@@ -162,6 +162,23 @@ pub trait MemoryProvider: Send + Sync {
     /// Providers without a token budget ignore the update.
     fn set_context_tokens(&mut self, _tokens: u32) {}
 
+    /// Whether this provider consumes a live [`crate::agentic::Summarizer`] and
+    /// therefore wants it rebound when a session-inheriting summarizer must
+    /// follow a `/model` or `/backend` switch. Only [`Summarizing`] returns
+    /// `true`; the fan-out in [`MemoryManager::set_summarizer`] uses it to avoid
+    /// building a (possibly GGUF-loading) summarizer for providers that ignore
+    /// it.
+    fn wants_summarizer(&self) -> bool {
+        false
+    }
+
+    /// Swap this provider's embedded summarizer in place — the descriptor twin
+    /// of [`set_context_tokens`](Self::set_context_tokens). Default no-op;
+    /// [`Summarizing`] overrides it. The TUI supplies an already-built
+    /// summarizer bound to the *current* route (newt-core stays free of
+    /// backend-resolution knowledge, exactly as `with_summarizer` intends).
+    fn set_summarizer(&mut self, _summarizer: crate::agentic::Summarizer) {}
+
     /// Clear conversation-local history while preserving provider configuration
     /// and system-prompt state. Used when the TUI starts a fresh conversation
     /// inside the same running process.
@@ -266,6 +283,22 @@ impl MemoryManager {
     pub fn set_context_tokens(&mut self, tokens: u32) {
         for provider in &mut self.providers {
             provider.set_context_tokens(tokens);
+        }
+    }
+
+    /// Rebind the session-inheriting summarizer after a live `/model` or
+    /// `/backend` switch, without rebuilding providers or losing history — the
+    /// summarizer twin of [`set_context_tokens`](Self::set_context_tokens).
+    ///
+    /// `build` is called **at most once**, and only when a provider actually
+    /// consumes a summarizer (i.e. [`Summarizing`] is configured), so a
+    /// `token_budget` / `rolling` session never pays to construct one (the
+    /// embedded engine may load a GGUF). The caller decides whether the
+    /// summarizer *follows* the session at all; a pinned summarizer must simply
+    /// not call this.
+    pub fn set_summarizer(&mut self, build: impl FnOnce() -> crate::agentic::Summarizer) {
+        if let Some(provider) = self.providers.iter_mut().find(|p| p.wants_summarizer()) {
+            provider.set_summarizer(build());
         }
     }
 
@@ -1256,6 +1289,17 @@ impl MemoryProvider for Summarizing {
         self.max_tokens = tokens.max(1);
     }
 
+    fn wants_summarizer(&self) -> bool {
+        true
+    }
+
+    fn set_summarizer(&mut self, summarizer: crate::agentic::Summarizer) {
+        // Swap the embedded summarizer in place — history and budget are
+        // untouched. The TUI only calls this for a SESSION-INHERITING summarizer
+        // after a live route switch; a pinned summarizer is never rebound.
+        self.summarizer = Some(summarizer);
+    }
+
     fn build_messages(&self, system_prompt: &str, new_task: &str) -> Vec<MemMessage> {
         let mut msgs = vec![MemMessage::system(system_prompt)];
         for t in &self.history {
@@ -2093,6 +2137,70 @@ mod tests {
         }
         // Should have compressed at least once without panicking.
         assert!(s.compress_count >= 1);
+    }
+
+    /// FOLLOW-SESSION summarizer (Issue 2, the split-brain fix): after a live
+    /// `/backend` switch the TUI calls `MemoryManager::set_summarizer`, which
+    /// reaches `Summarizing::set_summarizer`. The NEXT compaction must use the
+    /// NEW backend's summarizer — not the one captured at session start.
+    #[tokio::test]
+    async fn a_session_inheriting_summarizer_rebinds_to_the_new_backend() {
+        let mut s = Summarizing::new(512).with_summarizer(stub_summarizer("A-SUMMARY"));
+        let big = "x".repeat(200);
+        for i in 0..5u32 {
+            s.sync_turn(&big, &big, &metrics_with_input(10 + i)).await;
+        }
+        s.sync_turn(&big, &big, &metrics_with_input(600)).await; // over budget → compact
+        assert!(
+            s.prev_summary.contains("A-SUMMARY"),
+            "backend A summarizer must run first: {}",
+            s.prev_summary
+        );
+
+        // The route switched to backend B — rebind in place (history untouched).
+        MemoryProvider::set_summarizer(&mut s, Box::new(stub_summarizer("B-SUMMARY")));
+
+        for i in 0..5u32 {
+            s.sync_turn(&big, &big, &metrics_with_input(10 + i)).await;
+        }
+        s.sync_turn(&big, &big, &metrics_with_input(600)).await; // over budget → compact
+        assert!(
+            s.prev_summary.contains("B-SUMMARY"),
+            "the rebound backend-B summarizer must be used: {}",
+            s.prev_summary
+        );
+        assert!(
+            !s.prev_summary.contains("A-SUMMARY"),
+            "the stale backend-A summarizer must be gone"
+        );
+    }
+
+    /// The `MemoryManager::set_summarizer` fan-out only builds when a provider
+    /// actually consumes a summarizer — a `token_budget` / `rolling` session
+    /// never pays to construct one (the embedded engine may load a GGUF).
+    #[test]
+    fn manager_set_summarizer_does_not_build_without_a_summarizing_provider() {
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(TokenBudget::new(4_096, 0.80));
+        // The `FnOnce` MUST NOT run.
+        mgr.set_summarizer(|| panic!("no Summarizing provider → must not build a summarizer"));
+    }
+
+    /// …and it builds EXACTLY once (no per-provider fan-out cost) when a
+    /// `Summarizing` provider is present.
+    #[test]
+    fn manager_set_summarizer_builds_exactly_once_for_a_summarizing_provider() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let builds = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(TokenBudget::new(4_096, 0.80)); // ignores the summarizer
+        mgr.add_provider(Summarizing::new(512).with_summarizer(stub_summarizer("A")));
+        let b = builds.clone();
+        mgr.set_summarizer(move || {
+            b.fetch_add(1, Ordering::SeqCst);
+            Box::new(stub_summarizer("B")) as crate::agentic::Summarizer
+        });
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
     // --- Continuity: restore + delegation (Step 18.5, #247) ---

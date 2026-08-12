@@ -8099,6 +8099,94 @@ mod summarizer_default_tests {
             SummarizerChoice::DegradedSession,
         );
     }
+
+    /// The explicit ownership rule (Issue 2): which summarizers FOLLOW a live
+    /// `/model` / `/backend` switch and which stay PINNED.
+    #[test]
+    fn summarizer_ownership_decides_follow_vs_pinned() {
+        use super::summarizer_follows_session;
+        use newt_core::{BackendKind, SummarizerConfig};
+        let gguf = || Some("/models/embed.gguf".to_string());
+
+        // No override + embedded available → embedded engine, independent → PINNED.
+        assert!(!summarizer_follows_session(
+            &SummarizerConfig::default(),
+            gguf()
+        ));
+        // No override + embedded UNavailable → degraded session reuse → FOLLOWS.
+        assert!(summarizer_follows_session(
+            &SummarizerConfig::default(),
+            None
+        ));
+        // Pinned off-box endpoint → PINNED (never leaks onto the session host).
+        assert!(!summarizer_follows_session(
+            &SummarizerConfig {
+                endpoint: Some("http://sum-host:11434".into()),
+                model: Some("qwen2.5-1.5b".into()),
+                ..Default::default()
+            },
+            gguf()
+        ));
+        // Pinned embedded kind / pinned GGUF path → independent → PINNED.
+        assert!(!summarizer_follows_session(
+            &SummarizerConfig {
+                kind: Some(BackendKind::Embedded),
+                ..Default::default()
+            },
+            None
+        ));
+        assert!(!summarizer_follows_session(
+            &SummarizerConfig {
+                model_path: Some("/models/pinned.gguf".into()),
+                ..Default::default()
+            },
+            None
+        ));
+        // Partial override that only pins a MODEL but leaves the endpoint to
+        // inherit inf_url → still targets the session backend → FOLLOWS.
+        assert!(summarizer_follows_session(
+            &SummarizerConfig {
+                model: Some("small-summariser".into()),
+                ..Default::default()
+            },
+            gguf()
+        ));
+    }
+}
+
+/// Whether a SESSION-INHERITING summarizer — one that resolves onto the active
+/// inference backend, including the degraded fallback when the embedded engine
+/// is unavailable — must FOLLOW a live `/model` / `/backend` switch, as opposed
+/// to an explicitly PINNED one that stays fixed.
+///
+/// This is the ownership rule made explicit in ONE place; it mirrors
+/// [`resolve_summarizer_backend`]'s pinned-vs-inherited decision:
+///
+/// - No `[summarizer]` override + embedded engine available → the in-process
+///   embedded summarizer, independent of the session → does NOT follow.
+/// - No override + embedded UNavailable → degraded reuse of the session backend
+///   → follows.
+/// - A pinned endpoint, a pinned `kind = "embedded"`, or a pinned `model_path`
+///   → an independent backend → does NOT follow.
+/// - A partial override that leaves the endpoint to inherit `inf_url` (e.g. only
+///   a model name pinned) → still targets the session backend → follows.
+fn summarizer_follows_session(
+    sum_cfg: &newt_core::SummarizerConfig,
+    embedded_gguf: Option<String>,
+) -> bool {
+    let has_override = sum_cfg.kind.is_some()
+        || sum_cfg.endpoint.is_some()
+        || sum_cfg.model.is_some()
+        || sum_cfg.model_path.is_some();
+    if !has_override {
+        return matches!(
+            default_summarizer_choice(embedded_gguf),
+            SummarizerChoice::DegradedSession
+        );
+    }
+    sum_cfg.endpoint.is_none()
+        && sum_cfg.kind != Some(newt_core::BackendKind::Embedded)
+        && sum_cfg.model_path.is_none()
 }
 
 /// Build a loop summarizer for the current session backend, applying any
@@ -12899,7 +12987,13 @@ mod tool_round_cap_tests {
                             recovered_window = Some(context_window);
                         }
                         let dirty = {
-                            let entry = cap_cache.entry("cw-test-model".to_string()).or_default();
+                            let entry = cap_cache
+                                .entry(probe::cap_key(
+                                    newt_core::Serving::Multiplexer,
+                                    "",
+                                    "cw-test-model",
+                                ))
+                                .or_default();
                             probe::apply_observation(entry, &obs, today)
                         };
                         if dirty {
@@ -12989,7 +13083,11 @@ mod tool_round_cap_tests {
                 };
                 // Read the persisted facts after both the 400 and accepted retry.
                 let persisted = probe::load_cache()
-                    .get("cw-test-model")
+                    .get(&probe::cap_key(
+                        newt_core::Serving::Multiplexer,
+                        "",
+                        "cw-test-model",
+                    ))
                     .map(|e| (e.context_window, e.max_ok_input, e.safe_context));
                 (
                     out,
