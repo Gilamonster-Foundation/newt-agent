@@ -74,7 +74,7 @@ impl TuneConfidence {
 }
 
 /// One row in the capability cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityEntry {
     pub conformance: ToolConformance,
     /// ISO-8601 date (YYYY-MM-DD) the probe was last run.
@@ -364,10 +364,39 @@ pub fn apply_observation_with_input_ceiling_pct(
     }
 }
 
+/// The canonical capability-cache key for the active serving principal (#1126
+/// B2). The ONLY constructor is [`cap_key`], and there is deliberately no
+/// `From<String>` / `From<&str>`: a raw model name cannot be substituted for a
+/// canonical key, so every keying site is compiler-forced through [`cap_key`]
+/// and the Multiplexer-vs-Instance identity law can never be silently bypassed.
+///
+/// It is `#[serde(transparent)]` over its inner `String`, so the on-disk
+/// `model-capabilities.json` map is byte-for-byte the pre-newtype format: a
+/// Multiplexer entry is still keyed by the bare model name (every existing file
+/// keeps loading), and an Instance entry is keyed `backend:<name>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CapKey(String);
+
+impl CapKey {
+    /// The underlying string key — for the rare read-only lookup that must
+    /// bridge to a `&str` API (e.g. tracing). Never used to CONSTRUCT a key.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CapKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The full cache: capability key → entry. See [`cap_key`] for the keying
 /// discipline (#1126 Phase B2): per-MODEL for multiplexer backends (today's
 /// bare model name, unchanged), per-BACKEND for instance backends.
-pub type CapabilityCache = HashMap<String, CapabilityEntry>;
+pub type CapabilityCache = HashMap<CapKey, CapabilityEntry>;
 
 /// The capability-cache key for a backend/model pair (#1126 B2).
 ///
@@ -380,11 +409,16 @@ pub type CapabilityCache = HashMap<String, CapabilityEntry>;
 ///   model naturally overwrites the same key (the old model's entry would be
 ///   stale anyway), and two instances serving the same model name don't
 ///   collide.
-pub fn cap_key(serving: newt_core::Serving, backend_name: &str, model: &str) -> String {
-    match serving {
+///
+/// This is the SINGLE precedence algorithm for capability identity — callers
+/// must not re-derive it. Returns a [`CapKey`] so the result can only be used as
+/// a cache key, never confused with a wire model name.
+#[must_use]
+pub fn cap_key(serving: newt_core::Serving, backend_name: &str, model: &str) -> CapKey {
+    CapKey(match serving {
         newt_core::Serving::Multiplexer => model.to_string(),
         newt_core::Serving::Instance => format!("backend:{backend_name}"),
-    }
+    })
 }
 
 /// Metadata about a model from Ollama's `/api/tags`.
@@ -427,7 +461,7 @@ mod cap_key_tests {
         // Every existing model-capabilities.json entry keeps working: the
         // multiplexer key IS the model name, byte-for-byte.
         assert_eq!(
-            cap_key(Serving::Multiplexer, "gnuc-ollama", "qwen2.5-coder:7b"),
+            cap_key(Serving::Multiplexer, "gnuc-ollama", "qwen2.5-coder:7b").as_str(),
             "qwen2.5-coder:7b"
         );
     }
@@ -438,12 +472,133 @@ mod cap_key_tests {
         // with a new model overwrites the same key (stale-by-definition), and
         // two instances serving the same model name stay distinct.
         assert_eq!(
-            cap_key(Serving::Instance, "dgx1-vllm-8000", "ornith-1.0-35b"),
+            cap_key(Serving::Instance, "dgx1-vllm-8000", "ornith-1.0-35b").as_str(),
             "backend:dgx1-vllm-8000"
         );
+        // The identity law in one place: two DISTINCT instances serving the
+        // SAME model name resolve to DISTINCT keys, so neither poisons the
+        // other's empirical capability evidence (the #1647 instance-isolation
+        // gap this follow-up closes).
         assert_ne!(
             cap_key(Serving::Instance, "dgx1-vllm-8000", "m"),
             cap_key(Serving::Instance, "dgx1-vllm-8001", "m")
+        );
+        // …while a multiplexer keys purely by model, so two routes to the same
+        // model on one gateway intentionally SHARE evidence.
+        assert_eq!(
+            cap_key(Serving::Multiplexer, "gnuc-ollama", "m"),
+            cap_key(Serving::Multiplexer, "other-gateway", "m")
+        );
+    }
+
+    /// The cache is serde-`transparent` over the inner string, so the on-disk
+    /// `model-capabilities.json` is byte-for-byte the pre-newtype format:
+    /// existing (multiplexer, bare-model-keyed) files keep round-tripping, and
+    /// an instance entry persists as `backend:<name>`.
+    #[test]
+    fn capability_cache_round_trips_through_the_legacy_string_key_format() {
+        use super::{CapabilityCache, CapabilityEntry};
+        let entry = |max_ok_input: Option<u32>, safe_context: Option<u32>| CapabilityEntry {
+            conformance: super::ToolConformance::Native,
+            tested_date: "2026-06-10".into(),
+            safe_context,
+            max_ok_input,
+            ..Default::default()
+        };
+        let mut cache = CapabilityCache::default();
+        cache.insert(
+            cap_key(Serving::Multiplexer, "gnuc-ollama", "qwen2.5-coder:7b"),
+            entry(Some(24_000), Some(26_214)),
+        );
+        cache.insert(
+            cap_key(Serving::Instance, "dgx1-vllm-8000", "m"),
+            entry(Some(120_000), None),
+        );
+        let json = serde_json::to_string(&cache).unwrap();
+        // Legacy string keys, exactly as prior versions wrote them.
+        assert!(json.contains("\"qwen2.5-coder:7b\""));
+        assert!(json.contains("\"backend:dgx1-vllm-8000\""));
+        let restored: CapabilityCache = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, cache);
+    }
+
+    /// INSTANCE ISOLATION — the headline #1647 gap this follow-up closes. Two
+    /// vLLM `Serving::Instance` backends A and B serve the SAME model name "m"
+    /// but have different real capabilities. Exercising A → B → A must prove B
+    /// never inherits A's `max_ok_input` / `safe_context` / recovered window /
+    /// `estimate_ratio` / budget, and B's smaller limit + failure evidence never
+    /// poison A. (Before the cap_key rekey, both keyed by "m" and collided.)
+    #[test]
+    fn two_instances_serving_the_same_model_are_isolated_through_a_to_b_to_a() {
+        use super::{resolve_memory_budget, CapKey, CapabilityCache, CapabilityEntry};
+        let entry = |max_ok_input: Option<u32>,
+                     safe_context: Option<u32>,
+                     estimate_ratio: Option<f32>| CapabilityEntry {
+            conformance: super::ToolConformance::Native,
+            tested_date: "2026-08-01".into(),
+            safe_context,
+            max_ok_input,
+            estimate_ratio,
+            ..Default::default()
+        };
+        // A: a 128K-class instance; B: a 32K-class instance — SAME model "m".
+        let key_a = cap_key(Serving::Instance, "vllm-8000", "m");
+        let key_b = cap_key(Serving::Instance, "vllm-8001", "m");
+        assert_ne!(
+            key_a, key_b,
+            "same model, distinct backends → distinct keys"
+        );
+
+        let mut cache = CapabilityCache::default();
+        cache.insert(
+            key_a.clone(),
+            entry(Some(120_000), Some(120_000), Some(1.10)),
+        );
+        cache.insert(key_b.clone(), entry(Some(30_000), Some(30_000), Some(0.90)));
+
+        // A → B → A: each resolves to ITS OWN budget, never the other's.
+        assert_eq!(
+            resolve_memory_budget(None, None, cache.get(&key_a)),
+            120_000
+        );
+        assert_eq!(
+            resolve_memory_budget(None, None, cache.get(&key_b)),
+            30_000,
+            "B must NOT inherit A's 120K high-water mark / safe context / budget"
+        );
+        assert_eq!(
+            resolve_memory_budget(None, None, cache.get(&key_a)),
+            120_000,
+            "A survives the round trip unchanged"
+        );
+        // Distinct empirical state — ratios never cross.
+        assert_eq!(cache.get(&key_a).unwrap().estimate_ratio, Some(1.10));
+        assert_eq!(cache.get(&key_b).unwrap().estimate_ratio, Some(0.90));
+
+        // B hits a hard 400 and tightens its OWN safe_context — A is untouched.
+        cache.get_mut(&key_b).unwrap().safe_context = Some(16_000);
+        assert_eq!(
+            resolve_memory_budget(None, None, cache.get(&key_a)),
+            120_000,
+            "B's failure/recovery must not poison A"
+        );
+
+        // recovered_context_windows is the same HashMap<CapKey, u32> run_chat
+        // now keys by cap_id: B's recovery ceiling never lands on A's key.
+        let mut recovered = std::collections::HashMap::<CapKey, u32>::new();
+        recovered.insert(key_b.clone(), 16_000);
+        assert_eq!(recovered.get(&key_a).copied(), None);
+        assert_eq!(recovered.get(&key_b).copied(), Some(16_000));
+
+        // MULTIPLEXER SHARING preserved: two routes to the same model on a
+        // gateway intentionally share one model-keyed entry.
+        let mux = cap_key(Serving::Multiplexer, "gnuc-ollama", "m");
+        cache.insert(mux.clone(), entry(Some(64_000), Some(64_000), None));
+        assert_eq!(resolve_memory_budget(None, None, cache.get(&mux)), 64_000);
+        assert_eq!(
+            cache.get(&cap_key(Serving::Multiplexer, "other-route", "m")),
+            cache.get(&mux),
+            "any route to model m on a multiplexer shares the same evidence"
         );
     }
 }
@@ -497,13 +652,13 @@ pub fn load_cache() -> CapabilityCache {
 /// Returns `true` when anything changed (caller should persist).
 pub fn migrate_accounting(cache: &mut CapabilityCache) -> bool {
     let mut dirty = false;
-    for (model, entry) in cache.iter_mut() {
+    for (key, entry) in cache.iter_mut() {
         if entry.accounting_version >= ACCOUNTING_VERSION {
             continue;
         }
         if entry.max_ok_input.is_some() {
             tracing::info!(
-                model,
+                cap_key = %key,
                 max_ok_input = entry.max_ok_input,
                 "invalidating max_ok_input recorded under the double-counting \
                  regime (Step 18.1); the ratchet will re-learn"
@@ -531,46 +686,48 @@ pub fn save_cache(cache: &CapabilityCache) {
 // ---------------------------------------------------------------------------
 
 /// Resolve the context-token budget injected into the memory providers
-/// (`TokenBudget` / `Summarizing`) at construction.
+/// (`TokenBudget` / `Summarizing`) at construction and rebound in place every
+/// turn (#1647) so the budget follows the active model/backend.
 ///
-/// Precedence:
-/// 1. **Explicit `[memory] context_tokens`** — a deliberate user override;
+/// **One unambiguous precedence, highest first:**
+/// 1. **Explicit `[memory] context_tokens`** — a deliberate operator override;
 ///    always honoured.
-/// 2. **Active model declaration** — fresh endpoint metadata, explicit model
-///    tuning, or an imported community profile.
-/// 3. **Capability-derived** — the empirical probe cache entry for `model`:
-///    `max(max_ok_input, safe_context)` when both exist, else whichever
-///    exists (Phase 20, `docs/design/model-self-tuning.md` §2.1 — the table
-///    is the contract). `max_ok_input` is a high-water mark of PROVEN-good
-///    input — a floor, not a ceiling — so it must never pull the budget
-///    below the believed-safe window; conversely a prompt proven beyond the
-///    claim outranks it. The cw-400 path reins `safe_context` to its
-///    authoritative cap, so `max()` still lands on the authoritative number
-///    after a hard 400. The declared `context_window` is deliberately NOT a
-///    source: it is a claim, not a measurement.
-/// 4. **Static default** — [`newt_core::DEFAULT_CONTEXT_TOKENS`] only when
-///    neither exists (fresh model, no probe data yet).
+/// 2. **`declared_window`** — the active model's declared context window
+///    (live endpoint metadata, explicit `[[model]]` tuning, or an imported
+///    community profile), resolved by the caller for the CURRENTLY SELECTED
+///    model. Since #1647 a declared window DOES participate: a `/model` switch
+///    on a multiplexing gateway changes the window without any probe, and the
+///    memory budget must follow. This supersedes the older doctrine (a declared
+///    window is "a claim, not a measurement") — that rule governed the empirical
+///    ratchet in tier 3, NOT this construction-time budget seed.
+/// 3. **Capability-derived** — from the already-resolved capability `entry` for
+///    the active serving principal (keyed by [`cap_key`], NOT by a raw model
+///    name): `max(max_ok_input, safe_context)` when both exist, else whichever
+///    exists (Phase 20, `docs/design/model-self-tuning.md` §2.1 — the table is
+///    the contract). `max_ok_input` is a high-water mark of PROVEN-good input —
+///    a floor, not a ceiling — so it never pulls the budget below the
+///    believed-safe window; a prompt proven beyond the claim outranks it. The
+///    cw-400 path reins `safe_context` to its authoritative cap, so `max()`
+///    still lands on the authoritative number after a hard 400.
+/// 4. **Static default** — [`newt_core::DEFAULT_CONTEXT_TOKENS`] only when none
+///    of the above exists (fresh model, no probe data yet).
 ///
-/// `declared_window` belongs to the currently selected model and may come
-/// from live endpoint metadata, explicit model tuning, or a community
-/// profile. The TUI re-resolves this function every turn and rebinds memory
-/// providers in place, so a model/backend switch keeps history without
-/// retaining the previous model's budget.
+/// The caller resolves the capability `entry` itself
+/// (`cache.get(&cap_key(...))`) and passes it in, so this function is NOT a
+/// keying site: it cannot be handed a raw model string where a canonical
+/// [`CapKey`] belongs. See [`cap_key`] for the Multiplexer-vs-Instance law.
 pub fn resolve_memory_budget(
     explicit: Option<u32>,
     declared_window: Option<u32>,
-    cache: &CapabilityCache,
-    model: &str,
+    entry: Option<&CapabilityEntry>,
 ) -> u32 {
     explicit
         .or(declared_window)
         .or_else(|| {
-            cache
-                .get(model)
-                .and_then(|e| match (e.max_ok_input, e.safe_context) {
-                    (Some(m), Some(s)) => Some(m.max(s)),
-                    (m, s) => m.or(s),
-                })
+            entry.and_then(|e| match (e.max_ok_input, e.safe_context) {
+                (Some(m), Some(s)) => Some(m.max(s)),
+                (m, s) => m.or(s),
+            })
         })
         .unwrap_or(newt_core::DEFAULT_CONTEXT_TOKENS)
 }
@@ -1481,9 +1638,12 @@ pub fn print_capabilities_table(
     endpoint: &str,
     color: bool,
 ) {
+    // This table is an Ollama (Multiplexer) view, so the capability key is the
+    // bare model name — go through cap_key so the keying discipline lives in one
+    // place rather than open-coding `&m.name`.
     let tested = models
         .iter()
-        .filter(|m| cache.contains_key(&m.name))
+        .filter(|m| cache.contains_key(&cap_key(newt_core::Serving::Multiplexer, "", &m.name)))
         .count();
     println!(
         "Models on {}  ({} total, {} tested)\n",
@@ -1517,7 +1677,7 @@ pub fn print_capabilities_table(
             format!("{:>6}", m.param_size)
         };
         let (conformance_str, think_str, ctx_win_str, safe_ctx_str, conf_str, date_str) =
-            match cache.get(&m.name) {
+            match cache.get(&cap_key(newt_core::Serving::Multiplexer, "", &m.name)) {
                 Some(e) => {
                     let ctx = e
                         .context_window
@@ -1619,6 +1779,13 @@ fn fmt_k(n: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a capability key the way a Multiplexer (Ollama) backend would, so
+    /// migrate/lookup tests can key by a bare model name through the ONE
+    /// canonical constructor (no raw-String keys — that is now a type error).
+    fn mk(name: &str) -> CapKey {
+        cap_key(newt_core::Serving::Multiplexer, "", name)
+    }
 
     #[test]
     fn looks_like_tool_call_json_native_object() {
@@ -2102,7 +2269,7 @@ mod tests {
     fn migrate_accounting_invalidates_poisoned_entry() {
         let mut cache = CapabilityCache::default();
         cache.insert(
-            "llama3.1:8b".into(),
+            mk("llama3.1:8b"),
             CapabilityEntry {
                 conformance: ToolConformance::Native,
                 tested_date: "2026-06-08".into(),
@@ -2123,7 +2290,7 @@ mod tests {
             migrate_accounting(&mut cache),
             "migration must report dirty"
         );
-        let e = &cache["llama3.1:8b"];
+        let e = &cache[&mk("llama3.1:8b")];
         assert_eq!(e.max_ok_input, None, "poisoned ratchet value dropped");
         assert_eq!(e.consecutive_ok, 0);
         assert_eq!(e.tune_confidence, TuneConfidence::None);
@@ -2150,9 +2317,9 @@ mod tests {
             tune_confidence: TuneConfidence::Medium,
             ..Default::default() // accounting_version = current
         };
-        cache.insert("hosted-model".into(), entry.clone());
+        cache.insert(mk("hosted-model"), entry.clone());
         assert!(!migrate_accounting(&mut cache), "nothing to migrate");
-        let e = &cache["hosted-model"];
+        let e = &cache[&mk("hosted-model")];
         assert_eq!(e.max_ok_input, Some(800_000));
         assert_eq!(e.consecutive_ok, 2);
         assert_eq!(e.tune_confidence, TuneConfidence::Medium);
@@ -2164,7 +2331,7 @@ mod tests {
     fn migrate_accounting_stamps_untuned_legacy_entry() {
         let mut cache = CapabilityCache::default();
         cache.insert(
-            "old-model".into(),
+            mk("old-model"),
             CapabilityEntry {
                 conformance: ToolConformance::TextMode,
                 tested_date: "2026-06-04".into(),
@@ -2173,8 +2340,14 @@ mod tests {
             },
         );
         assert!(migrate_accounting(&mut cache));
-        assert_eq!(cache["old-model"].accounting_version, ACCOUNTING_VERSION);
-        assert_eq!(cache["old-model"].conformance, ToolConformance::TextMode);
+        assert_eq!(
+            cache[&mk("old-model")].accounting_version,
+            ACCOUNTING_VERSION
+        );
+        assert_eq!(
+            cache[&mk("old-model")].conformance,
+            ToolConformance::TextMode
+        );
     }
 
     /// Running the migration twice must be a no-op the second time.
@@ -2184,7 +2357,7 @@ mod tests {
         let mut e = make_entry();
         e.max_ok_input = Some(25_602);
         e.accounting_version = 0;
-        cache.insert("m".into(), e);
+        cache.insert(mk("m"), e);
         assert!(migrate_accounting(&mut cache), "first pass migrates");
         let snapshot = serde_json::to_string(&cache).unwrap();
         assert!(!migrate_accounting(&mut cache), "second pass is a no-op");
@@ -2194,57 +2367,51 @@ mod tests {
     // --- resolve_memory_budget (Step 18.2, #247) ---
 
     /// Fixture capability cache with one tuned entry for "tuned-model".
-    fn fixture_cache(max_ok_input: Option<u32>, safe_context: Option<u32>) -> CapabilityCache {
-        let mut cache = CapabilityCache::default();
-        cache.insert(
-            "tuned-model".into(),
-            CapabilityEntry {
-                conformance: ToolConformance::Native,
-                tested_date: "2026-06-10".into(),
-                context_window: Some(32_768),
-                safe_context,
-                max_ok_input,
-                ..Default::default()
-            },
-        );
-        cache
+    fn fixture_entry(max_ok_input: Option<u32>, safe_context: Option<u32>) -> CapabilityEntry {
+        CapabilityEntry {
+            conformance: ToolConformance::Native,
+            tested_date: "2026-06-10".into(),
+            context_window: Some(32_768),
+            safe_context,
+            max_ok_input,
+            ..Default::default()
+        }
     }
 
     /// Tier 1: an explicit `[memory] context_tokens` is a deliberate user
     /// override — it wins even when capability data exists.
     #[test]
     fn resolve_memory_budget_explicit_config_wins() {
-        let cache = fixture_cache(Some(24_000), Some(26_214));
+        let entry = fixture_entry(Some(24_000), Some(26_214));
         assert_eq!(
-            resolve_memory_budget(Some(16_000), Some(1_000_000), &cache, "tuned-model"),
+            resolve_memory_budget(Some(16_000), Some(1_000_000), Some(&entry)),
             16_000
         );
     }
 
     #[test]
     fn resolve_memory_budget_uses_the_active_models_declared_window() {
-        let cache = fixture_cache(Some(24_000), None);
+        let entry = fixture_entry(Some(24_000), None);
         assert_eq!(
-            resolve_memory_budget(None, Some(1_000_000), &cache, "tuned-model"),
+            resolve_memory_budget(None, Some(1_000_000), Some(&entry)),
             1_000_000
         );
+        // A newly selected model with its own declared window and no capability
+        // entry yet: the declaration is the budget (the prior model's is gone).
         assert_eq!(
-            resolve_memory_budget(None, Some(131_072), &cache, "different-model"),
+            resolve_memory_budget(None, Some(131_072), None),
             131_072,
             "the selected model's declaration replaces the prior model's budget"
         );
     }
 
-    /// Tier 2a: without an override, the capability-derived budget is
-    /// `max(max_ok_input, safe_context)` (Phase 20 §2.1) — here the proven
-    /// figure exceeds the claim-derived one and wins.
+    /// Tier 3a: without an override or declaration, the capability-derived
+    /// budget is `max(max_ok_input, safe_context)` (Phase 20 §2.1) — here the
+    /// proven figure exceeds the claim-derived one and wins.
     #[test]
     fn resolve_memory_budget_capability_max_ok_input_second() {
-        let cache = fixture_cache(Some(24_000), Some(6_553));
-        assert_eq!(
-            resolve_memory_budget(None, None, &cache, "tuned-model"),
-            24_000
-        );
+        let entry = fixture_entry(Some(24_000), Some(6_553));
+        assert_eq!(resolve_memory_budget(None, None, Some(&entry)), 24_000);
     }
 
     /// Phase 20 §2.1: the high-water mark is a floor of proven-good, not a
@@ -2253,53 +2420,39 @@ mod tests {
     /// prompt merely seen so far (the motivating 6,068-vs-8,734 failure).
     #[test]
     fn resolve_memory_budget_max_keeps_safe_context_over_low_hwm() {
-        let cache = fixture_cache(Some(6_068), Some(26_214));
-        assert_eq!(
-            resolve_memory_budget(None, None, &cache, "tuned-model"),
-            26_214
-        );
+        let entry = fixture_entry(Some(6_068), Some(26_214));
+        assert_eq!(resolve_memory_budget(None, None, Some(&entry)), 26_214);
     }
 
-    /// Tier 2b: with no `max_ok_input` yet (e.g. freshly de-poisoned by the
+    /// Tier 3b: with no `max_ok_input` yet (e.g. freshly de-poisoned by the
     /// 18.1 migration), `safe_context` is the capability-derived budget.
     #[test]
     fn resolve_memory_budget_falls_back_to_safe_context() {
-        let cache = fixture_cache(None, Some(6_553));
-        assert_eq!(
-            resolve_memory_budget(None, None, &cache, "tuned-model"),
-            6_553
-        );
+        let entry = fixture_entry(None, Some(6_553));
+        assert_eq!(resolve_memory_budget(None, None, Some(&entry)), 6_553);
         // And the mirror: max_ok_input alone serves when safe_context is
         // absent (hosted endpoints discovered via cw-400 have no num_ctx).
-        let cache = fixture_cache(Some(24_000), None);
-        assert_eq!(
-            resolve_memory_budget(None, None, &cache, "tuned-model"),
-            24_000
-        );
+        let entry = fixture_entry(Some(24_000), None);
+        assert_eq!(resolve_memory_budget(None, None, Some(&entry)), 24_000);
     }
 
-    /// Tier 3: the static default applies ONLY when neither an override nor
-    /// any empirical tuning exists — unknown model, or an entry with no
-    /// tuning data. The declared `context_window` alone is a claim, not a
-    /// measurement, and must not become a budget.
+    /// Tier 4: the static default applies ONLY when no override, no declared
+    /// window, and no empirical tuning exists — a cache MISS (fresh model), or
+    /// an entry present but untuned. Cross-principal leakage is now impossible
+    /// by construction: the caller resolves the entry via `cap_key`, so this
+    /// function can never look up the wrong entry (see the cap_key keying
+    /// tests for the instance-isolation guarantee).
     #[test]
     fn resolve_memory_budget_static_default_last() {
-        // Model absent from the cache entirely (fresh model, never probed).
-        let empty = CapabilityCache::default();
+        // Cache miss (fresh model / unknown principal → the caller passes None).
         assert_eq!(
-            resolve_memory_budget(None, None, &empty, "fresh-model"),
+            resolve_memory_budget(None, None, None),
             newt_core::DEFAULT_CONTEXT_TOKENS
         );
-        // Entry exists (declared window known) but no empirical tuning.
-        let untuned = fixture_cache(None, None);
+        // Entry present (declared window known) but no empirical tuning.
+        let untuned = fixture_entry(None, None);
         assert_eq!(
-            resolve_memory_budget(None, None, &untuned, "tuned-model"),
-            newt_core::DEFAULT_CONTEXT_TOKENS
-        );
-        // Some OTHER model's tuning must not leak onto this one.
-        let cache = fixture_cache(Some(24_000), Some(26_214));
-        assert_eq!(
-            resolve_memory_budget(None, None, &cache, "different-model"),
+            resolve_memory_budget(None, None, Some(&untuned)),
             newt_core::DEFAULT_CONTEXT_TOKENS
         );
     }
@@ -2311,8 +2464,8 @@ mod tests {
     /// now `max(max_ok_input, safe_context)` = 26,214, not the HWM alone.)
     #[test]
     fn resolve_memory_budget_never_ignores_probe_data() {
-        let cache = fixture_cache(Some(24_000), Some(26_214));
-        let budget = resolve_memory_budget(None, None, &cache, "tuned-model");
+        let entry = fixture_entry(Some(24_000), Some(26_214));
+        let budget = resolve_memory_budget(None, None, Some(&entry));
         assert_ne!(
             budget,
             newt_core::DEFAULT_CONTEXT_TOKENS,
@@ -2704,11 +2857,11 @@ mod tests {
         ] {
             let mut e = make_entry();
             e.tune_confidence = conf;
-            cache.insert(name.to_string(), e);
+            cache.insert(mk(name), e);
         }
         // Tested entry with no ctx data (the `—` placeholders).
         cache.insert(
-            "m-noctx".to_string(),
+            mk("m-noctx"),
             CapabilityEntry {
                 conformance: ToolConformance::TextMode,
                 tested_date: "2026-06-06".to_string(),
@@ -2717,7 +2870,7 @@ mod tests {
         );
         // A reasoning model: emits_thinking → the ✓ in the Think column.
         cache.insert(
-            "m-think".to_string(),
+            mk("m-think"),
             CapabilityEntry {
                 conformance: ToolConformance::Native,
                 tested_date: "2026-06-10".to_string(),

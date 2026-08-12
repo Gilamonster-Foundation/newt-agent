@@ -55,7 +55,7 @@ pub(crate) fn dispatch(
                         print_newt(&format!("Models on {url}:"), color, verbose);
                         for name in &names {
                             let conformance_tag = cache
-                                .get(name)
+                                .get(&probe::cap_key(newt_core::Serving::Multiplexer, "", name))
                                 .map(|e| format!("  {}", e.conformance.symbol()))
                                 .unwrap_or_default();
                             if *name == current {
@@ -76,7 +76,16 @@ pub(crate) fn dispatch(
                                 println!("  {name}{conformance_tag}");
                             }
                         }
-                        let tested = names.iter().filter(|n| cache.contains_key(*n)).count();
+                        let tested = names
+                            .iter()
+                            .filter(|n| {
+                                cache.contains_key(&probe::cap_key(
+                                    newt_core::Serving::Multiplexer,
+                                    "",
+                                    n,
+                                ))
+                            })
+                            .count();
                         if tested < names.len() {
                             println!(
                                 "\n  {}/{} tested — /models capabilities for the full matrix",
@@ -194,7 +203,14 @@ pub(crate) fn dispatch(
                         // (estimate_ratio, emits_thinking, max_ok_input, tune_*)
                         // are preserved and the refreshed window / quirk / ratio
                         // that full_probe writes are kept too (§4.1, item 12).
-                        let mut entry = cache.remove(model.as_str()).unwrap_or_default();
+                        // `/probe` is Ollama-only (guarded above), i.e. a
+                        // Multiplexer, so the capability key is the bare model
+                        // name — but go through cap_key so the keying discipline
+                        // is never open-coded (a raw String key is now a type
+                        // error).
+                        let key =
+                            probe::cap_key(newt_core::Serving::Multiplexer, &choice.name, model);
+                        let mut entry = cache.remove(&key).unwrap_or_default();
                         let report = probe::full_probe(
                             endpoint,
                             model,
@@ -208,7 +224,7 @@ pub(crate) fn dispatch(
                                 .unwrap_or_default(),
                             choice.kind,
                         );
-                        cache.insert(model.clone(), entry);
+                        cache.insert(key, entry);
                         probe::save_cache(&cache);
 
                         // Rich report (§4.1): conformance symbol PLUS the window,
