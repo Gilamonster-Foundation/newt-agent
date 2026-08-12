@@ -893,6 +893,37 @@ pub trait LiveToolOutput: Send + Sync {
     fn abandon(&self, generation: u64);
 }
 
+/// Renderer-neutral, turn-scoped consumer for COMPLETED tool output spill view.
+///
+/// This is the Rich TUI's completed spill renderer — the interactive, scrollable
+/// viewport that replaces the static `spill_view_lines` output for completed
+/// tool results. Only the Rich TUI (feature `rich-tui` + `live-spill`) implements
+/// this; the Lean TUI and headless callers pass `None` and retain the static
+/// completion-only output from `display::spill_view_lines`.
+///
+/// Key differences from `LiveToolOutput`:
+/// - Not incremental — renders a complete, finished tool result
+/// - Interactive — supports scrolling, expanding/collapsing, editor-mode nav
+/// - Bounded — max 50% of screen height so a single spill can't flood a tmux
+/// - Delimited — visual boundaries (⎵/⎶/⎴) mark scrollable region extents
+pub trait CompletedSpillRenderer: Send + Sync {
+    /// Render a completed tool result as an interactive spill viewport.
+    ///
+    /// `output` is the complete (stdout+stderr) tool output. `width` is the
+    /// terminal column count. `max_height` is the maximum rows this viewport
+    /// may occupy (enforced at 50% of terminal height by the caller).
+    ///
+    /// Returns the number of physical rows painted, so the caller can position
+    /// subsequent output correctly.
+    fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize;
+
+    /// Check if this renderer is active (has a viewport on screen).
+    fn is_active(&self) -> bool;
+
+    /// Erase the completed spill viewport from the terminal.
+    fn erase(&self);
+}
+
 /// Everything one agentic turn needs, resolved once by the caller (the TUI
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
@@ -1209,6 +1240,11 @@ pub struct ChatCtx<'a> {
     /// because shell stdout/stderr drains may publish from worker threads.
     /// `None` is the mandatory headless/non-TTY path.
     pub live_tool_output: Option<std::sync::Arc<dyn LiveToolOutput>>,
+    /// Optional TTY-owned COMPLETED spill renderer for Rich TUI (#1640).
+    /// Only the Rich TUI (feature `rich-tui` + `live-spill`) implements this;
+    /// the Lean TUI and headless callers pass `None` and retain the static
+    /// completion-only output from `display::spill_view_lines`.
+    pub completed_spill_renderer: Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
     /// The injected embedded-git capability (PR4, #461). `Some` ⇒ the `git`
     /// tool is advertised and dispatches through it (`LocalGitTool` in
     /// `newt-git`, injected by the binary). `None` (every headless / eval
@@ -1623,6 +1659,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         write_ledger,
         cancel,
         live_tool_output,
+        completed_spill_renderer: _,
         git_tool,
         crew_runner,
         operating_mode_control,
@@ -3300,6 +3337,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
+                        completed_spill_renderer: None,
                     },
                     tool_offload,
                     prompt_disposition,
@@ -5239,6 +5277,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        completed_spill_renderer: _,
     } = ctx;
     // See the Ollama path: a non-Act turn is allowed bounded reads but never
     // execution-pressure nudges.
@@ -6512,6 +6551,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
+                        completed_spill_renderer: None,
                     },
                     tool_offload,
                     prompt_disposition,
@@ -7132,6 +7172,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        completed_spill_renderer: _,
     } = ctx;
     // See the Ollama path: a non-Act turn is allowed bounded reads but never
     // execution-pressure nudges. (Mirrors the OpenAI path.)
@@ -8355,6 +8396,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
+                        completed_spill_renderer: None,
                     },
                     tool_offload,
                     prompt_disposition,
@@ -8738,6 +8780,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        completed_spill_renderer: _,
     } = ctx;
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // #1528: headless callers may pass no session state — fall back to a local
@@ -9321,6 +9364,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
+                        completed_spill_renderer: None,
                     },
                     tool_offload,
                     prompt_disposition,
@@ -10925,6 +10969,7 @@ mod tool_round_cap_tests {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            completed_spill_renderer: None,
         }
     }
 
@@ -11201,6 +11246,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -11511,6 +11557,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -11611,6 +11658,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -13728,6 +13776,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             Some(&turn_prompt),
             Some(&prompt_source),
@@ -13840,6 +13889,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -13961,6 +14011,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -14094,6 +14145,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -14219,6 +14271,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -14386,6 +14439,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -14562,6 +14616,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                completed_spill_renderer: None,
             },
             &mut NoMcp,
         )
@@ -15477,6 +15532,7 @@ mod save_note_loop_tests {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            completed_spill_renderer: None,
         }
     }
 
@@ -15984,6 +16040,7 @@ mod compression_loop_tests {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            completed_spill_renderer: None,
         }
     }
 
@@ -17277,6 +17334,7 @@ mod observation_hook_tests {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            completed_spill_renderer: None,
         }
     }
 

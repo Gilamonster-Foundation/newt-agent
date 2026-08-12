@@ -21,6 +21,10 @@ pub(crate) enum Gutter {
     HiddenBelow(usize),
     Track,
     Thumb,
+    /// Completed spill viewport delimiters (Rich TUI only)
+    CompletedTop, // ⎵
+    CompletedBottom, // ⎶
+    CompletedTrack,  // ⎴
 }
 
 impl Gutter {
@@ -32,6 +36,9 @@ impl Gutter {
             Self::HiddenBelow(_) => '▼',
             Self::Track => '▒',
             Self::Thumb => '▓',
+            Self::CompletedTop => '⎵',
+            Self::CompletedBottom => '⎶',
+            Self::CompletedTrack => '⎴',
         }
     }
 }
@@ -497,6 +504,36 @@ impl SpillView {
         }
     }
 
+    /// Frame for completed tool output (Rich TUI interactive viewport).
+    /// Uses completed delimiters (⎵/⎶/⎴) and adds Ctrl hints.
+    pub(crate) fn completed_frame(&self) -> SpillFrame {
+        let retained_start = self.dropped_lines;
+        let retained_count = self.retained_line_count();
+        let end = retained_start + retained_count;
+        let start = self.effective_start();
+        let shown = end.saturating_sub(start).min(self.visible_rows);
+
+        let top_gutter = Gutter::CompletedTop;
+        let bottom_gutter = Gutter::CompletedBottom;
+        let content = (0..shown)
+            .map(|row| {
+                let line = self.line_at(start - retained_start + row);
+                rendered_row(Gutter::CompletedTrack, &line.display_text(), self.width)
+            })
+            .collect();
+
+        SpillFrame {
+            top: rendered_row(
+                top_gutter,
+                "Completed output · Ctrl-C to dismiss",
+                self.width,
+            ),
+            content,
+            bottom: rendered_row(bottom_gutter, "Ctrl-C dismiss · ↑↓ scroll", self.width),
+            dropped_lines: self.dropped_lines,
+        }
+    }
+
     fn apply_events(&mut self, events: Vec<DecodedEvent>) {
         for event in events {
             match event {
@@ -543,7 +580,7 @@ impl SpillView {
         }
     }
 
-    fn retained_line_count(&self) -> usize {
+    pub(crate) fn retained_line_count(&self) -> usize {
         self.lines.len() + usize::from(!self.current.is_empty() || self.current_truncated)
     }
 
@@ -650,7 +687,11 @@ pub(crate) fn display_width(text: &str) -> usize {
 fn char_width(ch: char) -> usize {
     if is_combining(ch) {
         0
-    } else if ch.is_ascii() || matches!(ch, '…' | '▲' | '▼' | '▒' | '▓' | '⧉' | '▣' | '\u{fffd}')
+    } else if ch.is_ascii()
+        || matches!(
+            ch,
+            '…' | '▲' | '▼' | '▒' | '▓' | '⧉' | '▣' | '⎵' | '⎶' | '⎴' | '\u{fffd}'
+        )
     {
         1
     } else {

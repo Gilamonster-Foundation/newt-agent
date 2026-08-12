@@ -567,6 +567,7 @@ async fn run_one_turn(
         tool_offload: false,
         spill_store: None,
         disclosure: Some(&session_disclosure),
+        completed_spill_renderer: None,
         compaction_store: None,
         scratchpad: false,
         scratchpad_store: None,
