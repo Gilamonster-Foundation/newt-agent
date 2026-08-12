@@ -777,13 +777,13 @@ fn runtime_context_block_exposes_model_harness_and_backend() {
 }
 
 #[test]
-fn yolo_runtime_authority_note_tracks_disable_ocap_env() {
-    with_env_vars(&[], &["NEWT_DISABLE_OCAP"], || {
-        assert!(yolo_runtime_authority_note().is_none());
+fn runtime_authority_note_tracks_both_authority_switches() {
+    with_env_vars(&[], &["NEWT_DISABLE_OCAP", "NEWT_FULL_ACCESS"], || {
+        assert!(runtime_authority_note().is_none());
     });
 
-    with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &[], || {
-        let note = yolo_runtime_authority_note().expect("yolo note");
+    with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &["NEWT_FULL_ACCESS"], || {
+        let note = runtime_authority_note().expect("yolo note");
         assert!(note.contains("--disable-ocap/--yolo is active"), "{note}");
         assert!(
             note.contains("run_command uses the unconfined host shell"),
@@ -796,12 +796,43 @@ fn yolo_runtime_authority_note_tracks_disable_ocap_env() {
         assert!(note.contains("web_fetch remains net-leashed"), "{note}");
         assert!(!note.contains("web_fetch uses the unconfined"), "{note}");
     });
+
+    with_env_vars(&[("NEWT_FULL_ACCESS", "1")], &["NEWT_DISABLE_OCAP"], || {
+        let note = runtime_authority_note().expect("full-access note");
+        assert!(note.contains("--full-access is active"), "{note}");
+        assert!(note.contains("unrestricted exec authority"), "{note}");
+        assert!(note.contains("first calling run_command"), "{note}");
+    });
+
+    with_env_vars(
+        &[("NEWT_DISABLE_OCAP", "1"), ("NEWT_FULL_ACCESS", "1")],
+        &[],
+        || {
+            let note = runtime_authority_note().expect("combined authority note");
+            assert!(
+                note.contains("--disable-ocap/--yolo AND --full-access are active"),
+                "{note}"
+            );
+            assert!(
+                note.contains("configured [tui.permissions] preset and its exec floor are lifted"),
+                "{note}"
+            );
+            assert!(
+                note.contains("may still attenuate that session baseline"),
+                "{note}"
+            );
+            assert!(
+                note.contains("grounding the claim in its returned tool result"),
+                "{note}"
+            );
+        },
+    );
 }
 
 #[test]
 fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
     let id = newt_core::AgentIdentity::default();
-    with_env_vars(&[], &["NEWT_DISABLE_OCAP"], || {
+    with_env_vars(&[], &["NEWT_DISABLE_OCAP", "NEWT_FULL_ACCESS"], || {
         let block =
             runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama, &id);
         assert!(
@@ -810,7 +841,7 @@ fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
         );
     });
 
-    with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &[], || {
+    with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &["NEWT_FULL_ACCESS"], || {
         let block =
             runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama, &id);
         assert!(block.contains("# Runtime authority"), "{block}");
@@ -824,6 +855,26 @@ fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
             "{block}"
         );
     });
+
+    with_env_vars(
+        &[("NEWT_DISABLE_OCAP", "1"), ("NEWT_FULL_ACCESS", "1")],
+        &[],
+        || {
+            let block =
+                runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama, &id);
+            assert!(block.contains("# Runtime authority"), "{block}");
+            assert!(block.contains("run_command is available"), "{block}");
+            assert!(
+                block.contains("configured [tui.permissions] preset and its exec floor are lifted"),
+                "{block}"
+            );
+            assert!(block.contains("# Filesystem authority"), "{block}");
+            assert!(
+                !block.contains("You are confined to the workspace"),
+                "full-access context must not contradict itself: {block}"
+            );
+        },
+    );
 }
 
 #[test]

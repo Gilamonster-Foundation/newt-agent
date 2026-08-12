@@ -892,14 +892,56 @@ fn coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> String 
     format!("Co-authored-by: {model} <{}>", identity.email)
 }
 
-fn yolo_runtime_authority_note() -> Option<&'static str> {
-    newt_core::agentic::ocap_disabled().then_some(
-        "Runtime authority: --disable-ocap/--yolo is active. run_command uses the \
-         unconfined host shell when the active exec floor permits it, not the \
-         brush/agent-bridle confined shell. Do not claim run_command is unavailable \
-         due to brush in this mode. Native fs tools remain workspace-fenced; \
-         web_fetch remains net-leashed.",
-    )
+fn runtime_authority_note() -> Option<&'static str> {
+    match (
+        newt_core::agentic::ocap_disabled(),
+        newt_core::agentic::full_access_requested(),
+    ) {
+        (true, true) => Some(
+            "Runtime authority: --disable-ocap/--yolo AND --full-access are active. \
+             run_command is available with unrestricted exec authority and uses the \
+             unconfined host shell; the configured [tui.permissions] preset and its \
+             exec floor are lifted. A posture, persona, or operating mode may still \
+             attenuate that session baseline. \
+             Do not claim a capability wall without first calling run_command and \
+             grounding the claim in its returned tool result. Native fs tools are \
+             unrestricted; web_fetch has unrestricted configured net authority.",
+        ),
+        (true, false) => Some(
+            "Runtime authority: --disable-ocap/--yolo is active. run_command uses the \
+             unconfined host shell when the active exec floor permits it, not the \
+             brush/agent-bridle confined shell. Do not claim run_command is unavailable \
+             due to brush in this mode. Native fs tools remain workspace-fenced; \
+             web_fetch remains net-leashed.",
+        ),
+        (false, true) => Some(
+            "Runtime authority: --full-access is active. run_command is available with \
+             unrestricted exec authority; the configured permission preset and exec \
+             floor are lifted for this invocation, though a posture, persona, or \
+             operating mode may still attenuate that session baseline. Do not claim a capability wall \
+             without first calling run_command and grounding the claim in its returned \
+             tool result. Native fs tools and configured net authority are unrestricted.",
+        ),
+        (false, false) => None,
+    }
+}
+
+fn filesystem_authority_note() -> &'static str {
+    if newt_core::agentic::full_access_requested() {
+        "# Filesystem authority\n\
+         The full-access session baseline permits reads and writes outside the \
+         workspace. A posture, persona, or operating mode may still attenuate it. \
+         Treat an actual fs_read/fs_write tool denial as authoritative; do not \
+         infer confinement without a returned tool result.\n"
+    } else {
+        "# Filesystem confinement\n\
+         You are confined to the workspace (the current directory) plus any paths \
+         the operator explicitly opened. A read or write outside that returns \
+         `capability denied: fs_read/fs_write does not permit '<path>'`. Do NOT \
+         retry a denied path or try to work around it — instead tell the operator \
+         it's outside your workspace and that they can relaunch with \
+         `--read <path>` (read-only) or `--write <path>` (read+write) to grant it.\n"
+    }
 }
 
 fn runtime_context_block(
@@ -918,9 +960,10 @@ fn runtime_context_block(
     };
     let author_email = identity.email.as_str();
     let author_name = identity.name.as_str();
-    let runtime_authority = yolo_runtime_authority_note()
+    let runtime_authority = runtime_authority_note()
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
+    let filesystem_authority = filesystem_authority_note();
     format!(
         "# Environment (refreshed every turn)\n\
          Harness: newt-agent v{VERSION}\n\
@@ -944,13 +987,7 @@ fn runtime_context_block(
          (the author name may be `{author_name}` or this model's name, but the \
          email must always be `{author_email}`). Never commit with a guessed or \
          personal email.\n\
-         # Filesystem confinement\n\
-         You are confined to the workspace (the current directory) plus any paths \
-         the operator explicitly opened. A read or write outside that returns \
-         `capability denied: fs_read/fs_write does not permit '<path>'`. Do NOT \
-         retry a denied path or try to work around it — instead tell the operator \
-         it's outside your workspace and that they can relaunch with \
-         `--read <path>` (read-only) or `--write <path>` (read+write) to grant it.\n"
+         {filesystem_authority}"
     )
 }
 

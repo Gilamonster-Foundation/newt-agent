@@ -1845,6 +1845,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // without proving it, force one read-only ground-truth check round instead
     // of letting it hand the stale-context claim back to the human.
     let mut stale_file_nudges: usize = 0;
+    let mut unverified_exec_blocker_nudges: usize = 0;
+    let mut run_command_denial_observed = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: action-pressure nudges (narration rescue, workflow repair
     // steering, pending-plan pushes) fire ONLY when the user's turn actually
@@ -2571,6 +2573,35 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             .flatten();
                         let plan_nudge_hint =
                             combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+                        if should_ground_unverified_run_command_blocker(
+                            content,
+                            &tools,
+                            run_command_denial_observed,
+                            action_turn,
+                            unverified_exec_blocker_nudges,
+                            round + 1 < current_tool_round_limit,
+                        ) {
+                            if debug {
+                                print_debug(
+                                    "unsupported run_command blocker — requiring a ground-truth probe",
+                                    color,
+                                );
+                            }
+                            messages.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": content
+                            }));
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": format!(
+                                    "{} {}",
+                                    compress::LOOP_GUIDANCE_PREFIX,
+                                    run_command_ground_truth_nudge()
+                                )
+                            }));
+                            unverified_exec_blocker_nudges += 1;
+                            continue 'round_loop;
+                        }
                         if action_nudges && round + 1 < current_tool_round_limit {
                             if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                                 Some(&nudge_classification),
@@ -3333,6 +3364,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember outcomes that should make
             // an exact repeat self-correct next round.
             let ok = tools::tool_result_ok(&result);
+            run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
@@ -4195,6 +4227,131 @@ const SUSPICIOUS_EMPTY_RETRY_CAP: u32 = 2;
 /// per turn. Kept separate from narration nudges: this is a blocker-specific
 /// ground-truth check, not generic intent-to-act recovery.
 const STALE_FILE_NUDGE_CAP: usize = 1;
+const UNVERIFIED_EXEC_BLOCKER_NUDGE_CAP: usize = 1;
+
+/// A model must not turn an assumption about `run_command` into a reported
+/// capability wall. This detector is deliberately narrow: it requires the
+/// concrete tool name plus denial/blocker language seen in live transcripts.
+fn looks_like_unverified_run_command_blocker(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("run_command")
+        && [
+            "permission-denied",
+            "permission denied",
+            "exec not granted",
+            "capability wall",
+            "run_command is unavailable",
+            "run_command unavailable",
+            "can't run",
+            "cannot run",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn run_command_is_advertised(tools: &serde_json::Value) -> bool {
+    tools.as_array().is_some_and(|defs| {
+        defs.iter().any(|def| {
+            def.pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("run_command")
+                || (def.get("name").and_then(serde_json::Value::as_str) == Some("run_command"))
+        })
+    })
+}
+
+fn run_command_result_is_denial(tool_name: &str, ok: bool, result: &str) -> bool {
+    if tool_name != "run_command" || ok {
+        return false;
+    }
+    let lower = result.to_ascii_lowercase();
+    [
+        "permission denied",
+        "permission-denied",
+        "not within the granted authority",
+        "does not permit",
+        "capability denied",
+        "exec not granted",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn run_command_ground_truth_nudge() -> &'static str {
+    "Your capability-wall claim is unsupported: no returned run_command result \
+     this turn contains an exec denial. If you have not probed the relevant \
+     command, call run_command now and inspect its returned result. If a probe \
+     succeeded, ground the answer in that success. Report a denial only when an \
+     actual returned result contains one; otherwise continue the task."
+}
+
+fn should_ground_unverified_run_command_blocker(
+    content: &str,
+    tools: &serde_json::Value,
+    denial_observed: bool,
+    action_nudges: bool,
+    nudges_used: usize,
+    has_next_round: bool,
+) -> bool {
+    action_nudges
+        && nudges_used < UNVERIFIED_EXEC_BLOCKER_NUDGE_CAP
+        && has_next_round
+        && run_command_is_advertised(tools)
+        && !denial_observed
+        && looks_like_unverified_run_command_blocker(content)
+}
+
+#[cfg(test)]
+mod exec_grounding_tests {
+    use super::*;
+
+    #[test]
+    fn blocker_detector_requires_tool_name_and_denial_language() {
+        assert!(looks_like_unverified_run_command_blocker(
+            "I hit a capability wall: run_command is permission-denied (exec not granted)."
+        ));
+        assert!(!looks_like_unverified_run_command_blocker(
+            "The build is blocked, but I have not tested the shell yet."
+        ));
+        assert!(!looks_like_unverified_run_command_blocker(
+            "run_command completed successfully."
+        ));
+    }
+
+    #[test]
+    fn only_an_actual_denial_result_grounds_a_denial_claim() {
+        assert!(run_command_result_is_denial(
+            "run_command",
+            false,
+            "error: exec of cargo is not within the granted authority"
+        ));
+        assert!(!run_command_result_is_denial(
+            "run_command",
+            true,
+            "command completed successfully"
+        ));
+        assert!(!run_command_result_is_denial(
+            "read_file",
+            false,
+            "capability denied"
+        ));
+    }
+
+    #[test]
+    fn grounding_requires_advertisement_no_attempt_and_a_spare_round() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "run_command"}
+        }]);
+        let claim = "run_command is permission denied; I cannot run the build";
+        assert!(should_ground_unverified_run_command_blocker(
+            claim, &tools, false, true, 0, true
+        ));
+        assert!(!should_ground_unverified_run_command_blocker(
+            claim, &tools, false, true, 0, false
+        ));
+    }
+}
 /// Recent-progress horizon used to decide whether a configured workflow grace
 /// window should activate at the normal round cap.
 const WORKFLOW_RECENT_PROGRESS_ROUNDS: usize = 3;
@@ -5432,6 +5589,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut pending_plan_nudges: usize = 0;
     // Unverified stale-file blocker rescue counter (mirror of the Ollama path).
     let mut stale_file_nudges: usize = 0;
+    let mut unverified_exec_blocker_nudges: usize = 0;
+    let mut run_command_denial_observed = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: same intent gate as the primary loop — see the comment there.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
@@ -6131,6 +6290,32 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
             let plan_nudge_hint =
                 combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+            if should_ground_unverified_run_command_blocker(
+                &content,
+                &tools,
+                run_command_denial_observed,
+                action_turn,
+                unverified_exec_blocker_nudges,
+                round + 1 < current_tool_round_limit,
+            ) {
+                if debug {
+                    print_debug(
+                        "unsupported run_command blocker — requiring a ground-truth probe",
+                        color,
+                    );
+                }
+                messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "{} {}",
+                        compress::LOOP_GUIDANCE_PREFIX,
+                        run_command_ground_truth_nudge()
+                    )
+                }));
+                unverified_exec_blocker_nudges += 1;
+                continue 'round_loop;
+            }
             if !content.is_empty() && round + 1 < current_tool_round_limit && action_turn {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     nudge_classification.as_ref(),
@@ -6552,6 +6737,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
+            run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
@@ -7357,6 +7543,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut pending_plan_nudges: usize = 0;
     // Unverified stale-file blocker rescue counter (mirrors the OpenAI path).
     let mut stale_file_nudges: usize = 0;
+    let mut unverified_exec_blocker_nudges: usize = 0;
+    let mut run_command_denial_observed = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: same intent gate as the primary loop.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
@@ -8008,6 +8196,32 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
             let plan_nudge_hint =
                 combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+            if should_ground_unverified_run_command_blocker(
+                &content,
+                &tools,
+                run_command_denial_observed,
+                action_turn,
+                unverified_exec_blocker_nudges,
+                round + 1 < current_tool_round_limit,
+            ) {
+                if debug {
+                    print_debug(
+                        "unsupported run_command blocker — requiring a ground-truth probe",
+                        color,
+                    );
+                }
+                messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "{} {}",
+                        compress::LOOP_GUIDANCE_PREFIX,
+                        run_command_ground_truth_nudge()
+                    )
+                }));
+                unverified_exec_blocker_nudges += 1;
+                continue 'round_loop;
+            }
             if !content.is_empty() && round + 1 < current_tool_round_limit && action_turn {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     nudge_classification.as_ref(),
@@ -8395,6 +8609,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             }
             // 17.6 + 27.3 — mirrors the OpenAI path.
             let ok = tools::tool_result_ok(&result);
+            run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
@@ -8713,7 +8928,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         max_tool_rounds,
         workflow_grace_rounds: _,
         narration_nudge_cap: _,
-        action_nudges: _,
+        action_nudges,
         prompt_disposition,
         prompt_intake,
         tool_output_lines,
@@ -8817,6 +9032,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     } else {
         prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
     }
+    let action_turn = action_nudges
+        && prompt_disposition == PromptDisposition::Act
+        && crate::classifiers::user_turn_invites_action(prompt_context.active_text());
     let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
         mcp,
@@ -8914,6 +9132,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut repeat_calls = RepeatCallGuard::default();
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
+    let mut unverified_exec_blocker_nudges: usize = 0;
+    let mut run_command_denial_observed = false;
 
     let reasoning = responses_reasoning_field(cognition);
     let build_body = |input: &[serde_json::Value], with_tools: bool| {
@@ -9165,6 +9385,32 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
 
         if calls.is_empty() {
+            if should_ground_unverified_run_command_blocker(
+                &text,
+                &tools_chat,
+                run_command_denial_observed,
+                action_turn && tools_supported,
+                unverified_exec_blocker_nudges,
+                round + 1 < max_tool_rounds,
+            ) {
+                if debug {
+                    print_debug(
+                        "unsupported run_command blocker — requiring a ground-truth probe",
+                        color,
+                    );
+                }
+                input.push(serde_json::json!({ "role": "assistant", "content": text }));
+                input.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "{} {}",
+                        compress::LOOP_GUIDANCE_PREFIX,
+                        run_command_ground_truth_nudge()
+                    )
+                }));
+                unverified_exec_blocker_nudges += 1;
+                continue;
+            }
             // The decoder guarantees affirmative output here (text or calls); with
             // no calls, `text` is non-empty — return it as the turn's answer.
             return Ok((text, false, accumulated_usage, hallucination_count));
@@ -9362,6 +9608,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
+            run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             repeat_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
