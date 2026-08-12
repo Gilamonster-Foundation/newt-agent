@@ -445,6 +445,36 @@ fn preflight_irreducible_request(
 /// the schemas currently advertised on that request no longer fit an
 /// authoritative budget. Count trimming alone is not a token bound: one fresh
 /// tool or prompt-read result can be larger than the entire window.
+fn full_message_request_real_tokens(
+    messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+) -> usize {
+    calibrate_up(
+        estimate_request_tokens(messages, tools, estimation),
+        calibration,
+    )
+}
+
+/// Compression must fire whenever either the backend-anchored observation or
+/// the authoritative whole-request estimate crosses a budget. Otherwise the
+/// trigger can say "fits" immediately before preflight refuses the same wire.
+fn full_message_request_pressure_tokens(
+    tracked_tokens: usize,
+    wire_messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+) -> usize {
+    tracked_tokens.max(full_message_request_real_tokens(
+        wire_messages,
+        tools,
+        calibration,
+        estimation,
+    ))
+}
+
 fn preflight_full_message_request(
     messages: &[serde_json::Value],
     tools: Option<&serde_json::Value>,
@@ -456,10 +486,7 @@ fn preflight_full_message_request(
     let Some(budget) = authoritative_budget else {
         return Ok(());
     };
-    let required = calibrate_up(
-        estimate_request_tokens(messages, tools, estimation),
-        calibration,
-    );
+    let required = full_message_request_real_tokens(messages, tools, calibration, estimation);
     if required > budget {
         anyhow::bail!(
             "the complete inference request needs ~{required} input tokens, which cannot fit \
@@ -1987,7 +2014,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // Phase 20 §2.3: `current` is calibrated into real-token space —
             // the same currency as the (backend-derived) send budget and the
             // configured token threshold it is compared against.
-            let current = prompt_tracker.current(&messages, Some(&tools), cal, estimation);
+            let advertised_tools = tools_supported.then_some(&tools);
+            let current = full_message_request_pressure_tokens(
+                prompt_tracker.current(&messages, advertised_tools, cal, estimation),
+                &messages,
+                advertised_tools,
+                cal,
+                estimation,
+            );
             // The count-only budget is priced in message-token space — the
             // same chars/4 currency the pipeline compares its budget against
             // (F1); `current` (schema/template-inclusive) still drives the
@@ -5686,7 +5720,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         {
             // Phase 20 §2.3: calibrated `current` (real-token space) —
             // mirrors the Ollama path.
-            let current = prompt_tracker.current(&messages, Some(&tools), cal, estimation);
+            let advertised_tools = tools_supported.then_some(&tools);
+            let wire_messages = openai_chat_wire_messages(&messages)?;
+            let current = full_message_request_pressure_tokens(
+                prompt_tracker.current(&messages, advertised_tools, cal, estimation),
+                &wire_messages,
+                advertised_tools,
+                cal,
+                estimation,
+            );
             // Count-only budget priced in message-token space (F1) — mirrors
             // the Ollama path.
             let message_tokens = estimate_tokens(&messages, estimation);
@@ -7631,7 +7673,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // the shared prune → boundary → redacted summary → marker pipeline
         // serves the mid-loop trigger and the pre-send budget guard.
         {
-            let current = prompt_tracker.current(&messages, Some(&tools), cal, estimation);
+            let advertised_tools = tools_supported.then_some(&tools);
+            let (_, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
+            let current = full_message_request_pressure_tokens(
+                prompt_tracker.current(&messages, advertised_tools, cal, estimation),
+                &wire_messages,
+                advertised_tools,
+                cal,
+                estimation,
+            );
             let message_tokens = estimate_tokens(&messages, estimation);
             let has_authoritative_headroom = count_guard_has_headroom(
                 current,
@@ -17350,6 +17400,99 @@ mod compression_loop_tests {
             "#285 e2e trace: reclaimed dispatch ~{tokens} est. tokens \
              (full-request ceiling {input_ceiling}, num_ctx {num_ctx}), \
              a/b one-lined, c intact"
+        );
+    }
+
+    /// A backend-reported prompt count can be lower than Newt's calibrated
+    /// whole-request estimate. The tracker anchors the next round on that real
+    /// count, but the authoritative preflight prices the complete request from
+    /// scratch. Before this regression, that disagreement could skip the
+    /// compression trigger and then fail at preflight even though older history
+    /// was reclaimable. The loop must compact and dispatch the healed request.
+    struct UnderreportedAnchorResponder {
+        log: Arc<Mutex<Vec<(bool, usize)>>>,
+    }
+
+    impl Respond for UnderreportedAnchorResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            let has_marker = messages_contain(&body, SUMMARY_PREFIX);
+            if !body["stream"].as_bool().unwrap_or(false) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push((has_marker, body_request_tokens(&body)));
+            }
+            if has_marker {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "recovered after exact-request compaction" },
+                    "prompt_eval_count": 100,
+                    "eval_count": 5
+                }));
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": "", "tool_calls": [{
+                    "function": { "name": "read_file", "arguments": { "path": "big.txt" } }
+                }]},
+                // Deliberately below Newt's full-request estimate. This grounds
+                // the production seam: the anchor and preflight currencies are
+                // both valid observations, but only the latter controls dispatch.
+                "prompt_eval_count": 1,
+                "eval_count": 1
+            }))
+        }
+    }
+
+    /// The real temp-file read grounds the mocked backend call: the healed
+    /// request contains actual `read_file` output, not a hand-built tool result.
+    #[tokio::test]
+    async fn exact_request_pressure_self_compacts_after_tracker_underreport() {
+        let server = MockServer::start().await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(UnderreportedAnchorResponder { log: log.clone() })
+            .mount(&server)
+            .await;
+
+        let ws = gauntlet_workspace();
+        let workspace = ws.path().to_string_lossy().to_string();
+        // A large OLD assistant turn is reclaimable; the active task and fresh
+        // read_file result remain protected. The initial request fits by one
+        // token, while the follow-up requires compaction.
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("summarize this old investigation later"),
+            MemMessage::assistant("old reclaimable evidence\n".repeat(600)),
+            MemMessage::user(TASK),
+        ];
+        let budget = initial_request_budget(&messages, TASK);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = canned_summarizer(prompts.clone());
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        c.mid_loop_trim_tokens = Some(budget);
+        c.summarizer = Some(&*summarizer);
+        c.compress_state = Some(&mut compress_state);
+
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("exact-request pressure should compact and retry quietly");
+
+        assert_eq!(reply, "recovered after exact-request compaction");
+        assert!(
+            !prompts.lock().unwrap().is_empty(),
+            "self-healing must run the real compression pipeline"
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log.first().map(|entry| entry.0), Some(false));
+        assert!(
+            log.iter()
+                .skip(1)
+                .any(|(marker, tokens)| *marker && *tokens <= budget),
+            "a compacted request must be dispatched within the authoritative budget: {log:?}"
         );
     }
 
