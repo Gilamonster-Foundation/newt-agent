@@ -291,6 +291,16 @@ pub fn approve_dock(
     if peer_agent_fingerprint.is_empty() {
         anyhow::bail!("a peer agent fingerprint is required");
     }
+    // Reject a decoupled approval at the source: the fingerprint the dock is
+    // keyed under must be the pubkey's own BLAKE3. Without this, a mis-wired
+    // caller could sign fingerprint(B)+pubkey(C); verify_record would later drop
+    // it, but bailing here makes the inconsistent record unrepresentable rather
+    // than silently unusable.
+    if !fingerprint_binds_pubkey(peer_agent_fingerprint, peer_pubkey) {
+        anyhow::bail!(
+            "peer fingerprint {peer_agent_fingerprint} is not BLAKE3(pubkey) — refusing to sign a decoupled approval"
+        );
+    }
     let issuer = root_key.public().fingerprint().hex();
     let dir = docks_dir(config_path);
     std::fs::create_dir_all(&dir)?;
@@ -430,6 +440,36 @@ pub fn agent_fingerprint_of_pubkey(pubkey: &[u8; 32]) -> String {
     Fingerprint::of_bytes(pubkey).hex()
 }
 
+/// Decode a mesh agent public key from exactly 64 lowercase/uppercase hex chars
+/// into its 32 bytes. The one decoder the registry, the CLI, and the web gate
+/// share so "an agent pubkey" is validated the same way everywhere (no third
+/// open-coded loop). Returns `None` on any malformed input — wrong length, or a
+/// non-hex nibble — so callers fail closed.
+#[must_use]
+pub fn decode_agent_pubkey(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Whether `fingerprint` is genuinely `BLAKE3(pubkey)` for a canonically-decoded
+/// pubkey. This is the binding the docs always claimed but never enforced: a
+/// signed record must not be able to pair fingerprint(B) with pubkey(C). Fails
+/// closed on malformed pubkey hex.
+#[must_use]
+fn fingerprint_binds_pubkey(fingerprint: &str, pubkey_hex: &str) -> bool {
+    match decode_agent_pubkey(pubkey_hex) {
+        Some(bytes) => agent_fingerprint_of_pubkey(&bytes) == fingerprint,
+        None => false,
+    }
+}
+
 /// The RP-id slot for a dock ceremony transcript — the analogue of a passkey
 /// relying party, naming the ceremony so a dock transcript can never collide
 /// with an enrollment one.
@@ -507,6 +547,13 @@ fn verify_record(
     if !issuer_matches(issuer, root) {
         return Err(());
     }
+    // The fingerprint MUST be the pubkey's own BLAKE3 — otherwise a validly
+    // signed record could authorize a dial to pubkey(C) while carrying
+    // fingerprint(B). Both load_docks and approved() funnel through here, so this
+    // one check closes the binding at load AND at dial time, fail-closed.
+    if !fingerprint_binds_pubkey(&record.peer_agent_fingerprint, &record.peer_pubkey) {
+        return Err(());
+    }
     let Some(signature) = record.sig.as_ref() else {
         return Err(());
     };
@@ -534,11 +581,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A pubkey whose every byte is `seed`, as 64 hex chars.
+    fn pk_hex(seed: u8) -> String {
+        format!("{seed:02x}").repeat(32)
+    }
+    /// The genuine mesh fingerprint of `pk_hex(seed)` — a real BLAKE3(pubkey)
+    /// pair, so the record satisfies the binding the registry now enforces.
+    fn fp(seed: u8) -> String {
+        agent_fingerprint_of_pubkey(&[seed; 32])
+    }
+
     fn record() -> DockRecord {
         DockRecord {
-            peer_agent_fingerprint: "aabbccdd".into(),
+            peer_agent_fingerprint: fp(0),
             peer_label: "laptop-b".into(),
-            peer_pubkey: "00".repeat(32),
+            peer_pubkey: pk_hex(0),
             scope: "mirror-inject".into(),
             issued_generation: 0,
             transcript_id: "tx-1".into(),
@@ -571,7 +628,7 @@ mod tests {
             load_docks(&dir.path().join("config.toml"), Some(&root.public()));
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(registry.len(), 1);
-        assert!(registry.approved("aabbccdd").is_some());
+        assert!(registry.approved(&fp(0)).is_some());
         assert!(registry.approved("unknown").is_none());
     }
 
@@ -605,22 +662,22 @@ mod tests {
         let config = dir.path().join("config.toml");
         approve_dock(
             &config,
-            "aabbccdd",
+            &fp(0),
             "laptop-b",
-            &"00".repeat(32),
+            &pk_hex(0),
             "mirror-inject",
             "tx-1",
             &root,
         )
         .unwrap();
         let (registry, _) = load_docks(&config, Some(&root.public()));
-        assert!(registry.approved("aabbccdd").is_some());
+        assert!(registry.approved(&fp(0)).is_some());
 
-        let full = revoke_dock(&config, "aabb", &root).unwrap();
-        assert_eq!(full, "aabbccdd");
+        let full = revoke_dock(&config, &fp(0)[..8], &root).unwrap();
+        assert_eq!(full, fp(0));
         let (registry, _) = load_docks(&config, Some(&root.public()));
         assert!(
-            registry.approved("aabbccdd").is_none(),
+            registry.approved(&fp(0)).is_none(),
             "a revoked dock must never resolve"
         );
         // A revoked row is not `live`, so the overview and the kill-switch agree.
@@ -636,9 +693,9 @@ mod tests {
         root.save(&identity).unwrap();
         approve_dock(
             &config,
-            "aabbccdd",
+            &fp(0),
             "laptop-b",
-            &"00".repeat(32),
+            &pk_hex(0),
             "mirror-inject",
             "tx-1",
             &root,
@@ -646,11 +703,11 @@ mod tests {
         .unwrap();
         let (registry, warnings) = load_docks_with_identity(&config, &identity);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        assert!(registry.approved("aabbccdd").is_some());
+        assert!(registry.approved(&fp(0)).is_some());
 
         // A missing key fails closed — nothing is approved.
         let (empty, warnings) = load_docks_with_identity(&config, &dir.path().join("nope.pem"));
-        assert!(empty.approved("aabbccdd").is_none());
+        assert!(empty.approved(&fp(0)).is_none());
         assert!(!warnings.is_empty());
     }
 
@@ -661,9 +718,9 @@ mod tests {
         let config = dir.path().join("config.toml");
         approve_dock(
             &config,
-            "aabbccdd",
+            &fp(0),
             "laptop-b",
-            &"00".repeat(32),
+            &pk_hex(0),
             "mirror-inject",
             "tx-1",
             &root,
@@ -671,9 +728,9 @@ mod tests {
         .unwrap();
         approve_dock(
             &config,
-            "aabbccdd",
+            &fp(0),
             "laptop-b-renamed",
-            &"00".repeat(32),
+            &pk_hex(0),
             "mirror-inject",
             "tx-2",
             &root,
@@ -681,7 +738,7 @@ mod tests {
         .unwrap();
         let (registry, _) = load_docks(&config, Some(&root.public()));
         assert_eq!(registry.len(), 1, "re-approval replaces, never duplicates");
-        let dock = registry.approved("aabbccdd").unwrap();
+        let dock = registry.approved(&fp(0)).unwrap();
         assert_eq!(dock.peer_label, "laptop-b-renamed");
         assert_eq!(dock.issued_generation, 1);
     }
@@ -693,9 +750,9 @@ mod tests {
         let config = dir.path().join("config.toml");
         approve_dock(
             &config,
-            "aaaa",
+            &fp(0),
             "a",
-            &"00".repeat(32),
+            &pk_hex(0),
             "mirror-inject",
             "tx-a",
             &root,
@@ -703,9 +760,9 @@ mod tests {
         .unwrap();
         approve_dock(
             &config,
-            "bbbb",
+            &fp(1),
             "b",
-            &"11".repeat(32),
+            &pk_hex(1),
             "mirror-inject",
             "tx-b",
             &root,
@@ -738,7 +795,7 @@ mod tests {
         tampered.docks[0].scope.push('!');
         std::fs::write(&path, toml::to_string(&tampered).unwrap()).unwrap();
         assert!(
-            registry.approved("aabbccdd").is_none(),
+            registry.approved(&fp(0)).is_none(),
             "a row edited after load must not resolve"
         );
     }
@@ -770,5 +827,87 @@ mod tests {
         // A fresh nonce → fresh words even for the same peer (per-ceremony).
         let rerun = dock_ceremony("issuer-fp", "laptop-b", &pubkey, b"nonce-2", b"blind-1");
         assert_ne!(a.sas_words, rerun.sas_words);
+    }
+
+    #[test]
+    fn a_record_binding_one_fingerprint_to_another_pubkey_is_refused_and_dropped() {
+        let root = UserKey::generate();
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+
+        // The write path refuses to SIGN a decoupled approval: fingerprint(B)
+        // with pubkey(C).
+        let err = approve_dock(
+            &config,
+            &fp(1), // fingerprint of key B
+            "impostor",
+            &pk_hex(2), // pubkey of key C
+            "mirror-inject",
+            "tx-x",
+            &root,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not BLAKE3(pubkey)"));
+
+        // And even a validly-SIGNED decoupled record is dropped at load: an
+        // attacker who can sign cannot smuggle fp(B)+pubkey(C) past verify_record.
+        let issuer = root.fingerprint().hex();
+        let decoupled = DockRecord {
+            peer_agent_fingerprint: fp(1),
+            peer_pubkey: pk_hex(2),
+            ..record()
+        };
+        let dir2 = TempDir::new().unwrap();
+        write_bundle(
+            &dir2,
+            &DockBundle {
+                issuer: issuer.clone(),
+                subject: SUBJECT.into(),
+                docks: vec![sign_record(&issuer, SUBJECT, decoupled, &root)],
+            },
+        );
+        let (registry, warnings) =
+            load_docks(&dir2.path().join("config.toml"), Some(&root.public()));
+        assert!(
+            registry.is_empty(),
+            "a decoupled fp/pubkey record must not load"
+        );
+        assert!(!warnings.is_empty());
+        assert!(registry.approved(&fp(1)).is_none());
+    }
+
+    #[test]
+    fn a_malformed_pubkey_record_is_dropped() {
+        let root = UserKey::generate();
+        let issuer = root.fingerprint().hex();
+        for bad in ["zz".repeat(32), "00".repeat(20), String::new()] {
+            let mut rec = record();
+            rec.peer_pubkey = bad;
+            // Keep the fingerprint as-is; the pubkey no longer decodes, so the
+            // binding check fails closed regardless.
+            let dir = TempDir::new().unwrap();
+            write_bundle(
+                &dir,
+                &DockBundle {
+                    issuer: issuer.clone(),
+                    subject: SUBJECT.into(),
+                    docks: vec![sign_record(&issuer, SUBJECT, rec, &root)],
+                },
+            );
+            let (registry, _) = load_docks(&dir.path().join("config.toml"), Some(&root.public()));
+            assert!(
+                registry.is_empty(),
+                "a malformed-pubkey record must not load"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_agent_pubkey_round_trips_and_rejects_bad_input() {
+        assert_eq!(decode_agent_pubkey(&pk_hex(7)), Some([7u8; 32]));
+        assert!(decode_agent_pubkey("short").is_none());
+        assert!(decode_agent_pubkey(&"zz".repeat(32)).is_none());
+        assert!(fingerprint_binds_pubkey(&fp(3), &pk_hex(3)));
+        assert!(!fingerprint_binds_pubkey(&fp(3), &pk_hex(4)));
     }
 }
