@@ -161,6 +161,50 @@ pub fn load_docks(
     (registry, warnings)
 }
 
+/// Load the registry against the operator identity at `identity_pem`, for
+/// callers that hold only the on-disk key path and must not name a specific
+/// `agent-mesh-protocol` build (newt-web links a *path* copy for the mesh dial
+/// client while this crate links the registry copy — passing a `UserPublic`
+/// across that seam would not type-check). Fail-closed: if the key cannot be
+/// loaded, nothing is approved.
+pub fn load_docks_with_identity(
+    config_path: &Path,
+    identity_pem: &Path,
+) -> (DockRegistry, Vec<String>) {
+    match UserKey::load(identity_pem) {
+        Ok(key) => load_docks(config_path, Some(&key.public())),
+        Err(error) => (
+            DockRegistry::default(),
+            vec![format!("{}: {error}", identity_pem.display())],
+        ),
+    }
+}
+
+/// Approve a dock using the operator identity at `identity_pem`, for callers
+/// that hold only the key path (see [`load_docks_with_identity`] for why the
+/// `UserKey` type cannot cross the newt-web seam). Mainly a test seam so a
+/// path-side crate can seed an approval without a registry-typed key.
+pub fn approve_dock_with_identity(
+    config_path: &Path,
+    identity_pem: &Path,
+    peer_agent_fingerprint: &str,
+    peer_label: &str,
+    peer_pubkey: &str,
+    scope: &str,
+    transcript_id: &str,
+) -> anyhow::Result<PathBuf> {
+    let root = UserKey::load(identity_pem)?;
+    approve_dock(
+        config_path,
+        peer_agent_fingerprint,
+        peer_label,
+        peer_pubkey,
+        scope,
+        transcript_id,
+        &root,
+    )
+}
+
 impl DockRegistry {
     /// Resolve an approved, non-revoked dock by peer agent fingerprint,
     /// re-reading and re-verifying against the retained operator root. This is
@@ -581,6 +625,33 @@ mod tests {
         );
         // A revoked row is not `live`, so the overview and the kill-switch agree.
         assert!(registry.live().is_empty());
+    }
+
+    #[test]
+    fn load_with_identity_resolves_without_crossing_the_userpublic_seam() {
+        let root = UserKey::generate();
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let identity = dir.path().join("identity.pem");
+        root.save(&identity).unwrap();
+        approve_dock(
+            &config,
+            "aabbccdd",
+            "laptop-b",
+            &"00".repeat(32),
+            "mirror-inject",
+            "tx-1",
+            &root,
+        )
+        .unwrap();
+        let (registry, warnings) = load_docks_with_identity(&config, &identity);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(registry.approved("aabbccdd").is_some());
+
+        // A missing key fails closed — nothing is approved.
+        let (empty, warnings) = load_docks_with_identity(&config, &dir.path().join("nope.pem"));
+        assert!(empty.approved("aabbccdd").is_none());
+        assert!(!warnings.is_empty());
     }
 
     #[test]
