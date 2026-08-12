@@ -94,7 +94,7 @@ mesh's QUIC stack never enter the agent workspace graph (D1). Dockability is adv
 - Revocation latency is bounded by the pull-check cadence; if that proves too slow, an explicit
   session-close signal is added.
 
-## As-built (2026-08 security closure, PR #1643 + agent-mesh #75)
+## As-built (2026-08 security closure, PR #1643 + agent-mesh `5ff8f3f`, landed #75)
 
 This section is authoritative where it differs from the aspirational K-text above.
 
@@ -125,3 +125,64 @@ This section is authoritative where it differs from the aspirational K-text abov
   older text implied does not exist and its doc claim was removed.
 - **K7 as-built — transport is request/reply over the bus.** `session_streams` (live duplex push)
   remains the future refinement; list / mirror / inject are covered by request/reply today.
+
+### Dock grant audience — location-scoped bearer authorization (decided 2026-08-12)
+
+The signed `DockRecord` preimage (`newt-core/src/dock_registry.rs` `signing_payload`) binds the
+issuer (operator root `UserKey`), the subject, the **approved caller** agent fingerprint / label /
+pubkey, the `DockScope`, the generation, the ceremony transcript, and the `revoked` flag. It does
+**not** bind the resource-owning **responder**'s own identity. The hostile question this raises:
+
+> If a valid signed approval authorizing caller *A* is copied verbatim from responder *B*'s
+> `docks.d` into responder *C*'s `docks.d` (where *B* and *C* are distinct `AgentKey`s under the
+> same operator `UserKey`), does *C* now authorize *A*?
+
+Mechanically, yes — *C* verifies the record against the shared operator root and resolves *A*. That
+is **intended**, and the audience semantics are made explicit here rather than left accidental:
+
+```text
+Dock grants are location-scoped bearer authorization records.
+Possession in a responder's protected registry is itself the audience binding.
+Copying a valid record into another responder's protected registry is an
+operator-authority action, not a valid remote replay.
+```
+
+**Why this is sound — the write boundary is exactly the operator-root-key boundary.** Three
+code-grounded facts:
+
+1. **A responder can only *evaluate* a grant if the operator's *private* root key sits beside it.**
+   `authorize_caller` → `load_docks_with_identity` → `agent_mesh_core::UserKey::load(identity.pem)`
+   loads a **private** PKCS#8 key (created `0600`), and `docks.d` lives in the *same* `state_dir`
+   under the *same* filesystem permissions. Any principal that can *write* a record into a
+   responder's `docks.d` therefore also holds the private root key next to it and could **mint** any
+   grant directly (including a correctly-targeted one) — so target-binding raises no bar against the
+   only principal who can perform the copy.
+
+2. **No remote path writes or resolves the registry.** The mesh transport is request/reply over
+   QUIC and exposes no file-write primitive; every `DockRequest` handler (list / transcript /
+   inject) reads sessions or enqueues into the conversation store — none touches `docks.d`. The
+   web "stage-then-promote" flow (K4) lets a browser stage only an expiring proposal; only the
+   terminal (holding the root key) promotes it to a signed record. A machine holding a synced
+   `docks.d` but *not* `identity.pem` fail-closes (nothing resolves). So "A→B replayed at C" is not
+   transport-reachable — it requires local operator-level filesystem access to *C*, under which the
+   attacker already *is* the operator.
+
+3. **There is no stable responder identity to bind to.** The dock service mints an **ephemeral**
+   AgentKey per process (`mint_agent` → `AgentKey::issue` → `SigningKey::generate`), so a responder
+   has no persistent mesh fingerprint a grant could name as its audience. The only stable,
+   authenticated audience the architecture provides *is* the local registry (the `state_dir` +
+   co-located operator root key).
+
+**Honest caveat (non-blocking, future hardening).** If an operator syncs their whole `~/.newt`
+(both `identity.pem` and `docks.d`) across machines, an A→B grant will authorize A at every synced
+machine. That is a consequence of the operator declaring "these machines share my identity" (each
+then holds the root key and is a full operator root), not a remote vulnerability. A future
+hardening could bind a **persistent** responder dock-agent fingerprint (`target_agent_fingerprint`,
+obtained from the local authenticated mesh identity and verified at authorize time) into the signed
+preimage, making grants least-authority under config sync. It is **not** a landing blocker: it does
+not change the trust boundary (already the root key) and it first requires introducing a persistent
+responder dock-agent identity (today's is ephemeral). Tracked as a security-hardening residual.
+
+Regression: `dock_registry.rs::a_dock_grant_is_a_location_scoped_bearer_record_gated_by_root_key_possession`
+pins both halves — a copied grant resolves under a registry that holds the operator root key, and is
+**inert** under one that does not.

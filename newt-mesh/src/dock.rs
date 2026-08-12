@@ -562,6 +562,57 @@ mod tests {
         );
     }
 
+    /// The dock-grant audience theorem's TRANSPORT half (see
+    /// `docs/decisions/newt_web_docking.md`, "Dock grant audience"): NO dock
+    /// request writes the approved registry. A remote caller cannot cause a grant
+    /// to appear in — or change in — a responder's `docks.d`; the only writers are
+    /// the local, root-key-gated `newt dock approve/revoke` CLI. This is why
+    /// "possession in the protected registry is the audience" holds: there is no
+    /// mesh-reachable path that mutates the registry, so a grant can only be placed
+    /// by an operator with local filesystem authority (who also holds the
+    /// co-located root key). Runs the full authorize + handle path for
+    /// list/transcript/inject — including a real inject side effect — and asserts
+    /// `docks.d/peers.toml` is byte-identical before and after.
+    #[test]
+    fn no_dock_request_mutates_the_approved_registry() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(dir.path(), dir.path(), 100).unwrap();
+        let conv = store.create("s", None).unwrap();
+        store.append_turn(&conv, "q", "a").unwrap();
+
+        let caller_pubkey = [0x33u8; 32];
+        approve_caller(&user, dir.path(), &caller_pubkey, DockScope::MirrorInject);
+        let fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(&caller_pubkey);
+        let registry_path = dir.path().join("ocap/docks.d/peers.toml");
+        let before = std::fs::read(&registry_path).expect("registry seeded");
+
+        for req in [
+            DockRequest::ListSessions,
+            DockRequest::Transcript { conv: conv.clone() },
+            DockRequest::Inject {
+                conv: conv.clone(),
+                text: "AUDIENCE_PROBE".into(),
+            },
+        ] {
+            let authz = authorize_caller(dir.path(), &fp).expect("approved caller authorizes");
+            let _ = handle_dock(dir.path(), authz, req);
+        }
+
+        // The inject really landed in the peer's own store inbox (D2) — so the
+        // side effect ran for real, and STILL the registry is untouched.
+        assert_eq!(
+            store.take_injected_prompt(&conv).unwrap().map(|p| p.body),
+            Some("AUDIENCE_PROBE".to_string()),
+            "the inject must have actually executed against the store"
+        );
+        let after = std::fs::read(&registry_path).unwrap();
+        assert_eq!(
+            before, after,
+            "no dock request may write the approved registry (the audience is the local registry)"
+        );
+    }
+
     /// The operator's kill-switch (requirement 7) must fail-closed over the
     /// MESH, not only over HTTP: with the `dock-exposure-disabled` marker in the
     /// state dir, every dock request is refused, so a forcible undock is complete

@@ -1189,4 +1189,77 @@ mod tests {
         assert!(fingerprint_binds_pubkey(&fp(3), &pk_hex(3)));
         assert!(!fingerprint_binds_pubkey(&fp(3), &pk_hex(4)));
     }
+
+    /// AUDIENCE MODEL (`docs/decisions/newt_web_docking.md`, "Dock grant audience"):
+    /// dock grants are **location-scoped bearer authorization records**. The signed
+    /// preimage does not name the resource-owning responder, so a valid grant
+    /// authorizing caller `A`, copied verbatim from responder `B`'s `docks.d` into
+    /// responder `C`'s `docks.d` (distinct agents under one operator `UserKey`),
+    /// resolves at `C` — **but only when `C` also holds the operator's PRIVATE root
+    /// key beside the registry.** That co-location is the whole theorem: the write
+    /// boundary of `docks.d` is the same filesystem boundary that holds the root
+    /// key, so anyone who can place a record there could equally have minted it, and
+    /// a machine that merely copied `docks.d` without the root key gets nothing. No
+    /// mesh request writes `docks.d`, so this is never a remote replay — it is an
+    /// operator-authority action. This pins both halves.
+    #[test]
+    fn a_dock_grant_is_a_location_scoped_bearer_record_gated_by_root_key_possession() {
+        let operator = UserKey::generate();
+
+        // Responder B: the operator approves caller A (pk 0) to dock into B.
+        let dir_b = TempDir::new().unwrap();
+        let config_b = dir_b.path().join("config.toml");
+        let identity_b = dir_b.path().join("identity.pem");
+        operator.save(&identity_b).unwrap();
+        approve_dock(
+            &config_b,
+            &fp(0),
+            "caller-a",
+            &pk_hex(0),
+            DockScope::MirrorInject,
+            "tx",
+            &operator,
+        )
+        .unwrap();
+        let (reg_b, _) = load_docks_with_identity(&config_b, &identity_b);
+        assert!(
+            reg_b.approved(&fp(0)).is_some(),
+            "A must resolve at its own responder B"
+        );
+
+        // Copy B's SIGNED peers.toml verbatim into responder C's docks.d.
+        let dir_c = TempDir::new().unwrap();
+        let config_c = dir_c.path().join("config.toml");
+        let docks_c = docks_dir(&config_c);
+        std::fs::create_dir_all(&docks_c).unwrap();
+        let bytes = std::fs::read(docks_dir(&config_b).join(format!("{SUBJECT}.toml"))).unwrap();
+        std::fs::write(docks_c.join(format!("{SUBJECT}.toml")), &bytes).unwrap();
+
+        // (1) C WITHOUT the co-located operator root key: the copied grant is
+        // INERT. `load_docks_with_identity` fail-closes when it cannot load the
+        // private key, so a synced registry alone authorizes no one.
+        let (reg_c_no_key, warnings) =
+            load_docks_with_identity(&config_c, &dir_c.path().join("identity.pem"));
+        assert!(
+            reg_c_no_key.approved(&fp(0)).is_none(),
+            "a copied grant must NOT resolve without the co-located operator root key"
+        );
+        assert!(
+            !warnings.is_empty(),
+            "the missing root key must surface as an operator-visible warning"
+        );
+
+        // (2) C WITH the operator root key co-located (same operator): the grant
+        // resolves — location-scoped bearer semantics. Placing the record here
+        // required operator-level write to C's protected state dir, the SAME
+        // boundary that holds the root key; the operator could equally have minted
+        // A->C directly. This is an operator-authority action, not a remote replay.
+        let identity_c = dir_c.path().join("identity.pem");
+        operator.save(&identity_c).unwrap();
+        let (reg_c_with_key, _) = load_docks_with_identity(&config_c, &identity_c);
+        assert!(
+            reg_c_with_key.approved(&fp(0)).is_some(),
+            "with the co-located operator root key the bearer grant resolves"
+        );
+    }
 }
