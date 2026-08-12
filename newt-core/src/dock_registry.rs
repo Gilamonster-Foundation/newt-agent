@@ -30,6 +30,53 @@ const DOMAIN: &[u8] = b"newt/dock-registry/v1";
 /// (one operator, many approved peers), so they share one file.
 const SUBJECT: &str = "peers";
 
+/// The authority a dock is approved for — **enforced per operation**, not just
+/// signed. `Mirror` may read (list sessions + fetch transcript); `MirrorInject`
+/// may additionally enqueue a prompt (D2 — the peer still runs it, staying the
+/// sole writer). An unknown token fails to deserialize, so a tampered or
+/// forward-dated scope drops the whole record at load (fail-closed) rather than
+/// silently widening to write authority.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DockScope {
+    /// List sessions and read transcripts; NO inject.
+    Mirror,
+    /// Mirror + inject a prompt (D2).
+    MirrorInject,
+}
+
+impl DockScope {
+    /// Both scopes permit reads (list + transcript).
+    #[must_use]
+    pub fn allows_read(self) -> bool {
+        matches!(self, Self::Mirror | Self::MirrorInject)
+    }
+    /// Only `MirrorInject` permits enqueuing a prompt.
+    #[must_use]
+    pub fn allows_inject(self) -> bool {
+        matches!(self, Self::MirrorInject)
+    }
+    /// The canonical token used in the signed preimage and on disk.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Mirror => "mirror",
+            Self::MirrorInject => "mirror-inject",
+        }
+    }
+    /// Parse an operator-supplied scope (CLI). Least authority is the safe
+    /// default the caller should pick when unsure.
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim() {
+            "mirror" => Ok(Self::Mirror),
+            "mirror-inject" => Ok(Self::MirrorInject),
+            other => {
+                anyhow::bail!("unknown dock scope `{other}` (use `mirror` or `mirror-inject`)")
+            }
+        }
+    }
+}
+
 /// One approved dock, signed by the operator root.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DockRecord {
@@ -44,9 +91,8 @@ pub struct DockRecord {
     /// `fingerprint == BLAKE3(pubkey)` — a label can never point the approval at
     /// a key it was not signed for.
     pub peer_pubkey: String,
-    /// The scope the dock is approved for (coarse token in the same-operator
-    /// phase, e.g. `mirror-inject`). Signed so it cannot be widened on disk.
-    pub scope: String,
+    /// The typed authority this dock is approved for (enforced per operation).
+    pub scope: DockScope,
     /// Monotonic approval generation. Revocation bumps it via re-sign.
     pub issued_generation: u64,
     /// The SAS ceremony transcript this approval was minted under — the
@@ -190,7 +236,7 @@ pub fn approve_dock_with_identity(
     peer_agent_fingerprint: &str,
     peer_label: &str,
     peer_pubkey: &str,
-    scope: &str,
+    scope: DockScope,
     transcript_id: &str,
 ) -> anyhow::Result<PathBuf> {
     let root = UserKey::load(identity_pem)?;
@@ -203,6 +249,17 @@ pub fn approve_dock_with_identity(
         transcript_id,
         &root,
     )
+}
+
+/// Revoke a dock using the operator identity at `identity_pem` — the path-only
+/// twin of [`revoke_dock`] (see [`load_docks_with_identity`] for the seam).
+pub fn revoke_dock_with_identity(
+    config_path: &Path,
+    identity_pem: &Path,
+    peer_fingerprint_prefix: &str,
+) -> anyhow::Result<String> {
+    let root = UserKey::load(identity_pem)?;
+    revoke_dock(config_path, peer_fingerprint_prefix, &root)
 }
 
 impl DockRegistry {
@@ -284,7 +341,7 @@ pub fn approve_dock(
     peer_agent_fingerprint: &str,
     peer_label: &str,
     peer_pubkey: &str,
-    scope: &str,
+    scope: DockScope,
     transcript_id: &str,
     root_key: &UserKey,
 ) -> anyhow::Result<PathBuf> {
@@ -340,7 +397,7 @@ pub fn approve_dock(
         peer_agent_fingerprint: peer_agent_fingerprint.to_owned(),
         peer_label: peer_label.to_owned(),
         peer_pubkey: peer_pubkey.to_owned(),
-        scope: scope.to_owned(),
+        scope,
         issued_generation: next_generation,
         transcript_id: transcript_id.to_owned(),
         revoked: false,
@@ -360,9 +417,14 @@ pub fn approve_dock(
 /// flag flips and its generation bumps, then the whole row is re-signed. A
 /// tamperer who clears the flag by hand invalidates the signature, so the row
 /// is dropped at load rather than coming back to life — which is why this needs
-/// the root key exactly as [`approve_dock`] does. The generation bump is what a
-/// live responder's `verify_at(gen)` re-check trips on, closing an in-flight
-/// dock rather than only refusing the next one.
+/// the root key exactly as [`approve_dock`] does.
+///
+/// Linearization: the dock responder re-reads this registry on **every** request
+/// (`NewtDockService` → `authorize_caller` → `load_docks_with_identity` →
+/// `approved`), so once a revocation is committed to `peers.toml`, the very next
+/// request from that caller resolves to `None` and is denied — including an
+/// in-flight sequence of requests. `approved()` already excludes `revoked` rows,
+/// so no additional generation check is needed for the request/reply transport.
 pub fn revoke_dock(
     config_path: &Path,
     peer_fingerprint_prefix: &str,
@@ -596,7 +658,7 @@ fn signing_payload(issuer: &str, subject: &str, record: &DockRecord) -> Vec<u8> 
     push_field(&mut payload, record.peer_agent_fingerprint.as_bytes());
     push_field(&mut payload, record.peer_label.as_bytes());
     push_field(&mut payload, record.peer_pubkey.as_bytes());
-    push_field(&mut payload, record.scope.as_bytes());
+    push_field(&mut payload, record.scope.as_wire().as_bytes());
     push_field(&mut payload, &record.issued_generation.to_be_bytes());
     push_field(&mut payload, record.transcript_id.as_bytes());
     push_field(&mut payload, &[u8::from(record.revoked)]);
@@ -623,7 +685,7 @@ mod tests {
             peer_agent_fingerprint: fp(0),
             peer_label: "laptop-b".into(),
             peer_pubkey: pk_hex(0),
-            scope: "mirror-inject".into(),
+            scope: DockScope::MirrorInject,
             issued_generation: 0,
             transcript_id: "tx-1".into(),
             revoked: false,
@@ -666,7 +728,7 @@ mod tests {
         let issuer = root.fingerprint().hex();
         // Widen the scope on disk after signing — the signature no longer covers it.
         let mut signed = sign_record(&issuer, SUBJECT, record(), &root);
-        signed.scope = "co-drive".into();
+        signed.scope = DockScope::Mirror;
         let dir = TempDir::new().unwrap();
         write_bundle(
             &dir,
@@ -692,7 +754,7 @@ mod tests {
             &fp(0),
             "laptop-b",
             &pk_hex(0),
-            "mirror-inject",
+            DockScope::MirrorInject,
             "tx-1",
             &root,
         )
@@ -723,7 +785,7 @@ mod tests {
             &fp(0),
             "laptop-b",
             &pk_hex(0),
-            "mirror-inject",
+            DockScope::MirrorInject,
             "tx-1",
             &root,
         )
@@ -748,7 +810,7 @@ mod tests {
             &fp(0),
             "laptop-b",
             &pk_hex(0),
-            "mirror-inject",
+            DockScope::MirrorInject,
             "tx-1",
             &root,
         )
@@ -758,7 +820,7 @@ mod tests {
             &fp(0),
             "laptop-b-renamed",
             &pk_hex(0),
-            "mirror-inject",
+            DockScope::MirrorInject,
             "tx-2",
             &root,
         )
@@ -780,7 +842,7 @@ mod tests {
             &fp(0),
             "a",
             &pk_hex(0),
-            "mirror-inject",
+            DockScope::MirrorInject,
             "tx-a",
             &root,
         )
@@ -790,7 +852,7 @@ mod tests {
             &fp(1),
             "b",
             &pk_hex(1),
-            "mirror-inject",
+            DockScope::MirrorInject,
             "tx-b",
             &root,
         )
@@ -819,7 +881,7 @@ mod tests {
         let path = dir.path().join("ocap/docks.d/peers.toml");
         let mut tampered: DockBundle =
             toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        tampered.docks[0].scope.push('!');
+        tampered.docks[0].peer_label.push('!');
         std::fs::write(&path, toml::to_string(&tampered).unwrap()).unwrap();
         assert!(
             registry.approved(&fp(0)).is_none(),
@@ -874,7 +936,7 @@ mod tests {
             &fp(1), // fingerprint of key B
             "impostor",
             &pk_hex(2), // pubkey of key C
-            "mirror-inject",
+            DockScope::MirrorInject,
             "tx-x",
             &root,
         )
@@ -956,7 +1018,7 @@ mod tests {
                         &agent_fingerprint_of_pubkey(&[s; 32]),
                         &format!("peer-{s}"),
                         &format!("{s:02x}").repeat(32),
-                        "mirror-inject",
+                        DockScope::MirrorInject,
                         "tx",
                     )
                     .unwrap();
@@ -972,6 +1034,49 @@ mod tests {
             6,
             "every concurrent approval must survive the lock-serialized write"
         );
+    }
+
+    #[test]
+    fn dock_scope_permits_per_operation_and_parses_least_authority() {
+        assert!(DockScope::Mirror.allows_read());
+        assert!(!DockScope::Mirror.allows_inject());
+        assert!(DockScope::MirrorInject.allows_read());
+        assert!(DockScope::MirrorInject.allows_inject());
+        assert_eq!(DockScope::parse("mirror").unwrap(), DockScope::Mirror);
+        assert_eq!(
+            DockScope::parse("mirror-inject").unwrap(),
+            DockScope::MirrorInject
+        );
+        assert!(DockScope::parse("co-drive").is_err());
+        assert!(DockScope::parse("").is_err());
+    }
+
+    #[test]
+    fn an_unknown_scope_token_drops_the_whole_record_fail_closed() {
+        let root = UserKey::generate();
+        let issuer = root.fingerprint().hex();
+        // Sign a valid record, then rewrite the on-disk scope to an unknown
+        // token. It must fail to DESERIALIZE, dropping the bundle at load — a
+        // forward/tampered scope can never widen to inject authority.
+        let signed = sign_record(&issuer, SUBJECT, record(), &root);
+        let dir = TempDir::new().unwrap();
+        write_bundle(
+            &dir,
+            &DockBundle {
+                issuer: issuer.clone(),
+                subject: SUBJECT.into(),
+                docks: vec![signed],
+            },
+        );
+        let path = dir.path().join("ocap/docks.d/peers.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("mirror-inject", "co-drive");
+        std::fs::write(&path, text).unwrap();
+        let (registry, warnings) =
+            load_docks(&dir.path().join("config.toml"), Some(&root.public()));
+        assert!(registry.is_empty(), "an unknown scope must not load");
+        assert!(!warnings.is_empty());
     }
 
     #[test]

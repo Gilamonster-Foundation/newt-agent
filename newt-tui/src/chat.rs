@@ -2133,7 +2133,7 @@ pub(crate) fn run_chat(
                                                 d.peer_label,
                                                 &d.peer_agent_fingerprint
                                                     [..12.min(d.peer_agent_fingerprint.len())],
-                                                d.scope
+                                                d.scope.as_wire()
                                             );
                                         }
                                     }

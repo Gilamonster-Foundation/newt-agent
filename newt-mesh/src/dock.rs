@@ -8,9 +8,14 @@
 //! K7). The richer duplex `session_streams` primitive (live push) is a later
 //! refinement — request/reply covers list/mirror/inject.
 //!
-//! Trust: the bus handshake refuses a peer under a different `UserKey`, so a
-//! same-operator dock needs no extra check for phase 1 (the approved-dock
-//! ceremony is Phase 3). **D2 across the mesh:** `Inject` enqueues into the
+//! Authorization: same operator is *authentication*, not authorization. The bus
+//! handshake proves the caller shares the operator `UserKey`, but the responder
+//! still resolves the VERIFIED caller agent fingerprint (from
+//! [`RequestContext`], the envelope signer) against its OWN signed dock registry
+//! and enforces the approved [`DockScope`] per operation — so a sibling agent the
+//! operator never approved is refused here, at the resource owner, not merely on
+//! the bypassable dialer. Fail-closed by default; `NEWT_INSECURE_DOCK_NO_APPROVAL`
+//! is the named unsafe opt-out. **D2 across the mesh:** `Inject` enqueues into the
 //! peer's own store inbox via `ConversationStore::inject_prompt`; the peer's own
 //! REPL consumes it and stays the sole writer — the hub never writes a remote
 //! transcript.
@@ -18,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agent_mesh_bus::{Bus, PeerEndpoint, Topic};
+use agent_mesh_bus::{Bus, PeerEndpoint, RequestContext, Topic};
 use agent_mesh_core::{AgentKey, Fingerprint, UserKey};
 use serde::{Deserialize, Serialize};
 
@@ -75,14 +80,65 @@ pub struct DockTurn {
 }
 
 /// Service a single decoded dock request against the store at `state_dir`.
+/// The caller's authorization on THIS responder. `None` means enforcement is
+/// off (the explicit unsafe opt-out — serve any same-operator caller); `Some` is
+/// the scope the caller's approved dock is limited to, enforced per operation.
+type Authz = Option<newt_core::dock_registry::DockScope>;
+
+/// Whether the responder-side approved-dock gate is disabled. Fail-closed by
+/// default: a caller must be in this peer's signed dock registry unless the
+/// named unsafe opt-out is set (loopback dev / raw-transport testing).
+fn dock_approval_disabled() -> bool {
+    std::env::var("NEWT_INSECURE_DOCK_NO_APPROVAL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Authorize the caller (verified agent fingerprint) against THIS peer's signed
+/// dock registry. This is the resource-owning responder's own decision — same
+/// operator is authentication, not authorization, so a sibling agent the
+/// operator never approved is refused here even though the handshake admitted
+/// it. Re-reads the registry per request, so a revocation committed before the
+/// request denies (revocation linearization).
+fn authorize_caller(state_dir: &Path, caller_agent_fp: &str) -> Result<Authz, DockReply> {
+    if dock_approval_disabled() {
+        return Ok(None);
+    }
+    let config = state_dir.join("config.toml");
+    let identity = state_dir.join("identity.pem");
+    let (registry, _warnings) =
+        newt_core::dock_registry::load_docks_with_identity(&config, &identity);
+    match registry.approved(caller_agent_fp) {
+        Some(record) => Ok(Some(record.scope)),
+        None => Err(DockReply::Error(format!(
+            "caller {}… is not an approved dock on this peer (run `newt dock approve` here)",
+            &caller_agent_fp[..12.min(caller_agent_fp.len())]
+        ))),
+    }
+}
+
 /// Synchronous (SQLite); the async handler runs it on a blocking thread.
-fn handle_dock(state_dir: &Path, req: DockRequest) -> DockReply {
+fn handle_dock(state_dir: &Path, authz: Authz, req: DockRequest) -> DockReply {
     // The operator's dock-exposure kill-switch (requirement 7): a marker file in
     // the state dir. Fail-closed — while present, every dock request is refused
     // over the MESH too, not only over HTTP, so a forcible undock is complete
     // across transports.
     if state_dir.join("dock-exposure-disabled").exists() {
         return DockReply::Error("dock exposure disabled by the operator".into());
+    }
+    // Per-operation scope enforcement (skipped only under the unsafe opt-out):
+    // a Mirror dock may read but not inject.
+    if let Some(scope) = authz {
+        let permitted = match &req {
+            DockRequest::ListSessions | DockRequest::Transcript { .. } => scope.allows_read(),
+            DockRequest::Inject { .. } => scope.allows_inject(),
+        };
+        if !permitted {
+            return DockReply::Error(format!(
+                "caller's dock scope `{}` does not permit this operation",
+                scope.as_wire()
+            ));
+        }
     }
     use newt_core::ConversationStore;
     // `list_all` is cross-workspace, so the workspace arg here is irrelevant; the
@@ -176,16 +232,28 @@ impl NewtDockService {
         let user_fp = user.fingerprint();
         let bus = Bus::bind(user, agent, port).await?;
         let topic = Topic::new(user_fp, DOCK_TOPIC);
-        bus.handle_requests(topic, move |body| {
+        // handle_requests_with_context gives us the VERIFIED caller principal
+        // (the envelope signer), so the responder authorizes WHICH agent is
+        // dialing against its own signed registry — complete mediation at the
+        // resource owner, not merely on the (bypassable) dialer.
+        bus.handle_requests_with_context(topic, move |ctx: RequestContext, body| {
             let state_dir = state_dir.clone();
+            let caller_agent_fp = ctx.caller_agent_fp.hex();
             async move {
-                let reply =
-                    tokio::task::spawn_blocking(move || match serde_json::from_slice(&body) {
-                        Ok(req) => handle_dock(&state_dir, req),
+                let reply = tokio::task::spawn_blocking(move || {
+                    // Authorize the caller FIRST — refuse before any disclosure
+                    // or side effect.
+                    let authz = match authorize_caller(&state_dir, &caller_agent_fp) {
+                        Ok(authz) => authz,
+                        Err(deny) => return deny,
+                    };
+                    match serde_json::from_slice(&body) {
+                        Ok(req) => handle_dock(&state_dir, authz, req),
                         Err(e) => DockReply::Error(format!("bad dock request: {e}")),
-                    })
-                    .await
-                    .unwrap_or_else(|e| DockReply::Error(format!("dock handler panicked: {e}")));
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| DockReply::Error(format!("dock handler panicked: {e}")));
                 Ok(serde_json::to_vec(&reply).unwrap_or_default())
             }
         });
@@ -327,10 +395,39 @@ mod tests {
         PeerEndpoint::from_parts(pubkey, IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 
+    /// Seed `state_dir`'s registry so the responder approves `caller_pubkey` at
+    /// `scope` — the responder-side half of a dock (the peer approving a hub
+    /// agent). Signs with the operator `user`, whose identity is written so the
+    /// responder's `load_docks_with_identity` can verify.
+    fn approve_caller(
+        user: &UserKey,
+        state_dir: &Path,
+        caller_pubkey: &[u8; 32],
+        scope: DockScope,
+    ) {
+        let config = state_dir.join("config.toml");
+        let identity = state_dir.join("identity.pem");
+        if !identity.exists() {
+            user.save(&identity).unwrap();
+        }
+        let fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(caller_pubkey);
+        let hex: String = caller_pubkey.iter().map(|b| format!("{b:02x}")).collect();
+        // Path-only signer: loads the key from identity.pem INTERNALLY, so no
+        // UserKey type crosses the newt-mesh (path agent-mesh) / newt-core
+        // (registry agent-mesh) seam.
+        newt_core::dock_registry::approve_dock_with_identity(
+            &config, &identity, &fp, "hub", &hex, scope, "tx",
+        )
+        .unwrap();
+    }
+
     /// Pure dock-request handling against a seeded store — the DETERMINISTIC
     /// per-PR gate (no bus, no network), the twin of `service.rs`'s
     /// `handle_inference_*` unit tests. Grounds the protocol logic; the live
     /// transport is grounded by the ignored loopback-QUIC test below.
+    use newt_core::dock_registry::DockScope;
+    const MI: Authz = Some(DockScope::MirrorInject);
+
     #[test]
     fn handle_dock_lists_mirrors_and_injects() {
         let dir = tempfile::tempdir().unwrap();
@@ -338,13 +435,17 @@ mod tests {
         let conv = store.create("a session", None).unwrap();
         store.append_turn(&conv, "q", "answer text").unwrap();
 
-        match handle_dock(dir.path(), DockRequest::ListSessions) {
+        match handle_dock(dir.path(), MI, DockRequest::ListSessions) {
             DockReply::Sessions(s) => {
                 assert!(s.iter().any(|x| x.title == "a session"));
             }
             other => panic!("expected Sessions, got {other:?}"),
         }
-        match handle_dock(dir.path(), DockRequest::Transcript { conv: conv.clone() }) {
+        match handle_dock(
+            dir.path(),
+            MI,
+            DockRequest::Transcript { conv: conv.clone() },
+        ) {
             DockReply::Transcript(t) => {
                 assert!(t.turns.iter().any(|x| x.assistant == "answer text"));
             }
@@ -352,6 +453,7 @@ mod tests {
         }
         match handle_dock(
             dir.path(),
+            MI,
             DockRequest::Inject {
                 conv: conv.clone(),
                 text: "INJ".into(),
@@ -369,12 +471,96 @@ mod tests {
         assert!(matches!(
             handle_dock(
                 dir.path(),
+                MI,
                 DockRequest::Transcript {
                     conv: "nope".into()
                 }
             ),
             DockReply::NotFound
         ));
+    }
+
+    #[test]
+    fn a_mirror_scope_caller_can_read_but_never_inject() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(dir.path(), dir.path(), 100).unwrap();
+        let conv = store.create("a session", None).unwrap();
+        store.append_turn(&conv, "q", "answer text").unwrap();
+
+        let mirror: Authz = Some(DockScope::Mirror);
+        // Reads are permitted.
+        assert!(matches!(
+            handle_dock(dir.path(), mirror, DockRequest::ListSessions),
+            DockReply::Sessions(_)
+        ));
+        assert!(matches!(
+            handle_dock(
+                dir.path(),
+                mirror,
+                DockRequest::Transcript { conv: conv.clone() }
+            ),
+            DockReply::Transcript(_)
+        ));
+        // Inject is refused BEFORE the store is touched.
+        match handle_dock(
+            dir.path(),
+            mirror,
+            DockRequest::Inject {
+                conv: conv.clone(),
+                text: "SHOULD_NOT_LAND".into(),
+            },
+        ) {
+            DockReply::Error(msg) => assert!(msg.contains("does not permit")),
+            other => panic!("a mirror dock must refuse inject, got {other:?}"),
+        }
+        assert!(
+            store.take_injected_prompt(&conv).unwrap().is_none(),
+            "the refused inject must never reach the inbox"
+        );
+    }
+
+    #[test]
+    fn a_revoked_caller_is_denied_on_the_next_request_linearization() {
+        // Approve a caller, confirm it authorizes, then revoke and confirm the
+        // very next authorize_caller (which re-reads the registry) denies — the
+        // revocation linearization the responder relies on.
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let caller_pubkey = [0x5au8; 32];
+        approve_caller(&user, dir.path(), &caller_pubkey, DockScope::MirrorInject);
+        let fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(&caller_pubkey);
+
+        assert!(
+            matches!(authorize_caller(dir.path(), &fp), Ok(Some(_))),
+            "the approved caller must authorize"
+        );
+
+        // Revoke (via the path-only identity signer) and re-check.
+        let identity = dir.path().join("identity.pem");
+        newt_core::dock_registry::revoke_dock_with_identity(
+            &dir.path().join("config.toml"),
+            &identity,
+            &fp,
+        )
+        .unwrap();
+        assert!(
+            matches!(authorize_caller(dir.path(), &fp), Err(DockReply::Error(_))),
+            "a revoked caller must be denied on the next request"
+        );
+    }
+
+    #[test]
+    fn an_unapproved_caller_is_refused_before_any_disclosure() {
+        // authorize_caller with enforcement ON (no opt-out) and an empty
+        // registry: the caller is not approved, so it is denied. Uses a distinct
+        // env-free path — the registry simply has no matching record.
+        let dir = tempfile::tempdir().unwrap();
+        // No identity/registry seeded → nothing is approved → deny.
+        let denied = authorize_caller(dir.path(), "deadbeefdeadbeef");
+        assert!(
+            matches!(denied, Err(DockReply::Error(ref m)) if m.contains("not an approved dock")),
+            "an unapproved caller must be refused: {denied:?}"
+        );
     }
 
     /// The operator's kill-switch (requirement 7) must fail-closed over the
@@ -389,9 +575,10 @@ mod tests {
         let conv = store.create("a session", None).unwrap();
         store.append_turn(&conv, "q", "answer text").unwrap();
 
-        // Without the marker the peer lists its session.
+        // Without the marker the peer lists its session (unenforced authz here —
+        // the kill-switch is orthogonal to the approved-dock gate).
         assert!(matches!(
-            handle_dock(dir.path(), DockRequest::ListSessions),
+            handle_dock(dir.path(), None, DockRequest::ListSessions),
             DockReply::Sessions(_)
         ));
 
@@ -406,7 +593,7 @@ mod tests {
                 text: "INJ".into(),
             },
         ] {
-            match handle_dock(dir.path(), req) {
+            match handle_dock(dir.path(), None, req) {
                 DockReply::Error(msg) => assert!(msg.contains("disabled")),
                 other => panic!("disabled dock must refuse with Error, got {other:?}"),
             }
@@ -444,9 +631,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let client = DockClient::bind(&user, agent(&user, "hub", vec!["hub".into()]), 0)
-            .await
-            .unwrap();
+
+        // The responder is fail-closed: seed its OWN registry to approve the hub
+        // agent (mirror+inject) so the authorized caller succeeds. Same operator
+        // is not enough — the peer must have approved this specific agent.
+        let hub_agent = agent(&user, "hub", vec!["hub".into()]);
+        let hub_pubkey = hub_agent.verifying_key().to_bytes();
+        approve_caller(&user, dir.path(), &hub_pubkey, DockScope::MirrorInject);
+        let client = DockClient::bind(&user, hub_agent, 0).await.unwrap();
         let pubkey = svc.agent_pubkey();
         let port = svc.local_port();
 
@@ -489,5 +681,77 @@ mod tests {
 
         svc.close().await.unwrap();
         client.close().await.unwrap();
+    }
+
+    /// THE keystone hostile test (PR #1643 security closure): three agents share
+    /// ONE operator UserKey — A the resource-owning responder, B an APPROVED hub,
+    /// C an UNAPPROVED sibling. Same operator is authentication, not
+    /// authorization: C, which the operator never approved, must be denied at A's
+    /// responder on EVERY operation — even though the mesh handshake admits it —
+    /// before any disclosure or side effect. Real loopback QUIC.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live transport — nightly/full mesh-integration tier only"]
+    async fn a_sibling_agent_the_operator_never_approved_is_denied_over_the_mesh() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(dir.path(), dir.path(), 100).unwrap();
+        let conv = store.create("secret session", None).unwrap();
+        store.append_turn(&conv, "q", "TOP SECRET answer").unwrap();
+        store.claim(&conv).unwrap();
+
+        // A = the resource-owning responder (fail-closed by default).
+        let a = NewtDockService::bind(
+            &user,
+            agent(&user, "peer", vec![DOCK_CAPABILITY_TAG.into()]),
+            dir.path().to_path_buf(),
+            0,
+        )
+        .await
+        .unwrap();
+        let a_pubkey = a.agent_pubkey();
+        let a_port = a.local_port();
+
+        // B = an APPROVED hub; C = an UNAPPROVED sibling (same UserKey, distinct AgentKey).
+        let b_agent = agent(&user, "approved-hub", vec!["hub".into()]);
+        let b_pubkey = b_agent.verifying_key().to_bytes();
+        approve_caller(&user, dir.path(), &b_pubkey, DockScope::MirrorInject);
+        let b = DockClient::bind(&user, b_agent, 0).await.unwrap();
+        let c = DockClient::bind(&user, agent(&user, "sibling-c", vec!["hub".into()]), 0)
+            .await
+            .unwrap();
+
+        // B (approved) is served.
+        assert!(
+            b.list_sessions(loopback(a_pubkey, a_port)).await.is_ok(),
+            "the approved hub B must be served"
+        );
+
+        // C (unapproved sibling) is DENIED on every operation.
+        assert!(
+            c.list_sessions(loopback(a_pubkey, a_port)).await.is_err(),
+            "unapproved sibling C must not be able to LIST sessions"
+        );
+        assert!(
+            c.transcript(loopback(a_pubkey, a_port), &conv)
+                .await
+                .is_err(),
+            "C must not be able to read the transcript"
+        );
+        assert!(
+            c.inject(loopback(a_pubkey, a_port), &conv, "C_INJECT malicious")
+                .await
+                .is_err(),
+            "C must not be able to inject"
+        );
+        // And C's rejected inject never reached A's inbox (refused before the
+        // side effect).
+        assert!(
+            store.take_injected_prompt(&conv).unwrap().is_none(),
+            "the sibling's inject must never land in the peer's inbox"
+        );
+
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+        c.close().await.unwrap();
     }
 }

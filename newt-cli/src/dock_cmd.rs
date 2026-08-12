@@ -18,9 +18,10 @@ use clap::Subcommand;
 
 use newt_core::dock_registry;
 
-/// The scope a same-operator dock is approved for. D2: view + enqueue, never
-/// co-drive — the running agent stays the sole writer.
-const DEFAULT_SCOPE: &str = "mirror-inject";
+/// Least authority by default: a dock may only mirror (read) unless the operator
+/// explicitly asks for inject. Widening to `mirror-inject` is a deliberate choice
+/// on the command line, never the default.
+const DEFAULT_SCOPE: &str = "mirror";
 
 #[derive(Subcommand, Debug)]
 pub enum DockCmd {
@@ -36,7 +37,8 @@ pub enum DockCmd {
         /// Operator-facing label for the peer (e.g. `laptop-b`).
         #[arg(long, value_name = "LABEL")]
         label: String,
-        /// Approval scope. D2 default `mirror-inject`; there is no co-drive.
+        /// Approval scope: `mirror` (read only, the default) or `mirror-inject`
+        /// (also enqueue prompts, D2). Least authority by default.
         #[arg(long, default_value = DEFAULT_SCOPE)]
         scope: String,
         /// Operator root key. Default: `~/.newt/identity.pem`.
@@ -127,6 +129,7 @@ fn run_approve(
     let config_path = config_path(config)?;
     let root_key = load_root(operator_key_path)?;
     let pubkey = parse_pubkey(pubkey_hex)?;
+    let scope = dock_registry::DockScope::parse(scope)?;
 
     let issuer = root_key.public().fingerprint().hex();
     let peer_fp = dock_registry::agent_fingerprint_of_pubkey(&pubkey);
@@ -260,7 +263,7 @@ fn run_list(operator_key_path: Option<PathBuf>, config: Option<&Path>) -> anyhow
             "{:<20} {:<18} {}",
             dock.peer_label,
             &dock.peer_agent_fingerprint[..16.min(dock.peer_agent_fingerprint.len())],
-            dock.scope,
+            dock.scope.as_wire(),
         );
     }
     Ok(0)

@@ -81,9 +81,14 @@ MESH_PUBKEY=""; MESH_PORT=""; GHUB_PORT=""; GHUB_PID=""
 _wait_web() { local port="$1" what="$2" log="$3"; for _ in $(seq 1 40); do wait_ms 0.3; curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && return 0; done; echo "newt-web ($what) never became ready"; cat "$log"; exit 2; }
 start_web() { # peer 1, shares the peer-1 store; ALSO exposes over the mesh
   WEB_PORT="$(free_port)"
+  # This peer is the mesh RESPONDER for the mechanics + hub-side-ceremony tests.
+  # Its responder-side approved-dock gate is fail-closed by default; the
+  # responder-side authorization (sibling-denial) is proven precisely by the
+  # newt-mesh three-agent loopback-QUIC test, so here the responder takes the
+  # named unsafe opt-out to serve the mechanics/hub-side flows under test.
   NEWT_WEB_BIND="127.0.0.1:$WEB_PORT" NEWT_WEB_AUTH_HEADER="" \
     NEWT_WEB_STATE_DIR="$WORK/cfg" NEWT_WEB_WORKSPACE="$WORK/ws" \
-    NEWT_WEB_MESH_BIND="0" \
+    NEWT_WEB_MESH_BIND="0" NEWT_INSECURE_DOCK_NO_APPROVAL=1 \
     "$WEB_BIN" > "$WORK/web.log" 2>&1 &
   WEB_PID=$!; _wait_web "$WEB_PORT" peer1 "$WORK/web.log"
   # The mesh responder binds before the HTTP server accepts, so its line is in

@@ -506,7 +506,7 @@ mod tests {
             &fp,
             "laptop-b",
             &pubkey_hex,
-            "mirror-inject",
+            newt_core::dock_registry::DockScope::MirrorInject,
             "tx-1",
         )
         .unwrap();
