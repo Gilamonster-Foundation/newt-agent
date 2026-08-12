@@ -497,6 +497,10 @@ pub(crate) struct ToolDisplay<W: Write> {
     cols: usize,
     spill_lines: usize,
     result_override: Option<String>,
+    /// Optional completed spill renderer for Rich TUI interactive viewport (#1640).
+    /// When present, completed tool output renders as an interactive spill viewport
+    /// instead of static `spill_view_lines` output.
+    completed_spill_renderer: Option<std::sync::Arc<dyn crate::agentic::CompletedSpillRenderer>>,
 }
 
 impl<W: Write> ToolDisplay<W> {
@@ -507,7 +511,16 @@ impl<W: Write> ToolDisplay<W> {
             cols,
             spill_lines,
             result_override: None,
+            completed_spill_renderer: None,
         }
+    }
+
+    /// Set the completed spill renderer for Rich TUI interactive viewport.
+    pub(crate) fn set_completed_spill_renderer(
+        &mut self,
+        renderer: std::sync::Arc<dyn crate::agentic::CompletedSpillRenderer>,
+    ) {
+        self.completed_spill_renderer = Some(renderer);
     }
 
     pub(crate) fn call(&mut self, name: &str, detail: &str) {
@@ -553,6 +566,18 @@ impl<W: Write> ToolDisplay<W> {
         } else {
             output
         };
+
+        // Use CompletedSpillRenderer for Rich TUI interactive viewport (#1640)
+        if let Some(renderer) = &self.completed_spill_renderer {
+            let rows_painted = renderer.render_completed(output, self.cols, self.spill_lines);
+            // The renderer handles its own terminal output; we just need to flush
+            self.writer.flush().ok();
+            // Store the row count for potential erase (not needed now but kept for future)
+            let _ = rows_painted;
+            return;
+        }
+
+        // Fallback: static spill_view_lines for Lean TUI / headless
         let rendered = spill_view_lines(output, self.spill_lines, self.cols).join("\n");
         if self.color {
             execute!(
