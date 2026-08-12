@@ -9,13 +9,20 @@
 
 use std::sync::Mutex;
 
-use newt_core::TokenEstimation;
+use newt_core::{Serving, TokenEstimation};
 use newt_tui::probe::{
-    ensure_context_window, fetch_context_window, fetch_ollama_models, load_cache,
+    cap_key, ensure_context_window, fetch_context_window, fetch_ollama_models, load_cache,
     probe_input_boundary, probe_thinking, probe_tool_conformance,
-    probe_tool_conformance_calibrated, refresh_context_window, save_cache, CapabilityCache,
+    probe_tool_conformance_calibrated, refresh_context_window, save_cache, CapKey, CapabilityCache,
     CapabilityEntry, ToolConformance, TuneConfidence,
 };
+
+/// A Multiplexer (Ollama) capability key from a bare model name — the keying
+/// discipline goes through cap_key even in integration tests (a raw String key
+/// is now a compile error).
+fn mk(name: &str) -> CapKey {
+    cap_key(Serving::Multiplexer, "", name)
+}
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -863,7 +870,7 @@ fn save_then_load_cache_roundtrips_through_home_newt() {
 
     let mut cache = CapabilityCache::default();
     cache.insert(
-        "llama3:8b".to_string(),
+        mk("llama3:8b"),
         CapabilityEntry {
             conformance: ToolConformance::Native,
             tested_date: "2026-06-07".to_string(),
@@ -882,7 +889,7 @@ fn save_then_load_cache_roundtrips_through_home_newt() {
     assert!(raw.contains("native"));
 
     let back = load_cache();
-    let e = back.get("llama3:8b").expect("entry round-trips");
+    let e = back.get(&mk("llama3:8b")).expect("entry round-trips");
     assert_eq!(e.conformance, ToolConformance::Native);
     assert_eq!(e.context_window, Some(32768));
     assert_eq!(e.safe_context, Some(26214));
@@ -920,7 +927,9 @@ fn load_cache_migrates_legacy_poisoned_entry_once_and_persists() {
     .unwrap();
 
     let cache = load_cache();
-    let e = cache.get("llama3.1:8b").expect("entry survives migration");
+    let e = cache
+        .get(&mk("llama3.1:8b"))
+        .expect("entry survives migration");
     assert_eq!(e.max_ok_input, None, "poisoned ratchet value dropped");
     assert_eq!(e.consecutive_ok, 0);
     assert_eq!(e.tune_confidence, TuneConfidence::None);
@@ -938,7 +947,7 @@ fn load_cache_migrates_legacy_poisoned_entry_once_and_persists() {
     assert!(!raw.contains("25602"), "poisoned value must not survive");
     // ...and a second load is a pure read — same bytes, nothing re-migrated.
     let again = load_cache();
-    assert_eq!(again.get("llama3.1:8b").unwrap().max_ok_input, None);
+    assert_eq!(again.get(&mk("llama3.1:8b")).unwrap().max_ok_input, None);
     assert_eq!(
         std::fs::read_to_string(&on_disk).unwrap(),
         raw,
@@ -970,7 +979,7 @@ fn save_cache_is_best_effort_when_dir_missing() {
     let (_guard, home) = HomeGuard::tempdir();
     // No $HOME/.newt dir — the write fails silently (best-effort contract).
     let mut cache = CapabilityCache::default();
-    cache.insert("m".to_string(), CapabilityEntry::default());
+    cache.insert(mk("m"), CapabilityEntry::default());
     save_cache(&cache); // must not panic
     assert!(!home.join(".newt").exists(), "save must not create dirs");
     assert!(load_cache().is_empty());
@@ -983,6 +992,6 @@ fn cache_ops_are_noops_without_home() {
     // cache_path() resolves to None → load returns empty, save is a no-op.
     assert!(load_cache().is_empty());
     let mut cache = CapabilityCache::default();
-    cache.insert("m".to_string(), CapabilityEntry::default());
+    cache.insert(mk("m"), CapabilityEntry::default());
     save_cache(&cache); // must not panic
 }
