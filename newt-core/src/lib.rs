@@ -23,6 +23,7 @@ pub mod conversation;
 pub mod credential_registry;
 pub mod denial_journal;
 pub mod dgx;
+pub mod dock_registry;
 pub mod drift_cache;
 pub mod enrollment;
 pub mod error;
