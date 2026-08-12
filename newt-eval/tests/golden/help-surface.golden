@@ -58,6 +58,7 @@
   /info                    - show detailed session info (backend, permissions, version)
   /workspace               - show current workspace path
   /docs                    - quick pointers to newt docs and issue tracker
+  /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers
   /allow                   - alias for /permissions
   /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode
   /tenacity [level|list]   - how hard to push from reading to acting (relaxed→relentless)
