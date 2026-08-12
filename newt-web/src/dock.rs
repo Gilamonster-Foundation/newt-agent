@@ -75,6 +75,72 @@ fn dock_client() -> Option<Arc<newt_mesh::DockClient>> {
     DOCK_CLIENT.get().cloned()
 }
 
+// ── the approved-dock gate (requirement 5) ──────────────────────────────────
+// The hub refuses to dial a mesh peer the operator never approved. The check
+// is HUB-SIDE by necessity: the bus responder cannot see which same-operator
+// agent is calling, but the hub already knows each peer's agent pubkey from its
+// dock config, so it resolves `BLAKE3(pubkey)` against the signed dock registry
+// before every dial. All three mesh operations funnel through
+// `approved_endpoint`, so an ungated dial cannot be written.
+
+/// The operator identity paths the dock registry resolves against — set once at
+/// startup: `(config_path, identity_pem)`. The registry lives at
+/// `config_path`'s sibling `ocap/docks.d/`.
+static DOCK_IDENTITY: OnceLock<(std::path::PathBuf, std::path::PathBuf)> = OnceLock::new();
+
+/// Record where the operator config + identity live, so the gate can load the
+/// signed dock registry. Called once at startup; a second call is ignored.
+pub(crate) fn set_dock_identity(config_path: std::path::PathBuf, identity_pem: std::path::PathBuf) {
+    let _ = DOCK_IDENTITY.set((config_path, identity_pem));
+}
+
+/// Whether the hub enforces the approved-dock registry before a mesh dial.
+/// Opt-in (`NEWT_WEB_REQUIRE_DOCK_APPROVAL=1`) so loopback dev and the existing
+/// mesh smoke path keep working; the deployment turns it on to require a
+/// completed docking ceremony (requirement 5).
+fn require_dock_approval() -> bool {
+    std::env::var("NEWT_WEB_REQUIRE_DOCK_APPROVAL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The approval decision, pure over its inputs so it is testable without the
+/// process-global identity/env. `enforce` off ⇒ always Ok (dev). On ⇒ the
+/// registry at `identity` must hold a live approval for `BLAKE3(pubkey)`;
+/// missing identity, unapproved, or revoked all refuse.
+fn check_dock_approval(
+    enforce: bool,
+    identity: Option<&(std::path::PathBuf, std::path::PathBuf)>,
+    pubkey: &[u8; 32],
+) -> Result<(), String> {
+    if !enforce {
+        return Ok(());
+    }
+    let (config, identity) =
+        identity.ok_or("dock approval required but no operator identity is configured")?;
+    let fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(pubkey);
+    let (registry, _warnings) =
+        newt_core::dock_registry::load_docks_with_identity(config, identity);
+    if registry.approved(&fp).is_none() {
+        return Err(format!(
+            "peer {}… is not approved — run `newt dock approve`",
+            &fp[..fp.len().min(12)]
+        ));
+    }
+    Ok(())
+}
+
+/// Gate a mesh dial on the approved-dock registry, then build the endpoint.
+/// The ONLY place a mesh `PeerEndpoint` is constructed, so no dial skips the
+/// gate.
+fn approved_endpoint(
+    pubkey: &[u8; 32],
+    addr: &SocketAddr,
+) -> Result<newt_mesh::PeerEndpoint, String> {
+    check_dock_approval(require_dock_approval(), DOCK_IDENTITY.get(), pubkey)?;
+    Ok(newt_mesh::PeerEndpoint::new(*pubkey, *addr))
+}
+
 /// Percent-encode a value for a query string (peer label / conversation id).
 fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -178,7 +244,7 @@ async fn peer_sessions(peer: &DockPeer) -> Result<Vec<DockedSession>, String> {
         }
         DockKind::Mesh { pubkey, addr } => {
             let client = dock_client().ok_or("mesh dock unavailable (no operator identity)")?;
-            let ep = newt_mesh::PeerEndpoint::new(*pubkey, *addr);
+            let ep = approved_endpoint(pubkey, addr)?;
             client
                 .list_sessions(ep)
                 .await
@@ -206,7 +272,7 @@ async fn peer_transcript(peer: &DockPeer, conv: &str) -> Result<DockedTranscript
         }
         DockKind::Mesh { pubkey, addr } => {
             let client = dock_client().ok_or("mesh dock unavailable")?;
-            let ep = newt_mesh::PeerEndpoint::new(*pubkey, *addr);
+            let ep = approved_endpoint(pubkey, addr)?;
             client
                 .transcript(ep, conv)
                 .await
@@ -245,7 +311,7 @@ pub(crate) async fn peer_inject(peer: &DockPeer, conv: &str, text: &str) -> Resu
         }
         DockKind::Mesh { pubkey, addr } => {
             let client = dock_client().ok_or("mesh dock unavailable")?;
-            let ep = newt_mesh::PeerEndpoint::new(*pubkey, *addr);
+            let ep = approved_endpoint(pubkey, addr)?;
             client
                 .inject(ep, conv, text)
                 .await
@@ -384,6 +450,45 @@ mod tests {
     fn empty_peers_value_is_no_docks() {
         assert!(parse_peers("").is_empty());
         assert!(parse_peers("   ").is_empty());
+    }
+
+    #[test]
+    fn the_dock_gate_admits_only_an_approved_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let identity = dir.path().join("identity.pem");
+        // Write a real operator key via the path-side type — the PEM is a
+        // standard PKCS#8 ed25519 key the registry side re-loads verbatim.
+        agent_mesh_core::UserKey::generate()
+            .save(&identity)
+            .unwrap();
+        let ident = (config.clone(), identity.clone());
+        let pubkey = [9u8; 32];
+
+        // Enforcement off ⇒ dev/loopback dials freely.
+        assert!(check_dock_approval(false, None, &pubkey).is_ok());
+        // On but no identity configured ⇒ fail closed.
+        assert!(check_dock_approval(true, None, &pubkey).is_err());
+        // On, identity present, peer not yet approved ⇒ refused.
+        assert!(check_dock_approval(true, Some(&ident), &pubkey).is_err());
+
+        // The operator approves this exact pubkey.
+        let fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(&pubkey);
+        let pubkey_hex: String = pubkey.iter().map(|b| format!("{b:02x}")).collect();
+        newt_core::dock_registry::approve_dock_with_identity(
+            &config,
+            &identity,
+            &fp,
+            "laptop-b",
+            &pubkey_hex,
+            "mirror-inject",
+            "tx-1",
+        )
+        .unwrap();
+
+        // Now the approved peer is admitted; a different pubkey still is not.
+        assert!(check_dock_approval(true, Some(&ident), &pubkey).is_ok());
+        assert!(check_dock_approval(true, Some(&ident), &[8u8; 32]).is_err());
     }
 
     #[test]

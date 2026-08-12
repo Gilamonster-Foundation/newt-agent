@@ -706,6 +706,10 @@ async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
             return None;
         }
     };
+    // Tell the dock gate where the operator config + identity live so it can
+    // resolve the signed approved-dock registry (state/ocap/docks.d) before a
+    // mesh dial when NEWT_WEB_REQUIRE_DOCK_APPROVAL is on.
+    dock::set_dock_identity(state.join("config.toml"), id_path.clone());
     match newt_mesh::DockClient::bind(&user, mint_agent(&user, "newt-web-dock-client", vec![]), 0)
         .await
     {
