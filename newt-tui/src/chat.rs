@@ -212,6 +212,17 @@ fn context_window_for_core(
     }
 }
 
+/// Resolve the selected model's full window from strongest to weakest
+/// declaration. The caller performs the exact model lookup for configured and
+/// community profiles, so switching models naturally produces a new value.
+fn selected_model_context_window(
+    live: Option<u32>,
+    configured: Option<u32>,
+    community: Option<u32>,
+) -> Option<u32> {
+    live.or(configured).or(community)
+}
+
 /// A numbered server rejection is an authoritative upper bound on later
 /// turns. It may tighten an explicit/session window but never raise a tighter
 /// operator choice. An ordinary discovered window is deliberately not passed
@@ -348,6 +359,23 @@ mod context_window_handoff_tests {
             context_window_for_core(newt_core::BackendKind::Ollama, Some(32_768), Some(26_214),),
             Some(26_214),
             "Ollama retains the conservative KV-allocation fallback",
+        );
+    }
+
+    #[test]
+    fn selected_model_switch_replaces_the_previous_context_window() {
+        assert_eq!(
+            selected_model_context_window(None, None, Some(1_000_000)),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            selected_model_context_window(None, Some(131_072), None),
+            Some(131_072)
+        );
+        assert_eq!(
+            selected_model_context_window(Some(262_144), Some(131_072), Some(1_000_000)),
+            Some(262_144),
+            "fresh endpoint metadata wins for the newly selected model"
         );
     }
 
@@ -813,6 +841,10 @@ pub(crate) fn run_chat(
     // Capability cache: loaded once per session, written back after each turn
     // that updates tuning state (context window discovery, success/overflow).
     let mut cap_cache = probe::load_cache();
+    // Shareable, model-keyed declarations are resolved against the ACTIVE
+    // model each turn. This matters for multiplexing gateways where `/model`
+    // changes the window without changing the endpoint.
+    let community_tunings = newt_core::tuning::load_community_tunings();
     // Negative cache for /api/show (Phase 20,
     // docs/design/model-self-tuning.md §3): models whose context-window
     // fetch has been ATTEMPTED this session — successful or not. Without it,
@@ -1233,14 +1265,11 @@ pub(crate) fn run_chat(
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
     // Memory/compression budget (Step 18.2, #247): the SAME empirical
     // capability numbers that gate the loop's send_budget guard feed the
-    // memory providers, injected by value at construction (newt-core has no
-    // dependency on the probe types). Precedence: explicit `[memory]
-    // context_tokens` override → capability-derived (max_ok_input else
-    // safe_context) → DEFAULT_CONTEXT_TOKENS (fresh model, no probe data).
-    // Discovery runs here so construction and the first turn's guard resolve
-    // identical numbers; if the cache ratchets mid-session the providers
-    // keep their construction-time value — budgets refresh per session,
-    // while the loop's own guard tracks the live numbers.
+    // memory providers (newt-core has no dependency on probe types).
+    // Precedence: explicit `[memory] context_tokens` → selected model's live /
+    // configured / community declaration → capability evidence → static
+    // fallback. This seeds construction; the turn loop rebinds the providers
+    // in place whenever the selected model's resolution changes.
     let mem_budget = {
         let entry = cap_cache.entry(inf_model.clone()).or_default();
         // Once per model per session, even on failure (Phase 20): the set
@@ -1256,7 +1285,20 @@ pub(crate) fn run_chat(
         if updated {
             probe::save_cache(&cap_cache);
         }
-        probe::resolve_memory_budget(mem_cfg.context_tokens, &cap_cache, &inf_model)
+        let declared_window = selected_model_context_window(
+            inf_context_window,
+            cfg.find_model_tuning(&inf_model)
+                .and_then(|tuning| tuning.context_window),
+            community_tunings
+                .find(&inf_model)
+                .and_then(|profile| profile.context_window),
+        );
+        probe::resolve_memory_budget(
+            mem_cfg.context_tokens,
+            declared_window,
+            &cap_cache,
+            &inf_model,
+        )
     };
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
@@ -4269,9 +4311,13 @@ pub(crate) fn run_chat(
                         // cap. Chat Completions needs the former to reserve its
                         // active maximum output; Ollama still uses the latter
                         // as its conservative KV-allocation fallback.
-                        let requested_full_window = inf_context_window
-                            .or(cached_window)
-                            .or_else(|| model_tune.and_then(|t| t.context_window));
+                        let requested_full_window = selected_model_context_window(
+                            inf_context_window.or(cached_window),
+                            model_tune.and_then(|t| t.context_window),
+                            community_tunings
+                                .find(&inf_model)
+                                .and_then(|profile| profile.context_window),
+                        );
                         let recovered_hard_window = cap_context_window_by_recovery(
                             recovered_context_windows.get(&inf_model).copied(),
                             cached_hard_window,
@@ -4313,6 +4359,18 @@ pub(crate) fn run_chat(
                         Some(n) => (Some(n), Some(n)),
                         None => (eff_safe_context, eff_max_ok_input),
                     };
+
+                    // Memory providers keep their history but follow the
+                    // currently selected model's budget. Rebinding every turn
+                    // covers `/model`, `/backend`, and persona-driven routes,
+                    // including switches that retain conversation context.
+                    let active_memory_budget = probe::resolve_memory_budget(
+                        mem_cfg.context_tokens,
+                        eff_context_window,
+                        &cap_cache,
+                        &inf_model,
+                    );
+                    memory.set_context_tokens(active_memory_budget);
 
                     // Context-window resolution: explicit num_ctx first. For
                     // OpenAI, hand core the full window so its input percentage

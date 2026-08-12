@@ -536,7 +536,9 @@ pub fn save_cache(cache: &CapabilityCache) {
 /// Precedence:
 /// 1. **Explicit `[memory] context_tokens`** — a deliberate user override;
 ///    always honoured.
-/// 2. **Capability-derived** — the empirical probe cache entry for `model`:
+/// 2. **Active model declaration** — fresh endpoint metadata, explicit model
+///    tuning, or an imported community profile.
+/// 3. **Capability-derived** — the empirical probe cache entry for `model`:
 ///    `max(max_ok_input, safe_context)` when both exist, else whichever
 ///    exists (Phase 20, `docs/design/model-self-tuning.md` §2.1 — the table
 ///    is the contract). `max_ok_input` is a high-water mark of PROVEN-good
@@ -546,17 +548,22 @@ pub fn save_cache(cache: &CapabilityCache) {
 ///    authoritative cap, so `max()` still lands on the authoritative number
 ///    after a hard 400. The declared `context_window` is deliberately NOT a
 ///    source: it is a claim, not a measurement.
-/// 3. **Static default** — [`newt_core::DEFAULT_CONTEXT_TOKENS`] only when
+/// 4. **Static default** — [`newt_core::DEFAULT_CONTEXT_TOKENS`] only when
 ///    neither exists (fresh model, no probe data yet).
 ///
-/// The resolved value is injected by value at provider construction —
-/// newt-core has no dependency on the probe types (crate-boundary note in
-/// the Phase 18 design). Budgets therefore refresh per session: if the
-/// capability cache ratchets mid-session, providers keep their
-/// construction-time value while the agentic loop's own guard tracks the
-/// live numbers.
-pub fn resolve_memory_budget(explicit: Option<u32>, cache: &CapabilityCache, model: &str) -> u32 {
+/// `declared_window` belongs to the currently selected model and may come
+/// from live endpoint metadata, explicit model tuning, or a community
+/// profile. The TUI re-resolves this function every turn and rebinds memory
+/// providers in place, so a model/backend switch keeps history without
+/// retaining the previous model's budget.
+pub fn resolve_memory_budget(
+    explicit: Option<u32>,
+    declared_window: Option<u32>,
+    cache: &CapabilityCache,
+    model: &str,
+) -> u32 {
     explicit
+        .or(declared_window)
         .or_else(|| {
             cache
                 .get(model)
@@ -2209,8 +2216,22 @@ mod tests {
     fn resolve_memory_budget_explicit_config_wins() {
         let cache = fixture_cache(Some(24_000), Some(26_214));
         assert_eq!(
-            resolve_memory_budget(Some(16_000), &cache, "tuned-model"),
+            resolve_memory_budget(Some(16_000), Some(1_000_000), &cache, "tuned-model"),
             16_000
+        );
+    }
+
+    #[test]
+    fn resolve_memory_budget_uses_the_active_models_declared_window() {
+        let cache = fixture_cache(Some(24_000), None);
+        assert_eq!(
+            resolve_memory_budget(None, Some(1_000_000), &cache, "tuned-model"),
+            1_000_000
+        );
+        assert_eq!(
+            resolve_memory_budget(None, Some(131_072), &cache, "different-model"),
+            131_072,
+            "the selected model's declaration replaces the prior model's budget"
         );
     }
 
@@ -2220,7 +2241,10 @@ mod tests {
     #[test]
     fn resolve_memory_budget_capability_max_ok_input_second() {
         let cache = fixture_cache(Some(24_000), Some(6_553));
-        assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 24_000);
+        assert_eq!(
+            resolve_memory_budget(None, None, &cache, "tuned-model"),
+            24_000
+        );
     }
 
     /// Phase 20 §2.1: the high-water mark is a floor of proven-good, not a
@@ -2230,7 +2254,10 @@ mod tests {
     #[test]
     fn resolve_memory_budget_max_keeps_safe_context_over_low_hwm() {
         let cache = fixture_cache(Some(6_068), Some(26_214));
-        assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 26_214);
+        assert_eq!(
+            resolve_memory_budget(None, None, &cache, "tuned-model"),
+            26_214
+        );
     }
 
     /// Tier 2b: with no `max_ok_input` yet (e.g. freshly de-poisoned by the
@@ -2238,11 +2265,17 @@ mod tests {
     #[test]
     fn resolve_memory_budget_falls_back_to_safe_context() {
         let cache = fixture_cache(None, Some(6_553));
-        assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 6_553);
+        assert_eq!(
+            resolve_memory_budget(None, None, &cache, "tuned-model"),
+            6_553
+        );
         // And the mirror: max_ok_input alone serves when safe_context is
         // absent (hosted endpoints discovered via cw-400 have no num_ctx).
         let cache = fixture_cache(Some(24_000), None);
-        assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 24_000);
+        assert_eq!(
+            resolve_memory_budget(None, None, &cache, "tuned-model"),
+            24_000
+        );
     }
 
     /// Tier 3: the static default applies ONLY when neither an override nor
@@ -2254,19 +2287,19 @@ mod tests {
         // Model absent from the cache entirely (fresh model, never probed).
         let empty = CapabilityCache::default();
         assert_eq!(
-            resolve_memory_budget(None, &empty, "fresh-model"),
+            resolve_memory_budget(None, None, &empty, "fresh-model"),
             newt_core::DEFAULT_CONTEXT_TOKENS
         );
         // Entry exists (declared window known) but no empirical tuning.
         let untuned = fixture_cache(None, None);
         assert_eq!(
-            resolve_memory_budget(None, &untuned, "tuned-model"),
+            resolve_memory_budget(None, None, &untuned, "tuned-model"),
             newt_core::DEFAULT_CONTEXT_TOKENS
         );
         // Some OTHER model's tuning must not leak onto this one.
         let cache = fixture_cache(Some(24_000), Some(26_214));
         assert_eq!(
-            resolve_memory_budget(None, &cache, "different-model"),
+            resolve_memory_budget(None, None, &cache, "different-model"),
             newt_core::DEFAULT_CONTEXT_TOKENS
         );
     }
@@ -2279,7 +2312,7 @@ mod tests {
     #[test]
     fn resolve_memory_budget_never_ignores_probe_data() {
         let cache = fixture_cache(Some(24_000), Some(26_214));
-        let budget = resolve_memory_budget(None, &cache, "tuned-model");
+        let budget = resolve_memory_budget(None, None, &cache, "tuned-model");
         assert_ne!(
             budget,
             newt_core::DEFAULT_CONTEXT_TOKENS,
