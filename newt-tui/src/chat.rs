@@ -5222,6 +5222,15 @@ pub(crate) fn run_chat(
                                         }),
                                         #[cfg(not(feature = "live-spill"))]
                                         live_tool_output: None,
+                                        // #1640: Rich TUI completed spill renderer for interactive
+                                        // completed tool output viewport. Only on Rich TUI + live-spill.
+                                        #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
+                                        completed_spill_renderer: live_spill.as_ref().map(|spill| {
+                                            spill.clone()
+                                                as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
+                                        }),
+                                        #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
+                                        completed_spill_renderer: None,
                                         // PR4 (#461): the embedded git tool, now
                                         // always advertised (carries `init` for a
                                         // not-yet-a-repo workspace).

@@ -3214,6 +3214,9 @@ pub(crate) struct ToolCollaborators<'a> {
     pub(crate) spill_store: Option<&'a dyn SpillStore>,
     pub(crate) persona_tools: Option<&'a [String]>,
     pub(crate) live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    /// Optional completed spill renderer for Rich TUI interactive viewport (#1640).
+    pub(crate) completed_spill_renderer:
+        Option<std::sync::Arc<dyn crate::agentic::CompletedSpillRenderer>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3509,6 +3512,10 @@ pub(crate) async fn execute_tool_with_collaborators(
         super::display::term_cols(),
         super::display::spill_lines(),
     );
+    // Thread the completed spill renderer for Rich TUI interactive viewport (#1640)
+    if let Some(ref renderer) = collab.completed_spill_renderer {
+        display.set_completed_spill_renderer(renderer.clone());
+    }
     execute_tool_with_display_cancellable(
         &mut display,
         name,
@@ -3631,6 +3638,7 @@ async fn execute_tool_inner(
         spill_store,
         persona_tools,
         live_tool_output,
+        completed_spill_renderer: _,
     } = collab;
 
     // A model-entered Plan phase takes effect immediately for every later

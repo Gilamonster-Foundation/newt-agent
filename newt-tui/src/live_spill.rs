@@ -6,6 +6,8 @@ use crossterm::queue;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
 use newt_core::{LiveToolOutput, ToolOutputStream};
+// #1640: CompletedSpillRenderer trait for Rich TUI completed spill rendering
+use newt_core::agentic::CompletedSpillRenderer;
 use std::io::Write;
 #[cfg(any(unix, test))]
 use std::sync::atomic::AtomicBool;
@@ -339,7 +341,7 @@ impl LiveSpillRenderer {
         state
             .view
             .as_ref()
-            .map(fixed_frame_lines)
+            .map(|view| fixed_frame_lines(view, state.generation == Some(0)))
             .unwrap_or_default()
     }
 
@@ -526,14 +528,18 @@ impl LiveToolOutput for LiveSpillRenderer {
     }
 }
 
-fn fixed_frame_lines(view: &SpillView) -> Vec<String> {
-    let frame = view.frame();
+fn fixed_frame_lines(view: &SpillView, completed: bool) -> Vec<String> {
+    let frame = if completed {
+        view.completed_frame()
+    } else {
+        view.frame()
+    };
     let rows = view.visible_rows();
     let mut lines = Vec::with_capacity(rows + 2);
     lines.push(frame.top.line);
     lines.extend(frame.content.into_iter().map(|row| row.line));
     while lines.len() < rows + 1 {
-        lines.push("▒".to_string());
+        lines.push(if completed { "⎴" } else { "▒" }.to_string());
     }
     lines.push(frame.bottom.line);
     lines
@@ -632,7 +638,7 @@ fn paint_generation(
                     state
                         .view
                         .as_ref()
-                        .map(fixed_frame_lines)
+                        .map(|view| fixed_frame_lines(view, generation == 0))
                         .unwrap_or_default()
                 }),
                 state.color,
@@ -803,6 +809,71 @@ fn rendered_width(text: &str) -> usize {
             }
         })
         .sum()
+}
+
+// ========================================================================
+// #1640: CompletedSpillRenderer implementation for Rich TUI completed spill
+// ========================================================================
+
+impl CompletedSpillRenderer for LiveSpillRenderer {
+    /// Render a completed tool result as an interactive spill viewport.
+    ///
+    /// This reuses the existing SpillView frame logic but renders it as a
+    /// completed (non-live) viewport that supports scrolling, expanding, and
+    /// editor-mode navigation. The viewport is bounded to max 50% of screen
+    /// height to prevent flooding tmux.
+    fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize {
+        // Create a temporary SpillView with the completed output
+        let mut view = SpillView::with_limits(width, max_height, 4096, 4096);
+        view.push_stream_bytes(SpillStream::Stdout, output.as_bytes());
+        view.finish();
+
+        // Calculate the actual rows to use (bounded by max_height and 50% of terminal height)
+        let (_, terminal_rows) = (self.state.lock().unwrap().geometry)().unwrap_or((width, 24));
+        let max_allowed = (terminal_rows / 2).max(3).min(max_height);
+        let rows_to_show = view.retained_line_count().min(max_allowed).max(3);
+        view.resize(width, rows_to_show, max_allowed);
+
+        // Store the completed view in state for painting
+        {
+            let mut state = self.state.lock().unwrap();
+            state.view = Some(view);
+            state.generation = Some(0);
+        }
+
+        // Paint the frame using the existing paint logic
+        let generation = 0; // Completed views use generation 0
+        paint_generation(
+            &self.state,
+            &self.output,
+            &self.abandoned_through,
+            generation,
+        );
+
+        // Return the number of physical rows painted
+        let output_state = self.output.lock().unwrap();
+        output_state
+            .painted_line_widths
+            .iter()
+            .map(|w| w.max(&1).div_ceil(width.max(1)))
+            .sum()
+    }
+
+    /// Check if a completed spill viewport is currently on screen.
+    fn is_active(&self) -> bool {
+        self.state.lock().unwrap().view.is_some()
+    }
+
+    /// Erase the completed spill viewport from the terminal.
+    fn erase(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.view.is_some() {
+            state.view = None;
+            state.generation = None;
+            // Repaint to clear the viewport
+            paint_generation(&self.state, &self.output, &self.abandoned_through, 0);
+        }
+    }
 }
 
 #[cfg(test)]
