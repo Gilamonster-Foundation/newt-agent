@@ -373,6 +373,8 @@ impl ConstrainedExecutor {
         // pid), so one `killpg` reaps the child AND any descendants it left in
         // the group — the child-lifetime containment the raw `Command`s lacked.
         let pgid = child.child.id();
+        #[cfg(target_os = "windows")]
+        let windows_job = WindowsJob::for_child(&child.child);
 
         // Drain stdout/stderr on their own threads so a child that fills a pipe
         // buffer cannot deadlock the wait (matches `wait_with_output`).
@@ -396,7 +398,10 @@ impl ConstrainedExecutor {
                     if let Some(cg) = &cgroup {
                         cg.kill();
                     }
-                    kill_process_group(pgid);
+                    #[cfg(target_os = "windows")]
+                    kill_child_tree(&mut child.child, pgid, windows_job.as_ref());
+                    #[cfg(not(target_os = "windows"))]
+                    kill_child_tree(&mut child.child, pgid);
                     timed_out = true;
                     break child.child.wait().map_err(ExecRefused::Spawn)?;
                 }
@@ -411,7 +416,10 @@ impl ConstrainedExecutor {
         if let Some(cg) = &cgroup {
             cg.kill();
         }
-        kill_process_group(pgid);
+        #[cfg(target_os = "windows")]
+        kill_child_tree(&mut child.child, pgid, windows_job.as_ref());
+        #[cfg(not(target_os = "windows"))]
+        kill_child_tree(&mut child.child, pgid);
 
         let stdout = out_thread.join().unwrap_or_default();
         let stderr = err_thread.join().unwrap_or_default();
@@ -740,18 +748,118 @@ fn drain_pipe(pipe: Option<impl Read>) -> Vec<u8> {
     buf
 }
 
+#[cfg(target_os = "windows")]
+struct WindowsJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsJob {
+    fn for_child(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        // SAFETY: all pointers are null or point to initialized Win32 structs for
+        // the duration of the call. The returned handle is owned by `WindowsJob`.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `limits` has the exact type requested by
+        // `JobObjectExtendedLimitInformation`.
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        if !configured {
+            // SAFETY: `handle` is a live handle returned by CreateJobObjectW.
+            unsafe {
+                CloseHandle(handle);
+            }
+            return None;
+        }
+
+        let process = child.as_raw_handle() as HANDLE;
+        // SAFETY: both handles are live. Failure is possible when the host has
+        // already assigned the process to a non-breakaway job; in that case the
+        // executor keeps the immediate-child kill fallback.
+        let assigned = unsafe { AssignProcessToJobObject(handle, process) } != 0;
+        if !assigned {
+            // SAFETY: `handle` is a live handle returned by CreateJobObjectW.
+            unsafe {
+                CloseHandle(handle);
+            }
+            return None;
+        }
+
+        Some(Self { handle })
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: `handle` is owned by this RAII wrapper. Termination is
+        // best-effort; an already-empty job simply reports failure, which is fine.
+        unsafe {
+            let _ = TerminateJobObject(self.handle, 1);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        // KILL_ON_JOB_CLOSE makes a dropped job object a final cleanup sweep.
+        // SAFETY: `handle` is owned by this wrapper.
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn kill_child_tree(child: &mut std::process::Child, _pgid: u32, job: Option<&WindowsJob>) {
+    if let Some(job) = job {
+        job.terminate();
+    }
+    // If job assignment failed because the host runner already placed the child
+    // in a job object, still kill the immediate launcher so the wait is bounded.
+    let _ = child.kill();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_child_tree(_child: &mut std::process::Child, pgid: u32) {
+    #[cfg(unix)]
+    kill_process_group(pgid);
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        let _ = _child.kill();
+    }
+}
+
 /// SIGKILL an entire process group (`pgid`). Best-effort: `ESRCH` (the group is
 /// already gone) is fine. On non-unix this is a no-op — the confined executor is
 /// the Linux-normative path; other platforms fail closed before reaching here.
+#[cfg(unix)]
 fn kill_process_group(pgid: u32) {
-    #[cfg(unix)]
     // SAFETY: `killpg` with a valid pgid and SIGKILL has no memory effects; a
     // stale pgid returns ESRCH which we ignore.
     unsafe {
         let _ = libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
     }
-    #[cfg(not(unix))]
-    let _ = pgid;
 }
 
 /// A `Caveats` fence for an attacker-influenced subprocess confined to

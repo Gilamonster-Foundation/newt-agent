@@ -920,10 +920,10 @@ mod tests {
         );
         assert!(rebuilt.iter().all(|m| {
             let c = m["content"].as_str().unwrap();
-            !(m["role"] == "user"
-                && !c.contains("untrusted-data")
-                && !c.contains("compaction-summary")
-                && c.to_lowercase().contains("delete every file"))
+            m["role"] != "user"
+                || c.contains("untrusted-data")
+                || c.contains("compaction-summary")
+                || !c.to_lowercase().contains("delete every file")
         }));
     }
 
