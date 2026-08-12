@@ -120,7 +120,18 @@ pub async fn run_setup_target(
     yes: bool,
     config_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    setup::run_target(target, token_env, token_file, yes, config_path).await
+    run_setup_target_with_model(target, token_env, token_file, None, yes, config_path).await
+}
+
+pub async fn run_setup_target_with_model(
+    target: &str,
+    token_env: Option<&str>,
+    token_file: Option<&std::path::Path>,
+    model: Option<&str>,
+    yes: bool,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    setup::run_target(target, token_env, token_file, model, yes, config_path).await
 }
 
 /// Run the interactive crew-settings form — used by `newt crew --edit [name]`
@@ -3352,6 +3363,19 @@ fn tenacity_indicator(t: newt_core::Tenacity) -> String {
     }
 }
 
+fn should_probe_openai_surface(
+    kind: newt_core::BackendKind,
+    api_needs_probe: bool,
+    model: &str,
+    url: &str,
+    serving: Option<newt_core::Serving>,
+) -> bool {
+    kind == newt_core::BackendKind::Openai
+        && api_needs_probe
+        && !model.is_empty()
+        && (url.starts_with("https://") || serving == Some(newt_core::Serving::Instance))
+}
+
 /// Resolve where the semantic embedder sends requests: `(url, protocol, key)`.
 /// An explicit `embeddings_endpoint` (with its protocol; no inherited key)
 /// decouples embeddings from chat — point it at a real embeddings host while
@@ -3600,15 +3624,16 @@ fn finish_adoption(
             // OpenAI surface probe: absent `api` → try chat/completions, adopt
             // `responses` when the server says the model is responses-only.
             let mut api_was_probed = false;
-            // Hosted (https) endpoints only: Responses-only models are an
-            // OpenAI-cloud phenomenon, and on a plain-HTTP LAN multiplexer
-            // (llama-swap) the probe completion can trigger a full model load
-            // that always outlives the probe timeout — pure noise.
-            if choice.kind == newt_core::BackendKind::Openai
-                && choice.api_needs_probe
-                && !choice.model.is_empty()
-                && choice.url.starts_with("https://")
-            {
+            // Avoid forcing a model load on plain-HTTP multiplexers. An HTTPS
+            // provider or a fixed-model instance can be capability-probed
+            // without reviving the old llama-swap startup timeout.
+            if should_probe_openai_surface(
+                choice.kind,
+                choice.api_needs_probe,
+                &choice.model,
+                &choice.url,
+                choice.serving,
+            ) {
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         backend_probe::detect_openai_api(
@@ -13698,3 +13723,5 @@ mod env_resolution_tests;
 #[cfg(test)]
 #[path = "lib_tests/http_loop.rs"]
 mod http_loop_tests;
+
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12

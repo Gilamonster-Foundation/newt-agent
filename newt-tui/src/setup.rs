@@ -31,15 +31,27 @@
 //! into that same path — do not open-code a second writer here.
 
 use crate::line_console::{is_yes, Console, StdinConsole};
-use newt_core::backend_probe::EndpointProbeResult;
+use newt_core::backend_probe::{EndpointProbeResult, GenerationCheck};
 use newt_core::config::Discovery;
 use newt_core::provider_preset::{
-    self, list_models_for_preset, preset_support, PresetSupport, ProviderPreset,
+    self, list_models_for_preset, preset_support,
+    validate_authenticated_url as validate_authenticated_target, PresetSupport, ProviderPreset,
 };
 use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, Tier};
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+
+const SETUP_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn setup_http_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(SETUP_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -61,10 +73,7 @@ pub(crate) fn run_first_run(_color: bool) -> anyhow::Result<()> {
 fn wizard_entry(console: &mut dyn Console, flow: Flow) -> anyhow::Result<()> {
     let config_path =
         Config::user_config_path().unwrap_or_else(|| std::path::PathBuf::from("newt.toml"));
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(4))
-        .build()
-        .unwrap_or_default();
+    let client = setup_http_client()?;
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(run_with_flow(
             console,
@@ -82,6 +91,7 @@ pub async fn run_target(
     target: &str,
     token_env: Option<&str>,
     token_file: Option<&Path>,
+    model: Option<&str>,
     yes: bool,
     explicit_config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -105,9 +115,7 @@ pub async fn run_target(
     } else {
         Discovery::default()
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()?;
+    let client = setup_http_client()?;
     let mut console = StdinConsole;
     run_target_with(
         &mut console,
@@ -117,6 +125,7 @@ pub async fn run_target(
             target,
             token_env,
             token_file,
+            model,
             yes,
         },
         &discovery,
@@ -129,6 +138,7 @@ struct TargetSetupRequest<'a> {
     target: &'a str,
     token_env: Option<&'a str>,
     token_file: Option<&'a Path>,
+    model: Option<&'a str>,
     yes: bool,
 }
 
@@ -143,6 +153,7 @@ async fn run_target_with(
         target,
         token_env,
         token_file,
+        model,
         yes,
     } = request;
     if token_env.is_some() || token_file.is_some() {
@@ -157,7 +168,7 @@ async fn run_target_with(
         if candidates.len() == 1 { "" } else { "s" }
     ));
 
-    let (hits, failures) =
+    let (hits, mut failures) =
         probe_candidates_concurrently(client, &candidates, api_key.as_deref()).await?;
     if hits.is_empty() {
         for failure in failures {
@@ -167,6 +178,16 @@ async fn run_target_with(
             "no supported inference API found for `{target}`; tried {}",
             candidates.join(", ")
         );
+    }
+
+    let (hits, generation_failures) =
+        verify_target_hits(console, client, hits, model, api_key.as_deref()).await;
+    failures.extend(generation_failures);
+    if hits.is_empty() {
+        for failure in failures {
+            console.say(&format!("  {failure}"));
+        }
+        anyhow::bail!("no inference backend passed a minimal generation check for `{target}`");
     }
 
     if !failures.is_empty() {
@@ -219,6 +240,64 @@ async fn run_target_with(
     Ok(())
 }
 
+async fn verify_target_hits(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    hits: Vec<EndpointProbeResult>,
+    requested_model: Option<&str>,
+    api_key: Option<&str>,
+) -> (Vec<EndpointProbeResult>, Vec<String>) {
+    let supplied_key = api_key.is_some_and(|key| !key.trim().is_empty());
+    let mut verified = Vec::with_capacity(hits.len());
+    let mut failures = Vec::new();
+    for mut hit in hits {
+        let Some(model) = requested_model
+            .map(str::to_string)
+            .or_else(|| hit.warm.first().or(hit.models.first()).cloned())
+        else {
+            failures.push(format!(
+                "{} listed no model to generation-test",
+                hit.endpoint
+            ));
+            continue;
+        };
+        console.say(&format!(
+            "Testing a minimal chat at {} with {model}…",
+            hit.endpoint
+        ));
+        match newt_core::backend_probe::verify_generation(
+            client,
+            hit.kind,
+            None,
+            &hit.endpoint,
+            &model,
+            api_key,
+        )
+        .await
+        {
+            GenerationCheck::Accepted(_) => {
+                console.say("  ✓ chat accepted");
+                hit.models = vec![model.clone()];
+                hit.warm = vec![model];
+                verified.push(hit);
+            }
+            GenerationCheck::Rejected(code) if supplied_key => failures.push(format!(
+                "{} rejected the token or model authorization for {model} (HTTP {code}); check --token-file/--token-env and model access",
+                hit.endpoint
+            )),
+            GenerationCheck::Rejected(code) => failures.push(format!(
+                "{} requires authentication or model authorization for {model} (HTTP {code}); supply --token-file or --token-env",
+                hit.endpoint
+            )),
+            GenerationCheck::Unverified(reason) => failures.push(format!(
+                "{} could not generate with {model}: {reason}",
+                hit.endpoint
+            )),
+        }
+    }
+    (verified, failures)
+}
+
 // ---------------------------------------------------------------------------
 // Driver (fully testable: scripted Console + wiremock client)
 // ---------------------------------------------------------------------------
@@ -231,6 +310,142 @@ enum Flow {
     /// First run (unboxing) — the caller already proved no config exists.
     FirstRun,
 }
+
+struct PendingWizardToken {
+    token: String,
+    passphrase: Option<newt_core::secrets::SecretString>,
+}
+
+struct SetupFileSnapshot {
+    path: PathBuf,
+    body: Option<Vec<u8>>,
+    permissions: Option<std::fs::Permissions>,
+}
+
+impl SetupFileSnapshot {
+    fn capture(path: PathBuf) -> anyhow::Result<Self> {
+        match std::fs::read(&path) {
+            Ok(body) => Ok(Self {
+                permissions: Some(std::fs::metadata(&path)?.permissions()),
+                path,
+                body: Some(body),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self {
+                path,
+                body: None,
+                permissions: None,
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn restore(&self) -> anyhow::Result<()> {
+        match self.body.as_deref() {
+            Some(body) => {
+                if let Some(parent) = self.path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&self.path, body)?;
+                if let Some(permissions) = &self.permissions {
+                    std::fs::set_permissions(&self.path, permissions.clone())?;
+                }
+                Ok(())
+            }
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+        }
+    }
+}
+
+fn with_setup_file_rollback<T>(
+    paths: Vec<PathBuf>,
+    write: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut snapshots = Vec::with_capacity(paths.len());
+    for path in paths {
+        if snapshots
+            .iter()
+            .any(|snapshot: &SetupFileSnapshot| snapshot.path == path)
+        {
+            continue;
+        }
+        snapshots.push(SetupFileSnapshot::capture(path)?);
+    }
+    match write() {
+        Ok(value) => Ok(value),
+        Err(write_error) => {
+            // A token write updates the in-process secret cache. Clear it when
+            // rolling disk state back so a restored backend cannot observe the
+            // abandoned replacement credential.
+            newt_core::secrets::session().reset_for_test();
+            let mut restore_errors = Vec::new();
+            for snapshot in snapshots.iter().rev() {
+                if let Err(error) = snapshot.restore() {
+                    restore_errors.push(format!("{}: {error:#}", snapshot.path.display()));
+                }
+            }
+            if restore_errors.is_empty() {
+                Err(write_error)
+            } else {
+                anyhow::bail!(
+                    "setup write failed ({write_error:#}); rollback also failed: {}",
+                    restore_errors.join("; ")
+                )
+            }
+        }
+    }
+}
+
+fn persist_interactive_backend(
+    console: &mut dyn Console,
+    config_path: &Path,
+    cfg: &Config,
+    backend: &BackendConfig,
+    pending_token: Option<&PendingWizardToken>,
+) -> anyhow::Result<PathBuf> {
+    persist_interactive_backend_with(
+        console,
+        config_path,
+        cfg,
+        backend,
+        pending_token,
+        |cfg, path| cfg.save(path).map_err(anyhow::Error::from),
+    )
+}
+
+fn persist_interactive_backend_with(
+    console: &mut dyn Console,
+    config_path: &Path,
+    cfg: &Config,
+    backend: &BackendConfig,
+    pending_token: Option<&PendingWizardToken>,
+    save_config: impl FnOnce(&Config, &Path) -> anyhow::Result<()>,
+) -> anyhow::Result<PathBuf> {
+    let backend_path = config_path
+        .with_file_name("backends")
+        .join(format!("{}.toml", backend.name));
+    let mut protected_paths = vec![backend_path, config_path.to_path_buf()];
+    if pending_token.is_some() {
+        protected_paths.push(wizard_token_path(config_path, &backend.name)?);
+    }
+    with_setup_file_rollback(protected_paths, || {
+        if let Some(pending) = pending_token {
+            let reference = persist_wizard_token(console, config_path, &backend.name, pending)?;
+            if backend.api_key_file.as_deref() != Some(reference.as_str()) {
+                anyhow::bail!("internal token-reference mismatch for {}", backend.name);
+            }
+        }
+        let dropin = newt_core::write_backend_dropin(config_path, backend)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        save_config(cfg, config_path)?;
+        Ok(dropin)
+    })
+}
+
+type ConfiguredBackend = (Config, BackendConfig, Option<PendingWizardToken>);
 
 /// The wizard flow, parameterised over its console and HTTP client so it can be
 /// exercised end-to-end in tests (production enters via [`run_with_flow`]).
@@ -272,7 +487,7 @@ async fn run_with_flow(
     // the end (until then, last-written wins via each cfg.save).
     let mut written: Vec<String> = Vec::new();
     loop {
-        let (cfg, backend) = match choose_backend(console)? {
+        let (cfg, backend, pending_token) = match choose_backend(console)? {
             BackendChoice::LocalOllama => configure_ollama(console, client).await?,
             BackendChoice::CustomHost => {
                 configure_custom_host(console, client, config_path).await?
@@ -295,9 +510,13 @@ async fn run_with_flow(
             }
             console.say("Skipped this one.");
         } else {
-            let dropin = newt_core::write_backend_dropin(config_path, &backend)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            cfg.save(config_path)?;
+            let dropin = persist_interactive_backend(
+                console,
+                config_path,
+                &cfg,
+                &backend,
+                pending_token.as_ref(),
+            )?;
             console.say(&format!(
                 "Wrote {} and {}.",
                 config_path.display(),
@@ -363,7 +582,7 @@ fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
 async fn configure_ollama(
     console: &mut dyn Console,
     client: &reqwest::Client,
-) -> anyhow::Result<(Config, BackendConfig)> {
+) -> anyhow::Result<ConfiguredBackend> {
     let default_url = "http://127.0.0.1:11434";
     let raw = console.ask(&format!("Ollama host [{default_url}]: "))?;
     let url = normalize_url(
@@ -373,13 +592,14 @@ async fn configure_ollama(
     );
 
     let model = pick_model(console, client, &url).await?;
-    Ok(build_ollama_config(
+    let (config, backend) = build_ollama_config(
         Config::default(),
         "default",
         EndpointKind::Ollama,
         &url,
         &model,
-    ))
+    );
+    Ok((config, backend, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +654,7 @@ async fn configure_custom_host(
     console: &mut dyn Console,
     client: &reqwest::Client,
     config_path: &Path,
-) -> anyhow::Result<(Config, BackendConfig)> {
+) -> anyhow::Result<ConfiguredBackend> {
     loop {
         let raw = console
             .ask("Host name or URL (e.g. gpu-box, 10.0.0.5:8000, https://llm.example.net): ")?;
@@ -490,11 +710,11 @@ async fn configure_custom_host(
                 candidates.join(", ")
             ));
             console.say("  1) Try a different host");
-            console.say("  2) Enter endpoint and model by hand");
+            console.say("  2) Enter endpoint and model by hand (generation-tested)");
             console.say("  3) Cancel setup");
             let ans = console.ask("Choose [1]: ")?;
             match parse_choice(&ans, 3).unwrap_or(1) {
-                2 => return manual_backend_entry(console),
+                2 => return manual_backend_entry(console, client, config_path).await,
                 3 => {
                     // Interrupted, not a plain bail: first run maps this to
                     // its defaults fallback (`wizard::is_abort`).
@@ -526,28 +746,97 @@ async fn configure_custom_host(
             select_model(console, &ordered)?
         };
 
+        let (api_key, api) =
+            verify_custom_chat_with_retries(console, client, hit, &model, api_key).await?;
+
         let mut backend = backend_from_probe(hit, None, None)?;
         backend.model = Some(model);
-        if let Some(key) = api_key {
-            let reference = persist_wizard_token(console, config_path, &backend.name, &key)?;
-            backend.api_key_file = Some(reference);
+        if backend.serving == Some(newt_core::Serving::Instance) {
+            backend.api = api;
         }
+        let pending_token = if let Some(key) = api_key {
+            let pending = collect_wizard_token(console, &key)?;
+            let reference = wizard_token_reference(config_path, &backend.name)?;
+            backend.api_key_file = Some(reference);
+            Some(pending)
+        } else {
+            None
+        };
         let config = Config {
             backends: vec![], // the drop-in IS the backend list
             default_backend: Some(backend.name.clone()),
             ..Default::default()
         };
-        return Ok((config, backend));
+        return Ok((config, backend, pending_token));
     }
 }
 
-/// Nothing answered but the operator knows the endpoint: take it verbatim
-/// (name still host-derived, #1448 — never a fixed literal).
-fn manual_backend_entry(console: &mut dyn Console) -> anyhow::Result<(Config, BackendConfig)> {
+async fn verify_custom_chat_with_retries(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    hit: &EndpointProbeResult,
+    model: &str,
+    mut api_key: Option<String>,
+) -> anyhow::Result<(Option<String>, Option<newt_core::config::OpenAiApi>)> {
+    for _ in 0..3 {
+        if api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+            validate_authenticated_target(&hit.endpoint)?;
+        }
+        console.say(&format!("Testing a minimal chat against {}…", hit.endpoint));
+        match newt_core::backend_probe::verify_generation(
+            client,
+            hit.kind,
+            None,
+            &hit.endpoint,
+            model,
+            api_key.as_deref(),
+        )
+        .await
+        {
+            GenerationCheck::Accepted(api) => {
+                console.say("  ✓ chat accepted");
+                // A tool-free chat proves generation/authentication, but it
+                // cannot prove that agent tool calls work on Chat Completions.
+                // Leave Chat unpinned so the runtime tool-capability probe can
+                // choose; Responses is safe to persist after definitive
+                // Chat-unavailable fallback.
+                let api = api.filter(|surface| *surface == newt_core::config::OpenAiApi::Responses);
+                return Ok((api_key, api));
+            }
+            GenerationCheck::Rejected(code) => {
+                console.say(&format!("  ✗ authentication rejected (HTTP {code})"));
+                validate_authenticated_target(&hit.endpoint)?;
+                let key = console.ask_secret("API key (echoes as *, Enter to cancel): ")?;
+                let key = key.trim().to_string();
+                if key.is_empty() {
+                    anyhow::bail!("setup cancelled after authentication rejection");
+                }
+                api_key = Some(key);
+            }
+            GenerationCheck::Unverified(reason) => {
+                console.say(&format!("  Could not verify chat ({reason})."));
+                anyhow::bail!("setup cancelled because chat verification did not pass");
+            }
+        }
+    }
+    anyhow::bail!("authentication was rejected three times")
+}
+
+/// Nothing answered but the operator knows the endpoint: collect the wire and
+/// model, then require a real generation before returning a writable backend.
+async fn manual_backend_entry(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    config_path: &Path,
+) -> anyhow::Result<ConfiguredBackend> {
     let url = loop {
         let raw = console.ask("Endpoint URL: ")?;
         if !raw.trim().is_empty() {
-            break normalize_url(raw.trim(), "http", 11434);
+            let normalized = normalize_url(raw.trim(), "http", 11434);
+            break candidate_endpoints(&normalized, &Discovery::default())?
+                .into_iter()
+                .next()
+                .expect("an explicit URL produces one candidate");
         }
         console.say("  An endpoint URL is required (e.g. http://host:8080).");
     };
@@ -565,9 +854,30 @@ fn manual_backend_entry(console: &mut dyn Console) -> anyhow::Result<(Config, Ba
         BackendKind::Openai => newt_core::Serving::Instance,
         _ => newt_core::Serving::Multiplexer,
     };
-    Ok(build_backend_pair(
-        &name, &url, &model, kind, serving, None, "manual",
-    ))
+    let hit = EndpointProbeResult {
+        endpoint: url.clone(),
+        kind,
+        models: vec![model.clone()],
+        serving,
+        engine: None,
+        warm: vec![],
+    };
+    let (api_key, api) =
+        verify_custom_chat_with_retries(console, client, &hit, &model, None).await?;
+    let (config, mut backend) =
+        build_backend_pair(&name, &url, &model, kind, serving, None, "manual");
+    let pending_token = if let Some(key) = api_key {
+        let pending = collect_wizard_token(console, &key)?;
+        let reference = wizard_token_reference(config_path, &backend.name)?;
+        backend.api_key_file = Some(reference);
+        Some(pending)
+    } else {
+        None
+    };
+    if backend.serving == Some(newt_core::Serving::Instance) {
+        backend.api = api;
+    }
+    Ok((config, backend, pending_token))
 }
 
 // ---------------------------------------------------------------------------
@@ -580,19 +890,31 @@ async fn configure_hosted(
     console: &mut dyn Console,
     client: &reqwest::Client,
     config_path: &Path,
-) -> anyhow::Result<(Config, BackendConfig)> {
+) -> anyhow::Result<ConfiguredBackend> {
     let presets = provider_preset::resolve_presets(None);
-    let preset = select_preset(console, &presets)?;
-    configure_preset(console, client, &preset, config_path).await
+    match select_hosted_provider(console, &presets)? {
+        HostedProviderChoice::Preset(preset) => {
+            configure_preset(console, client, &preset, config_path).await
+        }
+        HostedProviderChoice::CustomEndpoint => {
+            configure_custom_host(console, client, config_path).await
+        }
+    }
 }
 
 /// Filterable roster picker. Unsupported presets (oauth-auth drop-ins,
 /// bedrock modes, unroutable base URLs) are listed as "(unavailable: …)"
 /// notes with the reason — visible, never numbered, never silently dropped.
-fn select_preset(
+#[derive(Debug, Clone, PartialEq)]
+enum HostedProviderChoice {
+    CustomEndpoint,
+    Preset(Box<ProviderPreset>),
+}
+
+fn select_hosted_provider(
     console: &mut dyn Console,
     presets: &[ProviderPreset],
-) -> anyhow::Result<ProviderPreset> {
+) -> anyhow::Result<HostedProviderChoice> {
     let mut available: Vec<(&ProviderPreset, String)> = Vec::new();
     let mut unavailable: Vec<(String, String)> = Vec::new();
     for p in presets {
@@ -607,14 +929,26 @@ fn select_preset(
         console.say(&format!("  (unavailable: {label} — {reason})"));
     }
     if available.is_empty() {
-        anyhow::bail!("no usable provider presets (see the unavailable notes above)");
+        console.say("\nAvailable providers:");
+        console.say("  0) I have a URL (custom endpoint)");
+        let _ = console.ask("Choose [0]: ")?;
+        return Ok(HostedProviderChoice::CustomEndpoint);
     }
     let rows: Vec<String> = available
         .iter()
         .map(|(p, endpoint)| format!("{:<24}{}", p.label(), endpoint))
         .collect();
-    let idx = select_row(console, &rows, "providers")?;
-    Ok(available[idx].0.clone())
+    match select_row_with_zero(
+        console,
+        &rows,
+        "providers",
+        "I have a URL (custom endpoint)",
+    )? {
+        Some(idx) => Ok(HostedProviderChoice::Preset(Box::new(
+            available[idx].0.clone(),
+        ))),
+        None => Ok(HostedProviderChoice::CustomEndpoint),
+    }
 }
 
 /// Configure a hosted provider from its preset: env-var reference first
@@ -627,7 +961,7 @@ async fn configure_preset(
     client: &reqwest::Client,
     preset: &ProviderPreset,
     config_path: &Path,
-) -> anyhow::Result<(Config, BackendConfig)> {
+) -> anyhow::Result<ConfiguredBackend> {
     console.say(&format!("\n{} — {}", preset.label(), preset.base_url));
     if let Some(description) = &preset.description {
         console.say(description);
@@ -643,35 +977,50 @@ async fn configure_preset(
         ));
     }
 
-    // (env reference, encrypted-file reference, key for the model probe)
-    let (api_key_env, api_key_file, probe_key): (Option<String>, Option<String>, Option<String>) =
-        if preset.env_vars.is_empty() {
-            (None, None, None) // keyless provider — no credential step
-        } else {
-            let exported = preset.env_vars.iter().find_map(|var| {
-                std::env::var(var)
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .map(|v| (var.clone(), v))
-            });
-            if let Some((var, value)) = exported {
-                let ans = console.ask(&format!("${var} is set in this shell. Use it? [Y/n] "))?;
-                if is_yes(&ans, true) {
-                    // Record the var that actually resolved, not [0].
-                    (Some(var), None, Some(value))
-                } else {
-                    preset_pasted_key(console, preset, config_path)?
+    let cred = if preset.env_vars.is_empty() {
+        WizardCred {
+            api_key_env: None,
+            api_key_file: None,
+            probe_key: None,
+            pending_token: None,
+        }
+    } else {
+        let exported = preset.env_vars.iter().find_map(|var| {
+            std::env::var(var)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| (var.clone(), v))
+        });
+        if let Some((var, value)) = exported {
+            let ans = console.ask(&format!("${var} is set in this shell. Use it? [Y/n] "))?;
+            if is_yes(&ans, true) {
+                // Record the var that actually resolved, not [0].
+                WizardCred {
+                    api_key_env: Some(var),
+                    api_key_file: None,
+                    probe_key: Some(value),
+                    pending_token: None,
                 }
             } else {
                 preset_pasted_key(console, preset, config_path)?
             }
+        } else {
+            preset_pasted_key(console, preset, config_path)?
+        }
+    };
+
+    if cred.probe_key.is_some() {
+        let PresetSupport::Supported { endpoint, .. } = preset_support(preset) else {
+            anyhow::bail!("preset {} is not usable on this build", preset.name);
         };
+        validate_authenticated_target(&endpoint)?;
+    }
 
     console.say(&format!(
         "Probing {} for available models…",
         preset.base_url
     ));
-    let models = list_models_for_preset(client, preset, probe_key.as_deref()).await;
+    let models = list_models_for_preset(client, preset, cred.probe_key.as_deref()).await;
     let model = match models {
         Ok(m) if !m.is_empty() => select_model(console, &m)?,
         Ok(_) | Err(_) => {
@@ -696,41 +1045,38 @@ async fn configure_preset(
     // Field note: a bad token used to sail through setup (list endpoints
     // aren't uniformly auth-gated) and only 401 on the first real message.
     // Test the credential NOW, with re-entry on rejection.
-    let (api_key_env, api_key_file, _probe_key) = verify_key_with_retries(
-        console,
-        client,
-        preset,
-        config_path,
-        &model,
-        (api_key_env, api_key_file, probe_key),
-    )
-    .await?;
+    let (cred, verified_api) =
+        verify_key_with_retries(console, client, preset, config_path, &model, cred).await?;
 
-    let backend = provider_preset::backend_from_preset(
+    let mut backend = provider_preset::backend_from_preset(
         preset,
         &model,
-        api_key_env,
-        api_key_file,
+        cred.api_key_env,
+        cred.api_key_file,
         crate::VERSION,
     )
     .map_err(|reason| anyhow::anyhow!("preset {} is not usable: {reason}", preset.name))?;
+    if verified_api.is_some() && backend.serving == Some(newt_core::Serving::Instance) {
+        backend.api = verified_api;
+    }
     let config = Config {
         backends: vec![], // the drop-in IS the backend list
         default_backend: Some(backend.name.clone()),
         ..Default::default()
     };
-    Ok((config, backend))
+    Ok((config, backend, cred.pending_token))
 }
 
-/// Credential triple as the wizard threads it: (env reference, encrypted-file
-/// reference, plaintext key for probes — never persisted).
-type WizardCred = (Option<String>, Option<String>, Option<String>);
+struct WizardCred {
+    api_key_env: Option<String>,
+    api_key_file: Option<String>,
+    probe_key: Option<String>,
+    pending_token: Option<PendingWizardToken>,
+}
 
-/// Live-test the pasted key before anything is written (wire-aware —
-/// [`provider_preset::verify_key_for_preset`]), with up to two re-entries on
-/// a 401/403. Env-only / keyless configurations (no probe key) pass through
-/// untouched, and an unverifiable check (endpoint down) continues honestly
-/// rather than blocking setup.
+/// Live-test the selected model before anything is written, with up to two
+/// credential re-entries on 401/403. A public model catalog is never treated
+/// as authentication evidence.
 async fn verify_key_with_retries(
     console: &mut dyn Console,
     client: &reqwest::Client,
@@ -738,36 +1084,56 @@ async fn verify_key_with_retries(
     config_path: &Path,
     model: &str,
     mut cred: WizardCred,
-) -> anyhow::Result<WizardCred> {
+) -> anyhow::Result<(WizardCred, Option<newt_core::config::OpenAiApi>)> {
+    let provider_preset::PresetSupport::Supported {
+        kind,
+        api,
+        endpoint,
+    } = provider_preset::preset_support(preset)
+    else {
+        anyhow::bail!("preset {} is not usable on this build", preset.name);
+    };
     for _ in 0..3 {
-        let Some(key) = cred.2.as_deref() else {
-            return Ok(cred);
-        };
-        console.say(&format!("Testing the key against {}…", preset.base_url));
-        match provider_preset::verify_key_for_preset(client, preset, key, model).await {
-            provider_preset::KeyCheck::Accepted => {
-                console.say("  ✓ key accepted");
-                return Ok(cred);
+        if cred
+            .probe_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+        {
+            validate_authenticated_target(&endpoint)?;
+        }
+        console.say(&format!(
+            "Testing a minimal chat against {}…",
+            preset.base_url
+        ));
+        match newt_core::backend_probe::verify_generation(
+            client,
+            kind,
+            api,
+            &endpoint,
+            model,
+            cred.probe_key.as_deref(),
+        )
+        .await
+        {
+            GenerationCheck::Accepted(api) => {
+                console.say("  ✓ chat accepted");
+                let api = api.filter(|surface| *surface == newt_core::config::OpenAiApi::Responses);
+                return Ok((cred, api));
             }
-            provider_preset::KeyCheck::Rejected(code) => {
-                console.say(&format!("  ✗ key rejected (HTTP {code})"));
+            GenerationCheck::Rejected(code) => {
+                console.say(&format!("  ✗ authentication rejected (HTTP {code})"));
                 let ans = console.ask("Re-enter the key? [Y/n] ")?;
                 if !is_yes(&ans, true) {
-                    console.say("  Keeping it — fix later by re-running `newt setup`.");
-                    return Ok(cred);
+                    anyhow::bail!("setup cancelled after authentication rejection");
                 }
                 cred = preset_pasted_key(console, preset, config_path)?;
             }
-            provider_preset::KeyCheck::Unverified(reason) => {
-                console.say(&format!(
-                    "  Could not verify the key ({reason}) — continuing."
-                ));
-                return Ok(cred);
+            GenerationCheck::Unverified(reason) => {
+                anyhow::bail!("minimal chat verification failed: {reason}");
             }
         }
     }
-    console.say("  Still rejected — keeping the last key; fix later with `newt setup`.");
-    Ok(cred)
+    anyhow::bail!("authentication was rejected three times")
 }
 
 /// The paste path shared by both preset branches: hidden input; Enter skips
@@ -778,7 +1144,7 @@ fn preset_pasted_key(
     console: &mut dyn Console,
     preset: &ProviderPreset,
     config_path: &Path,
-) -> anyhow::Result<(Option<String>, Option<String>, Option<String>)> {
+) -> anyhow::Result<WizardCred> {
     let key = console.ask_secret("API key (echoes as *, Enter to skip): ")?;
     let key = key.trim().to_string();
     if key.is_empty() {
@@ -790,35 +1156,69 @@ fn preset_pasted_key(
         console.say(&format!(
             "  No key — writing the backend anyway; export ${var} before use."
         ));
-        return Ok((Some(var), None, None));
+        return Ok(WizardCred {
+            api_key_env: Some(var),
+            api_key_file: None,
+            probe_key: None,
+            pending_token: None,
+        });
     }
-    let reference = persist_wizard_token(console, config_path, &preset.name, &key)?;
-    Ok((None, Some(reference), Some(key)))
+    let pending = collect_wizard_token(console, &key)?;
+    let reference = wizard_token_reference(config_path, &preset.name)?;
+    Ok(WizardCred {
+        api_key_env: None,
+        api_key_file: Some(reference),
+        probe_key: Some(key),
+        pending_token: Some(pending),
+    })
 }
 
-/// Store a pasted token ENCRYPTED at rest (`newt_core::secrets`): one
-/// optional-passphrase question (Enter = machine-local key), then the
-/// `.token.age` write. Returns the tilde-collapsed `api_key_file` value. The
-/// token itself is never echoed and never appears in any config file.
-fn persist_wizard_token(
+fn collect_wizard_token(
     console: &mut dyn Console,
-    config_path: &Path,
-    name: &str,
     token: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<PendingWizardToken> {
     console.say("Protect the stored key with a passphrase? Enter uses a machine-local key.");
     let pass = console.ask_secret("Passphrase (echoes as *): ")?;
-    let backends_dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.join("backends"))
-        .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?;
     let passphrase = {
         let trimmed = pass.trim();
         (!trimmed.is_empty()).then(|| newt_core::secrets::SecretString::from(trimmed.to_string()))
     };
-    let path = newt_core::secrets::store_token(&backends_dir, name, token, passphrase.as_ref())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(PendingWizardToken {
+        token: token.to_string(),
+        passphrase,
+    })
+}
+
+fn wizard_token_path(config_path: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    Ok(config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("backends"))
+        .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?
+        .join(format!("{name}.token.age")))
+}
+
+fn wizard_token_reference(config_path: &Path, name: &str) -> anyhow::Result<String> {
+    Ok(collapse_home(&wizard_token_path(config_path, name)?))
+}
+
+fn persist_wizard_token(
+    console: &mut dyn Console,
+    config_path: &Path,
+    name: &str,
+    pending: &PendingWizardToken,
+) -> anyhow::Result<String> {
+    let path = wizard_token_path(config_path, name)?;
+    let backends_dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("token path has no parent directory"))?;
+    let path = newt_core::secrets::store_token(
+        backends_dir,
+        name,
+        &pending.token,
+        pending.passphrase.as_ref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     let reference = collapse_home(&path);
     console.say(&format!("  → stored encrypted at {reference}"));
     Ok(reference)
@@ -938,15 +1338,32 @@ fn select_model(console: &mut dyn Console, models: &[String]) -> anyhow::Result<
 }
 
 /// The generic filterable numbered picker `select_model` and
-/// `select_preset` share: same threshold, same blank-filter and
+/// `select_hosted_provider` share: same threshold, same blank-filter and
 /// no-match-falls-back-to-all semantics, same pipe-safety. Returns the
 /// index into the ORIGINAL `rows` slice.
 fn select_row(console: &mut dyn Console, rows: &[String], noun: &str) -> anyhow::Result<usize> {
+    Ok(select_row_with_zero(console, rows, noun, "")?.expect("no zero choice was offered"))
+}
+
+fn select_row_with_zero(
+    console: &mut dyn Console,
+    rows: &[String],
+    noun: &str,
+    zero: &str,
+) -> anyhow::Result<Option<usize>> {
     let mut pool: Vec<(usize, &String)> = rows.iter().enumerate().collect();
 
     if pool.len() > FILTER_THRESHOLD {
         console.say(&format!("\n{} {noun} available.", pool.len()));
-        let needle = console.ask("Filter (blank = show all): ")?;
+        let prompt = if zero.is_empty() {
+            "Filter (blank = show all): ".to_string()
+        } else {
+            format!("Filter (blank = show all, 0 = {zero}): ")
+        };
+        let needle = console.ask(&prompt)?;
+        if !zero.is_empty() && needle.trim() == "0" {
+            return Ok(None);
+        }
         let needle = needle.trim().to_ascii_lowercase();
         if !needle.is_empty() {
             let matched: Vec<(usize, &String)> = pool
@@ -965,12 +1382,18 @@ fn select_row(console: &mut dyn Console, rows: &[String], noun: &str) -> anyhow:
     }
 
     console.say(&format!("\nAvailable {noun}:"));
+    if !zero.is_empty() {
+        console.say(&format!("  0) {zero}"));
+    }
     for (i, (_, row)) in pool.iter().enumerate() {
         console.say(&format!("  {}) {row}", i + 1));
     }
     let ans = console.ask("Choose [1]: ")?;
+    if !zero.is_empty() && ans.trim() == "0" {
+        return Ok(None);
+    }
     let picked = parse_choice(&ans, pool.len()).map(|n| n - 1).unwrap_or(0);
-    Ok(pool[picked].0)
+    Ok(Some(pool[picked].0))
 }
 
 fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
@@ -1132,38 +1555,6 @@ async fn probe_candidates_concurrently(
         ordered.into_iter().flatten().collect(),
         failures.into_iter().flatten().collect(),
     ))
-}
-
-fn validate_authenticated_target(target: &str) -> anyhow::Result<()> {
-    let target = target.trim();
-    if !target.contains("://") {
-        anyhow::bail!(
-            "authenticated setup needs an explicit URL including its scheme; use https:// so \
-             the bearer token is not sent to inferred ports or plaintext transport"
-        );
-    }
-    let url = reqwest::Url::parse(target)
-        .map_err(|error| anyhow::anyhow!("invalid authenticated setup URL `{target}`: {error}"))?;
-    if url.scheme() == "https" {
-        return Ok(());
-    }
-    let loopback = url.host_str().is_some_and(|host| {
-        let host = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    });
-    if url.scheme() == "http" && loopback {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "refusing to send a bearer token to `{target}` over plaintext transport; use an https:// \
-         URL (http:// is allowed only for loopback)"
-    )
 }
 
 fn strip_probe_suffix(url: &mut reqwest::Url) {
@@ -1365,6 +1756,7 @@ struct ExistingSetupBackend {
     api_key_env: Option<String>,
     api_key_file: Option<String>,
     kind: Option<BackendKind>,
+    api: Option<newt_core::config::OpenAiApi>,
     serving: Option<newt_core::Serving>,
     model: Option<String>,
     generated_by_setup: bool,
@@ -1383,6 +1775,7 @@ impl ExistingSetupBackend {
             .as_ref()
             .is_none_or(|model| probe.models.contains(model));
         kind_matches
+            && self.api.is_none()
             && serving_matches
             && model_matches
             && (!self.generated_by_setup || (self.serving.is_some() && self.model.is_some()))
@@ -1459,6 +1852,7 @@ fn read_existing_setup_backends(dir: &Path) -> anyhow::Result<Vec<ExistingSetupB
                 .as_ref()
                 .and_then(|backend| backend.api_key_file.clone()),
             kind: parsed.as_ref().and_then(|backend| backend.kind),
+            api: parsed.as_ref().and_then(|backend| backend.api),
             serving: parsed.as_ref().and_then(|backend| backend.serving),
             model: parsed.as_ref().and_then(|backend| backend.model.clone()),
             generated_by_setup: parsed.as_ref().is_some_and(|backend| {
@@ -1855,6 +2249,41 @@ mod tests {
         toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()
     }
 
+    async fn mount_openai_chat(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "OK"}}]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_authenticated_openai_chat(server: &MockServer, token: &str) {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {token}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "OK"}}]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_ollama_chat(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": "OK"},
+                "done": true
+            })))
+            .mount(server)
+            .await;
+    }
+
     impl Console for ScriptedConsole {
         fn ask(&mut self, _prompt: &str) -> io::Result<String> {
             Ok(self.answers.pop_front().unwrap_or_default())
@@ -1978,6 +2407,110 @@ mod tests {
         assert!(validate_authenticated_target("https://dgx1.home.lab:8000").is_ok());
         assert!(validate_authenticated_target("http://127.0.0.1:8000").is_ok());
         assert!(validate_authenticated_target("http://[::1]:8000").is_ok());
+    }
+
+    #[tokio::test]
+    async fn preset_retry_path_revalidates_transport_before_sending_a_key() {
+        let preset = ProviderPreset {
+            name: "remote-plaintext".into(),
+            base_url: "http://192.0.2.10/v1".into(),
+            env_vars: vec!["UNUSED_TEST_KEY".into()],
+            ..Default::default()
+        };
+        let cred = WizardCred {
+            api_key_env: None,
+            api_key_file: None,
+            probe_key: Some("replacement-secret".into()),
+            pending_token: None,
+        };
+        let mut console = ScriptedConsole::new(&[]);
+        let result = verify_key_with_retries(
+            &mut console,
+            &reqwest::Client::new(),
+            &preset,
+            Path::new("config.toml"),
+            "model",
+            cred,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("remote plaintext credential should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("refusing to send a bearer token"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn tool_free_chat_verification_does_not_pin_chat_completions() {
+        let server = MockServer::start().await;
+        mount_openai_chat(&server).await;
+        let hit = EndpointProbeResult {
+            endpoint: server.uri(),
+            kind: BackendKind::Openai,
+            models: vec!["model".into()],
+            serving: newt_core::Serving::Instance,
+            engine: None,
+            warm: vec![],
+        };
+        let mut console = ScriptedConsole::new(&[]);
+        let (_, api) = verify_custom_chat_with_retries(
+            &mut console,
+            &reqwest::Client::new(),
+            &hit,
+            "model",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(api, None, "runtime tool-capability probe must choose Chat");
+    }
+
+    /// Real-resource grounding for the rollback helper and the production
+    /// `persist_interactive_backend` path: an injected final config failure
+    /// must restore a replaced token, backend drop-in, and config together.
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn late_setup_write_failure_restores_token_backend_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("backends/example.token.age");
+        let backend_path = dir.path().join("backends/example.toml");
+        let config = dir.path().join("config.toml");
+        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+        std::fs::write(&token, b"old-token").unwrap();
+        std::fs::write(&backend_path, b"old-backend").unwrap();
+        std::fs::write(&config, b"old-config").unwrap();
+
+        let backend = BackendConfig {
+            name: "example".into(),
+            endpoint: "https://inference.example.test".into(),
+            model: Some("model".into()),
+            kind: Some(BackendKind::Openai),
+            api_key_file: Some(wizard_token_reference(&config, "example").unwrap()),
+            ..Default::default()
+        };
+        let cfg = Config {
+            default_backend: Some("example".into()),
+            ..Default::default()
+        };
+        let pending = PendingWizardToken {
+            token: "new-secret".into(),
+            passphrase: Some(newt_core::secrets::SecretString::from("test-passphrase")),
+        };
+        let mut console = ScriptedConsole::new(&[]);
+        let result = persist_interactive_backend_with(
+            &mut console,
+            &config,
+            &cfg,
+            &backend,
+            Some(&pending),
+            |_cfg, _path| anyhow::bail!("simulated late config failure"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&token).unwrap(), b"old-token");
+        assert_eq!(std::fs::read(&backend_path).unwrap(), b"old-backend");
+        assert_eq!(std::fs::read(&config).unwrap(), b"old-config");
     }
 
     #[test]
@@ -2348,6 +2881,9 @@ mod tests {
         assert!(!dir.path().join(".config.toml.setup.lock").exists());
     }
 
+    /// Real-resource grounding for the mocked multi-port target flow;
+    /// weekly/release only because it writes config files.
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
     #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn target_flow_probes_multiple_ports_and_writes_each_live_endpoint() {
@@ -2359,6 +2895,7 @@ mod tests {
             })))
             .mount(&vllm)
             .await;
+        mount_openai_chat(&vllm).await;
         let router = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -2367,6 +2904,7 @@ mod tests {
             })))
             .mount(&router)
             .await;
+        mount_openai_chat(&router).await;
         let discovery = newt_core::config::Discovery {
             hosts: vec![],
             ollama_ports: vec![],
@@ -2385,6 +2923,7 @@ mod tests {
                 target: "127.0.0.1",
                 token_env: None,
                 token_file: None,
+                model: None,
                 yes: true,
             },
             &discovery,
@@ -2419,6 +2958,7 @@ mod tests {
             })))
             .mount(&open)
             .await;
+        mount_openai_chat(&open).await;
         let secured = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -2442,6 +2982,7 @@ mod tests {
                 target: "127.0.0.1",
                 token_env: None,
                 token_file: None,
+                model: None,
                 yes: true,
             },
             &discovery,
@@ -2466,6 +3007,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        mount_openai_chat(&server).await;
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let mut console = ScriptedConsole::new(&["n"]);
@@ -2478,6 +3020,7 @@ mod tests {
                 target: &server.uri(),
                 token_env: None,
                 token_file: None,
+                model: None,
                 yes: false,
             },
             &newt_core::config::Discovery::default(),
@@ -2520,6 +3063,7 @@ mod tests {
                 target: "127.0.0.1",
                 token_env: None,
                 token_file: Some(&token_path),
+                model: None,
                 yes: true,
             },
             &discovery,
@@ -2544,6 +3088,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        mount_authenticated_openai_chat(&server, "secret-value").await;
         let dir = tempfile::tempdir().unwrap();
         let token_path = dir.path().join("token");
         std::fs::write(&token_path, "secret-value\n").unwrap();
@@ -2559,6 +3104,7 @@ mod tests {
                 target: &server.uri(),
                 token_env: None,
                 token_file: Some(&token_path),
+                model: None,
                 yes: true,
             },
             &newt_core::config::Discovery::default(),
@@ -2596,6 +3142,7 @@ mod tests {
                 target: &server.uri(),
                 token_env: None,
                 token_file: None,
+                model: None,
                 yes: true,
             },
             &newt_core::config::Discovery::default(),
@@ -2632,6 +3179,7 @@ mod tests {
                 target: &server.uri(),
                 token_env: None,
                 token_file: None,
+                model: None,
                 yes: true,
             },
             &newt_core::config::Discovery::default(),
@@ -2808,10 +3356,10 @@ mod tests {
             Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
             None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
         }
-        let (_cfg, backend) = result.unwrap();
+        let (_cfg, backend, _pending) = result.unwrap();
         let t = console.transcript();
-        assert!(t.contains("✗ key rejected (HTTP 401)"), "{t}");
-        assert!(t.contains("✓ key accepted"), "{t}");
+        assert!(t.contains("✗ authentication rejected (HTTP 401)"), "{t}");
+        assert!(t.contains("✓ chat accepted"), "{t}");
         assert!(backend.api_key_file.is_some(), "re-entered key is stored");
     }
 
@@ -2836,6 +3384,7 @@ mod tests {
             })))
             .mount(&s2)
             .await;
+        mount_ollama_chat(&s2).await;
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
         let client = reqwest::Client::new();
@@ -2887,6 +3436,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        mount_openai_chat(&server).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let client = reqwest::Client::new();
@@ -2926,6 +3476,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        mount_ollama_chat(&server).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let client = reqwest::Client::new();
@@ -3053,7 +3604,7 @@ mod tests {
     }
 
     #[test]
-    fn select_preset_lists_available_and_notes_unavailable_rows() {
+    fn select_hosted_provider_lists_available_and_notes_unavailable_rows() {
         // The picker over the core roster: supported rows are numbered;
         // an oauth-auth drop-in shows as an "(unavailable: …)" note with
         // the reason — visible, never silently dropped, never numbered.
@@ -3069,8 +3620,11 @@ mod tests {
         // (no filter prompt); row 4 is OpenRouter in roster order. The
         // filter path itself is pinned by select_row_filter_maps_back….
         let mut console = ScriptedConsole::new(&["4"]);
-        let picked = select_preset(&mut console, &presets).unwrap();
-        assert_eq!(picked.name, "openrouter");
+        let picked = select_hosted_provider(&mut console, &presets).unwrap();
+        assert!(matches!(
+            picked,
+            HostedProviderChoice::Preset(preset) if preset.name == "openrouter"
+        ));
         assert!(
             !console.transcript().contains("Filter"),
             "at the threshold the list shows directly: {}",
@@ -3088,6 +3642,19 @@ mod tests {
     }
 
     #[test]
+    fn select_hosted_provider_accepts_custom_endpoint() {
+        let presets = newt_core::provider_preset::builtin_presets();
+        let mut console = ScriptedConsole::new(&["0"]);
+
+        let picked = select_hosted_provider(&mut console, &presets).unwrap();
+
+        assert_eq!(picked, HostedProviderChoice::CustomEndpoint);
+        assert!(console
+            .transcript()
+            .contains("0) I have a URL (custom endpoint)"));
+    }
+
+    #[test]
     fn select_row_filter_maps_back_to_original_indices() {
         let rows: Vec<String> = (1..=12).map(|i| format!("row-{i}")).collect();
         // Filter to "row-1" matches row-1, row-10..12; pick 2 → "row-10"
@@ -3097,7 +3664,94 @@ mod tests {
         assert_eq!(idx, 9);
     }
 
+    #[test]
+    fn zero_choice_is_available_before_filtering_a_large_roster() {
+        let rows: Vec<String> = (1..=12).map(|i| format!("provider-{i}")).collect();
+        let mut console = ScriptedConsole::new(&["0"]);
+
+        let picked = select_row_with_zero(
+            &mut console,
+            &rows,
+            "providers",
+            "I have a URL (custom endpoint)",
+        )
+        .unwrap();
+
+        assert_eq!(picked, None);
+    }
+
     // --- custom-host / preset integration tests ------------------------------
+
+    /// Real-resource grounding for the mocked custom-endpoint generation and
+    /// credential checks; weekly/release only because it writes config files.
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    #[tokio::test]
+    async fn hosted_provider_custom_endpoint_uses_supplied_base_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer test-remote-key",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "example/model-a"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        mount_authenticated_openai_chat(&server, "test-remote-key").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let previous = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
+        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        newt_core::secrets::session().reset_for_test();
+        let server_with_v1 = format!("{}/v1/", server.uri());
+        let mut console = ScriptedConsole::new(&[
+            "3",
+            "0",
+            &server_with_v1,
+            "test-remote-key",
+            "1",
+            "1",
+            "",
+            "y",
+        ]);
+
+        run_with_flow(&mut console, &reqwest::Client::new(), &path, Flow::FirstRun)
+            .await
+            .unwrap();
+
+        let name = format!("127-0-0-1-{}", server.address().port());
+        let dropin = read_dropin(&path, &name);
+        assert_eq!(dropin.endpoint, server.uri());
+        assert_eq!(dropin.effective_model(), Some("example/model-a"));
+        assert_eq!(dropin.kind, Some(BackendKind::Openai));
+        assert!(dropin.api_key_file.is_some());
+        assert!(console
+            .transcript()
+            .contains("0) I have a URL (custom endpoint)"));
+        assert!(!console.transcript().contains("test-remote-key"));
+
+        newt_core::secrets::session().reset_for_test();
+        assert_eq!(dropin.resolve_api_key().as_deref(), Some("test-remote-key"));
+        newt_core::secrets::session().reset_for_test();
+        match previous {
+            Some(value) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, value),
+            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+        }
+    }
 
     #[serial_test::serial(real_fs)]
     #[tokio::test]
@@ -3130,6 +3784,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
+        mount_authenticated_openai_chat(&server, "test-remote-key").await;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -3193,6 +3848,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        mount_openai_chat(&server).await;
         std::env::remove_var("NEWT_TEST_PRESET_KEY");
         let preset = ProviderPreset {
             name: "testcloud".into(),
@@ -3208,7 +3864,7 @@ mod tests {
         let client = reqwest::Client::new();
         // key=<Enter: skip>, model=1
         let mut console = ScriptedConsole::new(&["", "1"]);
-        let (_cfg, backend) = configure_preset(&mut console, &client, &preset, &path)
+        let (_cfg, backend, _pending) = configure_preset(&mut console, &client, &preset, &path)
             .await
             .unwrap();
         assert_eq!(backend.api_key_env.as_deref(), Some("NEWT_TEST_PRESET_KEY"));
@@ -3241,6 +3897,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        mount_authenticated_openai_chat(&server, "sk-preset-secret").await;
         std::env::remove_var("NEWT_TEST_PRESET_KEY");
         let preset = ProviderPreset {
             name: "gatedcloud".into(),
@@ -3259,13 +3916,18 @@ mod tests {
         let client = reqwest::Client::new();
         // key (hidden), passphrase, model=1
         let mut console = ScriptedConsole::new(&["sk-preset-secret", "open sesame", "1"]);
-        let (_cfg, backend) = configure_preset(&mut console, &client, &preset, &path)
+        let (_cfg, backend, pending) = configure_preset(&mut console, &client, &preset, &path)
             .await
             .unwrap();
         assert!(backend.api_key_env.is_none());
         let token_ref = backend.api_key_file.as_deref().expect("encrypted ref");
         assert!(token_ref.ends_with("gatedcloud.token.age"));
         assert_eq!(backend.effective_model(), Some("gated-model"));
+        let pending = pending.expect("token is held until final write");
+        assert_eq!(
+            persist_wizard_token(&mut console, &path, "gatedcloud", &pending).unwrap(),
+            token_ref
+        );
         let body =
             std::fs::read_to_string(dir.path().join("backends/gatedcloud.token.age")).unwrap();
         assert!(body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
@@ -3290,6 +3952,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        mount_authenticated_openai_chat(&server, "sk-from-env").await;
         std::env::set_var("NEWT_TEST_PRESET_KEY", "sk-from-env");
         let preset = ProviderPreset {
             name: "envcloud".into(),
@@ -3305,7 +3968,7 @@ mod tests {
         let client = reqwest::Client::new();
         // use exported?=<Enter: yes>, model=1
         let mut console = ScriptedConsole::new(&["", "1"]);
-        let (_cfg, backend) = configure_preset(&mut console, &client, &preset, &path)
+        let (_cfg, backend, _pending) = configure_preset(&mut console, &client, &preset, &path)
             .await
             .unwrap();
         std::env::remove_var("NEWT_TEST_PRESET_KEY");
@@ -3336,7 +3999,8 @@ mod tests {
         let path = dir.path().join("config.toml");
         // passphrase=<Enter: machine key>
         let mut console = ScriptedConsole::new(&[""]);
-        let recorded = persist_wizard_token(&mut console, &path, "example", "a-secret")
+        let pending = collect_wizard_token(&mut console, "a-secret").unwrap();
+        let recorded = persist_wizard_token(&mut console, &path, "example", &pending)
             .expect("a supplied key must always be recorded, home dir or not");
 
         // SAFETY: same lane; restore before asserting so a failure cannot leak.
@@ -3446,6 +4110,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        mount_ollama_chat(&server).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let client = reqwest::Client::new();

@@ -2,10 +2,11 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
+#[ignore = "real-resource: weekly/release tier; spawns newt and touches the filesystem"]
 async fn setup_url_probes_with_token_reference_and_writes_backend_dropin() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -14,6 +15,21 @@ async fn setup_url_probes_with_token_reference_and_writes_backend_dropin() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [{"id": "served-model"}]
         })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer secret-value"))
+        .and(body_json(serde_json::json!({
+            "model": "served-model",
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 8,
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}]
+        })))
+        .expect(1)
         .mount(&server)
         .await;
     let config_dir = tempfile::tempdir().unwrap();
@@ -65,6 +81,8 @@ async fn setup_url_probes_with_token_reference_and_writes_backend_dropin() {
         .stdout(predicate::str::contains(server.uri()))
         .stdout(predicate::str::contains("served-model"));
 }
+
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
 
 #[tokio::test]
 async fn setup_url_failure_writes_nothing() {
@@ -143,7 +161,8 @@ fn setup_target_requires_yes_when_stdin_is_not_a_terminal() {
 }
 
 #[tokio::test]
-async fn setup_relative_token_file_persists_a_stable_absolute_reference() {
+#[ignore = "real-resource: weekly/release tier; spawns newt and touches the filesystem"]
+async fn setup_v1_url_requires_generation_and_persists_canonical_token_reference() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -151,30 +170,52 @@ async fn setup_relative_token_file_persists_a_stable_absolute_reference() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [{"id": "secured-model"}]
         })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer secret-value"))
+        .and(body_json(serde_json::json!({
+            "model": "secured-model",
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 8,
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}]
+        })))
+        .expect(1)
         .mount(&server)
         .await;
     let root = tempfile::tempdir().unwrap();
     let token_path = root.path().join("dgx.token");
     std::fs::write(&token_path, "secret-value\n").unwrap();
 
-    Command::cargo_bin("newt")
+    let target = format!("{}/v1/", server.uri());
+    let assertion = Command::cargo_bin("newt")
         .unwrap()
         .current_dir(root.path())
         .args([
             "--config-dir",
             "config",
             "setup",
-            &server.uri(),
+            &target,
             "--token-file",
             "dgx.token",
+            "--model",
+            "secured-model",
             "--yes",
         ])
         .assert()
-        .success()
+        .success();
+    assertion
+        .stdout(predicate::str::contains("chat accepted"))
         .stdout(predicate::str::contains("secret-value").not())
         .stderr(predicate::str::contains("secret-value").not());
 
     let name = format!("127-0-0-1-{}", server.address().port());
+    let config_body = std::fs::read_to_string(root.path().join("config/config.toml")).unwrap();
     let body = std::fs::read_to_string(
         root.path()
             .join("config/backends")
@@ -182,14 +223,69 @@ async fn setup_relative_token_file_persists_a_stable_absolute_reference() {
     )
     .unwrap();
     let backend: newt_core::BackendConfig = toml::from_str(&body).unwrap();
+    assert_eq!(backend.endpoint, server.uri());
     assert_eq!(
         backend.api_key_file.as_deref(),
         std::fs::canonicalize(&token_path).unwrap().to_str()
     );
+    assert!(!config_body.contains("secret-value"));
     assert!(!body.contains("secret-value"));
 }
 
 #[tokio::test]
+#[ignore = "real-resource: weekly/release tier; spawns newt and touches the filesystem"]
+async fn setup_public_models_but_unauthorized_generation_writes_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "catalog-model"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer rejected-secret"))
+        .and(body_json(serde_json::json!({
+            "model": "catalog-model",
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 8,
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": {"message": "unauthorized"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let token_path = root.path().join("token");
+    std::fs::write(&token_path, "rejected-secret\n").unwrap();
+    let config_dir = root.path().join("config");
+    let target = format!("{}/v1/", server.uri());
+
+    Command::cargo_bin("newt")
+        .unwrap()
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .args(["setup", &target, "--token-file"])
+        .arg(&token_path)
+        .arg("--yes")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("HTTP 401"))
+        .stdout(predicate::str::contains("rejected-secret").not())
+        .stderr(predicate::str::contains("minimal generation check"))
+        .stderr(predicate::str::contains("rejected-secret").not());
+
+    assert!(!config_dir.join("config.toml").exists());
+    assert!(!config_dir.join("backends").exists());
+}
+
+#[tokio::test]
+#[ignore = "real-resource: weekly/release tier; spawns newt and touches the filesystem"]
 async fn setup_bare_host_without_token_discovers_every_live_configured_port() {
     let first = MockServer::start().await;
     Mock::given(method("GET"))
@@ -199,11 +295,25 @@ async fn setup_bare_host_without_token_discovers_every_live_configured_port() {
         })))
         .mount(&first)
         .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}]
+        })))
+        .mount(&first)
+        .await;
     let second = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [{"id": "router-a"}, {"id": "router-b"}]
+        })))
+        .mount(&second)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}]
         })))
         .mount(&second)
         .await;

@@ -35,6 +35,8 @@ impl std::fmt::Display for ProbeHttpStatus {
     }
 }
 
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
+
 impl std::error::Error for ProbeHttpStatus {}
 
 #[derive(Debug)]
@@ -115,6 +117,353 @@ pub fn api_for_engine(kind: BackendKind, engine: Option<Engine>) -> &'static dyn
 /// The `anthropic-version` header value both the probe and the `/v1/messages`
 /// transport send. ONE const so the two can never drift.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+const MAX_GENERATION_PROBE_BODY_BYTES: usize = 64 * 1024;
+
+async fn read_generation_probe_body(
+    mut response: reqwest::Response,
+) -> Result<(reqwest::StatusCode, Vec<u8>), String> {
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GENERATION_PROBE_BODY_BYTES as u64)
+    {
+        return Err(format!(
+            "HTTP {status} response exceeds the {MAX_GENERATION_PROBE_BODY_BYTES}-byte probe limit"
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if body.len().saturating_add(chunk.len()) > MAX_GENERATION_PROBE_BODY_BYTES {
+            return Err(format!(
+                "HTTP {status} response exceeds the {MAX_GENERATION_PROBE_BODY_BYTES}-byte probe limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((status, body))
+}
+
+fn auth_rejection(status: reqwest::StatusCode) -> Option<GenerationCheck> {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    )
+    .then(|| GenerationCheck::Rejected(status.as_u16()))
+}
+
+/// Result of a minimal real generation request used to gate setup. Model
+/// catalogs are discovery only: they can be public even when generation is
+/// not authorized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationCheck {
+    Accepted(Option<OpenAiApiSurface>),
+    Rejected(u16),
+    Unverified(String),
+}
+
+#[derive(Clone, Copy)]
+enum RequiredEnvelope {
+    OllamaMessage,
+    OpenAiChoices,
+    AnthropicContent,
+}
+
+fn classify_generation_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    required: RequiredEnvelope,
+    api: Option<OpenAiApiSurface>,
+) -> GenerationCheck {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return GenerationCheck::Rejected(status.as_u16());
+    }
+    if !status.is_success() {
+        return GenerationCheck::Unverified(format!("HTTP {status}"));
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return GenerationCheck::Unverified(format!(
+                "HTTP {status} returned invalid JSON: {error}"
+            ));
+        }
+    };
+    let valid = match required {
+        RequiredEnvelope::OllamaMessage => {
+            parsed["message"].is_object()
+                && (parsed["message"]["content"].is_string()
+                    || parsed["message"]["tool_calls"].is_array())
+        }
+        RequiredEnvelope::OpenAiChoices => parsed["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .is_some_and(|choice| {
+                let message = &choice["message"];
+                message["content"].is_string()
+                    || message["reasoning"].is_string()
+                    || message["reasoning_content"].is_string()
+                    || message["tool_calls"]
+                        .as_array()
+                        .is_some_and(|calls| !calls.is_empty())
+            }),
+        RequiredEnvelope::AnthropicContent => parsed["content"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+    };
+    if valid {
+        GenerationCheck::Accepted(api)
+    } else {
+        let field = match required {
+            RequiredEnvelope::OllamaMessage => "message",
+            RequiredEnvelope::OpenAiChoices => "choices[0].message",
+            RequiredEnvelope::AnthropicContent => "content",
+        };
+        GenerationCheck::Unverified(format!(
+            "HTTP {status} response has no valid `{field}` envelope"
+        ))
+    }
+}
+
+fn openai_chat_probe_body(model: &str, modern_budget: bool) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "stream": false,
+    });
+    let budget = if modern_budget {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    body[budget] = serde_json::json!(8);
+    body
+}
+
+fn rejects_legacy_max_tokens(status: reqwest::StatusCode, body: &[u8]) -> bool {
+    if !matches!(status.as_u16(), 400 | 422) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("max_tokens")
+        && [
+            "unsupported",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "unexpected",
+            "deprecated",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+async fn send_openai_chat_probe(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    api_key: Option<&str>,
+    modern_budget: bool,
+) -> Result<(reqwest::StatusCode, Vec<u8>), GenerationCheck> {
+    let mut request = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&openai_chat_probe_body(model, modern_budget));
+    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| GenerationCheck::Unverified(format!("{error:#}")))?;
+    if let Some(rejected) = auth_rejection(response.status()) {
+        return Err(rejected);
+    }
+    read_generation_probe_body(response)
+        .await
+        .map_err(GenerationCheck::Unverified)
+}
+
+fn classify_responses_generation(status: reqwest::StatusCode, body: &[u8]) -> GenerationCheck {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return GenerationCheck::Rejected(status.as_u16());
+    }
+    if !status.is_success() {
+        return GenerationCheck::Unverified(format!("HTTP {status}"));
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return GenerationCheck::Unverified(format!(
+                "HTTP {status} returned invalid JSON: {error}"
+            ));
+        }
+    };
+    if parsed["status"] == "incomplete"
+        && parsed["incomplete_details"]["reason"] == "max_output_tokens"
+        && parsed["output"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    {
+        return GenerationCheck::Accepted(Some(OpenAiApiSurface::Responses));
+    }
+    match crate::responses_wire::decode_response(&parsed) {
+        Ok(_) => GenerationCheck::Accepted(Some(OpenAiApiSurface::Responses)),
+        Err(error) => GenerationCheck::Unverified(format!(
+            "HTTP {status} returned an unusable Responses payload: {error}"
+        )),
+    }
+}
+
+async fn send_responses_generation_probe(
+    request: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+) -> GenerationCheck {
+    let request = match api_key.filter(|key| !key.trim().is_empty()) {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    };
+    match request.send().await {
+        Ok(response) => {
+            if let Some(rejected) = auth_rejection(response.status()) {
+                return rejected;
+            }
+            match read_generation_probe_body(response).await {
+                Ok((status, body)) => classify_responses_generation(status, &body),
+                Err(error) => GenerationCheck::Unverified(error),
+            }
+        }
+        Err(error) => GenerationCheck::Unverified(format!("{error:#}")),
+    }
+}
+
+async fn send_generation_probe(
+    request: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+    required: RequiredEnvelope,
+    api: Option<OpenAiApiSurface>,
+) -> GenerationCheck {
+    let request = match api_key.filter(|key| !key.trim().is_empty()) {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    };
+    match request.send().await {
+        Ok(response) => {
+            if let Some(rejected) = auth_rejection(response.status()) {
+                return rejected;
+            }
+            match read_generation_probe_body(response).await {
+                Ok((status, body)) => classify_generation_response(status, &body, required, api),
+                Err(error) => GenerationCheck::Unverified(error),
+            }
+        }
+        Err(error) => GenerationCheck::Unverified(format!("{error:#}")),
+    }
+}
+
+/// Verify a selected endpoint/model with a minimal real generation request.
+/// `api = None` auto-negotiates an OpenAI-compatible endpoint by trying Chat
+/// Completions first and Responses only when Chat is absent or explicitly
+/// redirects to Responses.
+pub async fn verify_generation(
+    client: &reqwest::Client,
+    kind: BackendKind,
+    api: Option<OpenAiApiSurface>,
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> GenerationCheck {
+    let base = endpoint.trim_end_matches('/');
+    match kind {
+        BackendKind::Ollama => {
+            let body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false,
+                "options": {"num_predict": 1},
+            });
+            send_generation_probe(
+                client.post(format!("{base}/api/chat")).json(&body),
+                api_key,
+                RequiredEnvelope::OllamaMessage,
+                None,
+            )
+            .await
+        }
+        BackendKind::Openai => {
+            if api != Some(OpenAiApiSurface::Responses) {
+                let (mut status, mut body) =
+                    match send_openai_chat_probe(client, base, model, api_key, false).await {
+                        Ok(result) => result,
+                        Err(result) => return result,
+                    };
+                if rejects_legacy_max_tokens(status, &body) {
+                    (status, body) =
+                        match send_openai_chat_probe(client, base, model, api_key, true).await {
+                            Ok(result) => result,
+                            Err(result) => return result,
+                        };
+                }
+                if status.is_success() || api == Some(OpenAiApiSurface::ChatCompletions) {
+                    return classify_generation_response(
+                        status,
+                        &body,
+                        RequiredEnvelope::OpenAiChoices,
+                        Some(OpenAiApiSurface::ChatCompletions),
+                    );
+                }
+                let text = String::from_utf8_lossy(&body);
+                if status != reqwest::StatusCode::NOT_FOUND && !is_responses_only_error(&text) {
+                    return classify_generation_response(
+                        status,
+                        &body,
+                        RequiredEnvelope::OpenAiChoices,
+                        Some(OpenAiApiSurface::ChatCompletions),
+                    );
+                }
+            }
+            let body = crate::responses_wire::generation_probe_body(model);
+            send_responses_generation_probe(
+                client.post(format!("{base}/v1/responses")).json(&body),
+                api_key,
+            )
+            .await
+        }
+        BackendKind::Anthropic => {
+            let body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1,
+            });
+            let request = client
+                .post(format!("{base}/v1/messages"))
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&body);
+            let request = match api_key.filter(|key| !key.trim().is_empty()) {
+                Some(key) => request.header("x-api-key", key),
+                None => request,
+            };
+            match request.send().await {
+                Ok(response) => {
+                    if let Some(rejected) = auth_rejection(response.status()) {
+                        return rejected;
+                    }
+                    match read_generation_probe_body(response).await {
+                        Ok((status, body)) => classify_generation_response(
+                            status,
+                            &body,
+                            RequiredEnvelope::AnthropicContent,
+                            None,
+                        ),
+                        Err(error) => GenerationCheck::Unverified(error),
+                    }
+                }
+                Err(error) => GenerationCheck::Unverified(format!("{error:#}")),
+            }
+        }
+        BackendKind::Embedded => {
+            GenerationCheck::Unverified("embedded backends do not use an HTTP setup probe".into())
+        }
+    }
+}
 
 /// Ollama: `/api/tags` to list, `/api/show` for the window, always a
 /// time-multiplexer (many models loaded on demand). Bearer auth is sent when
@@ -939,6 +1288,14 @@ pub async fn detect_openai_api(
     if status.is_success() {
         return Ok(OpenAiApiSurface::ChatCompletions);
     }
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        anyhow::bail!(
+            "authentication rejected while detecting the OpenAI API surface (HTTP {status})"
+        );
+    }
     if is_responses_only_error(&body) {
         return Ok(OpenAiApiSurface::Responses);
     }
@@ -949,11 +1306,7 @@ pub async fn detect_openai_api(
 
     // Bare 404 on chat: see whether /v1/responses is the live surface.
     let responses_url = format!("{base}/v1/responses");
-    let responses_body = serde_json::json!({
-        "model": model,
-        "input": "ping",
-        "max_output_tokens": 1,
-    });
+    let responses_body = crate::responses_wire::generation_probe_body(model);
     let mut req = client.post(&responses_url).json(&responses_body);
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
         req = req.bearer_auth(key);
@@ -962,6 +1315,14 @@ pub async fn detect_openai_api(
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                anyhow::bail!(
+                    "authentication rejected while detecting the OpenAI API surface (HTTP {status})"
+                );
+            }
             if status.is_success()
                 || status != reqwest::StatusCode::NOT_FOUND
                 || is_responses_only_error(&body)
@@ -1230,6 +1591,121 @@ mod tests {
             managed: Some(mode),
             ..openai_backend(model, Some(Serving::Multiplexer))
         }
+    }
+
+    #[tokio::test]
+    async fn generation_probe_requires_an_authenticated_valid_chat_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer secret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "hi"}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = verify_generation(
+            &reqwest::Client::new(),
+            BackendKind::Openai,
+            Some(OpenAiApiSurface::ChatCompletions),
+            &server.uri(),
+            "selected-model",
+            Some("secret-token"),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            GenerationCheck::Accepted(Some(OpenAiApiSurface::ChatCompletions))
+        );
+        let requests = server.received_requests().await.expect("journal");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "selected-model");
+        assert_eq!(body["messages"][0]["content"], "Reply with OK.");
+        assert_eq!(body["max_tokens"], 8);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["stream"], false);
+    }
+
+    #[tokio::test]
+    async fn generation_probe_rejects_auth_and_malformed_success_envelopes() {
+        let auth = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&auth)
+            .await;
+        assert_eq!(
+            verify_generation(
+                &reqwest::Client::new(),
+                BackendKind::Openai,
+                Some(OpenAiApiSurface::ChatCompletions),
+                &auth.uri(),
+                "m",
+                None,
+            )
+            .await,
+            GenerationCheck::Rejected(403)
+        );
+
+        let malformed = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "chat.completion"
+            })))
+            .mount(&malformed)
+            .await;
+        assert!(matches!(
+            verify_generation(
+                &reqwest::Client::new(),
+                BackendKind::Openai,
+                Some(OpenAiApiSurface::ChatCompletions),
+                &malformed.uri(),
+                "m",
+                None,
+            )
+            .await,
+            GenerationCheck::Unverified(reason) if reason.contains("no valid `choices[0].message`")
+        ));
+    }
+
+    #[tokio::test]
+    async fn generation_probe_negotiates_the_responses_surface_after_chat_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            verify_generation(
+                &reqwest::Client::new(),
+                BackendKind::Openai,
+                None,
+                &server.uri(),
+                "responses-model",
+                None,
+            )
+            .await,
+            GenerationCheck::Accepted(Some(OpenAiApiSurface::Responses))
+        );
+        let requests = server.received_requests().await.expect("journal");
+        let responses: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(responses["store"], false);
     }
 
     // ── ManagedMode::Shared adopt-warm (ADR docs/decisions/managed_backend.md) ──
@@ -1850,6 +2326,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(api, OpenAiApiSurface::ChatCompletions);
+    }
+
+    #[tokio::test]
+    async fn detect_openai_api_does_not_report_a_surface_after_auth_rejection() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let error = detect_openai_api(&reqwest::Client::new(), &server.uri(), "m", None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("authentication rejected"));
     }
 
     #[tokio::test]
