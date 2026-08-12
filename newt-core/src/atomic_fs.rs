@@ -42,6 +42,10 @@ impl Drop for LockGuard {
 /// Blocks up to a bounded number of retries; takes over a lock older than the
 /// stale threshold (a crashed writer). Returns a guard that releases on drop.
 pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
+    // Track whether the *last* contended iteration was a permission denial, so
+    // the bail below can tell a settling-lock retry apart from a genuinely
+    // unwritable directory (see the message branch).
+    let mut denied = false;
     for _ in 0..LOCK_RETRIES {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -53,20 +57,52 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
                     path: lock_path.to_path_buf(),
                 })
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // `AlreadyExists` is the POSIX "another holder has it" signal. On
+            // Windows a lock whose previous holder just dropped its guard can be
+            // in DELETE_PENDING state, and `create_new` then returns
+            // `PermissionDenied` (ERROR_ACCESS_DENIED / os error 5) instead of
+            // `AlreadyExists` — the deletion is still settling. Treat both as the
+            // same transient "contended, retry" condition: the exclusive
+            // `create_new` above is still the ONLY thing that ever grants the
+            // lock, so retrying here can never hand it to two writers, and a
+            // genuine persistent permission fault just exhausts the bounded
+            // retries and falls through to the bail below. Without this, a burst
+            // of concurrent `newt dock approve` on Windows fatally errors
+            // mid-write (seen as a flaky `concurrent_approvals_do_not_lost_update`
+            // on the Windows CI lane).
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                denied = e.kind() == std::io::ErrorKind::PermissionDenied;
                 let stale = std::fs::metadata(lock_path)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.elapsed().ok())
                     .is_some_and(|age| age > LOCK_STALE);
-                if stale {
-                    let _ = std::fs::remove_file(lock_path);
+                // Only skip the backoff if we actually reclaimed a stale lock;
+                // if the removal itself fails (e.g. an unwritable dir), fall
+                // through to the sleep so we can't busy-spin the whole budget.
+                if stale && std::fs::remove_file(lock_path).is_ok() {
                     continue;
                 }
                 std::thread::sleep(LOCK_RETRY_DELAY);
             }
             Err(e) => return Err(e.into()),
         }
+    }
+    // A persistent `PermissionDenied` is not contention — retrying won't help,
+    // so say so rather than misdiagnosing an unwritable lock directory as a
+    // racing writer.
+    if denied {
+        anyhow::bail!(
+            "could not acquire {} — permission denied (os error 5 / EACCES). If a prior writer \
+             just released it this is transient; a persistent denial means the lock directory \
+             is not writable — check its permissions/ownership",
+            lock_path.display()
+        );
     }
     anyhow::bail!(
         "could not acquire {} — another process appears to be writing it; try again",
