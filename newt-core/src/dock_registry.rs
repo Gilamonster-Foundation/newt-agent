@@ -721,6 +721,108 @@ mod tests {
         assert!(registry.approved("unknown").is_none());
     }
 
+    /// Linux adversarial (symlink handling of `docks.d`): `read_dir` +
+    /// `read_to_string` both FOLLOW symlinks, so an attacker who can plant a
+    /// symlink in the registry dir could point it at a bundle they control. The
+    /// operator-root SIGNATURE — not the path — is the boundary: a symlinked
+    /// bundle signed by a FOREIGN key is followed, read, and dropped, so
+    /// symlink-following is not an authority bypass. macOS follows symlinks the
+    /// same way; this pins that the decision is content-signature-based and
+    /// identical on both platforms (no divergence).
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_docks_entry_with_a_foreign_signature_is_dropped() {
+        use std::os::unix::fs::symlink;
+        let root = UserKey::generate(); // the real operator
+        let attacker = UserKey::generate(); // a foreign key the attacker holds
+                                            // The attacker signs a dock (approving pk 0) with THEIR key, out-of-tree.
+        let issuer = attacker.fingerprint().hex();
+        let signed = sign_record(&issuer, SUBJECT, record(), &attacker);
+        let bundle = DockBundle {
+            issuer,
+            subject: SUBJECT.into(),
+            docks: vec![signed],
+        };
+        let dir = TempDir::new().unwrap();
+        // Write the attacker bundle OUTSIDE the registry dir…
+        let external = dir.path().join("attacker-bundle.toml");
+        std::fs::write(&external, toml::to_string(&bundle).unwrap()).unwrap();
+        // …then plant a symlink to it inside ocap/docks.d/.
+        let docks = dir.path().join("ocap/docks.d");
+        std::fs::create_dir_all(&docks).unwrap();
+        symlink(&external, docks.join("evil.toml")).unwrap();
+
+        // Loaded against the REAL operator root: the symlinked foreign bundle is
+        // followed, read, and DROPPED (foreign issuer). No approval crosses.
+        let (registry, warnings) =
+            load_docks(&dir.path().join("config.toml"), Some(&root.public()));
+        assert!(
+            registry.approved(&fp(0)).is_none(),
+            "a foreign-signed symlinked dock must not approve anyone"
+        );
+        assert!(registry.is_empty());
+        assert!(
+            warnings.iter().any(|w| w.contains("foreign issuer")),
+            "the drop must be surfaced to the operator: {warnings:?}"
+        );
+    }
+
+    /// Linux adversarial (registry-dir case-sensitivity): the authority decision
+    /// is content-based (exact fingerprint string + operator signature), never
+    /// filesystem-case-based. (1) The `.toml` extension match is case-exact, so a
+    /// `peers.TOML` bundle is NOT loaded — fail-closed on a case-mismatched name,
+    /// never silently admitted. (2) `approved()` compares the fingerprint
+    /// exactly, with no case-folding, so an upper-cased variant of an approved
+    /// fingerprint is denied. On a case-INSENSITIVE fs (macOS default) filenames
+    /// may collide, but the signature/fingerprint decision is identical — the
+    /// only divergence is which files `read_dir` surfaces, never who is approved.
+    #[test]
+    fn the_authority_decision_is_case_exact_not_filesystem_case_dependent() {
+        let root = UserKey::generate();
+        let issuer = root.fingerprint().hex();
+
+        // A correctly-signed bundle, but saved with an UPPER-CASE extension.
+        let dir = TempDir::new().unwrap();
+        let docks = dir.path().join("ocap/docks.d");
+        std::fs::create_dir_all(&docks).unwrap();
+        std::fs::write(
+            docks.join("peers.TOML"),
+            toml::to_string(&DockBundle {
+                issuer: issuer.clone(),
+                subject: SUBJECT.into(),
+                docks: vec![sign_record(&issuer, SUBJECT, record(), &root)],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (registry, _w) = load_docks(&dir.path().join("config.toml"), Some(&root.public()));
+        assert!(
+            registry.is_empty(),
+            "a .TOML-extension bundle must not be loaded (extension match is case-exact, fail-closed)"
+        );
+
+        // A properly-named bundle: the exact fingerprint is approved, an
+        // upper-cased fingerprint (a different string) is not.
+        let dir2 = TempDir::new().unwrap();
+        write_bundle(
+            &dir2,
+            &DockBundle {
+                issuer: issuer.clone(),
+                subject: SUBJECT.into(),
+                docks: vec![sign_record(&issuer, SUBJECT, record(), &root)],
+            },
+        );
+        let (registry2, _w2) = load_docks(&dir2.path().join("config.toml"), Some(&root.public()));
+        assert!(
+            registry2.approved(&fp(0)).is_some(),
+            "the exact fingerprint is approved"
+        );
+        assert!(
+            registry2.approved(&fp(0).to_uppercase()).is_none(),
+            "an upper-cased fingerprint is NOT approved (no case-folding)"
+        );
+    }
+
     #[test]
     fn a_tampered_scope_or_foreign_issuer_is_dropped() {
         let root = UserKey::generate();
