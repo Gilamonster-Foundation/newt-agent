@@ -10,6 +10,7 @@ pub mod agents;
 pub mod answer_authz;
 pub mod api_surface;
 pub mod artifact;
+pub mod atomic_fs;
 pub mod backend_probe;
 pub mod build_info;
 pub mod caveats;

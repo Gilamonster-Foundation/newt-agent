@@ -306,6 +306,10 @@ pub fn approve_dock(
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{SUBJECT}.toml"));
 
+    // Hold the lock across the WHOLE read-modify-write so two concurrent
+    // `newt dock approve` cannot lost-update each other; the atomic write keeps
+    // a crash from truncating peers.toml (losing every approval).
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&path))?;
     let mut bundle = match std::fs::read_to_string(&path) {
         Ok(text) => toml::from_str::<DockBundle>(&text)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => DockBundle {
@@ -345,7 +349,7 @@ pub fn approve_dock(
     bundle
         .docks
         .push(sign_record(&issuer, SUBJECT, record, root_key));
-    std::fs::write(&path, toml::to_string(&bundle)?)?;
+    crate::atomic_fs::atomic_write(&path, toml::to_string(&bundle)?.as_bytes())?;
     Ok(path)
 }
 
@@ -369,6 +373,7 @@ pub fn revoke_dock(
     }
     let issuer = root_key.public().fingerprint().hex();
     let path = docks_dir(config_path).join(format!("{SUBJECT}.toml"));
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&path))?;
     let text = std::fs::read_to_string(&path)
         .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
     let mut bundle: DockBundle = toml::from_str(&text)?;
@@ -399,7 +404,7 @@ pub fn revoke_dock(
     record.issued_generation += 1;
     let fingerprint = record.peer_agent_fingerprint.clone();
     bundle.docks[index] = sign_record(&issuer, SUBJECT, record, root_key);
-    std::fs::write(&path, toml::to_string(&bundle)?)?;
+    crate::atomic_fs::atomic_write(&path, toml::to_string(&bundle)?.as_bytes())?;
     Ok(fingerprint)
 }
 
@@ -408,6 +413,7 @@ pub fn revoke_dock(
 pub fn revoke_all_docks(config_path: &Path, root_key: &UserKey) -> anyhow::Result<Vec<String>> {
     let issuer = root_key.public().fingerprint().hex();
     let path = docks_dir(config_path).join(format!("{SUBJECT}.toml"));
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&path))?;
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -427,7 +433,7 @@ pub fn revoke_all_docks(config_path: &Path, root_key: &UserKey) -> anyhow::Resul
         }
     }
     if !revoked.is_empty() {
-        std::fs::write(&path, toml::to_string(&bundle)?)?;
+        crate::atomic_fs::atomic_write(&path, toml::to_string(&bundle)?.as_bytes())?;
     }
     Ok(revoked)
 }
@@ -900,6 +906,46 @@ mod tests {
                 "a malformed-pubkey record must not load"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_approvals_do_not_lost_update() {
+        // Without the write lock, N concurrent `newt dock approve` processes each
+        // read the same bundle and the last writer clobbers the rest. The lock
+        // serializes the read-modify-write, so every distinct approval survives.
+        let root = UserKey::generate();
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let identity = dir.path().join("identity.pem");
+        root.save(&identity).unwrap();
+
+        let handles: Vec<_> = (0u8..6)
+            .map(|s| {
+                let config = config.clone();
+                let identity = identity.clone();
+                std::thread::spawn(move || {
+                    approve_dock_with_identity(
+                        &config,
+                        &identity,
+                        &agent_fingerprint_of_pubkey(&[s; 32]),
+                        &format!("peer-{s}"),
+                        &format!("{s:02x}").repeat(32),
+                        "mirror-inject",
+                        "tx",
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let (registry, _) = load_docks(&config, Some(&root.public()));
+        assert_eq!(
+            registry.live().len(),
+            6,
+            "every concurrent approval must survive the lock-serialized write"
+        );
     }
 
     #[test]
