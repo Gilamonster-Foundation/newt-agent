@@ -84,6 +84,9 @@ jobs:
       - name: Drive the dock lifecycle headlessly
         working-directory: newt-agent
         run: |
+          # Invoke by ABSOLUTE path so drive.sh's BASH_SOURCE-based $HERE (and
+          # the stub it loads) resolve unambiguously regardless of how deep the
+          # checkout is nested (path: newt-agent stacks under $GITHUB_WORKSPACE).
           NEWT_BIN="$PWD/target/debug/newt" \
           WEB_BIN="$PWD/newt-web/target/debug/newt-web" \
-          newt-web/tests/drive/drive.sh
+          bash "$PWD/newt-web/tests/drive/drive.sh"
