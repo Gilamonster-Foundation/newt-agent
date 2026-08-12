@@ -1,0 +1,71 @@
+# Native macOS security lane for the newt-web ⇄ mesh docking authority model.
+#
+# The dock authorization boundary (responder-side caller authz, per-op DockScope,
+# revocation linearization) is security-critical and macOS is the DEV platform
+# (ci.yml notes behaviour differs macOS vs Linux), so this lane runs the
+# newt-mesh dock tests — INCLUDING the ignored live loopback-QUIC three-agent
+# hostile test (`a_sibling_agent_the_operator_never_approved_is_denied_over_the_mesh`)
+# — natively on Apple silicon. Real QUIC, real envelope signing, real registry.
+#
+# Follows the repo's runner convention: `vars.GMF_MAC_RUNNER || 'macos-latest'`
+# (a NEW org/repo Actions variable mirroring GMF_LINUX_RUNNER) so a self-hosted
+# Apple-silicon box can be targeted while defaulting to the hosted arm64 runner.
+name: dock security (macOS)
+on:
+  pull_request:
+    paths:
+      - "newt-mesh/**"
+      - "newt-core/src/dock_registry.rs"
+      - "newt-core/src/atomic_fs.rs"
+      - ".github/workflows/dock-security-macos.yml"
+  push:
+    branches: [main, "release/**"]
+    paths:
+      - "newt-mesh/**"
+      - "newt-core/src/dock_registry.rs"
+      - ".github/workflows/dock-security-macos.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dock-authz-macos:
+    name: dock authorization (native macOS, live QUIC)
+    runs-on: ${{ vars.GMF_MAC_RUNNER || 'macos-latest' }}
+    steps:
+      # Side-by-side layout (newt-mesh path-deps the sibling agent-mesh).
+      - uses: actions/checkout@v4
+        with:
+          path: newt-agent
+      - uses: actions/checkout@v4
+        with:
+          repository: Gilamonster-Foundation/agent-mesh
+          ref: main # landed agent-mesh main (#75 RequestContext seam = 5ff8f3f); no unmerged-branch dep — certification binds to the resolved SHA in this run's checkout log
+          path: agent-mesh
+      # Certification: record the exact agent-mesh SHA this security lane built
+      # against, so the native-macOS dock-authz evidence binds to a specific
+      # landed commit (landed #75 = 5ff8f3f). Inspect this line in the job log.
+      - name: Record agent-mesh SHA under test
+        run: |
+          echo "agent-mesh SHA under test: $(git -C agent-mesh rev-parse HEAD)"
+          git -C agent-mesh log --oneline -1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: clippy (dock authz, -D warnings)
+        working-directory: newt-agent
+        run: cargo clippy --manifest-path newt-mesh/Cargo.toml --all-targets -- -D warnings
+
+      # The deterministic dock authz + scope + revocation unit tests.
+      - name: dock unit tests (deterministic)
+        working-directory: newt-agent
+        run: cargo test --manifest-path newt-mesh/Cargo.toml dock
+
+      # The security-critical LIVE tier: real loopback-QUIC three-agent hostile
+      # test proving an unapproved same-operator sibling is denied at the
+      # responder. Single-threaded per the repo's real-resource convention.
+      - name: dock authz over real loopback QUIC (three-agent hostile)
+        working-directory: newt-agent
+        run: cargo test --manifest-path newt-mesh/Cargo.toml dock -- --include-ignored --test-threads=1

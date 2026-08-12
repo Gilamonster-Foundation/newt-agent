@@ -31,6 +31,19 @@ base64 = "0.22"
 serde_json = "1"
 async-stream = "0.3"
 futures-core = "0.3"
+# Tiny blocking HTTP client for the MVP dock transport (pull a peer cockpit's
+# GET /api/sessions). default-features off = no TLS stack — loopback/LAN http
+# only; the agent-mesh session_streams transport replaces this behind the
+# `dock::DockSource` seam. Called inside spawn_blocking.
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+# The agent-mesh dock transport (Phase 2): newt-web path-deps the excluded
+# newt-mesh crate for NewtDockService/DockClient, pulling the QUIC stack into
+# newt-web's OWN isolated build (D1 — never the agent workspace graph). The
+# operator identity types come from the SAME path agent-mesh-protocol newt-mesh
+# uses (NOT the registry copy newt-core pulls), so a UserKey handed to the dock
+# client is the type the client expects.
+newt-mesh = { path = "../newt-mesh" }
+agent-mesh-core = { package = "agent-mesh-protocol", path = "../../agent-mesh/agent-mesh-protocol" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -3,18 +3,26 @@
 # HOOK PARITY EXCEPTION: the root pre-push hook mirrors ci.yml, not this
 # excluded-crate lane. Browser installation is CI-only; the exact local BAT/UAT
 # commands are pinned in newt-web/README.md.
+#
+# newt-web now path-deps the excluded `newt-mesh` (the agent-mesh dock client),
+# which path-deps the sibling `../../agent-mesh/agent-mesh-protocol`. So this lane
+# uses the SAME side-by-side checkout as mesh-integration.yml — this repo in
+# `newt-agent/` and Gilamonster-Foundation/agent-mesh in `agent-mesh/` — and runs
+# every cargo step from `newt-agent/`.
 name: newt-web
 on:
   pull_request:
     paths:
       - "newt-web/**"
       - "newt-core/**"
+      - "newt-mesh/**"
       - ".github/workflows/newt-web.yml"
   push:
     branches: [main, "release/**"]
     paths:
       - "newt-web/**"
       - "newt-core/**"
+      - "newt-mesh/**"
       - ".github/workflows/newt-web.yml"
   workflow_dispatch:
     inputs:
@@ -28,7 +36,17 @@ jobs:
     name: newt-web (Rust + headless acceptance)
     runs-on: ubuntu-latest
     steps:
+      # Side-by-side layout matching local development (and mesh-integration.yml):
+      #   $GITHUB_WORKSPACE/newt-agent   (this repo)
+      #   $GITHUB_WORKSPACE/agent-mesh   (the sibling path dep newt-mesh resolves)
       - uses: actions/checkout@v4
+        with:
+          path: newt-agent
+      - uses: actions/checkout@v4
+        with:
+          repository: Gilamonster-Foundation/agent-mesh
+          ref: main # landed agent-mesh main (#75 RequestContext seam = 5ff8f3f); no unmerged-branch dep — certification binds to the resolved SHA in this run's checkout log
+          path: agent-mesh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -36,40 +54,43 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: newt-web/package-lock.json
+          cache-dependency-path: newt-agent/newt-web/package-lock.json
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: newt-web
+          workspaces: newt-agent/newt-web
       - name: fmt check
+        working-directory: newt-agent
         run: cargo fmt --manifest-path newt-web/Cargo.toml -- --check
       - name: clippy (-D warnings)
+        working-directory: newt-agent
         run: cargo clippy --manifest-path newt-web/Cargo.toml --all-targets -- -D warnings
       - name: test
+        working-directory: newt-agent
         run: cargo test --manifest-path newt-web/Cargo.toml
       - name: Install headless-harness dependencies
-        working-directory: newt-web
+        working-directory: newt-agent/newt-web
         run: npm ci
       - name: Install headless Chromium
-        working-directory: newt-web
+        working-directory: newt-agent/newt-web
         run: npx playwright install chromium --with-deps
       # BAT is the deterministic browser smoke gate on PRs and main. A manual
       # UAT-only dispatch skips it; release/** runs both tiers below.
       - name: Headless BAT
         if: github.event_name != 'workflow_dispatch' || inputs.tier != 'uat'
-        working-directory: newt-web
+        working-directory: newt-agent/newt-web
         run: npm run test:bat
       # UAT uses the same simulated Ollama boundary but drives user-visible
       # phone-sized behavior. It gates release branches and is opt-in manually,
       # matching docs/testing/bat-uat.md's CI/CD tier split.
       - name: Headless UAT
         if: startsWith(github.ref, 'refs/heads/release/') || (github.event_name == 'workflow_dispatch' && inputs.tier != 'bat')
-        working-directory: newt-web
+        working-directory: newt-agent/newt-web
         run: npm run test:uat
       - name: Upload headless acceptance report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: newt-web-playwright-report
-          path: newt-web/playwright-report/
+          path: newt-agent/newt-web/playwright-report/
           if-no-files-found: ignore
           retention-days: 14

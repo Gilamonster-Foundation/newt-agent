@@ -1677,6 +1677,22 @@ pub(crate) fn run_chat(
         {
             // A fresh turn: reset the re-prompt budget (as the read path does).
             retry_budget = retry_max;
+            // Phase 1b (req 3): a web/dock inject is NOT operator keystrokes.
+            // Surface its provenance so the operator can see a remote prompt
+            // arrived rather than mistake it for something they typed — it still
+            // runs as D2 (this session stays the sole writer). Printed through
+            // the same line path as every other newt notice, between turns.
+            let preview: String = injected.body.chars().take(60).collect();
+            let ellipsis = if injected.body.chars().count() > 60 {
+                "…"
+            } else {
+                ""
+            };
+            print_newt(
+                &format!("[web] injected prompt → \"{preview}{ellipsis}\" (runs now; D2)"),
+                color,
+                verbose,
+            );
             (
                 ReadOutcome::Line(injected.body),
                 ModelInputOrigin::WebInjected {
@@ -2038,6 +2054,100 @@ pub(crate) fn run_chat(
                             "  https://github.com/Gilamonster-Foundation/newt-agent/tree/main/docs"
                         );
                         println!("  /help (command list) · /help <cmd> (command detail)");
+                        println!();
+                        continue;
+                    }
+                    // req 7: the operator's dock kill-switch. `/dock disable`
+                    // writes the `dock-exposure-disabled` marker in the config
+                    // dir that the co-located newt-web + its mesh responder both
+                    // check fail-closed, forcibly undocking THIS box from every
+                    // remote hub at once. `/dock status` reports the switch and
+                    // the signed approved-dock registry.
+                    if slash_body == "dock" || slash_body.starts_with("dock ") {
+                        let sub = slash_body.strip_prefix("dock").unwrap_or("").trim();
+                        let cfg_dir = newt_core::Config::user_config_dir();
+                        let marker = cfg_dir.as_ref().map(|d| d.join("dock-exposure-disabled"));
+                        match sub {
+                            "disable" | "off" => match marker.as_ref() {
+                                Some(m) => match std::fs::write(m, b"") {
+                                    Ok(()) => print_newt(
+                                        "remote HTMX docking DISABLED — every hub is forcibly undocked (fail-closed until `/dock enable`)",
+                                        color,
+                                        verbose,
+                                    ),
+                                    Err(e) => print_newt(
+                                        &format!("could not disable docking: {e}"),
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                None => print_newt(
+                                    "no config dir; cannot set the dock kill-switch",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            "enable" | "on" => {
+                                if let Some(m) = marker.as_ref() {
+                                    let _ = std::fs::remove_file(m);
+                                }
+                                print_newt(
+                                    "remote HTMX docking re-enabled — approved hubs may dock again",
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            "status" | "" => {
+                                let disabled =
+                                    marker.as_ref().is_some_and(|m| m.exists());
+                                print_newt(
+                                    &format!(
+                                        "remote HTMX docking: {}",
+                                        if disabled {
+                                            "DISABLED (kill-switch on)"
+                                        } else {
+                                            "enabled"
+                                        }
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                                if let (Some(dir), Some(cfg)) =
+                                    (cfg_dir.as_ref(), newt_core::Config::user_config_path())
+                                {
+                                    let identity = dir.join("identity.pem");
+                                    let (reg, _warn) =
+                                        newt_core::dock_registry::load_docks_with_identity(
+                                            &cfg, &identity,
+                                        );
+                                    let live = reg.live();
+                                    if live.is_empty() {
+                                        println!(
+                                            "  approved peers: none (approve with `newt dock approve`)"
+                                        );
+                                    } else {
+                                        println!("  approved peers:");
+                                        for d in live {
+                                            println!(
+                                                "    {} ({}…) {}",
+                                                d.peer_label,
+                                                &d.peer_agent_fingerprint
+                                                    [..12.min(d.peer_agent_fingerprint.len())],
+                                                d.scope.as_wire()
+                                            );
+                                        }
+                                    }
+                                    println!("  durable revoke: `newt dock revoke-all`");
+                                }
+                            }
+                            other => print_newt(
+                                &format!(
+                                    "unknown /dock subcommand `{other}` — try disable | enable | status"
+                                ),
+                                color,
+                                verbose,
+                            ),
+                        }
                         println!();
                         continue;
                     }

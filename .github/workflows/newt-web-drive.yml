@@ -1,0 +1,92 @@
+name: newt-web dock drive (E2E)
+
+# The expensive real-process tier for the docking feature: it launches the REAL
+# newt TUI (in tmux) and the REAL newt-web cockpit against a shared store, backed
+# by a stub Ollama, and drives the whole dock lifecycle — dock, multi-dock,
+# select, inject, undock — headlessly (newt-web/tests/drive/drive.sh). Per the
+# repo's testing doctrine, real-process E2E runs on the WEEKLY schedule + on
+# demand, not on every PR: it builds the full `newt` binary and spawns tmux +
+# multiple cockpits. The fast, deterministic pieces gate PRs elsewhere — the
+# dock unit tests in `newt-web.yml`, the `handle_dock` logic + (nightly) the
+# loopback-QUIC transport test in `mesh-integration.yml`.
+on:
+  schedule:
+    # Sundays 05:30 UTC — alongside the other weekly real-resource tiers.
+    - cron: "30 5 * * 0"
+  workflow_dispatch: {}
+  # Also run when the harness itself changes, so a harness edit is validated;
+  # feature-code changes rely on the weekly run + an on-demand dispatch.
+  push:
+    paths:
+      - "newt-web/tests/drive/**"
+      - ".github/workflows/newt-web-drive.yml"
+  pull_request:
+    paths:
+      - "newt-web/tests/drive/**"
+      - ".github/workflows/newt-web-drive.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: newt-web-drive-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  drive:
+    name: dock lifecycle (tmux TUI + cockpit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      # Side-by-side layout: newt-web (excluded crate) path-deps newt-mesh →
+      # the sibling `../../agent-mesh/agent-mesh-protocol`, so the cockpit build
+      # needs Gilamonster-Foundation/agent-mesh checked out next to this repo
+      # (same as mesh-integration.yml / newt-web.yml).
+      - uses: actions/checkout@v4
+        with:
+          path: newt-agent
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Gilamonster-Foundation/agent-mesh
+          ref: main # landed agent-mesh main (#75 RequestContext seam = 5ff8f3f); no unmerged-branch dep — certification binds to the resolved SHA in this run's checkout log
+          path: agent-mesh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: newt-web-drive
+          workspaces: newt-agent
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install tmux (the TUI is driven in a real tmux pane)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      # The harness drives the REAL binaries; build both. `newt` is the
+      # workspace binary (target/debug/newt); newt-web is the excluded crate
+      # (its own target dir). Both build from the newt-agent checkout.
+      - name: Build newt (the TUI binary)
+        working-directory: newt-agent
+        run: cargo build -p newt-agent --bin newt
+
+      - name: Build newt-web (the cockpit)
+        working-directory: newt-agent
+        run: cargo build --manifest-path newt-web/Cargo.toml
+
+      - name: Drive the dock lifecycle headlessly
+        working-directory: newt-agent
+        run: |
+          # Invoke by ABSOLUTE path so drive.sh's BASH_SOURCE-based $HERE (and
+          # the stub it loads) resolve unambiguously regardless of how deep the
+          # checkout is nested (path: newt-agent stacks under $GITHUB_WORKSPACE).
+          NEWT_BIN="$PWD/target/debug/newt" \
+          WEB_BIN="$PWD/newt-web/target/debug/newt-web" \
+          bash "$PWD/newt-web/tests/drive/drive.sh"

@@ -19,6 +19,7 @@ mod dgx_pull;
 pub mod dgx_registry;
 pub mod dgx_status;
 pub mod dgx_vllm;
+mod dock_cmd;
 mod doctor;
 pub mod help_suite;
 mod identity_cmd;
@@ -666,6 +667,14 @@ pub enum Command {
     Ocap {
         #[command(subcommand)]
         cmd: ocap_cmd::OcapCmd,
+    },
+    /// Manage approved docks for newt-web mesh docking (requirement 5). Approve
+    /// a peer agent (SAS-confirmed, root-key-signed) so a hub cockpit will
+    /// surface its sessions, list them, or revoke — the operator's standing,
+    /// revocable intent behind every remote dock.
+    Dock {
+        #[command(subcommand)]
+        cmd: dock_cmd::DockCmd,
     },
     /// Solve one task HEADLESS and emit a trace (Terminal-Bench / #1419). Drives
     /// the same agentic loop the TUI runs, non-interactively, and exits. Reads
@@ -1473,6 +1482,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Ocap { cmd } => {
             let code = ocap_cmd::run(cmd, cli.config.as_deref())?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Dock { cmd } => {
+            let code = dock_cmd::run(cmd, cli.config.as_deref())?;
             if code != 0 {
                 std::process::exit(code);
             }

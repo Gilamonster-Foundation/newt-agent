@@ -5,7 +5,7 @@
 //! (`agents.rs`); the front end is server-rendered HTML (`shell.rs`); this
 //! file is the composition root — routes, state, and the SSE bridge only.
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -16,6 +16,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 mod agents;
+mod dock;
 mod shell;
 
 use agents::{Registry, Spec};
@@ -104,7 +105,13 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/agents/:id/pending", get(pending_decision_route))
         .route("/agents/:id/decision", post(decide_route))
         .route("/agents/:id/events", get(agent_events))
-        .route("/agents/:id", axum::routing::delete(delete_agent));
+        .route("/agents/:id", axum::routing::delete(delete_agent))
+        .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/:id/transcript", get(api_transcript))
+        .route("/api/sessions/:id/inject", post(api_inject))
+        .route("/dock/panel", get(dock_panel_route))
+        .route("/dock/inject", post(dock_inject_route))
+        .route("/overview", get(overview_route));
     if let Some(header) = auth_header {
         gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
     }
@@ -395,6 +402,209 @@ fn store_paths() -> (std::path::PathBuf, std::path::PathBuf) {
     (state, ws)
 }
 
+/// The operator's "stop exposing my sessions to any hub" kill-switch
+/// (requirement 7 / `newt_web_docking` K5). MVP: a marker file in the state dir
+/// that the operator (the TUI `/dock disable`) creates; **fail-closed** — while
+/// present, every dock-read surface (`/api/sessions*`) refuses. The signed,
+/// root-key + `PromptWindow`-gated, live-terminating version is the Phase-5
+/// hardening; the mechanism (the peer refusing to be docked) is proven here.
+fn dock_exposure_disabled() -> bool {
+    let (state, _) = store_paths();
+    state.join("dock-exposure-disabled").exists()
+}
+
+/// `GET /api/sessions` — this cockpit's sessions as JSON, the machine-readable
+/// twin of `sessions_section`. It is the surface a **hub** reads to dock this
+/// instance's sessions (`dock::HttpDockSource`); a hub and a peer speak one wire
+/// type ([`dock::DockedSession`]). Behind the same auth gate as the rest — a
+/// dock must authenticate. Store errors render an empty list, never a 500.
+async fn api_sessions() -> axum::response::Response {
+    if dock_exposure_disabled() {
+        return (
+            StatusCode::FORBIDDEN,
+            "dock exposure disabled by the operator",
+        )
+            .into_response();
+    }
+    let (state, ws) = store_paths();
+    let sessions = tokio::task::spawn_blocking(move || {
+        let Ok(store) = newt_core::ConversationStore::new(&state, &ws, 1000) else {
+            return Vec::new();
+        };
+        store
+            .list_all()
+            .unwrap_or_default()
+            .into_iter()
+            .take(30)
+            .map(|(c, workspace)| {
+                let live = store
+                    .live_owner(&c.id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|owner| store.is_owner_live(&owner));
+                dock::DockedSession {
+                    id: c.id,
+                    title: c.title,
+                    workspace,
+                    turns: c.turn_count,
+                    live,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    axum::Json(sessions).into_response()
+}
+
+/// `GET /api/sessions/:id/transcript` — one session's transcript as JSON, the
+/// surface a hub reads to MIRROR a docked session (mirror-only, D2). Resolves
+/// the conversation's own workspace (store `load` is workspace-fenced) so the
+/// caller need not know it. 404 if the conversation is unknown here.
+async fn api_transcript(Path(id): Path<String>) -> impl IntoResponse {
+    if dock_exposure_disabled() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let (state, ws) = store_paths();
+    let transcript = tokio::task::spawn_blocking(move || {
+        let store = newt_core::ConversationStore::new(&state, &ws, 1000).ok()?;
+        let wspath = store
+            .list_all()
+            .ok()?
+            .into_iter()
+            .find(|(c, _)| c.id == id)
+            .map(|(_, w)| w)?;
+        let fenced =
+            newt_core::ConversationStore::new(&state, std::path::PathBuf::from(&wspath), 1000)
+                .ok()?;
+        let rec = fenced.load(&id).ok()?;
+        Some(dock::DockedTranscript {
+            title: rec.title,
+            turns: rec
+                .turns
+                .iter()
+                .map(|t| dock::DockedTurn {
+                    user: t.user.clone(),
+                    assistant: t.assistant.clone(),
+                })
+                .collect(),
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+    match transcript {
+        Some(t) => axum::Json(t).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DockPanelQuery {
+    peer: String,
+    conv: String,
+}
+
+/// `GET /dock/panel?peer=&conv=` — the hub side of SELECT: resolve the clicked
+/// peer, mirror its session's transcript into the shared `#panel` read-only. An
+/// unknown peer is refused (fail-closed); an unreachable one renders a notice.
+async fn dock_panel_route(Query(q): Query<DockPanelQuery>) -> impl IntoResponse {
+    let Some(peer) = dock::peer_by_label(&q.peer) else {
+        return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
+    };
+    match dock::fetch_transcript(&peer, &q.conv).await {
+        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
+        Err(e) => Html(format!(
+            r#"<p class="empty">dock unreachable: {}</p>"#,
+            shell::escape(&e)
+        ))
+        .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct InjectForm {
+    text: String,
+}
+
+/// `POST /api/sessions/:id/inject` — enqueue a prompt into THIS instance's
+/// session (the remote side of a dock inject). It is the exact D2 seam the local
+/// attach uses (`ConversationStore::inject_prompt`), exposed over HTTP: the
+/// running REPL here stays the sole writer, this only enqueues. Resolves the
+/// conversation's own workspace (inject is workspace-fenced). 404 if unknown.
+async fn api_inject(Path(id): Path<String>, Form(form): Form<InjectForm>) -> impl IntoResponse {
+    if dock_exposure_disabled() {
+        return StatusCode::FORBIDDEN;
+    }
+    let (state, ws) = store_paths();
+    let ok = tokio::task::spawn_blocking(move || {
+        let store = newt_core::ConversationStore::new(&state, &ws, 1000).ok()?;
+        let wspath = store
+            .list_all()
+            .ok()?
+            .into_iter()
+            .find(|(c, _)| c.id == id)
+            .map(|(_, w)| w)?;
+        let fenced =
+            newt_core::ConversationStore::new(&state, std::path::PathBuf::from(&wspath), 1000)
+                .ok()?;
+        fenced.inject_prompt(&id, &form.text, None).ok().map(|_| ())
+    })
+    .await
+    .ok()
+    .flatten()
+    .is_some();
+    if ok {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// `POST /dock/inject?peer=&conv=` — the hub side of inject-over-dock: ask the
+/// clicked peer to enqueue a prompt into its session (D2 — the remote host runs
+/// it and stays sole writer), then re-mirror the docked panel so the operator
+/// sees the enqueue land and the transcript catch up as the remote consumes it.
+async fn dock_inject_route(
+    Query(q): Query<DockPanelQuery>,
+    Form(form): Form<InjectForm>,
+) -> impl IntoResponse {
+    let Some(peer) = dock::peer_by_label(&q.peer) else {
+        return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
+    };
+    if let Err(e) = dock::peer_inject(&peer, &q.conv, &form.text).await {
+        return Html(format!(
+            r#"<p class="empty">dock inject failed: {}</p>"#,
+            shell::escape(&e)
+        ))
+        .into_response();
+    }
+    // Re-mirror: the remote may not have consumed yet; the operator sees the ask
+    // land and the transcript catches up on the next select/refresh.
+    match dock::fetch_transcript(&peer, &q.conv).await {
+        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
+        Err(e) => Html(format!(r#"<p class="empty">{}</p>"#, shell::escape(&e))).into_response(),
+    }
+}
+
+/// `GET /overview` — the self-refreshing docked + sessions region (req 3: the
+/// web stays coequal with the TUI). The page polls this every few seconds so a
+/// terminal-started session, or a docked peer's new turns, appear without an F5.
+/// View-only (D2). The open `#panel` is a sibling, so a refresh never disturbs
+/// the transcript the operator is reading.
+async fn overview_route() -> Html<String> {
+    Html(overview_fragment().await)
+}
+
+/// The docked + sessions sections, in the page's order.
+pub(crate) async fn overview_fragment() -> String {
+    format!(
+        "{}{}",
+        dock::docked_section().await,
+        sessions_section().await
+    )
+}
+
 /// The "sessions on this box" section: conversations in the shared store,
 /// each followable read-only (W4). Store errors render as an empty section —
 /// the cockpit must not die because the store isn't there yet.
@@ -477,6 +687,95 @@ async fn follow_session(
     Html(format!("{panel}\n{strip}"))
 }
 
+/// Mint a short-lived agent key for a mesh role under the operator's `UserKey`.
+fn mint_agent(
+    user: &agent_mesh_core::UserKey,
+    role: &str,
+    caps: Vec<String>,
+) -> agent_mesh_core::AgentKey {
+    agent_mesh_core::AgentKey::issue(
+        user,
+        agent_mesh_core::AgentMetadata {
+            role: role.into(),
+            host: "newt-web".into(),
+            capabilities: caps,
+            issued_at: "2026-01-01T00:00:00Z".into(), // a claim; expiry is generation-based
+            expires_at: None,
+            caveats: agent_mesh_core::Caveats::top(),
+        },
+    )
+}
+
+/// Bring up the agent-mesh dock (Phase 2). Loads the operator `UserKey` from the
+/// state dir (the SAME identity the TUI signs under, so a same-operator peer
+/// auto-teams); binds a dial `DockClient` so `/dock` can reach mesh peers; and,
+/// if `NEWT_WEB_MESH_BIND` is set, binds a `NewtDockService` responder so THIS
+/// cockpit's sessions are dockable over the mesh. Returns the responder to keep
+/// it alive. Fail-soft: no identity ⇒ mesh dock disabled (HTTP docks still work).
+async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
+    let (state, _) = store_paths();
+    let id_path = state.join("identity.pem");
+    let user = match agent_mesh_core::UserKey::load(&id_path) {
+        Ok(u) => u,
+        Err(why) => {
+            eprintln!(
+                "newt-web: mesh dock DISABLED — no operator identity at {} ({why})",
+                id_path.display()
+            );
+            return None;
+        }
+    };
+    // Tell the dock gate where the operator config + identity live so it can
+    // resolve the signed approved-dock registry (state/ocap/docks.d) before a
+    // mesh dial. The gate is fail-closed by default; NEWT_INSECURE_DOCK_NO_APPROVAL
+    // is the only (named, unsafe) way off.
+    dock::set_dock_identity(state.join("config.toml"), id_path.clone());
+    match newt_mesh::DockClient::bind(&user, mint_agent(&user, "newt-web-dock-client", vec![]), 0)
+        .await
+    {
+        Ok(client) => {
+            dock::set_dock_client(std::sync::Arc::new(client));
+            eprintln!("newt-web: mesh dock dial client bound");
+        }
+        Err(why) => eprintln!("newt-web: mesh dock client bind failed: {why}"),
+    }
+    let Ok(port_str) = std::env::var("NEWT_WEB_MESH_BIND") else {
+        return None; // not opted in to being dockable over the mesh
+    };
+    let port: u16 = port_str.trim().parse().unwrap_or(0);
+    let agent = mint_agent(
+        &user,
+        "newt-web-dock",
+        vec![newt_mesh::DOCK_CAPABILITY_TAG.to_string()],
+    );
+    match newt_mesh::NewtDockService::bind(&user, agent, state.clone(), port).await {
+        Ok(svc) => {
+            eprintln!(
+                "newt-web: mesh dock service on udp/{} (agent {}, pubkey {})",
+                svc.local_port(),
+                svc.agent_fingerprint().short(),
+                hex_lower(&svc.agent_pubkey()),
+            );
+            // The peer-side half of the dock cross-check: print this key's 6-word
+            // mnemonic so the operator running `newt dock approve` elsewhere can
+            // confirm the SAME words — a fingerprint match in friendly form.
+            eprintln!(
+                "newt-web: dock key words: {}",
+                newt_core::dock_registry::pubkey_words(&svc.agent_pubkey()).join(" ")
+            );
+            Some(svc)
+        }
+        Err(why) => {
+            eprintln!("newt-web: mesh dock service bind failed: {why}");
+            None
+        }
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[tokio::main]
 async fn main() {
     // D3 (LAN-bind posture): bind address comes from NEWT_WEB_BIND, defaulting
@@ -497,6 +796,9 @@ async fn main() {
         ),
         Err(why) => eprintln!("newt-web: passkey verification DISABLED — {why}"),
     }
+    // Phase 2: bring up the agent-mesh dock; hold the responder alive for the
+    // life of the process (dropping it would tear the bus down).
+    let _dock_service = init_mesh_dock().await;
     axum::serve(listener, app()).await.expect("serve");
 }
 

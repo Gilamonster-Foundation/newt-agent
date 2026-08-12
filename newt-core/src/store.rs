@@ -1354,6 +1354,32 @@ impl ConversationStore {
         Ok(out)
     }
 
+    /// A cheap cross-workspace **change cursor**: every conversation's id paired
+    /// with its current `activity_tick` (the §6 per-writer Lamport tick, which is
+    /// monotonic *per conversation* because the single-writer claim gives each
+    /// conversation one live writer at a time). A follower keeps the previous
+    /// snapshot and diffs it against the next: a **changed tick** = new turn(s);
+    /// an **id that appeared** = a new session; an **id that vanished** = a
+    /// deleted session. This is the one shared "did anything change" signal the
+    /// web cockpit and the RichTUI dock overview poll instead of each
+    /// independently re-reading whole conversations (W-coequal, newt_web_docking
+    /// K6). It is a deliberately narrow projection of the `list_all` scan — id +
+    /// tick only, no title/turn-count/path — so the hot refresh path stays cheap.
+    /// Ordered by id for a stable, allocation-free diff. Spans all workspaces.
+    pub fn session_change_index(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.lock_conn();
+        let mut stmt =
+            conn.prepare("SELECT c.id, c.activity_tick FROM conversations c ORDER BY c.id ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Enqueue a prompt injected from an ATTACH surface (newt-web, A3/W6) for
     /// the running session to consume as its next turn. This is the ONLY store
     /// write an attach surface makes — it never calls `create`/`claim`/
@@ -5320,6 +5346,61 @@ mod tests {
         // from ANOTHER workspace: re-open at B's path, load B's conversation.
         let follower = ConversationStore::new(root.path(), path_of(&b), 100).unwrap();
         assert_eq!(follower.load(&b).unwrap().title, "in B");
+    }
+
+    /// `session_change_index` is the shared coequal-refresh cursor (K6): a
+    /// follower diffs successive snapshots to learn what changed. A new turn
+    /// bumps exactly the touched conversation's tick; a new conversation appears;
+    /// the scan spans workspaces. Diffing two snapshots is how the web cockpit /
+    /// RichTUI dock overview refresh without re-reading whole conversations.
+    #[test]
+    fn session_change_index_tracks_appends_and_new_sessions_across_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let store_a = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+
+        let a = store_a.create("in A", None).unwrap();
+        store_a.append_turn(&a, "q1", "r1").unwrap();
+        let b = store_b.create("in B", None).unwrap();
+        store_b.append_turn(&b, "q1", "r1").unwrap();
+
+        // Snapshot 1 (from EITHER handle) spans both workspaces.
+        let snap1: std::collections::HashMap<String, i64> = store_a
+            .session_change_index()
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(snap1.len(), 2, "both workspaces' conversations are indexed");
+        assert!(snap1.contains_key(&a) && snap1.contains_key(&b));
+
+        // A new turn on A bumps A's tick and leaves B's tick unchanged.
+        store_a.append_turn(&a, "q2", "r2").unwrap();
+        let snap2: std::collections::HashMap<String, i64> = store_a
+            .session_change_index()
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(snap2[&a] > snap1[&a], "an append advances the touched tick");
+        assert_eq!(
+            snap2[&b], snap1[&b],
+            "an untouched conversation's tick holds"
+        );
+
+        // A brand-new conversation appears in the next snapshot (diff = new id).
+        let c = store_b.create("also in B", None).unwrap();
+        store_b.append_turn(&c, "q", "r").unwrap();
+        let snap3: std::collections::HashMap<String, i64> = store_a
+            .session_change_index()
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(snap3.len(), 3);
+        assert!(
+            !snap2.contains_key(&c) && snap3.contains_key(&c),
+            "a session that appeared between snapshots is a diff the follower can see"
+        );
     }
 
     /// The A3/W6 attach-inject inbox: enqueue is FIFO and idempotent, dequeue is

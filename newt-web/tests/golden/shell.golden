@@ -60,7 +60,7 @@
 <body>
 <header><h1>newt-web</h1></header>
 <main id="content">
-<section class="sessions"><h2>your sessions</h2><p class="hint">Durable conversations in the store — attach from anywhere; the running session stays the writer (D2).</p><p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section>
+<div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML"><section class="sessions"><h2>your sessions</h2><p class="hint">Durable conversations in the store — attach from anywhere; the running session stays the writer (D2).</p><p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section></div>
 <details class="spawn-wrap">
 <summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
 <form class="spawn" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
