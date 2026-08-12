@@ -41,8 +41,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Gilamonster-Foundation/agent-mesh
-          ref: feat/request-context-seam # PIN: agent-mesh#75 (RequestContext seam); revert to main on merge
+          ref: main # landed agent-mesh main (#75 RequestContext seam = 5ff8f3f); no unmerged-branch dep — certification binds to the resolved SHA in this run's checkout log
           path: agent-mesh
+      # Certification: record the exact agent-mesh SHA this security lane built
+      # against, so the native-macOS dock-authz evidence binds to a specific
+      # landed commit (landed #75 = 5ff8f3f). Inspect this line in the job log.
+      - name: Record agent-mesh SHA under test
+        run: |
+          echo "agent-mesh SHA under test: $(git -C agent-mesh rev-parse HEAD)"
+          git -C agent-mesh log --oneline -1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

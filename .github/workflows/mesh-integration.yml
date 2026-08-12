@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Gilamonster-Foundation/agent-mesh
-          ref: feat/request-context-seam  # PIN: agent-mesh#75 (RequestContext seam); revert to main on merge
+          ref: main # landed agent-mesh main (#75 RequestContext seam = 5ff8f3f); tracks main for nightly drift — certification binds to the resolved SHA in this run's checkout log
           path: agent-mesh
 
       - uses: dtolnay/rust-toolchain@stable
