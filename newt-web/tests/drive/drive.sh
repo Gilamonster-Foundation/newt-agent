@@ -21,6 +21,7 @@ NEWT_BIN="${NEWT_BIN:-$HOME/bin/newt}"
 WEB_BIN="${WEB_BIN:-$HOME/.cargo-target/newtweb/debug/newt-web}"
 SESS="drive-$$"      # peer 1 TUI session
 SESS2="drive2-$$"    # peer 2 TUI session (multi-dock)
+CSESS="drivec-$$"    # the `newt dock approve` ceremony pane (SAS confirm)
 PASS=0
 FAIL=0
 
@@ -35,6 +36,8 @@ STUB_PID=""; WEB_PID=""
 teardown() {
   tmux kill-session -t "$SESS" 2>/dev/null || true
   tmux kill-session -t "$SESS2" 2>/dev/null || true
+  tmux kill-session -t "$CSESS" 2>/dev/null || true
+  [ -n "$GHUB_PID" ] && kill "$GHUB_PID" 2>/dev/null || true
   [ -n "$HUB_PID" ] && kill "$HUB_PID" 2>/dev/null || true
   [ -n "$PEER2_PID" ] && kill "$PEER2_PID" 2>/dev/null || true
   [ -n "$WEB_PID" ] && kill "$WEB_PID" 2>/dev/null || true
@@ -74,7 +77,7 @@ start_tui() { # start_tui <tmux-session> <cfg-dir> <ws-dir>
 # Two PEER cockpits (each fronting a store with a session) + one HUB cockpit
 # (own empty store) that DOCKS both peers — the multi-dock overview.
 WEB_PORT=""; WEB_PID=""; PEER2_PORT=""; PEER2_PID=""; HUB_PORT=""; HUB_PID=""; DOCK_PEERS=""
-MESH_PUBKEY=""; MESH_PORT=""
+MESH_PUBKEY=""; MESH_PORT=""; GHUB_PORT=""; GHUB_PID=""
 _wait_web() { local port="$1" what="$2" log="$3"; for _ in $(seq 1 40); do wait_ms 0.3; curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && return 0; done; echo "newt-web ($what) never became ready"; cat "$log"; exit 2; }
 start_web() { # peer 1, shares the peer-1 store; ALSO exposes over the mesh
   WEB_PORT="$(free_port)"
@@ -103,6 +106,19 @@ start_hub() { # docks whatever is in DOCK_PEERS
     "$WEB_BIN" > "$WORK/hub.log" 2>&1 &
   HUB_PID=$!; _wait_web "$HUB_PORT" hub "$WORK/hub.log"
 }
+# A hub that ENFORCES the approved-dock registry (requirement 5): it will only
+# dial a mesh peer the operator has approved via `newt dock approve`.
+start_gated_hub() {
+  GHUB_PORT="$(free_port)"; mkdir -p "$WORK/ghub"
+  cp "$WORK/cfg/identity.pem" "$WORK/ghub/identity.pem"   # same operator → mesh auto-teams
+  NEWT_WEB_BIND="127.0.0.1:$GHUB_PORT" NEWT_WEB_AUTH_HEADER="" \
+    NEWT_WEB_STATE_DIR="$WORK/ghub" NEWT_WEB_WORKSPACE="$WORK/ghub" \
+    NEWT_WEB_REQUIRE_DOCK_APPROVAL=1 \
+    NEWT_WEB_DOCK_PEERS="meshpeer=mesh:$MESH_PUBKEY@127.0.0.1:$MESH_PORT" \
+    "$WEB_BIN" > "$WORK/ghub.log" 2>&1 &
+  GHUB_PID=$!; _wait_web "$GHUB_PORT" ghub "$WORK/ghub.log"
+}
+ghub_get() { curl -fsS "http://127.0.0.1:$GHUB_PORT$1"; }
 hub_get() { curl -fsS "http://127.0.0.1:$HUB_PORT$1"; }
 web_get()  { curl -fsS "http://127.0.0.1:$WEB_PORT$1"; }
 web_post() { local path="$1"; shift; curl -fsS -X POST "http://127.0.0.1:$WEB_PORT$path" "$@"; }
@@ -231,6 +247,55 @@ main() {
   rm -f "$WORK/cfg/dock-exposure-disabled"   # '/dock enable'
   hub_get / | grep -q 'hello from the driver' \
     && ok "re-enabling exposure re-docks the peer" || bad "re-enable did not restore the dock"
+
+  say "DOCKING CEREMONY (req 5: a gated hub dials a mesh peer ONLY after approval)"
+  if "$NEWT_BIN" dock --help >/dev/null 2>&1; then
+    start_gated_hub
+    # 1. Before approval, the gated hub REFUSES the mesh peer (fail-closed).
+    GBEFORE="$(ghub_get /)"
+    printf '%s' "$GBEFORE" | grep -q 'not approved' \
+      && ok "gated hub REFUSES the unapproved mesh peer (registry gate is load-bearing)" \
+      || bad "gated hub did not refuse the unapproved peer"
+    printf '%s' "$GBEFORE" | grep -q '· mesh · remote' \
+      && bad "gated hub mirrored an UNAPPROVED peer (gate bypassed!)" \
+      || ok "gated hub does NOT mirror the unapproved peer's session"
+
+    # 2. The operator runs the SAS ceremony: `newt dock approve` in a real TTY
+    #    (tmux), compares the 6-word SAS, and confirms with `y`.
+    tmux new-session -d -s "$CSESS" -x 200 -y 50 \
+      "'$NEWT_BIN' --config '$WORK/ghub/config.toml' dock approve --operator-key-path '$WORK/ghub/identity.pem' --pubkey '$MESH_PUBKEY' --label meshpeer; echo CEREMONY_EXIT=\$? >> '$WORK/ghub/approve.out'"
+    if tui_wait "$CSESS" 'y/N' 20; then
+      tui_capture "$CSESS" | grep -q 'SAS words' \
+        && ok "approve shows the 6-word SAS bound to the peer pubkey (the ceremony 'secret')" \
+        || bad "approve did not display the SAS words"
+      tmux send-keys -t "$CSESS" 'y' C-m
+      tui_wait "$CSESS" 'CEREMONY_EXIT=0' 15 || wait_ms 1.0
+    else
+      bad "approve did not reach the SAS confirm prompt"
+    fi
+    "$NEWT_BIN" --config "$WORK/ghub/config.toml" dock list --operator-key-path "$WORK/ghub/identity.pem" 2>/dev/null | grep -q 'meshpeer' \
+      && ok "the signed approval is recorded (newt dock list shows meshpeer)" \
+      || bad "the approval was not recorded in the registry"
+
+    # 3. After approval, the SAME gated hub now ADMITS the mesh peer.
+    GAFTER="$(ghub_get /)"
+    printf '%s' "$GAFTER" | grep -q '· mesh · remote' \
+      && ok "gated hub now ADMITS the approved peer and mirrors it over the mesh (ceremony end-to-end)" \
+      || bad "gated hub still refuses the peer after approval"
+
+    # 4. `/undock all` re-closes the gate (req 7). Terminal-gated, so drive it
+    #    through a real TTY too.
+    tmux kill-session -t "$CSESS" 2>/dev/null || true
+    tmux new-session -d -s "$CSESS" -x 200 -y 50 \
+      "'$NEWT_BIN' --config '$WORK/ghub/config.toml' dock revoke-all --operator-key-path '$WORK/ghub/identity.pem'; echo REVOKE_EXIT=\$? >> '$WORK/ghub/approve.out'"
+    tui_wait "$CSESS" 'y/N' 15 && tmux send-keys -t "$CSESS" 'y' C-m
+    tui_wait "$CSESS" 'REVOKE_EXIT=' 15 || wait_ms 1.0
+    "$NEWT_BIN" --config "$WORK/ghub/config.toml" dock list --operator-key-path "$WORK/ghub/identity.pem" 2>/dev/null | grep -q 'meshpeer' \
+      && bad "revoke-all did not remove the approval" \
+      || ok "newt dock revoke-all removes the approval (the /undock all write path)"
+  else
+    skip "docking ceremony E2E (needs a branch newt with 'dock'; set NEWT_BIN= to the built binary)"
+  fi
 
   say "still pending (later phases)"
   skip "wire /dock disable|enable as a TUI slash command      (newt-tui; sets the marker headlessly proven above)"
