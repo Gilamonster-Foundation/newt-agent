@@ -1677,6 +1677,22 @@ pub(crate) fn run_chat(
         {
             // A fresh turn: reset the re-prompt budget (as the read path does).
             retry_budget = retry_max;
+            // Phase 1b (req 3): a web/dock inject is NOT operator keystrokes.
+            // Surface its provenance so the operator can see a remote prompt
+            // arrived rather than mistake it for something they typed — it still
+            // runs as D2 (this session stays the sole writer). Printed through
+            // the same line path as every other newt notice, between turns.
+            let preview: String = injected.body.chars().take(60).collect();
+            let ellipsis = if injected.body.chars().count() > 60 {
+                "…"
+            } else {
+                ""
+            };
+            print_newt(
+                &format!("[web] injected prompt → \"{preview}{ellipsis}\" (runs now; D2)"),
+                color,
+                verbose,
+            );
             (
                 ReadOutcome::Line(injected.body),
                 ModelInputOrigin::WebInjected {

@@ -228,6 +228,9 @@ main() {
   tui_wait "$SESS" 'echo: DOCK_INJECT' 30 \
     && ok "the REMOTE host ran the injected prompt (it — not the hub — wrote the turn)" \
     || bad "remote did not run the dock inject"
+  tui_capture "$SESS" | grep -q '\[web\] injected' \
+    && ok "the TUI shows the inject's provenance (req 3: not mistaken for operator keystrokes)" \
+    || bad "the TUI did not surface the web-inject provenance line"
   hub_get "/dock/panel?peer=laptop-b&conv=$CONV" | grep -q 'echo: DOCK_INJECT' \
     && ok "hub re-mirrors the remote turn the dock inject produced (full D2 loop over a dock)" \
     || bad "hub did not mirror the remote turn"
@@ -319,7 +322,7 @@ main() {
 
   say "still pending (later phases)"
   skip "terminate an already-live dock the instant a revoke lands (verify_at(gen) push, not next re-check)"
-  skip "TUI notification lines on a web-injected prompt while idle (Phase 1b; drain-at-idle)"
+  skip "wake the idle TUI to drain an inject WITHOUT a keystroke (Phase 1b idle-wake; provenance line already lands at the turn boundary above)"
   skip "swap HTTP transport → agent-mesh session_streams      (Phase 2, behind dock::DockSource)"
 
   echo
