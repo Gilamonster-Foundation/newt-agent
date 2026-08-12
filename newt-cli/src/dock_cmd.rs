@@ -24,10 +24,10 @@ const DEFAULT_SCOPE: &str = "mirror-inject";
 
 #[derive(Subcommand, Debug)]
 pub enum DockCmd {
-    /// Approve a peer agent to dock into this hub. Derives the 6-word SAS from
-    /// the peer's pubkey, shows it for you to compare against the peer's own
-    /// display, and — on confirmation — writes a signed approval to
-    /// `~/.newt/ocap/docks.d/peers.toml`.
+    /// Approve a peer agent to dock into this hub. Shows the peer pubkey's 6-word
+    /// mnemonic — the SAME words the peer's own newt-web prints when it binds its
+    /// dock service — for you to compare, then (on confirmation) writes a signed
+    /// approval to `~/.newt/ocap/docks.d/peers.toml`.
     Approve {
         /// The peer's mesh agent public key, 64 hex chars (the `pubkey` the
         /// peer's `newt-web` prints when it binds its dock service).
@@ -147,7 +147,7 @@ fn run_approve(
     // cannot obtain the window and falls through to the decline arm.
     let window = newt_core::tty::Terminal::suspend_for_prompt();
     window.notice(&format!(
-        "dock approval for `{label}`\n  peer agent fp : {}\n  peer pubkey   : {}…\n  SAS words     : {}\ncompare the SAS words against the peer's own display before approving.",
+        "dock approval for `{label}`\n  peer agent fp : {}\n  peer pubkey   : {}…\n  key words     : {}\nThe peer's newt-web prints these SAME words when it binds its dock service —\nconfirm they match before approving (a cross-check of the peer's key, not a\ntwo-party anti-MITM SAS: same-operator trust is already proven by the mesh handshake).",
         &peer_fp[..16.min(peer_fp.len())],
         &pubkey_hex[..16.min(pubkey_hex.len())],
         ceremony.sas_words.join(" "),

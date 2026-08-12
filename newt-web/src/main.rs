@@ -756,6 +756,13 @@ async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
                 svc.agent_fingerprint().short(),
                 hex_lower(&svc.agent_pubkey()),
             );
+            // The peer-side half of the dock cross-check: print this key's 6-word
+            // mnemonic so the operator running `newt dock approve` elsewhere can
+            // confirm the SAME words — a fingerprint match in friendly form.
+            eprintln!(
+                "newt-web: dock key words: {}",
+                newt_core::dock_registry::pubkey_words(&svc.agent_pubkey()).join(" ")
+            );
             Some(svc)
         }
         Err(why) => {

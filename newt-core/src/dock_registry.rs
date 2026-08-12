@@ -484,20 +484,38 @@ const DOCK_RP_ID: &str = "newt-dock/v1";
 /// (`EdDSA`). It is a domain constant, not a negotiated value.
 const DOCK_COSE_ALG: i64 = -8;
 
-/// The human-verifiable output of a dock ceremony: the 6-word SAS the operator
-/// reads to confirm *which* peer they are approving, plus the transcript id the
-/// signed [`DockRecord`] commits to. Reuses the passkey SAS machinery
-/// ([`crate::sas_transcript`]) verbatim so there is one transcript codec, not
-/// two.
+/// A deterministic six-word mnemonic of a peer agent pubkey.
+///
+/// This is NOT a two-party SAS: it is a friendly rendering of the (public) key
+/// itself, so **any** party that knows the pubkey derives the identical words
+/// with no exchanged secret and no round-trip. That is exactly what makes it a
+/// real cross-check for same-operator docking — the peer's own newt-web prints
+/// these same words when it binds its dock service, and the approving operator
+/// confirms they match. (A genuine anti-MITM two-party SAS, where each side
+/// contributes fresh entropy, is the cross-operator Phase-6 work; there is no
+/// online adversary to grind against when both ends already hold the same key.)
+#[must_use]
+pub fn pubkey_words(pubkey: &[u8; 32]) -> [&'static str; crate::sas_transcript::SAS_WORD_COUNT] {
+    let mut payload = Vec::with_capacity(64);
+    payload.extend_from_slice(b"newt/dock-pubkey-words/v1");
+    push_field(&mut payload, pubkey);
+    crate::sas_transcript::sas_words(&Fingerprint::of_bytes(&payload))
+}
+
+/// The human-verifiable output of a dock approval: the 6-word mnemonic of the
+/// peer pubkey (reproducible by the peer — see [`pubkey_words`]) plus the
+/// transcript id the signed [`DockRecord`] commits to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockCeremony {
-    /// The transcript id, hex — stored as `DockRecord::transcript_id`.
+    /// The transcript id, hex — stored as `DockRecord::transcript_id`. Binds the
+    /// approval to the exact pubkey + a fresh nonce (per-approval uniqueness).
     pub transcript_id: String,
-    /// Six BIP-39 words derived from the transcript. The operator compares
-    /// these against the peer's own display to confirm the exact pubkey.
+    /// The peer pubkey's 6-word mnemonic ([`pubkey_words`]). The operator
+    /// confirms these match the words the peer's own newt-web prints — a
+    /// fingerprint cross-check, not a two-party SAS.
     pub sas_words: [&'static str; crate::sas_transcript::SAS_WORD_COUNT],
-    /// The commitment to `(peer_pubkey, blinding)`, hex — carried so a two-sided
-    /// ceremony (Phase 6, cross-operator) can open it; unused in the
+    /// The commitment to `(peer_pubkey, blinding)`, hex — carried so a real
+    /// two-party ceremony (Phase 6, cross-operator) can open it; unused in the
     /// single-terminal same-operator flow beyond binding the transcript.
     pub commitment: String,
 }
@@ -515,7 +533,7 @@ pub fn dock_ceremony(
     nonce: &[u8],
     blinding: &[u8],
 ) -> DockCeremony {
-    use crate::sas_transcript::{commit, sas_words, TranscriptInputs};
+    use crate::sas_transcript::{commit, TranscriptInputs};
     let commitment = commit(peer_pubkey, blinding);
     let peer_fp = Fingerprint::of_bytes(peer_pubkey).hex();
     let inputs = TranscriptInputs {
@@ -531,7 +549,10 @@ pub fn dock_ceremony(
     let transcript = inputs.transcript_id();
     DockCeremony {
         transcript_id: transcript.hex(),
-        sas_words: sas_words(&transcript),
+        // Display words are the PUBKEY's mnemonic (reproducible by the peer), not
+        // the secret transcript's — so "compare with the peer's display" is a
+        // check the peer can actually satisfy.
+        sas_words: pubkey_words(peer_pubkey),
         commitment: commitment.hex(),
     }
 }
@@ -816,23 +837,28 @@ mod tests {
     }
 
     #[test]
-    fn dock_ceremony_is_deterministic_and_bound_to_the_pubkey() {
+    fn dock_display_words_come_from_the_pubkey_so_the_peer_can_reproduce_them() {
         let pubkey = [3u8; 32];
-        let a = dock_ceremony("issuer-fp", "laptop-b", &pubkey, b"nonce-1", b"blind-1");
-        // Same inputs → same words (both terminals derive independently).
-        let again = dock_ceremony("issuer-fp", "laptop-b", &pubkey, b"nonce-1", b"blind-1");
-        assert_eq!(a, again);
-        assert_eq!(a.sas_words.len(), 6);
+        // The display words are the pubkey's own mnemonic — anyone holding the
+        // (public) key derives them identically, which is what lets the peer's
+        // newt-web show the SAME words for the operator to compare.
+        assert_eq!(pubkey_words(&pubkey), pubkey_words(&pubkey));
+        assert_ne!(pubkey_words(&pubkey), pubkey_words(&[4u8; 32]));
 
-        // A different peer pubkey → different words: the SAS is what the operator
-        // reads to catch a swapped key.
+        let a = dock_ceremony("issuer-fp", "laptop-b", &pubkey, b"nonce-1", b"blind-1");
+        assert_eq!(a.sas_words, pubkey_words(&pubkey));
+
+        // A fresh nonce gives a fresh transcript_id (per-approval record
+        // uniqueness) but the SAME display words — the words track the KEY, not a
+        // secret the peer never sees.
+        let rerun = dock_ceremony("issuer-fp", "laptop-b", &pubkey, b"nonce-2", b"blind-1");
+        assert_eq!(a.sas_words, rerun.sas_words);
+        assert_ne!(a.transcript_id, rerun.transcript_id);
+
+        // A different peer pubkey → different words: this is what catches a
+        // swapped key.
         let other = dock_ceremony("issuer-fp", "laptop-b", &[4u8; 32], b"nonce-1", b"blind-1");
         assert_ne!(a.sas_words, other.sas_words);
-        assert_ne!(a.transcript_id, other.transcript_id);
-
-        // A fresh nonce → fresh words even for the same peer (per-ceremony).
-        let rerun = dock_ceremony("issuer-fp", "laptop-b", &pubkey, b"nonce-2", b"blind-1");
-        assert_ne!(a.sas_words, rerun.sas_words);
     }
 
     #[test]

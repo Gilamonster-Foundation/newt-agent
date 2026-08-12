@@ -289,18 +289,27 @@ main() {
       && bad "gated hub mirrored an UNAPPROVED peer (gate bypassed!)" \
       || ok "gated hub does NOT mirror the unapproved peer's session"
 
-    # 2. The operator runs the SAS ceremony: `newt dock approve` in a real TTY
-    #    (tmux), compares the 6-word SAS, and confirms with `y`.
+    # 2. The operator runs `newt dock approve` in a real TTY (tmux), compares the
+    #    peer pubkey's 6-word mnemonic, and confirms with `y`. The KEY WORDS the
+    #    approve pane shows must be the SAME words the peer's own newt-web printed
+    #    when it bound its dock service — a genuine cross-check (both derive from
+    #    the shared pubkey), not a one-sided mnemonic.
+    PEER_WORD="$(grep -oE 'dock key words: [a-z]+' "$WORK/web.log" | head -1 | awk '{print $4}')"
     tmux new-session -d -s "$CSESS" -x 200 -y 50 \
       "'$NEWT_BIN' --config '$WORK/ghub/config.toml' dock approve --operator-key-path '$WORK/ghub/identity.pem' --pubkey '$MESH_PUBKEY' --label meshpeer; echo CEREMONY_EXIT=\$? >> '$WORK/ghub/approve.out'"
     if tui_wait "$CSESS" 'y/N' 20; then
-      tui_capture "$CSESS" | grep -q 'SAS words' \
-        && ok "approve shows the 6-word SAS bound to the peer pubkey (the ceremony 'secret')" \
-        || bad "approve did not display the SAS words"
+      tui_capture "$CSESS" | grep -q 'key words' \
+        && ok "approve shows the peer pubkey's 6-word mnemonic" \
+        || bad "approve did not display the key words"
+      if [ -n "$PEER_WORD" ] && tui_capture "$CSESS" | grep -q "$PEER_WORD"; then
+        ok "the approve words MATCH the peer's own newt-web display (real cross-check, not one-sided)"
+      else
+        bad "approve words did not match the peer's printed key words"
+      fi
       tmux send-keys -t "$CSESS" 'y' C-m
       tui_wait "$CSESS" 'CEREMONY_EXIT=0' 15 || wait_ms 1.0
     else
-      bad "approve did not reach the SAS confirm prompt"
+      bad "approve did not reach the confirm prompt"
     fi
     "$NEWT_BIN" --config "$WORK/ghub/config.toml" dock list --operator-key-path "$WORK/ghub/identity.pem" 2>/dev/null | grep -q 'meshpeer' \
       && ok "the signed approval is recorded (newt dock list shows meshpeer)" \
