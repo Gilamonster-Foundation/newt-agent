@@ -54,6 +54,8 @@ fn parse_shell_engine(
     Ok(s.parse::<newt_core::ShellEngine>()?)
 }
 
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
+
 /// Build a parser command graph with the shared `help` formatting applied to
 /// this command and all subcommands.
 pub fn help_command() -> clap::Command {
@@ -771,6 +773,11 @@ pub enum Command {
             requires = "target"
         )]
         token_file: Option<PathBuf>,
+
+        /// Model to verify and configure for the target endpoint. Required for
+        /// deterministic non-interactive selection from large public catalogs.
+        #[arg(long, requires = "target")]
+        model: Option<String>,
 
         /// Write the detected backend configuration without confirmation.
         #[arg(long, short = 'y', requires = "target")]
@@ -1540,13 +1547,15 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             target,
             token_env,
             token_file,
+            model,
             yes,
         } => match target {
             Some(target) => {
-                newt_tui::run_setup_target(
+                newt_tui::run_setup_target_with_model(
                     &target,
                     token_env.as_deref(),
                     token_file.as_deref(),
+                    model.as_deref(),
                     yes,
                     cli.config.as_deref(),
                 )
@@ -2258,11 +2267,13 @@ mod tests {
                 target,
                 token_env,
                 token_file,
+                model,
                 yes,
             }) => {
                 assert_eq!(target.as_deref(), Some("https://dgx1.home.lab:8000"));
                 assert_eq!(token_env.as_deref(), Some("DGX_TOKEN"));
                 assert_eq!(token_file, None);
+                assert_eq!(model, None);
                 assert!(yes);
             }
             other => panic!("expected setup command, got {other:?}"),
@@ -2328,6 +2339,7 @@ mod tests {
                 target: None,
                 token_env: None,
                 token_file: None,
+                model: None,
                 yes: false,
             })
         ));
@@ -2339,6 +2351,7 @@ mod tests {
             vec!["newt", "setup", "--yes"],
             vec!["newt", "setup", "--token-env", "DGX_TOKEN"],
             vec!["newt", "setup", "--token-file", "/tmp/dgx-token"],
+            vec!["newt", "setup", "--model", "served-model"],
         ] {
             let err = Cli::try_parse_from(args).unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);

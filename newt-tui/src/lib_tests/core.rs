@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn openai_surface_probe_skips_plain_http_multiplexers() {
+    assert!(!should_probe_openai_surface(
+        newt_core::BackendKind::Openai,
+        true,
+        "model",
+        "http://gpu-box:8000",
+        Some(newt_core::Serving::Multiplexer),
+    ));
+    assert!(should_probe_openai_surface(
+        newt_core::BackendKind::Openai,
+        true,
+        "model",
+        "http://127.0.0.1:8000",
+        Some(newt_core::Serving::Instance),
+    ));
+    assert!(should_probe_openai_surface(
+        newt_core::BackendKind::Openai,
+        true,
+        "model",
+        "https://inference.example.test",
+        Some(newt_core::Serving::Multiplexer),
+    ));
+}
+
+#[test]
 fn coauthor_trailer_uses_resolved_identity_email() {
     let id = newt_core::AgentIdentity::default();
     let tr = coauthor_trailer("nemotron-3-nano:30b", &id);
@@ -1165,3 +1190,5 @@ fn slash_unknown_returns_true() {
 fn slash_dgx_no_subcmd_returns_true() {
     assert!(dispatch_slash("/dgx", "/ws", false, false, false).unwrap());
 }
+
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12

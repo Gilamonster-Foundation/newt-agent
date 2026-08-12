@@ -46,6 +46,19 @@ use serde_json::Value;
 /// explicit and identical on every surface.
 pub const STORE_RESPONSE_SERVER_SIDE: bool = false;
 
+/// Minimal Responses request used by capability probes. Keeping it here
+/// preserves the same explicit no-storage policy as production requests.
+pub fn generation_probe_body(model: &str) -> Value {
+    serde_json::json!({
+        "model": model,
+        "input": "Reply with OK.",
+        "max_output_tokens": 16,
+        "store": STORE_RESPONSE_SERVER_SIDE,
+    })
+}
+
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
+
 /// Split chat-style messages into the Responses API's `(instructions, input)`:
 /// `system`/`developer` messages concatenate into top-level `instructions`;
 /// `user`/`assistant` become `input` message items with plain string content.

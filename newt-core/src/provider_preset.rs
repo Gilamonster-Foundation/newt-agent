@@ -91,6 +91,8 @@ pub struct ProviderPreset {
     pub default_max_tokens: Option<u32>,
 }
 
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
+
 impl ProviderPreset {
     /// The picker label: `display_name` else `name`.
     pub fn label(&self) -> &str {
@@ -204,6 +206,41 @@ pub fn endpoint_from_base_url(base_url: &str, mode: ApiMode) -> Result<String, S
     }
 }
 
+/// Refuse to transmit setup credentials to an implicit or remote plaintext
+/// destination. HTTPS is accepted everywhere; HTTP is accepted only for a
+/// loopback host used by local development servers.
+pub fn validate_authenticated_url(target: &str) -> anyhow::Result<()> {
+    let target = target.trim();
+    if !target.contains("://") {
+        anyhow::bail!(
+            "authenticated setup needs an explicit URL including its scheme; use https:// so \
+             the bearer token is not sent to inferred ports or plaintext transport"
+        );
+    }
+    let url = reqwest::Url::parse(target)
+        .map_err(|error| anyhow::anyhow!("invalid authenticated setup URL `{target}`: {error}"))?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = url.host_str().is_some_and(|host| {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if url.scheme() == "http" && loopback {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to send a bearer token to `{target}` over plaintext transport; use an https:// \
+         URL (http:// is allowed only for loopback)"
+    )
+}
+
 /// Whether a preset can be turned into a working backend today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresetSupport {
@@ -295,8 +332,12 @@ pub async fn list_models_for_preset(
     let PresetSupport::Supported { kind, endpoint, .. } = preset_support(p) else {
         anyhow::bail!("preset {} is not usable on this build", p.name);
     };
+    let has_key = api_key.is_some_and(|key| !key.trim().is_empty());
     if let Some(models_url) = p.models_url.as_deref().filter(|u| !u.trim().is_empty()) {
         if kind == BackendKind::Openai {
+            if has_key {
+                validate_authenticated_url(models_url)?;
+            }
             let mut req = client.get(models_url);
             if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
                 req = req.bearer_auth(key);
@@ -319,88 +360,45 @@ pub async fn list_models_for_preset(
             "models_url is only honored for openai-mode presets; using the wire's own catalog"
         );
     }
+    if has_key {
+        validate_authenticated_url(&endpoint)?;
+    }
     crate::backend_probe::api_for(kind)
         .list_models(client, &endpoint, api_key)
         .await
 }
 
-/// Verdict of a live credential test against a preset's endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyCheck {
-    /// The endpoint accepted the credential (any non-auth status counts —
-    /// a 404/429 still proves the key got past the gate).
     Accepted,
-    /// HTTP 401/403 — the key itself was refused.
     Rejected(u16),
-    /// The check couldn't run (network error, unsupported wire) — carries
-    /// the reason; the caller should continue rather than block setup.
     Unverified(String),
 }
 
-/// Test a pasted key against the preset's endpoint BEFORE setup writes
-/// anything, so a mistyped token surfaces in the wizard instead of as a 401
-/// on the first real message.
-///
-/// Wire-aware, because list endpoints don't uniformly enforce auth
-/// (measured: ollama.com serves `/api/tags` and `/api/show` to anyone and
-/// gates only generation) — so the ollama wire is tested with a 1-token
-/// `/api/chat` against the chosen model, while the openai and anthropic
-/// wires use their auth-gated `/v1/models`. Only 401/403 reject the key:
-/// any other reachable status proves the credential got past the gate.
+/// Test a pasted key against the preset's selected model before setup writes.
 pub async fn verify_key_for_preset(
     client: &reqwest::Client,
     p: &ProviderPreset,
     key: &str,
     model: &str,
 ) -> KeyCheck {
-    let PresetSupport::Supported { kind, endpoint, .. } = preset_support(p) else {
+    let PresetSupport::Supported {
+        kind,
+        api,
+        endpoint,
+    } = preset_support(p)
+    else {
         return KeyCheck::Unverified("preset is not usable on this build".into());
     };
-    let base = endpoint.trim_end_matches('/').to_string();
-    let classify = |status: reqwest::StatusCode| {
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            KeyCheck::Rejected(status.as_u16())
-        } else {
-            KeyCheck::Accepted
-        }
-    };
-    let sent = match kind {
-        BackendKind::Ollama => {
-            let body = serde_json::json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "stream": false,
-                "options": {"num_predict": 1},
-            });
-            client
-                .post(format!("{base}/api/chat"))
-                .bearer_auth(key)
-                .json(&body)
-                .send()
-                .await
-        }
-        BackendKind::Openai => {
-            client
-                .get(format!("{base}/v1/models"))
-                .bearer_auth(key)
-                .send()
-                .await
-        }
-        BackendKind::Anthropic => {
-            client
-                .get(format!("{base}/v1/models"))
-                .header("x-api-key", key)
-                .header("anthropic-version", crate::backend_probe::ANTHROPIC_VERSION)
-                .send()
-                .await
-        }
-        BackendKind::Embedded => {
-            return KeyCheck::Unverified("embedded backends take no key".into())
-        }
-    };
-    match sent {
-        Ok(resp) => classify(resp.status()),
-        Err(e) => KeyCheck::Unverified(format!("{e:#}")),
+    if let Err(error) = validate_authenticated_url(&endpoint) {
+        return KeyCheck::Unverified(error.to_string());
+    }
+    match crate::backend_probe::verify_generation(client, kind, api, &endpoint, model, Some(key))
+        .await
+    {
+        crate::backend_probe::GenerationCheck::Accepted(_) => KeyCheck::Accepted,
+        crate::backend_probe::GenerationCheck::Rejected(status) => KeyCheck::Rejected(status),
+        crate::backend_probe::GenerationCheck::Unverified(reason) => KeyCheck::Unverified(reason),
     }
 }
 
@@ -1213,6 +1211,30 @@ providers:
     }
 
     #[tokio::test]
+    async fn custom_models_url_refuses_a_bearer_over_remote_plaintext() {
+        let p = ProviderPreset {
+            name: "unsafe-catalog".into(),
+            base_url: "https://inference.example.test/v1".into(),
+            models_url: Some("http://192.0.2.10/catalog/models".into()),
+            ..Default::default()
+        };
+        let error = list_models_for_preset(&reqwest::Client::new(), &p, Some("sk-secret"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to send a bearer token"), "{error}");
+    }
+
+    #[test]
+    fn authenticated_urls_require_https_except_for_loopback() {
+        assert!(validate_authenticated_url("host.example:8000").is_err());
+        assert!(validate_authenticated_url("http://host.example:8000").is_err());
+        assert!(validate_authenticated_url("https://host.example:8000").is_ok());
+        assert!(validate_authenticated_url("http://127.0.0.1:8000").is_ok());
+        assert!(validate_authenticated_url("http://[::1]:8000").is_ok());
+    }
+
+    #[tokio::test]
     async fn default_catalog_goes_through_the_wire_api() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1282,20 +1304,20 @@ providers:
     }
 
     #[tokio::test]
-    async fn verify_key_openai_wire_uses_models_endpoint() {
+    async fn verify_key_openai_wire_uses_selected_model_chat() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
             .and(header("authorization", "Bearer sk-good"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": []
+                "choices": [{"message": {"content": "hi"}}]
             })))
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
             .mount(&server)
             .await;
@@ -1313,12 +1335,48 @@ providers:
             verify_key_for_preset(&client, &p, "sk-bad", "m").await,
             KeyCheck::Rejected(403)
         );
+        let requests = server.received_requests().await.expect("journal");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], serde_json::json!("m"));
+        assert_eq!(body["max_tokens"], serde_json::json!(8));
+    }
+
+    #[tokio::test]
+    async fn verify_chat_does_not_treat_a_public_model_catalog_as_auth() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "listed-but-gated"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            crate::backend_probe::verify_generation(
+                &reqwest::Client::new(),
+                BackendKind::Openai,
+                None,
+                &server.uri(),
+                "listed-but-gated",
+                None,
+            )
+            .await,
+            crate::backend_probe::GenerationCheck::Rejected(401)
+        );
     }
 
     #[tokio::test]
     async fn verify_key_unreachable_is_unverified_not_rejected() {
-        // A down endpoint must not block setup (and must not claim the key
-        // is bad — we simply don't know).
+        // A down endpoint is distinct from a rejected key, but setup still
+        // fails closed because no generation was verified.
         let p = ProviderPreset {
             name: "down".into(),
             base_url: "http://127.0.0.1:1/v1".into(),
