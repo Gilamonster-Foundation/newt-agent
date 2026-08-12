@@ -41,6 +41,13 @@ Thumbs.db
 *.js
 *.mjs
 *.cjs
+# …but the dock drive harness (newt-web-drive.yml) SHIPS a Node stub Ollama +
+# any JS helpers it drives; the blanket ignores above must not swallow them or
+# the "dock lifecycle (tmux TUI + cockpit)" E2E aborts at start_stub on every
+# clean checkout (CI included). Keep the drive harness's committed assets.
+!/newt-web/tests/drive/*.mjs
+!/newt-web/tests/drive/*.cjs
+!/newt-web/tests/drive/*.js
 node_modules/
 dist/
 *.tsbuildinfo
