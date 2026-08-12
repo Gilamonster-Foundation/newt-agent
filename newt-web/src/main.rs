@@ -110,7 +110,8 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/api/sessions/:id/transcript", get(api_transcript))
         .route("/api/sessions/:id/inject", post(api_inject))
         .route("/dock/panel", get(dock_panel_route))
-        .route("/dock/inject", post(dock_inject_route));
+        .route("/dock/inject", post(dock_inject_route))
+        .route("/overview", get(overview_route));
     if let Some(header) = auth_header {
         gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
     }
@@ -584,6 +585,24 @@ async fn dock_inject_route(
         Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
         Err(e) => Html(format!(r#"<p class="empty">{}</p>"#, shell::escape(&e))).into_response(),
     }
+}
+
+/// `GET /overview` — the self-refreshing docked + sessions region (req 3: the
+/// web stays coequal with the TUI). The page polls this every few seconds so a
+/// terminal-started session, or a docked peer's new turns, appear without an F5.
+/// View-only (D2). The open `#panel` is a sibling, so a refresh never disturbs
+/// the transcript the operator is reading.
+async fn overview_route() -> Html<String> {
+    Html(overview_fragment().await)
+}
+
+/// The docked + sessions sections, in the page's order.
+pub(crate) async fn overview_fragment() -> String {
+    format!(
+        "{}{}",
+        dock::docked_section().await,
+        sessions_section().await
+    )
 }
 
 /// The "sessions on this box" section: conversations in the shared store,

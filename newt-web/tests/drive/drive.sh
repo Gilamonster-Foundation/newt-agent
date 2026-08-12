@@ -248,6 +248,14 @@ main() {
   hub_get / | grep -q 'hello from the driver' \
     && ok "re-enabling exposure re-docks the peer" || bad "re-enable did not restore the dock"
 
+  say "COEQUAL REFRESH (req 3: the web self-refreshes so a TUI change needs no F5)"
+  web_get / | grep -q 'hx-get="/overview"' && web_get / | grep -q 'every 3s' \
+    && ok "the cockpit page polls /overview (docked + sessions self-refresh)" \
+    || bad "the page does not wire the self-refresh"
+  web_get /overview | grep -q 'hello from the driver' \
+    && ok "GET /overview reflects the shared store (the TUI session appears without a reload)" \
+    || bad "/overview did not reflect the store"
+
   say "DOCKING CEREMONY (req 5: a gated hub dials a mesh peer ONLY after approval)"
   if "$NEWT_BIN" dock --help >/dev/null 2>&1; then
     start_gated_hub

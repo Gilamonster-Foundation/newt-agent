@@ -299,7 +299,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <body>
 <header><h1>newt-web</h1></header>
 <main id="content">
-{docked}{sessions}
+<div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML">{docked}{sessions}</div>
 <details class="spawn-wrap">
 <summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
 <form class="spawn" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
