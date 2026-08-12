@@ -232,19 +232,31 @@ main() {
     && ok "hub re-mirrors the remote turn the dock inject produced (full D2 loop over a dock)" \
     || bad "hub did not mirror the remote turn"
 
-  say "UNDOCK / kill-switch (req 7: the operator forcibly stops exposing to any hub)"
-  touch "$WORK/cfg/dock-exposure-disabled"   # simulates the peer-1 TUI '/dock disable'
+  say "UNDOCK / kill-switch (req 7: the TUI forcibly stops exposing to any hub)"
+  # Driven through the REAL TUI slash command — `/dock disable` writes the marker
+  # the co-located newt-web + its mesh responder both honor (shared config dir).
+  if tui_send "$SESS" "/dock disable" && tui_wait "$SESS" 'DISABLED' 15; then
+    ok "the TUI '/dock disable' command runs (req-7 kill-switch surface)"
+  else
+    bad "the TUI '/dock disable' command did not confirm"
+  fi
+  [ -f "$WORK/cfg/dock-exposure-disabled" ] \
+    && ok "the TUI wrote the dock-exposure kill-switch marker" \
+    || bad "the marker was not written by the TUI command"
   c="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/api/sessions")"
-  [ "$c" = "403" ] && ok "disabled peer refuses the dock read fail-closed (/api/sessions → 403)" \
+  [ "$c" = "403" ] && ok "the co-located newt-web honors the TUI kill-switch (/api/sessions → 403)" \
     || bad "peer did not refuse while disabled ($c)"
   HUB2="$(hub_get /)"
   printf '%s' "$HUB2" | grep -q 'hello from the driver' \
     && bad "hub still surfaces the undocked peer's session" \
-    || ok "hub no longer surfaces peer-1's sessions (forcibly undocked)"
+    || ok "hub no longer surfaces peer-1's sessions (forcibly undocked from every hub)"
   printf '%s' "$HUB2" | grep -q 'second peer working on kyln' \
-    && ok "the OTHER peer (nuc) is unaffected — undock is per-peer" \
+    && ok "the OTHER peer (nuc) is unaffected — undock is per-box" \
     || bad "undocking peer-1 wrongly dropped peer-2"
-  rm -f "$WORK/cfg/dock-exposure-disabled"   # '/dock enable'
+  tui_send "$SESS" "/dock enable"; tui_wait "$SESS" 're-enabled' 15
+  [ -f "$WORK/cfg/dock-exposure-disabled" ] \
+    && bad "the TUI '/dock enable' did not clear the marker" \
+    || ok "the TUI '/dock enable' clears the marker"
   hub_get / | grep -q 'hello from the driver' \
     && ok "re-enabling exposure re-docks the peer" || bad "re-enable did not restore the dock"
 
@@ -306,8 +318,8 @@ main() {
   fi
 
   say "still pending (later phases)"
-  skip "wire /dock disable|enable as a TUI slash command      (newt-tui; sets the marker headlessly proven above)"
-  skip "sign + root-key/PromptWindow-gate + terminate live docks (Phase 5 hardening of the kill-switch)"
+  skip "terminate an already-live dock the instant a revoke lands (verify_at(gen) push, not next re-check)"
+  skip "TUI notification lines on a web-injected prompt while idle (Phase 1b; drain-at-idle)"
   skip "swap HTTP transport → agent-mesh session_streams      (Phase 2, behind dock::DockSource)"
 
   echo

@@ -2041,6 +2041,100 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
+                    // req 7: the operator's dock kill-switch. `/dock disable`
+                    // writes the `dock-exposure-disabled` marker in the config
+                    // dir that the co-located newt-web + its mesh responder both
+                    // check fail-closed, forcibly undocking THIS box from every
+                    // remote hub at once. `/dock status` reports the switch and
+                    // the signed approved-dock registry.
+                    if slash_body == "dock" || slash_body.starts_with("dock ") {
+                        let sub = slash_body.strip_prefix("dock").unwrap_or("").trim();
+                        let cfg_dir = newt_core::Config::user_config_dir();
+                        let marker = cfg_dir.as_ref().map(|d| d.join("dock-exposure-disabled"));
+                        match sub {
+                            "disable" | "off" => match marker.as_ref() {
+                                Some(m) => match std::fs::write(m, b"") {
+                                    Ok(()) => print_newt(
+                                        "remote HTMX docking DISABLED — every hub is forcibly undocked (fail-closed until `/dock enable`)",
+                                        color,
+                                        verbose,
+                                    ),
+                                    Err(e) => print_newt(
+                                        &format!("could not disable docking: {e}"),
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                None => print_newt(
+                                    "no config dir; cannot set the dock kill-switch",
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            "enable" | "on" => {
+                                if let Some(m) = marker.as_ref() {
+                                    let _ = std::fs::remove_file(m);
+                                }
+                                print_newt(
+                                    "remote HTMX docking re-enabled — approved hubs may dock again",
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            "status" | "" => {
+                                let disabled =
+                                    marker.as_ref().is_some_and(|m| m.exists());
+                                print_newt(
+                                    &format!(
+                                        "remote HTMX docking: {}",
+                                        if disabled {
+                                            "DISABLED (kill-switch on)"
+                                        } else {
+                                            "enabled"
+                                        }
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                                if let (Some(dir), Some(cfg)) =
+                                    (cfg_dir.as_ref(), newt_core::Config::user_config_path())
+                                {
+                                    let identity = dir.join("identity.pem");
+                                    let (reg, _warn) =
+                                        newt_core::dock_registry::load_docks_with_identity(
+                                            &cfg, &identity,
+                                        );
+                                    let live = reg.live();
+                                    if live.is_empty() {
+                                        println!(
+                                            "  approved peers: none (approve with `newt dock approve`)"
+                                        );
+                                    } else {
+                                        println!("  approved peers:");
+                                        for d in live {
+                                            println!(
+                                                "    {} ({}…) {}",
+                                                d.peer_label,
+                                                &d.peer_agent_fingerprint
+                                                    [..12.min(d.peer_agent_fingerprint.len())],
+                                                d.scope
+                                            );
+                                        }
+                                    }
+                                    println!("  durable revoke: `newt dock revoke-all`");
+                                }
+                            }
+                            other => print_newt(
+                                &format!(
+                                    "unknown /dock subcommand `{other}` — try disable | enable | status"
+                                ),
+                                color,
+                                verbose,
+                            ),
+                        }
+                        println!();
+                        continue;
+                    }
                     // #263: review surface for prompted permission decisions.
                     // Read-only by design — promoting an allow to a durable
                     // grant is a human editing [tui.permissions] in config.
