@@ -398,7 +398,9 @@ pub async fn verify_key_for_preset(
     {
         crate::backend_probe::GenerationCheck::Accepted(_) => KeyCheck::Accepted,
         crate::backend_probe::GenerationCheck::Rejected(status) => KeyCheck::Rejected(status),
-        crate::backend_probe::GenerationCheck::Unverified(reason) => KeyCheck::Unverified(reason),
+        crate::backend_probe::GenerationCheck::Unverified(reason) => {
+            KeyCheck::Unverified(reason.to_string())
+        }
     }
 }
 

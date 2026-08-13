@@ -37,12 +37,13 @@ use newt_core::provider_preset::{
     self, list_models_for_preset, preset_support,
     validate_authenticated_url as validate_authenticated_target, PresetSupport, ProviderPreset,
 };
-use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, Tier};
+use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, OpenAiApi, Tier};
 use std::collections::HashSet;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 const SETUP_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const GENERATION_CHECK_ATTEMPTS: usize = 3;
 
 fn setup_http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
@@ -149,6 +150,32 @@ async fn run_target_with(
     request: TargetSetupRequest<'_>,
     discovery: &Discovery,
 ) -> anyhow::Result<()> {
+    run_target_with_persist(
+        console,
+        client,
+        config_path,
+        request,
+        discovery,
+        |config_path, hits, token_env, token_file| {
+            persist_verified_setup(config_path, hits, token_env, token_file)
+        },
+    )
+    .await
+}
+
+async fn run_target_with_persist(
+    console: &mut dyn Console,
+    client: &reqwest::Client,
+    config_path: &Path,
+    request: TargetSetupRequest<'_>,
+    discovery: &Discovery,
+    persist: impl FnOnce(
+        &Path,
+        &[VerifiedTargetHit],
+        Option<&str>,
+        Option<&Path>,
+    ) -> anyhow::Result<Vec<PathBuf>>,
+) -> anyhow::Result<()> {
     let TargetSetupRequest {
         target,
         token_env,
@@ -207,14 +234,14 @@ async fn run_target_with(
         if hits.len() == 1 { "" } else { "s" }
     ));
     for hit in &hits {
-        let backend = backend_from_probe(hit, token_env, token_file.as_deref())?;
+        let backend = backend_from_verified_probe(hit, token_env, token_file.as_deref())?;
         console.say(&format!(
             "  {} ({:?}, {}, {} model{})",
             backend.name,
             backend.kind,
             backend.endpoint,
-            hit.models.len(),
-            if hit.models.len() == 1 { "" } else { "s" }
+            hit.probe.models.len(),
+            if hit.probe.models.len() == 1 { "" } else { "s" }
         ));
     }
 
@@ -229,7 +256,7 @@ async fn run_target_with(
         }
     }
 
-    let written = persist_detected_setup(config_path, &hits, token_env, token_file.as_deref())?;
+    let written = persist(config_path, &hits, token_env, token_file.as_deref())?;
     for path in &written {
         console.say(&format!("Wrote {}.", path.display()));
     }
@@ -240,13 +267,23 @@ async fn run_target_with(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct VerifiedTargetHit {
+    probe: EndpointProbeResult,
+    /// The surface that answered the setup generation. Chat stays unpinned in
+    /// newly written config (runtime still owns the tool-capability probe), but
+    /// retaining it here lets a rerun recognize a runtime-probed drop-in as the
+    /// same backend instead of allocating `-2`, `-3`, ... forever.
+    api: Option<OpenAiApi>,
+}
+
 async fn verify_target_hits(
     console: &mut dyn Console,
     client: &reqwest::Client,
     hits: Vec<EndpointProbeResult>,
     requested_model: Option<&str>,
     api_key: Option<&str>,
-) -> (Vec<EndpointProbeResult>, Vec<String>) {
+) -> (Vec<VerifiedTargetHit>, Vec<String>) {
     let supplied_key = api_key.is_some_and(|key| !key.trim().is_empty());
     let mut verified = Vec::with_capacity(hits.len());
     let mut failures = Vec::new();
@@ -262,7 +299,7 @@ async fn verify_target_hits(
             continue;
         };
         console.say(&format!(
-            "Testing a minimal chat at {} with {model}…",
+            "Testing a minimal generation at {} with {model}…",
             hit.endpoint
         ));
         match newt_core::backend_probe::verify_generation(
@@ -275,11 +312,11 @@ async fn verify_target_hits(
         )
         .await
         {
-            GenerationCheck::Accepted(_) => {
-                console.say("  ✓ chat accepted");
+            GenerationCheck::Accepted(api) => {
+                console.say("  ✓ generation accepted");
                 hit.models = vec![model.clone()];
                 hit.warm = vec![model];
-                verified.push(hit);
+                verified.push(VerifiedTargetHit { probe: hit, api });
             }
             GenerationCheck::Rejected(code) if supplied_key => failures.push(format!(
                 "{} rejected the token or model authorization for {model} (HTTP {code}); check --token-file/--token-env and model access",
@@ -314,89 +351,8 @@ enum Flow {
 struct PendingWizardToken {
     token: String,
     passphrase: Option<newt_core::secrets::SecretString>,
-}
-
-struct SetupFileSnapshot {
     path: PathBuf,
-    body: Option<Vec<u8>>,
-    permissions: Option<std::fs::Permissions>,
-}
-
-impl SetupFileSnapshot {
-    fn capture(path: PathBuf) -> anyhow::Result<Self> {
-        match std::fs::read(&path) {
-            Ok(body) => Ok(Self {
-                permissions: Some(std::fs::metadata(&path)?.permissions()),
-                path,
-                body: Some(body),
-            }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self {
-                path,
-                body: None,
-                permissions: None,
-            }),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn restore(&self) -> anyhow::Result<()> {
-        match self.body.as_deref() {
-            Some(body) => {
-                if let Some(parent) = self.path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&self.path, body)?;
-                if let Some(permissions) = &self.permissions {
-                    std::fs::set_permissions(&self.path, permissions.clone())?;
-                }
-                Ok(())
-            }
-            None => match std::fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error.into()),
-            },
-        }
-    }
-}
-
-fn with_setup_file_rollback<T>(
-    paths: Vec<PathBuf>,
-    write: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let mut snapshots = Vec::with_capacity(paths.len());
-    for path in paths {
-        if snapshots
-            .iter()
-            .any(|snapshot: &SetupFileSnapshot| snapshot.path == path)
-        {
-            continue;
-        }
-        snapshots.push(SetupFileSnapshot::capture(path)?);
-    }
-    match write() {
-        Ok(value) => Ok(value),
-        Err(write_error) => {
-            // A token write updates the in-process secret cache. Clear it when
-            // rolling disk state back so a restored backend cannot observe the
-            // abandoned replacement credential.
-            newt_core::secrets::session().reset_for_test();
-            let mut restore_errors = Vec::new();
-            for snapshot in snapshots.iter().rev() {
-                if let Err(error) = snapshot.restore() {
-                    restore_errors.push(format!("{}: {error:#}", snapshot.path.display()));
-                }
-            }
-            if restore_errors.is_empty() {
-                Err(write_error)
-            } else {
-                anyhow::bail!(
-                    "setup write failed ({write_error:#}); rollback also failed: {}",
-                    restore_errors.join("; ")
-                )
-            }
-        }
-    }
+    reference: String,
 }
 
 fn persist_interactive_backend(
@@ -412,8 +368,39 @@ fn persist_interactive_backend(
         cfg,
         backend,
         pending_token,
-        |cfg, path| cfg.save(path).map_err(anyhow::Error::from),
+        |staged, destination| destination.durable_replace(staged),
+        |staged, destination| {
+            destination
+                .durable_replace(staged)
+                .map_err(anyhow::Error::from)
+        },
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetupCommitStep {
+    PersistVersionedToken,
+    PublishBackendTuple,
+    SelectBackend,
+}
+
+const SETUP_COMMIT_STEPS: [SetupCommitStep; 3] = [
+    SetupCommitStep::PersistVersionedToken,
+    SetupCommitStep::PublishBackendTuple,
+    SetupCommitStep::SelectBackend,
+];
+
+/// One ordering choke point for the setup transaction.  The injected operation
+/// keeps failpoint tests filesystem-free while production supplies the durable
+/// file actions.  Publishing the backend only after its immutable credential
+/// exists is the coherence invariant.
+fn run_setup_commit(
+    mut apply: impl FnMut(SetupCommitStep) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for step in SETUP_COMMIT_STEPS {
+        apply(step)?;
+    }
+    Ok(())
 }
 
 fn persist_interactive_backend_with(
@@ -422,27 +409,144 @@ fn persist_interactive_backend_with(
     cfg: &Config,
     backend: &BackendConfig,
     pending_token: Option<&PendingWizardToken>,
-    save_config: impl FnOnce(&Config, &Path) -> anyhow::Result<()>,
+    publish_backend: impl FnOnce(
+        &Path,
+        &newt_core::atomic_fs::ResolvedPath,
+    ) -> Result<(), newt_core::atomic_fs::DurableReplaceError>,
+    commit_config: impl FnOnce(&Path, &newt_core::atomic_fs::ResolvedPath) -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
-    let backend_path = config_path
+    if let Some(parent) = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let setup_lock = acquire_setup_lock(config_path)?;
+
+    let logical_backend_path = config_path
         .with_file_name("backends")
         .join(format!("{}.toml", backend.name));
-    let mut protected_paths = vec![backend_path, config_path.to_path_buf()];
-    if pending_token.is_some() {
-        protected_paths.push(wizard_token_path(config_path, &backend.name)?);
-    }
-    with_setup_file_rollback(protected_paths, || {
-        if let Some(pending) = pending_token {
-            let reference = persist_wizard_token(console, config_path, &backend.name, pending)?;
-            if backend.api_key_file.as_deref() != Some(reference.as_str()) {
-                anyhow::bail!("internal token-reference mismatch for {}", backend.name);
-            }
+    let backend_destination = setup_config_destination(&logical_backend_path)?;
+    let config_destination = &setup_lock.destination;
+    let token_destination = pending_token
+        .map(|pending| setup_config_destination(&pending.path))
+        .transpose()?;
+    let token_reference = pending_token.map(|pending| pending.reference.clone());
+    if let Some(reference) = token_reference.as_deref() {
+        if backend.api_key_file.as_deref() != Some(reference) {
+            anyhow::bail!("internal token-reference mismatch for {}", backend.name);
         }
-        let dropin = newt_core::write_backend_dropin(config_path, backend)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        save_config(cfg, config_path)?;
-        Ok(dropin)
-    })
+    }
+
+    let backend_body = toml::to_string(backend)?;
+    let config_body = toml::to_string_pretty(cfg)?;
+    let mut backend_published = false;
+    let result = (|| {
+        let mut guard = SetupCommitGuard::default();
+        let backend_permissions = setup_file_permissions(backend_destination.as_path())?;
+        let backend_stage = guard.stage(
+            &backend_destination,
+            backend_body.as_bytes(),
+            backend_permissions.as_ref(),
+        )?;
+        let config_permissions = setup_file_permissions(config_destination.as_path())?;
+        let config_stage = guard.stage(
+            config_destination,
+            config_body.as_bytes(),
+            config_permissions.as_ref(),
+        )?;
+        let mut publish_backend = Some(publish_backend);
+        let mut commit_config = Some(commit_config);
+        run_setup_commit(|step| match step {
+            SetupCommitStep::PersistVersionedToken => {
+                if let (Some(pending), Some(destination)) =
+                    (pending_token, token_destination.as_ref())
+                {
+                    match std::fs::symlink_metadata(destination.as_path()) {
+                        Ok(_) => anyhow::bail!(
+                            "allocated credential path {} already exists; retry setup",
+                            destination.as_path().display()
+                        ),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    newt_core::secrets::store_token_at_resolved(
+                        destination,
+                        &pending.token,
+                        pending.passphrase.as_ref(),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                    guard.created.push(destination.as_path().to_path_buf());
+                    let resolved = newt_core::secrets::resolve_token_file(destination.as_path())
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                    if resolved.as_deref() != pending_token.map(|pending| pending.token.as_str()) {
+                        anyhow::bail!("stored token verification failed for {}", backend.name);
+                    }
+                }
+                Ok(())
+            }
+            SetupCommitStep::PublishBackendTuple => {
+                let publication = publish_backend
+                    .take()
+                    .expect("setup backend publication is called exactly once")(
+                    &backend_stage,
+                    &backend_destination,
+                );
+                if let Err(error) = publication {
+                    if error.committed() {
+                        guard
+                            .created
+                            .push(backend_destination.as_path().to_path_buf());
+                        guard.retain_created();
+                        backend_published = true;
+                    }
+                    return Err(error.into());
+                }
+                guard
+                    .created
+                    .push(backend_destination.as_path().to_path_buf());
+                // From here forward the immutable token/backend tuple is a
+                // valid commit that lock-free readers may retain. Never roll it
+                // back or delete its credential if later config selection
+                // fails; rerunning setup safely completes the final phase.
+                guard.retain_created();
+                backend_published = true;
+                Ok(())
+            }
+            SetupCommitStep::SelectBackend => {
+                // Replacing the backend above is the coherent
+                // endpoint/credential commit. Config only selects that
+                // already-complete tuple.
+                commit_config
+                    .take()
+                    .expect("setup config commit is called exactly once")(
+                    &config_stage,
+                    config_destination,
+                )?;
+                guard
+                    .created
+                    .push(config_destination.as_path().to_path_buf());
+                Ok(())
+            }
+        })?;
+        let _ = guard.finish();
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if backend_published {
+            anyhow::bail!(
+                "backend {} and its credential were published coherently, but setup could not \
+                 finish updating {} ({error:#}); re-run setup to finish",
+                backend.name,
+                config_path.display()
+            );
+        }
+        return Err(error);
+    }
+    if let Some(reference) = token_reference {
+        console.say(&format!("  → stored encrypted at {reference}"));
+    }
+    Ok(logical_backend_path)
 }
 
 type ConfiguredBackend = (Config, BackendConfig, Option<PendingWizardToken>);
@@ -484,7 +588,7 @@ async fn run_with_flow(
     // Multi-backend loop: each pass configures + writes ONE backend, then
     // offers another round — so anthropic + ollama.com + a LAN box can all
     // land in one sitting. With several written, the default is picked at
-    // the end (until then, last-written wins via each cfg.save).
+    // the end (until then, each committed setup round selects its backend).
     let mut written: Vec<String> = Vec::new();
     loop {
         let (cfg, backend, pending_token) = match choose_backend(console)? {
@@ -538,10 +642,7 @@ async fn run_with_flow(
         // Rewrite ONLY default_backend, preserving the config's other keys
         // and comments (the same comment-preserving editor `newt setup
         // <target>` uses).
-        let old_text = std::fs::read_to_string(config_path).unwrap_or_default();
-        let new_text =
-            Config::with_default_backend(&old_text, chosen).map_err(|e| anyhow::anyhow!(e))?;
-        std::fs::write(config_path, new_text)?;
+        persist_default_backend(config_path, chosen)?;
         console.say(&format!(
             "Default backend: {chosen} (/backends switches per session)."
         ));
@@ -549,6 +650,23 @@ async fn run_with_flow(
 
     console.say("Edit those files (or re-run `newt setup`) to change anything.");
     offer_identity(console);
+    Ok(())
+}
+
+fn persist_default_backend(config_path: &Path, chosen: &str) -> anyhow::Result<()> {
+    let setup_lock = acquire_setup_lock(config_path)?;
+    let destination = &setup_lock.destination;
+    let old_text = read_setup_config(destination.as_path())?;
+    let new_text = Config::with_default_backend(&old_text, chosen)?;
+    if new_text == old_text {
+        return Ok(());
+    }
+    let permissions = setup_file_permissions(destination.as_path())?;
+    let staged = stage_setup_file(destination, new_text.as_bytes(), permissions.as_ref())?;
+    if let Err(error) = destination.durable_replace(&staged) {
+        let _ = std::fs::remove_file(staged);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -755,9 +873,8 @@ async fn configure_custom_host(
             backend.api = api;
         }
         let pending_token = if let Some(key) = api_key {
-            let pending = collect_wizard_token(console, &key)?;
-            let reference = wizard_token_reference(config_path, &backend.name)?;
-            backend.api_key_file = Some(reference);
+            let pending = collect_wizard_token(console, &key, config_path, &backend.name)?;
+            backend.api_key_file = Some(pending.reference.clone());
             Some(pending)
         } else {
             None
@@ -778,11 +895,14 @@ async fn verify_custom_chat_with_retries(
     model: &str,
     mut api_key: Option<String>,
 ) -> anyhow::Result<(Option<String>, Option<newt_core::config::OpenAiApi>)> {
-    for _ in 0..3 {
+    for attempt in 0..GENERATION_CHECK_ATTEMPTS {
         if api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
             validate_authenticated_target(&hit.endpoint)?;
         }
-        console.say(&format!("Testing a minimal chat against {}…", hit.endpoint));
+        console.say(&format!(
+            "Testing a minimal generation against {}…",
+            hit.endpoint
+        ));
         match newt_core::backend_probe::verify_generation(
             client,
             hit.kind,
@@ -794,7 +914,7 @@ async fn verify_custom_chat_with_retries(
         .await
         {
             GenerationCheck::Accepted(api) => {
-                console.say("  ✓ chat accepted");
+                console.say("  ✓ generation accepted");
                 // A tool-free chat proves generation/authentication, but it
                 // cannot prove that agent tool calls work on Chat Completions.
                 // Leave Chat unpinned so the runtime tool-capability probe can
@@ -805,6 +925,9 @@ async fn verify_custom_chat_with_retries(
             }
             GenerationCheck::Rejected(code) => {
                 console.say(&format!("  ✗ authentication rejected (HTTP {code})"));
+                if attempt + 1 == GENERATION_CHECK_ATTEMPTS {
+                    break;
+                }
                 validate_authenticated_target(&hit.endpoint)?;
                 let key = console.ask_secret("API key (echoes as *, Enter to cancel): ")?;
                 let key = key.trim().to_string();
@@ -814,12 +937,12 @@ async fn verify_custom_chat_with_retries(
                 api_key = Some(key);
             }
             GenerationCheck::Unverified(reason) => {
-                console.say(&format!("  Could not verify chat ({reason})."));
-                anyhow::bail!("setup cancelled because chat verification did not pass");
+                console.say(&format!("  Could not verify generation ({reason})."));
+                anyhow::bail!("setup cancelled because generation verification did not pass");
             }
         }
     }
-    anyhow::bail!("authentication was rejected three times")
+    anyhow::bail!("authentication was rejected {GENERATION_CHECK_ATTEMPTS} times")
 }
 
 /// Nothing answered but the operator knows the endpoint: collect the wire and
@@ -867,9 +990,8 @@ async fn manual_backend_entry(
     let (config, mut backend) =
         build_backend_pair(&name, &url, &model, kind, serving, None, "manual");
     let pending_token = if let Some(key) = api_key {
-        let pending = collect_wizard_token(console, &key)?;
-        let reference = wizard_token_reference(config_path, &backend.name)?;
-        backend.api_key_file = Some(reference);
+        let pending = collect_wizard_token(console, &key, config_path, &backend.name)?;
+        backend.api_key_file = Some(pending.reference.clone());
         Some(pending)
     } else {
         None
@@ -1093,7 +1215,7 @@ async fn verify_key_with_retries(
     else {
         anyhow::bail!("preset {} is not usable on this build", preset.name);
     };
-    for _ in 0..3 {
+    for attempt in 0..GENERATION_CHECK_ATTEMPTS {
         if cred
             .probe_key
             .as_deref()
@@ -1102,7 +1224,7 @@ async fn verify_key_with_retries(
             validate_authenticated_target(&endpoint)?;
         }
         console.say(&format!(
-            "Testing a minimal chat against {}…",
+            "Testing a minimal generation against {}…",
             preset.base_url
         ));
         match newt_core::backend_probe::verify_generation(
@@ -1116,12 +1238,15 @@ async fn verify_key_with_retries(
         .await
         {
             GenerationCheck::Accepted(api) => {
-                console.say("  ✓ chat accepted");
+                console.say("  ✓ generation accepted");
                 let api = api.filter(|surface| *surface == newt_core::config::OpenAiApi::Responses);
                 return Ok((cred, api));
             }
             GenerationCheck::Rejected(code) => {
                 console.say(&format!("  ✗ authentication rejected (HTTP {code})"));
+                if attempt + 1 == GENERATION_CHECK_ATTEMPTS {
+                    break;
+                }
                 let ans = console.ask("Re-enter the key? [Y/n] ")?;
                 if !is_yes(&ans, true) {
                     anyhow::bail!("setup cancelled after authentication rejection");
@@ -1129,11 +1254,11 @@ async fn verify_key_with_retries(
                 cred = preset_pasted_key(console, preset, config_path)?;
             }
             GenerationCheck::Unverified(reason) => {
-                anyhow::bail!("minimal chat verification failed: {reason}");
+                anyhow::bail!("minimal generation verification failed: {reason}");
             }
         }
     }
-    anyhow::bail!("authentication was rejected three times")
+    anyhow::bail!("authentication was rejected {GENERATION_CHECK_ATTEMPTS} times")
 }
 
 /// The paste path shared by both preset branches: hidden input; Enter skips
@@ -1163,8 +1288,8 @@ fn preset_pasted_key(
             pending_token: None,
         });
     }
-    let pending = collect_wizard_token(console, &key)?;
-    let reference = wizard_token_reference(config_path, &preset.name)?;
+    let pending = collect_wizard_token(console, &key, config_path, &preset.name)?;
+    let reference = pending.reference.clone();
     Ok(WizardCred {
         api_key_env: None,
         api_key_file: Some(reference),
@@ -1176,6 +1301,8 @@ fn preset_pasted_key(
 fn collect_wizard_token(
     console: &mut dyn Console,
     token: &str,
+    config_path: &Path,
+    name: &str,
 ) -> anyhow::Result<PendingWizardToken> {
     console.say("Protect the stored key with a passphrase? Enter uses a machine-local key.");
     let pass = console.ask_secret("Passphrase (echoes as *): ")?;
@@ -1183,43 +1310,38 @@ fn collect_wizard_token(
         let trimmed = pass.trim();
         (!trimmed.is_empty()).then(|| newt_core::secrets::SecretString::from(trimmed.to_string()))
     };
+    let path = versioned_wizard_token_path(config_path, name)?;
+    let reference = collapse_home(&path);
     Ok(PendingWizardToken {
         token: token.to_string(),
         passphrase,
+        path,
+        reference,
     })
 }
 
-fn wizard_token_path(config_path: &Path, name: &str) -> anyhow::Result<PathBuf> {
+fn versioned_wizard_token_path(config_path: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.join("backends"))
         .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?
-        .join(format!("{name}.token.age")))
+        .join(format!(
+            "{name}.token.{}.age",
+            newt_core::atomic_fs::unique_suffix()
+        )))
 }
 
-fn wizard_token_reference(config_path: &Path, name: &str) -> anyhow::Result<String> {
-    Ok(collapse_home(&wizard_token_path(config_path, name)?))
-}
-
+#[cfg(test)]
 fn persist_wizard_token(
     console: &mut dyn Console,
-    config_path: &Path,
-    name: &str,
+    _config_path: &Path,
+    _name: &str,
     pending: &PendingWizardToken,
 ) -> anyhow::Result<String> {
-    let path = wizard_token_path(config_path, name)?;
-    let backends_dir = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("token path has no parent directory"))?;
-    let path = newt_core::secrets::store_token(
-        backends_dir,
-        name,
-        &pending.token,
-        pending.passphrase.as_ref(),
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
-    let reference = collapse_home(&path);
+    newt_core::secrets::store_token_at(&pending.path, &pending.token, pending.passphrase.as_ref())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let reference = pending.reference.clone();
     console.say(&format!("  → stored encrypted at {reference}"));
     Ok(reference)
 }
@@ -1675,9 +1797,24 @@ fn backend_from_probe(
     })
 }
 
-fn persist_detected_setup(
+fn backend_from_verified_probe(
+    verified: &VerifiedTargetHit,
+    token_env: Option<&str>,
+    token_file: Option<&Path>,
+) -> anyhow::Result<BackendConfig> {
+    let mut backend = backend_from_probe(&verified.probe, token_env, token_file)?;
+    // Responses is a definitive fallback after Chat was absent. A successful
+    // tool-free Chat request does not establish tool-call compatibility, so the
+    // runtime capability probe must remain authoritative for that surface.
+    backend.api = verified
+        .api
+        .filter(|surface| *surface == OpenAiApi::Responses);
+    Ok(backend)
+}
+
+fn persist_verified_setup(
     config_path: &Path,
-    probes: &[EndpointProbeResult],
+    probes: &[VerifiedTargetHit],
     token_env: Option<&str>,
     token_file: Option<&Path>,
 ) -> anyhow::Result<Vec<PathBuf>> {
@@ -1690,15 +1827,16 @@ fn persist_detected_setup(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let _lock = acquire_setup_lock(config_path)?;
-    let old_config = read_setup_config(config_path)?;
+    let setup_lock = acquire_setup_lock(config_path)?;
+    let old_config = read_setup_config(setup_lock.destination.as_path())?;
     let backend_dir = config_path.with_file_name("backends");
     let existing = read_existing_setup_backends(&backend_dir)?;
     let mut used_names: HashSet<String> = existing.iter().map(|item| item.name.clone()).collect();
     let token_file_ref = token_file.and_then(Path::to_str);
     let mut planned = Vec::with_capacity(probes.len());
 
-    for probe in probes {
+    for verified in probes {
+        let probe = &verified.probe;
         let normalized = normalize_setup_endpoint(&probe.endpoint)?;
         let base_name = backend_name(&probe.endpoint)?;
         if let Some(found) = existing
@@ -1706,7 +1844,7 @@ fn persist_detected_setup(
             .filter(|item| {
                 item.endpoint.as_deref() == Some(normalized.as_str())
                     && item.matches_token_reference(token_env, token_file_ref)
-                    && item.matches_probe(probe)
+                    && item.matches_probe(verified)
             })
             .min_by_key(|item| (item.name != base_name, item.name.as_str()))
         {
@@ -1732,7 +1870,7 @@ fn persist_detected_setup(
         }
 
         let name = allocate_backend_name(&base_name, &mut used_names);
-        let mut backend = backend_from_probe(probe, token_env, token_file)?;
+        let mut backend = backend_from_verified_probe(verified, token_env, token_file)?;
         backend.name.clone_from(&name);
         let body = toml::to_string(&backend)?;
         planned.push(PlannedSetupBackend {
@@ -1745,7 +1883,30 @@ fn persist_detected_setup(
 
     let default_name = &planned[0].name;
     let updated_config = Config::with_default_backend(&old_config, default_name)?;
-    commit_setup_plan(config_path, &old_config, &updated_config, &planned)
+    commit_setup_plan(
+        config_path,
+        &setup_lock.destination,
+        &old_config,
+        &updated_config,
+        &planned,
+    )
+}
+
+/// Test-only compatibility wrapper for the lower-level persistence regressions
+/// that construct already-detected probes without running generation.
+#[cfg(test)]
+fn persist_detected_setup(
+    config_path: &Path,
+    probes: &[EndpointProbeResult],
+    token_env: Option<&str>,
+    token_file: Option<&Path>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let verified: Vec<VerifiedTargetHit> = probes
+        .iter()
+        .cloned()
+        .map(|probe| VerifiedTargetHit { probe, api: None })
+        .collect();
+    persist_verified_setup(config_path, &verified, token_env, token_file)
 }
 
 #[derive(Debug)]
@@ -1767,15 +1928,23 @@ impl ExistingSetupBackend {
         self.api_key_env.as_deref() == env && self.api_key_file.as_deref() == file
     }
 
-    fn matches_probe(&self, probe: &EndpointProbeResult) -> bool {
+    fn matches_probe(&self, verified: &VerifiedTargetHit) -> bool {
+        let probe = &verified.probe;
         let kind_matches = self.kind == Some(probe.kind);
+        let api_matches = self.api.is_none()
+            || self.api == verified.api
+            // Setup deliberately persists Chat acceptance without a surface
+            // pin so runtime capability probing may select Responses.  Such a
+            // writeback is the same verified backend, not a name collision.
+            || (self.api == Some(OpenAiApi::Responses)
+                && verified.api == Some(OpenAiApi::ChatCompletions));
         let serving_matches = self.serving.is_none_or(|serving| serving == probe.serving);
         let model_matches = self
             .model
             .as_ref()
             .is_none_or(|model| probe.models.contains(model));
         kind_matches
-            && self.api.is_none()
+            && api_matches
             && serving_matches
             && model_matches
             && (!self.generated_by_setup || (self.serving.is_some() && self.model.is_some()))
@@ -1882,42 +2051,22 @@ fn allocate_backend_name(base: &str, used: &mut HashSet<String>) -> String {
 }
 
 #[derive(Debug)]
-struct SetupLock(PathBuf);
-
-impl Drop for SetupLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+struct SetupLock {
+    destination: newt_core::atomic_fs::ResolvedPath,
+    _guard: newt_core::atomic_fs::LockGuard,
 }
 
 fn acquire_setup_lock(config_path: &Path) -> anyhow::Result<SetupLock> {
-    let filename = config_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let path = config_path.with_file_name(format!(".{filename}.setup.lock"));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(_) => Ok(SetupLock(path)),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => anyhow::bail!(
-            "another setup process is updating {}; remove {} only if that process has stopped",
-            config_path.display(),
-            path.display()
-        ),
-        Err(error) => Err(error.into()),
-    }
+    let destination = setup_config_destination(config_path)?;
+    let guard = newt_core::atomic_fs::acquire_lock(&destination.lock_path())?;
+    Ok(SetupLock {
+        destination,
+        _guard: guard,
+    })
 }
 
-fn setup_config_destination(path: &Path) -> anyhow::Result<PathBuf> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Ok(std::fs::canonicalize(path)?),
-        Ok(_) => Ok(path.to_path_buf()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
-        Err(error) => Err(error.into()),
-    }
+fn setup_config_destination(path: &Path) -> anyhow::Result<newt_core::atomic_fs::ResolvedPath> {
+    newt_core::atomic_fs::ResolvedPath::resolve(path)
 }
 
 fn setup_file_permissions(path: &Path) -> anyhow::Result<Option<std::fs::Permissions>> {
@@ -1929,54 +2078,11 @@ fn setup_file_permissions(path: &Path) -> anyhow::Result<Option<std::fs::Permiss
 }
 
 fn stage_setup_file(
-    destination: &Path,
+    destination: &newt_core::atomic_fs::ResolvedPath,
     body: &[u8],
     permissions: Option<&std::fs::Permissions>,
 ) -> anyhow::Result<PathBuf> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", destination.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let filename = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("setup");
-    for attempt in 0_u16..100 {
-        let temp = parent.join(format!(
-            ".{filename}.newt-{}-{attempt}.tmp",
-            std::process::id()
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&temp) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        };
-        let result = file
-            .write_all(body)
-            .and_then(|()| {
-                if let Some(permissions) = permissions {
-                    file.set_permissions(permissions.clone())?;
-                }
-                Ok(())
-            })
-            .and_then(|()| file.sync_all());
-        if let Err(error) = result {
-            let _ = std::fs::remove_file(&temp);
-            return Err(error.into());
-        }
-        return Ok(temp);
-    }
-    anyhow::bail!(
-        "could not allocate a temporary file beside {}",
-        destination.display()
-    )
+    destination.stage_with_permissions(body, permissions, true)
 }
 
 #[derive(Default)]
@@ -1989,7 +2095,7 @@ struct SetupCommitGuard {
 impl SetupCommitGuard {
     fn stage(
         &mut self,
-        destination: &Path,
+        destination: &newt_core::atomic_fs::ResolvedPath,
         body: &[u8],
         permissions: Option<&std::fs::Permissions>,
     ) -> anyhow::Result<PathBuf> {
@@ -2001,6 +2107,10 @@ impl SetupCommitGuard {
     fn finish(mut self) -> Vec<PathBuf> {
         self.committed = true;
         std::mem::take(&mut self.created)
+    }
+
+    fn retain_created(&mut self) {
+        self.committed = true;
     }
 }
 
@@ -2017,67 +2127,69 @@ impl Drop for SetupCommitGuard {
     }
 }
 
-fn commit_backend_no_clobber(temp: &Path, destination: &Path) -> anyhow::Result<()> {
-    match std::fs::hard_link(temp, destination) {
+fn commit_backend_no_clobber(
+    temp: &Path,
+    destination: &newt_core::atomic_fs::ResolvedPath,
+) -> anyhow::Result<()> {
+    match destination.durable_create(temp) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(anyhow::anyhow!(
-            "backend {} appeared while setup was running; retry setup",
-            destination.display()
-        )),
-        Err(link_error) => {
-            let result = (|| -> io::Result<()> {
-                let mut source = std::fs::File::open(temp)?;
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt as _;
-                    options.mode(0o600);
-                }
-                let mut destination_file = options.open(destination)?;
-                let copy_result = std::io::copy(&mut source, &mut destination_file)
-                    .and_then(|_| {
-                        destination_file.set_permissions(source.metadata()?.permissions())
-                    })
-                    .and_then(|()| destination_file.sync_all());
-                if copy_result.is_err() {
-                    drop(destination_file);
-                    let _ = std::fs::remove_file(destination);
-                }
-                copy_result.map(|_| ())
-            })();
-            result.map_err(|fallback_error| {
-                anyhow::anyhow!(
-                    "could not create backend {} without overwriting a file \
-                     (hard link: {link_error}; no-clobber copy: {fallback_error})",
-                    destination.display()
-                )
-            })
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists) =>
+        {
+            Err(anyhow::anyhow!(
+                "backend {} appeared while setup was running; retry setup",
+                destination.as_path().display()
+            ))
         }
+        Err(error) => Err(error.context(format!(
+            "could not durably create backend {} without overwriting it",
+            destination.as_path().display()
+        ))),
     }
 }
 
 fn commit_setup_plan(
     config_path: &Path,
+    config_destination: &newt_core::atomic_fs::ResolvedPath,
     old_config: &str,
     updated_config: &str,
     planned: &[PlannedSetupBackend],
+) -> anyhow::Result<Vec<PathBuf>> {
+    commit_setup_plan_with(
+        config_path,
+        config_destination,
+        old_config,
+        updated_config,
+        planned,
+        |staged, destination| destination.durable_replace(staged),
+    )
+}
+
+fn commit_setup_plan_with(
+    config_path: &Path,
+    config_destination: &newt_core::atomic_fs::ResolvedPath,
+    old_config: &str,
+    updated_config: &str,
+    planned: &[PlannedSetupBackend],
+    commit_config: impl FnOnce(
+        &Path,
+        &newt_core::atomic_fs::ResolvedPath,
+    ) -> Result<(), newt_core::atomic_fs::DurableReplaceError>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut guard = SetupCommitGuard::default();
     let mut staged_backends = Vec::new();
     for backend in planned {
         if let Some(body) = backend.body.as_deref() {
-            staged_backends.push((
-                guard.stage(&backend.path, body, None)?,
-                backend.path.clone(),
-            ));
+            let destination = setup_config_destination(&backend.path)?;
+            staged_backends.push((guard.stage(&destination, body, None)?, destination));
         }
     }
-    let config_destination = setup_config_destination(config_path)?;
-    let config_permissions = setup_file_permissions(&config_destination)?;
+    let config_permissions = setup_file_permissions(config_destination.as_path())?;
     let config_stage = if updated_config != old_config {
         Some(guard.stage(
-            &config_destination,
+            config_destination,
             updated_config.as_bytes(),
             config_permissions.as_ref(),
         )?)
@@ -2089,9 +2201,10 @@ fn commit_setup_plan(
         .and_then(|name| name.to_str())
         .unwrap_or("config.toml");
     let backup_path = config_path.with_file_name(format!("{filename}.bak"));
+    let backup_destination = setup_config_destination(&backup_path)?;
     let backup_stage = if !old_config.is_empty() && updated_config != old_config {
         Some(guard.stage(
-            &backup_path,
+            &backup_destination,
             old_config.as_bytes(),
             config_permissions.as_ref(),
         )?)
@@ -2099,10 +2212,10 @@ fn commit_setup_plan(
         None
     };
     let previous_backup_stage = if backup_stage.is_some() {
-        match std::fs::read(&backup_path) {
+        match std::fs::read(backup_destination.as_path()) {
             Ok(body) => {
-                let permissions = setup_file_permissions(&backup_path)?;
-                Some(guard.stage(&backup_path, &body, permissions.as_ref())?)
+                let permissions = setup_file_permissions(backup_destination.as_path())?;
+                Some(guard.stage(&backup_destination, &body, permissions.as_ref())?)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
@@ -2111,7 +2224,7 @@ fn commit_setup_plan(
         None
     };
 
-    if config_stage.is_some() && read_setup_config(config_path)? != old_config {
+    if config_stage.is_some() && read_setup_config(config_destination.as_path())? != old_config {
         anyhow::bail!(
             "{} changed while setup was preparing its update; retry setup",
             config_path.display()
@@ -2120,29 +2233,40 @@ fn commit_setup_plan(
 
     for (temp, destination) in &staged_backends {
         commit_backend_no_clobber(temp, destination)?;
-        guard.created.push(destination.clone());
+        guard.created.push(destination.as_path().to_path_buf());
     }
-    if config_stage.is_some() && read_setup_config(config_path)? != old_config {
+    if config_stage.is_some() && read_setup_config(config_destination.as_path())? != old_config {
         anyhow::bail!(
             "{} changed while setup was preparing its update; retry setup",
             config_path.display()
         );
     }
     if let Some(temp) = backup_stage.as_ref() {
-        std::fs::rename(temp, &backup_path)?;
+        backup_destination.durable_replace(temp)?;
     }
     if let Some(temp) = config_stage.as_ref() {
-        if let Err(config_error) = std::fs::rename(temp, &config_destination) {
+        if let Err(config_error) = commit_config(temp, config_destination) {
+            if config_error.committed() {
+                // The new config may already select these drop-ins. Keep every
+                // prerequisite and its old-config backup even though the
+                // replacement's parent-directory sync failed.
+                guard.retain_created();
+                return Err(config_error.into());
+            }
             let restore_result = if let Some(previous) = previous_backup_stage.as_ref() {
-                std::fs::rename(previous, &backup_path)
+                backup_destination
+                    .durable_replace(previous)
+                    .map_err(anyhow::Error::from)
             } else {
-                std::fs::remove_file(&backup_path).or_else(|error| {
-                    if error.kind() == io::ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })
+                std::fs::remove_file(backup_destination.as_path())
+                    .or_else(|error| {
+                        if error.kind() == io::ErrorKind::NotFound {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })
+                    .map_err(anyhow::Error::from)
             };
             if let Err(restore_error) = restore_result {
                 anyhow::bail!(
@@ -2219,8 +2343,49 @@ fn build_ollama_config(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::ffi::{OsStr, OsString};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            // SAFETY: every caller is in the `serial(real_fs)` lane.
+            unsafe { std::env::set_var(key, value) };
+            guard
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            // SAFETY: every caller is in the `serial(real_fs)` lane.
+            unsafe { std::env::remove_var(key) };
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: every caller is in the `serial(real_fs)` lane. Drop
+            // restores state even when an assertion panics or `?` returns.
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     /// Scripted console: pops answers in order, records what was said.
     struct ScriptedConsole {
@@ -2465,13 +2630,181 @@ mod tests {
         assert_eq!(api, None, "runtime tool-capability probe must choose Chat");
     }
 
-    /// Real-resource grounding for the rollback helper and the production
-    /// `persist_interactive_backend` path: an injected final config failure
-    /// must restore a replaced token, backend drop-in, and config together.
+    #[tokio::test]
+    async fn setup_never_renders_provider_error_refusal_or_bearer_material() {
+        const BEARER_SENTINEL: &str = "setup-secret-must-not-escape";
+        const BODY_SENTINEL: &str = "setup-provider-body-must-not-escape";
+        let escape = char::from(27);
+        let bell = char::from(7);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {BEARER_SENTINEL}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {BEARER_SENTINEL}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "completed",
+                "error": {"message": format!(
+                    "{BEARER_SENTINEL} {BODY_SENTINEL} {escape}[31mred{bell}"
+                )},
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "refusal",
+                        "refusal": format!("{BODY_SENTINEL} {escape}[2J")
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let hit = EndpointProbeResult {
+            endpoint: server.uri(),
+            kind: BackendKind::Openai,
+            models: vec!["model".into()],
+            serving: newt_core::Serving::Instance,
+            engine: None,
+            warm: vec![],
+        };
+        let mut console = ScriptedConsole::new(&[]);
+
+        let error = verify_custom_chat_with_retries(
+            &mut console,
+            &reqwest::Client::new(),
+            &hit,
+            "model",
+            Some(BEARER_SENTINEL.into()),
+        )
+        .await
+        .unwrap_err();
+        let transcript = console.transcript();
+        let rendered_error = error.to_string();
+
+        assert!(transcript.contains("Responses generation payload was unusable"));
+        for rendered in [&transcript, &rendered_error] {
+            assert!(!rendered.contains(BEARER_SENTINEL));
+            assert!(!rendered.contains(BODY_SENTINEL));
+            assert!(!rendered.contains(escape));
+            assert!(!rendered.contains(bell));
+        }
+        assert!(console
+            .output
+            .iter()
+            .all(|line| !line.chars().any(char::is_control)));
+        assert!(!rendered_error.chars().any(char::is_control));
+    }
+
+    #[tokio::test]
+    async fn authentication_retry_does_not_collect_an_untested_final_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(GENERATION_CHECK_ATTEMPTS as u64)
+            .mount(&server)
+            .await;
+        let hit = EndpointProbeResult {
+            endpoint: server.uri(),
+            kind: BackendKind::Openai,
+            models: vec!["model".into()],
+            serving: newt_core::Serving::Instance,
+            engine: None,
+            warm: vec![],
+        };
+        let mut console = ScriptedConsole::new(&["first-key", "second-key", "must-remain"]);
+
+        let error = verify_custom_chat_with_retries(
+            &mut console,
+            &reqwest::Client::new(),
+            &hit,
+            "model",
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("authentication was rejected 3 times"),
+            "{error:#}"
+        );
+        assert_eq!(
+            console.answers.front().map(String::as_str),
+            Some("must-remain"),
+            "the final rejection must not prompt for a key setup cannot test"
+        );
+    }
+
+    #[tokio::test]
+    async fn preset_authentication_retry_does_not_collect_an_untested_final_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(GENERATION_CHECK_ATTEMPTS as u64)
+            .mount(&server)
+            .await;
+        let preset = ProviderPreset {
+            name: "test-provider".into(),
+            base_url: server.uri(),
+            env_vars: vec!["UNUSED_TEST_KEY".into()],
+            ..Default::default()
+        };
+        let cred = WizardCred {
+            api_key_env: None,
+            api_key_file: None,
+            probe_key: Some("initial-key".into()),
+            pending_token: None,
+        };
+        let mut console =
+            ScriptedConsole::new(&["Y", "first-key", "", "Y", "second-key", "", "must-remain"]);
+
+        let result = verify_key_with_retries(
+            &mut console,
+            &reqwest::Client::new(),
+            &preset,
+            Path::new("/unused/config.toml"),
+            "model",
+            cred,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("the provider should reject every attempted key"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("authentication was rejected 3 times"),
+            "{error:#}"
+        );
+        assert_eq!(
+            console.answers.front().map(String::as_str),
+            Some("must-remain"),
+            "the preset flow must not collect a final untested key"
+        );
+    }
+
+    /// Real-resource grounding for a late config-selection failure: once the
+    /// immutable token/backend tuple is published it remains coherent for
+    /// lock-free concurrent readers and an idempotent setup retry.
     #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
     #[serial_test::serial(real_fs)]
     #[test]
-    fn late_setup_write_failure_restores_token_backend_and_config() {
+    fn late_setup_write_failure_retains_a_coherent_backend_tuple() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("backends/example.token.age");
         let backend_path = dir.path().join("backends/example.toml");
@@ -2481,12 +2814,14 @@ mod tests {
         std::fs::write(&backend_path, b"old-backend").unwrap();
         std::fs::write(&config, b"old-config").unwrap();
 
+        let versioned_token = dir.path().join("backends/example.token.version.age");
+        let versioned_reference = collapse_home(&versioned_token);
         let backend = BackendConfig {
             name: "example".into(),
             endpoint: "https://inference.example.test".into(),
             model: Some("model".into()),
             kind: Some(BackendKind::Openai),
-            api_key_file: Some(wizard_token_reference(&config, "example").unwrap()),
+            api_key_file: Some(versioned_reference.clone()),
             ..Default::default()
         };
         let cfg = Config {
@@ -2496,6 +2831,8 @@ mod tests {
         let pending = PendingWizardToken {
             token: "new-secret".into(),
             passphrase: Some(newt_core::secrets::SecretString::from("test-passphrase")),
+            path: versioned_token.clone(),
+            reference: versioned_reference,
         };
         let mut console = ScriptedConsole::new(&[]);
         let result = persist_interactive_backend_with(
@@ -2504,13 +2841,191 @@ mod tests {
             &cfg,
             &backend,
             Some(&pending),
+            |staged, destination| destination.durable_replace(staged),
             |_cfg, _path| anyhow::bail!("simulated late config failure"),
         );
 
         assert!(result.is_err());
         assert_eq!(std::fs::read(&token).unwrap(), b"old-token");
-        assert_eq!(std::fs::read(&backend_path).unwrap(), b"old-backend");
         assert_eq!(std::fs::read(&config).unwrap(), b"old-config");
+        let committed: BackendConfig =
+            toml::from_str(&std::fs::read_to_string(&backend_path).unwrap()).unwrap();
+        assert_eq!(committed.api_key_file, backend.api_key_file);
+        assert!(versioned_token.exists());
+        assert_eq!(
+            newt_core::secrets::resolve_token_file(&versioned_token)
+                .unwrap()
+                .as_deref(),
+            Some("new-secret")
+        );
+        for directory in [dir.path(), token.parent().unwrap()] {
+            let leftovers = std::fs::read_dir(directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".newt-"))
+                .collect::<Vec<_>>();
+            assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+        }
+    }
+
+    /// Real-filesystem grounding for the backend-publication failpoint: when
+    /// rename commits but parent sync fails, setup must retain the credential
+    /// prerequisite referenced by the now-visible backend.
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn backend_post_commit_sync_failure_retains_its_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend_dir = dir.path().join("backends");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "default_backend = \"old\"\n").unwrap();
+        let versioned_token = backend_dir.join("example.token.version.age");
+        let token_reference = collapse_home(&versioned_token);
+        let backend = BackendConfig {
+            name: "example".into(),
+            endpoint: "https://inference.example.test".into(),
+            model: Some("model".into()),
+            kind: Some(BackendKind::Openai),
+            api_key_file: Some(token_reference.clone()),
+            ..Default::default()
+        };
+        let cfg = Config {
+            default_backend: Some("example".into()),
+            ..Default::default()
+        };
+        let pending = PendingWizardToken {
+            token: "new-secret".into(),
+            passphrase: Some(newt_core::secrets::SecretString::from("test-passphrase")),
+            path: versioned_token.clone(),
+            reference: token_reference,
+        };
+
+        let error = persist_interactive_backend_with(
+            &mut ScriptedConsole::new(&[]),
+            &config,
+            &cfg,
+            &backend,
+            Some(&pending),
+            |staged, destination| {
+                std::fs::rename(staged, destination.as_path()).unwrap();
+                Err(newt_core::atomic_fs::DurableReplaceError::after_commit(
+                    destination.as_path(),
+                    io::Error::other("injected parent sync failure"),
+                ))
+            },
+            |_, _| unreachable!("config selection must not follow publication failure"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("published coherently"));
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "default_backend = \"old\"\n"
+        );
+        let committed: BackendConfig =
+            toml::from_str(&std::fs::read_to_string(backend_dir.join("example.toml")).unwrap())
+                .unwrap();
+        assert_eq!(committed.api_key_file, backend.api_key_file);
+        assert_eq!(
+            newt_core::secrets::resolve_token_file(&versioned_token)
+                .unwrap()
+                .as_deref(),
+            Some("new-secret")
+        );
+    }
+
+    /// A process may load the old drop-in before rotation and resolve its key
+    /// later. Setup therefore never synchronously garbage-collects immutable
+    /// credential versions when it publishes a replacement.
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn successful_rotation_retains_the_previous_credential_for_live_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend_dir = dir.path().join("backends");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let config = dir.path().join("config.toml");
+        let backend_path = backend_dir.join("example.toml");
+        let old_token = backend_dir.join("example.token.1-1-1.age");
+        std::fs::write(&old_token, "old-secret\n").unwrap();
+        let old_reader = BackendConfig {
+            name: "example".into(),
+            endpoint: "https://old.example.test".into(),
+            api_key_file: Some(old_token.display().to_string()),
+            ..Default::default()
+        };
+        std::fs::write(&backend_path, toml::to_string(&old_reader).unwrap()).unwrap();
+        std::fs::write(&config, "default_backend = \"example\"\n").unwrap();
+
+        let new_token = backend_dir.join("example.token.2-2-2.age");
+        let new_reference = new_token.display().to_string();
+        let replacement = BackendConfig {
+            name: "example".into(),
+            endpoint: "https://new.example.test".into(),
+            api_key_file: Some(new_reference.clone()),
+            ..Default::default()
+        };
+        let pending = PendingWizardToken {
+            token: "new-secret".into(),
+            passphrase: Some(newt_core::secrets::SecretString::from("test-passphrase")),
+            path: new_token,
+            reference: new_reference,
+        };
+        let cfg = Config {
+            default_backend: Some("example".into()),
+            ..Default::default()
+        };
+        persist_interactive_backend(
+            &mut ScriptedConsole::new(&[]),
+            &config,
+            &cfg,
+            &replacement,
+            Some(&pending),
+        )
+        .unwrap();
+
+        assert_eq!(old_reader.resolve_api_key().as_deref(), Some("old-secret"));
+        assert!(old_token.exists());
+    }
+
+    /// Real-resource grounding for the shared setup lock: an interactive
+    /// writer must fail before it stages or commits any file.
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn interactive_setup_lock_rejects_a_concurrent_writer_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let held = acquire_setup_lock(&config).unwrap();
+        let backend = BackendConfig {
+            name: "example".into(),
+            endpoint: "https://inference.example.test".into(),
+            model: Some("model".into()),
+            kind: Some(BackendKind::Openai),
+            ..Default::default()
+        };
+        let cfg = Config {
+            default_backend: Some("example".into()),
+            ..Default::default()
+        };
+        let mut console = ScriptedConsole::new(&[]);
+
+        let error = persist_interactive_backend_with(
+            &mut console,
+            &config,
+            &cfg,
+            &backend,
+            None,
+            |_, _| unreachable!("lock failure must precede backend publication"),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("another live process"));
+        assert!(!config.exists());
+        assert!(!dir.path().join("backends").exists());
+        drop(held);
     }
 
     #[test]
@@ -2536,6 +3051,89 @@ mod tests {
             serving: newt_core::backend_probe::api_for(BackendKind::Openai).serving(models.len()),
             engine: None,
             warm: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chat_setup_reuses_a_runtime_responses_writeback_but_not_the_reverse() {
+        let probe = openai_hit("https://inference.example.test", &["model"]);
+        let mut existing = ExistingSetupBackend {
+            name: "example".into(),
+            path: PathBuf::from("backends/example.toml"),
+            endpoint: Some(probe.endpoint.clone()),
+            api_key_env: None,
+            api_key_file: None,
+            kind: Some(BackendKind::Openai),
+            api: Some(OpenAiApi::Responses),
+            serving: Some(probe.serving),
+            model: Some("model".into()),
+            generated_by_setup: false,
+        };
+
+        assert!(existing.matches_probe(&VerifiedTargetHit {
+            probe: probe.clone(),
+            api: Some(OpenAiApi::ChatCompletions),
+        }));
+        assert!(existing.matches_probe(&VerifiedTargetHit {
+            probe: probe.clone(),
+            api: Some(OpenAiApi::Responses),
+        }));
+        existing.api = Some(OpenAiApi::ChatCompletions);
+        assert!(!existing.matches_probe(&VerifiedTargetHit {
+            probe,
+            api: Some(OpenAiApi::Responses),
+        }));
+    }
+
+    #[test]
+    fn every_injected_commit_failure_leaves_a_coherent_retryable_tuple() {
+        #[derive(Clone, Default)]
+        struct State {
+            new_token_exists: bool,
+            backend_token: &'static str,
+            selected: bool,
+        }
+
+        fn coherent(state: &State) -> bool {
+            state.backend_token == "old"
+                || (state.backend_token == "versioned" && state.new_token_exists)
+        }
+
+        for fail_at in SETUP_COMMIT_STEPS {
+            let mut state = State {
+                backend_token: "old",
+                ..Default::default()
+            };
+            let result = run_setup_commit(|step| {
+                if step == fail_at {
+                    anyhow::bail!("injected {step:?} failure");
+                }
+                match step {
+                    SetupCommitStep::PersistVersionedToken => state.new_token_exists = true,
+                    SetupCommitStep::PublishBackendTuple => state.backend_token = "versioned",
+                    SetupCommitStep::SelectBackend => state.selected = true,
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(
+                coherent(&state),
+                "failure at {fail_at:?} exposed a mixed tuple"
+            );
+
+            // Replaying all idempotent phases models setup recovery after a
+            // killed process and must converge on the selected new tuple.
+            run_setup_commit(|step| {
+                match step {
+                    SetupCommitStep::PersistVersionedToken => state.new_token_exists = true,
+                    SetupCommitStep::PublishBackendTuple => state.backend_token = "versioned",
+                    SetupCommitStep::SelectBackend => state.selected = true,
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(coherent(&state));
+            assert!(state.selected);
         }
     }
 
@@ -2676,6 +3274,43 @@ mod tests {
                 .as_deref(),
             Some("operator-dgx")
         );
+    }
+
+    /// Real-resource grounding for setup idempotency after the runtime records
+    /// its definitive OpenAI wire surface in a generated backend drop-in.
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn detected_setup_reuses_a_runtime_api_writeback_without_suffixing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        let verified = vec![VerifiedTargetHit {
+            probe: openai_hit("https://inference.example.test", &["model"]),
+            api: Some(OpenAiApi::ChatCompletions),
+        }];
+
+        persist_verified_setup(&config_path, &verified, None, None).unwrap();
+        let backend_dir = dir.path().join("backends");
+        let name = backend_name("https://inference.example.test").unwrap();
+        let backend_path = backend_dir.join(format!("{name}.toml"));
+        newt_core::writeback_probed_backend(&BackendConfig {
+            name,
+            endpoint: "https://inference.example.test".into(),
+            model: Some("model".into()),
+            kind: Some(BackendKind::Openai),
+            api: Some(OpenAiApi::Responses),
+            serving: Some(verified[0].probe.serving),
+            ..Default::default()
+        })
+        .unwrap();
+        let runtime_bytes = std::fs::read(&backend_path).unwrap();
+
+        let written = persist_verified_setup(&config_path, &verified, None, None).unwrap();
+
+        assert!(written.is_empty(), "runtime writeback should be reused");
+        assert_eq!(std::fs::read_dir(&backend_dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&backend_path).unwrap(), runtime_bytes);
     }
 
     #[serial_test::serial(real_fs)]
@@ -2830,6 +3465,64 @@ mod tests {
             .contains("default_backend"));
     }
 
+    /// Real-filesystem grounding for the bound setup destination: retargeting
+    /// the operator's config symlink after staging cannot move the commit away
+    /// from the file whose lock setup acquired.
+    #[cfg(unix)]
+    #[ignore = "real-resource: weekly/release tier; retargets a filesystem symlink"]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn setup_symlink_retarget_cannot_escape_the_locked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first/config.toml");
+        let second = dir.path().join("second/config.toml");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, "# first\n").unwrap();
+        std::fs::write(&second, "# second\n").unwrap();
+        let config = dir.path().join("config.toml");
+        symlink(&first, &config).unwrap();
+        let backend = BackendConfig {
+            name: "example".into(),
+            endpoint: "https://inference.example.test".into(),
+            model: Some("model".into()),
+            kind: Some(BackendKind::Openai),
+            ..Default::default()
+        };
+        let cfg = Config {
+            default_backend: Some("example".into()),
+            ..Default::default()
+        };
+
+        persist_interactive_backend_with(
+            &mut ScriptedConsole::new(&[]),
+            &config,
+            &cfg,
+            &backend,
+            None,
+            |staged, destination| destination.durable_replace(staged),
+            |staged, destination| {
+                std::fs::remove_file(&config)?;
+                symlink(&second, &config)?;
+                destination
+                    .durable_replace(staged)
+                    .map_err(anyhow::Error::from)
+            },
+        )
+        .unwrap();
+
+        assert!(std::fs::read_to_string(&first)
+            .unwrap()
+            .contains("default_backend"));
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "# second\n");
+        assert_eq!(
+            std::fs::canonicalize(&config).unwrap(),
+            std::fs::canonicalize(&second).unwrap()
+        );
+    }
+
     #[serial_test::serial(real_fs)]
     #[test]
     fn failed_setup_staging_cleans_earlier_temporary_files() {
@@ -2853,9 +3546,15 @@ mod tests {
             },
         ];
 
-        assert!(
-            commit_setup_plan(&config_path, "", "default_backend = \"first\"\n", &planned).is_err()
-        );
+        let destination = setup_config_destination(&config_path).unwrap();
+        assert!(commit_setup_plan(
+            &config_path,
+            &destination,
+            "",
+            "default_backend = \"first\"\n",
+            &planned,
+        )
+        .is_err());
         let leftovers = std::fs::read_dir(&backend_dir)
             .into_iter()
             .flatten()
@@ -2863,6 +3562,60 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "leftover staged files: {leftovers:?}");
         assert!(!config_path.exists());
+    }
+
+    /// Real-filesystem grounding for the detected-setup config failpoint: a
+    /// post-rename sync failure must not delete drop-ins already selected by
+    /// the visible replacement config.
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn detected_config_post_commit_sync_failure_retains_selected_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let old_config = "default_backend = \"old\"\n";
+        let updated_config = "default_backend = \"example\"\n";
+        std::fs::write(&config_path, old_config).unwrap();
+        let backend_path = dir.path().join("backends/example.toml");
+        let planned = vec![PlannedSetupBackend {
+            name: "example".into(),
+            endpoint: "https://inference.example.test".into(),
+            path: backend_path.clone(),
+            body: Some(
+                b"name = \"example\"\nendpoint = \"https://inference.example.test\"\n".to_vec(),
+            ),
+        }];
+        let destination = setup_config_destination(&config_path).unwrap();
+
+        let error = commit_setup_plan_with(
+            &config_path,
+            &destination,
+            old_config,
+            updated_config,
+            &planned,
+            |staged, destination| {
+                destination.durable_replace(staged).unwrap();
+                Err(newt_core::atomic_fs::DurableReplaceError::after_commit(
+                    destination.as_path(),
+                    io::Error::other("injected parent sync failure"),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("could not durably sync"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            updated_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path.with_file_name("config.toml.bak")).unwrap(),
+            old_config
+        );
+        assert!(backend_path.exists());
+        assert!(std::fs::read_to_string(backend_path)
+            .unwrap()
+            .contains("https://inference.example.test"));
     }
 
     #[serial_test::serial(real_fs)]
@@ -2873,12 +3626,62 @@ mod tests {
 
         let first = acquire_setup_lock(&config_path).unwrap();
         let error = acquire_setup_lock(&config_path).unwrap_err();
-        assert!(error.to_string().contains("another setup process"));
+        assert!(error.to_string().contains("another live process"));
         drop(first);
 
         let reacquired = acquire_setup_lock(&config_path).unwrap();
         drop(reacquired);
-        assert!(!dir.path().join(".config.toml.setup.lock").exists());
+        assert!(!dir.path().join("config.toml.lock").exists());
+    }
+
+    /// Per-PR mocked BAT for the regression where a public model catalog was
+    /// mistaken for authentication success and setup persisted an unusable
+    /// backend. No real filesystem or credential is involved in this lane.
+    #[tokio::test]
+    async fn bat_public_catalog_auth_rejection_never_calls_persistence() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "publicly-listed-model"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let persistence_called = std::cell::Cell::new(false);
+        let mut console = ScriptedConsole::new(&[]);
+
+        let error = run_target_with_persist(
+            &mut console,
+            &reqwest::Client::new(),
+            Path::new("unused/config.toml"),
+            TargetSetupRequest {
+                target: &server.uri(),
+                token_env: None,
+                token_file: None,
+                model: None,
+                yes: true,
+            },
+            &Discovery::default(),
+            |_, _, _, _| {
+                persistence_called.set(true);
+                Ok(Vec::new())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("no inference backend passed a minimal generation check"));
+        assert!(console.transcript().contains("requires authentication"));
+        assert!(!persistence_called.get());
     }
 
     /// Real-resource grounding for the mocked multi-port target flow;
@@ -3337,8 +4140,7 @@ mod tests {
         let cfg_path = dir.path().join("config.toml");
         // Pin the config dir: the machine identity for blank-passphrase
         // encryption lives under it.
-        let prev = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
-        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
         newt_core::secrets::session().reset_for_test();
         let preset = ProviderPreset {
             name: "cloudish".into(),
@@ -3352,14 +4154,10 @@ mod tests {
         let mut console = ScriptedConsole::new(&["bad-key", "", "1", "Y", "good-key", ""]);
         let result =
             configure_preset(&mut console, &reqwest::Client::new(), &preset, &cfg_path).await;
-        match prev {
-            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
-            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
-        }
         let (_cfg, backend, _pending) = result.unwrap();
         let t = console.transcript();
         assert!(t.contains("✗ authentication rejected (HTTP 401)"), "{t}");
-        assert!(t.contains("✓ chat accepted"), "{t}");
+        assert!(t.contains("✓ generation accepted"), "{t}");
         assert!(backend.api_key_file.is_some(), "re-entered key is stored");
     }
 
@@ -3714,8 +4512,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let previous = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
-        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
         newt_core::secrets::session().reset_for_test();
         let server_with_v1 = format!("{}/v1/", server.uri());
         let mut console = ScriptedConsole::new(&[
@@ -3747,10 +4544,6 @@ mod tests {
         newt_core::secrets::session().reset_for_test();
         assert_eq!(dropin.resolve_api_key().as_deref(), Some("test-remote-key"));
         newt_core::secrets::session().reset_for_test();
-        match previous {
-            Some(value) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, value),
-            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
-        }
     }
 
     #[serial_test::serial(real_fs)]
@@ -3790,8 +4583,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         // Pin the config dir: the machine identity for blank-passphrase
         // encryption lives under it.
-        let prev = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
-        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
         newt_core::secrets::session().reset_for_test();
         let client = reqwest::Client::new();
 
@@ -3807,13 +4599,15 @@ mod tests {
         assert_eq!(dropin.effective_model(), Some("example/model-a"));
         assert!(!dropin.endpoint.ends_with("/v1"), "probe suffix stripped");
         let token_ref = dropin.api_key_file.as_deref().expect("key recorded");
+        let token_path = PathBuf::from(token_ref);
+        let token_name = token_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
         assert!(
-            token_ref.ends_with(".token.age"),
-            "encrypted ref: {token_ref}"
+            token_name.starts_with(&format!("{name}.token.")) && token_name.ends_with(".age"),
+            "versioned encrypted ref: {token_ref}"
         );
-        let token_path = path
-            .with_file_name("backends")
-            .join(format!("{name}.token.age"));
         let body = std::fs::read_to_string(&token_path).unwrap();
         assert!(
             body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"),
@@ -3829,10 +4623,6 @@ mod tests {
         assert_eq!(dropin.resolve_api_key().as_deref(), Some("test-remote-key"));
 
         newt_core::secrets::session().reset_for_test();
-        match prev {
-            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
-            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
-        }
     }
 
     #[serial_test::serial(real_fs)]
@@ -3849,7 +4639,7 @@ mod tests {
             .mount(&server)
             .await;
         mount_openai_chat(&server).await;
-        std::env::remove_var("NEWT_TEST_PRESET_KEY");
+        let _preset_env = EnvVarGuard::remove("NEWT_TEST_PRESET_KEY");
         let preset = ProviderPreset {
             name: "testcloud".into(),
             display_name: Some("Test Cloud".into()),
@@ -3898,7 +4688,7 @@ mod tests {
             .mount(&server)
             .await;
         mount_authenticated_openai_chat(&server, "sk-preset-secret").await;
-        std::env::remove_var("NEWT_TEST_PRESET_KEY");
+        let _preset_env = EnvVarGuard::remove("NEWT_TEST_PRESET_KEY");
         let preset = ProviderPreset {
             name: "gatedcloud".into(),
             display_name: Some("Gated Cloud".into()),
@@ -3910,8 +4700,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let prev = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
-        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
         newt_core::secrets::session().reset_for_test();
         let client = reqwest::Client::new();
         // key (hidden), passphrase, model=1
@@ -3921,24 +4710,20 @@ mod tests {
             .unwrap();
         assert!(backend.api_key_env.is_none());
         let token_ref = backend.api_key_file.as_deref().expect("encrypted ref");
-        assert!(token_ref.ends_with("gatedcloud.token.age"));
+        assert!(token_ref.contains("gatedcloud.token."));
+        assert!(token_ref.ends_with(".age"));
         assert_eq!(backend.effective_model(), Some("gated-model"));
         let pending = pending.expect("token is held until final write");
         assert_eq!(
             persist_wizard_token(&mut console, &path, "gatedcloud", &pending).unwrap(),
             token_ref
         );
-        let body =
-            std::fs::read_to_string(dir.path().join("backends/gatedcloud.token.age")).unwrap();
+        let body = std::fs::read_to_string(&pending.path).unwrap();
         assert!(body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
         assert!(!body.contains("sk-preset-secret"));
         assert!(!console.transcript().contains("sk-preset-secret"));
 
         newt_core::secrets::session().reset_for_test();
-        match prev {
-            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
-            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
-        }
     }
 
     #[serial_test::serial(real_fs)]
@@ -3953,7 +4738,7 @@ mod tests {
             .mount(&server)
             .await;
         mount_authenticated_openai_chat(&server, "sk-from-env").await;
-        std::env::set_var("NEWT_TEST_PRESET_KEY", "sk-from-env");
+        let _preset_env = EnvVarGuard::set("NEWT_TEST_PRESET_KEY", "sk-from-env");
         let preset = ProviderPreset {
             name: "envcloud".into(),
             display_name: Some("Env Cloud".into()),
@@ -3971,7 +4756,6 @@ mod tests {
         let (_cfg, backend, _pending) = configure_preset(&mut console, &client, &preset, &path)
             .await
             .unwrap();
-        std::env::remove_var("NEWT_TEST_PRESET_KEY");
         assert_eq!(backend.api_key_env.as_deref(), Some("NEWT_TEST_PRESET_KEY"));
         assert!(backend.api_key_file.is_none(), "env reference only");
         assert_eq!(backend.effective_model(), Some("env-model"));
@@ -3984,49 +4768,31 @@ mod tests {
     #[test]
     #[serial_test::serial(real_fs)]
     fn a_token_reference_is_recorded_even_when_home_is_unset() {
-        let saved = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
         let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
         // The machine identity needs a config root even with HOME unset.
-        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
         newt_core::secrets::session().reset_for_test();
-        // SAFETY: guarded by the `real_fs` serial lane, and restored below.
-        unsafe {
-            std::env::remove_var("HOME");
-            std::env::remove_var("USERPROFILE");
-        }
+        let _home = EnvVarGuard::remove("HOME");
+        let _userprofile = EnvVarGuard::remove("USERPROFILE");
 
         let path = dir.path().join("config.toml");
         // passphrase=<Enter: machine key>
         let mut console = ScriptedConsole::new(&[""]);
-        let pending = collect_wizard_token(&mut console, "a-secret").unwrap();
+        let pending = collect_wizard_token(&mut console, "a-secret", &path, "example").unwrap();
         let recorded = persist_wizard_token(&mut console, &path, "example", &pending)
             .expect("a supplied key must always be recorded, home dir or not");
-
-        // SAFETY: same lane; restore before asserting so a failure cannot leak.
-        unsafe {
-            if let Some(v) = saved.0 {
-                std::env::set_var("HOME", v);
-            }
-            if let Some(v) = saved.1 {
-                std::env::set_var("USERPROFILE", v);
-            }
-        }
 
         assert!(
             !recorded.starts_with('~'),
             "with no home to collapse against, the path stays absolute: {recorded}"
         );
-        assert!(recorded.ends_with("example.token.age"));
+        assert!(recorded.contains("example.token."));
+        assert!(recorded.ends_with(".age"));
         let body = std::fs::read_to_string(&recorded).unwrap();
         assert!(body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
         assert!(!body.contains("a-secret"), "never plaintext on disk");
 
         newt_core::secrets::session().reset_for_test();
-        match prev {
-            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
-            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
-        }
     }
 
     // --- model selector (#1452): a llama.cpp router serves 30+ models, so the

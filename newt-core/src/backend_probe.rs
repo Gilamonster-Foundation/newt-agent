@@ -121,22 +121,22 @@ const MAX_GENERATION_PROBE_BODY_BYTES: usize = 64 * 1024;
 
 async fn read_generation_probe_body(
     mut response: reqwest::Response,
-) -> Result<(reqwest::StatusCode, Vec<u8>), String> {
+) -> Result<(reqwest::StatusCode, Vec<u8>), GenerationFailure> {
     let status = response.status();
     if response
         .content_length()
         .is_some_and(|length| length > MAX_GENERATION_PROBE_BODY_BYTES as u64)
     {
-        return Err(format!(
-            "HTTP {status} response exceeds the {MAX_GENERATION_PROBE_BODY_BYTES}-byte probe limit"
-        ));
+        return Err(GenerationFailure::ResponseTooLarge);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| GenerationFailure::Transport)?
+    {
         if body.len().saturating_add(chunk.len()) > MAX_GENERATION_PROBE_BODY_BYTES {
-            return Err(format!(
-                "HTTP {status} response exceeds the {MAX_GENERATION_PROBE_BODY_BYTES}-byte probe limit"
-            ));
+            return Err(GenerationFailure::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -158,7 +158,48 @@ fn auth_rejection(status: reqwest::StatusCode) -> Option<GenerationCheck> {
 pub enum GenerationCheck {
     Accepted(Option<OpenAiApiSurface>),
     Rejected(u16),
-    Unverified(String),
+    Unverified(GenerationFailure),
+}
+
+/// Terminal-safe reason why a generation probe could not verify an endpoint.
+///
+/// Provider response bodies and transport error strings never cross this type
+/// boundary, so an echoed bearer token, refusal, or control sequence cannot be
+/// rendered by setup diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationFailure {
+    Transport,
+    ResponseTooLarge,
+    HttpStatus(u16),
+    InvalidJson,
+    InvalidEnvelope,
+    InvalidResponsesPayload,
+    UnsupportedBackend,
+}
+
+impl std::fmt::Display for GenerationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport => formatter.write_str("the generation request or response failed"),
+            Self::ResponseTooLarge => formatter.write_str("the generation response was too large"),
+            Self::HttpStatus(status) => {
+                write!(
+                    formatter,
+                    "HTTP {status} did not accept the generation request"
+                )
+            }
+            Self::InvalidJson => formatter.write_str("the generation response was not valid JSON"),
+            Self::InvalidEnvelope => {
+                formatter.write_str("the generation response had no valid output envelope")
+            }
+            Self::InvalidResponsesPayload => {
+                formatter.write_str("the Responses generation payload was unusable")
+            }
+            Self::UnsupportedBackend => {
+                formatter.write_str("this backend does not use an HTTP generation probe")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -178,14 +219,12 @@ fn classify_generation_response(
         return GenerationCheck::Rejected(status.as_u16());
     }
     if !status.is_success() {
-        return GenerationCheck::Unverified(format!("HTTP {status}"));
+        return GenerationCheck::Unverified(GenerationFailure::HttpStatus(status.as_u16()));
     }
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
-        Err(error) => {
-            return GenerationCheck::Unverified(format!(
-                "HTTP {status} returned invalid JSON: {error}"
-            ));
+        Err(_) => {
+            return GenerationCheck::Unverified(GenerationFailure::InvalidJson);
         }
     };
     let valid = match required {
@@ -213,14 +252,7 @@ fn classify_generation_response(
     if valid {
         GenerationCheck::Accepted(api)
     } else {
-        let field = match required {
-            RequiredEnvelope::OllamaMessage => "message",
-            RequiredEnvelope::OpenAiChoices => "choices[0].message",
-            RequiredEnvelope::AnthropicContent => "content",
-        };
-        GenerationCheck::Unverified(format!(
-            "HTTP {status} response has no valid `{field}` envelope"
-        ))
+        GenerationCheck::Unverified(GenerationFailure::InvalidEnvelope)
     }
 }
 
@@ -273,7 +305,7 @@ async fn send_openai_chat_probe(
     let response = request
         .send()
         .await
-        .map_err(|error| GenerationCheck::Unverified(format!("{error:#}")))?;
+        .map_err(|_| GenerationCheck::Unverified(GenerationFailure::Transport))?;
     if let Some(rejected) = auth_rejection(response.status()) {
         return Err(rejected);
     }
@@ -287,29 +319,29 @@ fn classify_responses_generation(status: reqwest::StatusCode, body: &[u8]) -> Ge
         return GenerationCheck::Rejected(status.as_u16());
     }
     if !status.is_success() {
-        return GenerationCheck::Unverified(format!("HTTP {status}"));
+        return GenerationCheck::Unverified(GenerationFailure::HttpStatus(status.as_u16()));
     }
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
-        Err(error) => {
-            return GenerationCheck::Unverified(format!(
-                "HTTP {status} returned invalid JSON: {error}"
-            ));
+        Err(_) => {
+            return GenerationCheck::Unverified(GenerationFailure::InvalidJson);
         }
     };
+    // A deliberately tiny probe budget can end a real Responses generation as
+    // `incomplete/max_output_tokens`. Treat that as authentication evidence only
+    // when the partial body would otherwise be a usable, non-refusal response.
+    // Re-running the ONE fail-closed decoder with a synthetic terminal status
+    // preserves its top-level-error/refusal/recognized-output invariants instead
+    // of accepting any arbitrary non-empty `output` array.
+    let mut decodable = parsed.clone();
     if parsed["status"] == "incomplete"
         && parsed["incomplete_details"]["reason"] == "max_output_tokens"
-        && parsed["output"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty())
     {
-        return GenerationCheck::Accepted(Some(OpenAiApiSurface::Responses));
+        decodable["status"] = serde_json::Value::String("completed".into());
     }
-    match crate::responses_wire::decode_response(&parsed) {
+    match crate::responses_wire::decode_response(&decodable) {
         Ok(_) => GenerationCheck::Accepted(Some(OpenAiApiSurface::Responses)),
-        Err(error) => GenerationCheck::Unverified(format!(
-            "HTTP {status} returned an unusable Responses payload: {error}"
-        )),
+        Err(_) => GenerationCheck::Unverified(GenerationFailure::InvalidResponsesPayload),
     }
 }
 
@@ -331,7 +363,7 @@ async fn send_responses_generation_probe(
                 Err(error) => GenerationCheck::Unverified(error),
             }
         }
-        Err(error) => GenerationCheck::Unverified(format!("{error:#}")),
+        Err(_) => GenerationCheck::Unverified(GenerationFailure::Transport),
     }
 }
 
@@ -355,7 +387,7 @@ async fn send_generation_probe(
                 Err(error) => GenerationCheck::Unverified(error),
             }
         }
-        Err(error) => GenerationCheck::Unverified(format!("{error:#}")),
+        Err(_) => GenerationCheck::Unverified(GenerationFailure::Transport),
     }
 }
 
@@ -456,12 +488,10 @@ pub async fn verify_generation(
                         Err(error) => GenerationCheck::Unverified(error),
                     }
                 }
-                Err(error) => GenerationCheck::Unverified(format!("{error:#}")),
+                Err(_) => GenerationCheck::Unverified(GenerationFailure::Transport),
             }
         }
-        BackendKind::Embedded => {
-            GenerationCheck::Unverified("embedded backends do not use an HTTP setup probe".into())
-        }
+        BackendKind::Embedded => GenerationCheck::Unverified(GenerationFailure::UnsupportedBackend),
     }
 }
 
@@ -1677,7 +1707,7 @@ mod tests {
                 None,
             )
             .await,
-            GenerationCheck::Unverified(reason) if reason.contains("no valid `choices[0].message`")
+            GenerationCheck::Unverified(GenerationFailure::InvalidEnvelope)
         ));
     }
 
@@ -1716,6 +1746,111 @@ mod tests {
         let requests = server.received_requests().await.expect("journal");
         let responses: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(responses["store"], false);
+    }
+
+    #[test]
+    fn incomplete_responses_probe_requires_clean_recognized_partial_output() {
+        let partial = serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "partial"}]
+            }]
+        });
+        assert_eq!(
+            classify_responses_generation(
+                reqwest::StatusCode::OK,
+                &serde_json::to_vec(&partial).unwrap(),
+            ),
+            GenerationCheck::Accepted(Some(OpenAiApiSurface::Responses))
+        );
+
+        let mut with_error = partial.clone();
+        with_error["error"] = serde_json::json!({"message": "provider failure"});
+        assert!(matches!(
+            classify_responses_generation(
+                reqwest::StatusCode::OK,
+                &serde_json::to_vec(&with_error).unwrap(),
+            ),
+            GenerationCheck::Unverified(GenerationFailure::InvalidResponsesPayload)
+        ));
+
+        let refusal = serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{
+                "type": "message",
+                "content": [{"type": "refusal", "refusal": "declined"}]
+            }]
+        });
+        assert!(matches!(
+            classify_responses_generation(
+                reqwest::StatusCode::OK,
+                &serde_json::to_vec(&refusal).unwrap(),
+            ),
+            GenerationCheck::Unverified(GenerationFailure::InvalidResponsesPayload)
+        ));
+
+        let unrecognized = serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "reasoning", "summary": []}]
+        });
+        assert!(matches!(
+            classify_responses_generation(
+                reqwest::StatusCode::OK,
+                &serde_json::to_vec(&unrecognized).unwrap(),
+            ),
+            GenerationCheck::Unverified(GenerationFailure::InvalidResponsesPayload)
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_probe_never_returns_provider_text_or_bearer_material() {
+        const BEARER_SENTINEL: &str = "probe-secret-must-not-escape";
+        const BODY_SENTINEL: &str = "provider-body-must-not-escape";
+        let escape = char::from(27);
+        let bell = char::from(7);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", format!("Bearer {BEARER_SENTINEL}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "completed",
+                "error": {"message": format!(
+                    "{BEARER_SENTINEL} {BODY_SENTINEL} {escape}[31mred{bell}"
+                )},
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "refusal",
+                        "refusal": format!("{BODY_SENTINEL} {escape}[2J")
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = verify_generation(
+            &reqwest::Client::new(),
+            BackendKind::Openai,
+            Some(OpenAiApiSurface::Responses),
+            &server.uri(),
+            "model",
+            Some(BEARER_SENTINEL),
+        )
+        .await;
+        let GenerationCheck::Unverified(reason) = result else {
+            panic!("provider error/refusal must fail closed: {result:?}");
+        };
+        let rendered = reason.to_string();
+
+        assert_eq!(reason, GenerationFailure::InvalidResponsesPayload);
+        assert!(!rendered.contains(BEARER_SENTINEL));
+        assert!(!rendered.contains(BODY_SENTINEL));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.chars().any(char::is_control));
     }
 
     // ── ManagedMode::Shared adopt-warm (ADR docs/decisions/managed_backend.md) ──

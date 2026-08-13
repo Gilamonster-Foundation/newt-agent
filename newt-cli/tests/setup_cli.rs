@@ -210,7 +210,7 @@ async fn setup_v1_url_requires_generation_and_persists_canonical_token_reference
         .assert()
         .success();
     assertion
-        .stdout(predicate::str::contains("chat accepted"))
+        .stdout(predicate::str::contains("generation accepted"))
         .stdout(predicate::str::contains("secret-value").not())
         .stderr(predicate::str::contains("secret-value").not());
 

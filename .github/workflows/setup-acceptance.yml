@@ -1,0 +1,66 @@
+---
+name: Setup acceptance tier
+
+# The per-PR workspace test runs the mocked auth-gate BAT in
+# `setup::tests::bat_public_catalog_auth_rejection_never_calls_persistence`.
+# This workflow grounds that seam with the ignored real-filesystem and
+# real-process setup acceptance tests weekly, from the release gate, and on
+# demand.
+# These tests are serialized because they exercise process-wide credential
+# state, setup locks, atomic staging, rollback, and child-process config roots.
+#
+# HOOK PARITY EXCEPTION: this real-resource tier is intentionally outside the
+# pre-push hook. The mocked BAT remains in the ordinary per-PR test lane.
+
+"on":
+  workflow_call: {}
+  schedule:
+    - cron: "30 5 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  setup-acceptance:
+    name: setup real-resource acceptance (${{ matrix.os }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: setup-acceptance-${{ matrix.os }}
+
+      - name: Run fail-closed generation decoder tests
+        run: "cargo test -p newt-core backend_probe"
+
+      - name: Run mocked setup authentication suite
+        if: always()
+        run: "cargo test -p newt-tui setup::tests:: -- --test-threads=1"
+
+      - name: Run setup process acceptance tests
+        if: always()
+        run: "cargo test -p newt-agent --test setup_cli -- --ignored --test-threads=1"
+
+      - name: Run setup filesystem and failpoint acceptance tests
+        if: always()
+        run: "cargo test -p newt-tui setup::tests:: -- --ignored --test-threads=1"
+
+      - name: Run killed-process lock recovery acceptance tests
+        if: always()
+        run: "cargo test -p newt-core atomic_fs::tests:: -- --ignored --test-threads=1"
+
+# yamllint disable-line rule:line-length
+# Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 17:36 EDT | Date: 2026-08-12

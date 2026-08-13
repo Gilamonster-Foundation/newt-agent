@@ -25,6 +25,8 @@
 //! an injected [`UnlockProvider`]) under a thin IO shell ([`store_token`],
 //! [`resolve_token_file`], the process-wide [`session`]).
 
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 18:33 EDT | Date: 2026-08-12
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -470,14 +472,26 @@ pub fn identity_path() -> Result<PathBuf, SecretsError> {
 /// Load the machine identity if one exists (read path — never generates).
 pub fn load_identity() -> Result<Option<TokenIdentity>, SecretsError> {
     let path = identity_path()?;
-    let text = match std::fs::read_to_string(&path) {
+    load_identity_at(&path)
+}
+
+fn load_identity_at(path: &Path) -> Result<Option<TokenIdentity>, SecretsError> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(SecretsError::Io { path, source }),
+        Err(source) => {
+            return Err(SecretsError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
     };
     TokenIdentity::from_file_str(&text)
         .map(Some)
-        .map_err(|detail| SecretsError::Corrupt { path, detail })
+        .map_err(|detail| SecretsError::Corrupt {
+            path: path.to_path_buf(),
+            detail,
+        })
 }
 
 /// Load the machine identity, generating (0600) on first use (write path).
@@ -485,18 +499,33 @@ pub fn load_or_generate_identity() -> Result<TokenIdentity, SecretsError> {
     if let Some(ident) = load_identity()? {
         return Ok(ident);
     }
-    let ident = TokenIdentity::generate();
     let path = identity_path()?;
+    let destination =
+        crate::atomic_fs::ResolvedPath::resolve(&path).map_err(|error| SecretsError::Io {
+            path: path.clone(),
+            source: std::io::Error::other(error),
+        })?;
+    let lock_path = destination.lock_path();
+    let _lock = crate::atomic_fs::acquire_lock(&lock_path).map_err(|error| SecretsError::Io {
+        path: lock_path,
+        source: std::io::Error::other(error),
+    })?;
+    // Another process may have won the lock while this process was waiting.
+    if let Some(ident) = load_identity_at(destination.as_path())? {
+        return Ok(ident);
+    }
+    let ident = TokenIdentity::generate();
     let body = ident.to_file_string(
         &chrono::Local::now()
             .format("%Y-%m-%dT%H:%M:%S%z")
             .to_string(),
     );
-    std::fs::write(&path, body.expose_secret()).map_err(|source| SecretsError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    restrict_permissions(&path, 0o600);
+    destination
+        .atomic_write_private(body.expose_secret().as_bytes())
+        .map_err(|error| SecretsError::Io {
+            path: path.clone(),
+            source: std::io::Error::other(error),
+        })?;
     Ok(ident)
 }
 
@@ -520,16 +549,64 @@ pub fn store_token(
     token: &str,
     passphrase: Option<&SecretString>,
 ) -> Result<PathBuf, SecretsError> {
-    let passphrase = passphrase.filter(|p| !p.expose_secret().trim().is_empty());
     std::fs::create_dir_all(backends_dir).map_err(|source| SecretsError::Io {
         path: backends_dir.to_path_buf(),
         source,
     })?;
     let path = backends_dir.join(format!("{name}.token.age"));
+    store_token_at(&path, token, passphrase)?;
+    Ok(path)
+}
+
+/// Encrypt `token` into the exact `path` (0600), atomically and durably.
+///
+/// Setup uses this to create immutable, versioned credential files.  Publishing
+/// a backend drop-in that references the new path then becomes the single
+/// visible commit point: a crash before it leaves only an unreferenced token,
+/// never an old endpoint paired with a new credential.
+pub fn store_token_at(
+    path: &Path,
+    token: &str,
+    passphrase: Option<&SecretString>,
+) -> Result<(), SecretsError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| SecretsError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let destination =
+        crate::atomic_fs::ResolvedPath::resolve(path).map_err(|error| SecretsError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
+    store_token_at_resolved(&destination, token, passphrase)?;
+    if destination.as_path() != path {
+        session().cache(path, token.to_string());
+    }
+    Ok(())
+}
+
+/// Encrypt `token` into an already-bound destination.
+///
+/// Callers which lock a larger transaction use this entry point so a symlink
+/// cannot be resolved again between transaction lock acquisition and commit.
+pub fn store_token_at_resolved(
+    destination: &crate::atomic_fs::ResolvedPath,
+    token: &str,
+    passphrase: Option<&SecretString>,
+) -> Result<(), SecretsError> {
+    let path = destination.as_path();
+    let passphrase = passphrase.filter(|p| !p.expose_secret().trim().is_empty());
+    let lock_path = destination.lock_path();
+    let _lock = crate::atomic_fs::acquire_lock(&lock_path).map_err(|error| SecretsError::Io {
+        path: lock_path.clone(),
+        source: std::io::Error::other(error),
+    })?;
     let armored = match passphrase {
         Some(pass) => encrypt_with_passphrase(pass, token.as_bytes()).map_err(|detail| {
             SecretsError::Corrupt {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 detail,
             }
         })?,
@@ -537,22 +614,23 @@ pub fn store_token(
             let ident = load_or_generate_identity()?;
             encrypt_to_identity(&ident, token.as_bytes()).map_err(|detail| {
                 SecretsError::Corrupt {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     detail,
                 }
             })?
         }
     };
-    std::fs::write(&path, &armored).map_err(|source| SecretsError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    restrict_permissions(&path, 0o600);
-    session().cache(&path, token.to_string());
+    destination
+        .atomic_write_private(armored.as_bytes())
+        .map_err(|error| SecretsError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
+    session().cache(path, token.to_string());
     if let Some(pass) = passphrase {
         session().set_passphrase(pass.clone());
     }
-    Ok(path)
+    Ok(())
 }
 
 /// Read + resolve one `api_key_file` through the session. Missing file →
