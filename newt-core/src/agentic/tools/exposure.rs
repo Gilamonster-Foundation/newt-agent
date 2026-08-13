@@ -34,6 +34,13 @@ use crate::tokens::TokenEstimation;
 
 use super::catalog::BASE_TOOL_NAMES;
 
+/// Maximum function tools accepted by the OpenAI-compatible function-calling
+/// contract. This is a provider wire limit, not an authorization or operator
+/// exposure preference: a `Full` profile may authorize more tools than can fit
+/// in one request. Omitted tools remain authorized at dispatch and listable by
+/// `tool_search`; this projection does not activate their schemas.
+pub(crate) const OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS: usize = 128;
+
 /// How a tool earns a schema slot, independent of whether it is *available*
 /// (gate) or *authorized* (persona/disposition/caveats). Pure data — the class
 /// for each tool lives in [`EXPOSURE_CLASSES`], guarded against drift by
@@ -318,6 +325,62 @@ pub fn select_exposed(
     )
 }
 
+/// Project an authorized/exposed catalog onto the OpenAI-compatible wire's
+/// 128-function envelope.
+///
+/// Provider shape is the final pipeline constraint after exposure. Kernel
+/// tools are selected first regardless of their current array position, then
+/// the ordinary exposure bands fill the remaining slots. The returned array
+/// preserves original catalog order so the projection is deterministic and
+/// does not churn prompt prefixes. Authorization is unchanged: tools omitted
+/// here remain governed by the dispatch boundary and listable through
+/// `tool_search`, without implying that this projection activates them.
+#[must_use]
+pub(crate) fn select_openai_compatible_tools(defs: Value) -> Value {
+    let Value::Array(arr) = defs else {
+        return defs;
+    };
+    if arr.len() <= OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS {
+        return Value::Array(arr);
+    }
+
+    let kernel_count = arr
+        .iter()
+        .filter_map(entry_name)
+        .filter(|name| classify(name) == ExposureClass::Kernel)
+        .count();
+    debug_assert!(
+        kernel_count <= OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS,
+        "kernel tool catalog exceeds the OpenAI-compatible wire envelope"
+    );
+
+    let mut keep = vec![false; arr.len()];
+    let mut kept = 0usize;
+    for class in [
+        ExposureClass::Kernel,
+        ExposureClass::ByIntent,
+        ExposureClass::RecoveryOnly,
+        ExposureClass::OnDemand,
+    ] {
+        for (index, def) in arr.iter().enumerate() {
+            if kept == OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS {
+                break;
+            }
+            if entry_name(def).is_some_and(|name| classify(name) == class) {
+                keep[index] = true;
+                kept += 1;
+            }
+        }
+    }
+
+    Value::Array(
+        arr.into_iter()
+            .zip(keep)
+            .filter_map(|(def, keep)| keep.then_some(def))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::catalog::ALL_TOOL_NAMES;
@@ -391,6 +454,31 @@ mod tests {
             est(),
         );
         assert_eq!(out, defs, "Full must be bit-for-bit identity");
+    }
+
+    #[test]
+    fn openai_wire_cap_keeps_kernel_before_optional_mcp_tools() {
+        let mut defs = vec![tool("optional_server__tool_000", "remote")];
+        defs.extend(
+            (1..=OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS)
+                .map(|i| tool(&format!("optional_server__tool_{i:03}"), "remote")),
+        );
+        // Put kernel tools at the end to prove selection is by exposure law,
+        // not an accidental `truncate(128)` over today's catalog order.
+        defs.push(tool("run_command", "kernel"));
+        defs.push(tool("tool_search", "kernel"));
+
+        let out = select_openai_compatible_tools(Value::Array(defs));
+        let names = out
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(entry_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS);
+        assert!(names.contains(&"run_command"));
+        assert!(names.contains(&"tool_search"));
     }
 
     #[test]

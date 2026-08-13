@@ -55,8 +55,8 @@ pub use catalog::{
 use catalog::{
     levenshtein, nearest_tool_name, ALL_TOOL_NAMES, BASE_TOOL_NAMES, EXTENDED_TOOL_REGISTRY,
 };
-pub(crate) use exposure::select_exposed;
 pub use exposure::ExposureSettings;
+pub(crate) use exposure::{select_exposed, select_openai_compatible_tools};
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///
@@ -3670,9 +3670,11 @@ async fn execute_tool_inner(
     // A read/recovery tool can itself hit a caveat denial (for example
     // `web_fetch` outside the net allow-list). Non-Act turns must never turn
     // that into an authority grant, so remove the human grant seam even for the
-    // narrow tools the disposition permits. The existing caveats still decide
-    // whether the read is legal.
-    if disposition != PromptDisposition::Act {
+    // narrow tools the disposition permits. `request_user_input` is the sole
+    // exception: its question path mints no caveat and cannot widen this turn,
+    // but it must still be able to hand control back to an interactive operator.
+    // The existing caveats continue to decide whether each read is legal.
+    if disposition != PromptDisposition::Act && name != "request_user_input" {
         permission_gate = None;
     }
 
@@ -4091,7 +4093,7 @@ async fn execute_tool_inner(
                 persona_tools,
             );
             let catalog = filter_tools_for_disposition(catalog, disposition);
-            super::tool_search::execute_tool_search(query, &catalog)
+            super::tool_search::execute_tool_search_for_disposition(query, &catalog, disposition)
         }
 
         // Embedded git (PR4, #461): dispatch through the injected GitTool
@@ -11489,11 +11491,10 @@ mod execute_tool_branch_tests {
         ws: &std::path::Path,
         caveats: &Caveats,
         mcp: &mut dyn McpTools,
-        gate: Option<&mut MockGate>,
+        gate: Option<&mut dyn PermissionGate>,
         step_ledger: Option<&dyn crate::agentic::scheduled::StepLedger>,
         disposition: PromptDisposition,
     ) -> String {
-        let gate = gate.map(|gate| gate as &mut dyn PermissionGate);
         execute_tool_with_offload_and_prompt_and_artifacts(
             name,
             &args,
@@ -12413,6 +12414,35 @@ mod execute_tool_branch_tests {
         .await;
         assert_eq!(out, "the answer");
         assert_eq!(gate.asked, vec!["what now?".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn explain_request_user_input_keeps_the_interactive_question_gate() {
+        // Regression: the non-Act authority clamp used to erase the whole gate,
+        // which made this advertised Explain tool falsely report headless. Its
+        // free-text path does not mint authority, so it must keep the operator.
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+        let mut mcp = NoMcp;
+        let mut gate = AskGate::new(Some("send an Act request"));
+
+        let out = run_tool_with_disposition(
+            "request_user_input",
+            serde_json::json!({"question": "Please send this as an explicit action request."}),
+            ws.path(),
+            &caveats,
+            &mut mcp,
+            Some(&mut gate),
+            None,
+            PromptDisposition::Explain,
+        )
+        .await;
+
+        assert_eq!(out, "send an Act request");
+        assert_eq!(
+            gate.asked,
+            vec!["Please send this as an explicit action request.".to_string()]
+        );
     }
 
     #[test]

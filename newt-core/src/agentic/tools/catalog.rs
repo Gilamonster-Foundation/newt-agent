@@ -480,9 +480,9 @@ fn common_read_only_tool_allowed(name: &str) -> bool {
                 // legitimate QUESTION instead of penalized narration — the
                 // #1257 double-bind. Free-text Q&A only: `request_permissions`
                 // stays excluded (evidence turns must not mint capability
-                // grants), and the dispatch is side-effect-free under the
-                // nulled non-Act permission gate (headless → a recoverable
-                // no-human message, never a grant, never a hang).
+                // grants). Its dedicated question seam cannot mint caveats or
+                // widen the accepted turn; an absent interactive gate still
+                // returns a recoverable no-human message without hanging.
                 | "request_user_input"
     )
 }

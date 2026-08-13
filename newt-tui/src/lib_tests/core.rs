@@ -413,7 +413,7 @@ fn config_helpers_read_from_passed_config_not_disk() {
 
     // An empty config yields the documented defaults.
     let empty = newt_core::Config::default();
-    assert_eq!(max_tool_rounds(&empty), 25);
+    assert_eq!(max_tool_rounds(&empty), 40);
     assert_eq!(workflow_grace_rounds(&empty), 5);
     assert_eq!(tool_output_lines(&empty), 20);
     assert_eq!(resolve_tui(&empty), None);

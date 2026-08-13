@@ -563,9 +563,9 @@ fn context_stats_text_composes_budget_compression_and_features() {
 
 #[test]
 fn mid_loop_trim_threshold_clamps_below_round_cap() {
-    // Default config: threshold 40 clamped to max_tool_rounds(25) - 3 = 22,
+    // Default config: threshold 40 clamped to max_tool_rounds(40) - 3 = 37,
     // so the trim safety valve always fires before the round ceiling.
-    assert_eq!(mid_loop_trim_threshold(&newt_core::Config::default()), 22);
+    assert_eq!(mid_loop_trim_threshold(&newt_core::Config::default()), 37);
 
     // Small round cap: threshold clamps to cap - 3.
     let cfg = newt_core::Config {

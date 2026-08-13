@@ -1225,6 +1225,114 @@ async fn cap_exit_hallucinated_path_gets_claim_check_refutation() {
 // OpenAI-path coverage
 // -----------------------------------------------------------------------
 
+/// Large MCP surface from the field transcript: 169 remote definitions before
+/// Newt's built-ins. None is invoked; this fixture grounds the request-envelope
+/// regression without a live MCP server.
+struct ManyToolsMcp {
+    count: usize,
+}
+
+#[async_trait::async_trait]
+impl McpTools for ManyToolsMcp {
+    fn handles(&self, _name: &str) -> bool {
+        false
+    }
+
+    fn tool_defs(&self) -> Vec<serde_json::Value> {
+        (0..self.count)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("field_mcp__tool_{index:03}"),
+                        "description": "Synthetic remote tool for the provider-envelope regression.",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })
+            })
+            .collect()
+    }
+
+    async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
+        "unexpected MCP call".to_string()
+    }
+}
+
+/// Simulates an OpenAI-compatible gateway that rejects more than 128 function
+/// tools with the same opaque invalid_argument shape seen in the transcript.
+struct OpenAiToolEnvelopeResponder {
+    max_seen: Arc<AtomicUsize>,
+    kernel_seen: Arc<AtomicBool>,
+}
+
+impl Respond for OpenAiToolEnvelopeResponder {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body = body_json(req);
+        let tools = body["tools"].as_array().cloned().unwrap_or_default();
+        self.max_seen.fetch_max(tools.len(), Ordering::SeqCst);
+        let names = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        self.kernel_seen.store(
+            names.contains(&"run_command") && names.contains(&"tool_search"),
+            Ordering::SeqCst,
+        );
+        if tools.len() > crate::agentic::tools::exposure::OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS {
+            return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "code": "invalid_argument",
+                    "message": "an internal error occurred",
+                    "type": "invalid_request_error"
+                }
+            }));
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "tool envelope accepted"}}]
+        }))
+    }
+}
+
+#[tokio::test]
+async fn openai_large_mcp_catalog_stays_within_wire_contract_and_keeps_shell() {
+    let server = MockServer::start().await;
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let kernel_seen = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(OpenAiToolEnvelopeResponder {
+            max_seen: max_seen.clone(),
+            kernel_seen: kernel_seen.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.task = "test \"gh auth status\" now";
+    let mut mcp = ManyToolsMcp { count: 169 };
+
+    let (reply, _, _, _) = chat_complete(c, &mut mcp)
+        .await
+        .expect("the provider-compatible request should reach inference");
+
+    assert_eq!(reply, "tool envelope accepted");
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        crate::agentic::tools::exposure::OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS
+    );
+    assert!(
+        kernel_seen.load(Ordering::SeqCst),
+        "run_command and tool_search must survive optional MCP clipping"
+    );
+}
+
 #[tokio::test]
 async fn chat_complete_dispatches_openai_kind_and_returns_first_round_answer() {
     let server = MockServer::start().await;
@@ -1285,6 +1393,7 @@ async fn openai_unverified_run_command_blocker_gets_ground_truth_retry() {
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
+    c.task = "you should have a \"gh\" command ... test \"gh auth status\" now to tell me if you can use it?";
     c.max_tool_rounds = 2;
     let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
 
