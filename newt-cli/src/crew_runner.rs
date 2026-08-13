@@ -283,7 +283,15 @@ fn crew_dispatch_result(report: String, did_land: bool) -> Result<String, String
 /// attributes the commit to the configured account while the name records
 /// which model actually ran. Pure.
 fn crew_coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> String {
-    format!("Co-authored-by: {model} <{}>", identity.email)
+    // The `Model:` line pairs with the commit-time Harness/Operator/Time/Date
+    // fields stamped by newt-git's `sign_message`, forming the full footer:
+    //   Co-authored-by: <model> <email>
+    //   Model: <model>
+    //   Harness: <brand> v<ver> | Operator: <op> | Time: <t> | Date: <d>
+    format!(
+        "Co-authored-by: {model} <{}>\nModel: {model}",
+        identity.email
+    )
 }
 
 #[async_trait]
@@ -601,7 +609,13 @@ mod tests {
         // EMAIL makes GitHub attribute the commit to the configured account.
         let id = newt_core::AgentIdentity::default();
         let t = crew_coauthor_trailer("ornith:35b", &id);
-        assert_eq!(t, format!("Co-authored-by: ornith:35b <{}>", id.email));
+        assert_eq!(
+            t,
+            format!(
+                "Co-authored-by: ornith:35b <{}>\nModel: ornith:35b",
+                id.email
+            )
+        );
         assert!(
             t.contains("309460085+newt-agent@users.noreply.github.com"),
             "{t}"
@@ -614,7 +628,7 @@ mod tests {
         };
         assert_eq!(
             crew_coauthor_trailer("m", &custom),
-            "Co-authored-by: m <custom@example.com>"
+            "Co-authored-by: m <custom@example.com>\nModel: m"
         );
     }
 

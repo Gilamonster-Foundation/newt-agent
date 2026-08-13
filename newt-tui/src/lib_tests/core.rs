@@ -33,7 +33,7 @@ fn coauthor_trailer_uses_resolved_identity_email() {
     // harness identity (default: GitHub User https://github.com/newt-agent).
     assert_eq!(
         tr,
-        "Co-authored-by: nemotron-3-nano:30b <309460085+newt-agent@users.noreply.github.com>"
+        "Co-authored-by: nemotron-3-nano:30b <309460085+newt-agent@users.noreply.github.com>\nModel: nemotron-3-nano:30b"
     );
     assert!(tr.contains(newt_core::DEFAULT_AGENT_EMAIL));
     assert!(
@@ -52,7 +52,7 @@ fn coauthor_trailer_uses_resolved_identity_email() {
     };
     assert_eq!(
         coauthor_trailer("ornith:35b", &custom),
-        "Co-authored-by: ornith:35b <my-agent@example.com>"
+        "Co-authored-by: ornith:35b <my-agent@example.com>\nModel: ornith:35b"
     );
 }
 
