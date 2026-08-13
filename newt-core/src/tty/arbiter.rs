@@ -423,6 +423,7 @@ impl Terminal {
     /// shared ticker paints nothing until the returned window is dropped.
     pub fn suspend_for_prompt() -> PromptWindow {
         SUSPENSIONS.fetch_add(1, Ordering::SeqCst);
+        notify_prompt_observer(true);
         // 1. Take stdin FIRST and block until the turn watcher's read finishes,
         //    so we never erase the screen and then wait to be allowed to ask.
         let stdin = StdinToken::acquire();
@@ -645,6 +646,24 @@ impl Drop for PromptWindow {
         // Stdin last: the terminal mode goes back to whatever the turn watcher
         // had set up only after the screen is whole again.
         self.stdin = None;
+        notify_prompt_observer(false);
+    }
+}
+
+/// Observer notified when a live [`PromptWindow`] opens (`true`) and closes
+/// (`false`) — i.e. exactly when the process starts and stops blocking on a
+/// human. Registered at most once, by the UI tier; this crate knows nothing
+/// about what the observer does with the signal. The test stub never fires it.
+static PROMPT_OBSERVER: OnceLock<Box<dyn Fn(bool) + Send + Sync>> = OnceLock::new();
+
+/// Register the process-wide prompt observer. Later registrations are ignored.
+pub fn set_prompt_observer(observer: impl Fn(bool) + Send + Sync + 'static) {
+    let _ = PROMPT_OBSERVER.set(Box::new(observer));
+}
+
+fn notify_prompt_observer(open: bool) {
+    if let Some(observer) = PROMPT_OBSERVER.get() {
+        observer(open);
     }
 }
 

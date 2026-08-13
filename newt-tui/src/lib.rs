@@ -17,6 +17,7 @@ mod navigator_cmds;
 mod commands;
 mod danger;
 pub mod dgx_probe;
+mod lifecycle;
 mod line_console;
 #[cfg(feature = "live-spill")]
 mod live_spill;

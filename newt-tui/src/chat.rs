@@ -846,6 +846,10 @@ pub(crate) fn run_chat(
 ) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
+    // Report lifecycle state to Herdr when running inside a Herdr pane
+    // (no-op everywhere else).
+    crate::lifecycle::init();
+
     // Header line — one-time print, then normal scroll from here.
     if color {
         execute!(
@@ -1989,6 +1993,7 @@ pub(crate) fn run_chat(
                             parent: pending.parent.clone(),
                         }
                     });
+            crate::lifecycle::report(crate::lifecycle::IDLE);
             (surface.read_line(&prompt)?, origin)
         };
         match outcome {
@@ -1999,6 +2004,7 @@ pub(crate) fn run_chat(
                 if task.is_empty() {
                     continue;
                 }
+                crate::lifecycle::report(crate::lifecycle::WORKING);
                 model_input_origin = upgrade_origin_for_interrupted_objective(
                     model_input_origin,
                     &task,
