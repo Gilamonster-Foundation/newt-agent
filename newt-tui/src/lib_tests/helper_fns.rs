@@ -637,6 +637,8 @@ fn expand_prompt_tokens_replaces_all_tokens() {
 
 #[test]
 fn resolver_default_backend_beats_the_openai_heuristic() {
+    // Unset NEWT_DGX_MODEL to avoid interference from the environment
+    std::env::remove_var("NEWT_DGX_MODEL");
     // #1139 (C1): with several backends and a default_backend pointer, the
     // pointer wins; without it, the historical prefer-openai heuristic
     // applies; a sole backend is always chosen.

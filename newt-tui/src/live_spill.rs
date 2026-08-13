@@ -1740,6 +1740,7 @@ mod tests {
 // #1640: CompletedSpillRenderer implementation for Rich TUI completed spill
 // ========================================================================
 
+#[allow(clippy::items_after_test_module)]
 impl CompletedSpillRenderer for LiveSpillRenderer {
     /// Render a completed tool result as an interactive spill viewport.
     ///

@@ -14,6 +14,7 @@ const DEFAULT_HISTORY_LINES: usize = 4_096;
 const DEFAULT_LINE_CHARS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum Gutter {
     Expand,
     Collapse,
@@ -458,6 +459,7 @@ impl SpillView {
         self.dropped_lines
     }
 
+    #[allow(dead_code)]
     pub(crate) fn frame(&self) -> SpillFrame {
         let retained_start = self.dropped_lines;
         let retained_count = self.retained_line_count();
@@ -610,6 +612,7 @@ impl SpillView {
         }
     }
 
+    #[allow(dead_code)]
     fn thumb_row(&self, start: usize, shown: usize) -> Option<usize> {
         if shown == 0 {
             return None;
@@ -623,6 +626,7 @@ impl SpillView {
     }
 }
 
+#[allow(dead_code)]
 fn boundary_text(gutter: Gutter) -> String {
     match gutter {
         Gutter::HiddenAbove(lines) => hidden_text(lines, "above"),
@@ -637,6 +641,7 @@ fn boundary_text(gutter: Gutter) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn hidden_text(lines: usize, direction: &str) -> String {
     let noun = if lines == 1 { "line" } else { "lines" };
     format!("{lines} more {noun} {direction}")
