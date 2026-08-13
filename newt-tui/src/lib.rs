@@ -30,6 +30,7 @@ mod prompt;
 mod prompt_visibility_test;
 #[cfg(feature = "live-spill")]
 mod spill_view;
+mod type_ahead;
 // OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).
 mod mcp;
 mod mcp_token;
@@ -8880,6 +8881,12 @@ enum TurnKeyState {
     X10Mouse {
         remaining: u8,
     },
+    // #1303 FIX E follow-up: a CSI whose params overflowed the cap. The rest
+    // of the malformed sequence is swallowed here until its terminator —
+    // resyncing to Ground mid-sequence would leak the tail as ground bytes,
+    // which type-ahead capture now makes visible as prefill garbage.
+    #[cfg(feature = "live-spill")]
+    CsiDiscard,
 }
 
 /// #1303 FIX E: cap on accumulated CSI parameter bytes. A well-behaved SGR-mouse
@@ -8912,6 +8919,13 @@ struct TurnKeyDecoder {
     // watcher sets it from the resolved mouse-tier flag. Base keys are always on.
     #[cfg(feature = "live-spill")]
     mode_nav: bool,
+    // Persistent-prompt phase 1 (docs/decisions/persistent_prompt.md):
+    // ground-state bytes that are neither interrupts nor viewport-nav keys used
+    // to be DROPPED here — typing during a turn vanished. They now accumulate
+    // as type-ahead text; the watcher drains this into `type_ahead` ONCE at
+    // exit (a per-read drain would reset the Space/Enter latch and backspace
+    // editing between keystrokes) and the next prompt pre-fills with it.
+    text: Vec<u8>,
 }
 
 #[cfg(all(unix, feature = "live-spill"))]
@@ -8941,10 +8955,11 @@ impl TurnKeyDecoder {
                     // mouse / Alt-chord) is a non-`g` event — clear the vi `gg`
                     // latch so a `g` before it can't mis-fire `Top` on a later
                     // `g`. Every escape sequence starts with this `0x1b`, so one
-                    // clear here covers CSI/SS3/mouse/escape alike.
+                    // clear here covers CSI/SS3/mouse/escape alike. The armed
+                    // `g` was typed text, not nav — keep it in the prefill.
                     #[cfg(feature = "live-spill")]
-                    {
-                        self.pending_g = false;
+                    if std::mem::take(&mut self.pending_g) {
+                        self.push_text_byte(b'g');
                     }
                     TurnKeyState::Escape
                 }
@@ -8975,7 +8990,7 @@ impl TurnKeyDecoder {
                         if (0x20..=0x3f).contains(&byte) {
                             if self.params.len() >= MAX_CSI_PARAM_BYTES {
                                 self.params.clear();
-                                TurnKeyState::Ground
+                                TurnKeyState::CsiDiscard
                             } else {
                                 self.params.push(byte);
                                 TurnKeyState::Csi
@@ -8989,6 +9004,12 @@ impl TurnKeyDecoder {
                         TurnKeyState::Csi
                     }
                 }
+                #[cfg(feature = "live-spill")]
+                TurnKeyState::CsiDiscard if byte == 0x1b => TurnKeyState::Escape,
+                #[cfg(feature = "live-spill")]
+                TurnKeyState::CsiDiscard if (0x40..=0x7e).contains(&byte) => TurnKeyState::Ground,
+                #[cfg(feature = "live-spill")]
+                TurnKeyState::CsiDiscard => TurnKeyState::CsiDiscard,
                 #[cfg(feature = "live-spill")]
                 TurnKeyState::X10Mouse { remaining } => {
                     // #1303 FIX C: consume Cb,Cx,Cy. Decode the button from the
@@ -9092,20 +9113,55 @@ impl TurnKeyDecoder {
     }
 
     /// A Ground-state byte (not part of an escape sequence). The base keys —
-    /// `Space`/`Enter` → expand — are ALWAYS active in every mode (the unchanged
-    /// live-spill contract); editor-mode nav is layered on top and additive.
+    /// `Space`/`Enter` → expand — keep their live-spill contract while nothing
+    /// has been typed; once type-ahead has begun they are text (the user is
+    /// writing a message, not steering a viewport). Editor-mode nav (when opted
+    /// in) is layered on top; every remaining ground byte becomes type-ahead
+    /// text instead of vanishing.
     fn push_ground_key(&mut self, byte: u8, keys: &mut Vec<TurnKey>) {
-        if matches!(byte, b' ' | b'\r' | b'\n') {
+        if matches!(byte, b' ' | b'\r' | b'\n') && self.text.is_empty() {
             keys.push(TurnKey::ToggleExpanded);
             #[cfg(feature = "live-spill")]
             {
                 self.pending_g = false;
             }
-        } else {
-            // Editor-mode nav (live-spill only); the lean build has none.
-            #[cfg(feature = "live-spill")]
-            self.push_mode_ground_key(byte, keys);
+            return;
         }
+        // Editor-mode nav (live-spill only); the lean build has none. A byte
+        // the active mode consumes is nav, never text.
+        #[cfg(feature = "live-spill")]
+        if self.push_mode_ground_key(byte, keys) {
+            return;
+        }
+        self.push_text_byte(byte);
+    }
+
+    /// Accumulate one ground byte as type-ahead text. Backspace edits in place
+    /// (UTF-8 aware), CR/LF normalize to `\n`, tabs soften to a space, and the
+    /// remaining C0 controls are dropped — everything else (including UTF-8
+    /// lead/continuation bytes) is kept verbatim for the lossy decode at drain.
+    fn push_text_byte(&mut self, byte: u8) {
+        match byte {
+            0x08 | 0x7f => {
+                // Pop one whole character: continuation bytes (0x80..=0xbf)
+                // fall until the lead (or ASCII) byte that starts the char.
+                while let Some(popped) = self.text.pop() {
+                    if !(0x80..=0xbf).contains(&popped) {
+                        break;
+                    }
+                }
+            }
+            b'\r' | b'\n' => self.text.push(b'\n'),
+            b'\t' => self.text.push(b' '),
+            0x20..=0xff => self.text.push(byte),
+            _ => {}
+        }
+    }
+
+    /// Drain the accumulated type-ahead bytes (the watcher forwards them to
+    /// [`type_ahead`] after every read).
+    fn take_text(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.text)
     }
 
     /// Editor-mode-aware viewport nav (#1303 clause 4). vi is implemented fully
@@ -9113,22 +9169,30 @@ impl TurnKeyDecoder {
     /// `C-n`/`C-p`/`C-v` (line + page-down). nano rides the universal arrows.
     /// Modes' remaining bindings (emacs `M-v`/`M-<`/`M->`, nano `C-y`/`M-\`) are
     /// a documented follow-on seam — the `↑`/`↓`/`Space` base always works.
+    /// Returns `true` when the byte was consumed as a nav key (or armed the vi
+    /// `gg` latch); `false` hands it to type-ahead text.
     #[cfg(feature = "live-spill")]
-    fn push_mode_ground_key(&mut self, byte: u8, keys: &mut Vec<TurnKey>) {
+    fn push_mode_ground_key(&mut self, byte: u8, keys: &mut Vec<TurnKey>) -> bool {
         use newt_core::EditMode;
         // #1303 FIX F: the mode-aware keys only fire with the mouse opt-in. When
         // it's off (keyboard tier / opted-out), this is a no-op — `j`/`k`/`gg`…
-        // do nothing, exactly the 0.7.3 behavior — while the base keys
-        // (`↑`/`↓`/`Space`/`Enter`, handled in `push_ground_key` and the CSI/SS3
-        // arms) stay unconditional.
+        // are plain type-ahead text — while the base keys (`↑`/`↓` and the
+        // empty-buffer `Space`/`Enter`, handled in `push_ground_key` and the
+        // CSI/SS3 arms) stay unconditional.
         if !self.mode_nav {
-            return;
+            return false;
         }
         // `gg` (vi) is the only two-key sequence: a pending `g` consumes the
-        // next byte. `gg` → Top; anything else re-processes the byte normally.
-        if std::mem::take(&mut self.pending_g) && byte == b'g' {
-            keys.push(TurnKey::Top);
-            return;
+        // next byte. `gg` → Top; anything else re-processes the byte normally —
+        // and the armed `g` turns out to have been typed TEXT, so flush it to
+        // the type-ahead buffer rather than dropping it ("great" must not
+        // prefill as "reat").
+        if std::mem::take(&mut self.pending_g) {
+            if byte == b'g' {
+                keys.push(TurnKey::Top);
+                return true;
+            }
+            self.push_text_byte(b'g');
         }
         match self.mode {
             EditMode::Vi => match byte {
@@ -9138,17 +9202,18 @@ impl TurnKeyDecoder {
                 b'g' => self.pending_g = true,
                 0x04 => keys.push(TurnKey::HalfPageDown), // C-d
                 0x15 => keys.push(TurnKey::HalfPageUp),   // C-u
-                _ => {}
+                _ => return false,
             },
             EditMode::Emacs => match byte {
                 0x0e => keys.push(TurnKey::Down),         // C-n
                 0x10 => keys.push(TurnKey::Up),           // C-p
                 0x16 => keys.push(TurnKey::HalfPageDown), // C-v (page down)
-                _ => {}
+                _ => return false,
             },
             // nano is modeless/emacs-like; the universal arrows already cover it.
-            EditMode::Nano => {}
+            EditMode::Nano => return false,
         }
+        true
     }
 }
 
@@ -9284,8 +9349,9 @@ mod mouse_decode_tests {
     }
 
     // #1303 FIX F: the mode-aware nav keys activate ONLY with the mouse opt-in
-    // (`mode_nav`). A decoder built WITHOUT the opt-in must ignore vi `j`/`k`/`gg`
-    // exactly like 0.7.3, while the base keys stay unconditional.
+    // (`mode_nav`). A decoder built WITHOUT the opt-in must never emit nav keys
+    // for vi `j`/`k`/`gg` — since the persistent-prompt work those bytes are
+    // type-ahead TEXT (not dropped) — while the base keys stay unconditional.
     #[test]
     fn mode_nav_off_ignores_editor_keys_even_in_vi_mode() {
         let mut d = TurnKeyDecoder {
@@ -9293,11 +9359,13 @@ mod mouse_decode_tests {
             mode_nav: false,
             ..Default::default()
         };
-        assert_eq!(d.feed(b"j"), vec![], "opt-in off: vi `j` does nothing");
-        assert_eq!(d.feed(b"k"), vec![], "opt-in off: vi `k` does nothing");
-        assert_eq!(d.feed(b"gg"), vec![], "opt-in off: `gg` does nothing");
+        assert_eq!(d.feed(b"j"), vec![], "opt-in off: vi `j` is not nav");
+        assert_eq!(d.feed(b"k"), vec![], "opt-in off: vi `k` is not nav");
+        assert_eq!(d.feed(b"gg"), vec![], "opt-in off: `gg` is not nav");
         assert_eq!(d.feed(b"\x04"), vec![], "opt-in off: C-d does nothing");
-        // Base keys remain unconditional.
+        // The letters became type-ahead text (C-d, a C0 control, is dropped)…
+        assert_eq!(d.take_text(), b"jkgg");
+        // …and with the buffer drained, base keys remain unconditional.
         assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded], "space");
         assert_eq!(d.feed(b"\r"), vec![TurnKey::ToggleExpanded], "enter");
         assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up], "up-arrow");
@@ -9376,7 +9444,8 @@ mod mouse_decode_tests {
 
     // #1303 FIX E: the CSI params accumulator is length-capped so a
     // non-terminating CSI stream can't grow it without bound; the decoder
-    // resyncs to Ground and a following well-formed sequence still decodes.
+    // swallows the malformed sequence's tail and a following well-formed
+    // sequence still decodes.
     #[test]
     fn csi_params_are_length_capped_and_resync() {
         let mut d = TurnKeyDecoder::default();
@@ -9391,6 +9460,37 @@ mod mouse_decode_tests {
         );
         // After the overflow resync, a fresh arrow decodes normally.
         assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up]);
+        // The overflowed sequence's tail was swallowed, never captured as
+        // type-ahead text (prefill garbage).
+        assert!(d.take_text().is_empty(), "no CSI tail leaks into text");
+    }
+
+    /// An overflowed CSI's remaining param bytes and terminator are swallowed
+    /// to the terminator — not resynced to Ground where type-ahead capture
+    /// would turn them into visible prefill garbage.
+    #[test]
+    fn csi_overflow_tail_never_becomes_type_ahead_text() {
+        let mut d = TurnKeyDecoder::default();
+        let mut seq = b"\x1b[".to_vec();
+        seq.extend(std::iter::repeat_n(b'1', 40));
+        seq.push(b'~'); // terminator of the malformed sequence
+        seq.extend_from_slice(b"hi"); // real typing after it
+        assert!(d.feed(&seq).is_empty());
+        assert_eq!(d.take_text(), b"hi");
+    }
+
+    /// A broken vi `gg` latch flushes the armed `g` as text — "great" must
+    /// prefill as "great", not "reat"; an escape sequence breaking the latch
+    /// keeps the `g` too. A real `gg` still navigates.
+    #[test]
+    fn broken_gg_latch_keeps_the_typed_g() {
+        let mut d = TurnKeyDecoder::with_mode(newt_core::EditMode::Vi);
+        assert!(d.feed(b"great").is_empty());
+        assert_eq!(d.take_text(), b"great");
+        assert_eq!(d.feed(b"g\x1b[A"), vec![TurnKey::Up]);
+        assert_eq!(d.take_text(), b"g");
+        assert_eq!(d.feed(b"gg"), vec![TurnKey::Top]);
+        assert!(d.take_text().is_empty());
     }
 }
 
@@ -9452,6 +9552,61 @@ mod interrupt_tests {
         assert_eq!(decoder.feed(b"\r"), [TurnKey::ToggleExpanded]);
     }
 
+    /// The type-ahead drain happens at watcher EXIT, not per read: interactive
+    /// typing arrives one byte per read(2), and a per-read drain would empty
+    /// the decoder buffer between keystrokes — defeating the Space "typing has
+    /// begun" latch, so mid-sentence spaces would toggle the viewport and
+    /// vanish from the prefill ("fix the bug" → "fixthebug").
+    #[serial_test::serial(prompt_stdin, type_ahead)]
+    #[test]
+    fn per_keystroke_reads_preserve_spaces_in_type_ahead() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let _ = crate::type_ahead::take();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let cancel = AtomicBool::new(false);
+        let hard = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                watch_for_interrupt_fd(
+                    pipe[0],
+                    &cancel,
+                    &hard,
+                    &stop,
+                    None,
+                    newt_core::EditMode::Nano,
+                    false,
+                    10,
+                    50,
+                );
+            });
+            // One byte per write = one byte per read, the human typing shape.
+            for byte in *b"hi !" {
+                assert_eq!(
+                    unsafe { libc::write(pipe[1], [byte].as_ptr().cast(), 1) },
+                    1
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // No wake byte: the 10 ms poll timeout notices `stop` on its own,
+            // so nothing can race into the decoder after this store.
+            stop.store(true, Ordering::Relaxed);
+        });
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert!(!cancel.load(Ordering::Relaxed), "typing never interrupts");
+        assert_eq!(
+            crate::type_ahead::take(),
+            "hi !",
+            "the mid-sentence space survives per-keystroke reads"
+        );
+    }
+
     /// A stale leaked flag is healed on ENTRY — including on the watcherless
     /// (`enabled == false`) path, which has no other opportunity to clear it.
     #[serial_test::serial(interrupt_pending)]
@@ -9470,6 +9625,35 @@ mod interrupt_tests {
         });
         assert_eq!(ran, 42);
         assert!(!newt_core::tty::interrupt_pending());
+    }
+
+    /// Persistent-prompt phase 1: ground bytes that are neither interrupts nor
+    /// nav keys accumulate as type-ahead text instead of vanishing; backspace
+    /// edits, and escape-sequence bytes never leak in.
+    #[test]
+    fn typed_ground_bytes_accumulate_as_type_ahead_text() {
+        let mut d = TurnKeyDecoder::default();
+        assert!(d.feed(b"fix").is_empty(), "text produces no keys");
+        // Space after typing has begun is text, not ToggleExpanded…
+        assert!(d.feed(b" it").is_empty());
+        // …and an arrow key mid-typing is still nav, never text.
+        assert_eq!(d.feed(b"\x1b[A"), vec![TurnKey::Up]);
+        // Backspace removes the last char; UTF-8 is popped whole.
+        d.feed("é".as_bytes());
+        d.feed(&[0x7f]);
+        assert_eq!(d.take_text(), b"fix it");
+        // Drained: Space on an empty buffer toggles again (the base contract).
+        assert_eq!(d.feed(b" "), vec![TurnKey::ToggleExpanded]);
+        assert!(d.take_text().is_empty());
+    }
+
+    /// Enter with a non-empty buffer is a newline (a queued message), and CR
+    /// normalizes to `\n`.
+    #[test]
+    fn enter_mid_typing_is_a_newline_not_a_toggle() {
+        let mut d = TurnKeyDecoder::default();
+        assert!(d.feed(b"run the tests\r").is_empty());
+        assert_eq!(d.take_text(), b"run the tests\n");
     }
 
     /// The first Ctrl-C both trips the graceful cancel AND raises the
@@ -9863,6 +10047,15 @@ fn watch_for_interrupt_fd(
             }
         }
     }
+    // Persistent-prompt phase 1: whatever the decoder classified as text (not
+    // interrupts, not nav) becomes type-ahead for the next prompt. Drained
+    // ONCE at watcher exit — NOT per read: interactive typing arrives one byte
+    // per read, so a per-read drain would empty the decoder's buffer between
+    // every keystroke, defeating the Space/Enter "typing has begun" latch and
+    // backspace editing (spaces would toggle the viewport and vanish from the
+    // prefill). The prompt reads the buffer only after `thread::scope` joins
+    // this thread, so the single late push is always visible in time.
+    type_ahead::push_bytes(&decoder.take_text());
 }
 
 /// RAII cbreak: ICANON + ECHO + ISIG off (per-keystroke, no echo, and Ctrl-C
