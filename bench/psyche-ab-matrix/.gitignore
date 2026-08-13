@@ -1,0 +1,4 @@
+# Run bundles contain prompts, traces, workspaces, endpoint details, and model
+# provenance. Retain them in access-controlled storage; never commit by default.
+runs/
+qualification-runs/
