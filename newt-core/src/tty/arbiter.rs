@@ -423,7 +423,6 @@ impl Terminal {
     /// shared ticker paints nothing until the returned window is dropped.
     pub fn suspend_for_prompt() -> PromptWindow {
         SUSPENSIONS.fetch_add(1, Ordering::SeqCst);
-        notify_prompt_observer(true);
         // 1. Take stdin FIRST and block until the turn watcher's read finishes,
         //    so we never erase the screen and then wait to be allowed to ask.
         let stdin = StdinToken::acquire();
@@ -438,6 +437,12 @@ impl Terminal {
         for e in &live {
             e.erase();
         }
+
+        // 3. Only NOW is the process truly blocked on a human: stdin ownership
+        //    has succeeded and the screen is prompt-ready. Observing earlier
+        //    would report intent (possibly still waiting on another stdin
+        //    owner) rather than reality.
+        notify_prompt_observer(true);
 
         PromptWindow {
             _seal: Seal,
@@ -867,5 +872,49 @@ mod tests {
         assert!(!suspended());
         drop(w);
         assert!(!suspended());
+    }
+
+    /// The prompt observer describes reality, not intent: `open` fires only
+    /// once stdin ownership and suspension have succeeded (observable here as
+    /// stdin already being prompt-owned when the callback runs), `close` fires
+    /// on drop, and the inert test stub fires neither.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn prompt_observer_fires_after_stdin_acquisition_and_on_drop() {
+        // (thread, open, stdin_owned_at_callback); process-global log because
+        // the observer is a process-global OnceLock. Serial-guarded tests
+        // cannot interleave windows, so filtering to our thread is exact.
+        static LOG: Mutex<Vec<(std::thread::ThreadId, bool, bool)>> = Mutex::new(Vec::new());
+        set_prompt_observer(|open| {
+            LOG.lock()
+                .unwrap()
+                .push((std::thread::current().id(), open, prompt_stdin_active()));
+        });
+        let me = std::thread::current().id();
+        LOG.lock().unwrap().retain(|(t, _, _)| *t != me);
+
+        {
+            let _stub = PromptWindow::test_stub();
+        }
+        assert!(
+            LOG.lock().unwrap().iter().all(|(t, _, _)| *t != me),
+            "the stub must not fire the observer"
+        );
+
+        let w = Terminal::suspend_for_prompt();
+        drop(w);
+        let mine: Vec<(bool, bool)> = LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _, _)| *t == me)
+            .map(|(_, open, owned)| (*open, *owned))
+            .collect();
+        assert_eq!(
+            mine,
+            vec![(true, true), (false, false)],
+            "open fires exactly once, with stdin already owned (post-acquire, \
+             not intent); close fires on drop, after stdin is released"
+        );
     }
 }
