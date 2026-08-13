@@ -1035,6 +1035,13 @@ impl RichSurface {
         let mut terminal = make_terminal(cur_h)?;
         terminal.clear()?;
         let mut textarea = new_textarea(self.edit);
+        // Persistent-prompt phase 1: pre-fill anything typed while the last
+        // turn ran (captured as type-ahead by the keyboard watcher) so nothing
+        // the user typed is lost.
+        let typed_ahead = crate::type_ahead::take();
+        if !typed_ahead.is_empty() {
+            textarea = textarea_with(self.edit, typed_ahead.trim_end_matches('\n'));
+        }
         let mut editor = Editor::new(self.edit);
         // ↑/↓ history recall (the rustyline behavior the rich surface had
         // dropped): the on-disk history plus this session's not-yet-flushed

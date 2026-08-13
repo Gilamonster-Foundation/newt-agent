@@ -314,6 +314,13 @@ impl LeanSurface {
         io::stdout().flush()?;
 
         let mut state = ReadState::default();
+        // Persistent-prompt phase 1: anything typed while the last turn ran was
+        // captured as type-ahead — pre-fill it so nothing the user typed is
+        // lost (sanitized exactly like a paste; it is turn-time typed input).
+        let typed_ahead = crate::type_ahead::take();
+        if !typed_ahead.is_empty() {
+            state.insert_str(&sanitize_paste(&typed_ahead));
+        }
         self.rows_above_cursor = 0;
         self.render(prompt, &state)?;
 
