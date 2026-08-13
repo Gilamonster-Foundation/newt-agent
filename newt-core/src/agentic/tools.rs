@@ -3589,6 +3589,11 @@ async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
             Some(result)
         }
         None => {
+            // The turn is being torn down — an interactive viewport painted
+            // here would outlive every dismiss hook (the provider loops
+            // return immediately) and strand a dead frame above the caller's
+            // interrupt notice. Static excerpt only.
+            display.drop_completed_spill_renderer();
             let result = format!("error: {name} interrupted — tool cancelled before completion");
             display.result(&result);
             None

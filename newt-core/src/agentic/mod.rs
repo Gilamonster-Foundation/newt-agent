@@ -1037,11 +1037,20 @@ pub trait LiveToolOutput: Send + Sync {
 
 /// Renderer-neutral, turn-scoped consumer for COMPLETED tool output spill view.
 ///
-/// This is the Rich TUI's completed spill renderer — the interactive, scrollable
-/// viewport that replaces the static `spill_view_lines` output for completed
-/// tool results. Only the Rich TUI (feature `rich-tui` + `live-spill`) implements
-/// this; the Lean TUI and headless callers pass `None` and retain the static
-/// completion-only output from `display::spill_view_lines`.
+/// This is the Rich TUI's completed spill renderer — an interactive, scrollable
+/// viewport painted BELOW the committed `spill_view_lines` excerpt after a tool
+/// result. The excerpt stays the canonical transcript record on every tier; the
+/// viewport is a scroll affordance that lives only until the turn's next
+/// canonical write dismisses it (`dismiss_completed_spill` at round dispatch, or
+/// the next tool header). Only the Rich TUI (feature `rich-tui` + `live-spill`)
+/// implements this; the Lean TUI and headless callers pass `None`.
+///
+/// The dismissal discipline is load-bearing: the viewport's erase rewinds
+/// relative to the cursor (`MoveUp` + clear), so any committed line landing
+/// below a still-painted frame breaks the rewind and destroys rows the frame
+/// does not own. A viewport that must SURVIVE canonical output (scroll during
+/// the next thinking round, or at the prompt) is the #1303 step 6
+/// retain-overlay, not this trait.
 ///
 /// Key differences from `LiveToolOutput`:
 /// - Not incremental — renders a complete, finished tool result
@@ -1055,15 +1064,42 @@ pub trait CompletedSpillRenderer: Send + Sync {
     /// terminal column count. `max_height` is the maximum rows this viewport
     /// may occupy (enforced at 50% of terminal height by the caller).
     ///
-    /// Returns the number of physical rows painted, so the caller can position
-    /// subsequent output correctly.
+    /// Returns the number of physical rows painted — 0 when the viewport could
+    /// not take the screen (no TTY room, or a LIVE viewport is still up).
     fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize;
 
-    /// Check if this renderer is active (has a viewport on screen).
+    /// Whether a COMPLETED viewport is currently on screen (a live viewport
+    /// does not count).
     fn is_active(&self) -> bool;
 
-    /// Erase the completed spill viewport from the terminal.
+    /// Erase the completed spill viewport from the terminal — a pure rewind;
+    /// the committed excerpt above the frame is the durable record. No-op
+    /// when no completed viewport is up.
     fn erase(&self);
+
+    /// Drop the viewport's bookkeeping WITHOUT touching the terminal — the
+    /// completed twin of the live path's `abandon`. Used at turn-exit
+    /// boundaries where canonical lines may already have landed below a
+    /// still-painted frame (an error `?`, a cancel return): rewinding from
+    /// there would destroy rows the frame does not own, so the frame is left
+    /// as inert residue instead, and — critically — no LATER erase can replay
+    /// a stale rewind over the next turn's prompt. No-op when nothing is up.
+    fn discard(&self) {}
+}
+
+/// Turn-scoped guard: discards any still-tracked completed viewport when the
+/// provider function exits by ANY path (normal return, `?`, cancel, panic).
+/// This makes the worst failure — a stale `MoveUp` rewind executing on a later
+/// turn, over the prompt and the user's typed input — unrepresentable: the
+/// bookkeeping cannot outlive the turn that painted the frame.
+struct CompletedSpillDismissGuard<'a>(&'a Option<std::sync::Arc<dyn CompletedSpillRenderer>>);
+
+impl Drop for CompletedSpillDismissGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(renderer) = self.0 {
+            renderer.discard();
+        }
+    }
 }
 
 /// Everything one agentic turn needs, resolved once by the caller (the TUI
@@ -1559,6 +1595,20 @@ fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Take down any completed-spill viewport before the turn writes anything new.
+///
+/// The viewport's erase rewinds relative to the cursor, so it MUST come down
+/// before the next canonical line (round dispatch → spinner detail / retry
+/// indicator / streamed text, or the next tool header) lands below it and
+/// breaks the rewind math. The committed excerpt above the frame is the
+/// durable record, so dismissal loses nothing. Idempotent — an inner
+/// recovery-loop retry re-calling this is a no-op.
+fn dismiss_completed_spill(renderer: &Option<std::sync::Arc<dyn CompletedSpillRenderer>>) {
+    if let Some(renderer) = renderer {
+        renderer.erase();
+    }
+}
+
 /// Resolve as soon as the interrupt flag is set, polling at ~50 ms — fine for a
 /// human keypress and cheap enough to lose the race to any real I/O future.
 /// Never resolves when `cancel` is `None`, so a `select!` against it collapses
@@ -1609,7 +1659,14 @@ fn print_synthetic_tool_result(
     workspace: &str,
     result: &str,
     color: bool,
+    completed_spill_renderer: &Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
 ) {
+    // A completed viewport from an earlier tool in the SAME batch may still
+    // be painted; this synthetic block's header must not land below it (the
+    // same erase-first discipline as the wired ToolDisplay::call). Dismissing
+    // here rather than wiring the renderer in keeps synthetic results
+    // static-only — an audit line does not need an interactive viewport.
+    dismiss_completed_spill(completed_spill_renderer);
     let mut tool_display = display::ToolDisplay::new(
         io::stdout(),
         color,
@@ -1801,12 +1858,17 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         write_ledger,
         cancel,
         live_tool_output,
-        completed_spill_renderer: _,
+        completed_spill_renderer,
         git_tool,
         crew_runner,
         operating_mode_control,
         plan_mode_control,
     } = ctx;
+    // Any completed viewport this turn paints must not outlive the turn's
+    // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
+    // discards it — without terminal writes — so a stale rewind can never
+    // replay over a later turn's prompt.
+    let _completed_spill_guard = CompletedSpillDismissGuard(&completed_spill_renderer);
     // Explain / Research / Ask turns may still use bounded read-only tools, but
     // must never inherit the harness's execution-pressure repairs.
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
@@ -2050,6 +2112,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut workflow_grace_active = false;
     let mut current_tool_round_limit = max_tool_rounds;
     'round_loop: for round in 0..hard_tool_rounds {
+        // FIRST statement of every round: the previous round's completed
+        // viewport must come down before ANY canonical line this round can
+        // print — the grace-window debug note, the round separator, the
+        // compression notices, the cancel checkpoint's return to a caller
+        // that prints. Erasing here is safe precisely because nothing has
+        // written since the frame was painted.
+        dismiss_completed_spill(&completed_spill_renderer);
         if round >= current_tool_round_limit {
             if workflow_grace_active {
                 break;
@@ -3390,6 +3459,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         workspace,
                         &reason,
                         color,
+                        &completed_spill_renderer,
                     );
                     if let Some(rec) = tool_events.as_deref_mut() {
                         rec.push(crate::ToolEvent::from_call(
@@ -3425,6 +3495,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         for (_tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
             let name = vc.name.as_str();
             let args = vc.args.clone();
+            // Per-tool head: any frame from the PREVIOUS tool in this batch
+            // comes down before this iteration's first writer (the debug /
+            // trace echoes below print BEFORE the wired `call()` erase).
+            dismiss_completed_spill(&completed_spill_renderer);
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
@@ -3432,7 +3506,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // instead of re-executing a dead or already-useful call. The bogus
             // emission is still counted above; we just don't run it again.
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
-                print_synthetic_tool_result(name, &args, workspace, &steer, color);
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &steer,
+                    color,
+                    &completed_spill_renderer,
+                );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -3468,7 +3549,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     input_ceiling_pct,
                     low_budget_pct,
                 );
-                print_synthetic_tool_result(name, &args, workspace, &report, color);
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &report,
+                    color,
+                    &completed_spill_renderer,
+                );
                 report
             } else {
                 // #297 follow-up: race the tool dispatch against the turn's
@@ -3520,7 +3608,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
-                        completed_spill_renderer: None,
+                        completed_spill_renderer: completed_spill_renderer.clone(),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -3591,7 +3679,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
     }
 
-    // Reached the round cap. Trim the bloated message list so the final
+    // Reached the round cap. The cap exhausts immediately after a TOOL round,
+    // so the last tool's completed viewport is still painted and nothing has
+    // written since — take it down NOW, before the summary dispatch's retry
+    // indicators and the caller's summary text land below it.
+    dismiss_completed_spill(&completed_spill_renderer);
+    // Trim the bloated message list so the final
     // summary request doesn't overflow the model's context window, then
     // make ONE tools-disabled completion so the user gets a real partial answer.
     let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
@@ -5586,8 +5679,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
-        completed_spill_renderer: _,
+        completed_spill_renderer,
     } = ctx;
+    // Any completed viewport this turn paints must not outlive the turn's
+    // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
+    // discards it — without terminal writes — so a stale rewind can never
+    // replay over a later turn's prompt.
+    let _completed_spill_guard = CompletedSpillDismissGuard(&completed_spill_renderer);
     // See the Ollama path: a non-Act turn is allowed bounded reads but never
     // execution-pressure nudges.
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
@@ -5785,6 +5883,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut workflow_grace_active = false;
     let mut current_tool_round_limit = max_tool_rounds;
     'round_loop: for round in 0..hard_tool_rounds {
+        // FIRST statement of every round: the previous round's completed
+        // viewport must come down before ANY canonical line this round can
+        // print — the grace-window debug note, the round separator, the
+        // compression notices, the cancel checkpoint's return to a caller
+        // that prints. Erasing here is safe precisely because nothing has
+        // written since the frame was painted.
+        dismiss_completed_spill(&completed_spill_renderer);
         if round >= current_tool_round_limit {
             if workflow_grace_active {
                 break;
@@ -6753,6 +6858,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         workspace,
                         &reason,
                         color,
+                        &completed_spill_renderer,
                     );
                     if let Some(rec) = tool_events.as_deref_mut() {
                         rec.push(crate::ToolEvent::from_call(
@@ -6790,6 +6896,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
+            // Per-tool head: any frame from the PREVIOUS tool in this batch
+            // comes down before this iteration's first writer (the debug /
+            // trace echoes below print BEFORE the wired `call()` erase).
+            dismiss_completed_spill(&completed_spill_renderer);
             if debug && tc["function"].is_null() {
                 print_debug(
                     &format!(
@@ -6822,7 +6932,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // Ollama path; Responses uses function_call_output). Counted as a
             // hallucination above first when applicable.
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
-                print_synthetic_tool_result(name, &args, workspace, &steer, color);
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &steer,
+                    color,
+                    &completed_spill_renderer,
+                );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -6856,7 +6973,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     input_ceiling_pct,
                     low_budget_pct,
                 );
-                print_synthetic_tool_result(name, &args, workspace, &report, color);
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &report,
+                    color,
+                    &completed_spill_renderer,
+                );
                 report
             } else {
                 let Some(result) = tools::execute_tool_with_collaborators(
@@ -6899,7 +7023,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
-                        completed_spill_renderer: None,
+                        completed_spill_renderer: completed_spill_renderer.clone(),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -6912,6 +7036,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 result
             };
             if debug {
+                // This line lands directly below the viewport `result` just
+                // painted — take the frame down first or its later rewind
+                // erases this line and strands frame rows.
+                dismiss_completed_spill(&completed_spill_renderer);
                 let excerpt: String = result.chars().take(120).collect();
                 print_debug(&format!("tool result: {excerpt:?}"), color);
             }
@@ -6968,7 +7096,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
     }
 
-    // Reached the round cap. Trim the message list and make ONE final
+    // Reached the round cap; the last tool's completed viewport is still up
+    // and nothing has written since — dismiss before any summary output.
+    dismiss_completed_spill(&completed_spill_renderer);
+    // Trim the message list and make ONE final
     // tools-disabled completion (matches the Ollama path).
     let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
     let replay_protected_tail_len =
@@ -7521,8 +7652,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
-        completed_spill_renderer: _,
+        completed_spill_renderer,
     } = ctx;
+    // Any completed viewport this turn paints must not outlive the turn's
+    // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
+    // discards it — without terminal writes — so a stale rewind can never
+    // replay over a later turn's prompt.
+    let _completed_spill_guard = CompletedSpillDismissGuard(&completed_spill_renderer);
     // See the Ollama path: a non-Act turn is allowed bounded reads but never
     // execution-pressure nudges. (Mirrors the OpenAI path.)
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
@@ -7748,6 +7884,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut workflow_grace_active = false;
     let mut current_tool_round_limit = max_tool_rounds;
     'round_loop: for round in 0..hard_tool_rounds {
+        // FIRST statement of every round: the previous round's completed
+        // viewport must come down before ANY canonical line this round can
+        // print — the grace-window debug note, the round separator, the
+        // compression notices, the cancel checkpoint's return to a caller
+        // that prints. Erasing here is safe precisely because nothing has
+        // written since the frame was painted.
+        dismiss_completed_spill(&completed_spill_renderer);
         if round >= current_tool_round_limit {
             if workflow_grace_active {
                 break;
@@ -8648,6 +8791,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         workspace,
                         &reason,
                         color,
+                        &completed_spill_renderer,
                     );
                     if let Some(rec) = tool_events.as_deref_mut() {
                         rec.push(crate::ToolEvent::from_call(
@@ -8682,6 +8826,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
+            // Per-tool head: any frame from the PREVIOUS tool in this batch
+            // comes down before this iteration's first writer (the debug /
+            // trace echoes below print BEFORE the wired `call()` erase).
+            dismiss_completed_spill(&completed_spill_renderer);
             if debug && tc["function"].is_null() {
                 print_debug(
                     &format!(
@@ -8713,7 +8861,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: short-circuit selected exact repeats (mirrors
             // the OpenAI path).
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
-                print_synthetic_tool_result(name, &args, workspace, &steer, color);
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &steer,
+                    color,
+                    &completed_spill_renderer,
+                );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -8745,7 +8900,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     input_ceiling_pct,
                     low_budget_pct,
                 );
-                print_synthetic_tool_result(name, &args, workspace, &report, color);
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &report,
+                    color,
+                    &completed_spill_renderer,
+                );
                 report
             } else {
                 let Some(result) = tools::execute_tool_with_collaborators(
@@ -8784,7 +8946,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
-                        completed_spill_renderer: None,
+                        completed_spill_renderer: completed_spill_renderer.clone(),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -8797,6 +8959,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 result
             };
             if debug {
+                // This line lands directly below the viewport `result` just
+                // painted — take the frame down first or its later rewind
+                // erases this line and strands frame rows.
+                dismiss_completed_spill(&completed_spill_renderer);
                 let excerpt: String = result.chars().take(120).collect();
                 print_debug(&format!("tool result: {excerpt:?}"), color);
             }
@@ -8848,7 +9014,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
     }
 
-    // Reached the round cap. Trim the message list and make ONE final
+    // Reached the round cap; the last tool's completed viewport is still up
+    // and nothing has written since — dismiss before any summary output.
+    dismiss_completed_spill(&completed_spill_renderer);
+    // Trim the message list and make ONE final
     // tools-disabled completion (mirrors the OpenAI path).
     let protected_head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
     let replay_protected_tail_len =
@@ -9169,8 +9338,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
-        completed_spill_renderer: _,
+        completed_spill_renderer,
     } = ctx;
+    // Any completed viewport this turn paints must not outlive the turn's
+    // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
+    // discards it — without terminal writes — so a stale rewind can never
+    // replay over a later turn's prompt.
+    let _completed_spill_guard = CompletedSpillDismissGuard(&completed_spill_renderer);
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // #1528: headless callers may pass no session state — fall back to a local
     // one so the cw-400 recovery's `compress::compress` always has anti-thrash
@@ -9358,6 +9532,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     };
 
     for round in 0..max_tool_rounds {
+        // FIRST statement of every round: the previous round's completed
+        // viewport comes down while the cursor is still just below it — before
+        // the cancel checkpoint's return, the trace writer, or any dispatch
+        // output can land a canonical line under the frame.
+        dismiss_completed_spill(&completed_spill_renderer);
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
@@ -9653,6 +9832,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         workspace,
                         &reason,
                         color,
+                        &completed_spill_renderer,
                     );
                     if let Some(rec) = tool_events.as_deref_mut() {
                         rec.push(crate::ToolEvent::from_call(
@@ -9681,6 +9861,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let call_id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
+            // Per-tool head: any frame from the PREVIOUS tool in this batch
+            // comes down before this iteration's first writer (the debug /
+            // trace echoes below print BEFORE the wired `call()` erase).
+            dismiss_completed_spill(&completed_spill_renderer);
             if trace {
                 print_trace(
                     &format!(
@@ -9697,7 +9881,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // shape: echo a function_call_output with the steer).
             // Counted as a hallucination above first when applicable.
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
-                print_synthetic_tool_result(name, &args, workspace, &steer, color);
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &steer,
+                    color,
+                    &completed_spill_renderer,
+                );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -9741,7 +9932,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     estimation,
                     low_budget_pct,
                 );
-                print_synthetic_tool_result(name, &args, workspace, &report, color);
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &report,
+                    color,
+                    &completed_spill_renderer,
+                );
                 report
             } else {
                 let Some(result) = tools::execute_tool_with_collaborators(
@@ -9784,7 +9982,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
-                        completed_spill_renderer: None,
+                        completed_spill_renderer: completed_spill_renderer.clone(),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -9797,6 +9995,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 result
             };
             if debug {
+                // This line lands directly below the viewport `result` just
+                // painted — take the frame down first or its later rewind
+                // erases this line and strands frame rows.
+                dismiss_completed_spill(&completed_spill_renderer);
                 let excerpt: String = result.chars().take(120).collect();
                 print_debug(&format!("tool result: {excerpt:?}"), color);
             }
@@ -9876,7 +10078,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
     }
 
-    // Round cap: one final tools-disabled call for a summary answer (mirrors
+    // Round cap: the last tool's completed viewport is still up and nothing
+    // has written since — dismiss before any summary output.
+    dismiss_completed_spill(&completed_spill_renderer);
+    // One final tools-disabled call for a summary answer (mirrors
     // the chat path's final_summary, in the Responses shape). #1528 B5: the SAME
     // typed strict-wire gate the rounds use, with `tools_permitted = false` so the
     // final summary can carry NO tools; a proactive-compaction reason (if any) rides
@@ -11683,6 +11888,80 @@ mod tool_round_cap_tests {
         assert!(!streamed);
         // The cap exit reports itself (acceptance forensics, commit 4).
         assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
+    }
+
+    /// A completed-spill viewport painted by a tool result is DISMISSED by the
+    /// loop's hooks — round-top and cap-exit — and cannot outlive the turn
+    /// (the fn-exit guard discards on every path). Pins the load-bearing
+    /// erase-before-canonical-write discipline the call sites implement.
+    #[derive(Default)]
+    struct DismissTrackingRenderer {
+        rendered: AtomicUsize,
+        erased: AtomicUsize,
+        active: std::sync::atomic::AtomicBool,
+    }
+
+    impl CompletedSpillRenderer for DismissTrackingRenderer {
+        fn render_completed(&self, _output: &str, _width: usize, _max_height: usize) -> usize {
+            self.rendered.fetch_add(1, Ordering::SeqCst);
+            self.active.store(true, Ordering::SeqCst);
+            3
+        }
+        fn is_active(&self) -> bool {
+            self.active.load(Ordering::SeqCst)
+        }
+        fn erase(&self) {
+            self.erased.fetch_add(1, Ordering::SeqCst);
+            self.active.store(false, Ordering::SeqCst);
+        }
+        fn discard(&self) {
+            self.active.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_loop_dismisses_the_completed_viewport_it_painted() {
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaResponder {
+                tool_rounds_served: served.clone(),
+                final_answer: "done".into(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(
+            &uri,
+            &messages,
+            &caveats,
+            "do the thing",
+            BackendKind::Ollama,
+        );
+        let renderer = std::sync::Arc::new(DismissTrackingRenderer::default());
+        ctx.completed_spill_renderer = Some(renderer.clone());
+        ctx.safe_context = None;
+
+        let _ = chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect("turn completes");
+
+        assert!(
+            renderer.rendered.load(Ordering::SeqCst) > 0,
+            "the wired renderer painted for tool results"
+        );
+        assert!(
+            renderer.erased.load(Ordering::SeqCst) > 0,
+            "the loop's dismiss hooks erased the viewport"
+        );
+        assert!(
+            !renderer.is_active(),
+            "no viewport survives the turn (round-top / cap-exit / guard)"
+        );
     }
 
     #[tokio::test]

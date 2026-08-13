@@ -341,7 +341,7 @@ impl LiveSpillRenderer {
         state
             .view
             .as_ref()
-            .map(|view| fixed_frame_lines(view, state.generation == Some(0)))
+            .map(|view| fixed_frame_lines(view, state.generation == Some(COMPLETED_GENERATION)))
             .unwrap_or_default()
     }
 
@@ -638,7 +638,7 @@ fn paint_generation(
                     state
                         .view
                         .as_ref()
-                        .map(|view| fixed_frame_lines(view, generation == 0))
+                        .map(|view| fixed_frame_lines(view, generation == COMPLETED_GENERATION))
                         .unwrap_or_default()
                 }),
                 state.color,
@@ -815,64 +815,122 @@ fn rendered_width(text: &str) -> usize {
 // #1640: CompletedSpillRenderer implementation for Rich TUI completed spill
 // ========================================================================
 
+/// The generation completed viewports paint under. Live generations count up
+/// from 1 and `abandon` only ever raises `abandoned_through` to a live number,
+/// so `u64::MAX` can never satisfy `generation <= abandoned_through` — the
+/// abandonment gate stays open for completed frames without any bypass. (The
+/// prior sentinel, 0, sat BELOW the floor and was abandoned by definition:
+/// every completed paint and scroll repaint silently no-opped.)
+const COMPLETED_GENERATION: u64 = u64::MAX;
+
 impl CompletedSpillRenderer for LiveSpillRenderer {
     /// Render a completed tool result as an interactive spill viewport.
     ///
-    /// This reuses the existing SpillView frame logic but renders it as a
-    /// completed (non-live) viewport that supports scrolling, expanding, and
-    /// editor-mode navigation. The viewport is bounded to max 50% of screen
-    /// height to prevent flooding tmux.
+    /// Reuses the live SpillView frame logic — scrolling, expanding, and
+    /// editor-mode navigation all ride the existing `SpillInput` routing,
+    /// because the completed view IS `state.view`. Bounded to max 50% of the
+    /// terminal height so a single spill can't flood a tmux.
     fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize {
-        // Create a temporary SpillView with the completed output
-        let mut view = SpillView::with_limits(width, max_height, 4096, 4096);
-        view.push_stream_bytes(SpillStream::Stdout, output.as_bytes());
-        view.finish();
-
-        // Calculate the actual rows to use (bounded by max_height and 50% of terminal height)
-        let (_, terminal_rows) = (self.state.lock().unwrap().geometry)().unwrap_or((width, 24));
-        let max_allowed = (terminal_rows / 2).max(3).min(max_height);
-        let rows_to_show = view.retained_line_count().min(max_allowed).max(3);
-        view.resize(width, rows_to_show, max_allowed);
-
-        // Store the completed view in state for painting
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
+            // Never stomp a LIVE viewport: the live hand-off (`finish`) clears
+            // `generation` before completed rendering may take the screen. A
+            // previous COMPLETED frame is ours to replace.
+            if state
+                .generation
+                .is_some_and(|generation| generation != COMPLETED_GENERATION)
+            {
+                return 0;
+            }
+            if !sync_geometry(&mut state) {
+                return 0;
+            }
+            let mut view =
+                SpillView::with_limits(state.columns, max_height.max(1), HISTORY_LINES, LINE_CHARS);
+            view.push_stream_bytes(SpillStream::Stdout, output.as_bytes());
+            view.finish();
+            // Bounded by the caller's budget AND 50% of the terminal height.
+            let (_, terminal_rows) = (state.geometry)().unwrap_or((width, 24));
+            let max_allowed = (terminal_rows / 2).max(3).min(state.max_rows.max(1));
+            let rows_to_show = view
+                .retained_line_count()
+                .clamp(1, max_allowed.min(max_height.max(1)));
+            view.resize(state.columns, rows_to_show, max_allowed);
             state.view = Some(view);
-            state.generation = Some(0);
+            state.generation = Some(COMPLETED_GENERATION);
         }
-
-        // Paint the frame using the existing paint logic
-        let generation = 0; // Completed views use generation 0
         paint_generation(
             &self.state,
             &self.output,
             &self.abandoned_through,
-            generation,
+            COMPLETED_GENERATION,
         );
 
-        // Return the number of physical rows painted
-        let output_state = self.output.lock().unwrap();
+        // Physical rows painted, for the caller's cursor accounting.
+        let columns = self.lock_state().columns.max(1);
+        let output_state = self
+            .output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if output_state.painted_generation != Some(COMPLETED_GENERATION) {
+            return 0;
+        }
         output_state
             .painted_line_widths
             .iter()
-            .map(|w| w.max(&1).div_ceil(width.max(1)))
+            .map(|width| (*width).max(1).div_ceil(columns))
             .sum()
     }
 
-    /// Check if a completed spill viewport is currently on screen.
+    /// Whether a COMPLETED viewport is on screen. A live viewport does not
+    /// count — its lifecycle belongs to `LiveToolOutput`, not to dismissal.
     fn is_active(&self) -> bool {
-        self.state.lock().unwrap().view.is_some()
+        self.lock_state().generation == Some(COMPLETED_GENERATION)
     }
 
-    /// Erase the completed spill viewport from the terminal.
-    fn erase(&self) {
-        let mut state = self.state.lock().unwrap();
-        if state.view.is_some() {
+    /// Drop the completed viewport's bookkeeping without terminal writes —
+    /// the completed twin of live `abandon`. The painted frame (if any) stays
+    /// as inert residue; what this guarantees is that no LATER erase can
+    /// replay a stale rewind from a cursor that has since moved.
+    fn discard(&self) {
+        {
+            let mut state = self.lock_state();
+            if state.generation != Some(COMPLETED_GENERATION) {
+                return;
+            }
             state.view = None;
             state.generation = None;
-            // Repaint to clear the viewport
-            paint_generation(&self.state, &self.output, &self.abandoned_through, 0);
         }
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        discard_generation(&mut output, COMPLETED_GENERATION);
+    }
+
+    /// Erase the completed viewport — a pure rewind, releasing the model
+    /// state so the next `start`/`render_completed` begins clean. The
+    /// committed excerpt above the frame is the durable record. No-op when
+    /// no completed viewport is up (never touches a live generation).
+    fn erase(&self) {
+        let columns = {
+            let mut state = self.lock_state();
+            if state.generation != Some(COMPLETED_GENERATION) {
+                return;
+            }
+            // Re-sync so the rewind divides by the terminal's CURRENT width —
+            // the same stale-width hazard `Ephemeral::erase` documents.
+            let _ = sync_geometry(&mut state);
+            state.view = None;
+            state.generation = None;
+            state.columns
+        };
+        erase_generation(
+            &self.output,
+            &self.abandoned_through,
+            COMPLETED_GENERATION,
+            columns,
+        );
     }
 }
 
@@ -1801,5 +1859,224 @@ mod tests {
             renderer.snapshot_lines().last().map(String::as_str),
             Some("▣ Space collapses · ↑↓ scroll")
         );
+    }
+
+    // ====================================================================
+    // CompletedSpillRenderer (#1640 wiring): the completed viewport paints
+    // under a REAL generation, scrolls, and erases as a pure rewind.
+    // Nested so the trait import cannot make the parent module's
+    // `Ephemeral::erase` calls ambiguous.
+    // ====================================================================
+    mod completed {
+        use super::*;
+        use newt_core::agentic::CompletedSpillRenderer;
+
+        /// The regression #1640 shipped: generation 0 sat below the abandonment
+        /// floor, so every completed paint silently no-opped. A completed render
+        /// must actually reach the terminal and report its physical rows.
+        #[test]
+        fn completed_viewport_paints_and_reports_rows() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+
+            let rows = renderer.render_completed("l1\nl2\nl3\nl4\nl5\n", 80, 3);
+            assert!(rows > 0, "a completed render paints physical rows");
+            assert!(CompletedSpillRenderer::is_active(renderer.as_ref()));
+
+            let painted = String::from_utf8_lossy(&writer.0.lock().unwrap()).to_string();
+            assert!(
+                painted.contains("Completed output"),
+                "the completed header row painted: {painted:?}"
+            );
+            assert!(painted.contains("l5"), "the tail content painted");
+        }
+
+        /// Scrolling a completed viewport works — the completed view IS
+        /// `state.view`, so the existing `SpillInput` routing drives it; the
+        /// repaint must survive the abandonment gate (the shipped bug killed it).
+        #[test]
+        fn completed_viewport_scrolls_and_repaints() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.render_completed("l1\nl2\nl3\nl4\nl5\nl6\n", 80, 3);
+            assert!(renderer.scroll_up(), "a completed viewport accepts scroll");
+
+            let before = writer.0.lock().unwrap().len();
+            paint_generation(
+                &renderer.state,
+                &renderer.output,
+                &renderer.abandoned_through,
+                crate::live_spill::COMPLETED_GENERATION,
+            );
+            assert!(
+                writer.0.lock().unwrap().len() > before,
+                "the scroll repaint reached the terminal (gen-0 regression)"
+            );
+            let older = renderer.snapshot_lines();
+            assert!(
+                older.iter().any(|line| line.contains("l3")),
+                "scrolled content is older lines: {older:?}"
+            );
+        }
+
+        /// A live abandon (any live generation) must never gag a completed
+        /// viewport: completed frames paint under `COMPLETED_GENERATION`, which
+        /// sits above every possible abandonment floor.
+        #[test]
+        fn live_abandonment_cannot_gag_a_completed_viewport() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.abandon(7);
+
+            let rows = renderer.render_completed("after-abandon\n", 80, 3);
+            assert!(rows > 0, "completed paint survives a prior live abandon");
+            assert!(CompletedSpillRenderer::is_active(renderer.as_ref()));
+        }
+
+        /// Erase is a pure rewind and releases the model state; it is idempotent
+        /// and `is_active` flips false. (The shipped erase PAINTED instead.)
+        #[test]
+        fn completed_erase_rewinds_once_and_deactivates() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.render_completed("l1\nl2\nl3\n", 80, 3);
+            let painted = writer.0.lock().unwrap().len();
+
+            CompletedSpillRenderer::erase(renderer.as_ref());
+            assert!(!CompletedSpillRenderer::is_active(renderer.as_ref()));
+            let after_erase = writer.0.lock().unwrap().len();
+            assert!(after_erase > painted, "the rewind wrote erase bytes");
+
+            CompletedSpillRenderer::erase(renderer.as_ref());
+            assert_eq!(
+                writer.0.lock().unwrap().len(),
+                after_erase,
+                "a second erase writes zero bytes"
+            );
+        }
+
+        /// `erase` applied through the screen model leaves no frame rows behind —
+        /// the rewind math is exact.
+        #[test]
+        fn completed_erase_leaves_a_clean_screen() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.render_completed("alpha\nbeta\ngamma\n", 80, 3);
+            CompletedSpillRenderer::erase(renderer.as_ref());
+
+            let mut screen = ScreenModel::new(80);
+            screen.apply(&writer.0.lock().unwrap());
+            assert!(
+                screen.rows.iter().all(|row| row.trim().is_empty()),
+                "no frame residue after erase: {:?}",
+                screen.rows
+            );
+        }
+
+        /// A LIVE viewport is never stomped: completed rendering yields (returns
+        /// 0) while a live generation owns the screen, and `is_active` stays
+        /// false — a live frame is not the dismissal hook's business.
+        #[test]
+        fn a_live_viewport_is_never_stomped_by_completed_rendering() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.start(3);
+            renderer.write(3, ToolOutputStream::Stdout, b"live-line\n");
+
+            assert_eq!(renderer.render_completed("intruder\n", 80, 3), 0);
+            assert!(
+                !CompletedSpillRenderer::is_active(renderer.as_ref()),
+                "a live frame is not 'completed'"
+            );
+            assert!(
+                renderer
+                    .snapshot_lines()
+                    .iter()
+                    .any(|line| line.contains("live-line")),
+                "the live view is untouched"
+            );
+
+            // Erase must not touch the live generation either.
+            CompletedSpillRenderer::erase(renderer.as_ref());
+            assert!(renderer
+                .snapshot_lines()
+                .iter()
+                .any(|line| line.contains("live-line")));
+        }
+
+        /// `discard` drops the bookkeeping with ZERO terminal writes — the
+        /// turn-exit guard's contract: a stale rewind can never replay later,
+        /// and the erase that would have replayed it becomes a no-op.
+        #[test]
+        fn discard_clears_bookkeeping_without_touching_the_terminal() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.render_completed("l1\nl2\n", 80, 3);
+            let painted = writer.0.lock().unwrap().len();
+
+            renderer.discard();
+            assert!(!CompletedSpillRenderer::is_active(renderer.as_ref()));
+            assert_eq!(
+                writer.0.lock().unwrap().len(),
+                painted,
+                "discard wrote zero bytes"
+            );
+            CompletedSpillRenderer::erase(renderer.as_ref());
+            assert_eq!(
+                writer.0.lock().unwrap().len(),
+                painted,
+                "an erase after discard cannot replay a stale rewind"
+            );
+        }
+
+        /// `discard` never touches a LIVE generation — mirroring `erase`.
+        #[test]
+        fn discard_leaves_a_live_viewport_alone() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.start(5);
+            renderer.write(5, ToolOutputStream::Stdout, b"live-line\n");
+
+            renderer.discard();
+            assert!(
+                renderer
+                    .snapshot_lines()
+                    .iter()
+                    .any(|line| line.contains("live-line")),
+                "the live view survives a completed discard"
+            );
+        }
+
+        /// The returned row count matches the frame the terminal actually
+        /// shows — the caller positions subsequent output with it.
+        #[test]
+        fn reported_rows_match_the_screen_model() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            let rows = renderer.render_completed("l1\nl2\nl3\nl4\nl5\n", 80, 3);
+
+            let mut screen = ScreenModel::new(80);
+            screen.apply(&writer.0.lock().unwrap());
+            let visible = screen
+                .rows
+                .iter()
+                .filter(|row| !row.trim().is_empty())
+                .count();
+            assert_eq!(rows, visible, "reported rows == painted rows");
+        }
+
+        /// After the live hand-off (`finish`), completed rendering takes the
+        /// screen normally — the wired sequence display.rs actually runs.
+        #[test]
+        fn completed_rendering_takes_over_after_the_live_handoff() {
+            let writer = SharedWriter::default();
+            let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+            renderer.start(4);
+            renderer.write(4, ToolOutputStream::Stdout, b"live\n");
+            renderer.finish(4);
+
+            assert!(renderer.render_completed("done-1\ndone-2\n", 80, 3) > 0);
+            assert!(CompletedSpillRenderer::is_active(renderer.as_ref()));
+        }
     }
 }
