@@ -19,6 +19,9 @@ use std::sync::{Mutex, OnceLock};
 /// hundreds of bytes; the cap only exists so a wedged terminal or a cat on the
 /// keyboard cannot grow the buffer without bound. Overflow drops the newest
 /// bytes (the visible prefill makes the loss obvious, unlike a silent head-drop).
+/// Unix-gated like its only consumer `push_bytes` (the Windows watcher does not
+/// drain type-ahead yet), so `-D dead_code` stays clean on Windows.
+#[cfg(unix)]
 const MAX_BYTES: usize = 4096;
 
 fn buffer() -> &'static Mutex<Vec<u8>> {
