@@ -2009,7 +2009,11 @@ fn grant_net_kill_boundaries_recover_to_an_atomic_connector_and_grant() {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(path.exists(), "timed out waiting for {step} failpoint");
+        if !path.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timed out waiting for {step} failpoint");
+        }
     }
 
     for (step, committed_before_kill) in [("staged", false), ("replaced", true)] {
@@ -2023,8 +2027,14 @@ fn grant_net_kill_boundaries_recover_to_an_atomic_connector_and_grant() {
         )
         .unwrap();
         let ready = sb.cwd.join(format!("{step}-ready"));
-        let mut child = newt(&sb);
+        let newt_bin = assert_cmd::cargo::cargo_bin("newt");
+        let mut child = std::process::Command::new(newt_bin);
         child
+            .env("NEWT_CONFIG_DIR", &sb.config_dir)
+            .env("HOME", &sb.home)
+            .env("USERPROFILE", &sb.home)
+            .env_remove("NEWT_CONFIG")
+            .current_dir(&sb.cwd)
             .env("NEWT_TEST_MCP_IMPORT_KILL_AFTER", step)
             .env("NEWT_TEST_MCP_IMPORT_READY", &ready)
             .args([
@@ -2034,7 +2044,10 @@ fn grant_net_kill_boundaries_recover_to_an_atomic_connector_and_grant() {
                 "--name",
                 "review",
                 "--grant-net",
-            ]);
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         let mut child = child.spawn().unwrap();
         wait_for(&ready, &mut child, step);
         child.kill().unwrap();
@@ -2232,9 +2245,7 @@ mod composed_private_mcp_uat {
     use std::ffi::OsString;
 
     use newt_core::agentic::{LeasedMcpCall, McpTools, PromptIntake};
-    use newt_core::{
-        BackendKind, Caveats, ChatCtx, CompactionTriggerPolicy, MemMessage, ToolEvent,
-    };
+    use newt_core::{BackendKind, ChatCtx, CompactionTriggerPolicy, MemMessage, ToolEvent};
     use newt_mcp_client::McpToolset;
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -2366,6 +2377,12 @@ mod composed_private_mcp_uat {
     }
 
     async fn mount_review_mcp(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/reviews/42"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(server)
+            .await;
+
         Mock::given(method("POST"))
             .and(path("/mcp"))
             .and(body_string_contains("\"method\":\"initialize\""))
@@ -2476,7 +2493,8 @@ mod composed_private_mcp_uat {
             .stdout(predicate::str::contains("Imported 1 MCP server(s)"));
 
         let config_path = sb.config_dir.join("config.toml");
-        let persisted = load_config(&config_path).mcp_servers;
+        let runtime_config = load_config(&config_path);
+        let persisted = &runtime_config.mcp_servers;
         assert_eq!(persisted.len(), 1, "one connector persisted");
         assert_eq!(persisted[0].name, "review-source");
         assert_eq!(persisted[0].url.as_deref(), Some(mcp_url.as_str()));
@@ -2490,8 +2508,9 @@ mod composed_private_mcp_uat {
             "adoption promotes only the sanitized persisted copy to Newt trust"
         );
         assert_eq!(
-            load_config(&config_path)
+            runtime_config
                 .tui
+                .as_ref()
                 .expect("grant config")
                 .permissions
                 .net,
@@ -2499,11 +2518,18 @@ mod composed_private_mcp_uat {
             "grant-net is host-scoped"
         );
 
-        // McpToolset performs production discovery again from the sandboxed
-        // user config, then executes the real initialize + tools/list exchange.
+        // Exercise the same resolved config inputs and permission lowering as
+        // production, then execute the real initialize + tools/list exchange.
         let _discovery_env = DiscoveryEnv::install(&sb);
-        let caveats = Caveats::top();
-        let toolset = McpToolset::connect(sb.cwd.to_str().unwrap(), &[], true, &caveats).await;
+        let workspace = sb.cwd.to_str().unwrap();
+        let caveats = runtime_config
+            .tui
+            .as_ref()
+            .expect("grant config")
+            .permissions
+            .to_caveats(workspace);
+        let toolset =
+            McpToolset::connect(workspace, &runtime_config.mcp_servers, true, &caveats).await;
         assert_eq!(toolset.summary(), vec![("review-source".to_string(), 1)]);
         assert!(
             toolset.tool_defs()[0].get("_meta").is_none(),
@@ -2605,6 +2631,7 @@ mod composed_private_mcp_uat {
                 write_ledger: None,
                 cancel: None,
                 live_tool_output: None,
+                completed_spill_renderer: None,
                 git_tool: None,
                 crew_runner: None,
                 operating_mode_control: None,
@@ -2640,8 +2667,8 @@ mod composed_private_mcp_uat {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            model_wire.contains("SSRF block"),
-            "the private raw-fetch guard must remain intact: {model_wire}"
+            model_wire.contains("error: web_fetch returned HTTP 401"),
+            "the raw-fetch authentication failure must remain intact: {model_wire}"
         );
         assert!(
             model_wire.contains("Authenticated-source recovery"),
