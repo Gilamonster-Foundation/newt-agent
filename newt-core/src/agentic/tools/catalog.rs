@@ -344,7 +344,15 @@ pub(crate) fn merged_tool_definitions(
             defs.push((spec.definition)());
         }
     }
-    defs.extend(mcp.tool_defs());
+    // MCP `_meta` is connector-side catalog metadata, not part of either
+    // inference provider's function-tool schema. Recovery consumes it from the
+    // raw `McpTools::tool_defs()` catalog before this merge; scrub it from every
+    // model-facing definition while retaining the callable tool itself.
+    let mut mcp_defs = mcp.tool_defs();
+    for definition in &mut mcp_defs {
+        super::strip_mcp_catalog_metadata(definition);
+    }
+    defs.extend(mcp_defs);
     serde_json::Value::Array(defs)
 }
 

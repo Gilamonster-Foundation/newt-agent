@@ -7,16 +7,15 @@
 //! connecting to the servers (the MCP client transport) is a separate layer.
 //!
 //! Sources, in precedence order (earlier wins on a name clash):
-//! 1. newt's own `[[mcp_servers]]` (from `~/.newt/config.toml`)
-//! 2. Claude Code user config: `~/.claude.json` → `mcpServers`
-//! 3. Project config: `<workspace>/.mcp.json` → `mcpServers`
+//! 1. newt's own `[[mcp_servers]]` (from the resolved `config.toml`)
+//! 2. newt's user-owned `~/.newt/mcp.toml`
+//! 3. Claude Code user config: `~/.claude.json` → `mcpServers`
+//! 4. Project config: `<workspace>/.mcp.json` → `mcpServers`
 //!
-//! One [`McpServerEntry`] type parses **both** shapes: Claude's `mcpServers`
-//! map values and newt's TOML tables have the same fields (`command`/`args`/
-//! `env` for stdio; `type` + `url`/`headers` for sse/http), so a single struct
-//! serves as the universal target — the only difference is that Claude carries
-//! the server name as the map key while newt's TOML carries it as a `name`
-//! field.
+//! One [`McpServerEntry`] type is the common target for newt, Claude, and Codex
+//! shapes. Borrowed Claude/Codex configuration is parsed permissively for
+//! discovery but strictly for explicit adoption, where unsupported authority or
+//! transport semantics must fail instead of being silently erased.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -627,6 +626,605 @@ pub fn parse_claude_mcp(value: &serde_json::Value) -> Vec<McpServerEntry> {
         .collect()
 }
 
+/// A value-independent reason an entry in a borrowed MCP configuration cannot
+/// be adopted. Reasons deliberately never include source text, field names, or
+/// values: import diagnostics are allowed to identify the selected server, but
+/// must not echo credentials from a file that has not crossed the trust
+/// boundary yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpImportIssue {
+    /// The source entry contains a field newt cannot preserve.
+    UnknownField,
+    /// The entry is not an object/table or has values of the wrong shape.
+    InvalidShape,
+    /// Transport or authority semantics cannot be preserved safely.
+    UnsupportedSemantics,
+}
+
+impl std::fmt::Display for McpImportIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnknownField => "unsupported fields",
+            Self::InvalidShape => "an invalid entry shape",
+            Self::UnsupportedSemantics => "unsupported or ambiguous transport semantics",
+        })
+    }
+}
+
+/// One independently rejected entry. `name` is absent when the source's
+/// top-level MCP container itself has the wrong shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpImportRejection {
+    pub name: Option<String>,
+    pub issue: McpImportIssue,
+}
+
+/// Strict import parse result. Discovery remains best-effort and permissive;
+/// explicit adoption consumes this report and must account for every entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpImportParseReport {
+    pub entries: Vec<McpServerEntry>,
+    pub rejected: Vec<McpImportRejection>,
+}
+
+/// Secret-safe syntax error for borrowed Codex TOML. The original TOML parser
+/// error embeds the complete offending line, so it must never cross the CLI
+/// diagnostic boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpImportSyntaxError;
+
+impl std::fmt::Display for McpImportSyntaxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid configuration syntax")
+    }
+}
+
+impl std::error::Error for McpImportSyntaxError {}
+
+/// Value-independent reason an HTTP MCP URL cannot cross the explicit import
+/// boundary. The variants deliberately carry no source text so callers can
+/// report failures without echoing credentials embedded in a borrowed URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpHttpUrlIssue {
+    Invalid,
+    UnsupportedScheme,
+    UserInfo,
+    Query,
+    Fragment,
+    MissingHost,
+}
+
+impl std::fmt::Display for McpHttpUrlIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Invalid => "an invalid URL",
+            Self::UnsupportedScheme => "an unsupported URL scheme",
+            Self::UserInfo => "URL userinfo",
+            Self::Query => "a URL query",
+            Self::Fragment => "a URL fragment",
+            Self::MissingHost => "a URL without a hostname",
+        })
+    }
+}
+
+impl std::error::Error for McpHttpUrlIssue {}
+
+/// One canonical representation used by import persistence and net grants.
+/// Runtime consumers should use the same host value rather than reparsing with
+/// transport-specific rules. IPv6 brackets are removed from `host`; domains are
+/// lowercased and IDNA-normalized by `Url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalMcpHttpUrl {
+    pub url: String,
+    pub host: String,
+}
+
+/// Validate and canonicalize a remotely imported MCP URL. Imported URLs are
+/// control-plane authority, not arbitrary web links: userinfo, every query, and
+/// every fragment are rejected fail-closed because newt cannot prove those
+/// components are credential-free.
+pub fn canonical_mcp_http_url(
+    raw: &str,
+) -> std::result::Result<CanonicalMcpHttpUrl, McpHttpUrlIssue> {
+    let parsed = reqwest::Url::parse(raw).map_err(|_| McpHttpUrlIssue::Invalid)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(McpHttpUrlIssue::UnsupportedScheme);
+    }
+    let raw_authority_has_userinfo = raw
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'));
+    if raw_authority_has_userinfo || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(McpHttpUrlIssue::UserInfo);
+    }
+    if parsed.query().is_some() {
+        return Err(McpHttpUrlIssue::Query);
+    }
+    if parsed.fragment().is_some() {
+        return Err(McpHttpUrlIssue::Fragment);
+    }
+    let host = parsed
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or(McpHttpUrlIssue::MissingHost)?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    Ok(CanonicalMcpHttpUrl {
+        url: parsed.to_string(),
+        host,
+    })
+}
+
+fn portable_env_names<T>(values: &BTreeMap<String, T>) -> bool {
+    let mut canonical = std::collections::BTreeSet::new();
+    values
+        .keys()
+        .all(|name| is_safe_env_var_name(name) && canonical.insert(name.to_ascii_uppercase()))
+}
+
+fn portable_header_names<T>(values: &BTreeMap<String, T>) -> bool {
+    let mut canonical = std::collections::BTreeSet::new();
+    values.keys().all(|name| {
+        is_safe_http_header_name(name)
+            && !is_transport_owned_mcp_header(name)
+            && canonical.insert(name.to_ascii_lowercase())
+    })
+}
+
+/// Headers owned by the streamable-HTTP MCP transport. Allowing an imported
+/// connector to configure any of these would either change the request origin
+/// or conflict with the session/protocol values negotiated by the client.
+#[must_use]
+pub fn is_transport_owned_mcp_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host" | "mcp-protocol-version" | "mcp-session-id"
+    )
+}
+
+/// Strict, import-only Claude parser. Unlike discovery, adoption rejects
+/// unknown fields and ambiguous transport shapes instead of silently erasing
+/// semantics before stamping an entry trusted.
+#[must_use]
+pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseReport {
+    const SUPPORTED_FIELDS: &[&str] = &[
+        "enabled",
+        "type",
+        "command",
+        "args",
+        "env",
+        "url",
+        "headers",
+        "request_timeout_secs",
+        "requestTimeoutSecs",
+    ];
+
+    let Some(servers) = value.get("mcpServers") else {
+        return McpImportParseReport::default();
+    };
+    let Some(servers) = servers.as_object() else {
+        return McpImportParseReport {
+            entries: Vec::new(),
+            rejected: vec![McpImportRejection {
+                name: None,
+                issue: McpImportIssue::InvalidShape,
+            }],
+        };
+    };
+
+    let mut report = McpImportParseReport::default();
+    for (name, raw) in servers {
+        let Some(object) = raw.as_object() else {
+            report.rejected.push(McpImportRejection {
+                name: Some(name.clone()),
+                issue: McpImportIssue::InvalidShape,
+            });
+            continue;
+        };
+        if object
+            .keys()
+            .any(|field| !SUPPORTED_FIELDS.contains(&field.as_str()))
+        {
+            report.rejected.push(McpImportRejection {
+                name: Some(name.clone()),
+                issue: McpImportIssue::UnknownField,
+            });
+            continue;
+        }
+        let Ok(mut entry) = serde_json::from_value::<McpServerEntry>(raw.clone()) else {
+            report.rejected.push(McpImportRejection {
+                name: Some(name.clone()),
+                issue: McpImportIssue::InvalidShape,
+            });
+            continue;
+        };
+        entry.name = name.clone();
+        entry.trust = McpTrust::Untrusted;
+        let semantics_preserved = match entry.transport {
+            TransportKind::Stdio => {
+                entry.command.is_some()
+                    && entry.url.is_none()
+                    && entry.headers.is_empty()
+                    && portable_env_names(&entry.env)
+            }
+            TransportKind::Http => {
+                entry.url.is_some()
+                    && entry.command.is_none()
+                    && entry.args.is_empty()
+                    && entry.env.is_empty()
+                    && portable_header_names(&entry.headers)
+            }
+            // Newt's runtime deliberately skips legacy SSE, so adopting one
+            // would report success for a connector that can never run.
+            TransportKind::Sse => false,
+        };
+        if semantics_preserved {
+            report.entries.push(entry);
+        } else {
+            report.rejected.push(McpImportRejection {
+                name: Some(name.clone()),
+                issue: McpImportIssue::UnsupportedSemantics,
+            });
+        }
+    }
+    report
+}
+
+/// Parse Codex's `[mcp_servers.<name>]` TOML tables into newt's shared MCP
+/// representation.
+///
+/// Codex selects transport by shape rather than a `type` field: `url` is
+/// streamable HTTP, while `command` (with optional `args`) is stdio. Entries
+/// that mix the two shapes, contain fields newt cannot preserve without
+/// widening access, or use an unknown field are dropped independently.
+///
+/// This parser deliberately imports credential *references*, never credential
+/// values. `bearer_token_env_var` becomes an `Authorization` interpolation and
+/// each `env_http_headers` value becomes a structured [`SecretRef`] environment
+/// reference. Local `env_vars` are forwarded through the same reference type.
+/// Literal `http_headers` and stdio `env` cannot be imported because Codex may
+/// store plaintext credentials there. `tool_timeout_sec` maps to newt's
+/// per-request timeout; `auth = "oauth"` is accepted because Newt performs
+/// OAuth discovery. Startup timeouts are rejected because Newt cannot currently
+/// preserve their failure contract.
+/// Every result is marked
+/// [`McpTrust::Untrusted`], matching other borrowed configuration; an explicit
+/// `newt mcp import` is required before its process or endpoint may be used.
+#[must_use]
+pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SourcedCodexEnvVar {
+        name: String,
+        #[serde(default)]
+        source: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CodexEnvVar {
+        Name(String),
+        Sourced(SourcedCodexEnvVar),
+    }
+
+    impl CodexEnvVar {
+        fn local_name(self) -> Option<String> {
+            match self {
+                Self::Name(name) => Some(name),
+                Self::Sourced(SourcedCodexEnvVar { name, source }) => match source.as_deref() {
+                    None | Some("local") => Some(name),
+                    _ => None,
+                },
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CodexEntry {
+        url: Option<String>,
+        command: Option<String>,
+        args: Option<Vec<String>>,
+        env: Option<BTreeMap<String, String>>,
+        bearer_token_env_var: Option<String>,
+        http_headers: Option<BTreeMap<String, String>>,
+        env_http_headers: Option<BTreeMap<String, String>>,
+        env_vars: Option<Vec<CodexEnvVar>>,
+        auth: Option<String>,
+        startup_timeout_sec: Option<u64>,
+        tool_timeout_sec: Option<u64>,
+        required: Option<bool>,
+        enabled: Option<bool>,
+    }
+
+    let Ok(document) = toml::from_str::<toml::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(servers) = document.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+
+    servers
+        .iter()
+        .filter_map(|(name, value)| {
+            if name.trim().is_empty() {
+                return None;
+            }
+            let parsed: CodexEntry = value.clone().try_into().ok()?;
+            let CodexEntry {
+                url,
+                command,
+                args,
+                env,
+                bearer_token_env_var,
+                http_headers,
+                env_http_headers,
+                env_vars,
+                auth,
+                startup_timeout_sec,
+                tool_timeout_sec,
+                required,
+                enabled,
+            } = parsed;
+
+            // Newt discovers OAuth automatically, so Codex's default `oauth`
+            // intent carries over without storing an extra field. ChatGPT
+            // session auth, required-startup semantics, and a per-connector
+            // startup timeout cannot be preserved; accepting any of them would
+            // silently change authority or failure behavior.
+            if auth.as_deref().is_some_and(|kind| kind != "oauth")
+                || required.unwrap_or(false)
+                || startup_timeout_sec.is_some()
+            {
+                return None;
+            }
+
+            match (url, command) {
+                (Some(url), None) => {
+                    // `args` and `env` are stdio-only. Their presence alongside
+                    // a URL is an ambiguous transport, even when empty.
+                    if args.is_some()
+                        || env.is_some()
+                        || env_vars.is_some()
+                        || url.trim().is_empty()
+                    {
+                        return None;
+                    }
+                    if http_headers
+                        .as_ref()
+                        .is_some_and(|values| !portable_header_names(values))
+                    {
+                        return None;
+                    }
+
+                    let mut headers = BTreeMap::new();
+                    let mut canonical_header_names = std::collections::BTreeSet::new();
+                    for (header, env_var) in env_http_headers.unwrap_or_default() {
+                        if !is_safe_http_header_name(&header)
+                            || is_transport_owned_mcp_header(&header)
+                            || !is_safe_env_var_name(&env_var)
+                            || !canonical_header_names.insert(header.to_ascii_lowercase())
+                        {
+                            return None;
+                        }
+                        headers.insert(
+                            header,
+                            SecretValue::Ref(SecretRef {
+                                env: Some(env_var),
+                                ..Default::default()
+                            }),
+                        );
+                    }
+                    if let Some(env_var) = bearer_token_env_var {
+                        if !is_safe_env_var_name(&env_var)
+                            || !canonical_header_names.insert("authorization".to_string())
+                        {
+                            return None;
+                        }
+                        headers.insert(
+                            "Authorization".to_string(),
+                            SecretValue::literal(format!("Bearer ${{env:{env_var}}}")),
+                        );
+                    }
+
+                    Some(McpServerEntry {
+                        name: name.clone(),
+                        enabled: enabled.unwrap_or(true),
+                        transport: TransportKind::Http,
+                        command: None,
+                        args: Vec::new(),
+                        env: BTreeMap::new(),
+                        url: Some(url),
+                        headers,
+                        request_timeout_secs: tool_timeout_sec,
+                        trust: McpTrust::Untrusted,
+                    })
+                }
+                (None, Some(command)) => {
+                    // HTTP credential fields are invalid on a stdio entry. The
+                    // literal stdio `env` map itself is accepted but omitted:
+                    // there is no safe way to distinguish configuration from a
+                    // plaintext token in Codex's string-to-string map.
+                    if bearer_token_env_var.is_some()
+                        || http_headers.is_some()
+                        || env_http_headers.is_some()
+                        || auth.is_some()
+                        || command.trim().is_empty()
+                    {
+                        return None;
+                    }
+                    if env
+                        .as_ref()
+                        .is_some_and(|values| !portable_env_names(values))
+                    {
+                        return None;
+                    }
+                    let mut forwarded_env = BTreeMap::new();
+                    let mut canonical_env_names = std::collections::BTreeSet::new();
+                    for env_var in env_vars.unwrap_or_default() {
+                        let name = env_var.local_name()?;
+                        if !is_safe_env_var_name(&name)
+                            || !canonical_env_names.insert(name.to_ascii_uppercase())
+                        {
+                            return None;
+                        }
+                        forwarded_env.insert(
+                            name.clone(),
+                            SecretValue::Ref(SecretRef {
+                                env: Some(name),
+                                ..Default::default()
+                            }),
+                        );
+                    }
+
+                    Some(McpServerEntry {
+                        name: name.clone(),
+                        enabled: enabled.unwrap_or(true),
+                        transport: TransportKind::Stdio,
+                        command: Some(command),
+                        args: args.unwrap_or_default(),
+                        env: forwarded_env,
+                        url: None,
+                        headers: BTreeMap::new(),
+                        request_timeout_secs: tool_timeout_sec,
+                        trust: McpTrust::Untrusted,
+                    })
+                }
+                // Neither transport, or both transports at once.
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Strict Codex parser for explicit adoption. The discovery parser above keeps
+/// its best-effort behavior; this wrapper accounts for every source entry and
+/// converts syntax failures to a source-text-free error.
+pub fn parse_codex_mcp_toml_for_import(
+    text: &str,
+) -> std::result::Result<McpImportParseReport, McpImportSyntaxError> {
+    const SUPPORTED_FIELDS: &[&str] = &[
+        "url",
+        "command",
+        "args",
+        "env",
+        "bearer_token_env_var",
+        "http_headers",
+        "env_http_headers",
+        "env_vars",
+        "auth",
+        "startup_timeout_sec",
+        "tool_timeout_sec",
+        "required",
+        "enabled",
+    ];
+
+    let document = toml::from_str::<toml::Value>(text).map_err(|_| McpImportSyntaxError)?;
+    let Some(raw_servers) = document.get("mcp_servers") else {
+        return Ok(McpImportParseReport::default());
+    };
+    let Some(raw_servers) = raw_servers.as_table() else {
+        return Ok(McpImportParseReport {
+            entries: Vec::new(),
+            rejected: vec![McpImportRejection {
+                name: None,
+                issue: McpImportIssue::InvalidShape,
+            }],
+        });
+    };
+
+    let entries = parse_codex_mcp_toml(text);
+    let accepted: std::collections::BTreeSet<&str> =
+        entries.iter().map(|entry| entry.name.as_str()).collect();
+    let mut rejected = Vec::new();
+    for (name, raw) in raw_servers {
+        if accepted.contains(name.as_str()) {
+            continue;
+        }
+        let issue = match raw.as_table() {
+            None => McpImportIssue::InvalidShape,
+            Some(table)
+                if table
+                    .keys()
+                    .any(|field| !SUPPORTED_FIELDS.contains(&field.as_str())) =>
+            {
+                McpImportIssue::UnknownField
+            }
+            Some(_) => McpImportIssue::UnsupportedSemantics,
+        };
+        rejected.push(McpImportRejection {
+            name: Some(name.clone()),
+            issue,
+        });
+    }
+    Ok(McpImportParseReport { entries, rejected })
+}
+
+/// Count fields omitted by [`parse_codex_mcp_toml`] because Codex represents
+/// their values as plaintext strings. Keys and values are never copied into this
+/// result, so an importer can fail loudly without trusting source-controlled
+/// diagnostic text.
+#[must_use]
+pub fn codex_mcp_omitted_field_counts(text: &str) -> BTreeMap<String, usize> {
+    let Ok(document) = toml::from_str::<toml::Value>(text) else {
+        return BTreeMap::new();
+    };
+    let Some(servers) = document.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return BTreeMap::new();
+    };
+
+    let mut omitted = BTreeMap::new();
+    for (name, value) in servers {
+        let Some(table) = value.as_table() else {
+            continue;
+        };
+        let mut count = 0;
+        for source in ["env", "http_headers"] {
+            let Some(values) = table.get(source).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            count += values.len();
+        }
+        if count > 0 {
+            omitted.insert(name.clone(), count);
+        }
+    }
+    omitted
+}
+
+/// Restrict imported environment references to portable shell variable names.
+fn is_safe_env_var_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+/// RFC 9110 `token` syntax used for HTTP field names.
+fn is_safe_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 /// Read + parse a Claude-format MCP config file. Missing or malformed files
 /// yield an empty list (discovery is best-effort, never fatal).
 fn load_claude_file(path: &Path) -> Vec<McpServerEntry> {
@@ -663,15 +1261,39 @@ fn load_newt_mcp_toml(path: &Path) -> Vec<McpServerEntry> {
     parse_newt_mcp_toml(&text)
 }
 
-/// Dedup a precedence-ordered source list: first valid claimant of a name wins,
-/// invalid entries (a stdio server with no `command`, an sse/http with no `url`)
-/// are dropped before they can claim a name. Pure — the merge/precedence rule is
-/// unit-tested with in-memory entries.
-fn dedup_valid_first_wins(sources: Vec<McpServerEntry>) -> Vec<McpServerEntry> {
+/// The exact server prefix emitted into MCP tool names for this runtime mode.
+/// Every discovery, catalog, and routing surface uses this function so a
+/// sanitized collision cannot become a first-match dispatch ambiguity.
+#[must_use]
+pub fn runtime_server_prefix(name: &str, sanitize: bool) -> String {
+    if sanitize {
+        name.replace('-', "_")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Whether a server name can be losslessly separated from its remote tool
+/// name under the runtime's `server__tool` wire convention.
+#[must_use]
+pub fn runtime_server_prefix_is_unambiguous(name: &str, sanitize: bool) -> bool {
+    !runtime_server_prefix(name, sanitize).contains("__")
+}
+
+/// Dedup a precedence-ordered source list: first valid claimant of an emitted
+/// runtime prefix wins. Invalid entries are dropped before they can claim it.
+fn dedup_valid_first_wins(
+    sources: Vec<McpServerEntry>,
+    sanitize_server_names: bool,
+) -> Vec<McpServerEntry> {
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for entry in sources {
-        if entry.is_valid() && seen.insert(entry.name.clone()) {
+        let prefix = runtime_server_prefix(&entry.name, sanitize_server_names);
+        if entry.is_valid()
+            && runtime_server_prefix_is_unambiguous(&entry.name, sanitize_server_names)
+            && seen.insert(prefix)
+        {
             out.push(entry);
         }
     }
@@ -696,6 +1318,20 @@ pub fn discover(
     newt_mcp_toml: Option<&Path>,
     home: Option<&Path>,
     workspace: &Path,
+) -> Vec<McpServerEntry> {
+    discover_with_namespace_mode(newt_servers, newt_mcp_toml, home, workspace, false)
+}
+
+/// Discover with the caller's actual tool-name sanitization mode. When
+/// sanitization is enabled, `foo-bar` and `foo_bar` claim the same emitted
+/// prefix and only the higher-precedence entry survives. With it disabled the
+/// raw names remain distinct.
+pub fn discover_with_namespace_mode(
+    newt_servers: &[McpServerEntry],
+    newt_mcp_toml: Option<&Path>,
+    home: Option<&Path>,
+    workspace: &Path,
+    sanitize_server_names: bool,
 ) -> Vec<McpServerEntry> {
     // Provenance is stamped at each merge point (the #1301 trust boundary):
     // the two newt-owned sources are TRUSTED, the two borrowed Claude overlays
@@ -739,7 +1375,7 @@ pub fn discover(
             .into_iter()
             .map(untrusted),
     );
-    dedup_valid_first_wins(sources)
+    dedup_valid_first_wins(sources, sanitize_server_names)
 }
 
 #[cfg(test)]
@@ -788,6 +1424,467 @@ mod tests {
     #[test]
     fn missing_mcpservers_key_is_empty_not_error() {
         assert!(parse_claude_mcp(&serde_json::json!({ "other": 1 })).is_empty());
+    }
+
+    #[test]
+    fn strict_claude_import_rejects_unknown_and_ambiguous_entries_independently() {
+        let report = parse_claude_mcp_for_import(&serde_json::json!({
+            "mcpServers": {
+                "valid": { "command": "valid-mcp" },
+                "unknown": { "command": "other-mcp", "policy": "restricted" },
+                "ambiguous": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "command": "must-not-survive"
+                }
+            }
+        }));
+
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].name, "valid");
+        assert_eq!(report.entries[0].trust, McpTrust::Untrusted);
+        assert_eq!(report.rejected.len(), 2);
+        assert!(report.rejected.iter().any(|rejected| {
+            rejected.name.as_deref() == Some("unknown")
+                && rejected.issue == McpImportIssue::UnknownField
+        }));
+        assert!(report.rejected.iter().any(|rejected| {
+            rejected.name.as_deref() == Some("ambiguous")
+                && rejected.issue == McpImportIssue::UnsupportedSemantics
+        }));
+    }
+
+    #[test]
+    fn strict_claude_import_rejects_sse_and_nonportable_map_keys() {
+        let report = parse_claude_mcp_for_import(&serde_json::json!({
+            "mcpServers": {
+                "valid": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "headers": { "X-Trace": "${TRACE}" }
+                },
+                "sse": { "type": "sse", "url": "https://example.test/sse" },
+                "bad-header": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "headers": { "Bad\nHeader": "${TOKEN}" }
+                },
+                "header-case-collision": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "headers": { "X-Key": "${ONE}", "x-key": "${TWO}" }
+                },
+                "owned-host": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "headers": { "hOsT": "${HOST_OVERRIDE}" }
+                },
+                "owned-session": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "headers": { "MCP-Session-ID": "${SESSION_ID}" }
+                },
+                "owned-protocol": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "headers": { "mcp-protocol-version": "${PROTOCOL_VERSION}" }
+                },
+                "env-case-collision": {
+                    "command": "server",
+                    "env": { "TOKEN": "${ONE}", "token": "${TWO}" }
+                }
+            }
+        }));
+
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["valid"]
+        );
+        assert_eq!(report.rejected.len(), 7);
+        assert!(report
+            .rejected
+            .iter()
+            .all(|entry| entry.issue == McpImportIssue::UnsupportedSemantics));
+    }
+
+    #[test]
+    fn canonical_http_url_rejects_credential_components_and_normalizes_hosts() {
+        for raw in [
+            "https://user:secret@example.test/mcp",
+            "https://@example.test/mcp",
+            "https://example.test/mcp?auth=secret",
+            "https://example.test/mcp#secret",
+        ] {
+            assert!(canonical_mcp_http_url(raw).is_err());
+        }
+
+        let ipv6 = canonical_mcp_http_url("https://[2001:DB8::1]:8443/mcp").unwrap();
+        assert_eq!(ipv6.host, "2001:db8::1");
+        assert_eq!(ipv6.url, "https://[2001:db8::1]:8443/mcp");
+
+        let idna = canonical_mcp_http_url("https://BÜCHER.example/mcp").unwrap();
+        assert_eq!(idna.host, "xn--bcher-kva.example");
+        assert_eq!(idna.url, "https://xn--bcher-kva.example/mcp");
+    }
+
+    #[test]
+    fn parses_codex_http_with_exact_name_and_only_credential_references() {
+        let text = r#"
+[mcp_servers."Case.Sensitive-name"]
+url = "https://mcp.example.test/rpc"
+enabled = false
+bearer_token_env_var = "MCP_BEARER_TOKEN"
+env_http_headers = { X-API-Key = "MCP_API_KEY", X-Trace = "TRACE_ID" }
+"#;
+
+        let got = parse_codex_mcp_toml(text);
+        assert_eq!(got.len(), 1);
+        let server = &got[0];
+        assert_eq!(server.name, "Case.Sensitive-name");
+        assert!(!server.enabled);
+        assert_eq!(server.transport, TransportKind::Http);
+        assert_eq!(server.url.as_deref(), Some("https://mcp.example.test/rpc"));
+        assert_eq!(server.trust, McpTrust::Untrusted);
+        assert_eq!(server.headers.len(), 3);
+        assert_eq!(
+            server.headers.get("Authorization"),
+            Some(&SecretValue::literal("Bearer ${env:MCP_BEARER_TOKEN}"))
+        );
+        assert_eq!(
+            server.headers.get("X-API-Key"),
+            Some(&SecretValue::Ref(SecretRef {
+                env: Some("MCP_API_KEY".into()),
+                ..Default::default()
+            }))
+        );
+        assert_eq!(
+            server.headers.get("X-Trace"),
+            Some(&SecretValue::Ref(SecretRef {
+                env: Some("TRACE_ID".into()),
+                ..Default::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn codex_parser_reports_literal_headers_and_environment_values_without_values() {
+        let text = r#"
+[mcp_servers.literal-env]
+command = "local-server"
+env = { RUST_LOG = "debug", ACCESS_TOKEN = "literal-secret" }
+
+[mcp_servers.literal-headers]
+url = "https://mcp.example.test/rpc"
+http_headers = { X-Literal = "literal-secret" }
+"#;
+
+        let got = parse_codex_mcp_toml(text);
+        assert_eq!(got.len(), 2);
+        assert!(got
+            .iter()
+            .all(|entry| entry.env.is_empty() && entry.headers.is_empty()));
+        let omitted = codex_mcp_omitted_field_counts(text);
+        assert_eq!(omitted["literal-env"], 2);
+        assert_eq!(omitted["literal-headers"], 1);
+        assert!(!format!("{omitted:?}").contains("literal-secret"));
+    }
+
+    #[test]
+    fn strict_codex_import_reports_every_rejected_entry_and_hides_syntax_source() {
+        let report = parse_codex_mcp_toml_for_import(
+            r#"
+[mcp_servers.valid]
+command = "valid-mcp"
+
+[mcp_servers.unknown]
+command = "other-mcp"
+policy = "literal-value-must-not-appear"
+"#,
+        )
+        .unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].name, "valid");
+        assert_eq!(report.rejected.len(), 1);
+        assert_eq!(report.rejected[0].name.as_deref(), Some("unknown"));
+        assert_eq!(report.rejected[0].issue, McpImportIssue::UnknownField);
+
+        let malformed = "[mcp_servers.bad]\nsecret = \"never-echo-this";
+        let error = parse_codex_mcp_toml_for_import(malformed).unwrap_err();
+        assert_eq!(error.to_string(), "invalid configuration syntax");
+        assert!(!error.to_string().contains("never-echo-this"));
+    }
+
+    #[test]
+    fn parses_codex_environment_references_and_tool_timeout() {
+        let text = r#"
+[mcp_servers.local]
+command = "server"
+env_vars = ["ACCESS_TOKEN", { name = "TRACE_ID", source = "local" }]
+tool_timeout_sec = 45
+
+[mcp_servers.remote]
+url = "https://mcp.example.test/rpc"
+auth = "oauth"
+tool_timeout_sec = 90
+required = false
+"#;
+
+        let got = parse_codex_mcp_toml(text);
+        assert_eq!(got.len(), 2);
+
+        let local = got.iter().find(|server| server.name == "local").unwrap();
+        assert_eq!(local.request_timeout_secs, Some(45));
+        assert_eq!(
+            local.env.get("ACCESS_TOKEN"),
+            Some(&SecretValue::Ref(SecretRef {
+                env: Some("ACCESS_TOKEN".into()),
+                ..Default::default()
+            }))
+        );
+        assert_eq!(
+            local.env.get("TRACE_ID"),
+            Some(&SecretValue::Ref(SecretRef {
+                env: Some("TRACE_ID".into()),
+                ..Default::default()
+            }))
+        );
+
+        let remote = got.iter().find(|server| server.name == "remote").unwrap();
+        assert_eq!(remote.request_timeout_secs, Some(90));
+    }
+
+    #[test]
+    fn codex_parser_rejects_startup_timeout_and_unknown_nested_env_fields() {
+        let text = r#"
+[mcp_servers.good]
+command = "good-server"
+
+[mcp_servers.startup-timeout]
+url = "https://mcp.example.test/rpc"
+startup_timeout_sec = 20
+
+[mcp_servers.unknown-env-field]
+command = "server"
+env_vars = [{ name = "TOKEN", source = "local", typo = "must-not-disappear" }]
+"#;
+
+        let report = parse_codex_mcp_toml_for_import(text).unwrap();
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["good"]
+        );
+        assert_eq!(report.rejected.len(), 2);
+        assert!(report
+            .rejected
+            .iter()
+            .all(|entry| entry.issue == McpImportIssue::UnsupportedSemantics));
+    }
+
+    #[test]
+    fn codex_parser_rejects_remote_or_invalid_environment_references() {
+        let text = r#"
+[mcp_servers.good]
+command = "good-server"
+env_vars = ["LOCAL_TOKEN"]
+
+[mcp_servers.remote-source]
+command = "server"
+env_vars = [{ name = "REMOTE_TOKEN", source = "remote" }]
+
+[mcp_servers.unknown-source]
+command = "server"
+env_vars = [{ name = "TOKEN", source = "elsewhere" }]
+
+[mcp_servers.invalid-name]
+command = "server"
+env_vars = ["9TOKEN"]
+
+[mcp_servers.http-env-vars]
+url = "https://mcp.example.test/rpc"
+env_vars = ["TOKEN"]
+"#;
+
+        let names: Vec<String> = parse_codex_mcp_toml(text)
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+        assert_eq!(names, ["good"]);
+    }
+
+    #[test]
+    fn codex_parser_drops_ambiguous_or_unsafe_transport_shapes() {
+        let text = r#"
+[mcp_servers.good]
+url = "https://mcp.example.test/good"
+
+[mcp_servers.both]
+url = "https://mcp.example.test/both"
+command = "server"
+
+[mcp_servers.http-with-args]
+url = "https://mcp.example.test/args"
+args = []
+
+[mcp_servers.http-with-env]
+url = "https://mcp.example.test/env"
+env = {}
+
+[mcp_servers.stdio-with-bearer]
+command = "server"
+bearer_token_env_var = "TOKEN"
+
+[mcp_servers.stdio-with-headers]
+command = "server"
+http_headers = {}
+
+[mcp_servers.args-only]
+args = ["server"]
+
+[mcp_servers.empty-url]
+url = "  "
+
+[mcp_servers.empty-command]
+command = ""
+"#;
+
+        let names: Vec<String> = parse_codex_mcp_toml(text)
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+        assert_eq!(names, ["good"]);
+    }
+
+    #[test]
+    fn codex_parser_rejects_invalid_or_conflicting_credential_references() {
+        let text = r#"
+[mcp_servers.good]
+url = "https://mcp.example.test/good"
+env_http_headers = { X-API-Key = "API_KEY" }
+
+[mcp_servers.bad-bearer-env]
+url = "https://mcp.example.test/bearer"
+bearer_token_env_var = "TOKEN}${cmd:bad}"
+
+[mcp_servers.bad-header-env]
+url = "https://mcp.example.test/header-env"
+env_http_headers = { X-Key = "9INVALID" }
+
+[mcp_servers.bad-header-name]
+url = "https://mcp.example.test/header-name"
+env_http_headers = { "Bad Header" = "TOKEN" }
+
+[mcp_servers.duplicate-header-case]
+url = "https://mcp.example.test/duplicate"
+env_http_headers = { X-Key = "ONE", x-key = "TWO" }
+
+[mcp_servers.conflicting-authorization]
+url = "https://mcp.example.test/auth"
+bearer_token_env_var = "TOKEN"
+env_http_headers = { authorization = "OTHER_TOKEN" }
+
+[mcp_servers.owned-host]
+url = "https://mcp.example.test/host"
+env_http_headers = { hOsT = "HOST_OVERRIDE" }
+
+[mcp_servers.owned-session]
+url = "https://mcp.example.test/session"
+env_http_headers = { MCP-Session-ID = "SESSION_ID" }
+
+[mcp_servers.owned-protocol]
+url = "https://mcp.example.test/protocol"
+env_http_headers = { mcp-protocol-version = "PROTOCOL_VERSION" }
+"#;
+
+        let names: Vec<String> = parse_codex_mcp_toml(text)
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+        assert_eq!(names, ["good"]);
+    }
+
+    #[test]
+    fn codex_parser_rejects_unsupported_widening_and_misspelled_fields() {
+        let text = r#"
+[mcp_servers.good]
+command = "good-server"
+
+[mcp_servers.enabled-tools]
+command = "server"
+enabled_tools = ["read"]
+
+[mcp_servers.disabled-tools]
+command = "server"
+disabled_tools = ["write"]
+
+[mcp_servers.required]
+command = "server"
+required = true
+
+[mcp_servers.cwd]
+command = "server"
+cwd = "/tmp"
+
+[mcp_servers.explicit-type]
+url = "https://mcp.example.test/type"
+type = "http"
+
+[mcp_servers.chatgpt-auth]
+url = "https://mcp.example.test/chatgpt"
+auth = "chatgpt"
+
+[mcp_servers.oauth]
+url = "https://mcp.example.test/oauth"
+oauth_client_id = "client"
+
+[mcp_servers.oauth-resource]
+url = "https://mcp.example.test/oauth-resource"
+oauth_resource = "https://resource.example.test"
+
+[mcp_servers.wrong-case]
+url = "https://mcp.example.test/case"
+bearerTokenEnvVar = "TOKEN"
+"#;
+
+        let names: Vec<String> = parse_codex_mcp_toml(text)
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+        assert_eq!(names, ["good"]);
+    }
+
+    #[test]
+    fn codex_parser_drops_only_the_malformed_entry() {
+        let text = r#"
+[mcp_servers.before]
+command = "before"
+
+[mcp_servers.bad]
+command = "bad"
+args = "not-an-array"
+
+[mcp_servers.after]
+url = "https://mcp.example.test/after"
+"#;
+
+        let names: std::collections::BTreeSet<String> = parse_codex_mcp_toml(text)
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["after".to_string(), "before".to_string()])
+        );
+        assert!(parse_codex_mcp_toml("not = = toml [").is_empty());
+        assert!(parse_codex_mcp_toml("other = 1").is_empty());
+        assert!(parse_codex_mcp_toml("mcp_servers = []").is_empty());
     }
 
     #[test]
@@ -1329,16 +2426,66 @@ RUST_LOG = "debug"
         // Pure precedence over in-memory sources: config.toml newt entry wins,
         // then ~/.newt/mcp.toml, then the Claude overlays. First-name-wins,
         // order preserved.
-        let merged = dedup_valid_first_wins(vec![
-            stdio("dup", "config-wins"),
-            stdio("mcp-only", "m"),
-            stdio("dup", "mcp-toml-loses"),
-            stdio("claude-only", "c"),
-            stdio("dup", "claude-loses"),
-        ]);
+        let merged = dedup_valid_first_wins(
+            vec![
+                stdio("dup", "config-wins"),
+                stdio("mcp-only", "m"),
+                stdio("dup", "mcp-toml-loses"),
+                stdio("claude-only", "c"),
+                stdio("dup", "claude-loses"),
+            ],
+            false,
+        );
         let names: Vec<&str> = merged.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["dup", "mcp-only", "claude-only"]);
         assert_eq!(merged[0].command.as_deref(), Some("config-wins"));
+    }
+
+    #[test]
+    fn runtime_namespace_dedup_is_mode_aware_and_precedence_ordered() {
+        let sources = vec![
+            stdio("review-source", "higher-precedence"),
+            stdio("review_source", "lower-precedence"),
+        ];
+
+        let sanitized = dedup_valid_first_wins(sources.clone(), true);
+        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized[0].name, "review-source");
+        assert_eq!(sanitized[0].command.as_deref(), Some("higher-precedence"));
+
+        let raw = dedup_valid_first_wins(sources, false);
+        assert_eq!(
+            raw.iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["review-source", "review_source"]
+        );
+    }
+
+    #[test]
+    fn runtime_namespace_drops_names_that_contain_the_wire_separator() {
+        let sources = vec![
+            stdio("plain", "plain-server"),
+            stdio("raw__ambiguous", "raw-server"),
+            stdio("sanitized--ambiguous", "sanitized-server"),
+        ];
+
+        let sanitized = dedup_valid_first_wins(sources.clone(), true);
+        assert_eq!(
+            sanitized
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["plain"]
+        );
+
+        let raw = dedup_valid_first_wins(sources, false);
+        assert_eq!(
+            raw.iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["plain", "sanitized--ambiguous"]
+        );
     }
 
     #[test]
@@ -1363,3 +2510,5 @@ RUST_LOG = "debug"
         .is_empty());
     }
 }
+
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:16 EDT | Date: 2026-08-12

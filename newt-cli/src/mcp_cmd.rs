@@ -1,4 +1,4 @@
-//! `newt mcp add|remove|list|install` — manage `[[mcp_servers]]`
+//! `newt mcp add|remove|list|install|import` — manage `[[mcp_servers]]`
 //! registrations without hand-editing TOML.
 //!
 //! Bare `newt mcp` (no subcommand) still runs newt-as-an-MCP-server over
@@ -20,6 +20,8 @@
 //! attributed to its source. Unlike `discover`, an entry that can never
 //! connect (a stdio server with no `command`) is *shown* and flagged, not
 //! silently dropped: this is the management surface where you'd fix it.
+//!
+//! Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 14:20 EDT | Date: 2026-08-12
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -27,7 +29,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
-use newt_core::mcp::{McpServerEntry, McpTrust, SecretValue, TransportKind};
+use newt_core::atomic_fs::{LockGuard, ResolvedPath};
+use newt_core::config::ArrayMergeStrategy;
+use newt_core::mcp::{McpImportParseReport, McpServerEntry, McpTrust, SecretValue, TransportKind};
 use newt_core::mcp_catalog::{
     builtin_catalog, merge_catalog_layers, parse_catalog, McpCatalogEntry,
 };
@@ -91,25 +95,41 @@ pub enum McpCmd {
     /// unambiguous manual way to serve; bare `newt mcp` serves too when its
     /// stdin is piped (an MCP client), but prints this menu at a terminal.
     Serve,
-    /// Import MCP servers from a Claude-Code `mcpServers` JSON, writing the
-    /// equivalent newt TOML — breaking config out to `~/.newt/mcp.toml`
-    /// (created if absent). Secret-bearing values (incl. Claude's `${VAR}`) are
-    /// imported verbatim; newt resolves `${…}` host-side at spawn.
+    /// Import selected MCP servers from Claude Code, Codex, or a config file.
+    /// The equivalent trusted newt TOML is written to `~/.newt/mcp.toml`
+    /// (created if absent). Literal or active secret-bearing values make the
+    /// selected import fail; environment references survive.
     Import {
-        /// Path to a Claude-format JSON (`~/.claude.json`, a project `.mcp.json`,
-        /// or a pasted `mcp.json`). Omit when using `--from-claude`.
-        #[arg(required_unless_present = "from_claude")]
+        /// Path to a Claude JSON or Codex TOML MCP config. Omit with a built-in
+        /// source flag.
+        #[arg(
+            required_unless_present_any = ["from_claude", "from_codex"],
+            conflicts_with_all = ["from_claude", "from_codex"]
+        )]
         path: Option<PathBuf>,
         /// Import from `~/.claude.json`.
-        #[arg(long = "from-claude")]
+        #[arg(long = "from-claude", conflicts_with = "from_codex")]
         from_claude: bool,
+        /// Import from `$CODEX_HOME/config.toml` or `~/.codex/config.toml`.
+        #[arg(long = "from-codex")]
+        from_codex: bool,
+        /// Import exactly one named server.
+        #[arg(long, value_name = "NAME", required_unless_present = "all")]
+        name: Option<String>,
+        /// Import every server in the selected source.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+        /// Grant only each imported HTTP server's exact hostname in
+        /// `[tui.permissions] net`.
+        #[arg(long)]
+        grant_net: bool,
         /// Overwrite entries whose name already exists (default: error on a clash).
         #[arg(long)]
         force: bool,
         /// Keep existing entries — import only names not already present (no error).
         #[arg(long, conflicts_with = "force")]
         merge: bool,
-        /// Write to the project config instead of the user `~/.newt/mcp.toml`.
+        /// Rejected for imports: project config is borrowed and untrusted.
         #[arg(long)]
         project: bool,
     },
@@ -222,16 +242,26 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         McpCmd::Import {
             path,
             from_claude,
+            from_codex,
+            name,
+            all,
+            grant_net,
             force,
             merge,
             project,
         } => cmd_import(
-            path.as_deref(),
-            from_claude,
-            force,
-            merge,
-            config_path,
-            project,
+            ImportRequest {
+                path: path.as_deref(),
+                from_claude,
+                from_codex,
+                name: name.as_deref(),
+                all,
+                grant_net,
+                force,
+                merge,
+                config_path,
+                project,
+            },
             &mut out,
         ),
     }
@@ -401,19 +431,29 @@ pub(crate) fn add_to_config(
     // `add`/`install` prefer an EXISTING `~/.newt/mcp.toml` (create=false) — they
     // never spontaneously break config out; only `import` does that.
     let path = mcp_write_target(config_path, project, false)?;
-    let text = read_config_text(&path)?;
+    let (destination, _guard) = resolve_and_lock_write_target(&path)?;
+    let text = read_config_text(destination.as_path())?;
     let updated = Config::with_mcp_server_added(&text, entry)?;
-    write_back(&path, &updated)?;
+    write_back(&destination, &updated)?;
     Ok(path)
 }
 
-/// Write `text` to `path`, creating parent dirs. Shared by every mcp write verb.
-fn write_back(path: &Path, text: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+/// Bind and lock a config target before a read-modify-write operation. The
+/// returned guard shares the same owner-aware sidecar used by setup, permanent
+/// permission grants, and MCP imports.
+fn resolve_and_lock_write_target(path: &Path) -> anyhow::Result<(ResolvedPath, LockGuard)> {
+    let destination = ResolvedPath::resolve(path)
+        .with_context(|| format!("resolving write target {}", path.display()))?;
+    let guard = newt_core::atomic_fs::acquire_lock(&destination.lock_path())
+        .with_context(|| format!("locking write target {}", path.display()))?;
+    Ok((destination, guard))
+}
+
+/// Durably replace `destination` through the shared sibling-stage writer.
+fn write_back(destination: &ResolvedPath, text: &str) -> anyhow::Result<()> {
+    destination
+        .atomic_write(text.as_bytes())
+        .with_context(|| format!("writing {}", destination.as_path().display()))
 }
 
 /// Whether TOML `text` carries a `[[mcp_servers]]` entry named `name`.
@@ -431,18 +471,20 @@ fn config_has_mcp_server(text: &str, name: &str) -> bool {
 /// the operator has broken some servers out and left others inline.
 fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
     if let Some(explicit) = explicit_write_target(config_path, project)? {
-        let text = read_config_text(&explicit)?;
+        let (destination, _guard) = resolve_and_lock_write_target(&explicit)?;
+        let text = read_config_text(destination.as_path())?;
         let updated = Config::with_mcp_server_removed(&text, name)?;
-        write_back(&explicit, &updated)?;
+        write_back(&destination, &updated)?;
         return Ok(explicit);
     }
     let dir =
         Config::user_config_dir().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))?;
     for candidate in [dir.join("mcp.toml"), dir.join("config.toml")] {
-        if let Some(text) = read_optional(&candidate)? {
+        let (destination, _guard) = resolve_and_lock_write_target(&candidate)?;
+        if let Some(text) = read_optional(destination.as_path())? {
             if config_has_mcp_server(&text, name) {
                 let updated = Config::with_mcp_server_removed(&text, name)?;
-                write_back(&candidate, &updated)?;
+                write_back(&destination, &updated)?;
                 return Ok(candidate);
             }
         }
@@ -731,127 +773,956 @@ fn resolve_catalog() -> anyhow::Result<Vec<(McpCatalogEntry, CatalogOrigin)>> {
 }
 
 // ---------------------------------------------------------------------------
-// `newt mcp import` — Claude JSON → newt TOML bridge
+// `newt mcp import` — Claude/Codex config → newt TOML bridge
 // ---------------------------------------------------------------------------
 
-/// Resolve the JSON source for `import`: `--from-claude` → `~/.claude.json`,
-/// otherwise the explicit `path`.
-fn resolve_import_source(path: Option<&Path>, from_claude: bool) -> anyhow::Result<PathBuf> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportFormat {
+    ClaudeJson,
+    CodexToml,
+    Auto,
+}
+
+#[derive(Debug, Clone)]
+struct ImportRequest<'a> {
+    path: Option<&'a Path>,
+    from_claude: bool,
+    from_codex: bool,
+    name: Option<&'a str>,
+    all: bool,
+    grant_net: bool,
+    force: bool,
+    merge: bool,
+    config_path: Option<&'a Path>,
+    project: bool,
+}
+
+/// Resolve exactly one import source. A path is format-auto-detected; the two
+/// built-in flags bind both the path and parser so malformed input fails loudly.
+fn resolve_import_source(
+    path: Option<&Path>,
+    from_claude: bool,
+    from_codex: bool,
+) -> anyhow::Result<(PathBuf, ImportFormat)> {
     if from_claude {
         let home =
             crate::home_dir().ok_or_else(|| anyhow!("cannot resolve $HOME for --from-claude"))?;
-        return Ok(home.join(".claude.json"));
+        return Ok((home.join(".claude.json"), ImportFormat::ClaudeJson));
+    }
+    if from_codex {
+        let codex_home = std::env::var_os("CODEX_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| crate::home_dir().map(|home| home.join(".codex")))
+            .ok_or_else(|| anyhow!("cannot resolve $CODEX_HOME or $HOME for --from-codex"))?;
+        return Ok((codex_home.join("config.toml"), ImportFormat::CodexToml));
     }
     match path {
-        Some(p) => Ok(p.to_path_buf()),
-        None => bail!("provide a path to a Claude mcpServers JSON, or pass --from-claude"),
+        Some(p) => Ok((p.to_path_buf(), ImportFormat::Auto)),
+        None => bail!("provide one MCP config path, --from-claude, or --from-codex"),
     }
 }
 
-/// `newt mcp import` — read a Claude-Code `mcpServers` JSON and write each server
-/// as a `[[mcp_servers]]` block via the comment-preserving writer. Dedup-by-name:
-/// a clash is an error by default, `--force` overwrites, `--merge` skips existing.
-/// Default target is the broken-out `~/.newt/mcp.toml` (created if absent).
-fn cmd_import(
-    path: Option<&Path>,
-    from_claude: bool,
-    force: bool,
-    merge: bool,
-    config_path: Option<&Path>,
-    project: bool,
-    out: &mut dyn Write,
+fn parse_import_entries(text: &str, format: ImportFormat) -> anyhow::Result<McpImportParseReport> {
+    let parse_claude = || -> anyhow::Result<McpImportParseReport> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|_| anyhow!("source is not valid Claude JSON"))?;
+        Ok(newt_core::mcp::parse_claude_mcp_for_import(&value))
+    };
+    let parse_codex = || -> anyhow::Result<McpImportParseReport> {
+        newt_core::mcp::parse_codex_mcp_toml_for_import(text)
+            .map_err(|_| anyhow!("source is not valid Codex TOML"))
+    };
+    match format {
+        ImportFormat::ClaudeJson => parse_claude(),
+        ImportFormat::CodexToml => parse_codex(),
+        ImportFormat::Auto => match parse_claude() {
+            Ok(report) => Ok(report),
+            Err(_) => parse_codex()
+                .map_err(|_| anyhow!("source is neither valid Claude JSON nor valid Codex TOML")),
+        },
+    }
+}
+
+fn select_import_entries(
+    mut report: McpImportParseReport,
+    name: Option<&str>,
+    all: bool,
+    source: &Path,
+) -> anyhow::Result<Vec<McpServerEntry>> {
+    report.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Some(name) = name {
+        if let Some(entry) = report.entries.into_iter().find(|entry| entry.name == name) {
+            return Ok(vec![entry]);
+        }
+        if let Some(rejected) = report
+            .rejected
+            .iter()
+            .find(|rejected| rejected.name.as_deref() == Some(name))
+        {
+            bail!(
+                "MCP server `{name}` cannot be imported because it has {}; update the source entry before importing",
+                rejected.issue
+            );
+        }
+        return Err(anyhow!(
+            "no MCP server named `{name}` in {}",
+            source.display()
+        ));
+    }
+    if !all {
+        bail!("choose exactly one selector: --name <NAME> or --all");
+    }
+    if !report.rejected.is_empty() {
+        let count = report.rejected.len();
+        bail!(
+            "cannot import all MCP servers: {count} source {} cannot be preserved safely; fix the source or select one valid entry with --name",
+            if count == 1 { "entry" } else { "entries" }
+        );
+    }
+    Ok(report.entries)
+}
+
+/// Imported names later participate in tool prefixes and token-store lookup.
+/// Keep them one portable path component: no separators, traversal aliases,
+/// controls, or Windows-reserved punctuation.
+fn validate_import_server_name(name: &str) -> anyhow::Result<()> {
+    let mut chars = name.chars();
+    let safe_shape = name.len() <= 128
+        && chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'));
+    // Tool calls use `server__tool` on the wire. Reject names that contain that
+    // separator either now or after the default hyphen-to-underscore mapping;
+    // otherwise `split_once("__")` routes the call to the wrong server.
+    let unambiguous_namespace = newt_core::mcp::runtime_server_prefix_is_unambiguous(name, false)
+        && newt_core::mcp::runtime_server_prefix_is_unambiguous(name, true);
+    // Windows treats these basenames as devices even when an extension follows
+    // (`CON.json`, `LPT1.meta.json`, ...), so they are not portable token names.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let windows_device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
+    // Win32 strips trailing dots when resolving a path component, so a name
+    // ending in `.` can alias a different token-store filename.
+    let safe = safe_shape && unambiguous_namespace && !windows_device && !name.ends_with('.');
+    if !safe {
+        bail!(
+            "MCP server name is not a portable single-component identifier; rename it before importing"
+        );
+    }
+    Ok(())
+}
+
+fn diagnostic_server_name(name: &str) -> &str {
+    if validate_import_server_name(name).is_ok() {
+        name
+    } else {
+        "<invalid server name>"
+    }
+}
+
+/// Runtime's default MCP tool namespace maps hyphens to underscores. Imports
+/// must be unique under that effective spelling or two connected servers can
+/// advertise the same tool name and first-match routing picks the wrong one.
+fn effective_server_namespace(name: &str, sanitize: bool) -> String {
+    newt_core::mcp::runtime_server_prefix(name, sanitize)
+}
+
+fn reject_namespace_collisions<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    sanitize: bool,
 ) -> anyhow::Result<()> {
-    let source = resolve_import_source(path, from_claude)?;
+    let mut owners = std::collections::BTreeMap::<String, String>::new();
+    for name in names {
+        let namespace = effective_server_namespace(name, sanitize);
+        if let Some(owner) = owners.get(&namespace) {
+            if owner != name {
+                bail!(
+                    "MCP server names `{owner}` and `{name}` share the effective tool namespace `{namespace}`; rename one before importing"
+                );
+            }
+        } else {
+            owners.insert(namespace, name.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn import_namespace_sanitization(
+    target: &Path,
+    strong_explicit_target: bool,
+) -> anyhow::Result<bool> {
+    let user_mcp = Config::user_config_dir().map(|dir| dir.join("mcp.toml"));
+    let cfg = if user_mcp.as_deref() == Some(target) && !strong_explicit_target {
+        Config::resolve()?
+    } else if target.is_file() {
+        Config::load(target)?
+    } else {
+        Config::default()
+    };
+    Ok(cfg.tui.unwrap_or_default().sanitize_mcp_server_names)
+}
+
+fn valid_env_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether a literal consists only of a safe environment reference, with the
+/// optional fixed `Bearer ` prefix used by HTTP Authorization headers.
+fn safe_env_template(value: &str, allow_bearer: bool) -> bool {
+    let trimmed = value.trim();
+    let candidate = if allow_bearer {
+        trimmed.strip_prefix("Bearer ").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let Some(inner) = candidate
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    let env = inner.strip_prefix("env:").unwrap_or(inner);
+    valid_env_identifier(env)
+}
+
+fn safe_import_value(value: &SecretValue, header: bool) -> bool {
+    match value {
+        SecretValue::Ref(reference) => {
+            reference
+                .env
+                .as_ref()
+                .is_some_and(|name| valid_env_identifier(name))
+                && reference.file.is_none()
+                && reference.cmd.is_none()
+        }
+        SecretValue::Literal(value) => {
+            if safe_env_template(value, header) {
+                return true;
+            }
+            // Any other interpolation becomes active after explicit import;
+            // do not adopt it from a borrowed config source.
+            if value.contains("${") {
+                return false;
+            }
+            false
+        }
+    }
+}
+
+/// Validate URL and stdio-argument credential locations. Newt resolves imported
+/// references only in MCP headers and child environment values, not URLs or
+/// argv, so those locations fail closed. Errors identify only the location;
+/// credential values never enter diagnostics.
+fn validate_imported_secret_locations(entry: &McpServerEntry) -> anyhow::Result<()> {
+    if entry.url.as_deref().is_some_and(|url| url.contains("${")) {
+        bail!(
+            "MCP server `{}` has an unsupported URL environment reference; use an environment-backed header before importing",
+            entry.name
+        );
+    }
+    if entry.args.iter().any(|arg| arg.contains("${")) {
+        bail!(
+            "MCP server `{}` has an unsupported command-argument environment reference; use the child environment before importing",
+            entry.name
+        );
+    }
+    if let Some(url) = entry.url.as_deref() {
+        newt_core::mcp::canonical_mcp_http_url(url).map_err(|issue| {
+            anyhow!(
+                "MCP server `{}` has {issue}; move credentials to environment-backed headers and use a credential-free http(s) URL before importing",
+                entry.name
+            )
+        })?;
+    }
+    let audit = Config {
+        mcp_servers: vec![entry.clone()],
+        ..Config::default()
+    };
+    let redacted_text = audit
+        .to_redacted_toml()
+        .context("redacting imported MCP configuration")?;
+    let redacted = newt_core::mcp::parse_newt_mcp_toml(&redacted_text)
+        .into_iter()
+        .find(|candidate| candidate.name == entry.name)
+        .ok_or_else(|| anyhow!("redacted MCP configuration omitted the selected server"))?;
+
+    if entry.args.len() != redacted.args.len() {
+        bail!(
+            "MCP server `{}` has an invalid redacted argument list",
+            entry.name
+        );
+    }
+    for masked in &redacted.args {
+        if !masked.contains(Config::REDACTED) {
+            continue;
+        }
+        bail!(
+            "MCP server `{}` has a sensitive command argument; move credentials to the child environment before importing",
+            entry.name
+        );
+    }
+    Ok(())
+}
+
+/// Remove literal credentials and active file/command references before a
+/// borrowed server becomes trusted. Returns redaction-safe field names only.
+fn sanitize_imported_secrets(entry: &mut McpServerEntry) -> usize {
+    let mut omitted = 0;
+    entry.env.retain(|_key, value| {
+        let keep = safe_import_value(value, false);
+        if !keep {
+            omitted += 1;
+        }
+        keep
+    });
+    entry.headers.retain(|_key, value| {
+        let keep = safe_import_value(value, true);
+        if !keep {
+            omitted += 1;
+        }
+        keep
+    });
+    // The explicit import is the approval boundary. The marker is not
+    // serialized, but stamping it here keeps validation and tests honest.
+    entry.trust = McpTrust::Trusted;
+    omitted
+}
+
+fn canonicalize_import_http_url(entry: &mut McpServerEntry) -> anyhow::Result<Option<String>> {
+    if entry.transport != TransportKind::Http {
+        return Ok(None);
+    }
+    let raw = entry
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("MCP server `{}` has no HTTP URL", entry.name))?;
+    let canonical = newt_core::mcp::canonical_mcp_http_url(raw).map_err(|issue| {
+        anyhow!(
+            "MCP server `{}` has {issue}; move credentials to environment-backed headers because only credential-free http(s) URLs can be imported",
+            entry.name
+        )
+    })?;
+    entry.url = Some(canonical.url);
+    Ok(Some(canonical.host))
+}
+
+fn imported_http_hosts(entries: &[McpServerEntry]) -> anyhow::Result<Vec<String>> {
+    let mut hosts = std::collections::BTreeSet::new();
+    for entry in entries {
+        if !entry.enabled || entry.transport != TransportKind::Http {
+            continue;
+        }
+        let raw = entry
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow!("MCP server `{}` has no HTTP URL", entry.name))?;
+        let canonical = newt_core::mcp::canonical_mcp_http_url(raw)
+            .map_err(|issue| anyhow!("MCP server `{}` has {issue}", entry.name))?;
+        hosts.insert(canonical.host);
+    }
+    Ok(hosts.into_iter().collect())
+}
+
+/// Whether an active walked-up project config structurally replaces the base
+/// MCP array. In that mode no connector written to the user/explicit base can
+/// become effective, regardless of names, so a grant import must fail closed.
+fn project_replaces_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<Option<PathBuf>> {
+    let Some(project) = Config::project_config_path() else {
+        return Ok(None);
+    };
+    if ResolvedPath::resolve(&project)? == *base {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&project)
+        .with_context(|| format!("reading project config {}", project.display()))?;
+    let value: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("parsing project config {}", project.display()))?;
+    let has_project_mcp_array = value
+        .get("mcp_servers")
+        .and_then(toml::Value::as_array)
+        .is_some();
+    let project_strategy = value
+        .get("merge")
+        .and_then(|merge| merge.get("arrays"))
+        .and_then(toml::Value::as_str);
+    let base_strategy = base
+        .as_path()
+        .is_file()
+        .then(|| Config::load(base.as_path()))
+        .transpose()?
+        .and_then(|config| config.merge)
+        .map(|merge| merge.arrays);
+    let replaces = match project_strategy {
+        Some("append") => false,
+        Some("replace") => true,
+        Some(_) => true,
+        None => base_strategy != Some(ArrayMergeStrategy::Append),
+    };
+    Ok((has_project_mcp_array && replaces).then_some(project))
+}
+
+fn project_appends_to_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<bool> {
+    let Some(project) = Config::project_config_path() else {
+        return Ok(false);
+    };
+    if ResolvedPath::resolve(&project)? == *base {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&project)
+        .with_context(|| format!("reading project config {}", project.display()))?;
+    let value: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("parsing project config {}", project.display()))?;
+    if value
+        .get("mcp_servers")
+        .and_then(toml::Value::as_array)
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let project_strategy = value
+        .get("merge")
+        .and_then(|merge| merge.get("arrays"))
+        .and_then(toml::Value::as_str);
+    let base_strategy = base
+        .as_path()
+        .is_file()
+        .then(|| Config::load(base.as_path()))
+        .transpose()?
+        .and_then(|config| config.merge)
+        .map(|merge| merge.arrays);
+    Ok(matches!(project_strategy, Some("append"))
+        || (project_strategy.is_none() && base_strategy == Some(ArrayMergeStrategy::Append)))
+}
+
+fn permission_write_target(mcp_target: &Path, grant_net: bool) -> anyhow::Result<PathBuf> {
+    let user_dir =
+        Config::user_config_dir().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))?;
+    if mcp_target == user_dir.join("mcp.toml") {
+        if grant_net {
+            if let Some(ambient) = ambient_newt_toml()? {
+                bail!(
+                    "cannot grant MCP network access while ambient {} is the active base config; run the import outside that directory or select an operator-owned config with --config",
+                    ambient.display()
+                );
+            }
+        }
+        return Ok(user_dir.join("config.toml"));
+    }
+    Ok(mcp_target.to_path_buf())
+}
+
+/// A network grant must be committed in the same durable replacement as the
+/// connector that consumes it. At user scope this selects `config.toml` as the
+/// one authoritative document; a strong explicit target (`--config` or
+/// `$NEWT_CONFIG`) is already unified and must not be redirected.
+/// No-grant imports keep the break-out `mcp.toml` behavior.
+fn authoritative_import_target(
+    mcp_target: &Path,
+    grant_net: bool,
+    strong_explicit_target: bool,
+) -> anyhow::Result<PathBuf> {
+    if grant_net && !strong_explicit_target {
+        permission_write_target(mcp_target, true)
+    } else {
+        Ok(mcp_target.to_path_buf())
+    }
+}
+
+/// Config sources that can outrank the user-owned `mcp.toml` in at least one
+/// normal invocation. The ambient source matters in the current cwd; the user
+/// config matters everywhere that ambient source is absent. Checking both keeps
+/// an import from becoming silently shadowed as soon as the operator changes
+/// directories.
+fn outranking_import_sources(
+    mcp_target: &Path,
+    strong_explicit_target: bool,
+) -> anyhow::Result<Vec<(PathBuf, std::collections::BTreeSet<String>)>> {
+    if strong_explicit_target {
+        return Ok(Vec::new());
+    }
+    let Some(user_dir) = Config::user_config_dir() else {
+        return Ok(Vec::new());
+    };
+    if mcp_target != user_dir.join("mcp.toml") {
+        return Ok(Vec::new());
+    }
+
+    let mut sources = Vec::new();
+
+    // Inspect each source locally instead of attributing Config::resolve()'s
+    // merged names to its highest-precedence label. Otherwise a project file
+    // with no MCP entries can make the user config's own names look project-
+    // owned and falsely defeat `--merge` / `--force` on the authoritative file.
+    let user_config = user_dir.join("config.toml");
+    if user_config.is_file() {
+        sources.push((
+            user_config.clone(),
+            Config::load(&user_config)?
+                .mcp_servers
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect(),
+        ));
+    }
+    for source in [ambient_newt_toml()?, Config::project_config_path()]
+        .into_iter()
+        .flatten()
+    {
+        if source.is_file() {
+            sources.push((
+                source.clone(),
+                Config::load(&source)?
+                    .mcp_servers
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect(),
+            ));
+        }
+    }
+    Ok(sources)
+}
+
+fn borrowed_runtime_server_names() -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let home = crate::home_dir();
+    let workspace = std::env::current_dir().context("cannot resolve the current directory")?;
+    Ok(
+        newt_core::mcp::discover(&[], None, home.as_deref(), &workspace)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
+    )
+}
+
+/// Sort physical destination identities before taking any lock. Deduplicating
+/// after resolution makes aliases of the same file share one lock generation.
+fn sorted_unique_import_targets(mut targets: Vec<ResolvedPath>) -> Vec<ResolvedPath> {
+    targets.sort_by(|left, right| left.as_path().cmp(right.as_path()));
+    targets.dedup_by(|left, right| left.as_path() == right.as_path());
+    targets
+}
+
+/// Destinations whose operator-owned state determines a default user-scope
+/// import. Lock them before taking any snapshot so a cooperating config writer
+/// cannot change precedence or namespace sanitization between validation and
+/// the `mcp.toml` commit. Strong explicit targets are self-contained.
+fn import_lock_targets(
+    target: ResolvedPath,
+    breakout: ResolvedPath,
+    breakout_path: &Path,
+    strong_explicit_target: bool,
+    grant_net: bool,
+) -> anyhow::Result<Vec<ResolvedPath>> {
+    let mut targets = vec![target, breakout];
+    let user_mcp = Config::user_config_dir().map(|dir| dir.join("mcp.toml"));
+    if !strong_explicit_target && user_mcp.as_deref() == Some(breakout_path) {
+        let consulted = [
+            Config::user_config_path(),
+            ambient_newt_toml()?,
+            Config::project_config_path(),
+        ];
+        for path in consulted.into_iter().flatten() {
+            targets.push(
+                ResolvedPath::resolve(&path).with_context(|| {
+                    format!("resolving consulted MCP config {}", path.display())
+                })?,
+            );
+        }
+    }
+    if grant_net {
+        if let Some(project) = Config::project_config_path() {
+            targets.push(ResolvedPath::resolve(&project).with_context(|| {
+                format!("resolving consulted project config {}", project.display())
+            })?);
+        }
+    }
+    Ok(targets)
+}
+
+/// Acquire every consulted target lock in stable physical-path order and retain
+/// all guards through commit. This coordinates the authoritative write with the
+/// break-out source read without introducing lock-order inversion.
+fn acquire_import_target_locks(targets: Vec<ResolvedPath>) -> anyhow::Result<Vec<LockGuard>> {
+    let mut guards = Vec::new();
+    for destination in sorted_unique_import_targets(targets) {
+        let guard =
+            newt_core::atomic_fs::acquire_lock(&destination.lock_path()).with_context(|| {
+                format!(
+                    "locking MCP import target {}",
+                    destination.as_path().display()
+                )
+            })?;
+        guards.push(guard);
+    }
+    Ok(guards)
+}
+
+fn import_target_permissions(
+    destination: &ResolvedPath,
+) -> anyhow::Result<Option<std::fs::Permissions>> {
+    let path = destination.as_path();
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.permissions())),
+        Ok(_) => bail!(
+            "refusing to replace non-file resolved MCP import target {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading metadata for {}", path.display()))
+        }
+    }
+}
+
+/// Replace one config file without exposing a truncated intermediate state:
+/// prepare through [`ResolvedPath`], sync, durably replace, then sync the parent.
+fn ensure_expected_file_state(
+    destination: &ResolvedPath,
+    expected: Option<&str>,
+) -> anyhow::Result<()> {
+    import_target_permissions(destination)?;
+    let current = read_optional(destination.as_path())?;
+    if current.as_deref() != expected {
+        bail!(
+            "MCP import conflict at {}; a concurrent edit was preserved",
+            destination.as_path().display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn atomic_write_back(
+    destination: &ResolvedPath,
+    expected: Option<&str>,
+    text: &str,
+) -> anyhow::Result<()> {
+    atomic_write_back_with(
+        destination,
+        expected,
+        text,
+        || {},
+        |destination, staged| destination.durable_replace(staged),
+    )
+}
+
+fn atomic_write_back_with(
+    destination: &ResolvedPath,
+    expected: Option<&str>,
+    text: &str,
+    after_stage: impl FnOnce(),
+    replace: impl FnOnce(&ResolvedPath, &Path) -> Result<(), newt_core::atomic_fs::DurableReplaceError>,
+) -> anyhow::Result<()> {
+    let permissions = import_target_permissions(destination)?;
+    ensure_expected_file_state(destination, expected)?;
+    let staged =
+        destination.stage_with_permissions(text.as_bytes(), permissions.as_ref(), false)?;
+    after_stage();
+    // Re-check immediately before replacement. A non-cooperating edit or a
+    // newly introduced symlink at a previously absent destination fails closed.
+    if let Err(error) = ensure_expected_file_state(destination, expected) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    if let Err(error) = replace(destination, &staged) {
+        let _ = std::fs::remove_file(&staged);
+        // A committed error means the destination name already changed and
+        // only the parent-directory fsync failed. Never restore the old file:
+        // doing so could erase a connector+grant pair that is already visible.
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn import_process_failpoint(step: &str) {
+    const STEP_ENV: &str = "NEWT_TEST_MCP_IMPORT_KILL_AFTER";
+    if std::env::var(STEP_ENV).ok().as_deref() != Some(step) {
+        return;
+    }
+    let Some(ready) = std::env::var_os("NEWT_TEST_MCP_IMPORT_READY") else {
+        return;
+    };
+    std::fs::write(ready, step).expect("writing MCP import failpoint readiness marker");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn import_process_failpoint(_step: &str) {}
+
+fn atomic_import_commit(
+    destination: &ResolvedPath,
+    expected: Option<&str>,
+    text: &str,
+) -> anyhow::Result<()> {
+    atomic_write_back_with(
+        destination,
+        expected,
+        text,
+        || import_process_failpoint("staged"),
+        |destination, staged| {
+            destination.durable_replace_with_sync(staged, |path| {
+                import_process_failpoint("replaced");
+                #[cfg(unix)]
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                #[cfg(windows)]
+                let _ = path;
+                Ok(())
+            })
+        },
+    )
+}
+
+/// Read a selected set of Claude/Codex MCP servers and write trusted newt
+/// registrations. Dedup-by-name: a clash errors by default, `--force`
+/// overwrites, and `--merge` skips. `--grant-net` commits the connector and its
+/// exact host grants together in one authoritative config replacement.
+fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result<()> {
+    if request.project {
+        bail!(
+            "`newt mcp import --project` is refused: project MCP authority is borrowed and untrusted; import into the user-owned config instead"
+        );
+    }
+    let (source, format) =
+        resolve_import_source(request.path, request.from_claude, request.from_codex)?;
     let text = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {}", source.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("{} is not valid JSON", source.display()))?;
-    let mut imported = newt_core::mcp::parse_claude_mcp(&value);
-    if imported.is_empty() {
-        bail!("no `mcpServers` entries found in {}", source.display());
+    let imported = parse_import_entries(&text, format)
+        .with_context(|| format!("parsing {}", source.display()))?;
+    if imported.entries.is_empty() && imported.rejected.is_empty() {
+        bail!("no MCP server entries found in {}", source.display());
     }
-    // Deterministic order (map iteration is not) so output + writes are stable.
-    imported.sort_by(|a, b| a.name.cmp(&b.name));
-
+    let mut imported = select_import_entries(imported, request.name, request.all, &source)?;
+    let mut source_omissions = newt_core::mcp::codex_mcp_omitted_field_counts(&text);
+    for entry in &mut imported {
+        validate_import_server_name(&entry.name)?;
+        validate_imported_secret_locations(entry)?;
+        // URL validity and canonical representation are import invariants, not
+        // side effects of `--grant-net`: an adopted server must be connectable
+        // and its persisted URL and permission host must agree byte-for-byte.
+        canonicalize_import_http_url(entry)?;
+        let omitted = source_omissions.remove(&entry.name).unwrap_or_default()
+            + sanitize_imported_secrets(entry);
+        if omitted > 0 {
+            bail!(
+                "MCP server `{}` contains {} literal or active-reference credential field(s) that cannot be imported safely. Replace them with environment references before importing",
+                entry.name,
+                omitted
+            );
+        }
+    }
     // import is the break-out gesture: create ~/.newt/mcp.toml when at the user
     // level (create=true), unless an explicit target overrides.
-    let target = mcp_write_target(config_path, project, true)?;
-    let mut doc = read_config_text(&target)?;
+    let strong_explicit_target =
+        strong_explicit_write_target(request.config_path, request.project)?.is_some();
+    let breakout_target = mcp_write_target(request.config_path, request.project, true)?;
+    let target =
+        authoritative_import_target(&breakout_target, request.grant_net, strong_explicit_target)?;
+    let target_destination = ResolvedPath::resolve(&target)
+        .with_context(|| format!("resolving MCP import target {}", target.display()))?;
+    let breakout_destination = ResolvedPath::resolve(&breakout_target).with_context(|| {
+        format!(
+            "resolving MCP import break-out target {}",
+            breakout_target.display()
+        )
+    })?;
+    let lock_targets = import_lock_targets(
+        target_destination.clone(),
+        breakout_destination.clone(),
+        &breakout_target,
+        strong_explicit_target,
+        request.grant_net,
+    )?;
+    let _transaction_locks = acquire_import_target_locks(lock_targets)?;
+    target_destination
+        .cleanup_abandoned_stages()
+        .with_context(|| format!("cleaning abandoned stages for {}", target.display()))?;
+    if request.grant_net {
+        if let Some(project) = project_replaces_base_mcp_servers(&target_destination)? {
+            bail!(
+                "cannot grant MCP network access while project config {} replaces the base mcp_servers array; set [merge] arrays = \"append\", remove the project mcp_servers array, or run outside that project",
+                project.display()
+            );
+        }
+    }
+
+    let sanitize_names = import_namespace_sanitization(&breakout_target, strong_explicit_target)?;
+    reject_namespace_collisions(
+        imported.iter().map(|entry| entry.name.as_str()),
+        sanitize_names,
+    )?;
+    import_target_permissions(&target_destination)?;
+    let target_original = read_optional(target_destination.as_path())?;
+    let mut doc = target_original.clone().unwrap_or_default();
     let existing: std::collections::BTreeSet<String> = newt_core::mcp::parse_newt_mcp_toml(&doc)
         .into_iter()
         .map(|e| e.name)
         .collect();
-
-    // FIX 3 (#1301): `config.toml` OUTRANKS `~/.newt/mcp.toml` in discovery, so
-    // importing into mcp.toml a name already defined in config.toml would write
-    // an entry that is silently shadowed and can never take effect (and neither
-    // `--force` nor `--merge`, which only touch the mcp.toml target, can displace
-    // it). Detect that clash and refuse it. Only relevant when the write target
-    // IS the user-global mcp.toml — an explicit `--config`/`--project` writes to
-    // the higher-precedence file directly, so there is no inversion.
-    let (config_label, config_names): (String, std::collections::BTreeSet<String>) =
-        if Config::user_config_dir()
-            .map(|d| d.join("mcp.toml"))
-            .as_deref()
-            == Some(target.as_path())
-        {
-            let cfg = match config_path {
-                Some(p) => Config::load(p)?,
-                None => Config::resolve()?,
-            };
-            let label = config_path
-                .map(Path::to_path_buf)
-                .or_else(Config::user_config_path)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "config.toml".to_string());
-            (
-                label,
-                cfg.mcp_servers.iter().map(|e| e.name.clone()).collect(),
-            )
+    let breakout_existing: std::collections::BTreeSet<String> =
+        if target_destination == breakout_destination {
+            existing.clone()
         } else {
-            (String::new(), std::collections::BTreeSet::new())
+            newt_core::mcp::parse_newt_mcp_toml(
+                read_optional(breakout_destination.as_path())?
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
         };
+
+    let project_appends =
+        request.grant_net && project_appends_to_base_mcp_servers(&target_destination)?;
+    let project_path = Config::project_config_path()
+        .map(|path| ResolvedPath::resolve(&path))
+        .transpose()?;
+    let lower_precedence_names = if project_appends {
+        project_path
+            .as_ref()
+            .map(ResolvedPath::as_path)
+            .map(Config::load)
+            .transpose()?
+            .map(|config| {
+                config
+                    .mcp_servers
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let outranking = outranking_import_sources(&breakout_target, strong_explicit_target)?
+        .into_iter()
+        .filter(|(path, _)| {
+            ResolvedPath::resolve(path)
+                .map(|source| source != target_destination)
+                .unwrap_or(true)
+        })
+        .filter(|(path, _)| {
+            let is_appended_project = project_appends
+                && project_path.as_ref().is_some_and(|project| {
+                    ResolvedPath::resolve(path).ok().as_ref() == Some(project)
+                });
+            !is_appended_project
+        })
+        .collect::<Vec<_>>();
+    let mut existing_names = existing.clone();
+    existing_names.extend(breakout_existing.iter().cloned());
+    for (_, names) in &outranking {
+        existing_names.extend(names.iter().cloned());
+    }
+    existing_names.extend(borrowed_runtime_server_names()?);
+    for entry in &imported {
+        for existing_name in &existing_names {
+            if existing_name != &entry.name
+                && effective_server_namespace(existing_name, sanitize_names)
+                    == effective_server_namespace(&entry.name, sanitize_names)
+            {
+                bail!(
+                    "MCP server `{}` conflicts with existing server `{}` under the effective tool namespace; rename one before importing",
+                    entry.name,
+                    diagnostic_server_name(existing_name)
+                );
+            }
+        }
+    }
 
     let mut added = 0usize;
     let mut overwritten = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    let mut adopted = Vec::new();
     for entry in &imported {
-        // A clash with the OUTRANKING config.toml is always fatal — `--force` /
-        // `--merge` govern the mcp.toml target only and cannot make an import
-        // that config.toml would shadow take effect.
-        if config_names.contains(&entry.name) {
+        // A clash with an actually outranking config is always fatal. The
+        // authoritative write target itself was filtered above, so its entries
+        // retain the normal `--force` / `--merge` behavior.
+        if let Some((path, _)) = outranking
+            .iter()
+            .find(|(_, names)| names.contains(&entry.name))
+        {
             bail!(
-                "`{}` is already defined in {}, which outranks {} — an import here would be \
-                 ineffective (silently shadowed). Remove it from {} first, or re-run with an \
-                 explicit `--config`/`--project` target.",
+                "`{}` is already defined in {}, which outranks or can outrank {} — an import here would be ineffective. Remove it there first, or re-run with an explicit --config target",
                 entry.name,
-                config_label,
-                target.display(),
-                config_label
+                path.display(),
+                target.display()
             );
         }
-        if existing.contains(&entry.name) {
-            if merge {
+        let exists_in_target = existing.contains(&entry.name);
+        let exists_in_breakout = breakout_existing.contains(&entry.name);
+        let exists_lower_precedence = lower_precedence_names.contains(&entry.name);
+        if exists_in_target || exists_in_breakout || exists_lower_precedence {
+            if request.merge {
                 skipped.push(entry.name.clone());
                 continue;
             }
-            if force {
-                doc = Config::with_mcp_server_removed(&doc, &entry.name)?;
+            if request.force {
+                if target_destination != breakout_destination && exists_in_breakout {
+                    bail!(
+                        "MCP server `{}` exists in {} but --grant-net writes atomically to {}; refusing a cross-file overwrite that would leave a dormant duplicate. Remove the existing server first, then re-run the import",
+                        entry.name,
+                        breakout_target.display(),
+                        target.display()
+                    );
+                }
+                if exists_in_target {
+                    doc = Config::with_mcp_server_removed(&doc, &entry.name)?;
+                }
                 doc = Config::with_mcp_server_added(&doc, entry)?;
                 overwritten += 1;
+                adopted.push(entry.clone());
                 continue;
             }
+            let existing_path = if exists_in_target {
+                &target
+            } else if exists_lower_precedence {
+                project_path
+                    .as_ref()
+                    .map(ResolvedPath::as_path)
+                    .unwrap_or(&breakout_target)
+            } else {
+                &breakout_target
+            };
             bail!(
                 "MCP server `{}` already exists in {} — use --force to overwrite, \
                  or --merge to skip existing",
                 entry.name,
-                target.display()
+                existing_path.display()
             );
         }
         doc = Config::with_mcp_server_added(&doc, entry)?;
         added += 1;
+        adopted.push(entry.clone());
     }
-    write_back(&target, &doc)?;
+    let hosts = if request.grant_net {
+        imported_http_hosts(&adopted)?
+    } else {
+        Vec::new()
+    };
+    for host in &hosts {
+        doc = Config::with_net_host(&doc, host)?;
+    }
+    if target_original.as_deref() != Some(doc.as_str()) {
+        atomic_import_commit(&target_destination, target_original.as_deref(), &doc)?;
+    }
 
     writeln!(
         out,
@@ -868,6 +1739,14 @@ fn cmd_import(
             "Skipped {} already present: {}",
             skipped.len(),
             skipped.join(", ")
+        )?;
+    }
+    if !hosts.is_empty() {
+        writeln!(
+            out,
+            "Granted exact MCP network host(s) in {}: {}",
+            target.display(),
+            hosts.join(", ")
         )?;
     }
     print_next_steps(out)
@@ -1336,23 +2215,35 @@ mod tests {
     #[test]
     fn import_source_resolves_explicit_path_and_requires_one() {
         assert_eq!(
-            resolve_import_source(Some(Path::new("/tmp/mcp.json")), false).unwrap(),
-            PathBuf::from("/tmp/mcp.json")
+            resolve_import_source(Some(Path::new("/tmp/mcp.json")), false, false).unwrap(),
+            (PathBuf::from("/tmp/mcp.json"), ImportFormat::Auto)
         );
-        // Neither a path nor --from-claude → a loud usage error.
-        assert!(resolve_import_source(None, false).is_err());
+        // Neither a path nor a built-in source → a loud usage error.
+        assert!(resolve_import_source(None, false, false).is_err());
     }
 
     #[test]
     fn mcp_add_import_parses() {
-        let cli =
-            crate::Cli::try_parse_from(["newt", "mcp", "import", "/tmp/claude.json", "--force"])
-                .unwrap();
+        let cli = crate::Cli::try_parse_from([
+            "newt",
+            "mcp",
+            "import",
+            "/tmp/claude.json",
+            "--name",
+            "review",
+            "--grant-net",
+            "--force",
+        ])
+        .unwrap();
         let Some(crate::Command::Mcp {
             cmd:
                 Some(McpCmd::Import {
                     path,
                     from_claude,
+                    from_codex,
+                    name,
+                    all,
+                    grant_net,
                     force,
                     merge,
                     project,
@@ -1363,20 +2254,426 @@ mod tests {
         };
         assert_eq!(path.as_deref(), Some(Path::new("/tmp/claude.json")));
         assert!(!from_claude);
+        assert!(!from_codex);
+        assert_eq!(name.as_deref(), Some("review"));
+        assert!(!all);
+        assert!(grant_net);
         assert!(force);
         assert!(!merge);
         assert!(!project);
-        // --from-claude makes the path optional.
-        assert!(crate::Cli::try_parse_from(["newt", "mcp", "import", "--from-claude"]).is_ok());
+        // A built-in source makes the path optional, but selection remains
+        // explicit so bulk adoption is never accidental.
+        assert!(crate::Cli::try_parse_from([
+            "newt",
+            "mcp",
+            "import",
+            "--from-claude",
+            "--name",
+            "review"
+        ])
+        .is_ok());
+        assert!(
+            crate::Cli::try_parse_from(["newt", "mcp", "import", "--from-codex", "--all"]).is_ok()
+        );
+        assert!(crate::Cli::try_parse_from(["newt", "mcp", "import", "--from-claude"]).is_err());
+        assert!(crate::Cli::try_parse_from([
+            "newt",
+            "mcp",
+            "import",
+            "--from-claude",
+            "--from-codex",
+            "--all"
+        ])
+        .is_err());
         // --force and --merge are mutually exclusive.
         assert!(crate::Cli::try_parse_from([
             "newt",
             "mcp",
             "import",
             "/tmp/c.json",
+            "--all",
             "--force",
             "--merge"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn import_sanitizer_preserves_only_safe_secret_references() {
+        let mut entry = McpServerEntry {
+            name: "review".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: BTreeMap::from([
+                ("ROOT".into(), SecretValue::literal("/workspace")),
+                ("API_TOKEN".into(), SecretValue::literal("plaintext")),
+                ("FROM_ENV".into(), SecretValue::literal("${SAFE_TOKEN}")),
+                ("ACTIVE".into(), SecretValue::literal("${file:/tmp/token}")),
+            ]),
+            url: Some("https://broker.example.test/mcp".into()),
+            headers: BTreeMap::from([
+                (
+                    "Authorization".into(),
+                    SecretValue::literal("Bearer plaintext"),
+                ),
+                (
+                    "X-Token".into(),
+                    SecretValue::literal("Bearer ${env:SAFE_TOKEN}"),
+                ),
+            ]),
+            request_timeout_secs: None,
+            trust: McpTrust::Untrusted,
+        };
+
+        let omitted = sanitize_imported_secrets(&mut entry);
+        assert_eq!(entry.trust, McpTrust::Trusted);
+        assert!(!entry.env.contains_key("ROOT"));
+        assert!(entry.env.contains_key("FROM_ENV"));
+        assert!(!entry.env.contains_key("API_TOKEN"));
+        assert!(!entry.env.contains_key("ACTIVE"));
+        assert!(!entry.headers.contains_key("Authorization"));
+        assert!(entry.headers.contains_key("X-Token"));
+        assert_eq!(omitted, 4);
+    }
+
+    #[test]
+    fn import_validator_rejects_literal_url_and_arg_credentials_without_echoing_them() {
+        for mut entry in [
+            McpServerEntry {
+                name: "userinfo".into(),
+                enabled: true,
+                transport: TransportKind::Http,
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                url: Some("https://user:do-not-echo@example.test/mcp".into()),
+                headers: BTreeMap::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Untrusted,
+            },
+            stdio_entry("argument", Some("mcp-server")),
+            stdio_entry("header", Some("mcp-server")),
+            stdio_entry("joined-header", Some("mcp-server")),
+        ] {
+            if entry.name == "argument" {
+                entry.args = vec!["--token=do-not-echo".into()];
+            } else if entry.name == "header" {
+                entry.args = vec!["-H".into(), "X-API-Key: do-not-echo".into()];
+            } else if entry.name == "joined-header" {
+                entry.args = vec!["-HX-Client-Secret: do-not-echo".into()];
+            }
+            let error = validate_imported_secret_locations(&entry).unwrap_err();
+            assert!(!error.to_string().contains("do-not-echo"), "{error:#}");
+        }
+
+        for mut unsafe_ref in [
+            stdio_entry("arg-reference", Some("mcp-server")),
+            McpServerEntry {
+                name: "url-reference".into(),
+                enabled: true,
+                transport: TransportKind::Http,
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                url: Some("https://${MCP_USERINFO}@example.test/mcp?token=${MCP_TOKEN}".into()),
+                headers: BTreeMap::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Untrusted,
+            },
+        ] {
+            if unsafe_ref.name == "arg-reference" {
+                unsafe_ref.args = vec!["--token".into(), "${MCP_TOKEN}".into()];
+            }
+            assert!(validate_imported_secret_locations(&unsafe_ref).is_err());
+        }
+
+        for args in [
+            vec!["--auth=do-not-echo".into()],
+            vec!["--oauth2-bearer".into(), "do-not-echo".into()],
+            vec!["--cookie".into(), "do-not-echo".into()],
+            vec!["--user=operator:do-not-echo".into()],
+            vec!["-u".into(), "operator:do-not-echo".into()],
+            vec!["-bdo-not-echo".into()],
+        ] {
+            let mut entry = stdio_entry("argument-alias", Some("mcp-server"));
+            entry.args = args;
+            let error = validate_imported_secret_locations(&entry).unwrap_err();
+            assert!(!error.to_string().contains("do-not-echo"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn imported_names_are_portable_token_store_components() {
+        for invalid in [
+            "../other",
+            "a/b",
+            r"a\b",
+            ".",
+            "..",
+            "bad:name",
+            "bad name",
+            "CON",
+            "lpt1.remote",
+            "review.",
+            "review__source",
+            "review--source",
+            "review-_source",
+        ] {
+            assert!(validate_import_server_name(invalid).is_err(), "{invalid}");
+        }
+        for valid in ["review", "Case.Sensitive-name", "review_source"] {
+            validate_import_server_name(valid).unwrap();
+        }
+    }
+
+    #[test]
+    fn imported_names_are_unique_under_effective_tool_namespacing() {
+        reject_namespace_collisions(["review-source", "calendar"], true).unwrap();
+        let error =
+            reject_namespace_collisions(["review-source", "review_source"], true).unwrap_err();
+        assert!(error.to_string().contains("effective tool namespace"));
+        reject_namespace_collisions(["review-source", "review_source"], false).unwrap();
+    }
+
+    #[test]
+    fn exact_http_hosts_are_normalized_and_deduplicated() {
+        let entries = [
+            McpServerEntry {
+                name: "one".into(),
+                enabled: true,
+                transport: TransportKind::Http,
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                url: Some("https://BROKER.Example.test:8443/mcp".into()),
+                headers: BTreeMap::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Trusted,
+            },
+            McpServerEntry {
+                name: "two".into(),
+                url: Some("https://broker.example.test/other".into()),
+                ..stdio_entry("two", None)
+            },
+            McpServerEntry {
+                name: "disabled".into(),
+                enabled: false,
+                transport: TransportKind::Http,
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                url: Some("https://disabled.example.test/mcp".into()),
+                headers: BTreeMap::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Trusted,
+            },
+        ];
+        let mut entries = entries;
+        entries[1].transport = TransportKind::Http;
+        assert_eq!(
+            imported_http_hosts(&entries).unwrap(),
+            vec!["broker.example.test"]
+        );
+    }
+
+    #[test]
+    fn http_url_is_canonicalized_once_for_persistence_and_grants() {
+        let mut entry = McpServerEntry {
+            name: "one".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            url: Some("https://BÜCHER.example:443/mcp".into()),
+            headers: BTreeMap::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+        };
+        let host = canonicalize_import_http_url(&mut entry).unwrap().unwrap();
+        assert_eq!(host, "xn--bcher-kva.example");
+        assert_eq!(
+            entry.url.as_deref(),
+            Some("https://xn--bcher-kva.example/mcp")
+        );
+        assert_eq!(imported_http_hosts(&[entry]).unwrap(), [host]);
+    }
+
+    #[test]
+    fn import_url_validation_is_independent_of_network_grants_and_rejects_fragments() {
+        for url in [
+            "ftp://example.test/mcp",
+            "https://user:never-echo-this@example.test/mcp",
+            "https://example.test/mcp?auth=never-echo-this",
+            "https://example.test/mcp#access_token=never-echo-this",
+        ] {
+            let entry = McpServerEntry {
+                name: "review".into(),
+                enabled: true,
+                transport: TransportKind::Http,
+                command: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                url: Some(url.into()),
+                headers: BTreeMap::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Untrusted,
+            };
+            let mut entry = entry;
+            let error = canonicalize_import_http_url(&mut entry).unwrap_err();
+            assert!(!error.to_string().contains("never-echo-this"));
+        }
+    }
+
+    #[test]
+    fn import_selection_never_silently_discards_rejected_entries() {
+        let entry = stdio_entry("valid", Some("valid-mcp"));
+        let report = McpImportParseReport {
+            entries: vec![entry],
+            rejected: vec![newt_core::mcp::McpImportRejection {
+                name: Some("rejected".into()),
+                issue: newt_core::mcp::McpImportIssue::UnknownField,
+            }],
+        };
+        assert!(
+            select_import_entries(report.clone(), None, true, Path::new("source.toml"))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot import all")
+        );
+        assert!(select_import_entries(
+            report.clone(),
+            Some("rejected"),
+            false,
+            Path::new("source.toml")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported fields"));
+        assert_eq!(
+            select_import_entries(report, Some("valid"), false, Path::new("source.toml")).unwrap()
+                [0]
+            .name,
+            "valid"
+        );
+    }
+
+    #[test]
+    #[ignore = "real filesystem lock acceptance; run in mcp-import-real workflow"]
+    #[serial_test::serial(real_fs)]
+    fn import_and_ordinary_writers_share_sorted_resolved_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp_path = dir.path().join("mcp.toml");
+        let mcp = ResolvedPath::resolve(&mcp_path).unwrap();
+        let config = ResolvedPath::resolve(&dir.path().join("config.toml")).unwrap();
+        let mcp_alias = ResolvedPath::resolve(&dir.path().join(".").join("mcp.toml")).unwrap();
+
+        let targets = sorted_unique_import_targets(vec![mcp, mcp_alias, config]);
+        let paths: Vec<&Path> = targets.iter().map(ResolvedPath::as_path).collect();
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("config.toml"));
+        assert!(paths[1].ends_with("mcp.toml"));
+
+        let guards = acquire_import_target_locks(vec![
+            targets[1].clone(),
+            targets[0].clone(),
+            targets[1].clone(),
+        ])
+        .unwrap();
+        assert_eq!(guards.len(), 2);
+        assert!(targets.iter().all(|target| target.lock_path().is_file()));
+        drop(guards);
+        assert!(targets.iter().all(|target| !target.lock_path().exists()));
+
+        let (ordinary_target, _ordinary_guard) = resolve_and_lock_write_target(&mcp_path).unwrap();
+        assert_eq!(ordinary_target, targets[1]);
+    }
+
+    #[test]
+    #[ignore = "real filesystem durability acceptance; run in mcp-import-real workflow"]
+    #[serial_test::serial(real_fs)]
+    fn post_rename_sync_failure_never_restores_committed_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "before").unwrap();
+        let destination = ResolvedPath::resolve(&path).unwrap();
+        let _guard = newt_core::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+
+        let error = atomic_write_back_with(
+            &destination,
+            Some("before"),
+            "after",
+            || {},
+            |destination, staged| {
+                destination.durable_replace_with_sync(staged, |_| {
+                    Err(std::io::Error::other("injected parent fsync failure"))
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "after");
+        assert!(error.to_string().contains("could not durably sync"));
+    }
+
+    #[cfg(unix)]
+    /// Grounds the import adapter's use of a once-resolved destination. Even if
+    /// an ancestor symlink changes after lock acquisition, commit cannot escape
+    /// to the new parent.
+    #[test]
+    #[ignore = "real filesystem symlink acceptance; run in mcp-import-real workflow"]
+    #[serial_test::serial(real_fs)]
+    fn import_transaction_stays_bound_when_parent_symlink_is_retargeted() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let parent_link = dir.path().join("active");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        symlink(&first, &parent_link).unwrap();
+
+        let logical = parent_link.join("mcp.toml");
+        let destination = ResolvedPath::resolve(&logical).unwrap();
+        let _guard = newt_core::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+        std::fs::remove_file(&parent_link).unwrap();
+        symlink(&second, &parent_link).unwrap();
+        atomic_write_back(&destination, None, "# imported\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(first.join("mcp.toml")).unwrap(),
+            "# imported\n"
+        );
+        assert!(!second.join("mcp.toml").exists());
+        assert_eq!(
+            std::fs::canonicalize(&parent_link).unwrap(),
+            std::fs::canonicalize(&second).unwrap()
+        );
+    }
+
+    /// Grounds the pure staged-write tests above against the platform's actual
+    /// shared durable replacement behavior. Weekly/release acceptance only.
+    #[test]
+    #[ignore = "real filesystem acceptance; run in mcp-import-real workflow"]
+    #[serial_test::serial(real_fs)]
+    fn atomic_import_write_replaces_an_existing_target_without_temp_debris() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mcp.toml");
+        std::fs::write(&target, "before").unwrap();
+        let destination = ResolvedPath::resolve(&target).unwrap();
+        let _guard = newt_core::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+
+        atomic_write_back(&destination, Some("before"), "after").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "after");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
     }
 }

@@ -378,11 +378,65 @@ impl ResolvedPath {
         stage_file_at(&self.path, bytes, permissions, private_if_new)
     }
 
+    /// Remove sibling staging files left by writers whose owner process is no
+    /// longer alive. Call only while holding this destination's canonical lock.
+    /// Live, malformed, or PID-reused stages are preserved fail-closed.
+    pub fn cleanup_abandoned_stages(&self) -> anyhow::Result<usize> {
+        let Some(parent) = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        else {
+            return Ok(0);
+        };
+        let file_name = self
+            .path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", self.path.display()))?
+            .to_string_lossy();
+        let prefix = format!(".{file_name}.");
+        let mut removed = 0;
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(owner_and_nonce) = name
+                .strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".tmp"))
+            else {
+                continue;
+            };
+            let Some(pid) = owner_and_nonce
+                .split_once('-')
+                .and_then(|(pid, _)| pid.parse::<i64>().ok())
+                .filter(|pid| *pid > 0)
+            else {
+                continue;
+            };
+            if crate::store::pid_is_alive(pid) {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if removed > 0 {
+            sync_parent(&self.path)?;
+        }
+        Ok(removed)
+    }
+
     pub fn durable_replace(&self, staged: &Path) -> Result<(), DurableReplaceError> {
         self.durable_replace_with_sync(staged, sync_parent_io)
     }
 
-    fn durable_replace_with_sync(
+    /// Replace using an injected parent-sync operation while preserving the
+    /// before/after-commit error contract. Transaction adapters use this only
+    /// for deterministic durability failpoints; ordinary callers use
+    /// [`Self::durable_replace`].
+    pub fn durable_replace_with_sync(
         &self,
         staged: &Path,
         sync: impl FnOnce(&Path) -> std::io::Result<()>,
@@ -641,6 +695,28 @@ mod tests {
         atomic_write(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[ignore = "real filesystem cleanup acceptance; run in mcp-import-real workflow"]
+    #[serial_test::serial(real_fs)]
+    fn abandoned_stage_cleanup_removes_only_dead_owner_for_destination() {
+        let dir = TempDir::new().unwrap();
+        let destination = ResolvedPath::resolve(&dir.path().join("config.toml")).unwrap();
+        let dead = dir.path().join(".config.toml.4294967295-dead-0.tmp");
+        let live = dir
+            .path()
+            .join(format!(".config.toml.{}-live-0.tmp", std::process::id()));
+        let unrelated = dir.path().join(".mcp.toml.4294967295-dead-0.tmp");
+        for path in [&dead, &live, &unrelated] {
+            std::fs::write(path, b"stage").unwrap();
+        }
+
+        let _guard = acquire_lock(&destination.lock_path()).unwrap();
+        assert_eq!(destination.cleanup_abandoned_stages().unwrap(), 1);
+        assert!(!dead.exists());
+        assert!(live.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]

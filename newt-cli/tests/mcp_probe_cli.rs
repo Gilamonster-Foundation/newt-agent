@@ -234,7 +234,7 @@ async fn probe_url_succeeds_against_a_streamable_http_server() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "serverInfo": { "name": "wire-srv", "version": "9.9" },
                 "instructions": "A wired test server."

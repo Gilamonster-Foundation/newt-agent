@@ -43,11 +43,21 @@ jobs:
     permissions:
       contents: read
 
+  # MCP import and runtime recovery are stacked on setup acceptance because the
+  # shared crash-safe lock/replacement contract is their prerequisite. Every
+  # release build root below depends on this job, so no publication path can
+  # bypass either acceptance tier.
+  mcp-import-acceptance:
+    needs: [setup-acceptance]
+    uses: ./.github/workflows/mcp-import-real.yml
+    permissions:
+      contents: read
+
   # ── Build cross-platform binaries ──────────────────────────────────────
 
   build-binaries:
     name: Build (${{ matrix.label }})
-    needs: [setup-acceptance]
+    needs: [mcp-import-acceptance]
     strategy:
       fail-fast: false
       matrix:
@@ -529,7 +539,7 @@ jobs:
 
   build-wheels:
     name: Build wheel (${{ matrix.os }})
-    needs: [setup-acceptance]
+    needs: [mcp-import-acceptance]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -566,7 +576,7 @@ jobs:
 
   build-sdist:
     name: Build sdist
-    needs: [setup-acceptance]
+    needs: [mcp-import-acceptance]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
