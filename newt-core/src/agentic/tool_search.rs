@@ -6,12 +6,14 @@
 //! measures *which* names get fabricated). Where those react to a guess,
 //! `tool_search` lets a model that only half-remembers a capability *look it up*
 //! first: given a query it returns matching real tool names + a one-line
-//! description (and required params) drawn from the session's own advertised
+//! description (and required params) drawn from the current turn's authorized
 //! catalog — so `read_file` / `update_plan` / `crew` are discoverable by
 //! description rather than by lucky recall of an exact name.
 //!
-//! Out of scope (per #725): lazy/deferred tool loading. newt advertises every
-//! tool today; this is *discovery over the advertised set*, not lazy-loading.
+//! The catalog may be wider than the provider-wire projection: budget and
+//! provider-count clipping can hide schemas without changing authorization.
+//! `tool_search` can still list those known-hidden tools, but schema activation
+//! remains a later exposure-controller pass.
 //!
 //! [`execute_tool_search`] is deliberately PURE — it takes the catalog as a
 //! `&serde_json::Value` (the same shape [`super::tools::merged_tool_definitions`]
@@ -23,7 +25,7 @@
 /// unsure of a tool's exact name to *look it up* rather than guess a name from
 /// another harness.
 const TOOL_SEARCH_DESCRIPTION: &str =
-    "Search newt's available tools by intent/keyword — returns matching real \
+    "Search newt's tools available to the current turn by intent/keyword — returns matching real \
      tool names + what they do. Use this when unsure of a tool's exact name \
      instead of guessing.";
 
@@ -155,10 +157,10 @@ pub(crate) fn execute_tool_search(query: &str, catalog: &serde_json::Value) -> S
     // probe is a legitimate "what can you do?" — answer it fully.
     if terms.is_empty() {
         if tools.is_empty() {
-            return "No tools are available this session.".to_string();
+            return "No tools are available in the current turn.".to_string();
         }
         let body = tools.iter().map(match_line).collect::<Vec<_>>().join("\n");
-        return format!("Available tools:\n{body}");
+        return format!("Available tools in this turn:\n{body}");
     }
 
     // Score each tool over name (×3) + description (×1) + param names (×1).
@@ -188,7 +190,9 @@ pub(crate) fn execute_tool_search(query: &str, catalog: &serde_json::Value) -> S
     if scored.is_empty() {
         let names = tools.iter().map(|r| r.name).collect::<Vec<_>>().join(", ");
         if names.is_empty() {
-            return format!("No tool matched \"{query}\" — no tools are available this session.");
+            return format!(
+                "No tool matched \"{query}\" — no tools are available in the current turn."
+            );
         }
         return format!(
             "No tool matched \"{query}\". Available tools: {names}. Retry tool_search with a \
@@ -211,6 +215,45 @@ pub(crate) fn execute_tool_search(query: &str, catalog: &serde_json::Value) -> S
         ));
     }
     out.trim_end().to_string()
+}
+
+/// Add the disposition boundary to a discovery result. In particular, a
+/// filtered Explain/Research catalog must never be mistaken for proof that the
+/// whole session lacks an execution tool.
+pub(crate) fn execute_tool_search_for_disposition(
+    query: &str,
+    catalog: &serde_json::Value,
+    disposition: super::PromptDisposition,
+) -> String {
+    let result = execute_tool_search(query, catalog);
+    if disposition == super::PromptDisposition::Act || !query_seeks_execution_tool(query) {
+        return result;
+    }
+    format!(
+        "{result}\n\nCatalog scope: this is only the current {} turn. A missing execution \
+         tool may be available on a direct Act request. Ask the operator to send an explicit \
+         action request (use request_user_input when available); do not report a session-wide \
+         capability absence from this result. /mode changes working style but cannot widen an \
+         already accepted turn.",
+        disposition.as_str()
+    )
+}
+
+/// Whether discovery is asking for a host-execution capability rather than an
+/// ordinary read/recovery tool. Keep the handoff narrow: a successful Explain
+/// search for `read_file` must not interrupt the operator to request Act.
+fn query_seeks_execution_tool(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    lower.contains("run_command")
+        || lower.contains("run command")
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|term| {
+                matches!(
+                    term,
+                    "shell" | "terminal" | "subprocess" | "execute" | "execution" | "exec"
+                )
+            })
 }
 
 #[cfg(test)]
@@ -294,9 +337,43 @@ mod tests {
     #[test]
     fn empty_query_lists_everything() {
         let out = execute_tool_search("", &full_catalog());
-        assert!(out.contains("Available tools:"), "got: {out}");
+        assert!(out.contains("Available tools in this turn:"), "got: {out}");
         assert!(out.contains("read_file"), "got: {out}");
         assert!(out.contains("write_file"), "got: {out}");
+    }
+
+    #[test]
+    fn empty_catalog_is_scoped_to_the_current_turn_not_the_session() {
+        let out = execute_tool_search("run_command", &serde_json::json!([]));
+        assert!(out.contains("current turn"), "got: {out}");
+        assert!(!out.contains("this session"), "got: {out}");
+    }
+
+    #[test]
+    fn explain_search_coaches_an_explicit_action_handoff() {
+        let out = execute_tool_search_for_disposition(
+            "run_command",
+            &serde_json::json!([]),
+            super::super::PromptDisposition::Explain,
+        );
+        assert!(out.contains("direct Act request"), "got: {out}");
+        assert!(out.contains("request_user_input"), "got: {out}");
+        assert!(
+            out.contains("cannot widen an already accepted turn"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn explain_read_search_does_not_coach_an_action_handoff() {
+        let out = execute_tool_search_for_disposition(
+            "read a file",
+            &full_catalog(),
+            super::super::PromptDisposition::Explain,
+        );
+        assert!(out.contains("read_file"), "got: {out}");
+        assert!(!out.contains("direct Act request"), "got: {out}");
+        assert!(!out.contains("request_user_input"), "got: {out}");
     }
 
     #[test]

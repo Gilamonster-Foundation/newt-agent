@@ -34,6 +34,7 @@ let known      = registry.all();                       // every dispatchable nam
 let present    = filter_presence(known, session);      // Gate / injected capability
 let authorized = filter_authority(present, persona, disposition, caveats);
 let exposed    = exposure_policy.select(authorized, budget, task, active_set);
+let on_wire    = provider_contract.project(exposed);  // e.g. OpenAI <= 128 tools
 ```
 
 **Exposure is never authorization.** Dispatch checks `authorized`, never merely
@@ -116,18 +117,21 @@ max_initial_tools = 0         # 0 = unlimited; a safety rail, not the governor
 supports_dynamic_catalog = true  # reserved for per-round updates (Pass 5)
 ```
 
-`profile = "full"` (the default) is **bit-for-bit unchanged** — the controller
-is identity. `auto` / `minimal` engage budget-driven selection.
+`profile = "full"` (the default) keeps the **exposure controller** as a
+bit-for-bit identity. `auto` / `minimal` engage budget-driven selection. A
+provider's final wire projection still applies independently; OpenAI-compatible
+requests retain Kernel tools and fit at most 128 function schemas.
 
 ## Implementation sequence (separable PRs)
 
 1. **This PR — separate availability / authority / exposure + budget clip.**
    Introduce the exposure stage as a real pipeline step wired at all three loop
    sites, the exposure-class data + drift test, the `[tool_exposure]` config,
-   and budget-driven selection seeded by live `safe_context`. Default `full` =
-   no behavioral change. First live-testable milestone: a small model sees a
-   pocket multitool instead of the whole hardware aisle at turn start. No
-   mutable mid-turn catalogs required.
+   and budget-driven selection seeded by live `safe_context`. Default `full`
+   does not clip at this exposure stage; final provider-contract projection is
+   separate. First live-testable milestone: a small model sees a pocket
+   multitool instead of the whole hardware aisle at turn start. No mutable
+   mid-turn catalogs required.
 2. Schema measurement + Compact/Index projections; emit catalog-token metrics.
 3. Deterministic task-intent bundles fill the budget (data-driven family map).
 4. `tool_search` searches and activates hidden authorized tools; sticky working
@@ -142,3 +146,6 @@ Mid-turn / per-round catalog mutation; schema projection; `tool_search`
 activation of hidden tools; sticky working set; `ToolReach` plumbing; MCP
 `mcp_search`; event-gating RecoveryOnly on artifact existence. The *seams* are
 reserved (classes, config field `supports_dynamic_catalog`) but not wired.
+
+Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock |
+Time: 10:57 EDT | Date: 2026-08-13

@@ -2081,6 +2081,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // the deliverable, and pressuring a model answering a question is how the
     // "I'm genuinely finished" defense loop (#1158) gets seeded.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
+    // The exec-denial ground-truth retry trusts the harness-validated Act
+    // disposition. The generic narration nudges keep their narrower
+    // leading-verb classifier, but a compound action question must not disable
+    // the capability-wall correction merely because prose precedes its verb.
+    let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
         tenacity: crate::tenacity::effective_tenacity(),
@@ -2818,7 +2823,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             content,
                             &tools,
                             run_command_denial_observed,
-                            action_turn,
+                            exec_grounding_turn,
                             unverified_exec_blocker_nudges,
                             round + 1 < current_tool_round_limit,
                         ) {
@@ -5827,6 +5832,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         &std::collections::BTreeSet::new(),
         estimation,
     );
+    // The endpoint speaks the OpenAI function-tool wire even when the serving
+    // model is hosted behind vLLM/LiteLLM/NIM. Enforce that wire's 128-function
+    // envelope after authorization + exposure, keeping Kernel tools ahead of
+    // optional MCP schemas. Omitted tools remain dispatch-authorized and
+    // listable through tool_search; dynamic schema activation is separate.
+    let tools = crate::agentic::tools::select_openai_compatible_tools(tools);
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
@@ -5866,6 +5877,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: same intent gate as the primary loop — see the comment there.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
+    let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
         tenacity: crate::tenacity::effective_tenacity(),
@@ -6581,7 +6593,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 &content,
                 &tools,
                 run_command_denial_observed,
-                action_turn,
+                exec_grounding_turn,
                 unverified_exec_blocker_nudges,
                 round + 1 < current_tool_round_limit,
             ) {
@@ -7868,6 +7880,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: same intent gate as the primary loop.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
+    let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
         tenacity: crate::tenacity::effective_tenacity(),
@@ -8535,7 +8548,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 &content,
                 &tools,
                 run_command_denial_observed,
-                action_turn,
+                exec_grounding_turn,
                 unverified_exec_blocker_nudges,
                 round + 1 < current_tool_round_limit,
             ) {
@@ -9400,9 +9413,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     } else {
         prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
     }
-    let action_turn = action_nudges
-        && prompt_disposition == PromptDisposition::Act
-        && crate::classifiers::user_turn_invites_action(prompt_context.active_text());
+    let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
         mcp,
@@ -9469,6 +9480,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &std::collections::BTreeSet::new(),
         estimation,
     );
+    let tools_chat = crate::agentic::tools::select_openai_compatible_tools(tools_chat);
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
     let cal = sanitize_estimate_ratio(estimate_ratio);
@@ -9762,7 +9774,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &text,
                 &tools_chat,
                 run_command_denial_observed,
-                action_turn && tools_supported,
+                exec_grounding_turn && tools_supported,
                 unverified_exec_blocker_nudges,
                 round + 1 < max_tool_rounds,
             ) {

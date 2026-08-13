@@ -7795,9 +7795,12 @@ fn mouse_capable_for(
 }
 
 /// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
-/// Defaults to 25 when there's no `[tui]` table or no config file.
+/// Uses the canonical core default when there's no `[tui]` table or config file.
 fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
-    cfg.tui.as_ref().map(|t| t.max_tool_rounds).unwrap_or(25)
+    cfg.tui
+        .as_ref()
+        .map(|t| t.max_tool_rounds)
+        .unwrap_or_else(|| newt_core::TuiConfig::default().max_tool_rounds)
 }
 
 /// Additional progress-aware tool-call rounds after `[tui].max_tool_rounds`.
@@ -8672,14 +8675,14 @@ fn context_stats_text(
 /// Mid-loop message-trim threshold from `[tui].mid_loop_trim_threshold` (default 40).
 ///
 /// Clamped to `max_tool_rounds - 3` so the safety valve always fires before the
-/// round ceiling — even when the config has threshold > max_rounds (e.g. default
-/// threshold=40 with max_rounds=25 meant trimming never triggered).
+/// round ceiling. With both canonical defaults at 40, trimming starts at round
+/// 37 instead of colliding with the ceiling.
 fn mid_loop_trim_threshold(cfg: &newt_core::Config) -> usize {
     let threshold = cfg
         .tui
         .as_ref()
         .map(|t| t.mid_loop_trim_threshold)
-        .unwrap_or(40);
+        .unwrap_or_else(|| newt_core::TuiConfig::default().mid_loop_trim_threshold);
     threshold.min(max_tool_rounds(cfg).saturating_sub(3))
 }
 

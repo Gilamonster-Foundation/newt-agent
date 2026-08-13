@@ -654,6 +654,15 @@ impl Default for DispositionLexicon {
                 "build",
                 "run ",
                 "execute",
+                // A quoted command after `test` is an execution request even
+                // when phrased as a question. Keep this narrower than bare
+                // `test ` so "explain how the test harness works" remains an
+                // Explain deliverable.
+                // Leading space is a word boundary. `infer_disposition_with`
+                // pads the prompt so these also match at byte zero, without
+                // widening `latest \"release\"` or `greatest 'risk'` to Act.
+                " test \"",
+                " test '",
                 "commit",
                 "push",
                 "open a pr",
@@ -720,7 +729,10 @@ fn infer_disposition(prompt: &str) -> PromptDisposition {
 /// outright; else research; else explain; else the `?` fallback; else Act.
 fn infer_disposition_with(prompt: &str, lexicon: &DispositionLexicon) -> PromptDisposition {
     let lower = prompt.to_ascii_lowercase();
-    let hit = |needles: &[String]| needles.iter().any(|n| !n.is_empty() && lower.contains(n));
+    // Padding makes a lexicon entry with a leading-space word boundary match at
+    // the beginning of a prompt without losing that boundary inside prose.
+    let padded = format!(" {lower}");
+    let hit = |needles: &[String]| needles.iter().any(|n| !n.is_empty() && padded.contains(n));
     if hit(&lexicon.action) {
         return PromptDisposition::Act;
     }
@@ -907,6 +919,38 @@ mod tests {
         let card = intake.model_card();
         assert!(card.starts_with(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX));
         assert!(!card.contains("private parser"));
+    }
+
+    #[test]
+    fn quoted_command_test_question_is_an_action_turn() {
+        // Field regression (2026-08-13): the trailing `?` used to win because
+        // `test` was absent from the action lexicon. Explain then hid
+        // `run_command` even though the operator explicitly asked Newt to
+        // execute a quoted command under --yolo --full-access.
+        let prompt = "you should have a \"gh\" command ... test \"gh auth status\" now to tell me if you can use it?";
+        assert_eq!(
+            PromptIntake::analyze(prompt).disposition(),
+            PromptDisposition::Act
+        );
+
+        // Merely discussing tests remains an Explain deliverable; the narrow
+        // quoted-command needle must not turn ordinary test prose into Act.
+        assert_eq!(
+            PromptIntake::analyze("Explain how the test harness works?").disposition(),
+            PromptDisposition::Explain
+        );
+        assert_eq!(
+            PromptIntake::analyze("What is the latest \"release\"?").disposition(),
+            PromptDisposition::Explain
+        );
+        assert_eq!(
+            PromptIntake::analyze("Explain the greatest 'risk'?").disposition(),
+            PromptDisposition::Explain
+        );
+        assert_eq!(
+            PromptIntake::analyze("test \"gh auth status\" now").disposition(),
+            PromptDisposition::Act
+        );
     }
 
     #[test]
