@@ -446,9 +446,15 @@ if [ "$MODE" = "qualification" ]; then
   printf '%s\n' 'Answer briefly that the qualification preflight is complete. Do not call a tool.' \
     > "$OUT/preflight/instruction.txt"
   mkdir -p "$OUT/preflight/ws"
+  # The preflight pins the COGNITION contract; its OCAP lane is mechanically
+  # inert (the prompt forbids tool calls) but must be EXPLICIT so the recorded
+  # evidence never tracks newt's default lane — P3 flipped that default to
+  # confined, which silently turned the preflight contract to ocap=on. Pin the
+  # unconfined lane the validator expects.
   preflight_cmd=("$NEWT" --cognition contemplating --config "$PREFLIGHT_CFG" solve
     --instruction-file "$OUT/preflight/instruction.txt" --cwd "$OUT/preflight/ws"
-    --events "$OUT/preflight/events.jsonl" --non-interactive true --max-rounds 2 --plain)
+    --events "$OUT/preflight/events.jsonl" --non-interactive true --unsafe-host-exec
+    --max-rounds 2 --plain)
   preflight_cmd+=(--model-digest "$MODEL_DIGEST" --context-window "$CONTEXT_WINDOW")
   if ! env -u NEWT_TEAM NEWT_NO_MODEL_PULL=1 \
       timeout --kill-after=5s 60 "${preflight_cmd[@]}" \
