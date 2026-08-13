@@ -972,13 +972,57 @@ impl LocalGitTool {
 /// Append the `coauthor` trailer to a commit message, unless the message
 /// already carries any `Co-authored-by:` line (case-insensitive) — the user's
 /// "skip if one already present" rule. Pure, for testing.
+///
+/// The `coauthor` value carries the stable identity line(s) built at session
+/// start (`Co-authored-by:` + `Model:`). This function stamps the volatile,
+/// commit-time fields (`Harness`, `Operator`, `Time`, `Date`) so they reflect
+/// when the commit was actually created, not when the session began.
 fn sign_message(message: &str, coauthor: Option<&str>) -> String {
     match coauthor {
         Some(trailer) if !message.to_lowercase().contains("co-authored-by:") => {
-            format!("{}\n\n{trailer}", message.trim_end())
+            format!("{}\n\n{}", message.trim_end(), attribution_block(trailer))
         }
         _ => message.to_string(),
     }
+}
+
+/// The full attribution footer: the session-built `trailer` (Co-authored-by +
+/// Model line) followed by the commit-time Harness/Operator/Time/Date line.
+/// Pure given the clock + process env; reads `NEWT_BRAND_NAME` /
+/// `NEWT_OPERATOR` / `git config user.name` lazily at commit time.
+fn attribution_block(trailer: &str) -> String {
+    let harness = format!(
+        "{} v{}",
+        brand_name(),
+        newt_core::build_info::VERSION_WITH_COMMIT
+    );
+    let operator = operator_name().unwrap_or_else(|| "unknown".to_string());
+    let now = chrono::Local::now();
+    format!(
+        "{trailer}\nHarness: {harness} | Operator: {operator} | Time: {} | Date: {}",
+        now.format("%H:%M %Z"),
+        now.format("%Y-%m-%d"),
+    )
+}
+
+/// The harness/brand name — `NEWT_BRAND_NAME` so a rebrand (e.g.
+/// gilamonster-agent) stamps its own name; default `newt-agent`.
+fn brand_name() -> String {
+    std::env::var("NEWT_BRAND_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "newt-agent".to_string())
+}
+
+/// The operator name for the footer: `NEWT_OPERATOR` override, then git's
+/// `user.name`, then `GIT_AUTHOR_NAME`, then the OS username.
+fn operator_name() -> Option<String> {
+    if let Ok(v) = std::env::var("NEWT_OPERATOR") {
+        if !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    newt_core::agent_identity::default_operator()
 }
 
 impl newt_core::agentic::GitTool for LocalGitTool {
@@ -1684,14 +1728,54 @@ mod tests {
     #[test]
     fn sign_message_appends_trailer_then_dedups() {
         let tr = "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>";
-        // Plain message → trailer appended after a blank line.
+        // Plain message → attribution block appended after a blank line, and
+        // the commit-time Harness/Operator/Time/Date footer is stamped.
         let out = sign_message("docs: tweak", Some(tr));
-        assert_eq!(out, format!("docs: tweak\n\n{tr}"));
+        assert!(out.starts_with(&format!("docs: tweak\n\n{tr}")), "{out}");
+        assert!(out.contains("Harness: "), "{out}");
+        assert!(out.contains(" | Operator: "), "{out}");
+        assert!(out.contains(" | Time: "), "{out}");
+        assert!(out.contains(" | Date: "), "{out}");
         // Message already carrying a co-authored-by → left untouched (no dup).
         let already = "feat: x\n\nCo-authored-by: someone <a@b.c>";
         assert_eq!(sign_message(already, Some(tr)), already);
         // No trailer configured → message unchanged.
         assert_eq!(sign_message("m", None), "m");
+    }
+
+    #[test]
+    fn attribution_block_stamps_commit_time_footer_fields() {
+        // Grounds the mocked trailer tests: the footer carries the live
+        // harness version, an operator, and a commit-time Time/Date stamp.
+        let block = attribution_block("Co-authored-by: m <a@b.c>\nModel: m");
+        assert!(block.contains("Model: m"), "{block}");
+        assert!(
+            block.contains(&format!(
+                "Harness: newt-agent v{}",
+                newt_core::build_info::VERSION_WITH_COMMIT
+            )),
+            "default brand + real version: {block}"
+        );
+        assert!(block.contains("Operator: "), "{block}");
+        // Time is `HH:MM <zone>` and Date is `YYYY-MM-DD`. The zone token is
+        // platform-provided: a tz abbreviation (e.g. `EDT`) where the host
+        // supplies one, else a numeric offset (`-04:00`). Assert the shape,
+        // not one platform's spelling.
+        let footer = block.lines().last().unwrap();
+        let time = footer
+            .split("Time: ")
+            .nth(1)
+            .unwrap()
+            .split(" | ")
+            .next()
+            .unwrap();
+        let mut parts = time.split_whitespace();
+        let hhmm = parts.next().unwrap_or("");
+        assert_eq!(hhmm.len(), "12:34".len(), "HH:MM: {time}");
+        assert_eq!(hhmm.chars().nth(2), Some(':'), "HH:MM colon: {time}");
+        assert!(parts.next().is_some(), "a zone token follows HH:MM: {time}");
+        let date = footer.rsplit("Date: ").next().unwrap();
+        assert_eq!(date.len(), "2026-08-12".len(), "YYYY-MM-DD: {date}");
     }
 
     #[test]

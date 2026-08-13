@@ -251,6 +251,14 @@ pub struct AgentIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// The human operator running this agent, stamped into the commit
+    /// attribution footer's `Operator:` field. When unset in config it is
+    /// derived from the host git identity (`git config user.name`, then
+    /// `GIT_AUTHOR_NAME`, then the OS username) so a rebrand / unconfigured
+    /// box still records *someone*. `None` only when no source resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+
     /// Filesystem **path** to the agent's signing key PEM (tilde-expanded),
     /// the [`agent_mesh_protocol::UserKey`] that roots the §6 writer
     /// fingerprint and the mesh `AgentKey`. A **path**, never inline key
@@ -285,12 +293,35 @@ impl Default for AgentIdentity {
             name: DEFAULT_AGENT_NAME.to_string(),
             email: DEFAULT_AGENT_EMAIL.to_string(),
             model: None,
+            operator: None,
             signing_key: None,
             public_key: None,
             github_app: None,
             tokens: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// Derive the operator name from the host when config leaves it unset:
+/// `git config user.name` (the human's own git identity), then the
+/// `GIT_AUTHOR_NAME` env var, then the OS username. Returns `None` when no
+/// source resolves. Never fails — attribution degrades to omitting the field.
+pub fn default_operator() -> Option<String> {
+    let from_git = std::process::Command::new("git")
+        .args(["config", "--get", "user.name"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    from_git
+        .or_else(|| {
+            std::env::var("GIT_AUTHOR_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| std::env::var("USER").ok().filter(|s| !s.is_empty()))
 }
 
 /// Which layer an [`AgentIdentity`] resolved from. Surfaced by
@@ -492,6 +523,14 @@ impl AgentIdentity {
     #[must_use]
     pub fn git_author(&self) -> (String, String) {
         (self.name.clone(), self.email.clone())
+    }
+
+    /// The human operator name for the commit attribution footer's
+    /// `Operator:` field. Config wins; otherwise derived from the host git
+    /// identity so an unconfigured box still records *someone*.
+    #[must_use]
+    pub fn operator_name(&self) -> Option<String> {
+        self.operator.clone().or_else(default_operator)
     }
 
     /// A `Co-Authored-By:` trailer line for commit messages.

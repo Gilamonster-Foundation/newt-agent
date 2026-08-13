@@ -900,7 +900,15 @@ fn scan_cli_exec_grants() -> Vec<String> {
 /// credits which model did the work; the email attributes the credit to the
 /// configured harness account. Always well-formed; the model can't fake it.
 fn coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> String {
-    format!("Co-authored-by: {model} <{}>", identity.email)
+    // The `Model:` line pairs with the commit-time Harness/Operator/Time/Date
+    // fields stamped by newt-git's `sign_message`, forming the full footer:
+    //   Co-authored-by: <model> <email>
+    //   Model: <model>
+    //   Harness: <brand> v<ver> | Operator: <op> | Time: <t> | Date: <d>
+    format!(
+        "Co-authored-by: {model} <{}>\nModel: {model}",
+        identity.email
+    )
 }
 
 fn runtime_authority_note() -> Option<&'static str> {

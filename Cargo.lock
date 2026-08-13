@@ -4353,6 +4353,7 @@ dependencies = [
 name = "newt-git"
 version = "0.8.0"
 dependencies = [
+ "chrono",
  "grit-lib",
  "newt-core",
  "serde",
