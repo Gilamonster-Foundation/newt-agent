@@ -1188,17 +1188,25 @@ pub(crate) fn run_chat(
     //  - otherwise (footer OFF via `-n` / `--plain` / `NEWT_FOOTER=off`, piped /
     //    headless, or a non-`rich-tui` build) → the dead-simple LEAN crossterm
     //    text box (issue #527), the flight/wyvern morphology.
+    // #1640: remember which morphology we chose. Only the RICH surface has an
+    // interactive spill viewport, so only it should collapse committed tool
+    // output into a truncated excerpt; the LEAN surface shows the whole thing
+    // (see `committed_spill_lines`).
+    let surface_is_rich;
     let mut surface: Box<dyn InputSurface> = {
         #[cfg(feature = "rich-tui")]
         {
             if footer_on && io::stdout().is_terminal() {
+                surface_is_rich = true;
                 Box::new(rich_input::RichSurface::new(history_path)?)
             } else {
+                surface_is_rich = false;
                 Box::new(lean_input::LeanSurface::new(history_path)?)
             }
         }
         #[cfg(not(feature = "rich-tui"))]
         {
+            surface_is_rich = false;
             Box::new(lean_input::LeanSurface::new(history_path)?)
         }
     };
@@ -4975,8 +4983,14 @@ pub(crate) fn run_chat(
                         .and_then(|_| git_head_short(workspace));
                     // #1235: publish the universal tool spill-view height for
                     // this turn (process-wide knob, output_budget precedent).
-                    let resolved_spill_lines =
+                    // #1640: on the LEAN surface the committed excerpt is the
+                    // whole record (no viewport to recover hidden lines), so
+                    // `committed_spill_lines` forces it unbounded there; only the
+                    // RICH surface collapses + offers the interactive viewport.
+                    let configured_spill_lines =
                         effective_spill_lines(spill_lines(&cfg), spill_lines_override);
+                    let resolved_spill_lines =
+                        committed_spill_lines(surface_is_rich, configured_spill_lines);
                     newt_core::set_spill_lines(resolved_spill_lines);
                     #[cfg(feature = "live-spill")]
                     let live_spill = (resolved_spill_lines > 0 && live_spill_capable())

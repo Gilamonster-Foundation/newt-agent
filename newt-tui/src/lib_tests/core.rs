@@ -647,6 +647,29 @@ fn spill_override_resolves_and_reports_live_capability() {
     );
 }
 
+/// #1640: the committed tool-output excerpt is collapsed ONLY on the rich
+/// surface — the surface that can recover the hidden lines through an
+/// interactive viewport. The lean surface (the plain scroller) has no scroll
+/// region, so its excerpt is the whole record and must be shown in full.
+#[test]
+fn committed_excerpt_is_full_on_lean_and_collapsed_on_rich() {
+    const CONFIGURED: usize = 3;
+
+    // Rich keeps the configured height (a viewport backs the truncation)…
+    assert_eq!(committed_spill_lines(true, CONFIGURED), CONFIGURED);
+    // …and honours an explicit /spill 0 (unbounded) unchanged.
+    assert_eq!(committed_spill_lines(true, 0), 0);
+
+    // Lean is ALWAYS unbounded regardless of the configured height — there is
+    // no scrollable region on the plain scroller (#1640), so a "▲ N more lines
+    // above · /spill N" excerpt would hide output the surface cannot reveal.
+    // 0 is `spill_view_lines`' existing "print every line" contract (proven in
+    // newt-core's own display tests), so lean reuses that path unchanged.
+    assert_eq!(committed_spill_lines(false, CONFIGURED), 0);
+    assert_eq!(committed_spill_lines(false, 42), 0);
+    assert_eq!(committed_spill_lines(false, 0), 0);
+}
+
 /// #1412: every refusal reason reaches the operator, and zero rows is reported
 /// as a config choice rather than a broken terminal.
 #[test]

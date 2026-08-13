@@ -7553,6 +7553,26 @@ fn effective_spill_lines(configured: usize, session_override: Option<usize>) -> 
     session_override.unwrap_or(configured)
 }
 
+/// #1640: how many rows the *committed* tool-output excerpt keeps for THIS
+/// surface. The excerpt is only worth truncating when there is an interactive
+/// viewport to recover the hidden lines — i.e. the RICH surface. The LEAN
+/// surface (`--plain` / `-n` / piped / headless / a non-`rich-tui` build) has
+/// no scrollable regions at all (decision: the plain scroller), so its excerpt
+/// IS the whole durable record and must be shown in full. Collapsing it there
+/// only hides output behind a `/spill N` re-render the lean surface cannot even
+/// scroll — the exact regression #1640 reports.
+///
+/// So: pass the configured height through on rich; force `0` (unbounded) on
+/// lean. `0` is `spill_view_lines`' existing "print every line" contract, so no
+/// new code path is introduced — this only chooses the argument.
+fn committed_spill_lines(surface_is_rich: bool, configured: usize) -> usize {
+    if surface_is_rich {
+        configured
+    } else {
+        0
+    }
+}
+
 /// #1434: `--trace` SEEDS the session detail knob instead of sitting beside it.
 ///
 /// newt already has a session-wide detail level — `SPILL_LINES`, config-seeded
