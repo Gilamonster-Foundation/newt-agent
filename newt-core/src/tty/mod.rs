@@ -58,7 +58,7 @@ pub use modal::{
     modal_prompt_controls, read_prompt_window_line, ControlReader, PromptControlReader, PromptLine,
     MODAL_CONTROL_HINT,
 };
-pub use spinner::{with_spinner, Spinner};
+pub use spinner::{interrupt_pending, set_interrupt_pending, with_spinner, Spinner};
 pub use widgets::{Action, Level, Notice, Question};
 pub use width::{ch_width, str_width, wrap_line};
 

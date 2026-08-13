@@ -33,6 +33,42 @@ use super::{fit_line, format_spinner, term_cols, FADE_CT};
 /// odd one out, so this is the smallest visual delta available.
 const TICK: Duration = Duration::from_millis(100);
 
+/// Process-wide "the user asked to interrupt" signal.
+///
+/// Set by the TUI's keyboard watcher the moment Esc/Ctrl-C trips the graceful
+/// cancel flag, cleared when the turn ends. The spinner reads it on every
+/// frame and swaps its stage label for [`INTERRUPT_LABEL`], so the press is
+/// acknowledged on screen within one tick (~100 ms) — through the line the
+/// spinner already owns, never a second terminal writer (the #1312 rule).
+/// Without this, a graceful cancel is invisible until the turn reaches its
+/// next checkpoint and the whole TUI reads as hung.
+static INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// The acknowledgment label shown in place of the stage label while an
+/// interrupt is pending.
+pub const INTERRUPT_LABEL: &str = "interrupting… (press Ctrl-C again to force)";
+
+/// Flag/clear the pending-interrupt acknowledgment. The TUI watcher sets it on
+/// the first Esc/Ctrl-C; the turn wrapper clears it when the turn hands back.
+pub fn set_interrupt_pending(on: bool) {
+    INTERRUPT_PENDING.store(on, Ordering::SeqCst);
+}
+
+/// Whether an interrupt acknowledgment is currently pending.
+pub fn interrupt_pending() -> bool {
+    INTERRUPT_PENDING.load(Ordering::SeqCst)
+}
+
+/// The stage label a frame should actually show: the caller's label normally,
+/// the interrupt acknowledgment while a cancel is pending. Pure for testing.
+fn effective_label(label: &str, interrupted: bool) -> &str {
+    if interrupted {
+        INTERRUPT_LABEL
+    } else {
+        label
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -59,13 +95,15 @@ impl SpinnerState {
         if self.finished.load(Ordering::SeqCst) {
             return;
         }
+        let label = self
+            .label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let line = format_spinner(
             self.frame.load(Ordering::SeqCst),
             self.start.elapsed().as_secs_f32(),
-            &self
-                .label
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            effective_label(&label, interrupt_pending()),
             self.chars.load(Ordering::SeqCst),
         );
         let fitted = fit_line(&line, term_cols());
@@ -320,6 +358,24 @@ pub async fn with_spinner<F: std::future::Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pending interrupt swaps the stage label for the acknowledgment; the
+    /// caller's own label is untouched and returns when the flag clears.
+    #[test]
+    fn a_pending_interrupt_overrides_the_stage_label() {
+        assert_eq!(effective_label("thinking…", false), "thinking…");
+        assert_eq!(effective_label("thinking…", true), INTERRUPT_LABEL);
+    }
+
+    /// The process-wide flag round-trips and clears (serial: global state).
+    #[serial_test::serial(interrupt_pending)]
+    #[test]
+    fn interrupt_pending_flag_sets_and_clears() {
+        set_interrupt_pending(true);
+        assert!(interrupt_pending());
+        set_interrupt_pending(false);
+        assert!(!interrupt_pending());
+    }
 
     /// The gate is honored end to end: no capability ⇒ no spinner object at
     /// all, so a caller cannot accidentally emit a byte.
