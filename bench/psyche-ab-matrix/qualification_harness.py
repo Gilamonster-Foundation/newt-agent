@@ -36,6 +36,11 @@ REASONING_REPLAY_MARKER = "NEWT_QUALIFICATION_REASONING_REPLAY_MARKER_v1"
 PREFLIGHT_PROMPT = (
     "Answer briefly that the qualification preflight is complete. Do not call a tool."
 )
+# Newt's prompt-provenance system card (newt-core prompt_read.rs): the protected
+# active-prompt pair is a metadata system card with this prefix followed by the
+# exact operator text, kept as a compression-proof recovery copy in addition to
+# the live tail user turn.
+ACTIVE_PROMPT_CARD_PREFIX = "[NEWT ACTIVE PROMPT"
 TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 
 
@@ -168,18 +173,44 @@ def first_request_errors(request: dict[str, Any], requested_model: Any) -> list[
     """Return every initial Nemotron request-policy mismatch."""
     errors = _request_policy_errors(request, requested_model)
     messages = request.get("messages")
-    prompt_count = (
-        sum(
-            isinstance(message, dict)
+    prompt_indexes = (
+        [
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message, dict)
             and message.get("role") == "user"
             and message.get("content") == PREFLIGHT_PROMPT
-            for message in messages
-        )
+        ]
         if isinstance(messages, list)
-        else 0
+        else []
     )
-    if prompt_count != 1:
-        errors.append("first request must contain exactly the qualification user prompt")
+
+    # Newt sends the operator prompt as the live TAIL user turn. Since the
+    # prompt-provenance card landed on main (prompt_read.rs: the protected
+    # active-prompt pair), the identical text legitimately appears at most ONE
+    # extra time — the compression-proof recovery copy immediately after the
+    # "[NEWT ACTIVE PROMPT …]" system card. Anything else — no tail copy, a
+    # duplicate without its card, or more than two copies — is a policy break.
+    def is_recovery_copy(index: int) -> bool:
+        if index == 0:
+            return False
+        previous = messages[index - 1]
+        return (
+            isinstance(previous, dict)
+            and previous.get("role") == "system"
+            and str(previous.get("content", "")).startswith(ACTIVE_PROMPT_CARD_PREFIX)
+        )
+
+    tail_is_prompt = bool(prompt_indexes) and prompt_indexes[-1] == len(messages) - 1
+    shape_ok = tail_is_prompt and (
+        len(prompt_indexes) == 1
+        or (len(prompt_indexes) == 2 and is_recovery_copy(prompt_indexes[0]))
+    )
+    if not shape_ok:
+        errors.append(
+            "first request must carry the qualification user prompt as the live tail "
+            "turn, plus at most one card-adjacent recovery copy"
+        )
     if _contains_replay_marker(messages):
         errors.append("first request must not contain the reasoning replay marker")
     return errors

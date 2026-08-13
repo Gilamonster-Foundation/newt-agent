@@ -182,10 +182,58 @@ class EvidenceCaptureTests(unittest.TestCase):
         self.assertEqual(first_request_errors(first, model), [])
         self.assertEqual(second_request_errors(second, model, first), [])
 
+        # Newt's prompt-provenance shape (prompt_read.rs): the exact operator
+        # text appears once as the compression-proof recovery copy right after
+        # the [NEWT ACTIVE PROMPT …] system card AND once as the live tail
+        # turn. That intended duplication is valid evidence.
+        card_pair = {
+            **first,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "[NEWT ACTIVE PROMPT v1]\naddress: prompt:fixture",
+                },
+                {"role": "user", "content": PREFLIGHT_PROMPT},
+                {"role": "user", "content": PREFLIGHT_PROMPT},
+            ],
+        }
+        self.assertEqual(
+            first_request_errors(card_pair, model),
+            [],
+            "card-adjacent recovery copy + live tail turn is Newt's intended shape",
+        )
+
         mutations = {
             "wrong prompt": {
                 **first,
                 "messages": [{"role": "user", "content": "some other task"}],
+            },
+            "duplicate without its provenance card": {
+                **first,
+                "messages": [
+                    {"role": "system", "content": "fixture system"},
+                    {"role": "user", "content": PREFLIGHT_PROMPT},
+                    {"role": "user", "content": PREFLIGHT_PROMPT},
+                ],
+            },
+            "three copies of the prompt": {
+                **first,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "[NEWT ACTIVE PROMPT v1]\naddress: prompt:fixture",
+                    },
+                    {"role": "user", "content": PREFLIGHT_PROMPT},
+                    {"role": "user", "content": PREFLIGHT_PROMPT},
+                    {"role": "user", "content": PREFLIGHT_PROMPT},
+                ],
+            },
+            "prompt not the live tail turn": {
+                **first,
+                "messages": [
+                    {"role": "user", "content": PREFLIGHT_PROMPT},
+                    {"role": "user", "content": "a later unrelated turn"},
+                ],
             },
             "marker in first": {
                 **first,
