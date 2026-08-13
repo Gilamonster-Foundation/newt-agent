@@ -2648,18 +2648,18 @@ fn random_state() -> anyhow::Result<String> {
 
 fn open_browser(url: &str) -> std::io::Result<std::process::Child> {
     #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
+    let (program, prefix_args): (&str, &[&str]) = ("open", &[]);
     #[cfg(target_os = "linux")]
-    let mut command = std::process::Command::new("xdg-open");
+    let (program, prefix_args): (&str, &[&str]) = ("xdg-open", &[]);
     #[cfg(windows)]
-    let mut command = {
-        let mut command = std::process::Command::new("rundll32");
-        command.arg("url.dll,FileProtocolHandler");
-        command
-    };
+    let (program, prefix_args): (&str, &[&str]) = ("rundll32", &["url.dll,FileProtocolHandler"]);
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    let mut command = std::process::Command::new("xdg-open");
-    command.arg(url).spawn()
+    let (program, prefix_args): (&str, &[&str]) = ("xdg-open", &[]);
+
+    std::process::Command::new(program)
+        .args(prefix_args)
+        .arg(url)
+        .spawn()
 }
 
 struct CallbackTarget {
