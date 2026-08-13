@@ -35,10 +35,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Release publication is impossible until setup's cross-platform,
+  # real-process acceptance contract passes. The same reusable workflow also
+  # runs weekly and on demand without publishing anything.
+  setup-acceptance:
+    uses: ./.github/workflows/setup-acceptance.yml
+    permissions:
+      contents: read
+
   # ── Build cross-platform binaries ──────────────────────────────────────
 
   build-binaries:
     name: Build (${{ matrix.label }})
+    needs: [setup-acceptance]
     strategy:
       fail-fast: false
       matrix:
@@ -520,6 +529,7 @@ jobs:
 
   build-wheels:
     name: Build wheel (${{ matrix.os }})
+    needs: [setup-acceptance]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -556,6 +566,7 @@ jobs:
 
   build-sdist:
     name: Build sdist
+    needs: [setup-acceptance]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -623,3 +634,5 @@ jobs:
           # account-scoped API token, so attestations MUST be disabled here.
           attestations: false
           skip-existing: true
+
+# Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 17:39 EDT | Date: 2026-08-12

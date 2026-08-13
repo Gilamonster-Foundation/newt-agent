@@ -10,6 +10,8 @@
 //! own models, endpoints, rules, and local stdio MCP services without copying
 //! the whole global config. See [`Config::resolve`] and issue #222.
 
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 18:33 EDT | Date: 2026-08-12
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -3395,14 +3397,29 @@ pub fn write_backend_dropin(
     config_path: &std::path::Path,
     backend: &BackendConfig,
 ) -> std::result::Result<std::path::PathBuf, String> {
+    let config_destination = crate::atomic_fs::ResolvedPath::resolve(config_path)
+        .map_err(|error| format!("resolve config destination: {error:#}"))?;
+    let _lock = crate::atomic_fs::acquire_lock(&config_destination.lock_path())
+        .map_err(|error| format!("lock {}: {error:#}", config_path.display()))?;
+    write_backend_dropin_unlocked(config_path, backend)
+}
+
+fn write_backend_dropin_unlocked(
+    config_path: &std::path::Path,
+    backend: &BackendConfig,
+) -> std::result::Result<std::path::PathBuf, String> {
     if backend.name.trim().is_empty() {
         return Err("backend drop-in needs a name (it becomes the filename)".into());
     }
     let dir = config_path.with_file_name("backends");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let path = dir.join(format!("{}.toml", backend.name));
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path)
+        .map_err(|e| format!("resolve {}: {e:#}", path.display()))?;
     let body = toml::to_string(backend).map_err(|e| format!("serialize backend: {e}"))?;
-    std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+    destination
+        .atomic_write(body.as_bytes())
+        .map_err(|e| format!("write {}: {e:#}", path.display()))?;
     Ok(path)
 }
 
@@ -3423,11 +3440,17 @@ pub fn writeback_probed_backend(
     let Some(config_path) = Config::user_config_path() else {
         return Ok(None);
     };
+    let config_destination = crate::atomic_fs::ResolvedPath::resolve(&config_path)
+        .map_err(|error| format!("resolve config destination: {error:#}"))?;
+    let _lock = crate::atomic_fs::acquire_lock(&config_destination.lock_path())
+        .map_err(|error| format!("lock {}: {error:#}", config_path.display()))?;
     let dir = config_path.with_file_name("backends");
     let path = dir.join(format!("{}.toml", patch.name));
-    let mut merged = if path.is_file() {
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path)
+        .map_err(|e| format!("resolve {}: {e:#}", path.display()))?;
+    let mut merged = if destination.as_path().is_file() {
+        let text = std::fs::read_to_string(destination.as_path())
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
         toml::from_str::<BackendConfig>(&text)
             .map_err(|e| format!("parse {}: {e}", path.display()))?
     } else {
@@ -3471,7 +3494,11 @@ pub fn writeback_probed_backend(
             .map(|_| true)
             .or_else(|| merged.provenance.as_ref().and_then(|p| p.derived_serving)),
     });
-    write_backend_dropin(&config_path, &merged).map(Some)
+    let body = toml::to_string(&merged).map_err(|e| format!("serialize backend: {e}"))?;
+    destination
+        .atomic_write(body.as_bytes())
+        .map_err(|e| format!("write {}: {e:#}", path.display()))?;
+    Ok(Some(path))
 }
 
 /// The last-resort localhost Ollama backend: used both as `Config::default()`'s
@@ -4331,8 +4358,18 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
         }
+        let destination = crate::atomic_fs::ResolvedPath::resolve(path).map_err(|error| {
+            NewtError::Config(format!(
+                "resolve config destination for {}: {error:#}",
+                path.display()
+            ))
+        })?;
+        let _lock = crate::atomic_fs::acquire_lock(&destination.lock_path())
+            .map_err(|error| NewtError::Config(format!("lock {}: {error:#}", path.display())))?;
         let text = toml::to_string_pretty(self).map_err(|e| NewtError::Config(e.to_string()))?;
-        std::fs::write(path, text).map_err(NewtError::Io)
+        destination
+            .atomic_write(text.as_bytes())
+            .map_err(|error| NewtError::Config(format!("write {}: {error:#}", path.display())))
     }
 
     /// The confined leash MCP *probe* children run under — shared by
@@ -4534,12 +4571,26 @@ impl Config {
     /// A missing file is treated as empty (the table is created). Creates parent
     /// dirs as needed. Used by the interactive gate's "allow permanently" choice.
     pub fn append_permission_net_host(path: &Path, host: &str) -> Result<()> {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let updated = Self::with_net_host(&text, host)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
         }
-        std::fs::write(path, updated).map_err(NewtError::Io)
+        let destination = crate::atomic_fs::ResolvedPath::resolve(path).map_err(|error| {
+            NewtError::Config(format!(
+                "resolve config destination for {}: {error:#}",
+                path.display()
+            ))
+        })?;
+        let _lock = crate::atomic_fs::acquire_lock(&destination.lock_path())
+            .map_err(|error| NewtError::Config(format!("lock {}: {error:#}", path.display())))?;
+        let text = match std::fs::read_to_string(destination.as_path()) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(NewtError::Io(error)),
+        };
+        let updated = Self::with_net_host(&text, host)?;
+        destination
+            .atomic_write(updated.as_bytes())
+            .map_err(|error| NewtError::Config(format!("write {}: {error:#}", path.display())))
     }
 
     /// Build the ordered list of candidate config file paths.

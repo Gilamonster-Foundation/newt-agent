@@ -1,4 +1,5 @@
 //! SQLite-backed conversation store — Phase 17.1a/17.1b (issue #246).
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 18:33 EDT | Date: 2026-08-12
 //!
 //! The only conversation backend: the same public API the JSON-file store
 //! established (`create` / `create_with_id` / `exists` / `append_turn` /
@@ -3990,7 +3991,7 @@ fn system_liveness(owner: &StoredOwner, now: i64) -> bool {
 /// performs the existence + permission check: `0` = alive; `EPERM` = alive but
 /// owned by another user (still alive); `ESRCH` = gone.
 #[cfg(unix)]
-fn pid_is_alive(pid: i64) -> bool {
+pub(crate) fn pid_is_alive(pid: i64) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -4002,16 +4003,37 @@ fn pid_is_alive(pid: i64) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Windows analogue of the `kill(pid, 0)` probe above: `OpenProcess` with the
-/// lightest query right performs the same "does this pid exist" check without
-/// acting on the process. A live pid opens; a dead/reused pid fails with
-/// `ERROR_INVALID_PARAMETER`. `ERROR_ACCESS_DENIED` also means alive — the
-/// process exists but this process lacks rights to query it, the Windows
-/// analogue of the Unix `EPERM` case above.
+#[cfg(any(windows, test))]
+fn wait_probe_reports_live_or_unknown(result: u32, wait_object_0: u32) -> bool {
+    // Reclamation must fail closed. Only a signalled process handle proves the
+    // process exited; timeout means live, while WAIT_FAILED/unknown means the
+    // probe could not establish death.
+    result != wait_object_0
+}
+
+#[cfg(any(windows, test))]
+fn open_process_failure_reports_live_or_unknown(
+    raw_error: Option<i32>,
+    error_invalid_parameter: i32,
+) -> bool {
+    // `ERROR_INVALID_PARAMETER` is Windows' absent-pid result. Every other
+    // failure is inconclusive and must block stale-lock reclamation.
+    raw_error != Some(error_invalid_parameter)
+}
+
+/// Windows analogue of the `kill(pid, 0)` probe above. `OpenProcess` obtains a
+/// query handle, but a retained handle can still refer to an exited process, so
+/// only a signalled zero-time wait proves exit. Timeout means live; an unknown
+/// wait result fails closed as potentially live rather than permitting reclaim.
+/// Only `ERROR_INVALID_PARAMETER` proves the pid absent when opening fails;
+/// access denial and every unknown/transient failure remain potentially live.
 #[cfg(windows)]
-fn pid_is_alive(pid: i64) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+pub(crate) fn pid_is_alive(pid: i64) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     let Ok(pid) = u32::try_from(pid) else {
         return false;
@@ -4021,14 +4043,20 @@ fn pid_is_alive(pid: i64) -> bool {
     }
     // SAFETY: `OpenProcess` only queries a handle; it takes no action on the
     // target process.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
     if handle.is_null() {
-        return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+        return open_process_failure_reports_live_or_unknown(
+            std::io::Error::last_os_error().raw_os_error(),
+            ERROR_INVALID_PARAMETER as i32,
+        );
     }
-    // SAFETY: `handle` was just returned by the successful `OpenProcess` call
-    // above and is not used again after this call.
+    // SAFETY: `handle` is a valid process handle and the zero timeout makes
+    // this a non-blocking state probe.
+    let wait_result = unsafe { WaitForSingleObject(handle, 0) };
+    let running = wait_probe_reports_live_or_unknown(wait_result, WAIT_OBJECT_0);
+    // SAFETY: `handle` was returned by `OpenProcess` and is not used again.
     unsafe { CloseHandle(handle) };
-    true
+    running
 }
 
 /// This machine's `(hostname, kernel boot id)`. Both come from `/proc` (Linux —
@@ -4099,6 +4127,53 @@ fn validate_record_id(id: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_wait_decision_only_treats_signalled_as_exited() {
+        const WAIT_OBJECT_0_FIXTURE: u32 = 0;
+        const WAIT_TIMEOUT_FIXTURE: u32 = 258;
+        const WAIT_FAILED_FIXTURE: u32 = u32::MAX;
+
+        assert!(wait_probe_reports_live_or_unknown(
+            WAIT_TIMEOUT_FIXTURE,
+            WAIT_OBJECT_0_FIXTURE
+        ));
+        assert!(!wait_probe_reports_live_or_unknown(
+            WAIT_OBJECT_0_FIXTURE,
+            WAIT_OBJECT_0_FIXTURE
+        ));
+        assert!(wait_probe_reports_live_or_unknown(
+            WAIT_FAILED_FIXTURE,
+            WAIT_OBJECT_0_FIXTURE
+        ));
+        assert!(wait_probe_reports_live_or_unknown(
+            123_456,
+            WAIT_OBJECT_0_FIXTURE
+        ));
+    }
+
+    #[test]
+    fn windows_open_failure_only_treats_invalid_parameter_as_absent() {
+        const ERROR_ACCESS_DENIED_FIXTURE: i32 = 5;
+        const ERROR_INVALID_PARAMETER_FIXTURE: i32 = 87;
+
+        assert!(!open_process_failure_reports_live_or_unknown(
+            Some(ERROR_INVALID_PARAMETER_FIXTURE),
+            ERROR_INVALID_PARAMETER_FIXTURE
+        ));
+        assert!(open_process_failure_reports_live_or_unknown(
+            Some(ERROR_ACCESS_DENIED_FIXTURE),
+            ERROR_INVALID_PARAMETER_FIXTURE
+        ));
+        assert!(open_process_failure_reports_live_or_unknown(
+            Some(1_234_567),
+            ERROR_INVALID_PARAMETER_FIXTURE
+        ));
+        assert!(open_process_failure_reports_live_or_unknown(
+            None,
+            ERROR_INVALID_PARAMETER_FIXTURE
+        ));
+    }
 
     fn insert_prompt_lineage_for_test(
         store: &ConversationStore,
