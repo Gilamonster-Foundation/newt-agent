@@ -629,7 +629,12 @@ for posture in "${POSTURE_LIST[@]}"; do
           cmd+=(--confined)
           env_args+=(NEWT_BENCH_OCAP=on)
         else
-          cmd+=(--non-interactive true)
+          # P3 lane semantics: `--non-interactive` controls INTERACTION only —
+          # a plain `newt solve` is now CONFINED by default, and the unconfined
+          # lane requires the explicit opt-in. Without it the "off" lane
+          # silently runs confined and the solve contract records ocap=on,
+          # which validate-run.py rightly rejects as dishonest lane evidence.
+          cmd+=(--non-interactive true --unsafe-host-exec)
         fi
         [ -z "$MODEL_DIGEST" ] || cmd+=(--model-digest "$MODEL_DIGEST")
         [ -z "$CONTEXT_WINDOW" ] || cmd+=(--context-window "$CONTEXT_WINDOW")
