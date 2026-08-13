@@ -1,0 +1,1 @@
+In the file notes.md, fix the typo: change the word "teh" to "the". Then stop.
