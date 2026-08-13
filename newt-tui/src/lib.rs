@@ -9452,6 +9452,82 @@ mod interrupt_tests {
         assert_eq!(decoder.feed(b"\r"), [TurnKey::ToggleExpanded]);
     }
 
+    /// A stale leaked flag is healed on ENTRY — including on the watcherless
+    /// (`enabled == false`) path, which has no other opportunity to clear it.
+    #[serial_test::serial(interrupt_pending)]
+    #[test]
+    fn a_stale_interrupt_flag_is_cleared_on_entry() {
+        use std::sync::atomic::AtomicBool;
+        newt_core::tty::set_interrupt_pending(true);
+        let cancel = AtomicBool::new(false);
+        let hard = AtomicBool::new(false);
+        let ran = super::with_interrupt_watch(false, &cancel, &hard, || {
+            assert!(
+                !newt_core::tty::interrupt_pending(),
+                "cleared before the turn body runs"
+            );
+            42
+        });
+        assert_eq!(ran, 42);
+        assert!(!newt_core::tty::interrupt_pending());
+    }
+
+    /// The first Ctrl-C both trips the graceful cancel AND raises the
+    /// process-wide acknowledgment flag the spinner reads — the press is
+    /// visible on screen within a frame instead of feeling ignored.
+    #[serial_test::serial(prompt_stdin, interrupt_pending)]
+    #[test]
+    fn first_ctrl_c_raises_the_interrupt_acknowledgment() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        newt_core::tty::set_interrupt_pending(false);
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let cancel = AtomicBool::new(false);
+        let hard = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                watch_for_interrupt_fd(
+                    pipe[0],
+                    &cancel,
+                    &hard,
+                    &stop,
+                    None,
+                    newt_core::EditMode::Nano,
+                    false,
+                    10,
+                    100,
+                );
+            });
+            assert_eq!(
+                unsafe { libc::write(pipe[1], [0x03u8].as_ptr().cast(), 1) },
+                1
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !cancel.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(unsafe { libc::write(pipe[1], b"x".as_ptr().cast(), 1) }, 1);
+        });
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert!(cancel.load(Ordering::Relaxed), "graceful cancel tripped");
+        assert!(
+            !hard.load(Ordering::Relaxed),
+            "one press is never a force-stop"
+        );
+        assert!(
+            newt_core::tty::interrupt_pending(),
+            "the acknowledgment flag is raised for the spinner"
+        );
+        newt_core::tty::set_interrupt_pending(false);
+    }
+
     #[serial_test::serial(prompt_stdin)]
     #[test]
     fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
@@ -9563,12 +9639,27 @@ pub(crate) fn with_live_spill_watch<T>(
     spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
 ) -> T {
-    use std::sync::atomic::Ordering;
+    // A new turn can never legitimately begin with an interrupt already
+    // pending. Clearing on ENTRY (before any early return) also heals a flag a
+    // previous turn leaked through a path that could not clear — e.g. a
+    // watcherless turn after cbreak starts failing.
+    newt_core::tty::set_interrupt_pending(false);
     if !enabled {
         return f();
     }
-    let Ok(_cbreak) = CbreakGuard::enter() else {
-        return f();
+    let _cbreak = match CbreakGuard::enter() {
+        Ok(guard) => guard,
+        Err(err) => {
+            // Losing the watcher silently is how "Esc/Ctrl-C does nothing"
+            // becomes undiagnosable — say so once, before the turn paints.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "⚠ terminal mode unavailable ({err}) — Esc/Ctrl-C cannot interrupt this session"
+                );
+            });
+            return f();
+        }
     };
     // #1303: mouse capture is turn-scoped and released on EVERY exit path. The
     // guard drops when this scope unwinds — normal return, `?`, or panic — and
@@ -9593,14 +9684,37 @@ pub(crate) fn with_live_spill_watch<T>(
     };
     #[cfg(not(feature = "live-spill"))]
     let mode = newt_core::EditMode::default();
+    // Signals the watcher to exit from Drop, so it fires on the normal return
+    // AND on a panicking `f()` — without it, a panic would skip the store and
+    // `thread::scope`'s implicit join would wait forever on a watcher whose
+    // only exit condition never arrives.
+    struct StopOnExit<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for StopOnExit<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // Clears the acknowledgment flag from Drop AFTER `thread::scope` has
+    // joined the watcher (this guard is declared before the scope, so it drops
+    // after it — on the panic path too). Clearing before the join would race
+    // the watcher's final iteration: a Ctrl-C landing right as the turn ends
+    // could re-raise the flag after the clear and stick the "interrupting…"
+    // label through the entire next turn.
+    struct ClearInterruptOnExit;
+    impl Drop for ClearInterruptOnExit {
+        fn drop(&mut self) {
+            newt_core::tty::set_interrupt_pending(false);
+        }
+    }
+    let _clear_flag = ClearInterruptOnExit;
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
+        // The watcher polls `stop` with a 100 ms timeout, so it wakes and
+        // returns promptly once the guard fires, and the scope joins it before
+        // restoring the tty.
+        let _stop_watcher = StopOnExit(&stop);
         s.spawn(|| watch_for_interrupt(cancel, hard, &stop, spill, mode, mouse));
-        let out = f();
-        // Tell the watcher to exit; it polls with a 100 ms timeout, so it wakes
-        // and returns promptly, and the scope joins it before restoring the tty.
-        stop.store(true, Ordering::Relaxed);
-        out
+        f()
     })
 }
 
@@ -9737,7 +9851,10 @@ fn watch_for_interrupt_fd(
             presses += 1;
             if presses == 1 {
                 // 1st: graceful interrupt — the turn stops at its next
-                // checkpoint and hands control back to the prompt.
+                // checkpoint and hands control back to the prompt. Acknowledge
+                // on screen immediately (the spinner swaps its label within one
+                // tick) so a graceful cancel never reads as a hang.
+                newt_core::tty::set_interrupt_pending(true);
                 cancel.store(true, Ordering::Relaxed);
             } else {
                 // 2nd+ Ctrl-C: force-stop. Repeated presses are absorbed; the
