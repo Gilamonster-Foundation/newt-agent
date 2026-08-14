@@ -328,7 +328,10 @@ fn worker_loop(
     mut sink: Box<dyn Sink>,
     wake: Receiver<()>,
 ) {
-    loop {
+    // Wait BEFORE looking at the machine. Every delivery is then caused by an
+    // event that was already applied when its wake was sent — the worker can
+    // never race the first emit and report the machine's initial state.
+    while wake.recv().is_ok() {
         // Drain everything currently outstanding, then park.
         loop {
             match next_step(&inner, &pane) {
@@ -355,13 +358,10 @@ fn worker_loop(
                 Step::Park => break,
             }
         }
-        if wake.recv().is_err() {
-            // Every sender is gone: the session ended without an orderly
-            // shutdown. Release rather than leave Herdr holding stale state.
-            let _ = sink.deliver(&protocol::release_agent(&pane));
-            return;
-        }
     }
+    // Every sender is gone: the session ended without an orderly shutdown.
+    // Release rather than leave Herdr holding stale state.
+    let _ = sink.deliver(&protocol::release_agent(&pane));
 }
 
 // ---------------------------------------------------------------------------

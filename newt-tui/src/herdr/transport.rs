@@ -27,14 +27,14 @@
 //! this file (see `super`'s bounded queue). They protect the integration's
 //! ability to recover.
 
-use std::time::Duration;
-
 use super::protocol::Call;
 
 /// How long the worker waits for a connect before giving up on this event.
-const CONNECT_WAIT: Duration = Duration::from_millis(200);
+#[cfg(unix)]
+const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 /// Socket write timeout — the bound on "Herdr stopped reading".
-const IO_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(unix)]
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Where lifecycle calls go. The adapter owns one; tests inject fakes.
 pub(crate) trait Sink: Send {
@@ -224,6 +224,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use std::time::Instant;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -239,6 +240,19 @@ mod tests {
 
     fn working() -> Call {
         report_agent("w1:p2", PaneAgentState::Working, None)
+    }
+
+    /// Deliver, retrying a cold connect. A first attempt can miss its 200 ms
+    /// deadline on a loaded runner; the sink collects that attempt on a later
+    /// call, and a failed attempt with no connection writes nothing — so a
+    /// retry cannot duplicate a frame.
+    fn deliver_eventually(sink: &mut SocketSink, call: &Call) -> bool {
+        (0..50).any(|i| {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            sink.deliver(call)
+        })
     }
 
     // Herdr absent (no socket file at all): delivery fails immediately and
@@ -285,23 +299,28 @@ mod tests {
             let (conn, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(conn);
             let mut lines = Vec::new();
-            for _ in 0..2 {
+            loop {
                 let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 {
-                    break;
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break, // client hung up
+                    Ok(_) => lines.push(line),
                 }
-                lines.push(line);
             }
             lines
         });
 
         let mut sink = SocketSink::new(path);
-        assert!(sink.deliver(&report_agent(
-            "w1:p2",
-            PaneAgentState::Working,
-            Some("read_file")
-        )));
-        assert!(sink.deliver(&report_agent("w1:p2", PaneAgentState::Idle, None)));
+        assert!(deliver_eventually(
+            &mut sink,
+            &report_agent("w1:p2", PaneAgentState::Working, Some("read_file"))
+        ));
+        // The connection is warm now, so this one must land on the first try —
+        // that is the reuse claim.
+        assert!(
+            sink.deliver(&report_agent("w1:p2", PaneAgentState::Idle, None)),
+            "a warm connection must be reused, not reconnected"
+        );
+        drop(sink); // EOF for the server
 
         let lines = server.join().unwrap();
         assert_eq!(lines.len(), 2, "both calls arrive on the same connection");
@@ -325,10 +344,15 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
             let (conn, _) = listener.accept().unwrap();
-            std::thread::sleep(Duration::from_millis(300));
+            // Stay connected and silent for longer than the test needs, so a
+            // slow cold connect cannot turn into a closed-peer race.
+            std::thread::sleep(Duration::from_millis(1500));
             drop(conn);
         });
         let mut sink = SocketSink::new(path);
+        assert!(deliver_eventually(&mut sink, &working()));
+        // Warm connection, server still silent: delivery is immediate because
+        // the reply is never awaited.
         let t0 = Instant::now();
         assert!(sink.deliver(&working()));
         assert!(
@@ -357,8 +381,9 @@ mod tests {
         let mut sink = SocketSink::new(path);
         // The first call races the hangup: the write may land in the socket
         // buffer before the peer's close is observable. What must NOT happen
-        // is a permanently poisoned sink.
-        let _ = sink.deliver(&working());
+        // is a permanently poisoned sink. (Delivered through the retry helper
+        // so the server's `accept` definitely happens and its join returns.)
+        let _ = deliver_eventually(&mut sink, &working());
         server.join().unwrap();
         assert!(
             !sink.deliver(&working()),
