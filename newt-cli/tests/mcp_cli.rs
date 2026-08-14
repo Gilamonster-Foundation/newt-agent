@@ -2499,7 +2499,7 @@ mod composed_private_mcp_uat {
         assert_eq!(persisted[0].name, "review-source");
         assert_eq!(persisted[0].url.as_deref(), Some(mcp_url.as_str()));
 
-        let discovered = newt_core::mcp::discover(&persisted, None, Some(&sb.home), &sb.cwd);
+        let discovered = newt_core::mcp::discover(persisted, None, Some(&sb.home), &sb.cwd);
         assert_eq!(discovered.len(), 1, "persisted connector wins discovery");
         assert_eq!(discovered[0].name, "review-source");
         assert_eq!(
