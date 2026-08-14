@@ -516,6 +516,7 @@ fn header_line(
     model: &str,
     endpoint: &str,
     gauge: Option<(u32, u32)>,
+    session: &str,
     active: bool,
 ) -> Line<'static> {
     let accent = Color::Rgb(255, 165, 90);
@@ -526,6 +527,14 @@ fn header_line(
         format!(" {}", editor.header_mode()),
         Style::default().fg(if active { accent } else { dim }),
     ));
+    // #1671: the session name is ALWAYS visible — a mid-luminance grey so it
+    // reads without shouting (accessibility default: no saturated darks).
+    if !session.is_empty() {
+        spans.push(Span::styled(
+            format!(" {session} ·"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
     if !model.is_empty() {
         let loc = if endpoint.is_empty() {
             model.to_string()
@@ -633,6 +642,9 @@ struct RichStatus<'a> {
     model: &'a str,
     endpoint: &'a str,
     gauge: Option<(u32, u32)>,
+    /// #1671: the conversation's display name — title, `#shortid`, or
+    /// "ephemeral". Empty hides the span (tests pin the legacy header).
+    session: &'a str,
     background_jobs: &'a [BackgroundJob],
 }
 
@@ -657,6 +669,7 @@ fn draw(
             status.model,
             status.endpoint,
             status.gauge,
+            status.session,
             !empty,
         )),
         header_area,
@@ -992,6 +1005,8 @@ pub(crate) struct RichSurface {
     gauge: Option<(u32, u32)>,
     /// Harness tasks rendered by this surface while their shared state is live.
     background_jobs: Vec<BackgroundJob>,
+    /// #1671: the session display name shown in the header, refreshed per turn.
+    session: String,
 }
 
 impl RichSurface {
@@ -1006,6 +1021,7 @@ impl RichSurface {
             endpoint: String::new(),
             gauge: None,
             background_jobs: Vec::new(),
+            session: String::new(),
         })
     }
 
@@ -1104,6 +1120,7 @@ impl RichSurface {
                         model: &self.model,
                         endpoint: &self.endpoint,
                         gauge: self.gauge,
+                        session: &self.session,
                         background_jobs: &self.background_jobs,
                     },
                 );
@@ -1242,13 +1259,21 @@ impl InputSurface for RichSurface {
         Ok(())
     }
 
-    fn set_runtime_context(&mut self, model: &str, endpoint: &str, gauge: Option<(u32, u32)>) {
+    fn set_runtime_context(
+        &mut self,
+        model: &str,
+        endpoint: &str,
+        gauge: Option<(u32, u32)>,
+        session: &str,
+    ) {
         // Refresh the status-header model @ endpoint each turn (#527) so a
         // mid-session `/model` switch shows up on the next prompt. The
-        // context-budget gauge (24.6) rides the same per-turn refresh.
+        // context-budget gauge (24.6) and the session name (#1671) ride the
+        // same per-turn refresh.
         self.model = model.to_string();
         self.endpoint = endpoint.to_string();
         self.gauge = gauge;
+        self.session = session.to_string();
     }
 
     fn set_background_jobs(&mut self, jobs: Vec<BackgroundJob>) {
@@ -1701,18 +1726,50 @@ mod tests {
     }
 
     fn header_text(editor: &Editor, model: &str, endpoint: &str) -> String {
-        header_line(editor, model, endpoint, None, true)
+        header_line(editor, model, endpoint, None, "", true)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect()
     }
 
+    /// #1671: the session name is always visible in the header — between the
+    /// mode word and `model @ endpoint` — and an empty name (the default)
+    /// keeps the legacy header byte-identical.
+    #[test]
+    fn header_always_shows_the_session_name() {
+        let ed = vi_editor();
+        let text = |session: &str| -> String {
+            header_line(&ed, "kimi-k3", "https://api.example", None, session, true)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+
+        let named = text("mesh docking");
+        assert!(named.contains(" mesh docking ·"), "{named}");
+        // Name precedes the model @ endpoint block.
+        assert!(
+            named.find("mesh docking").unwrap() < named.find("kimi-k3").unwrap(),
+            "{named}"
+        );
+
+        // The untitled form (#shortid) and the ephemeral marker render too.
+        assert!(text("#a1b2c3d4").contains(" #a1b2c3d4 ·"));
+        assert!(text("ephemeral").contains(" ephemeral ·"));
+
+        // Empty = the legacy header, unchanged.
+        let legacy = text("");
+        assert!(!legacy.contains(" ·"), "{legacy}");
+        assert!(legacy.contains("kimi-k3 @ https://api.example"), "{legacy}");
+    }
+
     #[test]
     fn header_shows_context_budget_gauge_when_known() {
         let ed = vi_editor();
         let text = |g| -> String {
-            header_line(&ed, "m", "e", g, true)
+            header_line(&ed, "m", "e", g, "", true)
                 .spans
                 .iter()
                 .map(|s| s.content.as_ref())

@@ -787,11 +787,19 @@ pub(crate) trait InputSurface {
     /// edit-mode switch so the next read reflects the new mode.
     fn reload(&mut self) -> anyhow::Result<()>;
     /// Update the runtime context (active model + endpoint + the context-budget
-    /// gauge `(used, budget)`) shown in the rich status header (issues #527 /
-    /// #559). Called once per turn before `read_line` so a `/model` switch and
-    /// the latest fill are reflected. Default no-op: only the rich surface
-    /// renders it; the lean surface carries model in the prompt string (or not).
-    fn set_runtime_context(&mut self, _model: &str, _endpoint: &str, _gauge: Option<(u32, u32)>) {}
+    /// gauge `(used, budget)` + the session name, #1671) shown in the rich
+    /// status header (issues #527 / #559). Called once per turn before
+    /// `read_line` so a `/model` switch, the latest fill, and a `/rename` are
+    /// all reflected. Default no-op: only the rich surface renders it; the
+    /// lean surface carries model in the prompt string (or not).
+    fn set_runtime_context(
+        &mut self,
+        _model: &str,
+        _endpoint: &str,
+        _gauge: Option<(u32, u32)>,
+        _session: &str,
+    ) {
+    }
     /// Replace the harness-owned jobs whose live state the input surface may
     /// render. Default no-op keeps lean/headless output free of ephemeral UI.
     fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {}
@@ -845,6 +853,7 @@ pub(crate) fn run_chat(
     let session_start = resolve_session_start(
         std::env::var("NEWT_EPHEMERAL").is_ok(),
         std::env::var("NEWT_CONVERSATION_ID").ok(),
+        std::env::var("NEWT_RESUME").ok(),
         cfg.conversations.clone().unwrap_or_default().resume,
     );
     let ephemeral_session = session_start == SessionStart::Ephemeral;
@@ -1600,6 +1609,18 @@ pub(crate) fn run_chat(
                 let banner = resume_exact_conversation(&mut resume_ctx, id)?;
                 print_newt(&banner, color, verbose);
             }
+            // #1671 `--resume <name>`: id/prefix first (the exact contract),
+            // then title matching — then the SAME one restore path as above.
+            // Errors stay hard, like every explicit resume ask.
+            SessionStart::ResumeNamed(name) => {
+                let id = match store.resolve_id(name) {
+                    Ok(id) => id,
+                    Err(_) => crate::resolve_conversation_by_name(&store.list()?, name)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                };
+                let banner = resume_exact_conversation(&mut resume_ctx, &id)?;
+                print_newt(&banner, color, verbose);
+            }
             // [conversations] resume = true: latest by §6 activity tick.
             // Failure here degrades to a fresh conversation with a warning
             // — a corrupt record must not lock the user out of their TUI.
@@ -1798,7 +1819,22 @@ pub(crate) fn run_chat(
             let prompt = prompt_str(&cwd_display, is_vi, &inf_model, footer_on);
             // Refresh the rich status header's model @ endpoint each turn (#527)
             // so a mid-session `/model` switch is reflected (no-op for lean).
-            surface.set_runtime_context(&inf_model, &inf_url, token_gauge);
+            // #1671: the session NAME rides the same refresh, so the footer
+            // always says which conversation this is — the current title
+            // (re-read each turn: /rename and /resume both change it), the
+            // short id while untitled, or "ephemeral" with no persistence.
+            let session_label = if ephemeral_session {
+                "ephemeral".to_string()
+            } else {
+                conversation_store
+                    .as_ref()
+                    .and_then(|store| store.title(&active_conversation_id).ok().flatten())
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        format!("#{}", short_conversation_id(&active_conversation_id))
+                    })
+            };
+            surface.set_runtime_context(&inf_model, &inf_url, token_gauge, &session_label);
             surface.set_background_jobs(
                 nav_warmup
                     .as_ref()
