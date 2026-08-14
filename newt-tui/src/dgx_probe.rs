@@ -17,6 +17,8 @@
 //!   - `loaded_models()` — Ollama `/api/ps`, empty vec when unavailable.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -189,6 +191,35 @@ async fn fetch_text(url: &str, timeout_secs: u64) -> Option<String> {
         .ok()
 }
 
+fn snapshot_from_text(text: Option<&str>) -> TelemetrySnapshot {
+    text.map(parse_prometheus)
+        .as_ref()
+        .map(snapshot_from_metrics)
+        .unwrap_or_default()
+}
+
+fn spawn_sampler<F, Fut>(
+    interval_secs: u64,
+    mut sample: F,
+) -> tokio::sync::watch::Receiver<TelemetrySnapshot>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = TelemetrySnapshot> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::watch::channel(TelemetrySnapshot::default());
+    tokio::runtime::Handle::current().spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+        loop {
+            ticker.tick().await;
+            if tx.send(sample().await).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 // ---------------------------------------------------------------------------
 // DgxTelemetry — async client
 // ---------------------------------------------------------------------------
@@ -234,13 +265,8 @@ impl DgxTelemetry {
     /// unreachable — never propagates errors.
     pub async fn snapshot_async(&self) -> TelemetrySnapshot {
         let metrics_url = format!("{}/metrics", self.dcgm_base.trim_end_matches('/'));
-        fetch_text(&metrics_url, 5)
-            .await
-            .as_deref()
-            .map(parse_prometheus)
-            .as_ref()
-            .map(snapshot_from_metrics)
-            .unwrap_or_default()
+        let text = fetch_text(&metrics_url, 5).await;
+        snapshot_from_text(text.as_deref())
     }
 
     /// Blocking wrapper over [`snapshot_async`](Self::snapshot_async). Kept for
@@ -262,18 +288,11 @@ impl DgxTelemetry {
         self,
         interval_secs: u64,
     ) -> tokio::sync::watch::Receiver<TelemetrySnapshot> {
-        let (tx, rx) = tokio::sync::watch::channel(TelemetrySnapshot::default());
-        tokio::runtime::Handle::current().spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
-            loop {
-                ticker.tick().await;
-                if tx.send(self.snapshot_async().await).is_err() {
-                    break; // last receiver dropped — stop sampling
-                }
-            }
-        });
-        rx
+        let telemetry = Arc::new(self);
+        spawn_sampler(interval_secs, move || {
+            let telemetry = Arc::clone(&telemetry);
+            async move { telemetry.snapshot_async().await }
+        })
     }
 
     /// List models currently loaded in Ollama's VRAM (`/api/ps`).
@@ -322,15 +341,12 @@ mod tests {
 
     #[tokio::test]
     async fn into_sampler_publishes_in_background_without_blocking() {
-        // An unreachable DCGM endpoint: `snapshot_async` returns the default
-        // (all-`None`) snapshot. The point is the background task PUBLISHES on
-        // the `watch` channel so the UI can read it instantly — the caller of
-        // `into_sampler` never blocks on the network.
-        let tele = DgxTelemetry {
-            ollama_base: "http://127.0.0.1:1".into(),
-            dcgm_base: "http://127.0.0.1:1".into(), // closed port -> fast fail
-        };
-        let mut rx = tele.into_sampler(1);
+        // Inject a zero-I/O sample so this unit test verifies sampler liveness
+        // without depending on listener or network authority. The separate
+        // pure mapping test below covers failed fetches.
+        //
+        // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 17:38 EDT | Date: 2026-08-14
+        let mut rx = spawn_sampler(1, || async { TelemetrySnapshot::default() });
         // The first interval tick fires immediately, so a sample is published
         // promptly; reading is instant. The generous timeout only guards against
         // a starved timer under heavy parallel-test load (the publish itself is
@@ -341,11 +357,16 @@ mod tests {
             .expect("sender alive");
         assert!(
             !rx.borrow().has_data(),
-            "unreachable endpoint yields an empty snapshot"
+            "injected empty sample yields an empty snapshot"
         );
         // Dropping the receiver signals the background task to stop (no leak);
         // nothing to assert beyond it not panicking.
         drop(rx);
+    }
+
+    #[test]
+    fn failed_fetch_yields_an_empty_snapshot() {
+        assert!(!snapshot_from_text(None).has_data());
     }
 
     // --- parse_prometheus ---
