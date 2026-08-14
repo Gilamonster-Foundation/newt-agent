@@ -1704,6 +1704,20 @@ fn legacy_caps(animate: bool) -> crate::tty::LineCaps {
     }
 }
 
+/// Announce that a validated tool call is about to run.
+///
+/// The one semantic tool-activity signal for every wire (chat-completions,
+/// OpenAI, Anthropic, Responses): integrations learn what the agent is doing
+/// from the agent, not by scraping rendered output. Free when nobody is
+/// listening — the name is only allocated for a live observer.
+fn announce_tool_activity(name: &str) {
+    if crate::lifecycle::observed() {
+        crate::lifecycle::emit(crate::lifecycle::LifecycleEvent::ToolActivity {
+            tool: name.to_string(),
+        });
+    }
+}
+
 pub async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -3501,6 +3515,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         for (_tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
             let name = vc.name.as_str();
             let args = vc.args.clone();
+            announce_tool_activity(name);
             // Per-tool head: any frame from the PREVIOUS tool in this batch
             // comes down before this iteration's first writer (the debug /
             // trace echoes below print BEFORE the wired `call()` erase).
@@ -6909,6 +6924,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
+            announce_tool_activity(name);
             // Per-tool head: any frame from the PREVIOUS tool in this batch
             // comes down before this iteration's first writer (the debug /
             // trace echoes below print BEFORE the wired `call()` erase).
@@ -8840,6 +8856,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
+            announce_tool_activity(name);
             // Per-tool head: any frame from the PREVIOUS tool in this batch
             // comes down before this iteration's first writer (the debug /
             // trace echoes below print BEFORE the wired `call()` erase).
@@ -9874,6 +9891,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let call_id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
+            announce_tool_activity(name);
             // Per-tool head: any frame from the PREVIOUS tool in this batch
             // comes down before this iteration's first writer (the debug /
             // trace echoes below print BEFORE the wired `call()` erase).
