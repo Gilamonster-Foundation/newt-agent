@@ -45,6 +45,11 @@ mod rich_input;
 // operator dials. Gated with the other rich TTY surfaces so wyvern/lean strip it.
 #[cfg(feature = "rich-tui")]
 mod config_panel;
+// The slash-command palette (#1674): pure state + a thin render fn, drawn by
+// the rich input surface. Gated with the other rich TTY surfaces so the lean /
+// piped / wyvern paths never compile it in.
+#[cfg(feature = "rich-tui")]
+mod palette;
 // The backend chooser/editor panel (#1667) — same grammar, same gating; its
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]
@@ -88,6 +93,8 @@ use newt_core::recover_context_window_400;
 use prompt::expand_prompt_tokens;
 #[cfg(feature = "rich-tui")]
 use prompt::resolve_gutter_setting;
+#[cfg(feature = "rich-tui")]
+use prompt::rich_surface_selected;
 use prompt::{
     current_prompt_and_preview, debug_mode, footer_mode, footer_rich_enabled, prompt_str,
     prompt_token_help, resolve_edit_mode, strip_one_quote_pair, trace_mode, verbose_mode,
@@ -5383,6 +5390,11 @@ enum SessionStart {
     /// Resume exactly this conversation id (`NEWT_CONVERSATION_ID`). The id
     /// must exist in THIS workspace — the 17.1b workspace fence applies.
     ResumeExact(String),
+    /// #1671: resume by NAME (`newt --resume <name>` / `NEWT_RESUME`) — a
+    /// title (or id/prefix) resolved against this workspace's conversations
+    /// once the store is open. Like `ResumeExact`, errors are hard: a name
+    /// that matches nothing (or several) must not silently start fresh.
+    ResumeNamed(String),
     /// Auto-resume the workspace's most recently active conversation —
     /// highest §6 activity tick, never a timestamp comparison.
     ResumeLatest,
@@ -5392,11 +5404,13 @@ enum SessionStart {
 }
 
 /// Pure precedence chain (17.7): ephemeral wins outright, then an explicit
-/// conversation id, then the config default. A blank `NEWT_CONVERSATION_ID`
-/// reads as unset rather than as an id that can never exist.
+/// conversation id, then a name (#1671), then the config default. A blank
+/// `NEWT_CONVERSATION_ID` / `NEWT_RESUME` reads as unset rather than as a
+/// target that can never exist.
 fn resolve_session_start(
     ephemeral: bool,
     forced_id: Option<String>,
+    resume_name: Option<String>,
     resume_config: bool,
 ) -> SessionStart {
     if ephemeral {
@@ -5408,10 +5422,55 @@ fn resolve_session_start(
             return SessionStart::ResumeExact(id);
         }
     }
+    if let Some(name) = resume_name {
+        let name = name.trim().to_string();
+        if !name.is_empty() {
+            return SessionStart::ResumeNamed(name);
+        }
+    }
     if resume_config {
         SessionStart::ResumeLatest
     } else {
         SessionStart::Fresh
+    }
+}
+
+/// #1671: resolve `--resume <name>` against this workspace's conversations —
+/// pure, so the matching rules are unit-testable without a store. Titles are
+/// matched case-insensitively: a unique EXACT match wins; otherwise a unique
+/// substring match; anything else is a hard error naming the candidates (an
+/// ambiguous or missing name must never silently open the wrong conversation).
+/// Ids are not this function's job — the caller tries `resolve_id` first.
+fn resolve_conversation_by_name(
+    summaries: &[newt_core::ConversationSummary],
+    name: &str,
+) -> Result<String, String> {
+    let needle = name.trim().to_lowercase();
+    let matches = |pred: &dyn Fn(&str) -> bool| -> Vec<&newt_core::ConversationSummary> {
+        summaries
+            .iter()
+            .filter(|s| pred(&s.title.trim().to_lowercase()))
+            .collect()
+    };
+    let exact = matches(&|t: &str| t == needle);
+    let hits = if exact.is_empty() {
+        matches(&|t: &str| t.contains(needle.as_str()))
+    } else {
+        exact
+    };
+    match hits.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => Err(format!(
+            "no conversation titled \"{name}\" in this workspace — run newt and /resume to browse"
+        )),
+        many => Err(format!(
+            "\"{name}\" matches {} conversations — use an id: {}",
+            many.len(),
+            many.iter()
+                .map(|s| format!("{} \"{}\"", short_conversation_id(&s.id), s.title))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -10959,6 +11018,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /retrieval [turn N] [human|model|diff] - retrieval ledger",
         "  /compare semantic lexical | turn A B | index - compare retrieval",
         "  /export json|markdown    - export retrieval ledger",
+        "  /help [command]          - this command list, or one command's detail page",
         "  /exit  /quit  exit  quit - leave the session",
         "",
         "  Add --help (or -h) to any command — or /help <command> — for its detail page.",

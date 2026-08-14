@@ -2130,6 +2130,22 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// This conversation's current title, or `None` when no row exists yet
+    /// (a fresh session's record is created lazily on the first saved turn).
+    /// Workspace-fenced like [`exists`](Self::exists); a cheap single-row read
+    /// — the rich footer refreshes it every turn (#1671).
+    pub fn title(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.lock_conn();
+        let title = conn
+            .query_row(
+                "SELECT title FROM conversations WHERE id = ?1 AND workspace_key = ?2",
+                rusqlite::params![id, self.workspace_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(title)
+    }
+
     /// Persist a conversation's scratchpad `<state>` snapshot (#713). The map
     /// is serialized to JSON and written to the conversation row's `scratchpad`
     /// column so an interrupt + auto-resume can re-hydrate the live store.
@@ -4459,6 +4475,33 @@ mod tests {
         assert_eq!(chain[2].previous_prompt_id(), Some(chain[1].id()));
         assert!(appended.contains(&chain[1].id()));
         assert!(appended.contains(&chain[2].id()));
+    }
+
+    /// #1671: the footer's per-turn title read — present after create/rename,
+    /// `None` for a not-yet-persisted id, and workspace-fenced like `exists`.
+    #[test]
+    fn title_reads_current_name_and_is_workspace_fenced() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let store_a = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+
+        let id = store_a.create("mesh docking", None).unwrap();
+        assert_eq!(store_a.title(&id).unwrap().as_deref(), Some("mesh docking"));
+
+        // A rename is reflected on the next read.
+        store_a.rename(&id, "docking ceremony").unwrap();
+        assert_eq!(
+            store_a.title(&id).unwrap().as_deref(),
+            Some("docking ceremony")
+        );
+
+        // A fresh session's id has no row yet — None, not an error.
+        assert_eq!(store_a.title("no-such-conversation").unwrap(), None);
+
+        // Workspace fence: another workspace cannot read this title.
+        assert_eq!(store_b.title(&id).unwrap(), None);
     }
 
     #[test]

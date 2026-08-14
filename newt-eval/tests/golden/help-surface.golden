@@ -87,6 +87,7 @@
   /retrieval [turn N] [human|model|diff] - retrieval ledger
   /compare semantic lexical | turn A B | index - compare retrieval
   /export json|markdown    - export retrieval ledger
+  /help [command]          - this command list, or one command's detail page
   /exit  /quit  exit  quit - leave the session
 
   Add --help (or -h) to any command — or /help <command> — for its detail page.

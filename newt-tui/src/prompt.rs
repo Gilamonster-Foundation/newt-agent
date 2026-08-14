@@ -105,6 +105,18 @@ pub(crate) fn footer_rich_enabled(mode: newt_core::FooterMode, is_tty: bool) -> 
     }
 }
 
+/// Whether chat selects the RICH input surface — the gate the #1674 slash
+/// palette (and every other rich-surface behavior) actually lives behind.
+/// [`footer_rich_enabled`] ALONE does not protect a piped run:
+/// `FooterMode::On` forces the rich PROMPT STRING even off a TTY (it lands in
+/// logfiles by design). The rich SURFACE additionally requires stdout to be a
+/// real terminal — this conjunction, used by `run_chat`'s surface selection,
+/// is what keeps piped / headless runs on the lean surface. Pure for testing.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn rich_surface_selected(mode: newt_core::FooterMode, stdout_is_tty: bool) -> bool {
+    footer_rich_enabled(mode, stdout_is_tty) && stdout_is_tty
+}
+
 /// The built-in rich prompt template (used when `[tui] prompt` is unset and the
 /// prompt is rich). Expands via [`expand_prompt_tokens`] to e.g.
 /// `[2026-06-16 11:59:02] gpt-4.1 | emacs | newt-agent ❯ `. Written in the

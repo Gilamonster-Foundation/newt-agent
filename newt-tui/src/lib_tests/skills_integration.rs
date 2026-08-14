@@ -2031,34 +2031,87 @@ async fn prompt_only_restore_rehydrates_receipt_without_replaying_it_as_input() 
 
 #[test]
 fn session_start_precedence_chain() {
-    // --ephemeral beats everything, including an explicit id.
+    // --ephemeral beats everything, including an explicit id and a name.
     assert_eq!(
-        resolve_session_start(true, Some("some-id".into()), true),
+        resolve_session_start(true, Some("some-id".into()), Some("a name".into()), true),
         SessionStart::Ephemeral
     );
-    // NEWT_CONVERSATION_ID beats the config key — on either setting.
+    // NEWT_CONVERSATION_ID beats the name and the config key.
     assert_eq!(
-        resolve_session_start(false, Some("some-id".into()), true),
+        resolve_session_start(false, Some("some-id".into()), Some("a name".into()), true),
         SessionStart::ResumeExact("some-id".into())
     );
     assert_eq!(
-        resolve_session_start(false, Some(" some-id ".into()), false),
+        resolve_session_start(false, Some(" some-id ".into()), None, false),
         SessionStart::ResumeExact("some-id".into())
     );
-    // A blank env var reads as unset, not as an impossible id.
+    // #1671: --resume <name> beats the config key — on either setting.
     assert_eq!(
-        resolve_session_start(false, Some("   ".into()), true),
+        resolve_session_start(false, None, Some("mesh docking".into()), true),
+        SessionStart::ResumeNamed("mesh docking".into())
+    );
+    assert_eq!(
+        resolve_session_start(false, None, Some(" mesh docking ".into()), false),
+        SessionStart::ResumeNamed("mesh docking".into())
+    );
+    // A blank env var reads as unset, not as an impossible target.
+    assert_eq!(
+        resolve_session_start(false, Some("   ".into()), None, true),
         SessionStart::ResumeLatest
+    );
+    assert_eq!(
+        resolve_session_start(false, None, Some("   ".into()), false),
+        SessionStart::Fresh
     );
     // [conversations] resume decides the rest: on → latest, off → fresh.
     assert_eq!(
-        resolve_session_start(false, None, true),
+        resolve_session_start(false, None, None, true),
         SessionStart::ResumeLatest
     );
     assert_eq!(
-        resolve_session_start(false, None, false),
+        resolve_session_start(false, None, None, false),
         SessionStart::Fresh
     );
+}
+
+/// #1671: the pure name-matching rules behind `--resume <name>` — a unique
+/// exact (case-insensitive) title wins, then a unique substring; ambiguity
+/// and misses are hard errors that NAME the candidates.
+#[test]
+fn resume_by_name_matches_titles_and_refuses_ambiguity() {
+    let s = |id: &str, title: &str| newt_core::ConversationSummary {
+        id: id.into(),
+        title: title.into(),
+        persona: None,
+        updated_at_unix_nanos: 0,
+        turn_count: 1,
+    };
+    let list = vec![
+        s("aaaa1111-0000-0000-0000-000000000000", "mesh docking"),
+        s(
+            "bbbb2222-0000-0000-0000-000000000000",
+            "Mesh Docking Ceremony",
+        ),
+        s("cccc3333-0000-0000-0000-000000000000", "taxes TY2025"),
+    ];
+
+    // Case-insensitive EXACT match wins even when a superstring also exists.
+    assert_eq!(
+        resolve_conversation_by_name(&list, "Mesh Docking").unwrap(),
+        "aaaa1111-0000-0000-0000-000000000000"
+    );
+    // Unique substring match resolves.
+    assert_eq!(
+        resolve_conversation_by_name(&list, "taxes").unwrap(),
+        "cccc3333-0000-0000-0000-000000000000"
+    );
+    // Ambiguous substring: hard error listing the candidates.
+    let err = resolve_conversation_by_name(&list, "docking").unwrap_err();
+    assert!(err.contains("matches 2 conversations"), "{err}");
+    assert!(err.contains("mesh docking"), "{err}");
+    // No match: hard error, pointing at /resume browse.
+    let err = resolve_conversation_by_name(&list, "nonesuch").unwrap_err();
+    assert!(err.contains("no conversation titled"), "{err}");
 }
 
 #[serial_test::serial(real_fs)]

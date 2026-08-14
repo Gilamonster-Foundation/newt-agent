@@ -75,6 +75,7 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::chat::BackgroundJob;
+use crate::palette::{palette_lines, palette_step, PaletteState, PaletteStep};
 use crate::{footer_continues, InputSurface, ReadOutcome};
 
 // Opt-in wide-gutter width (`NEWT_GUTTER=auto`/`tui.gutter=N`): a fixed left
@@ -516,6 +517,7 @@ fn header_line(
     model: &str,
     endpoint: &str,
     gauge: Option<(u32, u32)>,
+    session: &str,
     active: bool,
 ) -> Line<'static> {
     let accent = Color::Rgb(255, 165, 90);
@@ -526,6 +528,14 @@ fn header_line(
         format!(" {}", editor.header_mode()),
         Style::default().fg(if active { accent } else { dim }),
     ));
+    // #1671: the session name is ALWAYS visible — a mid-luminance grey so it
+    // reads without shouting (accessibility default: no saturated darks).
+    if !session.is_empty() {
+        spans.push(Span::styled(
+            format!(" {session} ·"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
     if !model.is_empty() {
         let loc = if endpoint.is_empty() {
             model.to_string()
@@ -633,7 +643,14 @@ struct RichStatus<'a> {
     model: &'a str,
     endpoint: &'a str,
     gauge: Option<(u32, u32)>,
+    /// #1671: the conversation's display name — title, `#shortid`, or
+    /// "ephemeral". Empty hides the span (tests pin the legacy header).
+    session: &'a str,
     background_jobs: &'a [BackgroundJob],
+    /// The slash-command palette (#1674), rendered above the input row while
+    /// open. `None`/closed → the layout is byte-identical to the pre-palette
+    /// surface.
+    palette: Option<&'a PaletteState>,
 }
 
 fn draw(
@@ -657,10 +674,23 @@ fn draw(
             status.model,
             status.endpoint,
             status.gauge,
+            status.session,
             !empty,
         )),
         header_area,
     );
+    // The slash-command palette (#1674) sits directly above the input row,
+    // inside the same inline region — no second surface, no second event loop.
+    let body_area = match status.palette.filter(|p| p.is_open()) {
+        Some(p) if p.viewport() > 0 => {
+            let rows = (p.viewport() as u16).min(body_area.height.saturating_sub(1));
+            let [palette_area, rest] =
+                Layout::vertical([Constraint::Length(rows), Constraint::Min(1)]).areas(body_area);
+            f.render_widget(Paragraph::new(palette_lines(p)), palette_area);
+            rest
+        }
+        _ => body_area,
+    };
     let background = background_line(status.background_jobs, background_frame());
     let (input_area, background_area) = if background.is_some() {
         let [input_area, background_area] =
@@ -992,6 +1022,8 @@ pub(crate) struct RichSurface {
     gauge: Option<(u32, u32)>,
     /// Harness tasks rendered by this surface while their shared state is live.
     background_jobs: Vec<BackgroundJob>,
+    /// #1671: the session display name shown in the header, refreshed per turn.
+    session: String,
 }
 
 impl RichSurface {
@@ -1006,6 +1038,7 @@ impl RichSurface {
             endpoint: String::new(),
             gauge: None,
             background_jobs: Vec::new(),
+            session: String::new(),
         })
     }
 
@@ -1052,6 +1085,17 @@ impl RichSurface {
         history.extend(self.unsaved.iter().cloned());
         let mut hist_pos = history.len();
         let mut stash = String::new();
+        // The slash-command palette (#1674): pure per-turn state, fed by
+        // buffer edits below and rendered above the input row by `draw`.
+        // Opens on `/` at an empty prompt; filters as you type; ↑/↓ (C-p/C-n)
+        // move; Tab/Enter complete (never submit); Esc closes.
+        let mut palette = PaletteState::from_corpus();
+        // A `/` that arrived as TYPE-AHEAD (typed while the last turn ran)
+        // must open the palette exactly as a live keypress would — run the
+        // same buffer sync over the prefill (review of #1674). A longer
+        // prefilled `/cmd…` line follows the same rule as any non-`/` edit:
+        // it does not open the palette.
+        palette.on_buffer_change("", &textarea.lines().join("\n"));
         loop {
             // Grow/shrink the inline viewport to the input. The prompt is always
             // inline now — on the first row, either in a wide left gutter or as
@@ -1082,7 +1126,15 @@ impl RichSurface {
             // harness-background row all contribute to the inline viewport.
             let background_extra =
                 u16::from(self.background_jobs.iter().any(BackgroundJob::is_running));
-            let want = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra;
+            let base = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra;
+            // #1674: the palette viewport gets what the terminal can spare
+            // above the input (capped inside `viewport_rows`), never squeezing
+            // the input's own rows. 0 while closed → the height math (and the
+            // whole surface) is exactly the pre-palette shape.
+            let term_h = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
+            let pal_rows = palette.viewport_rows(term_h.saturating_sub(base + 1) as usize);
+            palette.set_viewport(pal_rows);
+            let want = base + pal_rows as u16;
             if want != cur_h {
                 // Blank the CURRENT region before resizing. ratatui reserves
                 // space for a taller inline viewport by scrolling whatever is on
@@ -1104,7 +1156,9 @@ impl RichSurface {
                         model: &self.model,
                         endpoint: &self.endpoint,
                         gauge: self.gauge,
+                        session: &self.session,
                         background_jobs: &self.background_jobs,
+                        palette: Some(&palette),
                     },
                 );
             })?;
@@ -1119,8 +1173,13 @@ impl RichSurface {
             // (only an explicit Enter keypress submits). Normalize CRLF/CR so a
             // paste from any platform lands as clean `\n` lines.
             if let Event::Paste(text) = evt {
+                let before = textarea.lines().join("\n");
                 let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
                 textarea.insert_str(normalized);
+                // A paste can open the palette only as a literal lone `/`;
+                // pasting anything into an open palette re-filters or (multi-
+                // line / slash gone) closes it.
+                palette.on_buffer_change(&before, &textarea.lines().join("\n"));
                 continue;
             }
             let Event::Key(key) = evt else {
@@ -1128,6 +1187,19 @@ impl RichSurface {
             };
             if key.kind != KeyEventKind::Press {
                 continue;
+            }
+            // #1674: the palette sees every key FIRST (before history recall,
+            // so ↑/↓ move the highlight, not the history). The decision is
+            // the pure `palette_step` — the loop only acts on its verdict, so
+            // the interception contracts are unit-tested in palette.rs.
+            match palette_step(&mut palette, &key) {
+                PaletteStep::Swallowed => continue,
+                PaletteStep::CompleteTo(text) => {
+                    // A COMPLETION into the prompt — never a submit.
+                    textarea = textarea_with(self.edit, &text);
+                    continue;
+                }
+                PaletteStep::PassThrough => {}
             }
             // History recall on ↑/↓ — but only at a vertical edge of the buffer
             // (top row for ↑, bottom row for ↓) so multi-line cursor movement
@@ -1161,6 +1233,7 @@ impl RichSurface {
                     continue;
                 }
             }
+            let before = textarea.lines().join("\n");
             let step = editor.input(key, &mut textarea);
             // A command (e.g. `:jumps`) may have queued a note to print above the
             // input region, into real scrollback.
@@ -1168,7 +1241,12 @@ impl RichSurface {
                 echo_note(&mut terminal, &note)?;
             }
             match step {
-                Step::Continue => {}
+                Step::Continue => {
+                    // #1674: track the edit — `/` typed at an empty prompt
+                    // opens the palette; edits re-filter it; backspacing the
+                    // leading `/` (or clearing the line) closes it.
+                    palette.on_buffer_change(&before, &textarea.lines().join("\n"));
+                }
                 Step::Submit => {
                     let body = textarea.lines().join("\n");
                     if body.trim().is_empty() {
@@ -1242,13 +1320,21 @@ impl InputSurface for RichSurface {
         Ok(())
     }
 
-    fn set_runtime_context(&mut self, model: &str, endpoint: &str, gauge: Option<(u32, u32)>) {
+    fn set_runtime_context(
+        &mut self,
+        model: &str,
+        endpoint: &str,
+        gauge: Option<(u32, u32)>,
+        session: &str,
+    ) {
         // Refresh the status-header model @ endpoint each turn (#527) so a
         // mid-session `/model` switch shows up on the next prompt. The
-        // context-budget gauge (24.6) rides the same per-turn refresh.
+        // context-budget gauge (24.6) and the session name (#1671) ride the
+        // same per-turn refresh.
         self.model = model.to_string();
         self.endpoint = endpoint.to_string();
         self.gauge = gauge;
+        self.session = session.to_string();
     }
 
     fn set_background_jobs(&mut self, jobs: Vec<BackgroundJob>) {
@@ -1577,6 +1663,62 @@ mod tests {
     }
 
     #[test]
+    fn slash_palette_renders_above_the_input_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // #1674: the palette renders INSIDE the existing inline draw path —
+        // between the status header and the input row — through the same
+        // frame as the editor. No second surface, no second event loop.
+        let mut palette = PaletteState::from_corpus();
+        palette.on_buffer_change("", "/");
+        palette.on_buffer_change("/", "/model");
+        let rows = palette.viewport_rows(8);
+        assert!(rows >= 2, "the /model filter keeps several corpus entries");
+        palette.set_viewport(rows);
+        let editor = nano_editor();
+        let ta = TextArea::new(vec!["/model".to_string()]);
+        let h = 1 + rows as u16 + 1; // header + palette + input
+        let mut term = Terminal::new(TestBackend::new(100, h)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &ta,
+                &editor,
+                Some(1),
+                RichStatus {
+                    palette: Some(&palette),
+                    ..RichStatus::default()
+                },
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..100)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        // Directly under the header: the highlighted first prefix match, with
+        // its corpus description beside it.
+        assert!(
+            row(1).starts_with("❯ /models"),
+            "highlight on the first match: {:?}",
+            row(1)
+        );
+        assert!(
+            row(1).contains("list models"),
+            "description rides beside the command: {:?}",
+            row(1)
+        );
+        // The input row (bottom) still shows the typed line on the prompt.
+        assert!(
+            row(h - 1).contains("❯ /model"),
+            "input row intact below the palette: {:?}",
+            row(h - 1)
+        );
+    }
+
+    #[test]
     fn overhang_prompt_is_inline_with_one_space_hanging_continuation() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1701,18 +1843,50 @@ mod tests {
     }
 
     fn header_text(editor: &Editor, model: &str, endpoint: &str) -> String {
-        header_line(editor, model, endpoint, None, true)
+        header_line(editor, model, endpoint, None, "", true)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect()
     }
 
+    /// #1671: the session name is always visible in the header — between the
+    /// mode word and `model @ endpoint` — and an empty name (the default)
+    /// keeps the legacy header byte-identical.
+    #[test]
+    fn header_always_shows_the_session_name() {
+        let ed = vi_editor();
+        let text = |session: &str| -> String {
+            header_line(&ed, "kimi-k3", "https://api.example", None, session, true)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+
+        let named = text("mesh docking");
+        assert!(named.contains(" mesh docking ·"), "{named}");
+        // Name precedes the model @ endpoint block.
+        assert!(
+            named.find("mesh docking").unwrap() < named.find("kimi-k3").unwrap(),
+            "{named}"
+        );
+
+        // The untitled form (#shortid) and the ephemeral marker render too.
+        assert!(text("#a1b2c3d4").contains(" #a1b2c3d4 ·"));
+        assert!(text("ephemeral").contains(" ephemeral ·"));
+
+        // Empty = the legacy header, unchanged.
+        let legacy = text("");
+        assert!(!legacy.contains(" ·"), "{legacy}");
+        assert!(legacy.contains("kimi-k3 @ https://api.example"), "{legacy}");
+    }
+
     #[test]
     fn header_shows_context_budget_gauge_when_known() {
         let ed = vi_editor();
         let text = |g| -> String {
-            header_line(&ed, "m", "e", g, true)
+            header_line(&ed, "m", "e", g, "", true)
                 .spans
                 .iter()
                 .map(|s| s.content.as_ref())
