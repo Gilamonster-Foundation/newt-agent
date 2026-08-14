@@ -337,11 +337,24 @@ fn psyche_command(rest: &str) -> String {
         "cognition" => return cognition_command(arg),
         "tenacity" => return tenacity_command(arg),
         // Reached only where chat.rs did NOT open the panel (piped / lean).
+        // Reached only when chat.rs did NOT open the panel: a lean build, a
+        // piped session, or a malformed alias (extra arguments) — so the
+        // message must never assert the terminal is incapable (review v2:
+        // `/psyche edit extra` on a rich TTY landed here and was told its
+        // interactive terminal wasn't one).
         "edit" => {
-            return "the dial panel needs an interactive rich terminal — \
-                    /psyche status shows the text view; /psyche cognition / \
-                    /psyche tenacity <level> change the dials."
-                .to_string()
+            return if arg.is_empty() {
+                "/psyche opens the dial panel on the rich TUI with an \
+                 interactive terminal; here, /psyche status shows the text \
+                 view and /psyche cognition / /psyche tenacity <level> change \
+                 the dials."
+                    .to_string()
+            } else {
+                format!(
+                    "usage: /psyche edit takes no arguments (got `{arg}`) — \
+                     bare /psyche opens the dial panel"
+                )
+            }
         }
         "" | "status" | "show" => {}
         other => {
@@ -386,7 +399,10 @@ fn psyche_command(rest: &str) -> String {
         "\n              how many minds work the task                   (NEWT_TEAM / newt crew)",
     );
     out.push_str("\nobsessive = the max-everything posture: contemplating + relentless + crew on.");
-    out.push_str("\n/psyche — open the dial panel (TTY) · /psyche cognition|tenacity <level> — text setters.");
+    out.push_str(
+        "\n/psyche — open the dial panel (rich TUI build + interactive terminal) · \
+         /psyche cognition|tenacity <level> — text setters.",
+    );
     out
 }
 
@@ -539,7 +555,15 @@ mod tests {
             assert!(out.contains("psyche — how hard"), "{rest:?}: {out}");
         }
         let edit = super::psyche_command("edit");
-        assert!(edit.contains("interactive rich terminal"), "{edit}");
+        assert!(edit.contains("dial panel"), "{edit}");
+        assert!(
+            !edit.contains("needs an interactive rich terminal"),
+            "review v2: the arm must not assert the terminal is incapable \
+             (it also fires for malformed aliases ON a rich TTY): {edit}"
+        );
+        // Extra arguments are a usage error, not a lecture about terminals.
+        let extra = super::psyche_command("edit extra");
+        assert!(extra.contains("takes no arguments"), "{extra}");
         // An unknown subcommand explains itself.
         let err = super::psyche_command("banana");
         assert!(err.contains("unknown /psyche subcommand"), "{err}");

@@ -3863,8 +3863,14 @@ pub(crate) fn run_chat(
                     // otherwise bare `/psyche` falls through to dispatch_slash,
                     // which renders the text status view — so piped, headless,
                     // and lean sessions keep a working `/psyche` with zero noise.
-                    let wants_psyche_panel = slash_body == "psyche edit"
-                        || (slash_body == "psyche"
+                    // Token-wise match (review v2 on #1665): `/psyche  edit`
+                    // with doubled spaces is still the alias, while
+                    // `/psyche edit extra` is NOT (it falls through to the
+                    // dispatch usage error rather than silently dropping the
+                    // extra argument).
+                    let psyche_tokens: Vec<&str> = slash_body.split_whitespace().collect();
+                    let wants_psyche_panel = psyche_tokens.as_slice() == ["psyche", "edit"]
+                        || (psyche_tokens.as_slice() == ["psyche"]
                             && cfg!(feature = "rich-tui")
                             && std::io::IsTerminal::is_terminal(&std::io::stdout()));
                     if wants_psyche_panel {
@@ -4017,9 +4023,9 @@ pub(crate) fn run_chat(
                         }
                         #[cfg(not(feature = "rich-tui"))]
                         print_newt(
-                            "the psyche panel needs an interactive rich terminal — use \
-                             /psyche status for the text view, or /psyche cognition / \
-                             /psyche tenacity <level> to change the dials.",
+                            "the psyche panel needs the rich TUI build with an interactive \
+                             terminal — use /psyche status for the text view, or /psyche \
+                             cognition / /psyche tenacity <level> to change the dials.",
                             color,
                             verbose,
                         );
