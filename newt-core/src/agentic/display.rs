@@ -391,6 +391,25 @@ pub(crate) fn spill_lines() -> usize {
     SPILL_LINES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// #1640 Layer 1 (meta-scroller): whether committed tool results COLLAPSE to a
+/// one-line summary instead of the multi-row excerpt. The conversation spine
+/// (the operator's prompts and the model's replies) is what the operator needs
+/// to keep in view; a wall of grey per tool is what buries it. Same
+/// process-wide-knob precedent as `SPILL_LINES` above: seeded per turn by the
+/// active surface (rich = on, lean = off — lean shows FULL output, #1640), read
+/// at the display site. Default off so headless/CLI paths keep today's excerpt.
+static SPILL_SUMMARY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set summary-collapse mode (per-turn, from the active surface).
+pub fn set_spill_summary(on: bool) {
+    SPILL_SUMMARY.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether committed tool results collapse to a one-line summary.
+pub(crate) fn spill_summary() -> bool {
+    SPILL_SUMMARY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The one place that names the recovery path out of a truncated view (#1433).
 ///
 /// Every truncation marker interpolates THIS, so a third one cannot silently
@@ -488,6 +507,53 @@ pub(crate) fn spill_view_lines(output: &str, view: usize, columns: usize) -> Vec
     out
 }
 
+/// #1640 Layer 1 (meta-scroller): the ONE-LINE collapse of a committed tool
+/// result — `▲ {n} lines · {tail} · {SPILL_RECOVERY_HINT}` — used in summary
+/// mode when the output spills past the `view` budget. Returns `None` when the
+/// output fits (≤ `view` logical lines) or `view` is 0 (unbounded): those keep
+/// the normal render, so a short result never collapses into pointless
+/// indirection and `/spill 0` still means "show everything".
+///
+/// The tail (the last non-empty line — where errors and results live) is
+/// truncated so the whole marker stays within `columns`; it is dropped
+/// entirely when fewer than 8 columns remain for it. Interpolates
+/// [`SPILL_RECOVERY_HINT`] per the #1433 single-recovery-path doctrine.
+pub(crate) fn spill_summary_line(output: &str, view: usize, columns: usize) -> Option<String> {
+    if view == 0 {
+        return None;
+    }
+    let total = output.lines().count();
+    if total <= view {
+        return None;
+    }
+    let tail = output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let head = format!("▲ {total} lines");
+    let hint = format!(" · {SPILL_RECOVERY_HINT}");
+    // Space left for the tail, in chars (the excerpt path also emits unwrapped
+    // text and lets the terminal soft-wrap; here we just keep the marker
+    // visually one row in the common case). The 4 covers the " · " separator
+    // and a possible `…` cut marker.
+    let avail = columns.saturating_sub(head.chars().count() + hint.chars().count() + 4);
+    let tail_len = tail.chars().count();
+    // Drop the tail only when the row can't fit a MEANINGFUL piece of it —
+    // a tail that fits outright is always shown, however short.
+    if avail < 8 && avail < tail_len {
+        return Some(format!("{head}{hint}"));
+    }
+    let shown: String = tail.chars().take(avail).collect();
+    let ellipsis = if shown.chars().count() < tail_len {
+        "…"
+    } else {
+        ""
+    };
+    Some(format!("{head} · {shown}{ellipsis}{hint}"))
+}
+
 /// Injected writer for one tool's operator-facing audit block. Production uses
 /// stdout; tests use a `Vec<u8>` so dispatcher routing can be verified without
 /// process-wide fd redirection.
@@ -496,6 +562,11 @@ pub(crate) struct ToolDisplay<W: Write> {
     color: bool,
     cols: usize,
     spill_lines: usize,
+    /// #1640 Layer 1: collapse a spilled result to a one-line summary marker
+    /// instead of the multi-row excerpt (rich surface; keeps the conversation
+    /// spine dominant). A required constructor parameter — not read from the
+    /// global here — so a call site cannot silently get the wrong mode.
+    summary: bool,
     result_override: Option<String>,
     /// Optional completed spill renderer for Rich TUI interactive viewport (#1640).
     /// When present, completed tool output ADDITIONALLY renders as an interactive
@@ -505,12 +576,19 @@ pub(crate) struct ToolDisplay<W: Write> {
 }
 
 impl<W: Write> ToolDisplay<W> {
-    pub(crate) fn new(writer: W, color: bool, cols: usize, spill_lines: usize) -> Self {
+    pub(crate) fn new(
+        writer: W,
+        color: bool,
+        cols: usize,
+        spill_lines: usize,
+        summary: bool,
+    ) -> Self {
         Self {
             writer,
             color,
             cols,
             spill_lines,
+            summary,
             result_override: None,
             completed_spill_renderer: None,
         }
@@ -585,7 +663,17 @@ impl<W: Write> ToolDisplay<W> {
         // The static excerpt is ALWAYS committed first — it is the canonical
         // transcript record on every tier, and it must never depend on an
         // ephemeral viewport that is erased moments later.
-        let rendered = spill_view_lines(output, self.spill_lines, self.cols).join("\n");
+        //
+        // #1640 Layer 1: in summary mode a SPILLED result commits as a single
+        // collapse marker instead of the multi-row excerpt, so the
+        // conversation spine (green prompts/replies) stays dominant. A result
+        // that fits the budget, and `/spill 0` (unbounded), keep the normal
+        // render — `spill_summary_line` returns `None` for both.
+        let rendered = self
+            .summary
+            .then(|| spill_summary_line(output, self.spill_lines, self.cols))
+            .flatten()
+            .unwrap_or_else(|| spill_view_lines(output, self.spill_lines, self.cols).join("\n"));
         if self.color {
             execute!(
                 &mut self.writer,
@@ -674,7 +762,14 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
 /// Print a tool-call header so the user can see what the agent is doing.
 #[cfg(test)]
 pub(crate) fn print_tool_call(name: &str, detail: &str, color: bool) {
-    ToolDisplay::new(io::stdout(), color, term_cols(), spill_lines()).call(name, detail);
+    ToolDisplay::new(
+        io::stdout(),
+        color,
+        term_cols(),
+        spill_lines(),
+        spill_summary(),
+    )
+    .call(name, detail);
 }
 
 /// Print completed tool output using the universal #1235 spill height. The
@@ -682,14 +777,21 @@ pub(crate) fn print_tool_call(name: &str, detail: &str, color: bool) {
 /// no longer overrides `[tui].spill_lines`.
 #[cfg(test)]
 pub(crate) fn print_tool_output(output: &str, _tool_output_lines: usize, color: bool) {
-    ToolDisplay::new(io::stdout(), color, term_cols(), spill_lines()).result(output);
+    ToolDisplay::new(
+        io::stdout(),
+        color,
+        term_cols(),
+        spill_lines(),
+        spill_summary(),
+    )
+    .result(output);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_view_lines,
-        tool_call_lines, wrap_to_width, SPILL_RECOVERY_HINT,
+        fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_summary_line,
+        spill_view_lines, tool_call_lines, wrap_to_width, SPILL_RECOVERY_HINT,
     };
 
     /// #1433: the excerpt is capped by LOGICAL lines, so its "N rows" promise
@@ -844,6 +946,72 @@ mod tests {
         // The fits-entirely form is inert-terminated too.
         let small = spill_view_lines("a\nb", 3, 80);
         assert_eq!(small.last().map(String::as_str), Some("…"));
+    }
+
+    /// #1640 Layer 1: a spilled result collapses to ONE line in summary mode —
+    /// total count, the tail (where errors live), and the #1433 recovery hint.
+    /// Fitting results and `/spill 0` (unbounded) return `None` (normal render).
+    #[test]
+    fn summary_line_collapses_only_spilled_results() {
+        // Spilled: one line with count + tail + hint.
+        let line = spill_summary_line("l1\nl2\nl3\nl4\nl5", 3, 80).expect("5 > 3 collapses");
+        assert_eq!(line, "▲ 5 lines · l5 · /spill N raises this view");
+
+        // Tail skips trailing blank lines — the last NON-EMPTY line informs.
+        let line = spill_summary_line("l1\nl2\nl3\nerror: boom\n\n", 3, 80).unwrap();
+        assert!(line.contains("error: boom"), "{line}");
+
+        // Fits the budget → None (normal render, no pointless indirection).
+        assert_eq!(spill_summary_line("a\nb\nc", 3, 80), None);
+        // `/spill 0` = unbounded → None (full text always wins).
+        assert_eq!(spill_summary_line("a\nb\nc\nd\ne", 0, 80), None);
+    }
+
+    /// The one-line promise holds on narrow terminals: the tail is truncated
+    /// (with `…`) to keep the marker within the column budget, and dropped
+    /// entirely when almost no room remains — but the hint always survives.
+    #[test]
+    fn summary_line_fits_narrow_terminals() {
+        let wide = format!("l1\nl2\nl3\n{}", "x".repeat(300));
+        let line = spill_summary_line(&wide, 3, 60).unwrap();
+        assert!(
+            line.chars().count() <= 60,
+            "one visual row on an 60-col terminal: {} chars",
+            line.chars().count()
+        );
+        assert!(line.contains('…'), "a cut tail is marked: {line}");
+        assert!(line.contains("/spill N raises this view"), "{line}");
+
+        // Pathologically narrow: tail dropped, count + hint intact.
+        let line = spill_summary_line(&wide, 3, 20).unwrap();
+        assert_eq!(line, "▲ 4 lines · /spill N raises this view");
+    }
+
+    /// `ToolDisplay` in summary mode commits the collapse marker INSTEAD of the
+    /// excerpt for a spilled result — and keeps the excerpt for a fitting one.
+    /// (Excerpt mode `false` is pinned by every other test in this module.)
+    #[test]
+    fn summary_mode_commits_the_marker_not_the_excerpt() {
+        let mut display = super::ToolDisplay::new(Vec::new(), false, 80, 3, true);
+        display.result("l1\nl2\nl3\nl4\nl5");
+        let out = String::from_utf8(display.writer).unwrap();
+        assert!(
+            out.contains("▲ 5 lines · l5 · /spill N raises this view"),
+            "the marker committed: {out:?}"
+        );
+        assert!(
+            !out.contains("▒ l3"),
+            "no excerpt rows in summary mode: {out:?}"
+        );
+
+        // A fitting result renders exactly as excerpt mode would.
+        let mut display = super::ToolDisplay::new(Vec::new(), false, 80, 3, true);
+        display.result("a\nb");
+        let out = String::from_utf8(display.writer).unwrap();
+        assert!(
+            out.contains("▒ a"),
+            "fitting results keep the full render: {out:?}"
+        );
     }
 
     #[test]
@@ -1136,7 +1304,7 @@ mod tests {
     fn result_commits_the_excerpt_before_the_viewport_renders() {
         let terminal = SharedBuf::default();
         let renderer = std::sync::Arc::new(RecordingRenderer::watching(terminal.clone()));
-        let mut display = super::ToolDisplay::new(terminal.clone(), false, 80, 3);
+        let mut display = super::ToolDisplay::new(terminal.clone(), false, 80, 3, false);
         display.set_completed_spill_renderer(renderer.clone());
 
         display.result("line-1\nline-2\n");
@@ -1166,7 +1334,7 @@ mod tests {
     fn the_next_tool_header_dismisses_an_active_viewport_first() {
         let terminal = SharedBuf::default();
         let renderer = std::sync::Arc::new(RecordingRenderer::watching(terminal.clone()));
-        let mut display = super::ToolDisplay::new(terminal.clone(), false, 80, 3);
+        let mut display = super::ToolDisplay::new(terminal.clone(), false, 80, 3, false);
         display.set_completed_spill_renderer(renderer.clone());
 
         display.result("first tool output\n");
@@ -1202,7 +1370,7 @@ mod tests {
     fn a_dropped_renderer_paints_no_viewport() {
         let terminal = SharedBuf::default();
         let renderer = std::sync::Arc::new(RecordingRenderer::watching(terminal.clone()));
-        let mut display = super::ToolDisplay::new(terminal.clone(), false, 80, 3);
+        let mut display = super::ToolDisplay::new(terminal.clone(), false, 80, 3, false);
         display.set_completed_spill_renderer(renderer.clone());
 
         display.drop_completed_spill_renderer();
@@ -1219,7 +1387,7 @@ mod tests {
     /// lean / headless tiers cannot be affected by the wiring.
     #[test]
     fn no_renderer_means_the_static_path_alone() {
-        let mut with_none = super::ToolDisplay::new(Vec::new(), false, 80, 3);
+        let mut with_none = super::ToolDisplay::new(Vec::new(), false, 80, 3, false);
         with_none.result("solo output\n");
         let committed = String::from_utf8(with_none.into_inner()).unwrap();
         let expected = format!("{}\n", spill_view_lines("solo output\n", 3, 80).join("\n"));

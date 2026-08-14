@@ -506,8 +506,44 @@ fn spill_commands_parse_expected_forms() {
         parse_spill_command("/spill reset").unwrap(),
         SpillCommand::Reset
     );
+    // #1640 Layer 1: the mode switches.
+    assert_eq!(
+        parse_spill_command("/spill summary").unwrap(),
+        SpillCommand::Summary
+    );
+    assert_eq!(
+        parse_spill_command("/spill excerpt").unwrap(),
+        SpillCommand::Excerpt
+    );
     assert!(parse_spill_command("/spillage 7").is_err());
     assert!(parse_spill_command("/spill many").is_err());
+}
+
+/// #1640 Layer 1: the summary default follows the SURFACE — rich collapses
+/// (its /spill vocabulary can recover detail), lean never does (it shows full
+/// output) — and the session override wins over both.
+#[test]
+fn spill_summary_defaults_to_the_surface_and_override_wins() {
+    assert!(effective_spill_summary(true, None), "rich collapses");
+    assert!(
+        !effective_spill_summary(false, None),
+        "lean never collapses"
+    );
+    assert!(
+        !effective_spill_summary(true, Some(false)),
+        "/spill excerpt"
+    );
+    assert!(effective_spill_summary(false, Some(true)), "/spill summary");
+
+    // `/spill status` names the mode — and its escape hatch — when it is on,
+    // and stays byte-identical to the historical string when it is off.
+    let on = spill_status(3, None, true, SpillEligibility::Available);
+    assert!(
+        on.contains("results collapse to a summary line (/spill excerpt restores rows)"),
+        "{on}"
+    );
+    let off = spill_status(3, None, false, SpillEligibility::Available);
+    assert!(!off.contains("summary line"), "{off}");
 }
 
 #[test]
@@ -629,19 +665,19 @@ fn spill_override_resolves_and_reports_live_capability() {
     assert_eq!(effective_spill_lines(3, Some(7)), 7);
     assert_eq!(effective_spill_lines(3, Some(0)), 0);
     assert_eq!(
-        spill_status(3, None, SpillEligibility::Available),
+        spill_status(3, None, false, SpillEligibility::Available),
         "spill rows: 3 (config default; live interaction available)"
     );
     // #1412: the unavailable arm now NAMES the refusing gate instead of saying
     // only "unavailable" — that silence is why a stale install was reported as
     // a vanished feature.
     assert_eq!(
-        spill_status(3, Some(7), SpillEligibility::StdoutNotTty),
+        spill_status(3, Some(7), false, SpillEligibility::StdoutNotTty),
         "spill rows: 7 this session (config default 3; live interaction unavailable: \
          stdout is not a terminal (piped or redirected))"
     );
     assert_eq!(
-        spill_status(3, Some(0), SpillEligibility::Available),
+        spill_status(3, Some(0), false, SpillEligibility::Available),
         "spill rows: unbounded this session (config default 3; live viewport disabled: \
          spill_lines is 0 (/spill <n> raises it))"
     );
@@ -684,7 +720,7 @@ fn spill_status_names_the_gate_that_refused() {
         (SpillEligibility::StdoutNotTty, "stdout is not a terminal"),
         (SpillEligibility::TermDumb, "TERM=dumb"),
     ] {
-        let status = spill_status(3, None, eligibility);
+        let status = spill_status(3, None, false, eligibility);
         assert!(
             status.contains(needle),
             "{eligibility:?} must surface {needle:?} to the operator, got: {status}"
@@ -693,7 +729,7 @@ fn spill_status_names_the_gate_that_refused() {
 
     // Rows are a separate axis from capability: a capable terminal with zero
     // rows must not be reported as an incapable terminal.
-    let zero = spill_status(0, None, SpillEligibility::Available);
+    let zero = spill_status(0, None, false, SpillEligibility::Available);
     assert!(zero.contains("spill_lines is 0"), "{zero}");
     assert!(
         !zero.contains("unavailable"),

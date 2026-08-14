@@ -987,6 +987,10 @@ pub(crate) fn run_chat(
     // `options.verbose || toolOutputExpanded` phase bug that motivated it.
     let mut spill_lines_override: Option<usize> =
         crate::initial_spill_override(crate::prompt::trace_mode(&cfg));
+    // #1640 Layer 1: per-session committed-result mode. `None` follows the
+    // surface default (rich collapses spilled results to a one-line summary,
+    // lean shows full output); `/spill summary` / `/spill excerpt` override.
+    let mut spill_summary_override: Option<bool> = None;
     // Human-only per-session override for the agentic loop's tool-call round
     // safety valve. `None` preserves config/model-tuning behavior exactly.
     let mut max_tool_rounds_override: Option<usize> = None;
@@ -2551,6 +2555,10 @@ pub(crate) fn run_chat(
                             &spill_status(
                                 configured,
                                 spill_lines_override,
+                                crate::effective_spill_summary(
+                                    surface_is_rich,
+                                    spill_summary_override,
+                                ),
                                 live_spill_eligibility(),
                             ),
                             color,
@@ -2563,45 +2571,47 @@ pub(crate) fn run_chat(
                     if slash_md == "spill" || slash_md.starts_with("spill ") {
                         let configured = spill_lines(&cfg);
                         match parse_spill_command(&task) {
-                            Ok(SpillCommand::Status) => print_newt(
-                                &spill_status(
-                                    configured,
-                                    spill_lines_override,
-                                    live_spill_eligibility(),
-                                ),
-                                color,
-                                verbose,
-                            ),
+                            // #1640 Layer 1: mode switches. `Reset` below also
+                            // returns the mode to the surface default.
+                            Ok(cmd @ (SpillCommand::Summary | SpillCommand::Excerpt)) => {
+                                spill_summary_override = Some(cmd == SpillCommand::Summary);
+                            }
+                            Ok(SpillCommand::Status) => {}
                             Ok(SpillCommand::Set(rows)) => {
                                 spill_lines_override = Some(rows);
-                                print_newt(
-                                    &spill_status(
-                                        configured,
-                                        spill_lines_override,
-                                        live_spill_eligibility(),
-                                    ),
-                                    color,
-                                    verbose,
-                                );
                             }
                             Ok(SpillCommand::Reset) => {
                                 spill_lines_override = None;
+                                spill_summary_override = None;
+                            }
+                            Err(e) => {
                                 print_newt(
-                                    &spill_status(
-                                        configured,
-                                        spill_lines_override,
-                                        live_spill_eligibility(),
+                                    &format!(
+                                        "error: {e} — use /spill [status|<rows>|reset|summary|excerpt]"
                                     ),
                                     color,
                                     verbose,
                                 );
+                                surface.save_history();
+                                println!();
+                                continue;
                             }
-                            Err(e) => print_newt(
-                                &format!("error: {e} — use /spill [status|<rows>|reset]"),
-                                color,
-                                verbose,
-                            ),
                         }
+                        // One status line for every successful form — the same
+                        // report, so the four arms cannot drift apart.
+                        print_newt(
+                            &spill_status(
+                                configured,
+                                spill_lines_override,
+                                crate::effective_spill_summary(
+                                    surface_is_rich,
+                                    spill_summary_override,
+                                ),
+                                live_spill_eligibility(),
+                            ),
+                            color,
+                            verbose,
+                        );
                         surface.save_history();
                         println!();
                         continue;
@@ -4992,6 +5002,13 @@ pub(crate) fn run_chat(
                     let resolved_spill_lines =
                         committed_spill_lines(surface_is_rich, configured_spill_lines);
                     newt_core::set_spill_lines(resolved_spill_lines);
+                    // #1640 Layer 1: publish the committed-result mode the same
+                    // way — rich collapses spilled results to a summary line so
+                    // the conversation spine stays dominant; lean never does.
+                    newt_core::set_spill_summary(crate::effective_spill_summary(
+                        surface_is_rich,
+                        spill_summary_override,
+                    ));
                     #[cfg(feature = "live-spill")]
                     let live_spill = (resolved_spill_lines > 0 && live_spill_capable())
                         .then_some(())

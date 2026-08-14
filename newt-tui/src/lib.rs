@@ -7421,6 +7421,10 @@ enum SpillCommand {
     Status,
     Set(usize),
     Reset,
+    /// #1640 Layer 1: collapse spilled tool results to a one-line marker.
+    Summary,
+    /// #1640 Layer 1: restore the multi-row excerpt.
+    Excerpt,
 }
 
 fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
@@ -7442,6 +7446,8 @@ fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
     match arg.to_ascii_lowercase().as_str() {
         "" | "show" | "status" => Ok(SpillCommand::Status),
         "reset" | "default" | "config" | "auto" => Ok(SpillCommand::Reset),
+        "summary" | "collapse" => Ok(SpillCommand::Summary),
+        "excerpt" | "expand" | "rows" => Ok(SpillCommand::Excerpt),
         _ => arg
             .parse::<usize>()
             .map(SpillCommand::Set)
@@ -7573,6 +7579,16 @@ fn committed_spill_lines(surface_is_rich: bool, configured: usize) -> usize {
     }
 }
 
+/// #1640 Layer 1: whether committed tool results collapse to a one-line
+/// summary marker on THIS surface. The default is the surface itself — rich
+/// collapses (its viewport + `/spill` vocabulary can recover the detail), lean
+/// never does (it shows FULL output, the same reasoning as
+/// [`committed_spill_lines`]) — and `/spill summary` / `/spill excerpt` set the
+/// session override on the same single-knob pattern as `spill_lines_override`.
+fn effective_spill_summary(surface_is_rich: bool, session_override: Option<bool>) -> bool {
+    session_override.unwrap_or(surface_is_rich)
+}
+
 /// #1434: `--trace` SEEDS the session detail knob instead of sitting beside it.
 ///
 /// newt already has a session-wide detail level — `SPILL_LINES`, config-seeded
@@ -7661,6 +7677,7 @@ impl SpillEligibility {
 fn spill_status(
     configured: usize,
     session_override: Option<usize>,
+    summary: bool,
     eligibility: SpillEligibility,
 ) -> String {
     let effective = effective_spill_lines(configured, session_override);
@@ -7682,7 +7699,14 @@ fn spill_status(
     } else {
         eligibility.explain()
     };
-    format!("spill rows: {rows}{source}; {live})")
+    // #1640 Layer 1: name the committed-result mode so `/spill status` answers
+    // "why is my tool output one line" (or "why is it five").
+    let mode = if summary {
+        "; results collapse to a summary line (/spill excerpt restores rows)"
+    } else {
+        ""
+    };
+    format!("spill rows: {rows}{source}; {live}{mode})")
 }
 
 fn live_spill_eligibility() -> SpillEligibility {
@@ -10526,12 +10550,14 @@ was launched in unless overridden."
         }
         "spill" => {
             "\
-/spill [status|N|reset] — control bounded tool-output rows for this session
+/spill [status|N|reset|summary|excerpt] — tool-output rows for this session
 
   /spill                 show the effective row count and live availability
   /spill <N>             set collapsed live and completed rows for later tools
   /spill reset           return to the configured [tui] spill_lines value
   /spill 0               disable live display; show completed output unbounded
+  /spill summary         collapse spilled results to one line (rich default)
+  /spill excerpt         restore the multi-row excerpt for spilled results
 
 While a tool is active, Up/Down scroll retained output. Space or Enter toggles
 the boundary: ⧉ expands up to the terminal's safe capacity; ▣ collapses it."
@@ -10839,7 +10865,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /tenacity [level|list]   - how hard to push from reading to acting (relaxed→relentless)",
         "  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)",
-        "  /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)",
+        "  /spill [status|N|reset|summary|excerpt] - tool rows / one-line collapse",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
