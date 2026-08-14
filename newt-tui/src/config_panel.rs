@@ -41,6 +41,8 @@
 //!
 //! ## Keys (vi-flavoured; save is explicit, Esc always cancels)
 //! - `↑`/`↓` select a dial, `←`/`→` change it (incl. `auto`/`inherit`).
+//!   The model row (#1666) spins through the active backend's served models;
+//!   its pick is applied by the CALLER through the `/model` path.
 //! - `Enter` — apply the changed dials + act on the persona choice, close.
 //!   With nothing changed (no dirty dial, persona kept), Enter closes silently
 //!   — a no-op visit applies nothing and reports nothing (#1665).
@@ -94,11 +96,35 @@ const NONE: &str = "none";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     Persona,
+    Model,
     Cognition,
     Tenacity,
 }
 
-const ROWS: [Row; 3] = [Row::Persona, Row::Cognition, Row::Tenacity];
+const ROWS: [Row; 4] = [Row::Persona, Row::Model, Row::Cognition, Row::Tenacity];
+
+/// One entry in the model spinner (#1666): a model the active backend serves,
+/// plus its cached conformance tag (the same symbol `/models` prints; empty
+/// when untested). Built by the caller — the panel stays network-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelChoice {
+    pub(crate) name: String,
+    pub(crate) tag: String,
+}
+
+/// Everything the CALLER resolves before the panel opens — the panel's input
+/// record (one struct rather than a positional list that outgrew clippy's
+/// argument limit when #1666 added the model spinner): the selectable
+/// personas + the active one, the operator baseline backend, the
+/// config/family tenacity base, and the served-model list + active model.
+pub(crate) struct PanelSeed {
+    pub personas: Vec<PersonaChoice>,
+    pub current_persona: Option<String>,
+    pub backend: Option<String>,
+    pub base_tenacity: Tenacity,
+    pub models: Option<Vec<ModelChoice>>,
+    pub current_model: String,
+}
 
 /// A value the operator may have changed: `Inherit` (untouched — do NOT write) or
 /// `Set` (dirty — write on apply).
@@ -175,14 +201,21 @@ pub(crate) enum SaveResult {
 pub(crate) enum PanelOutcome {
     /// Esc / `q` / `:q`: discard everything. Nothing was applied.
     Cancelled,
-    /// Enter / `:wq`-with-no-save: dials were applied; act on `persona`.
-    Applied { persona: PersonaAction },
+    /// Enter / `:wq`-with-no-save: dials were applied; act on `persona`, and
+    /// route `model` (the spinner pick, `None` = untouched) through the same
+    /// path `/model <name>` takes — the session owns that state (#1666).
+    Applied {
+        persona: PersonaAction,
+        model: Option<String>,
+    },
     /// `:w` then cancel: the file was persisted, but dials were NOT applied.
     Saved { name: String },
-    /// `:wq`: the file was persisted AND dials were applied; act on `persona`.
+    /// `:wq`: the file was persisted AND dials were applied; act on `persona`
+    /// and `model` exactly as in [`PanelOutcome::Applied`].
     SavedAndApplied {
         name: String,
         persona: PersonaAction,
+        model: Option<String>,
     },
 }
 
@@ -202,6 +235,15 @@ pub(crate) struct PanelState {
     current_persona: Option<String>,
     cognition: Dial<CognitionOverride>,
     tenacity: Dial<Option<Tenacity>>,
+    /// The active backend's served models (#1666); `None` = the backend could
+    /// not be listed when the panel opened — the row renders but won't dial.
+    model_opts: Option<Vec<ModelChoice>>,
+    /// Spinner position into `model_opts` (meaningless when `model_opts` is
+    /// `None`). Dirty = the operator touched the spinner.
+    model: Dial<usize>,
+    /// The model the session resolved when the panel opened — the "(active)"
+    /// marker + the value a no-op visit leaves untouched.
+    current_model: String,
     /// Tenacity with no CLI override and no persona layer (config per-family /
     /// default / `Standard`) — the value a persona that declares none inherits.
     base_tenacity: Tenacity,
@@ -220,15 +262,38 @@ pub(crate) struct PanelState {
 }
 
 impl PanelState {
-    /// Seed from the live overrides, the selectable personas + the active one, the
-    /// operator baseline backend, and the config/family tenacity base (for
-    /// projection).
-    pub(crate) fn new(
-        mut personas: Vec<PersonaChoice>,
-        current_persona: Option<String>,
-        backend: Option<String>,
-        base_tenacity: Tenacity,
-    ) -> Self {
+    /// Seed from the live overrides via [`PanelSeed`] — the caller resolves
+    /// everything; the panel stays network- and config-free.
+    pub(crate) fn new(seed: PanelSeed) -> Self {
+        let PanelSeed {
+            mut personas,
+            current_persona,
+            backend,
+            base_tenacity,
+            models,
+            current_model,
+        } = seed;
+        let current_model = current_model.as_str();
+        // Same guarantee as the persona ghost below (#1666): the ACTIVE model is
+        // always selectable, even when the backend's list omits it (stale list,
+        // model just unloaded) — otherwise opening the panel would silently
+        // reposition the spinner and Enter could apply an unchosen model. An
+        // empty served list degrades to unreachable (nothing to dial).
+        let model_opts = models
+            .map(|mut list| {
+                if !current_model.is_empty() && !list.iter().any(|m| m.name == current_model) {
+                    list.push(ModelChoice {
+                        name: current_model.to_string(),
+                        tag: "(not served)".to_string(),
+                    });
+                }
+                list
+            })
+            .filter(|list| !list.is_empty());
+        let model_idx = model_opts
+            .as_ref()
+            .and_then(|list| list.iter().position(|m| m.name == current_model))
+            .unwrap_or(0);
         // Guarantee the active persona is selectable. If it isn't in the list
         // (e.g. its file failed to load), append it so it renders "(active)" and
         // Enter maps to Keep — never a silent Clear (review-3 follow-up). Its
@@ -259,6 +324,9 @@ impl PanelState {
             current_persona,
             cognition: Dial::Inherit(cli_cognition()),
             tenacity: Dial::Inherit(cli_tenacity()),
+            model_opts,
+            model: Dial::Inherit(model_idx),
+            current_model: current_model.to_string(),
             base_tenacity,
             base_crew: std::env::var("NEWT_TEAM").is_ok(),
             backend,
@@ -286,6 +354,13 @@ impl PanelState {
         match ROWS[self.sel] {
             Row::Persona => {
                 self.persona_idx = clamp_step(self.persona_idx, dir, self.persona_opts.len());
+            }
+            Row::Model => {
+                // Unreachable backend → nothing to dial; the row says why.
+                if let Some(opts) = &self.model_opts {
+                    self.model
+                        .set(clamp_step(self.model.value(), dir, opts.len()));
+                }
             }
             Row::Cognition => {
                 let i = COGNITION_LADDER
@@ -345,7 +420,40 @@ impl PanelState {
     pub(crate) fn is_noop(&self) -> bool {
         !self.cognition.is_dirty()
             && !self.tenacity.is_dirty()
+            && !self.model.is_dirty()
             && self.persona_action() == PersonaAction::Keep
+    }
+
+    /// The model spinner's pick, `None` when untouched (#1666). A touched
+    /// spinner is a pick even at the original position — same deliberate
+    /// re-apply semantics as the dials — and the CALLER routes it through the
+    /// `/model` path (validation gate, persistence rules, warmup); the panel
+    /// itself never mutates model state.
+    pub(crate) fn chosen_model(&self) -> Option<String> {
+        if !self.model.is_dirty() {
+            return None;
+        }
+        self.model_opts
+            .as_ref()
+            .and_then(|opts| opts.get(self.model.value()))
+            .map(|m| m.name.clone())
+    }
+
+    fn model_label(&self) -> String {
+        let Some(opts) = &self.model_opts else {
+            return "(backend unreachable — /models when it's back)".to_string();
+        };
+        let m = &opts[self.model.value()];
+        let tag = if m.tag.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", m.tag)
+        };
+        if m.name == self.current_model {
+            format!("{}{tag} (active)", m.name)
+        } else {
+            format!("{}{tag} (pending)", m.name)
+        }
     }
 
     // ── Projection (review-3 §3) ─────────────────────────────────────────
@@ -587,6 +695,17 @@ impl PanelState {
                 editable: true,
             },
             RowView {
+                label: "model",
+                value: self.model_label(),
+                provenance: if self.model_opts.is_some() {
+                    "active backend".to_string()
+                } else {
+                    String::new()
+                },
+                selected: ROWS[self.sel] == Row::Model,
+                editable: self.model_opts.is_some(),
+            },
+            RowView {
                 label: "cognition",
                 value: cog_val,
                 provenance: cog_prov,
@@ -659,8 +778,8 @@ fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
     (i as i32 + dir).clamp(0, n - 1) as usize
 }
 
-/// Bordered block (2) + five rows + a hint/command/status row.
-const PANEL_HEIGHT: u16 = 9;
+/// Bordered block (2) + six rows + a hint/command/status row.
+const PANEL_HEIGHT: u16 = 10;
 
 fn make_terminal(height: u16) -> io::Result<Term> {
     Terminal::with_options(
@@ -764,13 +883,10 @@ fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
 /// [`PanelOutcome::Cancelled`] — bare `/psyche` opens this panel (#1665), so a
 /// browse-and-leave visit must be indistinguishable from never opening it.
 pub(crate) fn run(
-    personas: Vec<PersonaChoice>,
-    current_persona: Option<String>,
-    backend: Option<String>,
-    base_tenacity: Tenacity,
+    seed: PanelSeed,
     mut persist: impl FnMut(&str, &str, bool) -> SaveResult,
 ) -> io::Result<PanelOutcome> {
-    let mut state = PanelState::new(personas, current_persona, backend, base_tenacity);
+    let mut state = PanelState::new(seed);
     let mut applied = false;
     enable_raw_mode()?;
     let loop_result = (|| -> io::Result<()> {
@@ -845,9 +961,14 @@ fn close_outcome(applied: bool, state: &PanelState) -> PanelOutcome {
     if applied && !state.is_noop() {
         state.apply();
         let persona = state.persona_action();
+        let model = state.chosen_model();
         match state.saved.clone() {
-            Some(name) => PanelOutcome::SavedAndApplied { name, persona },
-            None => PanelOutcome::Applied { persona },
+            Some(name) => PanelOutcome::SavedAndApplied {
+                name,
+                persona,
+                model,
+            },
+            None => PanelOutcome::Applied { persona, model },
         }
     } else {
         match state.saved.clone() {
@@ -876,17 +997,45 @@ mod tests {
         }
     }
 
+    fn model_choices(names: &[&str]) -> Vec<ModelChoice> {
+        names
+            .iter()
+            .map(|n| ModelChoice {
+                name: n.to_string(),
+                tag: String::new(),
+            })
+            .collect()
+    }
+
+    fn seed(
+        current: Option<&str>,
+        personas: Vec<PersonaChoice>,
+        base_ten: Tenacity,
+        models: Option<Vec<ModelChoice>>,
+        current_model: &str,
+    ) -> PanelSeed {
+        PanelSeed {
+            personas,
+            current_persona: current.map(str::to_string),
+            backend: Some("sol".to_string()),
+            base_tenacity: base_ten,
+            models,
+            current_model: current_model.to_string(),
+        }
+    }
+
     fn panel(
         current: Option<&str>,
         personas: Vec<PersonaChoice>,
         base_ten: Tenacity,
     ) -> PanelState {
-        PanelState::new(
+        PanelState::new(seed(
+            current,
             personas,
-            current.map(str::to_string),
-            Some("sol".to_string()),
             base_ten,
-        )
+            Some(model_choices(&["m1", "m2", "m3"])),
+            "m2",
+        ))
     }
 
     fn two_personas() -> Vec<PersonaChoice> {
@@ -920,6 +1069,7 @@ mod tests {
         let _g = GlobalSettingsGuard::acquire();
         set_cli_tenacity(Tenacity::Relentless);
         let mut s = panel(None, two_personas(), Tenacity::Standard);
+        s.down(); // → model
         s.down(); // → cognition
         s.down(); // → tenacity (currently Some(relentless) via cli_tenacity seed)
                   // Cycle left to the `auto` (None) position, then apply → override cleared.
@@ -1022,7 +1172,8 @@ mod tests {
         assert!(s.is_noop(), "row selection alone is not a change");
         // Touch the cognition dial: dirty even after cycling back — a deliberate
         // same-value re-apply is still an operator action.
-        s.down(); // persona → cognition
+        s.down(); // persona → model
+        s.down(); // model → cognition
         s.cycle(1);
         assert!(!s.is_noop(), "a touched dial is a change");
         s.cycle(-1);
@@ -1033,6 +1184,87 @@ mod tests {
             p.cycle(-1);
         }
         assert!(!p.is_noop(), "persona Clear is a change");
+        // A touched model spinner is a change too (#1666).
+        let mut m = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        m.down(); // persona → model
+        m.cycle(1);
+        assert!(!m.is_noop(), "a touched model spinner is a change");
+    }
+
+    #[test]
+    fn model_spinner_dials_served_models_and_reports_only_a_touched_pick() {
+        // #1666: the spinner opens ON the active model, ←/→ moves through the
+        // served list, and chosen_model() reports None until touched.
+        let _g = GlobalSettingsGuard::acquire();
+        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        assert_eq!(s.chosen_model(), None, "untouched spinner picks nothing");
+        assert!(
+            s.model_label().contains("m2") && s.model_label().contains("(active)"),
+            "opens on the active model: {}",
+            s.model_label()
+        );
+        s.down(); // persona → model
+        s.cycle(1); // m2 → m3
+        assert_eq!(s.chosen_model().as_deref(), Some("m3"));
+        // The pick rides the outcome through the REAL exit path.
+        assert_eq!(
+            close_outcome(true, &s),
+            PanelOutcome::Applied {
+                persona: PersonaAction::Keep,
+                model: Some("m3".to_string()),
+            }
+        );
+        assert!(
+            s.model_label().contains("(pending)"),
+            "a non-active position renders pending: {}",
+            s.model_label()
+        );
+        // Touched-back-to-original is still a deliberate re-apply pick.
+        s.cycle(-1);
+        assert_eq!(s.chosen_model().as_deref(), Some("m2"));
+        // Left edge clamps (no wrap): m2 → m1 → m1.
+        s.cycle(-1);
+        s.cycle(-1);
+        assert_eq!(s.chosen_model().as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn an_active_model_missing_from_the_served_list_is_appended_not_lost() {
+        // #1666: same guarantee as the persona ghost — the panel must open ON
+        // the active model even when the backend's list omits it, or Enter
+        // could apply a silently repositioned spinner.
+        let _g = GlobalSettingsGuard::acquire();
+        let s = PanelState::new(seed(
+            None,
+            two_personas(),
+            Tenacity::Standard,
+            Some(model_choices(&["m1", "m2"])),
+            "ghost-model",
+        ));
+        assert!(
+            s.model_label().contains("ghost-model")
+                && s.model_label().contains("(not served)")
+                && s.model_label().contains("(active)"),
+            "{}",
+            s.model_label()
+        );
+        assert_eq!(s.chosen_model(), None, "still untouched");
+    }
+
+    #[test]
+    fn an_unreachable_backend_disables_the_model_dial() {
+        // #1666: no served list → the row says why, won't dial, never picks.
+        let _g = GlobalSettingsGuard::acquire();
+        let mut s = PanelState::new(seed(None, two_personas(), Tenacity::Standard, None, "m2"));
+        assert!(
+            s.model_label().contains("unreachable"),
+            "{}",
+            s.model_label()
+        );
+        s.down(); // persona → model
+        s.cycle(1);
+        assert_eq!(s.chosen_model(), None, "cycling a dead row picks nothing");
+        assert!(s.is_noop(), "a dead model row cannot dirty the visit");
     }
 
     #[test]
@@ -1047,7 +1279,7 @@ mod tests {
             backend: None,
             crew: None,
         }];
-        let mut s = PanelState::new(personas, None, Some("sol".to_string()), Tenacity::Standard);
+        let mut s = PanelState::new(seed(None, personas, Tenacity::Standard, None, ""));
         s.cycle(1); // none → alice
         assert_eq!(
             s.projected_backend().as_deref(),
@@ -1105,6 +1337,7 @@ mod tests {
         let _g = GlobalSettingsGuard::acquire();
         let mut s = panel(None, two_personas(), Tenacity::Standard);
         // change a dial so we can prove it was NOT applied
+        s.down(); // model
         s.down(); // cognition
         s.cycle(1); // auto → off (dirty)
         assert!(s.cognition.is_dirty());
@@ -1224,14 +1457,16 @@ mod tests {
         // Tenacity-ONLY dirty + Enter → a real Applied, and the override is
         // actually written through apply().
         let mut t = panel(None, two_personas(), Tenacity::Standard);
-        t.down(); // persona → cognition
+        t.down(); // persona → model
+        t.down(); // model → cognition
         t.down(); // cognition → tenacity
         t.cycle(1); // standard → insistent (dirty)
         let out = close_outcome(true, &t);
         assert_eq!(
             out,
             PanelOutcome::Applied {
-                persona: PersonaAction::Keep
+                persona: PersonaAction::Keep,
+                model: None,
             }
         );
         assert_eq!(
