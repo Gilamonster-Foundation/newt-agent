@@ -101,3 +101,15 @@ panel is the psyche's primary interface, not a subcommand:
 This is slice 1 of the slash-consolidation epic (#1673); the panel's
 interaction grammar (↑↓ / ←→ / Enter / Esc / `:` commands) is the house
 standard the backend panel (#1667), sessions (#1668), and tabs (#1669) reuse.
+
+## Amendment 2026-08-13 (2) — model spinner row (#1666)
+
+The panel gains a **model row**: a ←/→ spinner over the active backend's
+served models (fetched by the caller before the panel opens — the panel stays
+network-free), tagged with cached conformance symbols. The pick rides the
+`PanelOutcome` and is applied by the session through the exact `/model` path
+(`apply_model_choice`: #1122 served-validation gate, #545 persistence rules,
+Ollama warmup), AFTER any persona reroute so the pick validates against the
+persona's backend. An unreachable backend renders the row inert; the active
+model is always selectable even when the served list omits it (ghost entry,
+same guarantee as the persona selector).

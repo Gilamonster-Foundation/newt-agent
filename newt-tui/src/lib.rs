@@ -161,12 +161,22 @@ pub(crate) fn run_psyche_panel(
     current_persona: Option<String>,
     backend: Option<String>,
     base_tenacity: newt_core::Tenacity,
+    models: Option<Vec<config_panel::ModelChoice>>,
+    current_model: &str,
     persist: impl FnMut(&str, &str, bool) -> config_panel::SaveResult,
     color: bool,
     verbose: bool,
 ) -> config_panel::PanelOutcome {
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        match config_panel::run(personas, current_persona, backend, base_tenacity, persist) {
+        match config_panel::run(
+            personas,
+            current_persona,
+            backend,
+            base_tenacity,
+            models,
+            current_model,
+            persist,
+        ) {
             Ok(outcome) => outcome,
             Err(e) => {
                 print_newt(&format!("psyche panel error: {e}"), color, verbose);
@@ -10331,6 +10341,9 @@ persona sets its own default via `cognition:`."
 
   /psyche                open the dial panel (TTY): ↑↓ select, ←→ dial,
                          Enter apply, Esc leave (nothing changed → just exits)
+                         rows: persona · model (spins the backend's served
+                         models, applied via the /model path) · cognition ·
+                         tenacity
   /psyche status         the read-only text view (also what piped/lean gets)
   /psyche cognition <level|off|auto|list>   text setter for the cognition dial
   /psyche tenacity <level|auto|list>        text setter for the tenacity dial
