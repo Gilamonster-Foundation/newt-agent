@@ -300,7 +300,11 @@ pub(crate) use terminal::run_pager;
 /// guard mid-unwind in a child process to prove the restoration claim against
 /// an actual terminal. Nothing in the shipping path constructs it directly —
 /// `run_pager` owns its lifetime.
-#[cfg(all(test, feature = "rich-tui"))]
+// unix as well as test: the sole consumer is `transcript_pager_pty_test`,
+// which is itself `cfg(all(test, unix, feature = "rich-tui"))` because a pty
+// pair is unix-only. Without the `unix` here the re-export is an unused
+// import on Windows, and this repo runs `-D warnings`.
+#[cfg(all(test, unix, feature = "rich-tui"))]
 pub(crate) use terminal::AltScreenGuard;
 
 #[cfg(feature = "rich-tui")]
