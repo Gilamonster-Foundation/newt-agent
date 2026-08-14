@@ -202,6 +202,15 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub ephemeral: bool,
 
+    /// #1671: resume a saved conversation by NAME (the title `/rename` set —
+    /// case-insensitive; a unique substring also works) or by id/prefix, in
+    /// this workspace. Equivalent to `NEWT_RESUME=<name>`; an explicit
+    /// `NEWT_CONVERSATION_ID` still wins, and a name that matches nothing or
+    /// several conversations is a hard error (never a silent fresh start).
+    /// In-session, bare `/resume` browses and `/rename <title>` names.
+    #[arg(long, global = true, value_name = "NAME", conflicts_with = "ephemeral")]
+    pub resume: Option<String>,
+
     /// When a tool call is denied by the session's permission caveats, ask
     /// interactively — allow once / allow for this session / deny — instead
     /// of failing the call outright (issue #263). Decisions are recorded to
@@ -1211,6 +1220,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             if cli.ephemeral {
                 unsafe { std::env::set_var("NEWT_EPHEMERAL", "1") };
             }
+            // #1671: --resume <name> threads the same way; the TUI resolves
+            // the name against the workspace store (title or id/prefix) and
+            // fails hard on a miss. clap already refuses --resume + --ephemeral.
+            if let Some(name) = cli.resume.as_deref() {
+                unsafe { std::env::set_var("NEWT_RESUME", name) };
+            }
             // --prompt-for-permissions threads the same way (issue #263);
             // only the interactive TUI reads it — worker/eval never prompt.
             if cli.prompt_for_permissions {
@@ -1998,6 +2013,19 @@ mod tests {
         assert!(cli.ephemeral);
         let cli = Cli::try_parse_from(["newt"]).unwrap();
         assert!(!cli.ephemeral);
+    }
+
+    /// #1671: `--resume <name>` parses bare and under `code`, defaults off,
+    /// and contradicting `--ephemeral` is unrepresentable at the parser.
+    #[test]
+    fn parses_resume_by_name_global() {
+        let cli = Cli::try_parse_from(["newt", "--resume", "mesh docking"]).unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("mesh docking"));
+        let cli = Cli::try_parse_from(["newt", "code", "--resume", "taxes"]).unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("taxes"));
+        assert!(Cli::try_parse_from(["newt"]).unwrap().resume.is_none());
+        // Resume-a-conversation and never-persist cannot both be meant.
+        assert!(Cli::try_parse_from(["newt", "--resume", "x", "--ephemeral"]).is_err());
     }
 
     // ── plan --one-shot (#646) ──────────────────────────────────────────
