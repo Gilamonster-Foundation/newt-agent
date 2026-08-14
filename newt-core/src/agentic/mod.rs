@@ -183,7 +183,7 @@ pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRu
 pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, newt_line, print_harness_notice,
-    print_list_item, print_newt, set_spill_lines, GaugeLevel, NEWT_ORANGE_CT,
+    print_list_item, print_newt, set_spill_lines, set_spill_summary, GaugeLevel, NEWT_ORANGE_CT,
 };
 pub use driver::{
     HeadlessCodeSearch, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
@@ -1672,6 +1672,7 @@ fn print_synthetic_tool_result(
         color,
         display::term_cols(),
         display::spill_lines(),
+        display::spill_summary(),
     );
     present_synthetic_tool_result(
         &mut tool_display,
@@ -10309,7 +10310,7 @@ mod repeat_call_guard_tests {
     fn loop_owned_tool_results_share_one_complete_spill_block() {
         let mut repeated = Vec::new();
         {
-            let mut display = display::ToolDisplay::new(&mut repeated, false, 80, 3);
+            let mut display = display::ToolDisplay::new(&mut repeated, false, 80, 3, false);
             present_synthetic_tool_result(
                 &mut display,
                 "find",
@@ -10330,7 +10331,7 @@ mod repeat_call_guard_tests {
 
         let mut budget = Vec::new();
         {
-            let mut display = display::ToolDisplay::new(&mut budget, false, 80, 3);
+            let mut display = display::ToolDisplay::new(&mut budget, false, 80, 3, false);
             present_synthetic_tool_result(
                 &mut display,
                 "tokens_left",

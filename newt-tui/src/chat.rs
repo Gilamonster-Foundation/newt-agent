@@ -987,6 +987,10 @@ pub(crate) fn run_chat(
     // `options.verbose || toolOutputExpanded` phase bug that motivated it.
     let mut spill_lines_override: Option<usize> =
         crate::initial_spill_override(crate::prompt::trace_mode(&cfg));
+    // #1640 Layer 1: per-session committed-result mode. `None` follows the
+    // surface default (rich collapses spilled results to a one-line summary,
+    // lean shows full output); `/spill summary` / `/spill excerpt` override.
+    let mut spill_summary_override: Option<bool> = None;
     // Human-only per-session override for the agentic loop's tool-call round
     // safety valve. `None` preserves config/model-tuning behavior exactly.
     let mut max_tool_rounds_override: Option<usize> = None;
@@ -1188,17 +1192,25 @@ pub(crate) fn run_chat(
     //  - otherwise (footer OFF via `-n` / `--plain` / `NEWT_FOOTER=off`, piped /
     //    headless, or a non-`rich-tui` build) → the dead-simple LEAN crossterm
     //    text box (issue #527), the flight/wyvern morphology.
+    // #1640: remember which morphology we chose. Only the RICH surface has an
+    // interactive spill viewport, so only it should collapse committed tool
+    // output into a truncated excerpt; the LEAN surface shows the whole thing
+    // (see `committed_spill_lines`).
+    let surface_is_rich;
     let mut surface: Box<dyn InputSurface> = {
         #[cfg(feature = "rich-tui")]
         {
             if footer_on && io::stdout().is_terminal() {
+                surface_is_rich = true;
                 Box::new(rich_input::RichSurface::new(history_path)?)
             } else {
+                surface_is_rich = false;
                 Box::new(lean_input::LeanSurface::new(history_path)?)
             }
         }
         #[cfg(not(feature = "rich-tui"))]
         {
+            surface_is_rich = false;
             Box::new(lean_input::LeanSurface::new(history_path)?)
         }
     };
@@ -2543,6 +2555,11 @@ pub(crate) fn run_chat(
                             &spill_status(
                                 configured,
                                 spill_lines_override,
+                                crate::effective_spill_summary(
+                                    crate::summary_recovery_available(surface_is_rich),
+                                    spill_summary_override,
+                                ),
+                                surface_is_rich,
                                 live_spill_eligibility(),
                             ),
                             color,
@@ -2555,45 +2572,46 @@ pub(crate) fn run_chat(
                     if slash_md == "spill" || slash_md.starts_with("spill ") {
                         let configured = spill_lines(&cfg);
                         match parse_spill_command(&task) {
-                            Ok(SpillCommand::Status) => print_newt(
-                                &spill_status(
-                                    configured,
-                                    spill_lines_override,
-                                    live_spill_eligibility(),
-                                ),
-                                color,
-                                verbose,
-                            ),
-                            Ok(SpillCommand::Set(rows)) => {
-                                spill_lines_override = Some(rows);
+                            // #1640 Layer 1: one pure transition for every
+                            // form (crate::apply_spill_command, pinned by
+                            // test) — Reset returns BOTH knobs to the surface
+                            // defaults.
+                            Ok(cmd) => {
+                                crate::apply_spill_command(
+                                    cmd,
+                                    &mut spill_lines_override,
+                                    &mut spill_summary_override,
+                                );
+                            }
+                            Err(e) => {
                                 print_newt(
-                                    &spill_status(
-                                        configured,
-                                        spill_lines_override,
-                                        live_spill_eligibility(),
+                                    &format!(
+                                        "error: {e} — use /spill [status|<rows>|reset|summary|excerpt]"
                                     ),
                                     color,
                                     verbose,
                                 );
+                                surface.save_history();
+                                println!();
+                                continue;
                             }
-                            Ok(SpillCommand::Reset) => {
-                                spill_lines_override = None;
-                                print_newt(
-                                    &spill_status(
-                                        configured,
-                                        spill_lines_override,
-                                        live_spill_eligibility(),
-                                    ),
-                                    color,
-                                    verbose,
-                                );
-                            }
-                            Err(e) => print_newt(
-                                &format!("error: {e} — use /spill [status|<rows>|reset]"),
-                                color,
-                                verbose,
-                            ),
                         }
+                        // One status line for every successful form — the same
+                        // report, so the four arms cannot drift apart.
+                        print_newt(
+                            &spill_status(
+                                configured,
+                                spill_lines_override,
+                                crate::effective_spill_summary(
+                                    crate::summary_recovery_available(surface_is_rich),
+                                    spill_summary_override,
+                                ),
+                                surface_is_rich,
+                                live_spill_eligibility(),
+                            ),
+                            color,
+                            verbose,
+                        );
                         surface.save_history();
                         println!();
                         continue;
@@ -4975,11 +4993,22 @@ pub(crate) fn run_chat(
                         .and_then(|_| git_head_short(workspace));
                     // #1235: publish the universal tool spill-view height for
                     // this turn (process-wide knob, output_budget precedent).
-                    let resolved_spill_lines =
+                    // #1640: on the LEAN surface the committed excerpt is the
+                    // whole record (no viewport to recover hidden lines), so
+                    // `committed_spill_lines` forces it unbounded there; only the
+                    // RICH surface collapses + offers the interactive viewport.
+                    let configured_spill_lines =
                         effective_spill_lines(spill_lines(&cfg), spill_lines_override);
-                    newt_core::set_spill_lines(resolved_spill_lines);
+                    // Review fix (#1663): the forced value applies to the
+                    // COMMITTED record only. The LIVE in-progress viewport keeps
+                    // the configured height on every surface — reusing the
+                    // forced 0 for the live gate below silently killed the lean
+                    // live viewport (#1235), which this PR must not change.
+                    let committed_view =
+                        committed_spill_lines(surface_is_rich, configured_spill_lines);
+                    newt_core::set_spill_lines(committed_view);
                     #[cfg(feature = "live-spill")]
-                    let live_spill = (resolved_spill_lines > 0 && live_spill_capable())
+                    let live_spill = (configured_spill_lines > 0 && live_spill_capable())
                         .then_some(())
                         .and_then(|()| {
                             // #1410: `stdout` now returns the `Arc` itself —
@@ -4987,10 +5016,27 @@ pub(crate) fn run_chat(
                             // `Arc<dyn Ephemeral>`, so the constructor owns the
                             // wrapping rather than leaving it to each caller.
                             crate::live_spill::LiveSpillRenderer::stdout(
-                                resolved_spill_lines,
+                                configured_spill_lines,
                                 color,
                             )
                         });
+                    // #1640 Layer 1 + review fix (#1663): publish the
+                    // committed-result mode AFTER the live renderer exists,
+                    // because the collapse's whole justification is "the
+                    // viewport + /spill vocabulary can recover the detail" —
+                    // so the default engages ONLY when this turn actually has
+                    // the completed-spill viewport (rich + live-spill built +
+                    // renderer constructed). Rich-but-piped, or live-spill
+                    // compiled out → no viewport → spilled results keep the
+                    // excerpt. The /spill summary override still forces it.
+                    #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
+                    let summary_recoverable = surface_is_rich && live_spill.is_some();
+                    #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
+                    let summary_recoverable = false;
+                    newt_core::set_spill_summary(crate::effective_spill_summary(
+                        summary_recoverable,
+                        spill_summary_override,
+                    ));
                     #[cfg(feature = "live-spill")]
                     let spill_input = live_spill
                         .as_deref()

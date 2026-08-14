@@ -506,8 +506,95 @@ fn spill_commands_parse_expected_forms() {
         parse_spill_command("/spill reset").unwrap(),
         SpillCommand::Reset
     );
+    // #1640 Layer 1: the mode switches.
+    assert_eq!(
+        parse_spill_command("/spill summary").unwrap(),
+        SpillCommand::Summary
+    );
+    assert_eq!(
+        parse_spill_command("/spill excerpt").unwrap(),
+        SpillCommand::Excerpt
+    );
     assert!(parse_spill_command("/spillage 7").is_err());
     assert!(parse_spill_command("/spill many").is_err());
+}
+
+/// #1640 Layer 1: the summary default follows the SURFACE — rich collapses
+/// (its /spill vocabulary can recover detail), lean never does (it shows full
+/// output) — and the session override wins over both.
+#[test]
+fn spill_summary_defaults_to_the_surface_and_override_wins() {
+    assert!(effective_spill_summary(true, None), "rich collapses");
+    assert!(
+        !effective_spill_summary(false, None),
+        "lean never collapses"
+    );
+    assert!(
+        !effective_spill_summary(true, Some(false)),
+        "/spill excerpt"
+    );
+    assert!(effective_spill_summary(false, Some(true)), "/spill summary");
+
+    // `/spill status` names the mode — and its escape hatch — when it is on,
+    // and stays byte-identical to the historical string when it is off.
+    let on = spill_status(3, None, true, true, SpillEligibility::Available);
+    assert!(
+        on.contains("results collapse to a summary line (/spill excerpt restores rows)"),
+        "{on}"
+    );
+    let off = spill_status(3, None, false, true, SpillEligibility::Available);
+    assert!(!off.contains("summary line"), "{off}");
+}
+
+#[test]
+fn spill_status_never_claims_a_collapse_that_cannot_engage() {
+    // #1663 review F3/F9: the mode clause is guarded like the renderer is.
+    // (i) lean: committed rendering is forced full, so even summary=true
+    // (a /spill summary override) must not claim collapse — and the status
+    // says plainly that committed results print in full there.
+    let lean = spill_status(3, None, true, false, SpillEligibility::Available);
+    assert!(!lean.contains("summary line"), "{lean}");
+    assert!(
+        lean.contains("committed results always print in full"),
+        "{lean}"
+    );
+    // (ii) rich after /spill 0: unbounded view never collapses.
+    let unbounded = spill_status(3, Some(0), true, true, SpillEligibility::Available);
+    assert!(!unbounded.contains("summary line"), "{unbounded}");
+    // Rich with rows > 0 keeps the honest claim (guard must not over-suppress).
+    let rich = spill_status(3, None, true, true, SpillEligibility::Available);
+    assert!(rich.contains("summary line"), "{rich}");
+    assert!(!rich.contains("print in full"), "{rich}");
+}
+
+#[test]
+fn spill_reset_clears_both_session_knobs() {
+    // #1663 review F12: Reset returns BOTH knobs to surface defaults; the
+    // other forms each touch only the knob they own.
+    let mut lines = Some(7usize);
+    let mut summary = Some(true);
+    apply_spill_command(SpillCommand::Reset, &mut lines, &mut summary);
+    assert_eq!((lines, summary), (None, None), "Reset clears BOTH");
+
+    apply_spill_command(SpillCommand::Set(5), &mut lines, &mut summary);
+    assert_eq!(
+        (lines, summary),
+        (Some(5), None),
+        "Set leaves the mode alone"
+    );
+
+    apply_spill_command(SpillCommand::Summary, &mut lines, &mut summary);
+    assert_eq!((lines, summary), (Some(5), Some(true)), "Summary sets mode");
+
+    apply_spill_command(SpillCommand::Excerpt, &mut lines, &mut summary);
+    assert_eq!((lines, summary), (Some(5), Some(false)));
+
+    apply_spill_command(SpillCommand::Status, &mut lines, &mut summary);
+    assert_eq!(
+        (lines, summary),
+        (Some(5), Some(false)),
+        "Status is read-only"
+    );
 }
 
 #[test]
@@ -629,22 +716,45 @@ fn spill_override_resolves_and_reports_live_capability() {
     assert_eq!(effective_spill_lines(3, Some(7)), 7);
     assert_eq!(effective_spill_lines(3, Some(0)), 0);
     assert_eq!(
-        spill_status(3, None, SpillEligibility::Available),
+        spill_status(3, None, false, true, SpillEligibility::Available),
         "spill rows: 3 (config default; live interaction available)"
     );
     // #1412: the unavailable arm now NAMES the refusing gate instead of saying
     // only "unavailable" — that silence is why a stale install was reported as
     // a vanished feature.
     assert_eq!(
-        spill_status(3, Some(7), SpillEligibility::StdoutNotTty),
+        spill_status(3, Some(7), false, true, SpillEligibility::StdoutNotTty),
         "spill rows: 7 this session (config default 3; live interaction unavailable: \
          stdout is not a terminal (piped or redirected))"
     );
     assert_eq!(
-        spill_status(3, Some(0), SpillEligibility::Available),
+        spill_status(3, Some(0), false, true, SpillEligibility::Available),
         "spill rows: unbounded this session (config default 3; live viewport disabled: \
          spill_lines is 0 (/spill <n> raises it))"
     );
+}
+
+/// #1640: the committed tool-output excerpt is collapsed ONLY on the rich
+/// surface — the surface that can recover the hidden lines through an
+/// interactive viewport. The lean surface (the plain scroller) has no scroll
+/// region, so its excerpt is the whole record and must be shown in full.
+#[test]
+fn committed_excerpt_is_full_on_lean_and_collapsed_on_rich() {
+    const CONFIGURED: usize = 3;
+
+    // Rich keeps the configured height (a viewport backs the truncation)…
+    assert_eq!(committed_spill_lines(true, CONFIGURED), CONFIGURED);
+    // …and honours an explicit /spill 0 (unbounded) unchanged.
+    assert_eq!(committed_spill_lines(true, 0), 0);
+
+    // Lean is ALWAYS unbounded regardless of the configured height — there is
+    // no scrollable region on the plain scroller (#1640), so a "▲ N more lines
+    // above · /spill N" excerpt would hide output the surface cannot reveal.
+    // 0 is `spill_view_lines`' existing "print every line" contract (proven in
+    // newt-core's own display tests), so lean reuses that path unchanged.
+    assert_eq!(committed_spill_lines(false, CONFIGURED), 0);
+    assert_eq!(committed_spill_lines(false, 42), 0);
+    assert_eq!(committed_spill_lines(false, 0), 0);
 }
 
 /// #1412: every refusal reason reaches the operator, and zero rows is reported
@@ -661,7 +771,7 @@ fn spill_status_names_the_gate_that_refused() {
         (SpillEligibility::StdoutNotTty, "stdout is not a terminal"),
         (SpillEligibility::TermDumb, "TERM=dumb"),
     ] {
-        let status = spill_status(3, None, eligibility);
+        let status = spill_status(3, None, false, true, eligibility);
         assert!(
             status.contains(needle),
             "{eligibility:?} must surface {needle:?} to the operator, got: {status}"
@@ -670,7 +780,7 @@ fn spill_status_names_the_gate_that_refused() {
 
     // Rows are a separate axis from capability: a capable terminal with zero
     // rows must not be reported as an incapable terminal.
-    let zero = spill_status(0, None, SpillEligibility::Available);
+    let zero = spill_status(0, None, false, true, SpillEligibility::Available);
     assert!(zero.contains("spill_lines is 0"), "{zero}");
     assert!(
         !zero.contains("unavailable"),

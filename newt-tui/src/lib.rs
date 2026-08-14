@@ -7421,6 +7421,31 @@ enum SpillCommand {
     Status,
     Set(usize),
     Reset,
+    /// #1640 Layer 1: collapse spilled tool results to a one-line marker.
+    Summary,
+    /// #1640 Layer 1: restore the multi-row excerpt.
+    Excerpt,
+}
+
+/// Apply a parsed `/spill` command to the two session overrides. Pure and
+/// separately pinned (review fix on #1663): `Reset` must clear BOTH knobs —
+/// the row override AND the summary/excerpt mode — returning the session to
+/// its surface defaults; nothing else touches the knob it doesn't own.
+fn apply_spill_command(
+    cmd: SpillCommand,
+    lines_override: &mut Option<usize>,
+    summary_override: &mut Option<bool>,
+) {
+    match cmd {
+        SpillCommand::Status => {}
+        SpillCommand::Set(rows) => *lines_override = Some(rows),
+        SpillCommand::Summary => *summary_override = Some(true),
+        SpillCommand::Excerpt => *summary_override = Some(false),
+        SpillCommand::Reset => {
+            *lines_override = None;
+            *summary_override = None;
+        }
+    }
 }
 
 fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
@@ -7442,6 +7467,8 @@ fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
     match arg.to_ascii_lowercase().as_str() {
         "" | "show" | "status" => Ok(SpillCommand::Status),
         "reset" | "default" | "config" | "auto" => Ok(SpillCommand::Reset),
+        "summary" | "collapse" => Ok(SpillCommand::Summary),
+        "excerpt" | "expand" | "rows" => Ok(SpillCommand::Excerpt),
         _ => arg
             .parse::<usize>()
             .map(SpillCommand::Set)
@@ -7553,6 +7580,36 @@ fn effective_spill_lines(configured: usize, session_override: Option<usize>) -> 
     session_override.unwrap_or(configured)
 }
 
+/// #1640: how many rows the *committed* tool-output excerpt keeps for THIS
+/// surface. The excerpt is only worth truncating when there is an interactive
+/// viewport to recover the hidden lines — i.e. the RICH surface. The LEAN
+/// surface (`--plain` / `-n` / piped / headless / a non-`rich-tui` build) has
+/// no scrollable regions at all (decision: the plain scroller), so its excerpt
+/// IS the whole durable record and must be shown in full. Collapsing it there
+/// only hides output behind a `/spill N` re-render the lean surface cannot even
+/// scroll — the exact regression #1640 reports.
+///
+/// So: pass the configured height through on rich; force `0` (unbounded) on
+/// lean. `0` is `spill_view_lines`' existing "print every line" contract, so no
+/// new code path is introduced — this only chooses the argument.
+fn committed_spill_lines(surface_is_rich: bool, configured: usize) -> usize {
+    if surface_is_rich {
+        configured
+    } else {
+        0
+    }
+}
+
+/// #1640 Layer 1: whether committed tool results collapse to a one-line
+/// summary marker on THIS surface. The default is the surface itself — rich
+/// collapses (its viewport + `/spill` vocabulary can recover the detail), lean
+/// never does (it shows FULL output, the same reasoning as
+/// [`committed_spill_lines`]) — and `/spill summary` / `/spill excerpt` set the
+/// session override on the same single-knob pattern as `spill_lines_override`.
+fn effective_spill_summary(surface_is_rich: bool, session_override: Option<bool>) -> bool {
+    session_override.unwrap_or(surface_is_rich)
+}
+
 /// #1434: `--trace` SEEDS the session detail knob instead of sitting beside it.
 ///
 /// newt already has a session-wide detail level — `SPILL_LINES`, config-seeded
@@ -7641,9 +7698,17 @@ impl SpillEligibility {
 fn spill_status(
     configured: usize,
     session_override: Option<usize>,
+    summary: bool,
+    surface_is_rich: bool,
     eligibility: SpillEligibility,
 ) -> String {
     let effective = effective_spill_lines(configured, session_override);
+    // Review fix (#1663): status must describe what rendering will DO, not
+    // just echo the knobs — on lean the committed record is forced full, and
+    // collapse cannot engage when the committed view is unbounded (lean, or
+    // rich after `/spill 0`), so the mode clause is guarded the same way the
+    // renderer is.
+    let committed = committed_spill_lines(surface_is_rich, effective);
     let rows = if effective == 0 {
         "unbounded".to_string()
     } else {
@@ -7662,7 +7727,39 @@ fn spill_status(
     } else {
         eligibility.explain()
     };
-    format!("spill rows: {rows}{source}; {live})")
+    let lean_note = if !surface_is_rich && effective != 0 {
+        "; committed results always print in full on this surface"
+    } else {
+        ""
+    };
+    // #1640 Layer 1: name the committed-result mode so `/spill status` answers
+    // "why is my tool output one line" (or "why is it five").
+    let mode = if summary && committed != 0 {
+        "; results collapse to a summary line (/spill excerpt restores rows)"
+    } else {
+        ""
+    };
+    format!("spill rows: {rows}{source}; {live}{lean_note}{mode})")
+}
+
+/// Whether the committed-collapse default can honestly engage this session:
+/// the rich surface with the completed-spill viewport buildable (feature
+/// compiled + terminal capable). Shared by `/spill status` so the status line
+/// and the turn-head seeding (`summary_recoverable` in `run_chat`, which
+/// additionally requires the renderer to have actually constructed) cannot
+/// drift apart. Review fix on #1663.
+fn summary_recovery_available(surface_is_rich: bool) -> bool {
+    // `live_spill_capable` itself only exists under live-spill, so the whole
+    // conjunction is cfg-split rather than short-circuited with `cfg!`.
+    #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
+    {
+        surface_is_rich && live_spill_capable()
+    }
+    #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
+    {
+        let _ = surface_is_rich;
+        false
+    }
 }
 
 fn live_spill_eligibility() -> SpillEligibility {
@@ -10509,12 +10606,14 @@ was launched in unless overridden."
         }
         "spill" => {
             "\
-/spill [status|N|reset] — control bounded tool-output rows for this session
+/spill [status|N|reset|summary|excerpt] — tool-output rows for this session
 
   /spill                 show the effective row count and live availability
   /spill <N>             set collapsed live and completed rows for later tools
   /spill reset           return to the configured [tui] spill_lines value
   /spill 0               disable live display; show completed output unbounded
+  /spill summary         collapse spilled results to one line (rich default)
+  /spill excerpt         restore the multi-row excerpt for spilled results
 
 While a tool is active, Up/Down scroll retained output. Space or Enter toggles
 the boundary: ⧉ expands up to the terminal's safe capacity; ▣ collapses it."
@@ -10822,7 +10921,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /tenacity [level|list]   - how hard to push from reading to acting (relaxed→relentless)",
         "  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)",
-        "  /spill [status|N|reset]  - collapsed live/completed tool rows (0 = unbounded completion only)",
+        "  /spill [status|N|reset|summary|excerpt] - tool rows / one-line collapse",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",

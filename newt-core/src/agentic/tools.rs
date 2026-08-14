@@ -3511,6 +3511,7 @@ pub(crate) async fn execute_tool_with_collaborators(
         color,
         super::display::term_cols(),
         super::display::spill_lines(),
+        super::display::spill_summary(),
     );
     // Thread the completed spill renderer for Rich TUI interactive viewport (#1640)
     if let Some(ref renderer) = collab.completed_spill_renderer {
@@ -7883,7 +7884,7 @@ mod tests {
             "stderr": "",
         });
         let store = content_spill::SessionSpillStore::new([7u8; 16]);
-        let mut display = ToolDisplay::new(Vec::new(), false, 80, 3);
+        let mut display = ToolDisplay::new(Vec::new(), false, 80, 3, false);
         display.call("run_command", "large-output-command");
         let out =
             shell_envelope_output(&envelope, 50, false, true, Some(&store), Some(&mut display));
@@ -7927,7 +7928,7 @@ mod tests {
             "stdout": "",
             "stderr": "",
         });
-        let mut display = ToolDisplay::new(Vec::new(), false, 80, 3);
+        let mut display = ToolDisplay::new(Vec::new(), false, 80, 3, false);
         display.call("run_command", "exit 3");
         let out = shell_envelope_output(&envelope, 50, false, false, None, Some(&mut display));
         display.result(&out);
@@ -9884,7 +9885,8 @@ mod execute_tool_branch_tests {
         let caveats = caveats_rw(ws.path());
         let args = serde_json::json!({"path": "must-not-exist.txt", "content": "blocked"});
         let cancel = std::sync::atomic::AtomicBool::new(true);
-        let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3);
+        let mut display =
+            crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
 
         let out = execute_tool_with_display_cancellable(
             &mut display,
@@ -10271,7 +10273,8 @@ mod execute_tool_branch_tests {
         artifact_context: Option<ArtifactReadContext<'_>>,
         live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     ) -> (String, String) {
-        let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3);
+        let mut display =
+            crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
         // Mechanics helper: authorize the tool it is told to run (the MCP-auth
         // tests use `run_remote_gated` instead). Post the `mcp-under-leash`
         // name-grant closure an MCP call needs a structural grant; for a built-in
@@ -12632,7 +12635,8 @@ mod execute_tool_branch_tests {
         };
         let mut gate = MockGate::new(true, &denied);
         let sink = std::sync::Arc::new(LifecycleOutput::default());
-        let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3);
+        let mut display =
+            crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
         let out = exec_confined_command(
             // Use an external executable under every engine. Bare `echo` is a
             // Brush builtin and therefore correctly needs no exec grant.
