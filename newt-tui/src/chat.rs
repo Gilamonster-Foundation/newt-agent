@@ -1600,9 +1600,19 @@ pub(crate) fn run_chat(
         ),
     };
     tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
-    newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::SessionStarted {
-        session_id: ctx.session_id.clone(),
-    });
+    // #1662: declare ownership BEFORE announcing the start, so the two
+    // infrastructure emitters that have no session handle — the tty arbiter's
+    // Blocked/Unblocked and tool dispatch's ToolActivity — attribute their
+    // events to this session from the first one. The start itself is emitted
+    // with an explicit id rather than relying on the cell, so it is
+    // self-describing regardless of ownership ordering.
+    newt_core::lifecycle::set_active_session(ctx.session_id.clone());
+    newt_core::lifecycle::emit_for(
+        Some(ctx.session_id.clone()),
+        newt_core::lifecycle::LifecycleEvent::SessionStarted {
+            session_id: ctx.session_id.clone(),
+        },
+    );
 
     // Build system prompt now that SoulProvider has loaded its soul file.
     system = rebuild_system_prompt(
@@ -3470,6 +3480,20 @@ pub(crate) fn run_chat(
                         pending_clarification = None;
                         ephemeral_artifact_store =
                             session_artifact_store(ephemeral_session, &active_conversation_id)?;
+                        // #1662: `/new` (and its aliases) re-anchor the session,
+                        // so integrations must be told the NEW id. Ownership is
+                        // moved first for the same reason as at startup, then the
+                        // start is announced explicitly. A burst of these
+                        // coalesces downstream — the reporter tracks desired vs
+                        // delivered identity, so Herdr converges on the newest id
+                        // rather than being walked through every intermediate one.
+                        newt_core::lifecycle::set_active_session(active_conversation_id.clone());
+                        newt_core::lifecycle::emit_for(
+                            Some(active_conversation_id.clone()),
+                            newt_core::lifecycle::LifecycleEvent::SessionStarted {
+                                session_id: active_conversation_id.clone(),
+                            },
+                        );
                         // #1030: pre-title a `/start <title>` conversation by
                         // creating its (empty) record up front, so it appears in
                         // `/resume` with that title immediately; the first turn

@@ -888,7 +888,7 @@ mod tests {
             if std::thread::current().id() == me {
                 sink.lock()
                     .unwrap()
-                    .push((event.clone(), prompt_stdin_active()));
+                    .push((event.event.clone(), prompt_stdin_active()));
             }
         });
 

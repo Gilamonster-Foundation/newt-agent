@@ -16,9 +16,17 @@
 //!   and a branch, so a build with no integration behaves exactly like one
 //!   without this module. [`observed`] lets a call site skip even the cost of
 //!   *building* an event.
-//! - **An observer cannot break the agent.** Observer calls run under
-//!   [`std::panic::catch_unwind`]; a panicking integration loses its own
-//!   event, not the session.
+//! - **Observers are TRUSTED SYNCHRONOUS CALLBACKS, and only panics are
+//!   isolated.** Observer calls run under [`std::panic::catch_unwind`], so a
+//!   panicking integration loses its own event rather than the session. That
+//!   is the whole of the guarantee: an observer that *blocks* — a lock it
+//!   waits on, an I/O call, a sleep — blocks the agent's hot path, because
+//!   [`emit`] calls it inline on the emitting thread. This seam does not spawn,
+//!   time out, or queue on an observer's behalf. An integration that needs to
+//!   do work must enqueue and return (see `newt-tui::herdr`, which folds into
+//!   shared state and nudges a worker thread). Earlier wording here claimed an
+//!   observer "cannot break the agent", which overstated it: a blocking
+//!   observer can, and no mechanism here prevents that.
 //!
 //! The event vocabulary is deliberately semantic. Every variant corresponds to
 //! a place in the agent where that thing demonstrably happens — an accepted
@@ -62,10 +70,47 @@ pub enum LifecycleEvent {
     SessionEnded,
 }
 
-type Observer = Arc<dyn Fn(&LifecycleEvent) + Send + Sync>;
+/// An event together with the session it belongs to.
+///
+/// Session identity rides EVERY event, not just [`LifecycleEvent::SessionStarted`]
+/// — an integration that watches one session must be able to reject another
+/// session's `Thinking` without having tracked a start it may never have seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleEnvelope {
+    /// The session this event belongs to, when one is established.
+    ///
+    /// `None` only before any session has been announced (early startup) or
+    /// after [`clear_active_session`]. It is not a wildcard: a filtered
+    /// subscription does not receive `None`-scoped events.
+    pub session_id: Option<String>,
+    pub event: LifecycleEvent,
+}
 
-/// Registered observers, keyed by subscription id.
-static OBSERVERS: RwLock<Vec<(u64, Observer)>> = RwLock::new(Vec::new());
+type Observer = Arc<dyn Fn(&LifecycleEnvelope) + Send + Sync>;
+
+/// Registered observers, keyed by subscription id, each with the session it
+/// wants (`None` = every session).
+static OBSERVERS: RwLock<Vec<(u64, Option<String>, Observer)>> = RwLock::new(Vec::new());
+
+/// The session that currently OWNS the agent — the one whose turn is running
+/// and whose prompt owns the terminal.
+///
+/// Why an ambient cell rather than a handle threaded to every call site: two
+/// emitters live in process-global infrastructure that has no session and
+/// cannot be given one without changes outside this seam —
+/// `tty::arbiter::notify_prompt_observer` (the line arbiter is a singleton by
+/// construction: one terminal, one writer) and `agentic::announce_tool_activity`
+/// (deep in tool dispatch). For those two, attribution to the owning session is
+/// not a guess: a `PromptWindow` blocks whichever session holds the terminal,
+/// and a tool call runs inside whichever session's turn is executing, and the
+/// REPL runs turns synchronously so exactly one session can be in either state.
+///
+/// What would invalidate it: genuinely parallel turns inside ONE process. Tabs
+/// (#1669) do not — the ADR keeps one active tab with synchronous turns — but a
+/// future that runs two turns concurrently in-process must replace this cell
+/// with a real per-session context, and the call sites above are the two that
+/// would need plumbing. Separate processes are unaffected: each has its own.
+static ACTIVE_SESSION: RwLock<Option<String>> = RwLock::new(None);
 /// Mirror of `OBSERVERS.len()`, so the (overwhelmingly common) unobserved
 /// case costs one relaxed load and never touches the lock.
 static COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -82,7 +127,7 @@ pub struct Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         let mut guard = OBSERVERS.write().unwrap_or_else(PoisonError::into_inner);
-        guard.retain(|(id, _)| *id != self.id);
+        guard.retain(|(id, _, _)| *id != self.id);
         COUNT.store(guard.len(), Ordering::Release);
     }
 }
@@ -92,12 +137,54 @@ impl Drop for Subscription {
 /// The observer runs **on the emitting thread** — the agent's thread. It must
 /// therefore be bounded and non-blocking: enqueue, or update a cell, and
 /// return. Anything slower belongs on the observer's own thread.
-pub fn subscribe(observer: impl Fn(&LifecycleEvent) + Send + Sync + 'static) -> Subscription {
+pub fn subscribe(observer: impl Fn(&LifecycleEnvelope) + Send + Sync + 'static) -> Subscription {
+    register(None, Arc::new(observer))
+}
+
+/// Subscribe to ONE session's events. Events from any other session — and
+/// unscoped (`None`) events — are not delivered.
+///
+/// This is what keeps concurrent integrations honest: session B's `Waiting`
+/// cannot move session A's state machine, and A's `SessionEnded` cannot shut
+/// B's reporting down, because B's observer never sees them.
+pub fn subscribe_session(
+    session_id: impl Into<String>,
+    observer: impl Fn(&LifecycleEnvelope) + Send + Sync + 'static,
+) -> Subscription {
+    register(Some(session_id.into()), Arc::new(observer))
+}
+
+fn register(want: Option<String>, observer: Observer) -> Subscription {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let mut guard = OBSERVERS.write().unwrap_or_else(PoisonError::into_inner);
-    guard.push((id, Arc::new(observer)));
+    guard.push((id, want, observer));
     COUNT.store(guard.len(), Ordering::Release);
     Subscription { id }
+}
+
+/// Declare which session owns the agent from now on. Called when a session
+/// starts or is re-anchored by `/new`; see [`ACTIVE_SESSION`] for why the two
+/// infrastructure emitters need it.
+pub fn set_active_session(session_id: impl Into<String>) {
+    *ACTIVE_SESSION
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = Some(session_id.into());
+}
+
+/// Forget the owning session (the session ended and nothing replaced it).
+pub fn clear_active_session() {
+    *ACTIVE_SESSION
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+/// The session that currently owns the agent, if any.
+#[must_use]
+pub fn active_session() -> Option<String> {
+    ACTIVE_SESSION
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// Is anyone listening? Call sites that would have to allocate to build an
@@ -107,21 +194,45 @@ pub fn observed() -> bool {
     COUNT.load(Ordering::Acquire) > 0
 }
 
-/// Announce an event. Returns as soon as every observer has been handed it.
+/// Announce an event, attributed to the session that currently owns the agent.
+/// Returns as soon as every matching observer has been handed it.
 pub fn emit(event: LifecycleEvent) {
     if !observed() {
         return;
     }
-    // Clone the (cheap, refcounted) observer list and release the lock before
-    // calling out: an observer that re-enters `subscribe`/`emit` must not
-    // deadlock against the registry.
+    emit_for(active_session(), event);
+}
+
+/// Announce an event attributed to an EXPLICIT session — for call sites that
+/// hold the id and should not depend on the ambient owner. `SessionStarted`
+/// uses this, so a start is always self-describing even if the ownership cell
+/// has not been updated yet.
+pub fn emit_for(session_id: Option<String>, event: LifecycleEvent) {
+    if !observed() {
+        return;
+    }
+    let envelope = LifecycleEnvelope { session_id, event };
+    // Clone the (cheap, refcounted) matching observers and release the lock
+    // before calling out: an observer that re-enters `subscribe`/`emit` must
+    // not deadlock against the registry.
     let observers: Vec<Observer> = {
         let guard = OBSERVERS.read().unwrap_or_else(PoisonError::into_inner);
-        guard.iter().map(|(_, o)| Arc::clone(o)).collect()
+        guard
+            .iter()
+            .filter(|(_, want, _)| match want {
+                // Unfiltered subscription: everything, including unscoped.
+                None => true,
+                // Filtered: this session only. An unscoped event is NOT a
+                // wildcard — it belongs to no session, so it matches none.
+                Some(want) => envelope.session_id.as_deref() == Some(want.as_str()),
+            })
+            .map(|(_, _, o)| Arc::clone(o))
+            .collect()
     };
     for observer in observers {
-        // An integration's bug is the integration's problem.
-        let _ = catch_unwind(AssertUnwindSafe(|| observer(&event)));
+        // A panicking integration loses its own event. A BLOCKING one blocks
+        // the agent — see the module docs; that is not isolated here.
+        let _ = catch_unwind(AssertUnwindSafe(|| observer(&envelope)));
     }
 }
 
@@ -130,7 +241,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// A collector that records only events emitted by the calling thread.
+    /// A collector that records only envelopes emitted by the calling thread.
     /// The registry is process-global, so sibling tests (and the tty arbiter's
     /// own tests) emit concurrently; filtering by thread makes each test's
     /// expectations exact without serializing the suite.
@@ -140,7 +251,20 @@ mod tests {
         let mine = std::thread::current().id();
         let sub = subscribe(move |e| {
             if std::thread::current().id() == mine {
-                sink.lock().unwrap().push(e.clone());
+                sink.lock().unwrap().push(e.event.clone());
+            }
+        });
+        (sub, seen)
+    }
+
+    /// The same, scoped to ONE session id.
+    fn session_collector(id: &str) -> (Subscription, Arc<Mutex<Vec<LifecycleEvent>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mine = std::thread::current().id();
+        let sub = subscribe_session(id, move |e| {
+            if std::thread::current().id() == mine {
+                sink.lock().unwrap().push(e.event.clone());
             }
         });
         (sub, seen)
@@ -180,31 +304,148 @@ mod tests {
             .read()
             .unwrap()
             .iter()
-            .any(|(entry, _)| *entry == id));
+            .any(|(entry, _, _)| *entry == id));
         drop(sub);
         assert!(
             !OBSERVERS
                 .read()
                 .unwrap()
                 .iter()
-                .any(|(entry, _)| *entry == id),
+                .any(|(entry, _, _)| *entry == id),
             "drop must unregister exactly this observer"
         );
     }
 
     #[test]
+    fn every_event_carries_its_session_not_just_the_start() {
+        // The defect this closes: identity used to ride SessionStarted alone,
+        // so an integration that attached mid-session could not attribute a
+        // single later event.
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mine = std::thread::current().id();
+        let sub = subscribe(move |e| {
+            if std::thread::current().id() == mine {
+                sink.lock().unwrap().push(e.session_id.clone());
+            }
+        });
+        emit_for(Some("sess-A".into()), LifecycleEvent::Thinking);
+        emit_for(Some("sess-A".into()), LifecycleEvent::TurnCompleted);
+        drop(sub);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("sess-A".to_string()), Some("sess-A".to_string())],
+            "identity rides every event"
+        );
+    }
+
+    // ── adversarial concurrent sessions (#1662) ───────────────────────────
+    //
+    // Two integrations, one process, one registry. Each must be deaf to the
+    // other's session. These drive the REAL subscribe/emit seam rather than a
+    // hand-rolled filter, so a regression in the matcher fails them.
+
+    #[test]
+    fn a_thinking_does_not_reach_b() {
+        let (sub_a, a) = session_collector("A");
+        let (sub_b, b) = session_collector("B");
+        emit_for(Some("A".into()), LifecycleEvent::Thinking);
+        drop(sub_a);
+        drop(sub_b);
+        assert_eq!(*a.lock().unwrap(), vec![LifecycleEvent::Thinking]);
+        assert!(
+            b.lock().unwrap().is_empty(),
+            "B must not observe A's Thinking"
+        );
+    }
+
+    #[test]
+    fn b_waiting_does_not_reach_a() {
+        let (sub_a, a) = session_collector("A");
+        let (sub_b, b) = session_collector("B");
+        emit_for(Some("B".into()), LifecycleEvent::Waiting);
+        drop(sub_a);
+        drop(sub_b);
+        assert_eq!(*b.lock().unwrap(), vec![LifecycleEvent::Waiting]);
+        assert!(
+            a.lock().unwrap().is_empty(),
+            "A must not observe B's Waiting — B going idle cannot idle A"
+        );
+    }
+
+    #[test]
+    fn a_session_ended_does_not_end_b_and_b_keeps_reporting() {
+        let (sub_a, a) = session_collector("A");
+        let (sub_b, b) = session_collector("B");
+        emit_for(Some("A".into()), LifecycleEvent::SessionEnded);
+        // B must still be live afterwards — the shutdown was not contagious.
+        emit_for(Some("B".into()), LifecycleEvent::TurnStarted);
+        emit_for(Some("B".into()), LifecycleEvent::TurnCompleted);
+        drop(sub_a);
+        drop(sub_b);
+        assert_eq!(*a.lock().unwrap(), vec![LifecycleEvent::SessionEnded]);
+        assert_eq!(
+            *b.lock().unwrap(),
+            vec![LifecycleEvent::TurnStarted, LifecycleEvent::TurnCompleted],
+            "B continues reporting after A ended"
+        );
+    }
+
+    #[test]
+    fn an_unscoped_event_is_not_a_wildcard() {
+        // `None` means "belongs to no session", not "belongs to all of them".
+        // Treating it as a wildcard would hand every filtered integration the
+        // early-startup events of a session that is not theirs.
+        let (sub_a, a) = session_collector("A");
+        let (sub_all, all) = collector();
+        emit_for(None, LifecycleEvent::Waiting);
+        drop(sub_a);
+        drop(sub_all);
+        assert!(a.lock().unwrap().is_empty(), "filtered gets nothing");
+        assert_eq!(
+            *all.lock().unwrap(),
+            vec![LifecycleEvent::Waiting],
+            "unfiltered still gets it"
+        );
+    }
+
+    #[test]
+    fn the_active_session_stamps_the_infrastructure_emitters() {
+        // `emit` (no explicit id) is what tty::arbiter and tool dispatch call.
+        // It must attribute to whoever owns the agent.
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        let (sub, seen) = session_collector("owner");
+        set_active_session("owner");
+        emit(LifecycleEvent::Blocked);
+        clear_active_session();
+        emit(LifecycleEvent::Unblocked); // now unscoped — must not arrive
+        drop(sub);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![LifecycleEvent::Blocked],
+            "scoped while owned; unscoped after clearing"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(panic_hook)]
     fn a_panicking_observer_cannot_break_the_agent() {
+        // Serialized on `panic_hook`: this swaps the PROCESS-GLOBAL panic hook
+        // to keep test output clean, and doing that while a sibling test is
+        // panicking (or asserting) would silence or corrupt its report. The
+        // lane is the smallest correct fix — the alternative, leaving the hook
+        // alone, floods the suite output with an intentional panic.
         let (sub, seen) = collector();
         let boom = subscribe(|_| panic!("integration bug"));
         let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // keep the test output clean
+        std::panic::set_hook(Box::new(|_| {}));
         emit(LifecycleEvent::Waiting);
         std::panic::set_hook(hook);
         drop(boom);
         drop(sub);
         assert_eq!(
-            *seen.lock().unwrap(),
-            vec![LifecycleEvent::Waiting],
+            seen.lock().unwrap().last(),
+            Some(&LifecycleEvent::Waiting),
             "the surviving observer still receives the event"
         );
     }

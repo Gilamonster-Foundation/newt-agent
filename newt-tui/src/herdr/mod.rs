@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use newt_core::lifecycle::{self, LifecycleEvent, Subscription};
+use newt_core::lifecycle::{self, LifecycleEnvelope, LifecycleEvent, Subscription};
 
 use protocol::{Call, PaneAgentState, SessionStartSource};
 use transport::{Sink, SocketSink};
@@ -185,6 +185,14 @@ impl Machine {
 #[derive(Debug)]
 struct Inner {
     machine: Machine,
+    /// The session id Herdr SHOULD know about, and how it started. Desired
+    /// state, not an event: `/new` overwrites it, so a burst of restarts
+    /// coalesces to the newest identity instead of queueing every one.
+    desired_session: Option<(String, SessionStartSource)>,
+    /// The session id Herdr has been told SUCCESSFULLY. Only a delivered call
+    /// updates this, so a transient failure leaves `desired != delivered` and
+    /// the next wake retries — identity converges instead of being lost.
+    delivered_session: Option<String>,
     oneshots: VecDeque<Call>,
     /// Wake tokens dropped because the worker was busy. Diagnostic only —
     /// correctness never depends on a wake arriving.
@@ -210,21 +218,54 @@ impl Adapter {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Is this envelope for the session this pane tracks?
+    ///
+    /// `SessionStarted` always passes — it is how a pane adopts or re-anchors
+    /// its session. Otherwise only an event explicitly scoped to a DIFFERENT
+    /// session is rejected.
+    ///
+    /// Unscoped (`None`) events are ACCEPTED, deliberately. They come from
+    /// emitters that ran before ownership was declared (or after it was
+    /// cleared), and a pane hosts one session, so treating them as foreign
+    /// would silently drop real state updates — a much worse failure than
+    /// attributing a startup event to the session that is about to own the
+    /// pane. Rejection is reserved for the case we can actually prove wrong:
+    /// a named session that is not ours.
+    fn belongs_here(inner: &Inner, envelope: &LifecycleEnvelope) -> bool {
+        if matches!(envelope.event, LifecycleEvent::SessionStarted { .. }) {
+            return true;
+        }
+        match (&inner.desired_session, &envelope.session_id) {
+            (Some((mine, _)), Some(theirs)) => mine == theirs,
+            _ => true,
+        }
+    }
+
     /// Fold one lifecycle event in. Bounded: a lock, a pure transition, and a
     /// non-blocking wake. Called on the agent's thread.
-    fn on_event(&self, event: &LifecycleEvent) {
+    ///
+    /// A pane hosts ONE session at a time, so this adopts the session named by
+    /// `SessionStarted` (re-anchoring on `/new`) and then IGNORES events
+    /// belonging to any other session. Without that filter a second session in
+    /// the same process would drive this pane's state machine and, worse, its
+    /// `SessionEnded` would shut this reporter down (#1662).
+    fn on_event(&self, envelope: &LifecycleEnvelope) {
         {
             let mut inner = self.lock();
+            if !Self::belongs_here(&inner, envelope) {
+                return;
+            }
+            let event = &envelope.event;
             match event {
                 LifecycleEvent::SessionStarted { session_id } => {
-                    push_oneshot(
-                        &mut inner,
-                        protocol::report_agent_session(
-                            &self.pane,
-                            session_id,
-                            SessionStartSource::Startup,
-                        ),
-                    );
+                    // Desired state, NOT a one-shot (#1662). The old path
+                    // pushed the call onto the bounded oneshot queue, where a
+                    // transient delivery failure dropped it permanently and a
+                    // full queue dropped the NEWEST identity — the one `/new`
+                    // had just established. Recording intent instead lets the
+                    // worker retry until Herdr actually knows, and lets a
+                    // later start overwrite an earlier one.
+                    inner.desired_session = Some((session_id.clone(), SessionStartSource::Startup));
                     if let Some(title) = &self.title {
                         push_oneshot(
                             &mut inner,
@@ -299,6 +340,9 @@ enum Step {
     Stop,
     /// A one-shot call; delivered at most once, dropped if it fails.
     Once(Call),
+    /// The session identity Herdr should have; marked delivered only on
+    /// success, so it converges across transient failures.
+    Session(String, Call),
     /// The current desired state; marked delivered only on success.
     State(Report, Call),
     /// Nothing to do; wait for the next wake.
@@ -309,6 +353,14 @@ fn next_step(inner: &Arc<Mutex<Inner>>, pane: &str) -> Step {
     let mut guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
     if guard.shutdown {
         return Step::Stop;
+    }
+    // Identity first: a state report Herdr attributes to a stale session is
+    // worse than one that arrives a wake later.
+    if let Some((id, source)) = guard.desired_session.clone() {
+        if guard.delivered_session.as_deref() != Some(id.as_str()) {
+            let call = protocol::report_agent_session(pane, &id, source);
+            return Step::Session(id, call);
+        }
     }
     if let Some(call) = guard.oneshots.pop_front() {
         return Step::Once(call);
@@ -341,6 +393,19 @@ fn worker_loop(
                 }
                 Step::Once(call) => {
                     let _ = sink.deliver(&call);
+                }
+                Step::Session(id, call) => {
+                    if sink.deliver(&call) {
+                        inner
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .delivered_session = Some(id);
+                    } else {
+                        // Undelivered: `desired` still differs from
+                        // `delivered`, so the next wake retries. One attempt
+                        // per wake — bounded, no spin.
+                        break;
+                    }
                 }
                 Step::State(report, call) => {
                     if sink.deliver(&call) {
@@ -379,6 +444,8 @@ impl Reporter {
     fn spawn(env: &HerdrEnv, title: Option<String>, sink: Box<dyn Sink>) -> (Self, Adapter) {
         let inner = Arc::new(Mutex::new(Inner {
             machine: Machine::new(),
+            desired_session: None,
+            delivered_session: None,
             oneshots: VecDeque::new(),
             coalesced: 0,
             shutdown: false,
@@ -470,10 +537,22 @@ pub(crate) fn session_guard(workspace: &str) -> SessionGuard {
 
 fn install(env: &HerdrEnv, title: Option<String>, sink: Box<dyn Sink>) -> SessionGuard {
     let (reporter, adapter) = Reporter::spawn(env, title, sink);
-    let subscription = lifecycle::subscribe(move |event| adapter.on_event(event));
+    let subscription = lifecycle::subscribe(move |envelope| adapter.on_event(envelope));
     SessionGuard {
         subscription: Some(subscription),
         reporter: Some(reporter),
+    }
+}
+
+#[cfg(test)]
+impl Adapter {
+    /// Test shim: deliver a bare event as an envelope. `session` is the
+    /// session it belongs to — `None` means unscoped (early startup).
+    fn on_bare(&self, session: Option<&str>, event: LifecycleEvent) {
+        self.on_event(&LifecycleEnvelope {
+            session_id: session.map(str::to_string),
+            event,
+        });
     }
 }
 
@@ -673,7 +752,7 @@ mod tests {
             LifecycleEvent::TurnFailed { reason: None },
             LifecycleEvent::TurnCancelled,
         ] {
-            adapter.on_event(&event);
+            adapter.on_bare(None, event);
             // One event at a time so every intermediate state is observable;
             // coalescing is exercised in its own test.
             assert!(eventually(|| worker_is_idle(&reporter.inner)));
@@ -731,7 +810,7 @@ mod tests {
             LifecycleEvent::Unblocked,
             LifecycleEvent::Unblocked, // unbalanced: ignored
         ] {
-            adapter.on_event(&event);
+            adapter.on_bare(None, event);
             assert!(eventually(|| worker_is_idle(&reporter.inner)));
         }
         reporter.shutdown();
@@ -766,21 +845,24 @@ mod tests {
         let (adapter, mut reporter) = harness(sink.clone());
 
         // Let the worker enter `deliver` and block there.
-        adapter.on_event(&LifecycleEvent::TurnStarted);
+        adapter.on_bare(None, LifecycleEvent::TurnStarted);
         std::thread::sleep(Duration::from_millis(20));
 
         const FLOOD: usize = 20_000;
         let start = Instant::now();
         for i in 0..FLOOD {
-            adapter.on_event(&if i % 2 == 0 {
-                LifecycleEvent::Thinking
-            } else {
-                LifecycleEvent::ToolActivity {
-                    tool: "read_file".into(),
-                }
-            });
+            adapter.on_bare(
+                None,
+                if i % 2 == 0 {
+                    LifecycleEvent::Thinking
+                } else {
+                    LifecycleEvent::ToolActivity {
+                        tool: "read_file".into(),
+                    }
+                },
+            );
         }
-        adapter.on_event(&LifecycleEvent::Waiting); // the LAST word
+        adapter.on_bare(None, LifecycleEvent::Waiting); // the LAST word
         let elapsed = start.elapsed();
         // The qualitative proof is that this line is reached at all: the sink
         // is STILL blocked, so a design that waited on delivery would never
@@ -827,11 +909,11 @@ mod tests {
     fn a_failed_delivery_is_redelivered() {
         let sink = FakeSink::failing(2);
         let (adapter, mut reporter) = harness(sink.clone());
-        adapter.on_event(&LifecycleEvent::TurnStarted);
+        adapter.on_bare(None, LifecycleEvent::TurnStarted);
         assert!(eventually(|| sink.count() >= 1));
-        adapter.on_event(&LifecycleEvent::TurnStarted); // same state again
+        adapter.on_bare(None, LifecycleEvent::TurnStarted); // same state again
         assert!(eventually(|| sink.states().len() >= 2));
-        adapter.on_event(&LifecycleEvent::TurnStarted);
+        adapter.on_bare(None, LifecycleEvent::TurnStarted);
         assert!(eventually(|| {
             let states = sink.states();
             states.len() >= 3 && states.iter().all(|s| s == "working")
@@ -846,7 +928,7 @@ mod tests {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let (adapter, mut reporter) = harness(FakeSink::panicking());
-        adapter.on_event(&LifecycleEvent::TurnStarted);
+        adapter.on_bare(None, LifecycleEvent::TurnStarted);
         assert!(eventually(|| reporter
             .worker
             .as_ref()
@@ -854,8 +936,8 @@ mod tests {
 
         let start = Instant::now();
         for _ in 0..1_000 {
-            adapter.on_event(&LifecycleEvent::Thinking);
-            adapter.on_event(&LifecycleEvent::Waiting);
+            adapter.on_bare(None, LifecycleEvent::Thinking);
+            adapter.on_bare(None, LifecycleEvent::Waiting);
         }
         let elapsed = start.elapsed();
         std::panic::set_hook(hook);
@@ -877,7 +959,7 @@ mod tests {
     fn shutdown_releases_authority_last() {
         let sink = FakeSink::new();
         let (adapter, mut reporter) = harness(sink.clone());
-        adapter.on_event(&LifecycleEvent::TurnStarted);
+        adapter.on_bare(None, LifecycleEvent::TurnStarted);
         assert!(eventually(|| !sink.states().is_empty()));
         reporter.shutdown();
         let seen = sink.seen();
@@ -896,7 +978,7 @@ mod tests {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
         let (adapter, mut reporter) = harness(FakeSink::gated(&gate));
-        adapter.on_event(&LifecycleEvent::TurnStarted);
+        adapter.on_bare(None, LifecycleEvent::TurnStarted);
         std::thread::sleep(Duration::from_millis(20));
         let t0 = Instant::now();
         reporter.shutdown();
@@ -914,7 +996,7 @@ mod tests {
     fn a_dropped_adapter_still_releases_authority() {
         let sink = FakeSink::new();
         let (adapter, mut reporter) = harness(sink.clone());
-        adapter.on_event(&LifecycleEvent::TurnStarted);
+        adapter.on_bare(None, LifecycleEvent::TurnStarted);
         assert!(eventually(|| !sink.states().is_empty()));
         let worker = reporter.worker.take().unwrap();
         drop(adapter);
@@ -939,5 +1021,157 @@ mod tests {
         lifecycle::emit(LifecycleEvent::Waiting);
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(sink.count(), after, "a dropped guard receives nothing more");
+    }
+    // ── #1662: session scoping and convergent identity ────────────────────
+
+    /// Deliver a `SessionStarted` for `id`, then wait for it to reach the sink.
+    fn start_session(adapter: &Adapter, reporter: &Reporter, id: &str) {
+        adapter.on_bare(
+            Some(id),
+            LifecycleEvent::SessionStarted {
+                session_id: id.into(),
+            },
+        );
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+    }
+
+    #[test]
+    fn session_identity_survives_transient_delivery_failure() {
+        // The old path pushed `report_agent_session` as a one-shot: a single
+        // failed deliver dropped the identity for good. Desired-vs-delivered
+        // makes it converge.
+        let sink = FakeSink::failing(2);
+        let calls = Arc::clone(&sink.calls);
+        let (adapter, reporter) = harness(sink);
+
+        adapter.on_bare(
+            Some("s1"),
+            LifecycleEvent::SessionStarted {
+                session_id: "s1".into(),
+            },
+        );
+        // One retry per wake, so nudge while polling. Racing the worker with a
+        // fixed number of un-awaited sends is what made the first draft of
+        // this test flaky-by-construction.
+        assert!(eventually(|| {
+            adapter.on_bare(Some("s1"), LifecycleEvent::Waiting);
+            reporter.inner.lock().unwrap().delivered_session.as_deref() == Some("s1")
+        }));
+        assert_eq!(
+            reporter.inner.lock().unwrap().delivered_session.as_deref(),
+            Some("s1"),
+            "identity converges despite two failed deliveries"
+        );
+        let sessions = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.method == "pane.report_agent_session")
+            .count();
+        assert!(
+            sessions >= 3,
+            "the failed attempts were retried, not dropped (saw {sessions})"
+        );
+    }
+
+    #[test]
+    fn new_coalesces_to_the_newest_session_id() {
+        // `/new` in a burst: Herdr must end up knowing the LAST id, and must
+        // not be walked through every intermediate one.
+        let sink = FakeSink::new();
+        let calls = Arc::clone(&sink.calls);
+        let (adapter, reporter) = harness(sink);
+
+        for id in ["s1", "s2", "s3"] {
+            adapter.on_bare(
+                Some(id),
+                LifecycleEvent::SessionStarted {
+                    session_id: id.into(),
+                },
+            );
+        }
+        assert!(eventually(|| reporter
+            .inner
+            .lock()
+            .unwrap()
+            .delivered_session
+            .as_deref()
+            == Some("s3")));
+        assert_eq!(
+            reporter.inner.lock().unwrap().delivered_session.as_deref(),
+            Some("s3"),
+            "the newest identity wins"
+        );
+        let ids: Vec<String> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.method == "pane.report_agent_session")
+            .filter_map(|c| {
+                c.params
+                    .get("agent_session_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            ids.last().map(String::as_str),
+            Some("s3"),
+            "last reported id is the newest, saw {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_thinking_does_not_reach_b() {
+        let sink = FakeSink::new();
+        let (adapter, reporter) = harness(sink);
+        start_session(&adapter, &reporter, "B");
+        // A's Thinking arrives at B's pane adapter and must be ignored.
+        adapter.on_bare(Some("A"), LifecycleEvent::Thinking);
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        assert_eq!(
+            reporter.inner.lock().unwrap().machine.logical.0,
+            PaneAgentState::Idle,
+            "A's Thinking must not put B's pane to Working"
+        );
+    }
+
+    #[test]
+    fn b_waiting_does_not_reach_a() {
+        let sink = FakeSink::new();
+        let (adapter, reporter) = harness(sink);
+        start_session(&adapter, &reporter, "A");
+        adapter.on_bare(Some("A"), LifecycleEvent::TurnStarted);
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        // B going idle must not idle A.
+        adapter.on_bare(Some("B"), LifecycleEvent::Waiting);
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        assert_eq!(
+            reporter.inner.lock().unwrap().machine.logical.0,
+            PaneAgentState::Working,
+            "B's Waiting must not idle A's pane"
+        );
+    }
+
+    #[test]
+    fn a_session_ended_does_not_shut_down_b_and_b_keeps_reporting() {
+        let sink = FakeSink::new();
+        let (adapter, reporter) = harness(sink);
+        start_session(&adapter, &reporter, "B");
+        // A ends. B's reporter must survive it.
+        adapter.on_bare(Some("A"), LifecycleEvent::SessionEnded);
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        assert!(
+            !reporter.inner.lock().unwrap().shutdown,
+            "A's SessionEnded must not shut down B's reporter"
+        );
+        // …and B still reports afterwards.
+        adapter.on_bare(Some("B"), LifecycleEvent::TurnStarted);
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        assert_eq!(
+            reporter.inner.lock().unwrap().machine.logical.0,
+            PaneAgentState::Working,
+            "B continues reporting after A ended"
+        );
     }
 }
