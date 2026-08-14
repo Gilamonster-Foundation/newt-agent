@@ -159,8 +159,17 @@ const FIELDS: [Field; 6] = [
 /// The kind dial's ladder: auto (probe at connect) → the HTTP wire kinds. The
 /// in-process `embedded` kind is deliberately absent — it has no endpoint and
 /// belongs to `newt setup`.
-const KIND_LADDER: [Option<BackendKind>; 3] =
-    [None, Some(BackendKind::Ollama), Some(BackendKind::Openai)];
+///
+/// EVERY HTTP kind must appear here: [`FormState::edit`] resolves the dial by
+/// `position()`, so a kind missing from the ladder would prefill at index 0
+/// ("auto") and silently downgrade a PINNED kind to probe-at-connect on an
+/// unrelated save — see the anthropic regression test below.
+const KIND_LADDER: [Option<BackendKind>; 4] = [
+    None,
+    Some(BackendKind::Ollama),
+    Some(BackendKind::Openai),
+    Some(BackendKind::Anthropic),
+];
 
 fn kind_label(kind: Option<BackendKind>) -> &'static str {
     match kind {
@@ -314,6 +323,18 @@ impl PanelState {
                 self.status = Some(format!(
                     "'{n}' lives inline in config.toml — edit that file (the panel edits \
                      ~/.newt/backends/ drop-ins)"
+                ));
+            }
+            // A kind the dial cannot represent (today: `embedded`, which has no
+            // endpoint and belongs to `newt setup`) must REFUSE the form rather
+            // than open one whose kind row silently reads back as something
+            // else — the form overlays `kind` on every save, so an
+            // unrepresentable kind could only be saved as a corruption.
+            (BackendSelection::Named(n), true) if !KIND_LADDER.contains(&opt.kind) => {
+                let label = kind_label(opt.kind);
+                self.status = Some(format!(
+                    "'{n}' is a {label} backend — the panel edits http backends only; \
+                     edit ~/.newt/backends/{n}.toml"
                 ));
             }
             (BackendSelection::Named(_), true) => {
@@ -1143,6 +1164,75 @@ mod tests {
             panic!("form")
         };
         assert_eq!(form.name, "brand-new");
+    }
+
+    #[test]
+    fn editing_an_anthropic_backend_round_trips_its_pinned_kind() {
+        // Regression (#1683 retarget review): `BackendKind::Anthropic` was
+        // missing from KIND_LADDER, so editing an anthropic drop-in prefilled
+        // the kind dial at "auto (probe)" and an unrelated save (e.g. a model
+        // change) silently downgraded the PINNED kind to probe-at-connect —
+        // exactly the config corruption the six-field overlay contract forbids.
+        let mut s = PanelState::new(PanelSeed {
+            options: vec![BackendOption {
+                name: "claude".to_string(),
+                selection: BackendSelection::Named("claude".to_string()),
+                editable: true,
+                kind: Some(BackendKind::Anthropic),
+                endpoint: "https://api.anthropic.com".to_string(),
+                model: None,
+                api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+                api_key_file: None,
+            }],
+            active: Some(0),
+        });
+        s.begin_edit();
+        let Mode::Form(form) = &s.mode else {
+            panic!("edit should open the form");
+        };
+        assert_eq!(
+            kind_label(KIND_LADDER[form.kind_idx]),
+            "anthropic",
+            "the kind dial prefills at the drop-in's pinned kind"
+        );
+        let mut seen: Vec<BackendEdit> = Vec::new();
+        let mut persist = |edit: &BackendEdit| {
+            seen.push(edit.clone());
+            BackendSaveResult::Saved {
+                note: String::new(),
+            }
+        };
+        assert!(s.submit_form(&mut persist));
+        assert_eq!(
+            seen[0].kind,
+            Some(BackendKind::Anthropic),
+            "an untouched kind dial round-trips the pinned kind"
+        );
+    }
+
+    #[test]
+    fn editing_a_kind_the_dial_cannot_represent_is_refused_not_downgraded() {
+        // The same class of bug, fail-closed for the kinds the panel does not
+        // model: `embedded` has no endpoint, so the six-field form could only
+        // ever save it as a corruption. Refuse with a visible status instead.
+        let mut s = PanelState::new(PanelSeed {
+            options: vec![BackendOption {
+                name: "local".to_string(),
+                selection: BackendSelection::Named("local".to_string()),
+                editable: true,
+                kind: Some(BackendKind::Embedded),
+                endpoint: String::new(),
+                model: None,
+                api_key_env: None,
+                api_key_file: None,
+            }],
+            active: Some(0),
+        });
+        s.begin_edit();
+        assert!(matches!(s.mode, Mode::Choose), "no form opens");
+        let status = s.status.as_deref().unwrap_or_default();
+        assert!(status.contains("embedded"), "{status}");
+        assert!(status.contains("http backends only"), "{status}");
     }
 
     #[test]
