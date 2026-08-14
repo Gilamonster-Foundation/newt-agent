@@ -507,11 +507,33 @@ pub(crate) fn spill_view_lines(output: &str, view: usize, columns: usize) -> Vec
     out
 }
 
+/// Whether `output` spills past a `view`-row budget at `columns` — the SAME
+/// wrapped-rows accounting [`spill_view_lines`] spends (#1433), so the
+/// collapse decision and the excerpt truncation can never disagree. (Review
+/// fix on #1663: the collapse previously counted LOGICAL lines, so a result
+/// of a few heavily-wrapped lines was truncated by the excerpt path yet
+/// refused to collapse in summary mode.) `view == 0` never spills (unbounded).
+pub(crate) fn spills_past(output: &str, view: usize, columns: usize) -> bool {
+    if view == 0 {
+        return false;
+    }
+    let content_width = columns.saturating_sub(2).max(1);
+    let mut used = 0usize;
+    for l in output.lines() {
+        used += wrap_to_width(l, content_width).len().max(1);
+        if used > view {
+            return true;
+        }
+    }
+    false
+}
+
 /// #1640 Layer 1 (meta-scroller): the ONE-LINE collapse of a committed tool
 /// result — `▲ {n} lines · {tail} · {SPILL_RECOVERY_HINT}` — used in summary
-/// mode when the output spills past the `view` budget. Returns `None` when the
-/// output fits (≤ `view` logical lines) or `view` is 0 (unbounded): those keep
-/// the normal render, so a short result never collapses into pointless
+/// mode when the output spills past the `view` budget, measured in WRAPPED
+/// rows via [`spills_past`] (the excerpt path's own accounting). Returns
+/// `None` when the output fits or `view` is 0 (unbounded): those keep the
+/// normal render, so a short result never collapses into pointless
 /// indirection and `/spill 0` still means "show everything".
 ///
 /// The tail (the last non-empty line — where errors and results live) is
@@ -519,13 +541,10 @@ pub(crate) fn spill_view_lines(output: &str, view: usize, columns: usize) -> Vec
 /// entirely when fewer than 8 columns remain for it. Interpolates
 /// [`SPILL_RECOVERY_HINT`] per the #1433 single-recovery-path doctrine.
 pub(crate) fn spill_summary_line(output: &str, view: usize, columns: usize) -> Option<String> {
-    if view == 0 {
+    if !spills_past(output, view, columns) {
         return None;
     }
     let total = output.lines().count();
-    if total <= view {
-        return None;
-    }
     let tail = output
         .lines()
         .rev()
@@ -1325,6 +1344,81 @@ mod tests {
              painted — render-before-commit would put the frame above its own \
              record: {seen:?}"
         );
+    }
+
+    /// #1663 review F13: in SUMMARY mode the committed record is the one-line
+    /// marker, but the completed viewport must still receive the FULL output —
+    /// the marker's whole justification is that the viewport recovers detail.
+    #[test]
+    fn summary_mode_commits_the_marker_but_the_viewport_gets_full_output() {
+        let terminal = SharedBuf::default();
+        let renderer = std::sync::Arc::new(RecordingRenderer::watching(terminal.clone()));
+        let mut display = super::ToolDisplay::new(terminal.clone(), false, 80, 3, true);
+        display.set_completed_spill_renderer(renderer.clone());
+
+        let output = "l1\nl2\nl3\nl4\nl5\nERROR: tail\n";
+        display.result(output);
+
+        let committed = terminal.contents();
+        assert!(
+            committed.contains("▲ 6 lines"),
+            "the committed record is the collapsed marker: {committed}"
+        );
+        assert!(
+            !committed.contains("l1"),
+            "the hidden body is NOT in the committed record: {committed}"
+        );
+        assert_eq!(
+            renderer.rendered.lock().unwrap().as_slice(),
+            [output],
+            "the viewport rendered the FULL output, not the marker"
+        );
+    }
+
+    /// #1663 review F14: summary mode is confined to result() — the
+    /// in-progress presentation events (preview/document) keep their full
+    /// behavior with a summary=true ToolDisplay.
+    #[test]
+    fn summary_mode_leaves_preview_and_document_untouched() {
+        use super::ToolPresentation as _;
+        let terminal = SharedBuf::default();
+        let mut display = super::ToolDisplay::new(terminal.clone(), false, 80, 3, true);
+        let body = "p1\np2\np3\np4\np5\n";
+        display.preview(body, 10);
+        display.document(body);
+        let out = terminal.contents();
+        for l in ["p1", "p2", "p3", "p4", "p5"] {
+            assert!(out.contains(l), "preview/document keep full lines: {out}");
+        }
+        assert!(
+            !out.contains("▲ 5 lines"),
+            "no collapse marker outside result(): {out}"
+        );
+    }
+
+    /// #1663 review F4: the collapse predicate spends WRAPPED rows exactly like
+    /// the excerpt path (#1433) — a result of few logical lines but heavy
+    /// wrapping collapses in summary mode instead of falling back to a
+    /// truncated excerpt.
+    #[test]
+    fn collapse_uses_wrapped_row_accounting_like_the_excerpt() {
+        // 2 logical lines, but the first wraps to many rows at 20 columns.
+        let long = format!("{}\nshort tail\n", "x".repeat(200));
+        assert!(super::spills_past(&long, 3, 20), "wrapped rows spill");
+        assert!(
+            super::spill_summary_line(&long, 3, 20).is_some(),
+            "summary engages on wrapped spill (logical-line count would say no)"
+        );
+        // Parity with the excerpt: what the excerpt truncates, summary collapses.
+        let excerpt = super::spill_view_lines(&long, 3, 20);
+        assert!(
+            excerpt[0].starts_with('▲'),
+            "excerpt path truncates the same input: {excerpt:?}"
+        );
+        // And a genuinely fitting result engages neither.
+        let fits = "a\nb\n";
+        assert!(!super::spills_past(fits, 3, 80));
+        assert!(super::spill_summary_line(fits, 3, 80).is_none());
     }
 
     /// The NEXT tool's header dismisses a still-active viewport BEFORE any

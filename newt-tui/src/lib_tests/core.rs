@@ -537,13 +537,64 @@ fn spill_summary_defaults_to_the_surface_and_override_wins() {
 
     // `/spill status` names the mode — and its escape hatch — when it is on,
     // and stays byte-identical to the historical string when it is off.
-    let on = spill_status(3, None, true, SpillEligibility::Available);
+    let on = spill_status(3, None, true, true, SpillEligibility::Available);
     assert!(
         on.contains("results collapse to a summary line (/spill excerpt restores rows)"),
         "{on}"
     );
-    let off = spill_status(3, None, false, SpillEligibility::Available);
+    let off = spill_status(3, None, false, true, SpillEligibility::Available);
     assert!(!off.contains("summary line"), "{off}");
+}
+
+#[test]
+fn spill_status_never_claims_a_collapse_that_cannot_engage() {
+    // #1663 review F3/F9: the mode clause is guarded like the renderer is.
+    // (i) lean: committed rendering is forced full, so even summary=true
+    // (a /spill summary override) must not claim collapse — and the status
+    // says plainly that committed results print in full there.
+    let lean = spill_status(3, None, true, false, SpillEligibility::Available);
+    assert!(!lean.contains("summary line"), "{lean}");
+    assert!(
+        lean.contains("committed results always print in full"),
+        "{lean}"
+    );
+    // (ii) rich after /spill 0: unbounded view never collapses.
+    let unbounded = spill_status(3, Some(0), true, true, SpillEligibility::Available);
+    assert!(!unbounded.contains("summary line"), "{unbounded}");
+    // Rich with rows > 0 keeps the honest claim (guard must not over-suppress).
+    let rich = spill_status(3, None, true, true, SpillEligibility::Available);
+    assert!(rich.contains("summary line"), "{rich}");
+    assert!(!rich.contains("print in full"), "{rich}");
+}
+
+#[test]
+fn spill_reset_clears_both_session_knobs() {
+    // #1663 review F12: Reset returns BOTH knobs to surface defaults; the
+    // other forms each touch only the knob they own.
+    let mut lines = Some(7usize);
+    let mut summary = Some(true);
+    apply_spill_command(SpillCommand::Reset, &mut lines, &mut summary);
+    assert_eq!((lines, summary), (None, None), "Reset clears BOTH");
+
+    apply_spill_command(SpillCommand::Set(5), &mut lines, &mut summary);
+    assert_eq!(
+        (lines, summary),
+        (Some(5), None),
+        "Set leaves the mode alone"
+    );
+
+    apply_spill_command(SpillCommand::Summary, &mut lines, &mut summary);
+    assert_eq!((lines, summary), (Some(5), Some(true)), "Summary sets mode");
+
+    apply_spill_command(SpillCommand::Excerpt, &mut lines, &mut summary);
+    assert_eq!((lines, summary), (Some(5), Some(false)));
+
+    apply_spill_command(SpillCommand::Status, &mut lines, &mut summary);
+    assert_eq!(
+        (lines, summary),
+        (Some(5), Some(false)),
+        "Status is read-only"
+    );
 }
 
 #[test]
@@ -665,19 +716,19 @@ fn spill_override_resolves_and_reports_live_capability() {
     assert_eq!(effective_spill_lines(3, Some(7)), 7);
     assert_eq!(effective_spill_lines(3, Some(0)), 0);
     assert_eq!(
-        spill_status(3, None, false, SpillEligibility::Available),
+        spill_status(3, None, false, true, SpillEligibility::Available),
         "spill rows: 3 (config default; live interaction available)"
     );
     // #1412: the unavailable arm now NAMES the refusing gate instead of saying
     // only "unavailable" — that silence is why a stale install was reported as
     // a vanished feature.
     assert_eq!(
-        spill_status(3, Some(7), false, SpillEligibility::StdoutNotTty),
+        spill_status(3, Some(7), false, true, SpillEligibility::StdoutNotTty),
         "spill rows: 7 this session (config default 3; live interaction unavailable: \
          stdout is not a terminal (piped or redirected))"
     );
     assert_eq!(
-        spill_status(3, Some(0), false, SpillEligibility::Available),
+        spill_status(3, Some(0), false, true, SpillEligibility::Available),
         "spill rows: unbounded this session (config default 3; live viewport disabled: \
          spill_lines is 0 (/spill <n> raises it))"
     );
@@ -720,7 +771,7 @@ fn spill_status_names_the_gate_that_refused() {
         (SpillEligibility::StdoutNotTty, "stdout is not a terminal"),
         (SpillEligibility::TermDumb, "TERM=dumb"),
     ] {
-        let status = spill_status(3, None, false, eligibility);
+        let status = spill_status(3, None, false, true, eligibility);
         assert!(
             status.contains(needle),
             "{eligibility:?} must surface {needle:?} to the operator, got: {status}"
@@ -729,7 +780,7 @@ fn spill_status_names_the_gate_that_refused() {
 
     // Rows are a separate axis from capability: a capable terminal with zero
     // rows must not be reported as an incapable terminal.
-    let zero = spill_status(0, None, false, SpillEligibility::Available);
+    let zero = spill_status(0, None, false, true, SpillEligibility::Available);
     assert!(zero.contains("spill_lines is 0"), "{zero}");
     assert!(
         !zero.contains("unavailable"),

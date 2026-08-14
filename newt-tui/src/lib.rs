@@ -7427,6 +7427,27 @@ enum SpillCommand {
     Excerpt,
 }
 
+/// Apply a parsed `/spill` command to the two session overrides. Pure and
+/// separately pinned (review fix on #1663): `Reset` must clear BOTH knobs —
+/// the row override AND the summary/excerpt mode — returning the session to
+/// its surface defaults; nothing else touches the knob it doesn't own.
+fn apply_spill_command(
+    cmd: SpillCommand,
+    lines_override: &mut Option<usize>,
+    summary_override: &mut Option<bool>,
+) {
+    match cmd {
+        SpillCommand::Status => {}
+        SpillCommand::Set(rows) => *lines_override = Some(rows),
+        SpillCommand::Summary => *summary_override = Some(true),
+        SpillCommand::Excerpt => *summary_override = Some(false),
+        SpillCommand::Reset => {
+            *lines_override = None;
+            *summary_override = None;
+        }
+    }
+}
+
 fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
     let body = input.trim().trim_start_matches('/').trim();
     let Some(rest) = body.strip_prefix("spill") else {
@@ -7678,9 +7699,16 @@ fn spill_status(
     configured: usize,
     session_override: Option<usize>,
     summary: bool,
+    surface_is_rich: bool,
     eligibility: SpillEligibility,
 ) -> String {
     let effective = effective_spill_lines(configured, session_override);
+    // Review fix (#1663): status must describe what rendering will DO, not
+    // just echo the knobs — on lean the committed record is forced full, and
+    // collapse cannot engage when the committed view is unbounded (lean, or
+    // rich after `/spill 0`), so the mode clause is guarded the same way the
+    // renderer is.
+    let committed = committed_spill_lines(surface_is_rich, effective);
     let rows = if effective == 0 {
         "unbounded".to_string()
     } else {
@@ -7699,14 +7727,39 @@ fn spill_status(
     } else {
         eligibility.explain()
     };
+    let lean_note = if !surface_is_rich && effective != 0 {
+        "; committed results always print in full on this surface"
+    } else {
+        ""
+    };
     // #1640 Layer 1: name the committed-result mode so `/spill status` answers
     // "why is my tool output one line" (or "why is it five").
-    let mode = if summary {
+    let mode = if summary && committed != 0 {
         "; results collapse to a summary line (/spill excerpt restores rows)"
     } else {
         ""
     };
-    format!("spill rows: {rows}{source}; {live}{mode})")
+    format!("spill rows: {rows}{source}; {live}{lean_note}{mode})")
+}
+
+/// Whether the committed-collapse default can honestly engage this session:
+/// the rich surface with the completed-spill viewport buildable (feature
+/// compiled + terminal capable). Shared by `/spill status` so the status line
+/// and the turn-head seeding (`summary_recoverable` in `run_chat`, which
+/// additionally requires the renderer to have actually constructed) cannot
+/// drift apart. Review fix on #1663.
+fn summary_recovery_available(surface_is_rich: bool) -> bool {
+    // `live_spill_capable` itself only exists under live-spill, so the whole
+    // conjunction is cfg-split rather than short-circuited with `cfg!`.
+    #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
+    {
+        surface_is_rich && live_spill_capable()
+    }
+    #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
+    {
+        let _ = surface_is_rich;
+        false
+    }
 }
 
 fn live_spill_eligibility() -> SpillEligibility {

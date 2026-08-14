@@ -2556,9 +2556,10 @@ pub(crate) fn run_chat(
                                 configured,
                                 spill_lines_override,
                                 crate::effective_spill_summary(
-                                    surface_is_rich,
+                                    crate::summary_recovery_available(surface_is_rich),
                                     spill_summary_override,
                                 ),
+                                surface_is_rich,
                                 live_spill_eligibility(),
                             ),
                             color,
@@ -2571,18 +2572,16 @@ pub(crate) fn run_chat(
                     if slash_md == "spill" || slash_md.starts_with("spill ") {
                         let configured = spill_lines(&cfg);
                         match parse_spill_command(&task) {
-                            // #1640 Layer 1: mode switches. `Reset` below also
-                            // returns the mode to the surface default.
-                            Ok(cmd @ (SpillCommand::Summary | SpillCommand::Excerpt)) => {
-                                spill_summary_override = Some(cmd == SpillCommand::Summary);
-                            }
-                            Ok(SpillCommand::Status) => {}
-                            Ok(SpillCommand::Set(rows)) => {
-                                spill_lines_override = Some(rows);
-                            }
-                            Ok(SpillCommand::Reset) => {
-                                spill_lines_override = None;
-                                spill_summary_override = None;
+                            // #1640 Layer 1: one pure transition for every
+                            // form (crate::apply_spill_command, pinned by
+                            // test) — Reset returns BOTH knobs to the surface
+                            // defaults.
+                            Ok(cmd) => {
+                                crate::apply_spill_command(
+                                    cmd,
+                                    &mut spill_lines_override,
+                                    &mut spill_summary_override,
+                                );
                             }
                             Err(e) => {
                                 print_newt(
@@ -2604,9 +2603,10 @@ pub(crate) fn run_chat(
                                 configured,
                                 spill_lines_override,
                                 crate::effective_spill_summary(
-                                    surface_is_rich,
+                                    crate::summary_recovery_available(surface_is_rich),
                                     spill_summary_override,
                                 ),
+                                surface_is_rich,
                                 live_spill_eligibility(),
                             ),
                             color,
@@ -4999,18 +4999,16 @@ pub(crate) fn run_chat(
                     // RICH surface collapses + offers the interactive viewport.
                     let configured_spill_lines =
                         effective_spill_lines(spill_lines(&cfg), spill_lines_override);
-                    let resolved_spill_lines =
+                    // Review fix (#1663): the forced value applies to the
+                    // COMMITTED record only. The LIVE in-progress viewport keeps
+                    // the configured height on every surface — reusing the
+                    // forced 0 for the live gate below silently killed the lean
+                    // live viewport (#1235), which this PR must not change.
+                    let committed_view =
                         committed_spill_lines(surface_is_rich, configured_spill_lines);
-                    newt_core::set_spill_lines(resolved_spill_lines);
-                    // #1640 Layer 1: publish the committed-result mode the same
-                    // way — rich collapses spilled results to a summary line so
-                    // the conversation spine stays dominant; lean never does.
-                    newt_core::set_spill_summary(crate::effective_spill_summary(
-                        surface_is_rich,
-                        spill_summary_override,
-                    ));
+                    newt_core::set_spill_lines(committed_view);
                     #[cfg(feature = "live-spill")]
-                    let live_spill = (resolved_spill_lines > 0 && live_spill_capable())
+                    let live_spill = (configured_spill_lines > 0 && live_spill_capable())
                         .then_some(())
                         .and_then(|()| {
                             // #1410: `stdout` now returns the `Arc` itself —
@@ -5018,10 +5016,27 @@ pub(crate) fn run_chat(
                             // `Arc<dyn Ephemeral>`, so the constructor owns the
                             // wrapping rather than leaving it to each caller.
                             crate::live_spill::LiveSpillRenderer::stdout(
-                                resolved_spill_lines,
+                                configured_spill_lines,
                                 color,
                             )
                         });
+                    // #1640 Layer 1 + review fix (#1663): publish the
+                    // committed-result mode AFTER the live renderer exists,
+                    // because the collapse's whole justification is "the
+                    // viewport + /spill vocabulary can recover the detail" —
+                    // so the default engages ONLY when this turn actually has
+                    // the completed-spill viewport (rich + live-spill built +
+                    // renderer constructed). Rich-but-piped, or live-spill
+                    // compiled out → no viewport → spilled results keep the
+                    // excerpt. The /spill summary override still forces it.
+                    #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
+                    let summary_recoverable = surface_is_rich && live_spill.is_some();
+                    #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
+                    let summary_recoverable = false;
+                    newt_core::set_spill_summary(crate::effective_spill_summary(
+                        summary_recoverable,
+                        spill_summary_override,
+                    ));
                     #[cfg(feature = "live-spill")]
                     let spill_input = live_spill
                         .as_deref()
