@@ -3,8 +3,9 @@
   /models                  - list models on the active endpoint
   /models capabilities     - tool-conformance matrix (cached)
   /model <name>            - switch model on the active backend (sticks across runs)
-  /backend <openai|ollama> [model] - switch backend (e.g. /backend ollama deepseek-r1)
-  /backends [name]         - list configured backends; /backends <name> switches (e.g. dgx1, gnuc)
+  /backend                 - backend panel on a rich TTY: choose · edit · add · remove
+  /backend <openai|ollama> [model] - text form: switch the wire kind (e.g. /backend ollama deepseek-r1)
+  /backends [name]         - alias of /backend; text list stays: bare lists (piped/lean), /backends <name> switches
   /thinking <on|off>       - toggle the reasoning spinner for this session
   /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)
   /probe window [model]    - empirical input-boundary search (records max input at High confidence)
@@ -24,6 +25,7 @@
   /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)
   /start [title]           - begin a new conversation, leaving the current one open to /resume
   /rename <title>          - retitle the current conversation so it is easy to find in /resume
+  /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)
   /conversation list       - list saved conversations
   /conversation show <id>  - show a saved conversation
   /conversation restore <id> - restore a saved conversation

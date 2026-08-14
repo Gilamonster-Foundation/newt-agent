@@ -618,7 +618,17 @@ mod tests {
             pin("/context compaction"),
             "[headroom_aware|message_count|reset]"
         );
-        assert_eq!(pin("/backend"), "<openai|ollama> [model]");
+        // #1667 gave `/backend` a BARE panel row that now leads the corpus, and
+        // the palette dedupes by command with the first occurrence winning (see
+        // the test below) — so the palette's `/backend` is the argument-less
+        // panel form. The pipe rule itself still governs the text row, pinned
+        // directly here so #1674's finding stays covered by a real corpus line.
+        assert_eq!(pin("/backend"), "");
+        let text_form = parse_help_corpus(&[
+            "  /backend <openai|ollama> [model] - text form: switch the wire kind",
+        ]);
+        assert_eq!(text_form[0].cmd, "/backend");
+        assert_eq!(text_form[0].args, "<openai|ollama> [model]");
         // The pipe-GROUP rule (first token) still expands alternatives.
         assert_eq!(pin("/callers"), "<sym>");
         assert_eq!(pin("/hierarchy"), "<sym>");

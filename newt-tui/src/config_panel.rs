@@ -69,7 +69,7 @@ use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
 use newt_core::role_profile::Cognition;
 use newt_core::tenacity::{clear_cli_tenacity, cli_tenacity, set_cli_tenacity, Tenacity};
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// The cognition dial's ladder of OVERRIDE positions (auto/inherit → off → levels).
 const COGNITION_LADDER: &[CognitionOverride] = &[
@@ -127,23 +127,24 @@ pub(crate) struct PanelSeed {
 }
 
 /// A value the operator may have changed: `Inherit` (untouched — do NOT write) or
-/// `Set` (dirty — write on apply).
+/// `Set` (dirty — write on apply). Shared with the backend panel (#1667), which
+/// follows the same dirty-tracking grammar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Dial<T> {
+pub(crate) enum Dial<T> {
     Inherit(T),
     Set(T),
 }
 
 impl<T: Copy> Dial<T> {
-    fn value(self) -> T {
+    pub(crate) fn value(self) -> T {
         match self {
             Self::Inherit(v) | Self::Set(v) => v,
         }
     }
-    fn is_dirty(self) -> bool {
+    pub(crate) fn is_dirty(self) -> bool {
         matches!(self, Self::Set(_))
     }
-    fn set(&mut self, v: T) {
+    pub(crate) fn set(&mut self, v: T) {
         *self = Self::Set(v);
     }
 }
@@ -764,13 +765,14 @@ impl PanelState {
     }
 }
 
-/// A rendered row: label, value, provenance, and display flags.
-struct RowView {
-    label: &'static str,
-    value: String,
-    provenance: String,
-    selected: bool,
-    editable: bool,
+/// A rendered row: label, value, provenance, and display flags. Shared with the
+/// backend panel (#1667) so every panel renders rows the same way.
+pub(crate) struct RowView {
+    pub(crate) label: &'static str,
+    pub(crate) value: String,
+    pub(crate) provenance: String,
+    pub(crate) selected: bool,
+    pub(crate) editable: bool,
 }
 
 fn sanitize_name(s: &str) -> String {
@@ -780,7 +782,8 @@ fn sanitize_name(s: &str) -> String {
         .collect()
 }
 
-fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
+/// Clamped (non-wrapping) spinner step — shared with the backend panel (#1667).
+pub(crate) fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
     let n = len as i32;
     (i as i32 + dir).clamp(0, n - 1) as usize
 }
@@ -788,7 +791,7 @@ fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
 /// Bordered block (2) + six rows + a hint/command/status row.
 const PANEL_HEIGHT: u16 = 10;
 
-fn make_terminal(height: u16) -> io::Result<Term> {
+pub(crate) fn make_terminal(height: u16) -> io::Result<Term> {
     Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
@@ -798,17 +801,48 @@ fn make_terminal(height: u16) -> io::Result<Term> {
 }
 
 fn draw(f: &mut ratatui::Frame, state: &PanelState) {
+    let bottom = if let Mode::Command(buf) = &state.mode {
+        command_line(buf)
+    } else if let Some(status) = &state.status {
+        status_line(status)
+    } else {
+        hint_line(
+            "↑↓ select · ←→ change (auto=inherit) · Enter apply · Esc cancel · Ctrl-S/:w <name> save",
+        )
+    };
+    render_panel(
+        f,
+        " psyche — operator dials ",
+        &state.view_rows(),
+        bottom,
+        11,
+        26,
+    );
+}
+
+/// The shared panel chrome (#1667): bordered block + title, one line per
+/// [`RowView`] (selected rows get the `❯` marker and `‹ ›` dial chrome, dim
+/// provenance column), and the caller's bottom line. `label_w`/`val_w` are the
+/// per-panel column widths.
+pub(crate) fn render_panel(
+    f: &mut ratatui::Frame,
+    title: &str,
+    rows: &[RowView],
+    bottom: Line,
+    label_w: usize,
+    val_w: usize,
+) {
     let area = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" psyche — operator dials ");
+        .title(title.to_string());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    for row in state.view_rows() {
+    for row in rows {
         let marker = if row.selected { "❯ " } else { "  " };
-        let name = format!("{marker}{:<11}", row.label);
+        let name = format!("{marker}{:<label_w$}", row.label);
         let val = if row.selected && row.editable {
             format!("‹ {} ›", row.value)
         } else {
@@ -817,36 +851,16 @@ fn draw(f: &mut ratatui::Frame, state: &PanelState) {
         let (name_style, val_style) = row_styles(row.selected, row.editable);
         let mut spans = vec![
             Span::styled(name, name_style),
-            Span::styled(format!("{val:<26}"), val_style),
+            Span::styled(format!("{val:<val_w$}"), val_style),
         ];
         if !row.provenance.is_empty() {
             spans.push(Span::styled(
-                row.provenance,
+                row.provenance.clone(),
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
         lines.push(Line::from(spans));
     }
-    let bottom = if let Mode::Command(buf) = &state.mode {
-        Line::from(Span::styled(
-            format!(":{buf}▏"),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ))
-    } else if let Some(status) = &state.status {
-        Line::from(Span::styled(
-            status.clone(),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ))
-    } else {
-        Line::from(Span::styled(
-            "↑↓ select · ←→ change (auto=inherit) · Enter apply · Esc cancel · Ctrl-S/:w <name> save",
-            Style::default().add_modifier(Modifier::DIM),
-        ))
-    };
     lines.push(bottom);
 
     let para = Paragraph::new(lines);
@@ -861,7 +875,37 @@ fn draw(f: &mut ratatui::Frame, state: &PanelState) {
     );
 }
 
-fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
+/// The green `:…▏` ex-command bottom line — shared panel chrome (#1667).
+pub(crate) fn command_line(buf: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(":{buf}▏"),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The magenta status bottom line — shared panel chrome (#1667).
+pub(crate) fn status_line(status: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        status.to_string(),
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The dim key-hint bottom line — shared panel chrome (#1667).
+pub(crate) fn hint_line(hint: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        hint,
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+}
+
+/// Row styling shared across panels (#1667): selected = bold cyan/yellow,
+/// read-only = dim.
+pub(crate) fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
     if selected {
         (
             Style::default()

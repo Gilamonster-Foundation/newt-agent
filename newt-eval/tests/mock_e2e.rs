@@ -28,16 +28,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn all_bundled_cases_pass_in_mock_mode() {
-    // Build the worker once. `cargo build` is a no-op if it's already
-    // built; in CI the lint+test job has built it implicitly.
-    ensure_worker_built();
-    let worker = locate_worker_bin();
-    assert!(
-        worker.exists(),
-        "expected newt binary somewhere in target/ — checked CARGO_TARGET_DIR={:?}, fell back to {}",
-        std::env::var_os("CARGO_TARGET_DIR"),
-        worker.display()
-    );
+    // The worker is BUILT (fatally) and IDENTIFIED by cargo — see
+    // `worker_under_test` for why this is no longer a hunt through target/.
+    let worker = &worker_under_test().path;
 
     let cases_dir = cases::default_cases_dir();
     let all_cases = cases::load_all(&cases_dir).expect("bundled cases load");
@@ -67,7 +60,7 @@ async fn all_bundled_cases_pass_in_mock_mode() {
             .mount(&mock)
             .await;
 
-        let config = RunnerConfig::new(&worker).with_mock_endpoint(mock.uri());
+        let config = RunnerConfig::new(worker).with_mock_endpoint(mock.uri());
 
         let outcome = run_case(case, &config)
             .await
@@ -146,7 +139,7 @@ async fn all_bundled_cases_pass_in_mock_mode() {
 // run it) are both unix.
 #[cfg(unix)]
 mod golden {
-    use super::{ensure_worker_built, locate_worker_bin};
+    use super::worker_under_test;
     use newt_eval::{cases, run_case, RunnerConfig};
     use serde_json::json;
     use std::path::PathBuf;
@@ -209,8 +202,7 @@ mod golden {
     /// Boundary 1 — ACP: the T0 TaskReply, normalized. Reuses the SAME
     /// wiremock + `run_case` path as `all_bundled_cases_pass_in_mock_mode`.
     async fn capture_acp_reply() -> String {
-        ensure_worker_built();
-        let worker = locate_worker_bin();
+        let worker = &worker_under_test().path;
         let cases_dir = cases::default_cases_dir();
         let all = cases::load_all(&cases_dir).expect("bundled cases load");
         let t0 = all
@@ -229,7 +221,7 @@ mod golden {
             .mount(&mock)
             .await;
 
-        let config = RunnerConfig::new(&worker).with_mock_endpoint(mock.uri());
+        let config = RunnerConfig::new(worker).with_mock_endpoint(mock.uri());
         let outcome = run_case(t0, &config).await.expect("T0 runs");
         let ws = outcome.workspace.display().to_string();
         let bl = outcome.baseline.display().to_string();
@@ -246,13 +238,12 @@ mod golden {
     /// HOME-isolated so a developer's `~/.newt` MCP config can't leak into the
     /// golden (the master must be machine-independent).
     async fn capture_mcp_handshake() -> String {
-        ensure_worker_built();
-        let worker = locate_worker_bin();
+        let worker = &worker_under_test().path;
         let home = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(home.path().join(".newt")).expect("mk .newt");
         std::fs::write(home.path().join(".newt/config.toml"), "").expect("seed config");
 
-        let mut cmd = Command::new(&worker);
+        let mut cmd = Command::new(worker);
         cmd.arg("mcp")
             .env("OLLAMA_HOST", "http://127.0.0.1:1")
             .env("HOME", home.path())
@@ -323,8 +314,7 @@ mod golden {
     /// cwd-isolated so no operator config/skills or `.newt` walk-up can leak
     /// into the master.
     async fn capture_help_surface() -> String {
-        ensure_worker_built();
-        let worker = locate_worker_bin();
+        let worker = &worker_under_test().path;
         let home = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(home.path().join(".newt")).expect("mk .newt");
         std::fs::write(home.path().join(".newt/config.toml"), "").expect("seed config");
@@ -332,7 +322,7 @@ mod golden {
 
         let mut out = String::new();
         for topic in [None, Some("dgx")] {
-            let mut cmd = Command::new(&worker);
+            let mut cmd = Command::new(worker);
             cmd.arg("help");
             if let Some(t) = topic {
                 cmd.arg(t);
@@ -435,59 +425,147 @@ mod golden {
     }
 }
 
-// ── helpers ─────────────────────────────────────────────────────────
+// ── the binary under test ───────────────────────────────────────────
+//
+// #1677 — the stale-binary hazard, and why this is no longer a search.
+//
+// Until #1677 this file did two separable things badly:
+//
+//   1. `ensure_worker_built()` ran `cargo build --bin newt` and threw the
+//      result away ("errors are non-fatal"). Run from the newt-eval package
+//      directory — which is where cargo puts a test process's cwd — that
+//      invocation does not build anything at all:
+//
+//          error: no bin target named `newt` in default-run packages
+//          help: available bin in `newt-agent` package: newt
+//
+//      i.e. the build was a silent no-op on EVERY run, for every developer
+//      and every CI job.
+//
+//   2. `locate_worker_bin()` then swept four candidate target directories ×
+//      {debug, release} for the FIRST file named `newt` and graded that.
+//
+// Composed, the helper could not fail loudly and could not miss: a months-old
+// `target/release/newt` from an unrelated branch satisfies step 2 perfectly. A
+// green E2E over a binary nobody can identify is worse than a red one — it is
+// the "gate that passes while nothing changed" pathology this file's golden
+// section already names, arriving through the back door.
+//
+// The replacement removes the search entirely. Cargo is asked to build the
+// binary and to SAY WHERE IT PUT IT (`--message-format=json` → the
+// `compiler-artifact` message's `executable`), so the path is an output of the
+// build rather than a guess about it; a failed build is fatal; and the SHA-256
+// of the exact bytes is printed once as run evidence and quoted in failures.
+// This also makes `$CARGO_TARGET_DIR` / `[build] target-dir` / `cargo llvm-cov`
+// handling automatic — cargo reports its own layout (the newt-agent#64 concern
+// the old sweep was hand-coding).
 
-/// Best-effort build of `newt` so the test doesn't have to assume the
-/// caller already built it. Errors are non-fatal — we'll surface a
-/// clearer "binary not found" assertion below.
-fn ensure_worker_built() {
-    let _ = std::process::Command::new(env!("CARGO"))
-        .args(["build", "--bin", "newt"])
-        .output();
+/// The built worker: absolute path + SHA-256 of the bytes under test.
+#[derive(Debug, Clone)]
+struct WorkerBin {
+    path: PathBuf,
+    sha256: String,
 }
 
-fn worker_exe_name() -> String {
-    format!("newt{}", std::env::consts::EXE_SUFFIX)
-}
-
-/// Locate the `newt` binary in the workspace's `target/` dir.
+/// Build `newt` with `args` and return the artifact cargo reports.
 ///
-/// Searches cargo target directories in priority order:
-/// 1. `$CARGO_TARGET_DIR` (set by `cargo llvm-cov` to `target/llvm-cov-target`)
-/// 2. the cargo-resolved target dir (honors `~/.cargo/config.toml`, newt-agent#64)
-/// 3. `<manifest>/../target/{debug,release}/`
-fn locate_worker_bin() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest.parent().expect("manifest dir has parent");
-
-    // cargo llvm-cov sets CARGO_TARGET_DIR — honor it first.
-    let mut target_dirs: Vec<PathBuf> = Vec::new();
-    if let Some(tdir) = std::env::var_os("CARGO_TARGET_DIR") {
-        target_dirs.push(PathBuf::from(tdir));
+/// `Err` on: cargo failing to start, a non-zero build, or a build that
+/// produced no `newt` executable. Fallible (rather than panicking inline) so
+/// the regression test can drive the OLD argument list through this exact code
+/// path and see it rejected.
+fn build_worker(args: &[&str]) -> Result<WorkerBin, String> {
+    let out = std::process::Command::new(env!("CARGO"))
+        .arg("build")
+        .args(args)
+        .arg("--message-format=json-render-diagnostics")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .map_err(|e| format!("could not run cargo: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        return Err(format!(
+            "`cargo build {}` FAILED ({}). The worker E2E must never fall back \
+             to an older binary — fix the build.\n{stderr}",
+            args.join(" "),
+            out.status
+        ));
     }
-    // Honor `[build] target-dir` from cargo config (newt-agent#64) — a plain
-    // `workspace_root/target` guess misses it (and can resolve to a stale path).
-    if let Ok(meta) = cargo_metadata::MetadataCommand::new().exec() {
-        target_dirs.push(meta.target_directory.into_std_path_buf());
-    }
-    target_dirs.push(workspace_root.join("target"));
-    target_dirs.push(workspace_root.join("target").join("llvm-cov-target"));
-
-    for tdir in &target_dirs {
-        for profile in ["debug", "release"] {
-            let candidate = tdir.join(profile).join(worker_exe_name());
-            if candidate.exists() {
-                return candidate;
-            }
+    // Last artifact wins: a fresh (cached) unit still reports its executable,
+    // so this works whether or not the build actually recompiled anything.
+    let mut exe: Option<PathBuf> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        if v.pointer("/target/name").and_then(|n| n.as_str()) != Some("newt") {
+            continue;
+        }
+        if let Some(p) = v.get("executable").and_then(|e| e.as_str()) {
+            exe = Some(PathBuf::from(p));
         }
     }
-    // Fallback to the cargo-resolved debug path (newt-agent#64), else the
-    // conventional path; the caller's assertion surfaces a missing path cleanly.
-    cargo_metadata::MetadataCommand::new()
-        .exec()
-        .ok()
-        .map(|m| m.target_directory.into_std_path_buf())
-        .unwrap_or_else(|| workspace_root.join("target"))
-        .join("debug")
-        .join(worker_exe_name())
+    let path = exe.ok_or_else(|| {
+        format!(
+            "`cargo build {}` reported no `newt` executable — it built something \
+             else (or nothing). Refusing to guess a binary from target/.\n{stderr}",
+            args.join(" ")
+        )
+    })?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("cargo named {} but it is unreadable: {e}", path.display()))?;
+    let sha256 = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes));
+    Ok(WorkerBin { path, sha256 })
+}
+
+/// The one binary this whole suite grades — built once per test process, with
+/// its identity printed so any run's evidence names the exact bytes.
+fn worker_under_test() -> &'static WorkerBin {
+    static WORKER: std::sync::OnceLock<WorkerBin> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        // `-p newt-agent` is load-bearing: `--bin newt` alone resolves against
+        // the *cwd's* package (newt-eval), which has no such target.
+        let w = build_worker(&["-p", "newt-agent", "--bin", "newt"])
+            .unwrap_or_else(|e| panic!("worker build: {e}"));
+        eprintln!(
+            "[worker] under test: {} sha256={}",
+            w.path.display(),
+            w.sha256
+        );
+        w
+    })
+}
+
+/// Regression (#1677): the worker build is FATAL and the binary under test is
+/// cargo's own artifact, not a filesystem sweep.
+///
+/// Would have failed before the fix, in both halves:
+///   * `ensure_worker_built()` swallowed the error from an invocation that
+///     never built anything — here the same code path must return `Err`;
+///   * `locate_worker_bin()` returned the first `newt`-shaped file it found —
+///     here the path must be the executable cargo reported, and must hash.
+#[test]
+fn worker_build_failure_is_fatal_and_the_binary_is_identified() {
+    let good = worker_under_test();
+    assert!(
+        good.path.is_file(),
+        "cargo named a worker that is not a file: {}",
+        good.path.display()
+    );
+    assert_eq!(good.sha256.len(), 64, "sha256 hex digest");
+
+    // The exact invocation the old helper used, driven through the new
+    // fallible path: it must be an ERROR, never a silent no-op that leaves a
+    // stale binary standing in for a fresh one. (If a future cargo resolves
+    // `--bin newt` workspace-wide from a member dir, this fails loudly and the
+    // note above should be revised — that is the intent, not a flake.)
+    let stale_lane = build_worker(&["--bin", "newt"]);
+    assert!(
+        stale_lane.is_err(),
+        "the pre-#1677 build invocation succeeded from {}; the swallow-and-\
+         fall-back-to-target/ hazard needs re-analysis",
+        env!("CARGO_MANIFEST_DIR")
+    );
 }
