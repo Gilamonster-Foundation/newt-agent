@@ -330,28 +330,7 @@ pub(crate) fn dispatch(
                     verbose,
                 );
             } else if matches!(arg1, "openai" | "ollama") {
-                // SAFETY: single-threaded REPL; the post-command re-resolve picks
-                // it up. Session-only — does NOT persist; use `/model` or edit
-                // `[backends]` to persist a choice.
-                unsafe { std::env::set_var("NEWT_BACKEND", arg1) };
-                // Optional model arg → session-only override on the same axis the
-                // loadout `model` feeds (NEWT_DGX_MODEL), consumed by the Ollama
-                // resolution. Avoids mutating saved config on a live A/B switch.
-                if arg1 == "ollama" && !arg2.is_empty() {
-                    unsafe { std::env::set_var("NEWT_DGX_MODEL", arg2) };
-                }
-                let choice =
-                    resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
-                print_newt(
-                    &format!(
-                        "switched to {} · {} @ {} — next message.",
-                        kind_name(&choice),
-                        choice.model,
-                        choice.url
-                    ),
-                    color,
-                    verbose,
-                );
+                apply_backend_kind(arg1, arg2, color, verbose);
             } else {
                 print_newt("usage: /backend <openai|ollama> [model]", color, verbose);
             }
@@ -382,49 +361,8 @@ pub(crate) fn dispatch(
                         verbose,
                     );
                 }
-            } else if cfg.backends.iter().any(|b| b.name == arg1) {
-                // SAFETY: single-threaded REPL. The post-command re-resolve in the
-                // session loop reads NEWT_PROVIDER and repoints the session at this
-                // named backend. Clear any stale per-session model override so the
-                // named backend's own default model applies.
-                unsafe {
-                    std::env::set_var("NEWT_PROVIDER", arg1);
-                    std::env::remove_var("NEWT_DGX_MODEL");
-                }
-                // Persist the choice so it sticks across runs (#545): records
-                // `provider` and clears `model` in ~/.newt/settings.toml, to be
-                // restored next start at the lowest precedence (an explicit
-                // NEWT_PROVIDER or a --loadout still wins). Skipped in an
-                // ephemeral session, which must leave no trace; the live switch
-                // above still applies. Best-effort — a write never blocks it.
-                if newt_core::settings::should_persist(is_ephemeral_session()) {
-                    newt_core::settings::record_provider(arg1);
-                }
-                let choice =
-                    resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
-                print_newt(
-                    &format!(
-                        "switched to backend '{}' · {} @ {} — next message.",
-                        arg1, choice.model, choice.url
-                    ),
-                    color,
-                    verbose,
-                );
             } else {
-                let names: Vec<&str> = cfg.backends.iter().map(|b| b.name.as_str()).collect();
-                print_newt(
-                    &format!(
-                        "no backend named '{}'. configured: {}",
-                        arg1,
-                        if names.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            names.join(", ")
-                        }
-                    ),
-                    color,
-                    verbose,
-                );
+                apply_backend_choice(arg1, color, verbose);
             }
         }
 
@@ -458,6 +396,89 @@ pub(crate) fn dispatch(
         other => unreachable!("commands::model::dispatch routed a non-model command: {other:?}"),
     }
     Ok(true)
+}
+
+/// Switch the session to a coarse backend WIRE KIND — the single application
+/// path shared by `/backend <openai|ollama> [model]` and the backend panel's
+/// bare-kind fallback rows (#1667), extracted verbatim from the slash arm so
+/// the two surfaces cannot drift:
+///
+/// - SAFETY: single-threaded REPL; the post-command re-resolve picks it up.
+///   Session-only — does NOT persist; use `/model` or a named `/backends`
+///   switch to persist a choice.
+/// - Optional `model` (ollama only) → session-only override on the same axis
+///   the loadout `model` feeds (NEWT_DGX_MODEL), consumed by the Ollama
+///   resolution. Avoids mutating saved config on a live A/B switch.
+pub(crate) fn apply_backend_kind(kind: &str, model: &str, color: bool, verbose: bool) {
+    unsafe { std::env::set_var("NEWT_BACKEND", kind) };
+    if kind == "ollama" && !model.is_empty() {
+        unsafe { std::env::set_var("NEWT_DGX_MODEL", model) };
+    }
+    let choice = resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
+    print_newt(
+        &format!(
+            "switched to {} · {} @ {} — next message.",
+            choice.kind.label(),
+            choice.model,
+            choice.url
+        ),
+        color,
+        verbose,
+    );
+}
+
+/// Switch the session to the NAMED backend `name` — the single application path
+/// shared by `/backends <name>` and the backend panel chooser (#1667),
+/// extracted verbatim from the slash arm (mirroring [`apply_model_choice`]) so
+/// there is exactly one set of switch semantics. Returns whether it applied
+/// (`false` = no such configured backend; the miss is printed).
+///
+/// - SAFETY: single-threaded REPL. The post-command re-resolve in the session
+///   loop reads NEWT_PROVIDER and repoints the session at this named backend.
+///   Clear any stale per-session model override so the named backend's own
+///   default model applies.
+/// - Persist the choice so it sticks across runs (#545): records `provider`
+///   and clears `model` in ~/.newt/settings.toml, to be restored next start at
+///   the lowest precedence (an explicit NEWT_PROVIDER or a --loadout still
+///   wins). Skipped in an ephemeral session, which must leave no trace; the
+///   live switch still applies. Best-effort — a write never blocks it.
+pub(crate) fn apply_backend_choice(name: &str, color: bool, verbose: bool) -> bool {
+    let cfg = newt_core::Config::resolve().unwrap_or_default();
+    if cfg.backends.iter().any(|b| b.name == name) {
+        unsafe {
+            std::env::set_var("NEWT_PROVIDER", name);
+            std::env::remove_var("NEWT_DGX_MODEL");
+        }
+        if newt_core::settings::should_persist(is_ephemeral_session()) {
+            newt_core::settings::record_provider(name);
+        }
+        let choice = resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
+        print_newt(
+            &format!(
+                "switched to backend '{}' · {} @ {} — next message.",
+                name, choice.model, choice.url
+            ),
+            color,
+            verbose,
+        );
+        true
+    } else {
+        let names: Vec<&str> = cfg.backends.iter().map(|b| b.name.as_str()).collect();
+        print_newt(
+            &format!(
+                "no backend named '{}'. configured: {}",
+                name,
+                if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
+                }
+            ),
+            color,
+            verbose,
+        );
+        false
+    }
 }
 
 /// The #1122 gate: may this model choice be applied/persisted? A `None` served

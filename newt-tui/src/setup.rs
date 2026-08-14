@@ -1853,6 +1853,7 @@ fn persist_verified_setup(
                 endpoint: normalized,
                 path: found.path.clone(),
                 body: None,
+                replace: false,
             });
             continue;
         }
@@ -1865,6 +1866,7 @@ fn persist_verified_setup(
                 endpoint: normalized,
                 path: found.path.clone(),
                 body: None,
+                replace: false,
             });
             continue;
         }
@@ -1878,17 +1880,23 @@ fn persist_verified_setup(
             name,
             endpoint: normalized,
             body: Some(body.into_bytes()),
+            replace: false,
         });
     }
 
     let default_name = &planned[0].name;
     let updated_config = Config::with_default_backend(&old_config, default_name)?;
+    // The wizard only ever CREATES drop-ins (no `replace`), so the after-commit
+    // warning sink stays empty here; the backend panel's edit path is the one
+    // that can fill it.
+    let mut warnings = Vec::new();
     commit_setup_plan(
         config_path,
         &setup_lock.destination,
         &old_config,
         &updated_config,
         &planned,
+        &mut warnings,
     )
 }
 
@@ -1957,6 +1965,10 @@ struct PlannedSetupBackend {
     endpoint: String,
     path: PathBuf,
     body: Option<Vec<u8>>,
+    /// `true` = durably REPLACE an existing drop-in (the backend panel's edit,
+    /// #1667); `false` = create-only, refusing to clobber a file that appeared
+    /// concurrently (the setup wizard's add semantics, #1660).
+    replace: bool,
 }
 
 impl PlannedSetupBackend {
@@ -2150,12 +2162,32 @@ fn commit_backend_no_clobber(
     }
 }
 
+/// Classify a durable-replace failure on a drop-in the plan REPLACES (#1667
+/// review §10). An **after-commit** failure means the rename already succeeded
+/// — the new bytes ARE the file, only the parent-directory fsync failed — so it
+/// is a durability WARNING, never a "save failed" that would leave the caller
+/// reporting a write that is visibly on disk as lost. A before-commit failure is
+/// a real failure and propagates.
+fn replace_warning(
+    result: Result<(), newt_core::atomic_fs::DurableReplaceError>,
+) -> Result<Option<String>, newt_core::atomic_fs::DurableReplaceError> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(error) if error.committed() => Ok(Some(error.to_string())),
+        Err(error) => Err(error),
+    }
+}
+
+/// `warnings` collects non-fatal after-commit durability problems (see
+/// [`replace_warning`]): the bytes are on disk, but a sync step failed. The
+/// caller reports them alongside a SUCCESSFUL write.
 fn commit_setup_plan(
     config_path: &Path,
     config_destination: &newt_core::atomic_fs::ResolvedPath,
     old_config: &str,
     updated_config: &str,
     planned: &[PlannedSetupBackend],
+    warnings: &mut Vec<String>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     commit_setup_plan_with(
         config_path,
@@ -2163,6 +2195,7 @@ fn commit_setup_plan(
         old_config,
         updated_config,
         planned,
+        warnings,
         |staged, destination| destination.durable_replace(staged),
     )
 }
@@ -2173,6 +2206,7 @@ fn commit_setup_plan_with(
     old_config: &str,
     updated_config: &str,
     planned: &[PlannedSetupBackend],
+    warnings: &mut Vec<String>,
     commit_config: impl FnOnce(
         &Path,
         &newt_core::atomic_fs::ResolvedPath,
@@ -2183,7 +2217,11 @@ fn commit_setup_plan_with(
     for backend in planned {
         if let Some(body) = backend.body.as_deref() {
             let destination = setup_config_destination(&backend.path)?;
-            staged_backends.push((guard.stage(&destination, body, None)?, destination));
+            staged_backends.push((
+                guard.stage(&destination, body, None)?,
+                destination,
+                backend.replace,
+            ));
         }
     }
     let config_permissions = setup_file_permissions(config_destination.as_path())?;
@@ -2231,9 +2269,19 @@ fn commit_setup_plan_with(
         );
     }
 
-    for (temp, destination) in &staged_backends {
-        commit_backend_no_clobber(temp, destination)?;
-        guard.created.push(destination.as_path().to_path_buf());
+    for (temp, destination, replace) in &staged_backends {
+        if *replace {
+            // The backend panel's EDIT (#1667): durably replace the existing
+            // drop-in. Deliberately NOT registered for rollback — the original
+            // bytes are gone once replaced, and the new content is itself a
+            // valid drop-in, so a later failure must not delete it. An
+            // after-commit sync failure is a warning, not a failure: the file
+            // on disk IS the edit (review §10).
+            warnings.extend(replace_warning(destination.durable_replace(temp))?);
+        } else {
+            commit_backend_no_clobber(temp, destination)?;
+            guard.created.push(destination.as_path().to_path_buf());
+        }
     }
     if config_stage.is_some() && read_setup_config(config_destination.as_path())? != old_config {
         anyhow::bail!(
@@ -2279,6 +2327,310 @@ fn commit_setup_plan_with(
         }
     }
     Ok(guard.finish())
+}
+
+// ---------------------------------------------------------------------------
+// Backend panel persistence (#1667) — REUSES the wizard's crash-safe machinery
+// (acquire_setup_lock → plan → commit_setup_plan, #1660); the panel never gets
+// a second write path.
+// ---------------------------------------------------------------------------
+
+/// The result of a panel save: the written path plus any non-fatal durability
+/// warnings (the bytes ARE on disk — see [`replace_warning`], review §10).
+#[cfg(feature = "rich-tui")]
+#[derive(Debug)]
+pub(crate) struct PanelSave {
+    pub path: PathBuf,
+    pub warnings: Vec<String>,
+}
+
+/// A valid backend file-stem (the panel's name grammar, shared by the write and
+/// delete paths so a traversal shape can never reach the filesystem).
+#[cfg(feature = "rich-tui")]
+fn valid_panel_backend_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The TOML keys the panel form manages, paired with the dirty flags that say
+/// whether the operator actually touched each one (three Cs: the mapping is
+/// data, so a new form field is one row here). Only DIRTY keys are overlaid.
+#[cfg(feature = "rich-tui")]
+fn dirty_dropin_edits(
+    edit: &crate::backend_panel::BackendEdit,
+) -> Vec<(&'static str, Option<String>)> {
+    let dirty = edit.dirty;
+    [
+        (
+            "kind",
+            dirty.kind,
+            edit.kind.map(|kind| kind.label().to_string()),
+        ),
+        (
+            "endpoint",
+            dirty.endpoint,
+            Some(edit.endpoint.trim().to_string()).filter(|url| !url.is_empty()),
+        ),
+        ("model", dirty.model, edit.model.clone()),
+        ("api_key_env", dirty.api_key_env, edit.api_key_env.clone()),
+        (
+            "api_key_file",
+            dirty.api_key_file,
+            edit.api_key_file.clone(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, dirty, _)| *dirty)
+    .map(|(key, _, value)| (key, value))
+    .collect()
+}
+
+/// Write the panel's add/edit form as the drop-in `backends/<name>.toml`, under
+/// the setup lock, via the staged [`commit_setup_plan`] commit.
+///
+/// An EDIT (`edit.replace`) **re-reads the file at SAVE time** and overlays only
+/// the keys the operator actually changed ([`dirty_dropin_edits`]), through
+/// `BackendConfig::with_dropin_edits` — a `toml_edit` overlay, so comments, key
+/// order, and keys `BackendConfig` does not model survive (review §6 and §8;
+/// the old serde round-trip silently destroyed both, and re-applying the whole
+/// panel-open prefill silently reverted a concurrent writer's untouched fields).
+/// A field the form never touched — the `kind` dial included — is left
+/// byte-for-byte alone, which is the persistence half of the review §1 fix (the
+/// dial half is `KIND_LADDER` + `begin_edit`'s fail-closed refusal).
+///
+/// **Residual race:** the read → stage → replace window is guarded by the setup
+/// lock, so any *newt* writer serializes behind it; a foreign editor writing the
+/// drop-in inside that window still loses its change to the overlay. Narrowing
+/// that further needs a content hash / O_EXCL exchange the drop-in format does
+/// not carry yet.
+///
+/// An ADD refuses to clobber an existing file. `config.toml` is never rewritten
+/// here (the default pointer is the chooser's job, not the editor's).
+#[cfg(feature = "rich-tui")]
+pub(crate) fn persist_panel_backend(
+    config_path: &Path,
+    edit: &crate::backend_panel::BackendEdit,
+) -> anyhow::Result<PanelSave> {
+    anyhow::ensure!(!edit.name.trim().is_empty(), "backend needs a name");
+    anyhow::ensure!(
+        valid_panel_backend_name(edit.name.trim()),
+        "invalid backend name '{}'",
+        edit.name
+    );
+    if let Some(parent) = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let setup_lock = acquire_setup_lock(config_path)?;
+    let old_config = read_setup_config(setup_lock.destination.as_path())?;
+    let path = config_path
+        .with_file_name("backends")
+        .join(format!("{}.toml", edit.name));
+    let body = if edit.replace {
+        let existing = std::fs::read_to_string(&path)
+            .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+        BackendConfig::with_dropin_edits(&existing, &dirty_dropin_edits(edit))
+            .map_err(|error| anyhow::anyhow!("edit {}: {error}", path.display()))?
+    } else if path.exists() {
+        anyhow::bail!("backend '{}' already exists — edit it instead", edit.name);
+    } else {
+        let backend = BackendConfig {
+            name: edit.name.clone(),
+            endpoint: edit.endpoint.clone(),
+            kind: edit.kind,
+            model: edit.model.clone(),
+            api_key_env: edit.api_key_env.clone(),
+            api_key_file: edit.api_key_file.clone(),
+            ..BackendConfig::default()
+        };
+        toml::to_string(&backend)?
+    };
+    // Parse what we are about to write: the drop-in must still be a valid
+    // backend after the overlay, and the plan wants the normalized endpoint.
+    let parsed: BackendConfig = toml::from_str(&body)
+        .map_err(|error| anyhow::anyhow!("{} would become invalid: {error}", path.display()))?;
+    let endpoint = if parsed.endpoint.trim().is_empty() {
+        // A `kind = "embedded"` drop-in has a model_path, not a URL.
+        String::new()
+    } else {
+        normalize_setup_endpoint(&parsed.endpoint)?
+    };
+    let planned = [PlannedSetupBackend {
+        name: edit.name.clone(),
+        endpoint,
+        path: path.clone(),
+        body: Some(body.into_bytes()),
+        replace: edit.replace,
+    }];
+    // old == updated: the plan stages/commits ONLY the drop-in; config.toml is
+    // left byte-for-byte alone (no backup dance, no default_backend rewrite).
+    let mut warnings = Vec::new();
+    commit_setup_plan(
+        config_path,
+        &setup_lock.destination,
+        &old_config,
+        &old_config,
+        &planned,
+        &mut warnings,
+    )?;
+    Ok(PanelSave { path, warnings })
+}
+
+/// The `default_backend` a config.toml TEXT names, if any.
+#[cfg(feature = "rich-tui")]
+fn default_backend_in(config_text: &str) -> Option<String> {
+    toml::from_str::<toml::Value>(config_text)
+        .ok()?
+        .get("default_backend")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The `[[backends]]` names declared INLINE in a config.toml text.
+#[cfg(feature = "rich-tui")]
+fn inline_backend_names_in(config_text: &str) -> Vec<String> {
+    toml::from_str::<toml::Value>(config_text)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get("backends"))
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("name").and_then(toml::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `[[backends]]` names declared inline in the config.toml at `config_path`
+/// — a drop-in that shares one of these names does NOT fully shadow it: the
+/// merge re-inherits `api_key_*` / `tiers` the drop-in omits
+/// (`Config::merge_backends_from_dir`), so clearing an auth field in the panel
+/// can silently come back (review §4). The panel marks those rows and says so
+/// in the save note.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn inline_backend_names(config_path: &Path) -> Vec<String> {
+    std::fs::read_to_string(config_path)
+        .map(|text| inline_backend_names_in(&text))
+        .unwrap_or_default()
+}
+
+/// Delete the drop-in `backends/<name>.toml` under the setup lock, durably
+/// syncing the parent directory — the panel's `:d <name>` (#1667). Returns the
+/// operator-visible notes the caller must report (a `default_backend` repoint, a
+/// non-durable delete).
+///
+/// **The durable default pointer is part of this transaction** (review §2/§7/§11):
+/// removing the backend `config.toml`'s `default_backend` names would leave a
+/// dangling pointer, which `Config::select_backend` treats as a hard
+/// `UnknownNamed` operator error (the ACP worker `bail!`s on it, and no
+/// settings.toml mask exists there). So when the removed name IS the default,
+/// this refuses unless the same transaction hands over `repoint_default_to` —
+/// the backend the caller just applied — and then repoints `default_backend`
+/// (comment-preserving, via `Config::with_default_backend`) BEFORE unlinking, so
+/// a failed delete can never leave the pointer dangling.
+///
+/// The caller (the panel) additionally refuses to remove the ACTIVE backend
+/// unless a different named selection is applied in the same transaction; this
+/// function guards the filesystem invariants (a sane file-stem name, the file
+/// existing) and the durable pointer.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn remove_panel_backend(
+    config_path: &Path,
+    name: &str,
+    repoint_default_to: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        valid_panel_backend_name(name),
+        "invalid backend name '{name}'"
+    );
+    if let Some(new) = repoint_default_to {
+        anyhow::ensure!(
+            valid_panel_backend_name(new),
+            "invalid backend name '{new}'"
+        );
+        anyhow::ensure!(
+            new != name,
+            "cannot repoint default_backend at '{new}' while removing it"
+        );
+    }
+    let setup_lock = acquire_setup_lock(config_path)?;
+    let old_config = read_setup_config(setup_lock.destination.as_path())?;
+    let backends_dir = config_path.with_file_name("backends");
+    let path = backends_dir.join(format!("{name}.toml"));
+    anyhow::ensure!(
+        path.exists(),
+        "no backend drop-in named '{name}' ({})",
+        path.display()
+    );
+    let mut notes = Vec::new();
+    if default_backend_in(&old_config).as_deref() == Some(name) {
+        let Some(new) = repoint_default_to else {
+            anyhow::bail!(
+                "'{name}' is config.toml's default_backend — removing it would leave a dangling \
+                 default (a hard 'unknown backend' error for `newt solve` and the ACP worker); \
+                 dial another named backend first so the switch and the removal happen in one \
+                 transaction"
+            );
+        };
+        anyhow::ensure!(
+            backends_dir.join(format!("{new}.toml")).exists()
+                || inline_backend_names_in(&old_config)
+                    .iter()
+                    .any(|n| n == new),
+            "cannot repoint default_backend at unknown backend '{new}'"
+        );
+        let updated_config = Config::with_default_backend(&old_config, new)?;
+        let mut warnings = Vec::new();
+        commit_setup_plan(
+            config_path,
+            &setup_lock.destination,
+            &old_config,
+            &updated_config,
+            &[],
+            &mut warnings,
+        )?;
+        notes.extend(warnings);
+        notes.push(format!(
+            "default_backend now points at '{new}' ({})",
+            config_path.display()
+        ));
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            // Surface a non-durable delete the way the write side surfaces a
+            // post-rename sync failure (review §9) — the unlink HAPPENED, so
+            // this is a warning on a success, not an error.
+            if let Err(error) = newt_core::atomic_fs::sync_parent(&path) {
+                notes.push(format!(
+                    "removed {}, but could not durably sync its parent directory: {error:#}",
+                    path.display()
+                ));
+            }
+            Ok(notes)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+            "no backend drop-in named '{name}' ({})",
+            path.display()
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The names of the per-file backend drop-ins next to `config_path` — which
+/// chooser entries the panel may edit/remove (inline `[[backends]]` in
+/// config.toml stay read-only there). Reuses the wizard's directory reader.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn panel_backend_file_names(config_path: &Path) -> Vec<String> {
+    read_existing_setup_backends(&config_path.with_file_name("backends"))
+        .map(|found| found.into_iter().map(|item| item.name).collect())
+        .unwrap_or_default()
 }
 
 /// Build the new-shape setup result (#1140): a backend DROP-IN (one endpoint,
@@ -3537,12 +3889,14 @@ mod tests {
                 endpoint: "http://first:8000".into(),
                 path: backend_dir.join("first.toml"),
                 body: Some(b"name = \"first\"\n".to_vec()),
+                replace: false,
             },
             PlannedSetupBackend {
                 name: "second".into(),
                 endpoint: "http://second:8000".into(),
                 path: blocked_parent.join("second.toml"),
                 body: Some(b"name = \"second\"\n".to_vec()),
+                replace: false,
             },
         ];
 
@@ -3553,6 +3907,7 @@ mod tests {
             "",
             "default_backend = \"first\"\n",
             &planned,
+            &mut Vec::new(),
         )
         .is_err());
         let leftovers = std::fs::read_dir(&backend_dir)
@@ -3562,6 +3917,288 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "leftover staged files: {leftovers:?}");
         assert!(!config_path.exists());
+    }
+
+    /// #1667: the backend panel's ADD persists through the SAME setup-lock plan
+    /// commit as the wizard (#1660) — a fresh drop-in appears, config.toml is
+    /// never rewritten, a duplicate add is refused, and the lock is released.
+    #[cfg(feature = "rich-tui")]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn panel_backend_add_creates_a_dropin_and_never_touches_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "# operator config\n").unwrap();
+        let edit = crate::backend_panel::BackendEdit {
+            name: "dgx1".into(),
+            kind: Some(BackendKind::Openai),
+            endpoint: "http://dgx1:8000".into(),
+            model: Some("gpt-oss-120b".into()),
+            api_key_env: Some("DGX_KEY".into()),
+            api_key_file: None,
+            dirty: crate::backend_panel::DirtyFields::default(),
+            replace: false,
+        };
+        let saved = persist_panel_backend(&config_path, &edit).unwrap();
+        let path = saved.path;
+        assert!(
+            saved.warnings.is_empty(),
+            "a clean write warns about nothing"
+        );
+        assert_eq!(path, dir.path().join("backends/dgx1.toml"));
+        let written: BackendConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.name, "dgx1");
+        assert_eq!(written.endpoint, "http://dgx1:8000");
+        assert_eq!(written.kind, Some(BackendKind::Openai));
+        assert_eq!(written.model.as_deref(), Some("gpt-oss-120b"));
+        assert_eq!(written.api_key_env.as_deref(), Some("DGX_KEY"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "# operator config\n",
+            "the editor never rewrites config.toml"
+        );
+        // Adding the same name again is refused (no clobber)…
+        let error = persist_panel_backend(&config_path, &edit).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error:#}");
+        // …the drop-in list names it for the chooser's editability marker…
+        assert_eq!(
+            panel_backend_file_names(&config_path),
+            vec!["dgx1".to_string()]
+        );
+        // …and the setup lock was released (a fresh acquire succeeds).
+        drop(acquire_setup_lock(&config_path).unwrap());
+    }
+
+    /// #1667: the panel's EDIT overlays ONLY the fields the operator actually
+    /// changed — wizard/probe-written fields the form does not show (tiers,
+    /// serving), operator comments, keys `BackendConfig` does not model, and a
+    /// `kind` the operator never dialed all round-trip untouched
+    /// (review §1/§6/§8).
+    #[cfg(feature = "rich-tui")]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn panel_backend_edit_overlays_only_dirty_fields_and_preserves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let backend_dir = dir.path().join("backends");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        std::fs::write(
+            backend_dir.join("gnuc.toml"),
+            "# operator notes for the lab box\n\
+             name = \"gnuc\"\nendpoint = \"http://gnuc:11434\" # LAN\nmodel = \"qwen3:30b\"\n\
+             tiers = [\"FAST\"]\nkind = \"anthropic\"\nserving = \"multiplexer\"\n\
+             operator_hint = \"keep me\"\n",
+        )
+        .unwrap();
+        // The operator changed ONLY the model — the kind dial was never
+        // touched, so `kind = "anthropic"` (outside the form's ladder) must
+        // survive verbatim.
+        let edit = crate::backend_panel::BackendEdit {
+            name: "gnuc".into(),
+            kind: Some(BackendKind::Anthropic),
+            endpoint: "http://gnuc:11434".into(),
+            model: Some("llama3.1:8b".into()),
+            api_key_env: None,
+            api_key_file: None,
+            dirty: crate::backend_panel::DirtyFields {
+                model: true,
+                ..crate::backend_panel::DirtyFields::default()
+            },
+            replace: true,
+        };
+        let saved = persist_panel_backend(&config_path, &edit).unwrap();
+        let body = std::fs::read_to_string(&saved.path).unwrap();
+        let written: BackendConfig = toml::from_str(&body).unwrap();
+        assert_eq!(
+            written.model.as_deref(),
+            Some("llama3.1:8b"),
+            "the form field applied"
+        );
+        assert_eq!(
+            written.kind,
+            Some(BackendKind::Anthropic),
+            "an out-of-ladder kind survived an edit that never touched it (§1)"
+        );
+        assert_eq!(
+            written.serving,
+            Some(newt_core::Serving::Multiplexer),
+            "an unmanaged field survived the edit"
+        );
+        assert_eq!(
+            written.tiers,
+            vec![Tier::Fast],
+            "an unmanaged field survived the edit"
+        );
+        assert!(body.contains("# operator notes"), "comment lost: {body}");
+        assert!(body.contains("# LAN"), "inline comment lost: {body}");
+        assert!(
+            body.contains("operator_hint = \"keep me\""),
+            "unmodelled key lost: {body}"
+        );
+        // Clearing an auth field IS written (a dirty None removes the key).
+        let clear = crate::backend_panel::BackendEdit {
+            api_key_env: None,
+            dirty: crate::backend_panel::DirtyFields {
+                api_key_env: true,
+                ..crate::backend_panel::DirtyFields::default()
+            },
+            ..edit.clone()
+        };
+        std::fs::write(
+            backend_dir.join("gnuc.toml"),
+            format!("{body}api_key_env = \"OLD\"\n"),
+        )
+        .unwrap();
+        let saved = persist_panel_backend(&config_path, &clear).unwrap();
+        let written: BackendConfig =
+            toml::from_str(&std::fs::read_to_string(&saved.path).unwrap()).unwrap();
+        assert_eq!(written.api_key_env, None, "the cleared key is gone");
+        // Editing a drop-in that vanished is a visible error, not a create.
+        let ghost = crate::backend_panel::BackendEdit {
+            name: "ghost".into(),
+            replace: true,
+            ..edit
+        };
+        assert!(persist_panel_backend(&config_path, &ghost).is_err());
+        assert!(!backend_dir.join("ghost.toml").exists());
+    }
+
+    /// #1667: `:d <name>` deletes exactly one drop-in under the setup lock;
+    /// a missing name and a path-traversal shape are refused visibly.
+    #[cfg(feature = "rich-tui")]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn panel_backend_remove_deletes_the_dropin_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let backend_dir = dir.path().join("backends");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        std::fs::write(
+            backend_dir.join("old.toml"),
+            "name = \"old\"\nendpoint = \"http://old:1\"\n",
+        )
+        .unwrap();
+        assert!(remove_panel_backend(&config_path, "old", None)
+            .unwrap()
+            .is_empty());
+        assert!(!backend_dir.join("old.toml").exists());
+        let error = remove_panel_backend(&config_path, "old", None).unwrap_err();
+        assert!(
+            error.to_string().contains("no backend drop-in"),
+            "{error:#}"
+        );
+        let error = remove_panel_backend(&config_path, "../evil", None).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid backend name"),
+            "{error:#}"
+        );
+        drop(acquire_setup_lock(&config_path).unwrap());
+    }
+
+    /// #1667 review §2/§7/§11 REGRESSION: removing the backend config.toml's
+    /// `default_backend` names must never leave a dangling pointer — which
+    /// `Config::select_backend` reports as a hard `UnknownNamed` error to
+    /// `newt solve` / the ACP worker (no settings.toml mask exists there). It is
+    /// refused outright, and accepted only as one transaction that repoints the
+    /// default at the backend the caller just applied.
+    #[cfg(feature = "rich-tui")]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn panel_backend_remove_never_orphans_the_config_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let backend_dir = dir.path().join("backends");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        // The #1140 wizard shape: the backends live ONLY as drop-ins.
+        let original = "# hand-authored\ndefault_backend = \"dgx1\" # keep this note\n";
+        std::fs::write(&config_path, original).unwrap();
+        for name in ["dgx1", "gnuc"] {
+            std::fs::write(
+                backend_dir.join(format!("{name}.toml")),
+                format!("endpoint = \"http://{name}:8000\"\n"),
+            )
+            .unwrap();
+        }
+
+        // Refused without a replacement…
+        let error = remove_panel_backend(&config_path, "dgx1", None).unwrap_err();
+        assert!(error.to_string().contains("default_backend"), "{error:#}");
+        assert!(
+            backend_dir.join("dgx1.toml").exists(),
+            "a refused remove deletes nothing"
+        );
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+        // …and refused when the replacement is not a real backend.
+        let error = remove_panel_backend(&config_path, "dgx1", Some("ghost")).unwrap_err();
+        assert!(error.to_string().contains("unknown backend"), "{error:#}");
+        assert!(backend_dir.join("dgx1.toml").exists());
+
+        // Accepted as ONE transaction: the pointer moves first, then the file.
+        let notes = remove_panel_backend(&config_path, "dgx1", Some("gnuc")).unwrap();
+        assert!(!backend_dir.join("dgx1.toml").exists());
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config.contains("default_backend = \"gnuc\""),
+            "the durable pointer followed the switch: {config}"
+        );
+        assert!(
+            config.contains("# keep this note") && config.contains("# hand-authored"),
+            "the repoint preserved operator content: {config}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("default_backend now points")),
+            "the repoint is reported: {notes:?}"
+        );
+        // A non-default backend still removes with no config rewrite at all.
+        std::fs::write(
+            backend_dir.join("spare.toml"),
+            "endpoint = \"http://spare:1\"\n",
+        )
+        .unwrap();
+        assert!(remove_panel_backend(&config_path, "spare", None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), config);
+        drop(acquire_setup_lock(&config_path).unwrap());
+    }
+
+    /// #1667 review §10: a post-rename parent-sync failure is a WARNING on a
+    /// successful write (the bytes are the file), never a "save failed" that
+    /// would leave the panel reporting a visible edit as lost. A before-commit
+    /// failure is still a failure.
+    #[test]
+    fn an_after_commit_sync_failure_is_a_warning_not_a_failure() {
+        let path = Path::new("/tmp/newt-test/backends/dgx1.toml");
+        assert_eq!(replace_warning(Ok(())).unwrap(), None);
+        let warning = replace_warning(Err(
+            newt_core::atomic_fs::DurableReplaceError::after_commit(
+                path,
+                io::Error::other("injected parent sync failure"),
+            ),
+        ))
+        .unwrap()
+        .expect("an after-commit failure is a warning");
+        assert!(
+            warning.contains("could not durably sync") && warning.contains("dgx1.toml"),
+            "{warning}"
+        );
+    }
+
+    /// #1667 review §4: the inline `[[backends]]` names are what the panel uses
+    /// to warn that a same-named drop-in does not fully own its fields.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn inline_backend_names_reads_the_declared_entries() {
+        let text = "default_backend = \"dgx1\"\n\
+                    [[backends]]\nname = \"dgx1\"\nendpoint = \"http://dgx1:8000\"\n\
+                    [[backends]]\nname = \"relic\"\nendpoint = \"http://relic:1\"\n";
+        assert_eq!(inline_backend_names_in(text), vec!["dgx1", "relic"]);
+        assert_eq!(default_backend_in(text).as_deref(), Some("dgx1"));
+        assert!(inline_backend_names_in("# nothing here\n").is_empty());
+        assert_eq!(default_backend_in("# nothing here\n"), None);
     }
 
     /// Real-filesystem grounding for the detected-setup config failpoint: a
@@ -3584,6 +4221,7 @@ mod tests {
             body: Some(
                 b"name = \"example\"\nendpoint = \"https://inference.example.test\"\n".to_vec(),
             ),
+            replace: false,
         }];
         let destination = setup_config_destination(&config_path).unwrap();
 
@@ -3593,6 +4231,7 @@ mod tests {
             old_config,
             updated_config,
             &planned,
+            &mut Vec::new(),
             |staged, destination| {
                 destination.durable_replace(staged).unwrap();
                 Err(newt_core::atomic_fs::DurableReplaceError::after_commit(

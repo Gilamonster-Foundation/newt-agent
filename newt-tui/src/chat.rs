@@ -3978,9 +3978,11 @@ pub(crate) fn run_chat(
                     // `/psyche edit extra` is NOT (it falls through to the
                     // dispatch usage error rather than silently dropping the
                     // extra argument).
-                    let psyche_tokens: Vec<&str> = slash_body.split_whitespace().collect();
-                    let wants_psyche_panel = psyche_tokens.as_slice() == ["psyche", "edit"]
-                        || (psyche_tokens.as_slice() == ["psyche"]
+                    // (Shared by the psyche panel gate here and the backend
+                    // panel gate below, #1667.)
+                    let panel_tokens: Vec<&str> = slash_body.split_whitespace().collect();
+                    let wants_psyche_panel = panel_tokens.as_slice() == ["psyche", "edit"]
+                        || (panel_tokens.as_slice() == ["psyche"]
                             && cfg!(feature = "rich-tui")
                             && std::io::IsTerminal::is_terminal(&std::io::stdout()));
                     if wants_psyche_panel {
@@ -4210,6 +4212,265 @@ pub(crate) fn run_chat(
                             color,
                             verbose,
                         );
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // #1667: bare `/backend` (and `/backends`, its alias) IS the
+                    // backend panel on a rich interactive terminal — one surface
+                    // to choose, edit, add, and remove backends. With arguments,
+                    // piped, or on the lean build, both commands fall through to
+                    // dispatch_slash unchanged: the text list, the named switch,
+                    // and the kind toggle keep working exactly as before.
+                    #[cfg(feature = "rich-tui")]
+                    if matches!(panel_tokens.as_slice(), ["backend"] | ["backends"])
+                        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    {
+                        use backend_panel::{BackendOption, BackendSelection, BackendSource};
+                        // Chooser options: every configured backend — the exact
+                        // set `/backends <name>` can switch to — tagged with
+                        // WHERE its definition lives (the panel writes only
+                        // ~/.newt/backends drop-ins), plus the bare wire-kind
+                        // fallbacks the `/backend <openai|ollama>` form supports.
+                        let names_in = |path: Option<std::path::PathBuf>| -> std::collections::HashSet<String> {
+                            path.map(|p| setup::panel_backend_file_names(&p).into_iter().collect())
+                                .unwrap_or_default()
+                        };
+                        let dropins = names_in(newt_core::Config::user_config_path());
+                        // `Config::merge_disk_backends` merges the PROJECT
+                        // `.newt/backends` LAST (last-wins), so a name defined
+                        // in both resolves to the project file: editing or
+                        // removing the user drop-in would be a silent no-op and
+                        // a phantom delete (review §3). Mark those read-only.
+                        let project_dropins = names_in(newt_core::Config::project_config_path());
+                        // A same-named inline [[backends]] entry keeps supplying
+                        // whatever the drop-in omits (review §4).
+                        let inline: std::collections::HashSet<String> =
+                            newt_core::Config::user_config_path()
+                                .map(|p| setup::inline_backend_names(&p).into_iter().collect())
+                                .unwrap_or_default();
+                        let mut options: Vec<BackendOption> = cfg
+                            .backends
+                            .iter()
+                            .map(|b| BackendOption {
+                                name: b.name.clone(),
+                                selection: BackendSelection::Named(b.name.clone()),
+                                source: if project_dropins.contains(&b.name) {
+                                    BackendSource::ShadowedByProject
+                                } else if !dropins.contains(&b.name) {
+                                    BackendSource::Inline
+                                } else if inline.contains(&b.name) {
+                                    BackendSource::UserDropInOverInline
+                                } else {
+                                    BackendSource::UserDropIn
+                                },
+                                kind: b.kind,
+                                endpoint: b.endpoint.clone(),
+                                model: b.model.clone(),
+                                api_key_env: b.api_key_env.clone(),
+                                api_key_file: b.api_key_file.clone(),
+                            })
+                            .collect();
+                        for kind in ["ollama", "openai"] {
+                            options.push(BackendOption::kind_fallback(kind));
+                        }
+                        let active_idx = match active_backend_name(&cfg) {
+                            Some(n) => options.iter().position(
+                                |o| matches!(&o.selection, BackendSelection::Named(m) if *m == n),
+                            ),
+                            // No named match (env-shim / kind-forced session):
+                            // mark the kind fallback the session resolves to.
+                            None => {
+                                let k = resolve_backend_choice(&cfg).kind.label();
+                                options.iter().position(
+                                    |o| matches!(o.selection, BackendSelection::Kind(s) if s == k),
+                                )
+                            }
+                        };
+                        // Persistence is I/O-INJECTED (config_panel review-3 §1):
+                        // these closures are the panel's ONLY filesystem writes,
+                        // both riding the setup wizard's crash-safe lock + plan
+                        // machinery (#1660) — never a second write path. A
+                        // failure keeps the panel open with a visible status.
+                        let persist = |edit: &backend_panel::BackendEdit| {
+                            let Some(path) = newt_core::Config::user_config_path() else {
+                                return backend_panel::BackendSaveResult::Failed(
+                                    "no user config directory".to_string(),
+                                );
+                            };
+                            match setup::persist_panel_backend(&path, edit) {
+                                // A save with an after-commit sync WARNING is a
+                                // save: the bytes are on disk, so the note says
+                                // so instead of claiming the edit failed
+                                // (review §10).
+                                Ok(saved) => backend_panel::BackendSaveResult::Saved {
+                                    note: std::iter::once(backend_panel::saved_note(
+                                        &edit.name,
+                                        &saved.path,
+                                        inline.contains(&edit.name),
+                                    ))
+                                    .chain(saved.warnings)
+                                    .collect::<Vec<_>>()
+                                    .join(" — "),
+                                },
+                                Err(e) => {
+                                    backend_panel::BackendSaveResult::Failed(format!("{e:#}"))
+                                }
+                            }
+                        };
+                        // The in-loop `:d` never repoints `default_backend`: the
+                        // panel routes a default/active removal through the
+                        // one-transaction close below, and setup refuses here as
+                        // a second line of defence.
+                        let remove = |name: &str| -> Result<String, String> {
+                            let path = newt_core::Config::user_config_path()
+                                .ok_or_else(|| "no user config directory".to_string())?;
+                            setup::remove_panel_backend(&path, name, None)
+                                .map(|notes| {
+                                    std::iter::once(format!("removed backend '{name}'"))
+                                        .chain(notes)
+                                        .collect::<Vec<_>>()
+                                        .join(" — ")
+                                })
+                                .map_err(|e| format!("{e:#}"))
+                        };
+                        let close = match backend_panel::run(
+                            backend_panel::PanelSeed {
+                                options,
+                                active: active_idx,
+                                default_backend: cfg.default_backend.clone(),
+                            },
+                            persist,
+                            remove,
+                        ) {
+                            Ok(close) => close,
+                            // A mid-panel terminal failure still hands back the
+                            // file operations that already committed, so they
+                            // are reported and cfg is re-resolved (review §5/§12).
+                            Err(e) => {
+                                print_newt(
+                                    &format!("backend panel error: {}", e.error),
+                                    color,
+                                    verbose,
+                                );
+                                e.close
+                            }
+                        };
+                        // Commit: report the file operations that already
+                        // happened in-loop, apply the chooser pick through the
+                        // SAME path the slash forms use, then replicate the
+                        // loop's post-command refresh below. A cancelled no-op
+                        // visit prints nothing — browse-and-leave is as quiet
+                        // as never opening the panel (#1665 discipline).
+                        for note in &close.changes {
+                            print_newt(note, color, verbose);
+                        }
+                        let mut files_changed = !close.changes.is_empty();
+                        let mut applied = false;
+                        if let Some(sel) = &close.apply {
+                            match sel {
+                                BackendSelection::Named(name) => {
+                                    // EXACTLY `/backends <name>`: NEWT_PROVIDER,
+                                    // stale NEWT_DGX_MODEL cleared, #545 persist
+                                    // unless ephemeral — one shared path.
+                                    applied =
+                                        commands::model::apply_backend_choice(name, color, verbose);
+                                    // The remove-active / remove-default
+                                    // transaction: the new selection is applied
+                                    // FIRST (env + settings), then the old
+                                    // drop-in is deleted — and because `name` is
+                                    // the backend that just became the session's,
+                                    // it is also the repoint target for
+                                    // config.toml's `default_backend`, so the
+                                    // durable pointer can never be left dangling
+                                    // (review §2/§7/§11). A failed delete after a
+                                    // successful switch leaves a valid (just
+                                    // untidy) state, reported visibly.
+                                    if applied {
+                                        if let Some(old) = &close.remove_after_apply {
+                                            match newt_core::Config::user_config_path()
+                                                .ok_or_else(|| {
+                                                    anyhow::anyhow!("no user config directory")
+                                                })
+                                                .and_then(|p| {
+                                                    setup::remove_panel_backend(
+                                                        &p,
+                                                        old,
+                                                        Some(name.as_str()),
+                                                    )
+                                                }) {
+                                                Ok(notes) => {
+                                                    files_changed = true;
+                                                    print_newt(
+                                                        &format!("removed backend '{old}'"),
+                                                        color,
+                                                        verbose,
+                                                    );
+                                                    for note in notes {
+                                                        print_newt(&note, color, verbose);
+                                                    }
+                                                }
+                                                Err(e) => print_newt(
+                                                    &format!(
+                                                        "could not remove backend '{old}': {e:#}"
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                                BackendSelection::Kind(kind) => {
+                                    // EXACTLY `/backend <kind>`: session-only
+                                    // NEWT_BACKEND toggle — same shared path.
+                                    commands::model::apply_backend_kind(kind, "", color, verbose);
+                                    applied = true;
+                                }
+                            }
+                        }
+                        if applied || files_changed {
+                            // The panel path `continue`s BEFORE the loop's
+                            // post-command refresh, so do here what the slash
+                            // path gets there: re-resolve cfg and repoint the
+                            // session. A backend switch CAN change the URL, so
+                            // mirror the real post-dispatch DGX handling too —
+                            // re-probe telemetry only when the URL changed
+                            // (verbose-only; dropping the old receiver stops
+                            // the previous background sampler, #412/#414).
+                            cfg = newt_core::Config::resolve().unwrap_or_default();
+                            let url_changed = refresh_backend(
+                                &cfg,
+                                &mut choice,
+                                &mut inf_url,
+                                &mut inf_model,
+                                &mut inf_kind,
+                                &mut inf_key,
+                                &mut inf_context_window,
+                                color,
+                                verbose,
+                            );
+                            if url_changed {
+                                dgx_rx = if verbose {
+                                    dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                        .map(|d| d.into_sampler(2))
+                                } else {
+                                    None
+                                };
+                            }
+                        }
+                        // Review P1#2 + §13: `/backend` and `/backends` are
+                        // operator backend commands, so the baseline a later
+                        // `/persona clear` reverts to is captured for the WHOLE
+                        // command — bare listing included, applied pick or not.
+                        // The lean/piped path reaches the identical capture
+                        // through is_operator_backend_command below (which pins
+                        // bare "backend"/"backends" as baseline-updating); doing
+                        // it unconditionally here is what keeps the rich panel
+                        // surface and the text surface behaviourally identical,
+                        // rather than the panel inventing narrower semantics.
+                        base_provider = std::env::var("NEWT_PROVIDER").ok();
+                        base_model = std::env::var("NEWT_DGX_MODEL").ok();
                         surface.save_history();
                         println!();
                         continue;
