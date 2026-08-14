@@ -49,9 +49,8 @@ pub mod widgets;
 pub mod width;
 
 pub use arbiter::{
-    prompt_stdin_active, prompt_windows_constructed, set_prompt_observer, try_watch_stdin,
-    Ephemeral, EphemeralRegistration, LineLease, LineWriter, PromptWindow, Sink, Terminal,
-    WatcherStdinGuard,
+    prompt_stdin_active, prompt_windows_constructed, try_watch_stdin, Ephemeral,
+    EphemeralRegistration, LineLease, LineWriter, PromptWindow, Sink, Terminal, WatcherStdinGuard,
 };
 pub use caps::{enter_protocol_mode, protocol_mode, LineCaps};
 pub use frames::{format_spinner, SPINNER_FRAMES};

@@ -42,6 +42,8 @@ pub mod git_hardening;
 pub mod kit;
 pub mod launch_authority;
 pub mod lazy_emission;
+/// Generic agent lifecycle events — the seam integrations subscribe to.
+pub mod lifecycle;
 pub mod mcp;
 pub mod mcp_catalog;
 pub mod mcp_probe;

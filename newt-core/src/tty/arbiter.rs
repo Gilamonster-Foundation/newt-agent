@@ -655,21 +655,16 @@ impl Drop for PromptWindow {
     }
 }
 
-/// Observer notified when a live [`PromptWindow`] opens (`true`) and closes
-/// (`false`) — i.e. exactly when the process starts and stops blocking on a
-/// human. Registered at most once, by the UI tier; this crate knows nothing
-/// about what the observer does with the signal. The test stub never fires it.
-static PROMPT_OBSERVER: OnceLock<Box<dyn Fn(bool) + Send + Sync>> = OnceLock::new();
-
-/// Register the process-wide prompt observer. Later registrations are ignored.
-pub fn set_prompt_observer(observer: impl Fn(bool) + Send + Sync + 'static) {
-    let _ = PROMPT_OBSERVER.set(Box::new(observer));
-}
-
+/// Announce that a live [`PromptWindow`] opened (`true`) or closed (`false`)
+/// as a generic lifecycle event — i.e. exactly when the process starts and
+/// stops blocking on a human. This module knows nothing about who listens;
+/// see [`crate::lifecycle`]. The test stub never fires it.
 fn notify_prompt_observer(open: bool) {
-    if let Some(observer) = PROMPT_OBSERVER.get() {
-        observer(open);
-    }
+    crate::lifecycle::emit(if open {
+        crate::lifecycle::LifecycleEvent::Blocked
+    } else {
+        crate::lifecycle::LifecycleEvent::Unblocked
+    });
 }
 
 #[cfg(test)]
@@ -874,47 +869,48 @@ mod tests {
         assert!(!suspended());
     }
 
-    /// The prompt observer describes reality, not intent: `open` fires only
-    /// once stdin ownership and suspension have succeeded (observable here as
-    /// stdin already being prompt-owned when the callback runs), `close` fires
-    /// on drop, and the inert test stub fires neither.
+    /// Blocked/Unblocked describe reality, not intent: `Blocked` is emitted
+    /// only once stdin ownership and suspension have succeeded (observable
+    /// here as stdin already being prompt-owned when the observer runs),
+    /// `Unblocked` on drop, and the inert test stub emits neither.
     #[serial_test::serial(tty_arbiter)]
     #[test]
-    fn prompt_observer_fires_after_stdin_acquisition_and_on_drop() {
-        // (thread, open, stdin_owned_at_callback); process-global log because
-        // the observer is a process-global OnceLock. Serial-guarded tests
-        // cannot interleave windows, so filtering to our thread is exact.
-        static LOG: Mutex<Vec<(std::thread::ThreadId, bool, bool)>> = Mutex::new(Vec::new());
-        set_prompt_observer(|open| {
-            LOG.lock()
-                .unwrap()
-                .push((std::thread::current().id(), open, prompt_stdin_active()));
-        });
+    fn blocked_is_emitted_after_stdin_acquisition_and_unblocked_on_drop() {
+        use crate::lifecycle::LifecycleEvent;
+
+        // (event, stdin_owned_at_callback), recorded only for this thread —
+        // the lifecycle registry is process-global and sibling tests emit
+        // concurrently.
+        let log: Arc<Mutex<Vec<(LifecycleEvent, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
         let me = std::thread::current().id();
-        LOG.lock().unwrap().retain(|(t, _, _)| *t != me);
+        let sub = crate::lifecycle::subscribe(move |event| {
+            if std::thread::current().id() == me {
+                sink.lock()
+                    .unwrap()
+                    .push((event.clone(), prompt_stdin_active()));
+            }
+        });
 
         {
             let _stub = PromptWindow::test_stub();
         }
         assert!(
-            LOG.lock().unwrap().iter().all(|(t, _, _)| *t != me),
-            "the stub must not fire the observer"
+            log.lock().unwrap().is_empty(),
+            "the stub must not emit lifecycle events"
         );
 
         let w = Terminal::suspend_for_prompt();
         drop(w);
-        let mine: Vec<(bool, bool)> = LOG
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(t, _, _)| *t == me)
-            .map(|(_, open, owned)| (*open, *owned))
-            .collect();
+        drop(sub);
         assert_eq!(
-            mine,
-            vec![(true, true), (false, false)],
-            "open fires exactly once, with stdin already owned (post-acquire, \
-             not intent); close fires on drop, after stdin is released"
+            *log.lock().unwrap(),
+            vec![
+                (LifecycleEvent::Blocked, true),
+                (LifecycleEvent::Unblocked, false)
+            ],
+            "Blocked is emitted exactly once, with stdin already owned \
+             (post-acquire, not intent); Unblocked on drop, after stdin is released"
         );
     }
 }
