@@ -1073,6 +1073,23 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
     assert!(help_lines().iter().any(|l| l.contains("/docs")));
     assert!(help_lines().iter().any(|l| l.contains("/allow")));
     assert!(help_lines().iter().any(|l| l.contains("/plan")));
+    // #1665: /psyche is the one advertised dial surface; the retired top-level
+    // /tenacity + /cognition lines are gone from the corpus (their help PAGES
+    // survive as redirects for /help tenacity muscle memory).
+    assert!(help_lines().iter().any(|l| l.contains("/psyche")));
+    assert!(!help_lines()
+        .iter()
+        .any(|l| l.contains("/tenacity") || l.contains("/cognition")));
+    let tenacity_page = command_help_page("tenacity").expect("tenacity redirect page");
+    assert!(
+        tenacity_page.contains("/psyche tenacity"),
+        "{tenacity_page}"
+    );
+    let cognition_page = command_help_page("cognition").expect("cognition redirect page");
+    assert!(
+        cognition_page.contains("/psyche cognition"),
+        "{cognition_page}"
+    );
     let spill_help = command_help_page("spill").expect("spill help page");
     assert!(spill_help.contains("Space or Enter"));
     assert!(spill_help.contains("⧉"));
@@ -1294,6 +1311,30 @@ fn help_lists_config_command() {
 #[test]
 fn slash_unknown_returns_true() {
     assert!(dispatch_slash("/notacommand", "/ws", false, false, false).unwrap());
+}
+
+#[test]
+fn retired_dials_through_the_real_router_mutate_nothing() {
+    // #1665 review: the earlier no-mutation test called settings::dispatch
+    // directly, bypassing lib.rs routing. Drive the FULL router. Residual gap,
+    // stated honestly: with no stdout capture in this suite, deleting the
+    // "tenacity"/"cognition" tokens from dispatch_slash degrades them to the
+    // unknown-command print — observably identical here. What this DOES pin:
+    // the router path never half-applies a retired dial, whatever it prints.
+    use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+    use newt_core::tenacity::{cli_tenacity, set_cli_tenacity, Tenacity};
+    let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    set_cli_cognition(CognitionOverride::Unset);
+    set_cli_tenacity(Tenacity::Standard);
+    assert!(dispatch_slash("/tenacity relentless", "/ws", false, false, false).unwrap());
+    assert!(dispatch_slash("/cognition contemplating", "/ws", false, false, false).unwrap());
+    assert_eq!(cli_tenacity(), Some(Tenacity::Standard));
+    assert_eq!(cli_cognition(), CognitionOverride::Unset);
+    // And the surviving /psyche text setters DO mutate through the router —
+    // proving the routing distinction, not just shared inertness.
+    assert!(dispatch_slash("/psyche tenacity relentless", "/ws", false, false, false).unwrap());
+    assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
+    set_cli_tenacity(Tenacity::Standard);
 }
 
 #[test]

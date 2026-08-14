@@ -42,6 +42,8 @@
 //! ## Keys (vi-flavoured; save is explicit, Esc always cancels)
 //! - `↑`/`↓` select a dial, `←`/`→` change it (incl. `auto`/`inherit`).
 //! - `Enter` — apply the changed dials + act on the persona choice, close.
+//!   With nothing changed (no dirty dial, persona kept), Enter closes silently
+//!   — a no-op visit applies nothing and reports nothing (#1665).
 //! - `Esc` / `q` — cancel: discard changes, close (never applies).
 //! - `Ctrl-S` or `:w <name>` — save the posture as persona `<name>` (`:w!` to
 //!   overwrite). `:wq <name>` — save + apply + close. `:q` — cancel + close.
@@ -333,6 +335,17 @@ impl PanelState {
         } else {
             PersonaAction::Switch(selected.clone())
         }
+    }
+
+    /// True when applying would change nothing: no dial is dirty and the persona
+    /// choice is Keep. [`run`] downgrades an Enter on a no-op panel to a silent
+    /// close (#1665) — bare `/psyche` opens the panel, so browsing must never
+    /// mutate or report. A dial cycled away and back is dirty (a deliberate
+    /// same-value re-apply), so it still counts as a change.
+    pub(crate) fn is_noop(&self) -> bool {
+        !self.cognition.is_dirty()
+            && !self.tenacity.is_dirty()
+            && self.persona_action() == PersonaAction::Keep
     }
 
     // ── Projection (review-3 §3) ─────────────────────────────────────────
@@ -747,6 +760,9 @@ fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
 /// during `:w`/`:wq` BEFORE any dial is applied, so a failed write leaves the
 /// runtime untouched and the panel open (review-3 §1). Dials apply ONLY on an
 /// explicit apply (Enter / a `:wq` whose save landed); Esc / `q` / `:q` discard.
+/// An Enter with nothing changed ([`PanelState::is_noop`]) downgrades to
+/// [`PanelOutcome::Cancelled`] — bare `/psyche` opens this panel (#1665), so a
+/// browse-and-leave visit must be indistinguishable from never opening it.
 pub(crate) fn run(
     personas: Vec<PersonaChoice>,
     current_persona: Option<String>,
@@ -815,19 +831,30 @@ pub(crate) fn run(
     // the loop (via `persist`). Now apply the dials — but ONLY on an explicit
     // apply — then hand the persona action to the caller, which applies it, reroutes
     // the backend, recomputes, and reports from fresh runtime state.
-    Ok(if applied {
+    Ok(close_outcome(applied, &state))
+}
+
+/// The panel's exit contract, factored out of the raw-mode loop so it is
+/// unit-testable without a TTY (adversarial-review finding on #1665): given
+/// whether the operator explicitly applied (Enter / a `:wq` whose save landed)
+/// and the final working state, produce the [`PanelOutcome`] — running
+/// [`PanelState::apply`] as a side effect ONLY on a real (non-noop) apply.
+/// The noop downgrade lives HERE: Enter with nothing changed maps to
+/// `Cancelled` (or `Saved` after a lone `:w`, so the save is still reported).
+fn close_outcome(applied: bool, state: &PanelState) -> PanelOutcome {
+    if applied && !state.is_noop() {
         state.apply();
         let persona = state.persona_action();
-        match state.saved {
+        match state.saved.clone() {
             Some(name) => PanelOutcome::SavedAndApplied { name, persona },
             None => PanelOutcome::Applied { persona },
         }
     } else {
-        match state.saved {
+        match state.saved.clone() {
             Some(name) => PanelOutcome::Saved { name },
             None => PanelOutcome::Cancelled,
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -983,6 +1010,32 @@ mod tests {
     }
 
     #[test]
+    fn a_noop_visit_is_detected_so_enter_closes_silently() {
+        // #1665: bare /psyche opens the panel, so browsing-then-Enter must be a
+        // no-op — nothing applied, nothing reported. Moving the selection is
+        // not a change; touching a dial (even back to its original value) is.
+        let _g = GlobalSettingsGuard::acquire();
+        let mut s = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        assert!(s.is_noop(), "fresh panel: nothing to apply");
+        s.down();
+        s.up();
+        assert!(s.is_noop(), "row selection alone is not a change");
+        // Touch the cognition dial: dirty even after cycling back — a deliberate
+        // same-value re-apply is still an operator action.
+        s.down(); // persona → cognition
+        s.cycle(1);
+        assert!(!s.is_noop(), "a touched dial is a change");
+        s.cycle(-1);
+        assert!(!s.is_noop(), "cycled back is still dirty (re-apply)");
+        // A persona switch is a change too.
+        let mut p = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        while p.persona_idx != 0 {
+            p.cycle(-1);
+        }
+        assert!(!p.is_noop(), "persona Clear is a change");
+    }
+
+    #[test]
     fn no_backend_persona_projects_the_operator_baseline() {
         // review-3 §3: a persona that declares no backend projects the operator
         // BASELINE (the revert target), not the outgoing persona's backend.
@@ -1131,16 +1184,68 @@ mod tests {
         s.begin_command("w keep");
         s.run_command(&mut persist);
         assert_eq!(s.saved.as_deref(), Some("keep"));
-        // Simulate the cancel branch of `run` (applied = false):
-        let outcome = match s.saved.clone() {
-            Some(name) => PanelOutcome::Saved { name },
-            None => PanelOutcome::Cancelled,
-        };
+        // The REAL exit path (close_outcome), not a hand-copied match: a save
+        // happened but the loop was cancelled → Saved, never a posture summary.
         assert_eq!(
-            outcome,
+            close_outcome(false, &s),
             PanelOutcome::Saved {
                 name: "keep".to_string()
             }
         );
+        // And an Enter AFTER a lone :w with no dial/persona change: still Saved
+        // (the save is reported; the noop "apply" stays silent), NOT
+        // SavedAndApplied.
+        assert_eq!(
+            close_outcome(true, &s),
+            PanelOutcome::Saved {
+                name: "keep".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn close_outcome_downgrades_a_noop_enter_and_applies_a_real_one() {
+        // Adversarial-review findings on #1665: (1) the Enter downgrade
+        // `applied && !is_noop()` must be exercised through the REAL exit path;
+        // (2) the tenacity term of is_noop needs a tenacity-ONLY dirty case —
+        // dropping `!self.tenacity.is_dirty()` from is_noop silently discarded
+        // a tenacity-only edit (apply() skipped, Cancelled returned).
+        use newt_core::cognition::{set_cli_cognition, CognitionOverride};
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
+
+        // Noop visit: Enter and Esc are indistinguishable — both Cancelled.
+        let s = panel(None, two_personas(), Tenacity::Standard);
+        assert_eq!(close_outcome(true, &s), PanelOutcome::Cancelled);
+        assert_eq!(close_outcome(false, &s), PanelOutcome::Cancelled);
+        assert_eq!(cli_tenacity(), Some(Tenacity::Standard), "nothing applied");
+
+        // Tenacity-ONLY dirty + Enter → a real Applied, and the override is
+        // actually written through apply().
+        let mut t = panel(None, two_personas(), Tenacity::Standard);
+        t.down(); // persona → cognition
+        t.down(); // cognition → tenacity
+        t.cycle(1); // standard → insistent (dirty)
+        let out = close_outcome(true, &t);
+        assert_eq!(
+            out,
+            PanelOutcome::Applied {
+                persona: PersonaAction::Keep
+            }
+        );
+        assert_eq!(
+            cli_tenacity(),
+            Some(Tenacity::Insistent),
+            "the tenacity-only edit was applied, not silently discarded"
+        );
+        // The same dirty state WITHOUT the explicit apply stays Cancelled and
+        // writes nothing further.
+        set_cli_tenacity(Tenacity::Standard);
+        assert_eq!(close_outcome(false, &t), PanelOutcome::Cancelled);
+        assert_eq!(cli_tenacity(), Some(Tenacity::Standard));
+
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
     }
 }

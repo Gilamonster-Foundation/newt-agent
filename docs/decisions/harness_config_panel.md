@@ -82,3 +82,22 @@ command, the flag, or the config file.
 built against this documented seam. The tenacity dial is already usable via
 `--tenacity`, `[tenacity]` config, and `/tenacity`, with the static footer
 indicator (#1480); the panel makes it (and model-profile selection) navigable.
+
+## Amendment 2026-08-13 — bare `/psyche` IS the panel (#1665)
+
+Operator decision: the top-level slash surface had sprawled, and the dial
+panel is the psyche's primary interface, not a subcommand:
+
+- **Bare `/psyche` opens this panel** on a rich-tui TTY (`psyche edit`
+  survives as a muscle-memory alias). Piped / lean / non-TTY falls through to
+  the text status view (`/psyche status`).
+- **A no-op visit is silent**: Enter with no dirty dial and the persona kept
+  downgrades to a cancel — nothing applied, nothing reported. Browsing the
+  panel must be indistinguishable from never opening it.
+- **`/cognition` + `/tenacity` retired as top-levels**; the text setters live
+  on as `/psyche cognition <level>` / `/psyche tenacity <level>` (piped/lean
+  parity). The retired commands redirect and mutate NOTHING.
+
+This is slice 1 of the slash-consolidation epic (#1673); the panel's
+interaction grammar (↑↓ / ←→ / Enter / Esc / `:` commands) is the house
+standard the backend panel (#1667), sessions (#1668), and tabs (#1669) reuse.
