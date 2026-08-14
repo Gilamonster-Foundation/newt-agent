@@ -224,60 +224,159 @@ fn stage_netprobe() -> Option<(tempfile::TempDir, PathBuf)> {
 /// windows short and separate — widening those only slows every denial test.
 const ARRIVAL_WAIT: Duration = Duration::from_secs(30);
 
-/// The loopback listeners' accept window. This clock starts at listener
-/// creation — BEFORE the AppContainer child is even launched — so it must
-/// comfortably cover a cold `powershell.exe` start inside a fresh AppContainer
-/// on a loaded hosted runner. With the old 3s deadline the accept thread could
-/// exit (dropping its channel sender) while `launch()` was still blocked on
-/// the child, so the deputy's later relay hit a dead port and `relay_rx` saw
-/// `Disconnected` — the `appcontainer_named_pipe_deputy` flake: same SHA red
-/// on one run, green on its twin. Kept above [`ARRIVAL_WAIT`] so the listener
-/// covers the launch delay plus the first receiver's wait; on the success path
-/// the relay lands before `launch()` even returns, so the window only shapes
-/// how a failure reports (`Disconnected` vs `Timeout`), never what passes.
-const ACCEPT_WINDOW: Duration = Duration::from_secs(60);
-
 /// The child-execution budget for MUST-SUCCEED control runs (`constrained_run`
 /// / `constrained_cmd` calls whose output is then asserted on). The deadline
 /// starts after spawn and absorbs launcher init + AppContainer profile
 /// bring-up + a cold child start; at expiry the child tree is killed and the
 /// run reports empty stdout, so a tight budget turns runner load straight into
-/// a red assert — the same flake class as [`ACCEPT_WINDOW`]. Success returns
-/// early; only already-failing runs pay the wider ceiling. Deliberately NOT
-/// used for the intentional-timeout run (500ms), which exists to expire.
+/// a red assert — the same flake class the loopback listeners had before
+/// [`LoopbackListener`] tied their accept loop to test lifetime. Success
+/// returns early; only already-failing runs pay the wider ceiling.
+/// Deliberately NOT used for the intentional-timeout run (500ms), which
+/// exists to expire.
 const CONTROL_BUDGET: Duration = Duration::from_secs(30);
 
-fn tcp_listener() -> (u16, mpsc::Receiver<Vec<u8>>) {
+/// Head-room over (measured startup + the child's own timeout budget) allowed
+/// to the timeout-cleanup promptness assertion: kill + reap + pipe drain, plus
+/// scheduler noise. Bounded well below the timed-out child's own runtime
+/// (minutes), so the assertion still fails if the host ever blocks behind the
+/// full child wait.
+const PROMPTNESS_SLACK: Duration = Duration::from_secs(10);
+
+/// A loopback listener whose accept loop lives exactly as long as the test
+/// that owns it — the semantically correct accept window.
+///
+/// The old design armed a wall-clock deadline at listener CREATION, before
+/// the AppContainer child was even launched. A cold `powershell.exe` start
+/// inside a fresh AppContainer on a loaded hosted runner could outlast that
+/// deadline while `launch()` was still blocked, so the accept thread exited
+/// (dropping its sender and the bound port) and the deputy's later relay hit
+/// a dead port — the `appcontainer_named_pipe_deputy` flake: same SHA red on
+/// one run, green on its twin. No fixed pre-launch deadline can be correct,
+/// because the launch delay it must cover is unbounded scheduler noise.
+///
+/// Instead the accept thread now exits when the owning test drops this
+/// handle (observed as the `_live` channel disconnecting). Positive "did the
+/// connection arrive" deadlines live only at the `rx.recv_timeout(...)` call
+/// sites, whose clocks start at the semantically meaningful points; negative
+/// must-NOT-arrive windows stay short and separate. The listener itself can
+/// no longer lose a race with a slow child launch, and the accept thread
+/// still cannot outlive the test (panic unwind included).
+struct LoopbackListener {
+    port: u16,
+    rx: mpsc::Receiver<Vec<u8>>,
+    /// Dropped when the owning test scope ends; the accept thread observes
+    /// the disconnect and exits. This — not a wall clock — bounds the loop.
+    _live: mpsc::Sender<()>,
+}
+
+fn tcp_listener() -> LoopbackListener {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     listener
         .set_nonblocking(true)
         .expect("set nonblocking listener");
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + ACCEPT_WINDOW;
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let _ = stream.write_all(b"ok");
-                    let mut buf = Vec::new();
-                    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-                    let _ = stream.read_to_end(&mut buf);
-                    let _ = tx.send(buf);
+    let (live_tx, live_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.write_all(b"ok");
+                let mut buf = Vec::new();
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                let _ = stream.read_to_end(&mut buf);
+                let _ = tx.send(buf);
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if matches!(live_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
                     return;
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(_) => {
-                    return;
-                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                return;
             }
         }
     });
-    (port, rx)
+    LoopbackListener {
+        port,
+        rx,
+        _live: live_tx,
+    }
+}
+
+/// Printed to stdout by a hostile child IMMEDIATELY BEFORE it attempts the
+/// forbidden operation. Asserting on it separates "the process started and
+/// reached the attempt" from "the operation was denied", so a failed
+/// AppContainer launch, a shell startup failure, or a crashed child cannot
+/// vacuously satisfy a denial assert that only checks for absent effects.
+const ATTEMPT_MARKER: &str = "DENIAL-ATTEMPT-BEGIN";
+
+/// A hostile write command that first proves the shell is alive and about to
+/// attempt the write. `&` (not `&&`) so the write attempt runs regardless,
+/// and the redirection binds only to the second `echo`.
+fn attempted_write_cmd(path: &Path, marker: &str) -> String {
+    format!("echo {ATTEMPT_MARKER}& {}", write_cmd(path, marker))
+}
+
+/// The credential-read probe, identical for the positive-grant and the denial
+/// run so the only difference between them is the granted environment. The
+/// leading [`ATTEMPT_MARKER`] proves the child started and reached the read —
+/// without it, an empty stdout (killed at the budget, never launched, crashed
+/// shell) satisfies "no credential appeared" while proving nothing.
+fn env_probe_command() -> String {
+    format!("echo {ATTEMPT_MARKER}& echo %OPENAI_API_KEY% & echo %OPENAI_BASE_URL%")
+}
+
+/// Both child streams as one string, for diagnostics and for the probes whose
+/// evidence is a whole-output signature rather than a specific stream.
+fn combined(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Every denial-by-absent-effect assert must be preceded by this: the child
+/// printed [`ATTEMPT_MARKER`], so the forbidden operation was genuinely
+/// attempted and its absence is kernel policy, not a broken harness.
+fn assert_attempt_reached(what: &str, out: &Output) {
+    // Checked on stdout ONLY, not the combined streams: `agent-bridle-aclaunch`
+    // hands the child its own inherited stdio handles, so the child's `echo`
+    // lands in stdout. Accepting the marker from stderr as well would let a
+    // launcher diagnostic that happens to quote the command line stand in for
+    // the child having run — reintroducing the vacuity this guard closes.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(ATTEMPT_MARKER),
+        "{what}: hostile child must start and reach its forbidden-operation attempt \
+         (marker {ATTEMPT_MARKER} missing — a failed launch would otherwise pass \
+         the denial assert vacuously); status={:?} output={:?}",
+        out.status.code(),
+        combined(out),
+    );
+}
+
+/// Proof that `ab-netprobe` launched inside the container and completed a
+/// DENIED connect attempt: on failure it prints `ab-netprobe: ... failed: ...`
+/// (0.7.10 says `connect to`, newer versions say `tcp to` — assert on the
+/// stable pieces). Without this, a probe that never launched is
+/// indistinguishable from a denied one.
+fn assert_netprobe_attempted(what: &str, out: &Output) {
+    // `ab-netprobe` writes its own diagnostic to stderr; the launcher passes
+    // the child's stderr handle straight through. Same reasoning as
+    // [`assert_attempt_reached`] — assert on the stream that carries the
+    // child's evidence, and print both streams when it is missing.
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains("ab-netprobe:") && text.contains("failed"),
+        "{what}: ab-netprobe must launch and report a failed connect attempt — \
+         otherwise 'denied' is indistinguishable from 'probe never ran'; \
+         status={:?} output={:?}",
+        out.status.code(),
+        combined(out),
+    );
 }
 
 fn host_ab_netprobe(port: u16) -> bool {
@@ -448,10 +547,14 @@ fn appcontainer_denies_profile_secret_read() {
             tag("profile-secret"),
             "cmd.exe".to_string(),
             "/c".to_string(),
-            "type".to_string(),
-            path_s(&secret),
+            // No embedded `"`: aclaunch quotes with MSVC/CommandLineToArgvW
+            // rules (`"` -> `\"`), which cmd.exe's own parser does not honour.
+            // Every command string in this file stays quote-free, like
+            // `write_cmd`.
+            format!("echo {ATTEMPT_MARKER}& type {}", cmd_quote(&secret)),
         ],
     );
+    assert_attempt_reached("profile secret read", &denied);
     let stdout = String::from_utf8_lossy(&denied.stdout);
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
@@ -503,9 +606,10 @@ fn appcontainer_denies_outside_workspace_write() {
             path_s(workspace.path()),
             "cmd.exe".to_string(),
             "/c".to_string(),
-            write_cmd(&target, WRITTEN),
+            attempted_write_cmd(&target, WRITTEN),
         ],
     );
+    assert_attempt_reached("outside-workspace write", &denied);
     assert!(
         contains_file(&target, SENTINEL) && !contains_file(&target, WRITTEN),
         "outside write must be denied; status={:?} stdout={} stderr={}",
@@ -540,9 +644,10 @@ fn appcontainer_denies_sibling_dir_write() {
             path_s(&workspace),
             "cmd.exe".to_string(),
             "/c".to_string(),
-            write_cmd(&target, WRITTEN),
+            attempted_write_cmd(&target, WRITTEN),
         ],
     );
+    assert_attempt_reached("sibling-dir write", &denied);
     assert!(
         contains_file(&target, SENTINEL) && !contains_file(&target, WRITTEN),
         "sibling write must be denied; status={:?} stdout={} stderr={}",
@@ -585,9 +690,10 @@ fn appcontainer_denies_reparse_and_unc_escape() {
             path_s(&workspace),
             "cmd.exe".to_string(),
             "/c".to_string(),
-            write_cmd(&dotdot_path, WRITTEN),
+            attempted_write_cmd(&dotdot_path, WRITTEN),
         ],
     );
+    assert_attempt_reached("`..` escape write", &denied_dotdot);
     assert!(
         contains_file(&dotdot_target, SENTINEL) && !contains_file(&dotdot_target, WRITTEN),
         "`..` escape must be denied; status={:?} stderr={}",
@@ -605,9 +711,10 @@ fn appcontainer_denies_reparse_and_unc_escape() {
             path_s(&workspace),
             "cmd.exe".to_string(),
             "/c".to_string(),
-            format!("echo {WRITTEN}>{extended}"),
+            format!("echo {ATTEMPT_MARKER}& echo {WRITTEN}>{extended}"),
         ],
     );
+    assert_attempt_reached("`\\\\?\\` alternate-spelling write", &denied_extended);
     assert!(
         contains_file(&extended_target, SENTINEL) && !contains_file(&extended_target, WRITTEN),
         "`\\\\?\\` alternate spelling must be denied; status={:?} stderr={}",
@@ -637,9 +744,10 @@ fn appcontainer_denies_reparse_and_unc_escape() {
             path_s(&workspace),
             "cmd.exe".to_string(),
             "/c".to_string(),
-            write_cmd(&through_junction, WRITTEN),
+            attempted_write_cmd(&through_junction, WRITTEN),
         ],
     );
+    assert_attempt_reached("junction escape write", &denied_junction);
     assert!(
         contains_file(&junction_target, SENTINEL) && !contains_file(&junction_target, WRITTEN),
         "junction escape must be denied; status={:?} stderr={}",
@@ -689,12 +797,14 @@ fn appcontainer_denies_reparse_and_unc_escape() {
             "-NonInteractive".to_string(),
             "-Command".to_string(),
             format!(
-                "Set-Content -LiteralPath {} -Value {}",
+                "Write-Output {}; Set-Content -LiteralPath {} -Value {}",
+                ps_quote(ATTEMPT_MARKER),
                 ps_quote(&unc),
                 ps_quote(WRITTEN)
             ),
         ],
     );
+    assert_attempt_reached("UNC admin-share write", &denied_unc);
     assert!(
         contains_file(&unc_target, SENTINEL) && !contains_file(&unc_target, WRITTEN),
         "UNC admin-share escape must be denied by AppContainer policy, not by host unavailability; status={:?} stderr={}",
@@ -719,10 +829,7 @@ fn appcontainer_child_does_not_inherit_provider_credentials() {
     let positive = constrained_run(
         workspace.path(),
         "cmd.exe",
-        vec![
-            "/c".to_string(),
-            "echo %OPENAI_API_KEY% & echo %OPENAI_BASE_URL%".to_string(),
-        ],
+        vec!["/c".to_string(), env_probe_command()],
         CONTROL_BUDGET,
         vec![
             ("OPENAI_API_KEY", "explicit-grant".to_string()),
@@ -741,21 +848,22 @@ fn appcontainer_child_does_not_inherit_provider_credentials() {
     let denied = constrained_run(
         workspace.path(),
         "cmd.exe",
-        vec![
-            "/c".to_string(),
-            "echo %OPENAI_API_KEY% & echo %OPENAI_BASE_URL%".to_string(),
-        ],
+        vec!["/c".to_string(), env_probe_command()],
         CONTROL_BUDGET,
         Vec::new(),
     )
     .expect("env denial run");
     assert_appcontainer(&denied);
-    // The denial is only proven by a run that actually completed: a child
-    // killed at the budget would report empty stdout and vacuously satisfy the
-    // no-leak assert below, proving nothing.
+    // The denial is only proven by a run that actually reached the read: a
+    // child killed at the budget, or one that never started, would report
+    // empty stdout and vacuously satisfy the no-leak assert below.
     assert!(
         denied.success,
         "env denial control must complete before its output can prove anything: {denied:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied.stdout).contains(ATTEMPT_MARKER),
+        "env denial control must prove the child reached the credential read: {denied:?}"
     );
     let stdout = String::from_utf8_lossy(&denied.stdout);
     assert!(
@@ -776,17 +884,17 @@ fn appcontainer_denies_direct_tcp() {
         return;
     };
 
-    let (host_port, host_rx) = tcp_listener();
+    let host_listener = tcp_listener();
     assert!(
-        host_ab_netprobe(host_port),
+        host_ab_netprobe(host_listener.port),
         "host netprobe control must connect"
     );
     assert!(
-        host_rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
+        host_listener.rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
         "host control listener must observe the connection"
     );
 
-    let (port, rx) = tcp_listener();
+    let deny_listener = tcp_listener();
     let denied = launch(
         &launcher,
         [
@@ -796,9 +904,10 @@ fn appcontainer_denies_direct_tcp() {
             path_s(probe_dir.path()),
             path_s(&probe),
             "127.0.0.1".to_string(),
-            port.to_string(),
+            deny_listener.port.to_string(),
         ],
     );
+    assert_netprobe_attempted("direct TCP denial", &denied);
     assert!(
         !denied.status.success(),
         "AppContainer net:none must deny direct TCP; stdout={} stderr={}",
@@ -806,7 +915,10 @@ fn appcontainer_denies_direct_tcp() {
         String::from_utf8_lossy(&denied.stderr)
     );
     assert!(
-        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        deny_listener
+            .rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
         "parent listener must not observe a denied AppContainer TCP connection"
     );
 }
@@ -876,7 +988,7 @@ fn appcontainer_loopback_behavior() {
         return;
     };
 
-    let (deny_port, _) = tcp_listener();
+    let deny_listener = tcp_listener();
     let denied = launch(
         &launcher,
         [
@@ -886,9 +998,10 @@ fn appcontainer_loopback_behavior() {
             path_s(probe_dir.path()),
             path_s(&probe),
             "127.0.0.1".to_string(),
-            deny_port.to_string(),
+            deny_listener.port.to_string(),
         ],
     );
+    assert_netprobe_attempted("default-loopback denial", &denied);
     assert!(
         !denied.status.success(),
         "default AppContainer loopback must be denied without loopback exemption"
@@ -903,7 +1016,7 @@ fn appcontainer_loopback_behavior() {
         );
         return;
     }
-    let (allow_port, allow_rx) = tcp_listener();
+    let allow_listener = tcp_listener();
     let allowed = launch(
         &launcher,
         [
@@ -914,7 +1027,7 @@ fn appcontainer_loopback_behavior() {
             path_s(probe_dir.path()),
             path_s(&probe),
             "127.0.0.1".to_string(),
-            allow_port.to_string(),
+            allow_listener.port.to_string(),
         ],
     );
     assert!(
@@ -923,7 +1036,7 @@ fn appcontainer_loopback_behavior() {
         String::from_utf8_lossy(&allowed.stderr)
     );
     assert!(
-        allow_rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
+        allow_listener.rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
         "parent listener must observe loopback-exemption connection"
     );
 }
@@ -948,7 +1061,7 @@ fn appcontainer_named_pipe_deputy() {
     let Some((probe_dir, probe)) = stage_netprobe() else {
         return;
     };
-    let (direct_port, direct_rx) = tcp_listener();
+    let direct_listener = tcp_listener();
     let direct = launch(
         &launcher,
         [
@@ -958,17 +1071,25 @@ fn appcontainer_named_pipe_deputy() {
             path_s(probe_dir.path()),
             path_s(&probe),
             "127.0.0.1".to_string(),
-            direct_port.to_string(),
+            direct_listener.port.to_string(),
         ],
     );
+    assert_netprobe_attempted("pipe-deputy direct-loopback control", &direct);
     assert!(
-        !direct.status.success() && direct_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        !direct.status.success(),
         "direct loopback control must be denied before testing the pipe deputy"
     );
+    assert!(
+        direct_listener
+            .rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
+        "parent listener must not observe the denied direct-loopback control connection"
+    );
 
-    let (relay_port, relay_rx) = tcp_listener();
+    let relay_listener = tcp_listener();
     let pipe_name = tag("pipe-deputy");
-    let pipe_rx = spawn_named_pipe_deputy(&pipe_name, relay_port);
+    let pipe_rx = spawn_named_pipe_deputy(&pipe_name, relay_listener.port);
     let script = format!(
         "$p=New-Object System.IO.Pipes.NamedPipeClientStream('.',{},[System.IO.Pipes.PipeDirection]::Out);\
          $p.Connect(2000);\
@@ -1003,7 +1124,7 @@ fn appcontainer_named_pipe_deputy() {
         "named pipe deputy payload mismatch: {pipe_payload:?}"
     );
     assert!(
-        relay_rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
+        relay_listener.rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
         "AppContainer child caused a host named-pipe deputy to relay over loopback"
     );
 }
@@ -1130,6 +1251,7 @@ fn appcontainer_inheritable_handle_inheritance() {
 
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue';\
+         Write-Output '{ATTEMPT_MARKER}';\
          $h=[IntPtr]::new({});\
          $sfh=New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($h,$false);\
          $fs=New-Object System.IO.FileStream($sfh,[System.IO.FileAccess]::Write);\
@@ -1151,6 +1273,13 @@ fn appcontainer_inheritable_handle_inheritance() {
     )
     .expect("handle inheritance probe");
     assert_appcontainer(&out);
+    // The CLOSED_ON_THIS_RUNNER classification below is only evidence if the
+    // probe actually ran: a PowerShell that never started would report the
+    // same absent HANDLE-LEAK as a kernel that closed the handle.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(ATTEMPT_MARKER),
+        "handle probe must prove PowerShell started and reached the handle write: {out:?}"
+    );
     let text = std::fs::read_to_string(&marker).unwrap_or_default();
     assert!(
         text.contains("PARENT-HANDLE-VALID"),
@@ -1251,12 +1380,7 @@ fn appcontainer_descendants_stay_in_the_same_token() {
             token_tree_probe_command(),
         ],
     );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_two_generation_low_token(&combined);
+    assert_two_generation_low_token(&combined(&out));
 }
 
 #[test]
@@ -1278,12 +1402,7 @@ fn appcontainer_follows_shells_and_helpers() {
             token_tree_probe_command(),
         ],
     );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_two_generation_low_token(&combined);
+    assert_two_generation_low_token(&combined(&out));
 
     let helper = launch(
         &launcher,
@@ -1295,12 +1414,7 @@ fn appcontainer_follows_shells_and_helpers() {
             path_s(&probe),
         ],
     );
-    let helper_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&helper.stdout),
-        String::from_utf8_lossy(&helper.stderr)
-    )
-    .to_ascii_lowercase();
+    let helper_output = combined(&helper).to_ascii_lowercase();
     assert!(
         helper_output.contains("usage: ab-netprobe"),
         "staged workspace .exe helper must launch inside the AppContainer; output={helper_output}"
@@ -1316,12 +1430,7 @@ fn appcontainer_follows_shells_and_helpers() {
     }
     args.extend([path_s(&git), "--version".to_string()]);
     let git_out = launch(&launcher, args);
-    let git_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&git_out.stdout),
-        String::from_utf8_lossy(&git_out.stderr)
-    )
-    .to_ascii_lowercase();
+    let git_output = combined(&git_out).to_ascii_lowercase();
     if !git_output.contains("git version") {
         eprintln!("git helper probe did not run under this AppContainer DACL shape: {git_output}");
     }
@@ -1337,6 +1446,11 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
     }
     let workspace = fresh_dir("timeout");
 
+    // The quick control doubles as the startup calibration for the promptness
+    // assertion below: its wall time is (AppContainer bring-up + a trivial
+    // child + teardown) measured on THIS machine at THIS moment, which is
+    // exactly the term that must not be charged against the timeout budget.
+    let quick_started = Instant::now();
     let quick = constrained_run(
         workspace.path(),
         "cmd.exe",
@@ -1349,6 +1463,7 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
         Vec::new(),
     )
     .expect("quick timeout control");
+    let startup_reference = quick_started.elapsed();
     assert_appcontainer(&quick);
     assert!(quick.success, "quick control should complete: {quick:?}");
     assert!(
@@ -1374,14 +1489,21 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
         slow.timed_out,
         "slow child must be reported timed out: {slow:?}"
     );
-    // The child's spin loop runs on the order of minutes, so any cap well under
-    // that still proves the host tore it down at the 500ms budget rather than
-    // blocking behind the full child wait. 15s (not 4s) leaves room for
-    // AppContainer spawn + teardown overhead on a loaded runner — this is a
-    // promptness proof, not a latency benchmark.
+    // Promptness proof, anchored at the right semantic point. The claim is
+    // "the host tore the child down at its 500ms budget instead of blocking
+    // behind the full child wait" — and the child's spin loop runs on the
+    // order of minutes. A fixed wall-clock cap charges AppContainer bring-up
+    // (unbounded scheduler noise on a hosted runner) against that budget,
+    // which is what turns runner load into a red assert. Measuring against
+    // the startup cost observed moments earlier removes exactly that term
+    // while keeping the cap orders of magnitude below "blocked on the child".
+    let elapsed = started.elapsed();
+    let bound = startup_reference + Duration::from_millis(500) + PROMPTNESS_SLACK;
     assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "timeout cleanup must not block behind the Windows child wait"
+        elapsed < bound,
+        "timeout cleanup must not block behind the Windows child wait; \
+         elapsed={elapsed:?} bound={bound:?} (startup reference {startup_reference:?} \
+         + 500ms budget + {PROMPTNESS_SLACK:?} slack)"
     );
     assert!(
         slow.stdout.is_empty(),

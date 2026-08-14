@@ -42,6 +42,35 @@ fixture uses `cmd.exe` stdout plus a CPU-only timed command rather than
 filesystem writes or PowerShell filesystem providers, so lifecycle remains
 separate from authority.
 
+### Vacuity guards — attempt first, then denial
+
+Most denials here are proved by an *absent effect*: no file written, no
+datagram delivered, no credential in stdout. That evidence is worthless unless
+the child actually reached the forbidden operation — a failed AppContainer
+launch, a PowerShell that never started, a crashed shell, a harness timeout, a
+missing artifact, or a stale binary all produce the same absent effect as a
+kernel denial. Each hostile fixture therefore proves the attempt happened
+*before* asserting the denial:
+
+- `cmd.exe` / PowerShell fixtures emit `DENIAL-ATTEMPT-BEGIN` on stdout
+  immediately before the forbidden call (the UDP fixture uses its
+  `POWERSHELL-RAN` marker file for the same purpose).
+- `ab-netprobe` fixtures require the probe's own
+  `ab-netprobe: ... failed: ...` line, which also proves the staged binary that
+  ran really is `ab-netprobe` rather than a stale or silent executable.
+- Must-succeed control runs assert `success` plus their expected stdout, so a
+  child killed at its budget cannot stand in for a denial.
+- The launcher/probe requirements above (`BRIDLE_REQUIRE_*`) turn a missing
+  artifact into a hard failure rather than a skip.
+
+Correspondingly, the suite's timing policy separates the two directions.
+Must-arrive waits (positive controls, the pipe payload, the deputy relay) get
+generous budgets whose clocks start only once the awaited event is possible,
+and the loopback listeners' accept loop is bounded by test lifetime rather than
+by a wall clock armed before the child is launched. Must-NOT-arrive windows are
+kept short and are never widened to make a run green — widening them would trade
+proof for wall clock.
+
 Manual token snapshot:
 
 ```powershell
