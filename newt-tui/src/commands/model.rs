@@ -662,6 +662,14 @@ mod mark_tests {
     ///
     /// Both no-op arms, driven through the real `dispatch`: a bare `/backends`
     /// LISTING, and a `/backends <unknown>`. Neither touches the network.
+    ///
+    /// Since #1683 landed the unified panel, the unknown-name arm delegates to
+    /// `apply_backend_choice` — the SAME function the panel chooser calls — so
+    /// this one test now covers the refusal path of both surfaces. That matters
+    /// because #1683 merged BEFORE this PR: the panel shipped a backend chooser
+    /// while the pin machinery was still unmerged, so nothing on `main` marked
+    /// at all. This is the assertion that the two compose the way the design
+    /// says rather than the way the merge order implied.
     #[test]
     fn browsing_backends_marks_no_preference_action() {
         let _g = GlobalSettingsGuard::acquire();
