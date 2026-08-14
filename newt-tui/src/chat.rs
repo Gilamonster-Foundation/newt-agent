@@ -1530,6 +1530,22 @@ pub(crate) fn run_chat(
     };
     tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
 
+    // herdr bridge: when this session runs inside a herdr pane, announce the
+    // session + set the tab title. `detect()` is `None` outside herdr, so this
+    // is a no-op on any non-herdr run.
+    let herdr = newt_core::herdr::HerdrContext::detect();
+    if let Some(herdr) = &herdr {
+        herdr.report_session_start(
+            &ctx.session_id,
+            newt_core::herdr::SessionStartSource::Startup,
+        );
+        let title = std::path::Path::new(workspace)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        herdr.report_metadata(title.as_deref(), None);
+        herdr.mark_idle();
+    }
+
     // Build system prompt now that SoulProvider has loaded its soul file.
     system = rebuild_system_prompt(
         workspace,
@@ -1813,7 +1829,14 @@ pub(crate) fn run_chat(
                             parent: pending.parent.clone(),
                         }
                     });
-            (surface.read_line(&prompt)?, origin)
+            if let Some(h) = &herdr {
+                h.mark_idle();
+            }
+            let read = surface.read_line(&prompt)?;
+            if let Some(h) = &herdr {
+                h.mark_working(None);
+            }
+            (read, origin)
         };
         match outcome {
             ReadOutcome::Line(line) => {
