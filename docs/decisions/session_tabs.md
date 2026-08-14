@@ -298,6 +298,12 @@ implementation PR is tested against.
   Invariant: `activate(B)` yields identical live state regardless of which
   tabs were visited before, in any order.
 
+**Naming:** #1684's rework resets the posture globals to an *invocation
+baseline* on every conversation switch. That is the same object and the same
+rule as this ADR's `SessionBaseline` — one concept at two layers, not two.
+Implementers should see a single name; if #1684 lands the term first, this
+ADR adopts it rather than introducing a synonym.
+
 **Deactivation (the outgoing half of every switch/create/close/exit):**
 before any incoming mutation, the outgoing tab (a) **flushes its
 `PosturePin`** — the same `PosturePin::capture(base_provider, base_model)` +
@@ -310,6 +316,22 @@ list: **saved-turn** (#1684, keeps per-turn provenance), **deactivation**
 (switch-away, `/tab new`, close, `/resume`-replacement), and **session exit**
 (every exit path, beside `release_all`). No flush-on-every-dial-mutation
 write-through is required (rejected below).
+
+**How #1684's action-scoped capture changes this rule's weight.** The
+paragraph above assumes capture runs at the saved-turn chokepoint, which is
+what makes the deactivation flush *load-bearing* for posture: without it the
+dial change is simply lost. #1684's rework moves capture off that chokepoint
+to explicit operator **actions** (successful `/backends`, `/backend`,
+`/model`, `/psyche cognition|tenacity`, `/psyche obsessive`, psyche-panel
+apply — dirty axes only, merged per-axis into the stored pin). Under that
+model the dial change is already persisted *at the dial change*, so for
+**posture** the deactivation flush degrades from load-bearing to
+belt-and-braces — it remains correct and idempotent, but it is no longer the
+thing that closes the hole. For the **sidecar and input stash** the
+deactivation step stays load-bearing either way: those have no action seam
+and exist only in memory. State this explicitly, because a reader who assumes
+the saved-turn seam will otherwise mis-derive the invariant and conclude the
+flush is the only defense.
 
 **Dirty-state window (accepted, bounded):** posture mutations made after the
 last flush seam are lost on **crash** — the same blast radius as a crashed
@@ -612,14 +634,16 @@ semantics:**
    (verified at three call sites) — PR-A converts the *switch-to-open-tab*
    case only (`:tab drop`) to activation semantics; single-session resume
    behavior is untouched.
-3. Recommended (fixes a #1684-visible defect independent of tabs): flush the
-   outgoing conversation's pin *before* `/resume` replaces it — today "change
-   a dial → `/resume` another conversation → never send a prompt" leaves the
-   outgoing row's pin stale, since capture runs only at the saved-turn seam.
-   This is the same deactivation-flush rule this ADR mandates for tabs; if
-   #1684 declines it, PR-A adds the flush at its own seams and #1684's
-   single-session `/resume`-away keeps the stale-pin window (documented, not
-   silent).
+3. A #1684-visible defect independent of tabs — **resolved at the root, not
+   by this flush.** Under saved-turn capture, "change a dial → `/resume`
+   another conversation → never send a prompt" leaves the outgoing row's pin
+   stale. The original recommendation here was to flush the outgoing pin
+   before `/resume` replaces it. #1684's action-scoped capture supersedes
+   that: the dial change is captured at the action, so there is nothing left
+   to flush and the staleness is dissolved rather than documented. PR-A
+   therefore inherits a closed hole on the posture axis and must not
+   re-derive a flush as its defense — see "How #1684's action-scoped capture
+   changes this rule's weight" above.
 4. **No new fields in `PosturePin`.** The baseline is a session-start
    snapshot living beside `TabSet` in newt-tui; nothing else process-global
    moves into the pin. Authority/security state stays outside the pin
