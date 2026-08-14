@@ -45,6 +45,11 @@ mod rich_input;
 // operator dials. Gated with the other rich TTY surfaces so wyvern/lean strip it.
 #[cfg(feature = "rich-tui")]
 mod config_panel;
+// The slash-command palette (#1674): pure state + a thin render fn, drawn by
+// the rich input surface. Gated with the other rich TTY surfaces so the lean /
+// piped / wyvern paths never compile it in.
+#[cfg(feature = "rich-tui")]
+mod palette;
 #[cfg(feature = "rich-tui")]
 mod vi;
 // The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
