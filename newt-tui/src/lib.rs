@@ -30,6 +30,32 @@ mod prompt;
 mod prompt_visibility_test;
 #[cfg(feature = "live-spill")]
 mod spill_view;
+/// #1677 — the PTY acceptance proof that the transcript pager hands the
+/// terminal back (cooked mode + primary screen) on every exit path, including
+/// a panic. Same tier and same reasoning as `prompt_visibility_test`: a
+/// terminal property can only be observed on a terminal. Rich-only, because
+/// the surface it proves exists only there.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod transcript_pager_pty_test;
+// #1670: the transcript view. The module splits along the charter boundary —
+// the PURE row model (stored turns → styled rows) is always compiled and
+// always tested, while the terminal half (alt-screen + raw mode + ratatui
+// draw loop) is COMPILE-gated to `rich-tui` inside the module. That gate is
+// mechanical, not merely runtime: `ratatui`/`crossterm` are non-optional deps
+// of this crate, so without it a lean binary would carry an alt-screen
+// surface it can never legitimately enter — the boundary erosion
+// `plain_scroller_tui.md` forbids. Dependency direction, deliberately:
+// durable conversation model → transcript view model → RichTUI pager.
+//
+// On LEAN the view model has no consumer (lean answers `/transcript` with the
+// existing plain `conversation_show_message` spine), so it is dead code there
+// — deliberately. It stays compiled so its pure row/fold/scroll tests run in
+// the DEFAULT `cargo test`, the configuration the lean CI lane and most
+// contributors actually execute; gating the whole module would silently drop
+// that correctness suite from the default gate. The allowance is scoped to the
+// lean config alone, so genuinely-unused code in a rich build still fails the
+// zero-warnings policy.
+#[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
 mod transcript_pager;
 mod type_ahead;
 // OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).

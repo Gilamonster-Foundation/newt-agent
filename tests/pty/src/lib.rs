@@ -95,6 +95,44 @@ impl Pty {
         String::from_utf8_lossy(&out).into_owned()
     }
 
+    /// Change the pty's window size mid-test — the resize probe for
+    /// full-screen surfaces (#1677: the transcript pager must survive a
+    /// resize without corrupting its scroll state).
+    ///
+    /// Note: the kernel sends SIGWINCH to the pty's foreground process
+    /// *group*, but a child handed the slave via `slave_stdio()` never made
+    /// it a controlling terminal (`O_NOCTTY`, no `setsid`), so no signal is
+    /// delivered automatically. Pair this with [`signal_winch`] on the
+    /// child's pid so its event loop actually observes the change.
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let rc = unsafe { libc::ioctl(self.slave, libc::TIOCSWINSZ, &ws) };
+        assert_eq!(rc, 0, "TIOCSWINSZ (pty resize) failed");
+    }
+
+    /// Is the pty currently in RAW mode?
+    ///
+    /// The strongest postcondition a terminal-restoration test can assert
+    /// (#1677). Line-discipline settings belong to the pty *device*, not to a
+    /// particular file descriptor, so a `tcgetattr` on the parent's own slave
+    /// fd observes the state the CHILD installed with `enable_raw_mode()`.
+    /// That makes this KERNEL state — not an inference from escape bytes the
+    /// child may have emitted, buffered, or never flushed.
+    ///
+    /// Raw here means what crossterm's `enable_raw_mode` does: canonical mode
+    /// and echo off. Cooked (restored) is both back on.
+    pub fn is_raw(&self) -> bool {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::tcgetattr(self.slave, &mut t) };
+        assert_eq!(rc, 0, "tcgetattr on the pty slave failed");
+        (t.c_lflag & libc::ICANON) == 0 || (t.c_lflag & libc::ECHO) == 0
+    }
+
     /// A fresh duplicate of the slave as a `Stdio`, for handing to a child.
     ///
     /// One call per stream: `Stdio::from(File)` takes ownership and closes the
@@ -106,6 +144,15 @@ impl Pty {
         // owner of the duplicate.
         let file = unsafe { std::fs::File::from_raw_fd(libc::dup(self.slave)) };
         std::process::Stdio::from(file)
+    }
+}
+
+/// Deliver SIGWINCH to a pty child so it notices a [`Pty::resize`] — see the
+/// controlling-terminal note there. Best-effort by design: the child may
+/// already have exited, and this must not race that exit into a panic.
+pub fn signal_winch(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGWINCH);
     }
 }
 

@@ -46,8 +46,11 @@ pyo3 = [
 [dev-dependencies]
 wiremock.workspace = true
 assert_cmd.workspace = true
-cargo_metadata.workspace = true
 predicates.workspace = true
+# #1677: the mock E2E hashes the exact `newt` binary cargo just built, so a run's
+# evidence names the bytes under test (it replaced a target/-sweep that could
+# silently grade a stale binary). `cargo_metadata` went with that sweep.
+sha2.workspace = true
 # `grade` integration tests build real fixture/workspace trees on disk.
 tempfile.workspace = true
 

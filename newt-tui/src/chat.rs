@@ -585,6 +585,34 @@ fn restored_clarification_notice(pending: &PendingClarification) -> String {
     )
 }
 
+/// Render `/transcript` for the surface this session actually runs (#1670).
+///
+/// The RICH arm — the alt-screen pager — is **compile-gated**, so a lean build
+/// contains no pager code at all and this collapses to the plain printed
+/// spine. That is stronger than the runtime `surface_is_rich` check alone:
+/// `ratatui`/`crossterm` are non-optional deps, so without the `cfg` the lean
+/// binary would carry an alt-screen surface it can never legitimately enter
+/// (`plain_scroller_tui.md`: the lean path has no scroll regions, ever).
+fn render_transcript(
+    record: &newt_core::ConversationRecord,
+    surface_is_rich: bool,
+    color: bool,
+    verbose: bool,
+) {
+    #[cfg(feature = "rich-tui")]
+    if surface_is_rich {
+        let mut pager = crate::transcript_pager::PagerState::new(&record.title, &record.turns);
+        if let Err(e) = crate::transcript_pager::run_pager(&mut pager) {
+            print_newt(&format!("transcript pager error: {e}"), color, verbose);
+        }
+        return;
+    }
+    // Lean (and the rich build's non-rich surface): the plain spine into
+    // scrollback — searchable, copy-pasteable, no terminal takeover.
+    let _ = surface_is_rich;
+    print_newt(&conversation_show_message(record), color, verbose);
+}
+
 /// Mint the prompt receipt that must exist before inference or tool work.
 ///
 /// Persistent sessions fail closed when the durable transaction fails. An
@@ -2672,28 +2700,7 @@ pub(crate) fn run_chat(
                                         verbose,
                                     ),
                                     Ok(record) => {
-                                        if surface_is_rich {
-                                            let mut pager =
-                                                crate::transcript_pager::PagerState::new(
-                                                    &record.title,
-                                                    &record.turns,
-                                                );
-                                            if let Err(e) =
-                                                crate::transcript_pager::run_pager(&mut pager)
-                                            {
-                                                print_newt(
-                                                    &format!("transcript pager error: {e}"),
-                                                    color,
-                                                    verbose,
-                                                );
-                                            }
-                                        } else {
-                                            print_newt(
-                                                &conversation_show_message(&record),
-                                                color,
-                                                verbose,
-                                            );
-                                        }
+                                        render_transcript(&record, surface_is_rich, color, verbose);
                                     }
                                     Err(e) => print_newt(
                                         &format!("could not load this conversation: {e}"),

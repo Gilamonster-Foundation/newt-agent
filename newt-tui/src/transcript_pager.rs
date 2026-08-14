@@ -139,10 +139,22 @@ impl PagerState {
                 out.push(PagerRow {
                     kind: RowKind::ToolFold,
                     turn: i,
+                    // Honest about depth (#1677): folded invites the
+                    // keypress; UNFOLDED says what the reader is actually
+                    // getting. The store keeps tool SUMMARIES only —
+                    // `ToolEvent` has no output field — so a header that
+                    // said just "N tool calls" would imply bodies that were
+                    // never retained. Bounded output retention is the
+                    // tracked #1672 follow-up.
                     text: format!(
-                        "{state} ⚙ {} tool call{} — Enter unfolds",
+                        "{state} ⚙ {} tool call{}{}",
                         turn.tools.len(),
-                        if turn.tools.len() == 1 { "" } else { "s" }
+                        if turn.tools.len() == 1 { "" } else { "s" },
+                        if self.folded[i] {
+                            " — Enter unfolds"
+                        } else {
+                            " — summaries only; tool output is not retained"
+                        }
                     ),
                 });
                 if !self.folded[i] {
@@ -178,6 +190,14 @@ impl PagerState {
     pub(crate) fn scroll_by(&mut self, delta: isize, page_rows: usize) {
         let max = self.max_scroll(page_rows);
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
+    }
+
+    /// Re-clamp the scroll position to the end rail for a `page_rows`-tall
+    /// viewport (#1677). The renderer calls this every frame, so a RESIZE —
+    /// the one viewport change the keyboard cannot produce — can never leave
+    /// the view stranded past the rail that `end()`/`scroll_by()` enforce.
+    pub(crate) fn clamp_scroll(&mut self, page_rows: usize) {
+        self.scroll = self.scroll.min(self.max_scroll(page_rows));
     }
 
     pub(crate) fn home(&mut self) {
@@ -264,62 +284,89 @@ impl TurnRows {
 
 // ---------------------------------------------------------------------------
 // The modal terminal loop (the only part that touches the TTY).
+//
+// COMPILE-GATED to `rich-tui` (#1677 review). Everything above this line is the
+// pure transcript VIEW MODEL — no terminal, no ratatui — and stays compiled and
+// unit-tested in every configuration, including the lean/no-rich build. Only
+// this half, which takes the terminal over (raw mode + alternate screen), is
+// severed from lean. `ratatui`/`crossterm` are non-optional deps of this crate,
+// so without this gate a lean binary would carry an alt-screen surface it can
+// never legitimately enter — `plain_scroller_tui.md`: the lean path has no
+// scroll regions, ever.
 // ---------------------------------------------------------------------------
+#[cfg(feature = "rich-tui")]
+pub(crate) use terminal::run_pager;
+/// Re-exported for the real-PTY acceptance test only (#1677): it drops the
+/// guard mid-unwind in a child process to prove the restoration claim against
+/// an actual terminal. Nothing in the shipping path constructs it directly —
+/// `run_pager` owns its lifetime.
+#[cfg(all(test, feature = "rich-tui"))]
+pub(crate) use terminal::AltScreenGuard;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use std::io;
+#[cfg(feature = "rich-tui")]
+mod terminal {
+    use super::{PagerState, RowKind};
 
-/// Restore the primary screen + cooked mode on EVERY exit path — error or
-/// panic included. Leaking the alternate screen would strand the whole
-/// session invisible, a worse failure than any pager bug.
-struct AltScreenGuard;
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::layout::{Constraint, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use std::io;
 
-impl AltScreenGuard {
-    fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        if let Err(e) = crossterm::execute!(io::stdout(), EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(e);
+    /// Restore the primary screen + cooked mode on EVERY exit path — error or
+    /// panic included. Leaking the alternate screen would strand the whole
+    /// session invisible, a worse failure than any pager bug.
+    ///
+    /// `pub(crate)` solely for `transcript_pager_pty_test` (#1677): the real-PTY
+    /// error-path test drops this guard mid-unwind in a child process to prove
+    /// the restoration claim above against an actual terminal.
+    pub(crate) struct AltScreenGuard;
+
+    impl AltScreenGuard {
+        pub(crate) fn enter() -> io::Result<Self> {
+            enable_raw_mode()?;
+            if let Err(e) = crossterm::execute!(io::stdout(), EnterAlternateScreen) {
+                let _ = disable_raw_mode();
+                return Err(e);
+            }
+            Ok(Self)
         }
-        Ok(Self)
     }
-}
 
-impl Drop for AltScreenGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
-        let _ = disable_raw_mode();
+    impl Drop for AltScreenGuard {
+        fn drop(&mut self) {
+            let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+        }
     }
-}
 
-fn row_style(kind: RowKind) -> Style {
-    match kind {
-        // The spine is the primary content — default foreground, heads bold.
-        RowKind::PromptHead | RowKind::ReplyHead => Style::default().add_modifier(Modifier::BOLD),
-        RowKind::Prompt | RowKind::Reply => Style::default(),
-        // The grey is secondary — exactly the inline vocabulary.
-        RowKind::ToolFold | RowKind::Tool => Style::default().fg(Color::DarkGray),
-        RowKind::Blank => Style::default(),
+    fn row_style(kind: RowKind) -> Style {
+        match kind {
+            // The spine is the primary content — default foreground, heads bold.
+            RowKind::PromptHead | RowKind::ReplyHead => {
+                Style::default().add_modifier(Modifier::BOLD)
+            }
+            RowKind::Prompt | RowKind::Reply => Style::default(),
+            // The grey is secondary — exactly the inline vocabulary.
+            RowKind::ToolFold | RowKind::Tool => Style::default().fg(Color::DarkGray),
+            RowKind::Blank => Style::default(),
+        }
     }
-}
 
-/// Run the pager until the operator quits (q / Esc). Blocking; owns the
-/// terminal for its lifetime and restores it on return.
-pub(crate) fn run_pager(state: &mut PagerState) -> io::Result<()> {
-    let _guard = AltScreenGuard::enter()?;
-    let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    terminal.clear()?;
-    loop {
-        let mut page_rows = 1usize;
-        terminal.draw(|f| {
+    /// Run the pager until the operator quits (q / Esc). Blocking; owns the
+    /// terminal for its lifetime and restores it on return.
+    pub(crate) fn run_pager(state: &mut PagerState) -> io::Result<()> {
+        let _guard = AltScreenGuard::enter()?;
+        let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        terminal.clear()?;
+        loop {
+            let mut page_rows = 1usize;
+            terminal.draw(|f| {
             let [header, body, footer] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Fill(1),
@@ -344,8 +391,12 @@ pub(crate) fn run_pager(state: &mut PagerState) -> io::Result<()> {
                 header,
             );
 
+            // #1677: re-clamp to the SAME end rail the keyboard uses. The
+            // renderer's own clamp used to be `len - 1`, one rail past the
+            // model's `len - page_rows`, so GROWING the terminal could strand
+            // the view in a position no keystroke can produce.
+            state.clamp_scroll(page_rows);
             let rows = state.rows();
-            state.scroll = state.scroll.min(rows.len().saturating_sub(1));
             let visible = rows
                 .iter()
                 .skip(state.scroll)
@@ -363,32 +414,33 @@ pub(crate) fn run_pager(state: &mut PagerState) -> io::Result<()> {
             );
         })?;
 
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let half = (page_rows / 2).max(1) as isize;
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Char('c') if ctrl => return Ok(()),
-            KeyCode::Up | KeyCode::Char('k') => state.scroll_by(-1, page_rows),
-            KeyCode::Down | KeyCode::Char('j') => state.scroll_by(1, page_rows),
-            KeyCode::PageUp => state.scroll_by(-(page_rows as isize), page_rows),
-            KeyCode::PageDown => state.scroll_by(page_rows as isize, page_rows),
-            KeyCode::Char('u') if ctrl => state.scroll_by(-half, page_rows),
-            KeyCode::Char('d') if ctrl => state.scroll_by(half, page_rows),
-            KeyCode::Char('g') | KeyCode::Home => state.home(),
-            KeyCode::Char('G') | KeyCode::End => state.end(page_rows),
-            KeyCode::Char('n') => state.next_message(page_rows),
-            KeyCode::Char('p') => state.prev_message(),
-            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Tab => state.toggle_fold(page_rows),
-            _ => {}
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let half = (page_rows / 2).max(1) as isize;
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('c') if ctrl => return Ok(()),
+                KeyCode::Up | KeyCode::Char('k') => state.scroll_by(-1, page_rows),
+                KeyCode::Down | KeyCode::Char('j') => state.scroll_by(1, page_rows),
+                KeyCode::PageUp => state.scroll_by(-(page_rows as isize), page_rows),
+                KeyCode::PageDown => state.scroll_by(page_rows as isize, page_rows),
+                KeyCode::Char('u') if ctrl => state.scroll_by(-half, page_rows),
+                KeyCode::Char('d') if ctrl => state.scroll_by(half, page_rows),
+                KeyCode::Char('g') | KeyCode::Home => state.home(),
+                KeyCode::Char('G') | KeyCode::End => state.end(page_rows),
+                KeyCode::Char('n') => state.next_message(page_rows),
+                KeyCode::Char('p') => state.prev_message(),
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Tab => state.toggle_fold(page_rows),
+                _ => {}
+            }
         }
     }
-}
+} // mod terminal (rich-tui only)
 
 #[cfg(test)]
 mod tests {
@@ -556,5 +608,345 @@ mod tests {
         empty.next_message(3);
         empty.prev_message();
         empty.toggle_fold(3);
+    }
+    // ── #1677 state-model stress ────────────────────────────────────────
+    //
+    // The pure model is where scroll/fold/jump correctness is decided, so the
+    // awkward shapes get pinned HERE rather than through a terminal: resize
+    // (the one viewport change no keystroke can produce), fold churn changing
+    // the rail underfoot, the extremes, and text the renderer will clip.
+
+    #[test]
+    fn a_resize_smaller_then_larger_never_strands_the_view() {
+        // Regression for the renderer/model rail mismatch (#1677): the draw
+        // path clamped to `len - 1` while every model clamp uses
+        // `len - page_rows`, so GROWING the terminal left the scroll beyond
+        // the end rail — a position the keyboard cannot reach, and one that
+        // renders a short final page with content scrolled off the top.
+        let turns: Vec<_> = (0..12)
+            .map(|i| turn(&format!("p{i}"), "reply", 0))
+            .collect();
+        let mut s = PagerState::new("t", &turns);
+        let total = s.rows().len();
+
+        // Small viewport, parked at the end rail.
+        s.end(4);
+        assert_eq!(s.scroll, total - 4);
+
+        // Grow the terminal: the rail moves UP, so the position must follow.
+        s.clamp_scroll(20);
+        assert_eq!(
+            s.scroll,
+            total.saturating_sub(20),
+            "growing the viewport must re-clamp to the new end rail"
+        );
+
+        // Shrink again: the rail moves down, and clamping must not *push* the
+        // view (clamp is a ceiling, never a jump).
+        let before = s.scroll;
+        s.clamp_scroll(4);
+        assert_eq!(s.scroll, before, "shrinking must not move a valid position");
+
+        // A viewport taller than the content pins to the top.
+        s.clamp_scroll(total + 50);
+        assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn a_viewport_of_one_row_is_survivable() {
+        // The degenerate terminal (a 1-row split) must not divide by zero or
+        // strand: `max_scroll` floors page_rows at 1.
+        let turns: Vec<_> = (0..3).map(|i| turn(&format!("p{i}"), "r", 0)).collect();
+        let mut s = PagerState::new("t", &turns);
+        let total = s.rows().len();
+        s.end(1);
+        assert_eq!(s.scroll, total - 1);
+        s.scroll_by(50, 1);
+        assert_eq!(s.scroll, total - 1, "still clamped at the last row");
+        s.clamp_scroll(0); // a zero-height body is treated as one row
+        assert!(s.scroll < total);
+    }
+
+    #[test]
+    fn page_and_half_page_moves_walk_and_clamp() {
+        let turns: Vec<_> = (0..30).map(|i| turn(&format!("p{i}"), "r", 0)).collect();
+        let mut s = PagerState::new("t", &turns);
+        let page = 10usize;
+        let max = s.rows().len() - page;
+
+        s.scroll_by(page as isize, page); // PageDown
+        assert_eq!(s.scroll, page);
+        s.scroll_by(-(page as isize), page); // PageUp
+        assert_eq!(s.scroll, 0);
+        s.scroll_by(-(page as isize), page); // PageUp at the top rail
+        assert_eq!(s.scroll, 0, "saturates at the top, never wraps");
+        s.scroll_by((page / 2) as isize, page); // Ctrl-D
+        assert_eq!(s.scroll, page / 2);
+        for _ in 0..50 {
+            s.scroll_by(page as isize, page);
+        }
+        assert_eq!(s.scroll, max, "clamps at the end rail, never past it");
+    }
+
+    #[test]
+    fn home_and_end_are_the_rails() {
+        let turns: Vec<_> = (0..8).map(|i| turn(&format!("p{i}"), "r", 0)).collect();
+        let mut s = PagerState::new("t", &turns);
+        let page = 5usize;
+        s.end(page);
+        assert_eq!(s.scroll, s.rows().len() - page);
+        s.home();
+        assert_eq!(s.scroll, 0);
+        // End on content SHORTER than the viewport stays at the top rather
+        // than producing a negative rail.
+        let short = vec![turn("only", "one", 0)];
+        let mut s2 = PagerState::new("t", &short);
+        s2.end(100);
+        assert_eq!(s2.scroll, 0);
+    }
+
+    #[test]
+    fn unfolding_moves_the_rail_and_scroll_stays_valid() {
+        // Fold churn changes `rows().len()` underfoot, so every clamp must be
+        // recomputed against the CURRENT flattening rather than a cached
+        // length. Toggling is done on the turn the model says is current
+        // (turn 0 at home) instead of walking to an arbitrary turn — see
+        // `the_end_rail_bounds_how_far_the_spine_jumps_can_reach` for why a
+        // walk to the LAST turn is not a thing the model promises.
+        let turns: Vec<_> = (0..6).map(|i| turn(&format!("p{i}"), "r", 3)).collect();
+        let mut s = PagerState::new("t", &turns);
+        let page = 6usize;
+
+        s.home();
+        assert_eq!(s.current_turn(), 0);
+        let folded_rows = s.rows().len();
+        let folded_rail = {
+            s.end(page);
+            s.scroll
+        };
+
+        // Unfold turn 0: content grows by exactly its tool lines, so the end
+        // rail moves DOWN by the same amount.
+        s.home();
+        s.toggle_fold(page);
+        assert_eq!(
+            s.rows().len(),
+            folded_rows + 3,
+            "unfolding adds exactly the turn's tool lines"
+        );
+        s.end(page);
+        assert_eq!(
+            s.scroll,
+            folded_rail + 3,
+            "the end rail tracks the new content length"
+        );
+
+        // Park at the rail, then RE-fold: the rail moves back up and the
+        // parked position must be re-clamped rather than left past the end.
+        s.home();
+        s.toggle_fold(page);
+        s.scroll = folded_rail + 3; // where the operator was before the fold
+        s.clamp_scroll(page);
+        assert_eq!(
+            s.scroll, folded_rail,
+            "re-folding pulls a stranded position back to the rail"
+        );
+    }
+
+    #[test]
+    fn the_end_rail_bounds_how_far_the_spine_jumps_can_reach() {
+        // A PINNED LIMITATION, deliberately recorded rather than left as
+        // folklore (#1677). `current_turn` is derived as "the last prompt head
+        // at or above the top row", and `next_message` clamps its target to
+        // the end rail. So when the final turn's head falls INSIDE the last
+        // page, `n` cannot make that turn current: scroll parks at
+        // `max_scroll`, the head sits below the top row, and the derivation
+        // keeps naming the previous turn. The final turn is fully VISIBLE at
+        // that point — this is a naming/targeting limit, not a scrolling one —
+        // but two consequences follow that a reader should know about: the
+        // position header under-reports at the bottom, and a fold keystroke
+        // there targets the turn at the TOP of the view.
+        //
+        // Widening the derivation to "the last head visible in the viewport"
+        // would fix both, and would also move fold targeting — which is a
+        // behavior change, not a landing fix. Tracked as follow-up on #1672.
+        let turns: Vec<_> = (0..4).map(|i| turn(&format!("p{i}"), "short", 0)).collect();
+        let mut s = PagerState::new("t", &turns);
+        let page = 8usize; // tall enough that the last heads sit inside it
+        let rows = s.rows();
+        let last_head = rows
+            .iter()
+            .rposition(|r| r.kind == RowKind::PromptHead)
+            .expect("a head exists");
+        assert!(
+            last_head > s.max_scroll(page),
+            "precondition: the final head lies beyond the end rail"
+        );
+
+        // Pressing `n` repeatedly converges and then STOPS, without spinning.
+        s.home();
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            s.next_message(page);
+            seen.push(s.current_turn());
+        }
+        let reached = *seen.last().expect("jumped");
+        assert!(
+            reached < turns.len() - 1,
+            "the final turn is not reachable as `current` from the end rail"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[1] >= w[0]),
+            "jumps never move backwards: {seen:?}"
+        );
+        assert_eq!(
+            s.scroll,
+            s.max_scroll(page),
+            "the view IS parked at the bottom — the last turn is on screen"
+        );
+    }
+
+    #[test]
+    fn the_current_turn_follows_the_scroll() {
+        let turns: Vec<_> = (0..5)
+            .map(|i| turn(&format!("prompt {i}"), "reply\nline\nline", 0))
+            .collect();
+        let mut s = PagerState::new("t", &turns);
+        assert_eq!(s.current_turn(), 0);
+        let rows = s.rows();
+        // Park the top row exactly on the last turn's prompt head.
+        let last_head = rows
+            .iter()
+            .rposition(|r| r.kind == RowKind::PromptHead)
+            .expect("a prompt head exists");
+        s.scroll = last_head;
+        assert_eq!(
+            s.current_turn(),
+            4,
+            "current is the last head at or above the top row"
+        );
+        s.home();
+        assert_eq!(s.current_turn(), 0, "derived, not remembered");
+    }
+
+    #[test]
+    fn wide_and_unicode_text_survives_the_model_intact() {
+        // The model does not wrap or clip — the renderer does. What it must
+        // guarantee is that the bytes it hands over are the stored bytes, so
+        // a CJK/emoji transcript is never corrupted on the way to the screen.
+        let cjk = "日本語のテキストです";
+        let emoji = "🦎 newt 👀 spine";
+        let turns = vec![turn(cjk, emoji, 0)];
+        let s = PagerState::new("t", &turns);
+        let rows = s.rows();
+        assert!(
+            rows.iter().any(|r| r.text.contains(cjk)),
+            "wide text preserved: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.text.contains(emoji)),
+            "emoji preserved: {rows:?}"
+        );
+        // Row count is per LINE, not per display column — one line in, one
+        // row out, regardless of how many columns it will occupy.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.kind == RowKind::PromptHead)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_very_long_line_is_one_row_and_is_not_truncated_by_the_model() {
+        let long = "x".repeat(20_000);
+        let turns = vec![turn(&long, "r", 0)];
+        let s = PagerState::new("t", &turns);
+        let rows = s.rows();
+        let head = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PromptHead)
+            .expect("head");
+        assert!(head.text.len() >= 20_000, "the model never truncates");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.kind == RowKind::PromptHead)
+                .count(),
+            1,
+            "one logical line is exactly one row (clipping is the renderer's job)"
+        );
+    }
+
+    #[test]
+    fn one_turn_and_many_turns_flatten_consistently() {
+        let one = PagerState::new("t", &[turn("p", "r", 0)]);
+        assert_eq!(
+            one.rows()
+                .iter()
+                .filter(|r| r.kind == RowKind::Blank)
+                .count(),
+            0,
+            "no separator before the first turn"
+        );
+        let many: Vec<_> = (0..25).map(|i| turn(&format!("p{i}"), "r", 0)).collect();
+        let s = PagerState::new("t", &many);
+        assert_eq!(
+            s.rows().iter().filter(|r| r.kind == RowKind::Blank).count(),
+            24,
+            "exactly one separator BETWEEN each pair of turns"
+        );
+        assert_eq!(
+            s.rows()
+                .iter()
+                .filter(|r| r.kind == RowKind::PromptHead)
+                .count(),
+            25
+        );
+    }
+
+    #[test]
+    fn a_ten_thousand_row_transcript_stays_linear() {
+        // Long-transcript sanity (#1677). Deliberately asserts SHAPE, not
+        // wall-clock: timing has no place in the mocked unit tier and would be
+        // flaky under parallel CI load. What this pins is what a quadratic
+        // regression would break — flattening is exactly one row per logical
+        // line, the rails are computed from the current flattening, and a fold
+        // adds exactly its own tool lines with no compounding. The measured
+        // interactive timing is recorded in the PR body instead.
+        // 2_000 turns x 6 rows each (prompt + 3 reply lines + fold header +
+        // separator) clears the 10k bar the sanity check is specified at.
+        let turns: Vec<_> = (0..2_000)
+            .map(|i| turn(&format!("prompt {i}"), "reply\nsecond\nthird", 2))
+            .collect();
+        let mut s = PagerState::new("long", &turns);
+        let rows = s.rows().len();
+        assert!(rows > 10_000, "expected a 10k+ row transcript, got {rows}");
+
+        let page = 40usize;
+        s.end(page);
+        assert_eq!(s.scroll, rows - page, "the end rail is exact at this size");
+        s.home();
+        assert_eq!(s.scroll, 0);
+
+        // A bounded walk down the spine: each jump moves forward, and none of
+        // them costs more than the flattening itself.
+        let mut last = s.current_turn();
+        for _ in 0..200 {
+            s.next_message(page);
+            let now = s.current_turn();
+            assert!(now >= last, "jumps are monotonic on a long transcript");
+            last = now;
+        }
+        assert!(last > 100, "200 jumps made real progress, reached {last}");
+
+        // Folding at this size adds exactly the folded turn's tool lines.
+        s.home();
+        let before = s.rows().len();
+        s.toggle_fold(page);
+        assert_eq!(
+            s.rows().len(),
+            before + 2,
+            "one unfold adds exactly its two tool lines, even at 10k rows"
+        );
     }
 }
