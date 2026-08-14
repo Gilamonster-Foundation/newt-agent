@@ -75,6 +75,11 @@ impl Call {
     ///
     /// `id` is echoed by Herdr in its response; we never read it, but the
     /// field is mandatory in the schema.
+    ///
+    /// Only the unix transport frames anything — Herdr panes are unix-socket
+    /// only — but the wire format stays platform-independent so its tests run
+    /// everywhere.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn encode(&self, id: u64) -> Option<Vec<u8>> {
         let request = json!({
             "id": format!("{SOURCE}:{id}"),
