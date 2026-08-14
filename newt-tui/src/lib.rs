@@ -4354,7 +4354,12 @@ mod persona_backend_tests {
     fn operator_backend_commands_update_the_baseline_but_persona_paths_do_not() {
         for cmd in [
             "backends sol",
+            // #1667 review §13: the BARE forms are baseline-updating too — on a
+            // rich TTY they open the backend panel instead of dispatching, and
+            // that path captures the baseline unconditionally so the panel
+            // surface and this text surface stay behaviourally identical.
             "backends",
+            "backend",
             "model gpt-5.6-sol",
             "backend openai",
         ] {

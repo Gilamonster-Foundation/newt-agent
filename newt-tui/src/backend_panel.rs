@@ -23,6 +23,31 @@
 //! - A no-op visit (untouched spinner, no file operation) closes silently —
 //!   Enter and Esc are indistinguishable, exactly like `/psyche` (#1665).
 //!
+//! ## Source of truth — the panel is an EDITOR, never a second authority
+//! The chooser must not become a competing copy of session posture. Each layer
+//! keeps its existing owner; the panel only *edits* them through that owner:
+//!
+//! | # | Layer | Canonical owner | The panel's part |
+//! |---|-------|-----------------|------------------|
+//! | a | current backend (this session) | the process env + `newt_core::Config::resolve()` → `chat::refresh_backend`; written ONLY by `commands::model::apply_backend_choice` / `apply_backend_kind` | hands the pick to that function; never sets `NEWT_PROVIDER` itself |
+//! | b | current model | `commands::model::apply_model_choice` / the adopt path (`NEWT_DGX_MODEL`) | never touched here — the form's `model` is the *drop-in's declared* model, config, not session state |
+//! | c | persisted default | `config.toml` `default_backend` (via `Config::with_default_backend`) and `~/.newt/settings.toml` `provider` (via `settings::record_provider`, inside `apply_backend_choice`) | writes them only through those two owners: `setup::persist_panel_backend` / `remove_panel_backend` for the files, `apply_backend_choice` for the settings pin |
+//! | d | conversation-scoped override | the PosturePin work (#1684, separate PR) | out of scope here; the panel neither reads nor writes it |
+//! | e | in-panel selection (dirty, uncommitted) | [`PanelState::pick`] — a `Dial`, alive only while the overlay is open | discarded on Esc; on Enter it is handed to (a) and never re-read |
+//!
+//! Precedence when they disagree, most specific first: (e) only at the moment
+//! of apply → (d) → (a) `$NEWT_PROVIDER` → (c) `settings.toml` provider →
+//! (c) `config.toml` `default_backend` → newt's discovery heuristics. That is
+//! `Config::select_configured_backend` + `chat::resolve_backend_choice`,
+//! unchanged by this panel.
+//!
+//! Consequently [`PanelState`]'s `options` / `active` are a **read-only snapshot
+//! taken by the caller before the overlay opens** — a view, not a store. It is
+//! never consulted after close: the caller re-resolves `Config` and re-derives
+//! the session from it, so a panel-local value can never disagree with the
+//! resolved one. Saved edits are folded back into the snapshot purely so the
+//! still-open chooser shows what the operator just wrote.
+//!
 //! [`PanelState`] is pure (no terminal, no I/O) and unit-tested; the raw-mode
 //! loop ([`run`]) mirrors `config_panel::run`.
 
@@ -47,16 +72,74 @@ pub(crate) enum BackendSelection {
     Kind(&'static str),
 }
 
+/// WHERE a chooser row's definition lives — which decides whether this panel may
+/// edit it, and (when it may not) what to tell the operator instead. Data, not a
+/// bare `editable: bool`, so the refusal can name the real reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendSource {
+    /// `~/.newt/backends/<name>.toml` — the only rows this panel writes.
+    UserDropIn,
+    /// A user drop-in that ALSO has a same-named inline `[[backends]]` entry in
+    /// `config.toml`. Still editable, but the merge re-inherits `api_key_*` /
+    /// `tiers` the drop-in omits, so clearing an auth field here can come back
+    /// (review §4) — the panel says so on save.
+    UserDropInOverInline,
+    /// An inline `[[backends]]` entry in `config.toml` — read-only here.
+    Inline,
+    /// A `<project>/.newt/backends/<name>.toml` drop-in wins over the user's
+    /// (`Config::merge_disk_backends` merges the project dir LAST). Editing or
+    /// removing the user file would be a silent no-op / a phantom delete
+    /// (review §3), so the panel refuses both.
+    ShadowedByProject,
+    /// A bare wire-kind toggle row (`/backend openai|ollama`).
+    KindToggle,
+}
+
+impl BackendSource {
+    /// Only a user drop-in this panel actually owns may be edited/removed.
+    fn editable(self) -> bool {
+        matches!(self, Self::UserDropIn | Self::UserDropInOverInline)
+    }
+
+    /// The chooser row's provenance column.
+    fn provenance(self) -> &'static str {
+        match self {
+            Self::UserDropIn => "drop-in — e edits",
+            Self::UserDropInOverInline => "drop-in + inline entry",
+            Self::Inline => "inline config.toml",
+            Self::ShadowedByProject => "shadowed by project config",
+            Self::KindToggle => "session-only toggle",
+        }
+    }
+
+    /// Why this row cannot be edited/removed from here.
+    fn refusal(self, name: &str) -> String {
+        match self {
+            Self::UserDropIn | Self::UserDropInOverInline => String::new(),
+            Self::Inline => format!(
+                "'{name}' lives inline in config.toml — edit that file (the panel edits \
+                 ~/.newt/backends/ drop-ins)"
+            ),
+            Self::ShadowedByProject => format!(
+                "'{name}' is shadowed by a project .newt/backends drop-in — edit that file \
+                 (a change here would not take effect)"
+            ),
+            Self::KindToggle => {
+                "the wire-kind toggles aren't editable — `a` adds a named backend".to_string()
+            }
+        }
+    }
+}
+
 /// One spinner entry, built by the caller: every configured backend (the exact
 /// set `/backends <name>` can switch to) plus the two kind fallbacks. Named
-/// entries carry their form prefill; only file-backed ones are editable here.
+/// entries carry their form prefill; only the user drop-ins this panel owns are
+/// editable here (see [`BackendSource`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackendOption {
     pub name: String,
     pub selection: BackendSelection,
-    /// Per-file drop-ins can be edited/removed from the panel; inline
-    /// `config.toml` entries and the kind fallbacks cannot.
-    pub editable: bool,
+    pub source: BackendSource,
     pub kind: Option<BackendKind>,
     pub endpoint: String,
     pub model: Option<String>,
@@ -70,13 +153,17 @@ impl BackendOption {
         Self {
             name: kind.to_string(),
             selection: BackendSelection::Kind(kind),
-            editable: false,
+            source: BackendSource::KindToggle,
             kind: None,
             endpoint: String::new(),
             model: None,
             api_key_env: None,
             api_key_file: None,
         }
+    }
+
+    fn editable(&self) -> bool {
+        self.source.editable()
     }
 }
 
@@ -87,11 +174,48 @@ pub(crate) struct PanelSeed {
     /// Index into `options` of the backend the session currently resolves to
     /// (`None` when nothing matches, e.g. an env-shim endpoint).
     pub active: Option<usize>,
+    /// `config.toml`'s `default_backend` — the DURABLE pointer, which diverges
+    /// from `active` whenever `$NEWT_PROVIDER` / a restored settings pin names
+    /// another backend. Removing it needs the same one-transaction treatment as
+    /// removing the active backend, or the next headless run hard-errors on a
+    /// dangling pointer (review §2/§7/§11).
+    pub default_backend: Option<String>,
+}
+
+/// Which form fields the operator ACTUALLY changed. The persistence layer
+/// overlays only these onto the file it re-reads at save time, so an untouched
+/// field can neither revert a concurrent writer (review §6) nor silently drop a
+/// value the form cannot express — e.g. `kind = "anthropic"` (review §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DirtyFields {
+    pub kind: bool,
+    pub endpoint: bool,
+    pub model: bool,
+    pub api_key_env: bool,
+    pub api_key_file: bool,
+}
+
+impl DirtyFields {
+    /// An ADD writes a whole new file: every field is the operator's.
+    fn all() -> Self {
+        Self {
+            kind: true,
+            endpoint: true,
+            model: true,
+            api_key_env: true,
+            api_key_file: true,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.kind || self.endpoint || self.model || self.api_key_env || self.api_key_file
+    }
 }
 
 /// A validated edit-form result, handed to the injected `persist` closure. The
-/// six form-managed fields; everything else in an existing drop-in (tiers,
-/// serving, engine, provenance, …) is preserved by the persistence layer.
+/// six form-managed fields plus `dirty` (which of them the operator touched);
+/// everything else in an existing drop-in — unmanaged fields, comments, and any
+/// key newt does not model — is preserved by the persistence layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackendEdit {
     pub name: String,
@@ -100,6 +224,7 @@ pub(crate) struct BackendEdit {
     pub model: Option<String>,
     pub api_key_env: Option<String>,
     pub api_key_file: Option<String>,
+    pub dirty: DirtyFields,
     /// `true` replaces the existing `<name>.toml` (edit); `false` must create
     /// it fresh (add — the plan commit refuses to clobber).
     pub replace: bool,
@@ -163,7 +288,12 @@ const FIELDS: [Field; 6] = [
 /// EVERY HTTP kind must appear here: [`FormState::edit`] resolves the dial by
 /// `position()`, so a kind missing from the ladder would prefill at index 0
 /// ("auto") and silently downgrade a PINNED kind to probe-at-connect on an
-/// unrelated save — see the anthropic regression test below.
+/// unrelated save — see the anthropic regression test below. A kind that is
+/// still not representable ([`BackendKind::Embedded`]) fails CLOSED in
+/// [`PanelState::begin_edit`]; and as a second line of defence the save
+/// overlays the `kind` key only when the operator actually MOVED the dial
+/// ([`FormState::dirty`], review §1/§6), so an untouched kind is never written
+/// at all.
 const KIND_LADDER: [Option<BackendKind>; 4] = [
     None,
     Some(BackendKind::Ollama),
@@ -193,6 +323,21 @@ struct FormState {
     model: String,
     key_env: String,
     key_file: String,
+    /// The prefill, kept verbatim so save time can tell which fields the
+    /// operator actually changed (review §1/§6). Default for an add.
+    original: FormValues,
+}
+
+/// The five overlayable form values, as prefilled. `kind` is kept as the DIAL
+/// POSITION rather than the value: "the operator moved the dial" is the honest
+/// test of intent, and it stays honest even if a kind ever prefills off-ladder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FormValues {
+    kind_idx: usize,
+    url: String,
+    model: String,
+    key_env: String,
+    key_file: String,
 }
 
 impl FormState {
@@ -206,19 +351,51 @@ impl FormState {
             model: String::new(),
             key_env: String::new(),
             key_file: String::new(),
+            original: FormValues::default(),
         }
     }
 
     fn edit(opt: &BackendOption) -> Self {
+        // `begin_edit` refuses any kind the ladder cannot represent, so this
+        // position() always hits; the fallback would only ever be reached by a
+        // future caller, and `dirty` keeps even that case from writing a kind
+        // the operator never dialed.
+        let kind_idx = KIND_LADDER.iter().position(|k| *k == opt.kind).unwrap_or(0);
         Self {
             editing: Some(opt.name.clone()),
             sel: 0,
             name: opt.name.clone(),
-            kind_idx: KIND_LADDER.iter().position(|k| *k == opt.kind).unwrap_or(0),
+            kind_idx,
             url: opt.endpoint.clone(),
             model: opt.model.clone().unwrap_or_default(),
             key_env: opt.api_key_env.clone().unwrap_or_default(),
             key_file: opt.api_key_file.clone().unwrap_or_default(),
+            original: FormValues {
+                kind_idx,
+                url: opt.endpoint.clone(),
+                model: opt.model.clone().unwrap_or_default(),
+                key_env: opt.api_key_env.clone().unwrap_or_default(),
+                key_file: opt.api_key_file.clone().unwrap_or_default(),
+            },
+        }
+    }
+
+    fn kind(&self) -> Option<BackendKind> {
+        KIND_LADDER.get(self.kind_idx).copied().flatten()
+    }
+
+    /// Which fields differ from the prefill (an ADD dirties everything).
+    fn dirty(&self) -> DirtyFields {
+        if self.editing.is_none() {
+            return DirtyFields::all();
+        }
+        let changed = |now: &str, before: &str| now.trim() != before.trim();
+        DirtyFields {
+            kind: self.kind_idx != self.original.kind_idx,
+            endpoint: changed(&self.url, &self.original.url),
+            model: changed(&self.model, &self.original.model),
+            api_key_env: changed(&self.key_env, &self.original.key_env),
+            api_key_file: changed(&self.key_file, &self.original.key_file),
         }
     }
 
@@ -239,7 +416,7 @@ impl FormState {
 enum Mode {
     Choose,
     Command(String),
-    Form(FormState),
+    Form(Box<FormState>),
 }
 
 /// The panel's working state. Pure: no terminal, no I/O; fully unit-testable.
@@ -251,6 +428,9 @@ pub(crate) struct PanelState {
     /// Index of the active backend at open (the `(active)` marker + the
     /// remove-active refusal).
     active: Option<usize>,
+    /// `config.toml`'s durable `default_backend` — removing it needs the same
+    /// one-transaction switch as removing the active backend.
+    default_backend: Option<String>,
     /// Spinner position. Dirty = the operator touched it — a deliberate pick
     /// even back at the original position (same re-apply semantics as the
     /// psyche panel's model spinner).
@@ -267,11 +447,16 @@ pub(crate) struct PanelState {
 
 impl PanelState {
     pub(crate) fn new(seed: PanelSeed) -> Self {
-        let PanelSeed { options, active } = seed;
+        let PanelSeed {
+            options,
+            active,
+            default_backend,
+        } = seed;
         let pick = active.unwrap_or(0).min(options.len().saturating_sub(1));
         Self {
             options,
             active,
+            default_backend,
             pick: Dial::Inherit(pick),
             mode: Mode::Choose,
             status: None,
@@ -314,38 +499,27 @@ impl PanelState {
     pub(crate) fn begin_edit(&mut self) {
         self.status = None;
         let opt = self.selected().clone();
-        match (&opt.selection, opt.editable) {
-            (BackendSelection::Kind(_), _) => {
-                self.status =
-                    Some("the wire-kind toggles aren't editable — `a` adds a named backend".into());
-            }
-            (BackendSelection::Named(n), false) => {
-                self.status = Some(format!(
-                    "'{n}' lives inline in config.toml — edit that file (the panel edits \
-                     ~/.newt/backends/ drop-ins)"
-                ));
-            }
+        if !opt.editable() {
+            self.status = Some(opt.source.refusal(&opt.name));
+        } else if !KIND_LADDER.contains(&opt.kind) {
             // A kind the dial cannot represent (today: `embedded`, which has no
             // endpoint and belongs to `newt setup`) must REFUSE the form rather
             // than open one whose kind row silently reads back as something
-            // else — the form overlays `kind` on every save, so an
-            // unrepresentable kind could only be saved as a corruption.
-            (BackendSelection::Named(n), true) if !KIND_LADDER.contains(&opt.kind) => {
-                let label = kind_label(opt.kind);
-                self.status = Some(format!(
-                    "'{n}' is a {label} backend — the panel edits http backends only; \
-                     edit ~/.newt/backends/{n}.toml"
-                ));
-            }
-            (BackendSelection::Named(_), true) => {
-                self.mode = Mode::Form(FormState::edit(&opt));
-            }
+            // else.
+            let label = kind_label(opt.kind);
+            let name = &opt.name;
+            self.status = Some(format!(
+                "'{name}' is a {label} backend — the panel edits http backends only; \
+                 edit ~/.newt/backends/{name}.toml"
+            ));
+        } else {
+            self.mode = Mode::Form(Box::new(FormState::edit(&opt)));
         }
     }
 
     pub(crate) fn begin_add(&mut self) {
         self.status = None;
-        self.mode = Mode::Form(FormState::add());
+        self.mode = Mode::Form(Box::new(FormState::add()));
     }
 
     /// `d`: prefill the typed confirm — the ex-command line `:d <name>` the
@@ -447,12 +621,25 @@ impl PanelState {
                 return false;
             }
         };
+        if edit.replace && !edit.dirty.any() {
+            // Nothing was touched: writing would only risk clobbering whatever
+            // the file says now. Close the form as quietly as a no-op visit.
+            self.status = Some(format!("no changes to backend '{}'", edit.name));
+            self.mode = Mode::Choose;
+            return false;
+        }
+        // Keep the row's provenance across an edit — a drop-in that also has an
+        // inline entry stays marked as such.
+        let source = self
+            .named_index(&edit.name)
+            .filter(|_| edit.replace)
+            .map_or(BackendSource::UserDropIn, |i| self.options[i].source);
         match persist(&edit) {
             BackendSaveResult::Saved { note } => {
                 let opt = BackendOption {
                     name: edit.name.clone(),
                     selection: BackendSelection::Named(edit.name.clone()),
-                    editable: true,
+                    source,
                     kind: edit.kind,
                     endpoint: edit.endpoint.clone(),
                     model: edit.model.clone(),
@@ -561,17 +748,22 @@ impl PanelState {
             self.status = Some(format!("no configured backend named '{name}'"));
             return None;
         };
-        if !self.options[idx].editable {
-            self.status = Some(format!(
-                "'{name}' lives inline in config.toml — remove it there"
-            ));
+        if !self.options[idx].editable() {
+            self.status = Some(self.options[idx].source.refusal(name));
             return None;
         }
-        if self.active == Some(idx) {
-            // The active backend may only go together with a NEW selection
-            // applied in the SAME transaction: spinner dialed to a different
-            // named backend → close applying it, then the caller deletes this
-            // file. Anything else is refused.
+        // Two pointers may not be orphaned by a delete: the SESSION's active
+        // backend, and config.toml's DURABLE `default_backend` — which diverges
+        // from the active one whenever $NEWT_PROVIDER or a restored settings pin
+        // names another backend, and whose dangling value is a hard
+        // `UnknownNamed` error for `newt solve` / the ACP worker (review
+        // §2/§7/§11). Either may only go together with a NEW selection applied in
+        // the SAME transaction: spinner dialed to a different named backend →
+        // close applying it, then the caller switches, repoints the default, and
+        // deletes this file. Anything else is refused.
+        let is_active = self.active == Some(idx);
+        let is_default = self.default_backend.as_deref() == Some(name);
+        if is_active || is_default {
             let picked_other_named = self.pick.is_dirty()
                 && self.pick.value() != idx
                 && matches!(
@@ -579,9 +771,14 @@ impl PanelState {
                     BackendSelection::Named(_)
                 );
             if !picked_other_named {
+                let role = match (is_active, is_default) {
+                    (true, true) => "the active backend and config.toml's default_backend",
+                    (true, false) => "the active backend",
+                    _ => "config.toml's default_backend",
+                };
                 self.status = Some(format!(
-                    "'{name}' is the active backend — dial another named backend first; \
-                     then :d {name} switches and removes it in one transaction"
+                    "'{name}' is {role} — dial another named backend first; then :d {name} \
+                     switches and removes it in one transaction"
                 ));
                 return None;
             }
@@ -631,13 +828,7 @@ impl PanelState {
         let mut rows = vec![RowView {
             label: "backend",
             value: self.pick_label(),
-            provenance: if is_kind {
-                "session-only toggle".to_string()
-            } else if opt.editable {
-                "drop-in — e edits".to_string()
-            } else {
-                "inline config.toml".to_string()
-            },
+            provenance: opt.source.provenance().to_string(),
             selected: true,
             editable: true,
         }];
@@ -709,7 +900,7 @@ fn form_rows(form: &FormState) -> Vec<RowView> {
                         cursor(sel, &form.name)
                     },
                 ),
-                Field::Kind => ("kind", kind_label(KIND_LADDER[form.kind_idx]).to_string()),
+                Field::Kind => ("kind", kind_label(form.kind()).to_string()),
                 Field::Url => ("url", cursor(sel, &form.url)),
                 Field::Model => ("model", cursor(sel, &form.model)),
                 Field::KeyEnv => ("key env", cursor(sel, &form.key_env)),
@@ -759,12 +950,20 @@ fn validate_form(form: &FormState, options: &[BackendOption]) -> Result<BackendE
         return Err(format!("'{name}' already exists — select it and press e"));
     }
     let url = form.url.trim().to_string();
-    if url.is_empty() {
-        return Err("backend needs a url (e.g. http://host:11434)".to_string());
-    }
-    match reqwest::Url::parse(&url) {
-        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {}
-        _ => return Err(format!("invalid url '{url}' — needs http:// or https://")),
+    let dirty = form.dirty();
+    // The URL is validated when the operator TYPED one (always, on an add). An
+    // untouched url is not written back at all (the dirty-field overlay), so a
+    // drop-in that legitimately has none — `kind = "embedded"`, which serves a
+    // local model_path — stays editable instead of being held hostage to a URL
+    // the form would then have to invent.
+    if dirty.endpoint {
+        if url.is_empty() {
+            return Err("backend needs a url (e.g. http://host:11434)".to_string());
+        }
+        match reqwest::Url::parse(&url) {
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {}
+            _ => return Err(format!("invalid url '{url}' — needs http:// or https://")),
+        }
     }
     let key_env = form.key_env.trim();
     if key_env.chars().any(|c| c.is_whitespace() || c == '=') {
@@ -772,13 +971,30 @@ fn validate_form(form: &FormState, options: &[BackendOption]) -> Result<BackendE
     }
     Ok(BackendEdit {
         name,
-        kind: KIND_LADDER[form.kind_idx],
+        kind: form.kind(),
         endpoint: url,
         model: none_if_empty(&form.model),
         api_key_env: none_if_empty(&form.key_env),
         api_key_file: none_if_empty(&form.key_file),
+        dirty,
         replace: form.editing.is_some(),
     })
+}
+
+/// The caller's summary line for a saved drop-in — pure so the caveat wording is
+/// pinned by a test rather than buried in a closure. `also_inline` marks the
+/// review §4 trap: a same-named inline `[[backends]]` entry keeps supplying the
+/// `api_key_*` / `tiers` the drop-in omits, so CLEARING an auth field here does
+/// not clear it in the resolved config.
+pub(crate) fn saved_note(name: &str, path: &std::path::Path, also_inline: bool) -> String {
+    let mut note = format!("saved backend '{name}' → {}", path.display());
+    if also_inline {
+        note.push_str(&format!(
+            " (note: config.toml also declares [[backends]] '{name}' — fields this drop-in \
+             omits, including a cleared api-key, are re-inherited from it; edit that entry too)"
+        ));
+    }
+    note
 }
 
 /// Bordered block (2) + up to six rows + a hint/command/status row.
@@ -824,6 +1040,47 @@ fn close_outcome(applied: bool, state: &PanelState) -> PanelClose {
     }
 }
 
+/// A terminal I/O failure MID-PANEL, carrying the close contract for whatever
+/// already committed to disk before it (review §5/§12). `changes` are file
+/// operations that ALREADY happened, so losing them would leave the session
+/// reporting nothing and running against a config it never re-resolved — the
+/// exact invariant `PanelClose::changes` documents. The caller reports the error
+/// AND honours the close.
+#[derive(Debug)]
+pub(crate) struct PanelRunError {
+    pub error: io::Error,
+    pub close: PanelClose,
+}
+
+impl From<io::Error> for PanelRunError {
+    /// A failure before the loop owns any state (raw mode / terminal setup):
+    /// nothing has been committed, so there is nothing to honour.
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            close: PanelClose::cancelled(),
+        }
+    }
+}
+
+/// The panel's exit, whichever way the loop ended: a mid-loop I/O error still
+/// carries the committed file operations to the caller.
+fn finish(
+    loop_result: io::Result<()>,
+    applied: bool,
+    state: &PanelState,
+) -> Result<PanelClose, PanelRunError> {
+    match loop_result {
+        Ok(()) => Ok(close_outcome(applied, state)),
+        Err(error) => Err(PanelRunError {
+            error,
+            // Nothing was APPLIED (the loop never reached its exit), but the
+            // add/edit/remove notes are real and already on disk.
+            close: close_outcome(false, state),
+        }),
+    }
+}
+
 /// Open the panel, drive its raw-mode inline event loop, and return the close
 /// contract. `persist` / `remove` are the ONLY filesystem I/O — injected so a
 /// failed write keeps the panel open with a visible status and mutates nothing
@@ -834,7 +1091,7 @@ pub(crate) fn run(
     seed: PanelSeed,
     mut persist: impl FnMut(&BackendEdit) -> BackendSaveResult,
     mut remove: impl FnMut(&str) -> Result<String, String>,
-) -> io::Result<PanelClose> {
+) -> Result<PanelClose, PanelRunError> {
     if seed.options.is_empty() {
         return Ok(PanelClose::cancelled());
     }
@@ -907,19 +1164,18 @@ pub(crate) fn run(
         Ok(())
     })();
     let _ = disable_raw_mode();
-    loop_result?;
-    Ok(close_outcome(applied, &state))
+    finish(loop_result, applied, &state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn named(name: &str, editable: bool) -> BackendOption {
+    fn named(name: &str, source: BackendSource) -> BackendOption {
         BackendOption {
             name: name.to_string(),
             selection: BackendSelection::Named(name.to_string()),
-            editable,
+            source,
             kind: Some(BackendKind::Ollama),
             endpoint: format!("http://{name}:11434"),
             model: Some("qwen3:30b".to_string()),
@@ -929,17 +1185,23 @@ mod tests {
     }
 
     /// dgx1 (active, file-backed) · gnuc (file-backed) · relic (inline) + the
-    /// two kind fallbacks.
+    /// two kind fallbacks. `default_backend` is the active one unless a test
+    /// says otherwise.
     fn panel() -> PanelState {
+        seeded(Some("dgx1"))
+    }
+
+    fn seeded(default_backend: Option<&str>) -> PanelState {
         PanelState::new(PanelSeed {
             options: vec![
-                named("dgx1", true),
-                named("gnuc", true),
-                named("relic", false),
+                named("dgx1", BackendSource::UserDropIn),
+                named("gnuc", BackendSource::UserDropIn),
+                named("relic", BackendSource::Inline),
                 BackendOption::kind_fallback("ollama"),
                 BackendOption::kind_fallback("openai"),
             ],
             active: Some(0),
+            default_backend: default_backend.map(str::to_string),
         })
     }
 
@@ -1137,7 +1399,7 @@ mod tests {
         assert!(s.submit_form(&mut persist));
         assert_eq!(s.mode, Mode::Choose);
         assert_eq!(s.options[3].name, "fresh", "inserted after the named set");
-        assert!(s.options[3].editable, "a fresh drop-in is editable");
+        assert!(s.options[3].editable(), "a fresh drop-in is editable");
         assert!(matches!(
             s.options[4].selection,
             BackendSelection::Kind("ollama")
@@ -1177,7 +1439,7 @@ mod tests {
             options: vec![BackendOption {
                 name: "claude".to_string(),
                 selection: BackendSelection::Named("claude".to_string()),
-                editable: true,
+                source: BackendSource::UserDropIn,
                 kind: Some(BackendKind::Anthropic),
                 endpoint: "https://api.anthropic.com".to_string(),
                 model: None,
@@ -1185,6 +1447,7 @@ mod tests {
                 api_key_file: None,
             }],
             active: Some(0),
+            default_backend: None,
         });
         s.begin_edit();
         let Mode::Form(form) = &s.mode else {
@@ -1195,6 +1458,11 @@ mod tests {
             "anthropic",
             "the kind dial prefills at the drop-in's pinned kind"
         );
+        // Change ONLY the model — the dial is never touched.
+        s.form_nav(1); // kind
+        s.form_nav(1); // url
+        s.form_nav(1); // model
+        type_text(&mut s, "claude-opus-4");
         let mut seen: Vec<BackendEdit> = Vec::new();
         let mut persist = |edit: &BackendEdit| {
             seen.push(edit.clone());
@@ -1208,6 +1476,15 @@ mod tests {
             Some(BackendKind::Anthropic),
             "an untouched kind dial round-trips the pinned kind"
         );
+        // …and the SAVE never even names the kind key: an untouched dial is
+        // not written, so the drop-in's own value survives whatever the ladder
+        // can or cannot express (review §1/§6, the persistence half).
+        assert!(!seen[0].dirty.kind, "an untouched kind is not written back");
+        assert!(
+            !seen[0].dirty.endpoint,
+            "an untouched url is not written back"
+        );
+        assert!(seen[0].dirty.model, "the typed model IS written");
     }
 
     #[test]
@@ -1219,7 +1496,7 @@ mod tests {
             options: vec![BackendOption {
                 name: "local".to_string(),
                 selection: BackendSelection::Named("local".to_string()),
-                editable: true,
+                source: BackendSource::UserDropIn,
                 kind: Some(BackendKind::Embedded),
                 endpoint: String::new(),
                 model: None,
@@ -1227,6 +1504,7 @@ mod tests {
                 api_key_file: None,
             }],
             active: Some(0),
+            default_backend: None,
         });
         s.begin_edit();
         assert!(matches!(s.mode, Mode::Choose), "no form opens");
@@ -1411,5 +1689,192 @@ mod tests {
         assert!(rows[0].value.contains("wire kind"));
         assert_eq!(rows[0].provenance, "session-only toggle");
         assert!(!rows.iter().any(|r| r.label == "url"));
+    }
+
+    // ── Review fixes (#1683 adversarial review) ──────────────────────────
+
+    /// §6: an edit that changed nothing performs NO I/O — the panel-open
+    /// prefill is never re-stamped over whatever the file says now.
+    #[test]
+    fn an_untouched_edit_writes_nothing() {
+        let mut s = panel();
+        let mut called = 0usize;
+        let mut persist = |_: &BackendEdit| {
+            called += 1;
+            BackendSaveResult::Saved {
+                note: String::new(),
+            }
+        };
+        s.begin_edit();
+        assert!(!s.submit_form(&mut persist));
+        assert_eq!(called, 0, "no write for a no-op edit");
+        assert_eq!(s.mode, Mode::Choose);
+        assert!(s.status.as_deref().unwrap().contains("no changes"));
+        assert!(s.changes.is_empty());
+    }
+
+    /// §6: a URL the operator never typed is neither validated nor written —
+    /// so an edit that only changes the model cannot fail on, or re-stamp, the
+    /// endpoint. Typing a bad one IS still refused.
+    #[test]
+    fn an_untouched_url_is_not_revalidated_but_a_typed_one_is() {
+        let mut s = panel();
+        s.cycle(1); // → gnuc
+        s.begin_edit();
+        s.form_nav(1);
+        s.form_nav(1);
+        s.form_nav(1); // model
+        type_text(&mut s, "-instruct");
+        let mut seen: Vec<BackendEdit> = Vec::new();
+        {
+            let mut persist = |edit: &BackendEdit| {
+                seen.push(edit.clone());
+                BackendSaveResult::Saved {
+                    note: "saved".to_string(),
+                }
+            };
+            assert!(s.submit_form(&mut persist), "{:?}", s.status);
+        }
+        assert!(!seen[0].dirty.endpoint, "the untouched url is not written");
+        let mut never = |_: &BackendEdit| BackendSaveResult::Saved {
+            note: String::new(),
+        };
+        s.begin_edit();
+        s.form_nav(1);
+        s.form_nav(1); // url
+        type_text(&mut s, " and rubbish");
+        assert!(!s.submit_form(&mut never));
+        assert!(s.status.as_deref().unwrap().contains("invalid url"));
+    }
+
+    /// §2/§7/§11 REGRESSION: `:d <name>` on config.toml's `default_backend` is
+    /// refused unless the same transaction applies another named backend — a
+    /// dangling `default_backend` is a hard `UnknownNamed` error for
+    /// `newt solve` / the ACP worker, which have no settings.toml mask.
+    #[test]
+    fn remove_refuses_the_config_default_even_when_it_is_not_active() {
+        // Active = gnuc (a NEWT_PROVIDER pin), default_backend = dgx1.
+        let mut s = PanelState::new(PanelSeed {
+            options: vec![
+                named("dgx1", BackendSource::UserDropIn),
+                named("gnuc", BackendSource::UserDropIn),
+                BackendOption::kind_fallback("ollama"),
+            ],
+            active: Some(1),
+            default_backend: Some("dgx1".to_string()),
+        });
+        let called = std::cell::Cell::new(false);
+        let mut remove = |_: &str| {
+            called.set(true);
+            Ok(String::new())
+        };
+        s.begin_command("d dgx1");
+        assert_eq!(s.run_command(&mut remove), None, "refused, stays open");
+        assert!(!called.get(), "the file is never touched");
+        assert!(
+            s.status.as_deref().unwrap().contains("default_backend"),
+            "{:?}",
+            s.status
+        );
+        assert!(s.named_index("dgx1").is_some());
+        // Dialing another NAMED backend makes it one transaction: the caller
+        // applies gnuc, repoints default_backend at it, then deletes dgx1.
+        s.cycle(-1); // → dgx1
+        s.cycle(1); // → gnuc (dirty)
+        s.begin_command("d dgx1");
+        assert_eq!(s.run_command(&mut remove), Some(true));
+        assert!(!called.get(), "the delete is deferred to the caller");
+        let close = close_outcome(true, &s);
+        assert_eq!(
+            close.apply,
+            Some(BackendSelection::Named("gnuc".to_string()))
+        );
+        assert_eq!(close.remove_after_apply.as_deref(), Some("dgx1"));
+    }
+
+    /// §3 REGRESSION: a name a PROJECT `.newt/backends` drop-in also defines
+    /// resolves to the project file (merge is last-wins), so editing or
+    /// removing the user drop-in from here would be a silent no-op and a
+    /// phantom delete. Both are refused, and the row says why.
+    #[test]
+    fn a_project_shadowed_backend_is_neither_editable_nor_removable() {
+        let mut s = PanelState::new(PanelSeed {
+            options: vec![
+                named("dgx1", BackendSource::ShadowedByProject),
+                named("gnuc", BackendSource::UserDropIn),
+            ],
+            active: Some(1),
+            default_backend: None,
+        });
+        s.cycle(-1); // dial onto the shadowed row
+        assert_eq!(
+            s.chooser_rows()[0].provenance,
+            "shadowed by project config",
+            "the row admits the shadow"
+        );
+        s.begin_edit();
+        assert_eq!(s.mode, Mode::Choose, "no form for a shadowed entry");
+        assert!(s.status.as_deref().unwrap().contains("shadowed"));
+        let called = std::cell::Cell::new(false);
+        let mut remove = |_: &str| {
+            called.set(true);
+            Ok(String::new())
+        };
+        s.begin_command("d dgx1");
+        assert_eq!(s.run_command(&mut remove), None);
+        assert!(!called.get(), "no phantom delete");
+        assert!(s.status.as_deref().unwrap().contains("shadowed"));
+        assert!(s.named_index("dgx1").is_some(), "nothing dropped");
+    }
+
+    /// §4: a drop-in that shares its name with an inline `[[backends]]` entry
+    /// says so on save — the merge re-inherits whatever the drop-in omits, so
+    /// "I cleared the api-key" is not the whole truth.
+    #[test]
+    fn the_save_note_flags_a_same_named_inline_entry() {
+        let path = std::path::Path::new("/home/x/.newt/backends/dgx1.toml");
+        let plain = saved_note("dgx1", path, false);
+        assert_eq!(
+            plain,
+            "saved backend 'dgx1' → /home/x/.newt/backends/dgx1.toml"
+        );
+        let shared = saved_note("dgx1", path, true);
+        assert!(shared.starts_with(&plain), "keeps the plain summary");
+        assert!(shared.contains("[[backends]]") && shared.contains("re-inherited"));
+        // …and the chooser row marks the same trap.
+        assert_eq!(
+            BackendSource::UserDropInOverInline.provenance(),
+            "drop-in + inline entry"
+        );
+        assert!(BackendSource::UserDropInOverInline.editable());
+    }
+
+    /// §5/§12 REGRESSION: a mid-panel terminal I/O failure must still hand the
+    /// caller the file operations that ALREADY committed — dropping them left
+    /// the session reporting nothing and running against a config it never
+    /// re-resolved, even though a drop-in had been deleted.
+    #[test]
+    fn an_io_error_still_carries_the_committed_file_changes() {
+        let mut s = panel();
+        let mut remove = ok_remove();
+        s.begin_command("d gnuc");
+        s.run_command(&mut remove); // the delete COMMITTED in-loop
+        let err = finish(Err(io::Error::other("terminal detached")), true, &s)
+            .expect_err("an io error is still an error");
+        assert!(err.error.to_string().contains("terminal detached"));
+        assert_eq!(
+            err.close.changes,
+            vec!["removed backend 'gnuc'"],
+            "the committed change survives for the caller to report + re-resolve"
+        );
+        assert_eq!(err.close.apply, None, "an aborted panel applies nothing");
+        // A failure BEFORE the loop owns state carries nothing.
+        let early: PanelRunError = io::Error::other("no raw mode").into();
+        assert_eq!(early.close, PanelClose::cancelled());
+        // The clean path is unchanged.
+        assert_eq!(
+            finish(Ok(()), false, &s).unwrap().changes,
+            vec!["removed backend 'gnuc'"]
+        );
     }
 }

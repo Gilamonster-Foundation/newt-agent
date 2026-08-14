@@ -2971,6 +2971,51 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// Overlay `edits` onto a per-file backend drop-in's TOML `text`,
+    /// **preserving comments, key order, and every key newt does not model** —
+    /// unlike a serde round-trip (`toml::from_str` → mutate → `toml::to_string`),
+    /// which silently destroys both. Pure: the caller owns the read/write, the
+    /// same contract as [`Config::with_default_backend`], which exists for
+    /// exactly this reason on the config side.
+    ///
+    /// Each edit is `(key, value)`: `Some` sets that top-level key to the string
+    /// (creating it when absent, keeping the existing line's decor when
+    /// present), `None` removes it. Only string scalars are settable, which
+    /// covers every field the backend panel's form manages (`kind`, `endpoint`,
+    /// `model`, `api_key_env`, `api_key_file`, `name`); an edit list that omits
+    /// a key leaves it byte-for-byte alone.
+    ///
+    /// # Errors
+    /// Returns [`NewtError::Config`] when `text` is not valid TOML.
+    pub fn with_dropin_edits(text: &str, edits: &[(&str, Option<String>)]) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("backend drop-in is not valid TOML: {e}")))?;
+        let root = doc.as_table_mut();
+        for (key, value) in edits {
+            match value {
+                Some(new) => match root.get_mut(key) {
+                    Some(item) => {
+                        // Keep the operator's trailing comment / spacing on a
+                        // key that already exists.
+                        let decor = item.as_value().map(|value| value.decor().clone());
+                        *item = toml_edit::value(new.as_str());
+                        if let (Some(decor), Some(value)) = (decor, item.as_value_mut()) {
+                            *value.decor_mut() = decor;
+                        }
+                    }
+                    None => {
+                        root.insert(key, toml_edit::value(new.as_str()));
+                    }
+                },
+                None => {
+                    root.remove(key);
+                }
+            }
+        }
+        Ok(doc.to_string())
+    }
+
     /// Resolve explicitly accepted Chat Completions request extensions.
     #[must_use]
     pub fn chat_completions_capability(&self) -> crate::model_card::ChatCompletionsCapability {
@@ -7995,6 +8040,70 @@ operator_note = \"leave me alone\" # custom inline comment
             out.contains("# custom inline comment"),
             "unrelated inline comment lost: {out}"
         );
+    }
+
+    /// #1667 review §8: the backend panel's EDIT must not destroy operator
+    /// content. `with_dropin_edits` touches ONLY the listed keys — comments,
+    /// key order, and keys `BackendConfig` does not model survive, which a
+    /// serde round-trip (`from_str` → mutate → `to_string`) silently deletes.
+    #[test]
+    fn with_dropin_edits_touches_only_named_keys_and_keeps_comments_and_unknowns() {
+        let original = "\
+# hand-authored drop-in for the lab box
+endpoint = \"http://gnuc:11434\" # the LAN address
+kind = \"anthropic\"
+model = \"qwen3:30b\"
+api_key_env = \"OLD_KEY\"
+operator_hint = \"do not lose me\"
+
+[serving_notes]
+note = \"unmodelled table\"
+";
+        // Change only the model; clear the api-key env.
+        let out = BackendConfig::with_dropin_edits(
+            original,
+            &[
+                ("model", Some("llama3.1:8b".to_string())),
+                ("api_key_env", None),
+            ],
+        )
+        .unwrap();
+
+        let parsed: BackendConfig = toml::from_str(&out).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("llama3.1:8b"));
+        assert_eq!(parsed.api_key_env, None, "the cleared key is gone");
+        assert_eq!(
+            parsed.kind,
+            Some(BackendKind::Anthropic),
+            "an untouched kind survives verbatim (the #1667 §1 corruption)"
+        );
+        assert!(
+            out.contains("# hand-authored drop-in"),
+            "comment lost: {out}"
+        );
+        assert!(
+            out.contains("# the LAN address"),
+            "inline comment lost: {out}"
+        );
+        assert!(
+            out.contains("operator_hint = \"do not lose me\""),
+            "unknown key lost: {out}"
+        );
+        assert!(out.contains("[serving_notes]"), "unknown table lost: {out}");
+    }
+
+    /// A key the drop-in does not have yet is created; invalid TOML is a
+    /// visible error, never a silent overwrite.
+    #[test]
+    fn with_dropin_edits_creates_missing_keys_and_rejects_invalid_toml() {
+        let out = BackendConfig::with_dropin_edits(
+            "endpoint = \"http://x:1\"\n",
+            &[("kind", Some("openai".to_string()))],
+        )
+        .unwrap();
+        let parsed: BackendConfig = toml::from_str(&out).unwrap();
+        assert_eq!(parsed.kind, Some(BackendKind::Openai));
+        assert!(BackendConfig::with_dropin_edits("not = = toml", &[]).is_err());
     }
 
     #[test]
