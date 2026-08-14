@@ -42,6 +42,8 @@
 //! ## Keys (vi-flavoured; save is explicit, Esc always cancels)
 //! - `↑`/`↓` select a dial, `←`/`→` change it (incl. `auto`/`inherit`).
 //! - `Enter` — apply the changed dials + act on the persona choice, close.
+//!   With nothing changed (no dirty dial, persona kept), Enter closes silently
+//!   — a no-op visit applies nothing and reports nothing (#1665).
 //! - `Esc` / `q` — cancel: discard changes, close (never applies).
 //! - `Ctrl-S` or `:w <name>` — save the posture as persona `<name>` (`:w!` to
 //!   overwrite). `:wq <name>` — save + apply + close. `:q` — cancel + close.
@@ -333,6 +335,17 @@ impl PanelState {
         } else {
             PersonaAction::Switch(selected.clone())
         }
+    }
+
+    /// True when applying would change nothing: no dial is dirty and the persona
+    /// choice is Keep. [`run`] downgrades an Enter on a no-op panel to a silent
+    /// close (#1665) — bare `/psyche` opens the panel, so browsing must never
+    /// mutate or report. A dial cycled away and back is dirty (a deliberate
+    /// same-value re-apply), so it still counts as a change.
+    pub(crate) fn is_noop(&self) -> bool {
+        !self.cognition.is_dirty()
+            && !self.tenacity.is_dirty()
+            && self.persona_action() == PersonaAction::Keep
     }
 
     // ── Projection (review-3 §3) ─────────────────────────────────────────
@@ -747,6 +760,9 @@ fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
 /// during `:w`/`:wq` BEFORE any dial is applied, so a failed write leaves the
 /// runtime untouched and the panel open (review-3 §1). Dials apply ONLY on an
 /// explicit apply (Enter / a `:wq` whose save landed); Esc / `q` / `:q` discard.
+/// An Enter with nothing changed ([`PanelState::is_noop`]) downgrades to
+/// [`PanelOutcome::Cancelled`] — bare `/psyche` opens this panel (#1665), so a
+/// browse-and-leave visit must be indistinguishable from never opening it.
 pub(crate) fn run(
     personas: Vec<PersonaChoice>,
     current_persona: Option<String>,
@@ -815,7 +831,7 @@ pub(crate) fn run(
     // the loop (via `persist`). Now apply the dials — but ONLY on an explicit
     // apply — then hand the persona action to the caller, which applies it, reroutes
     // the backend, recomputes, and reports from fresh runtime state.
-    Ok(if applied {
+    Ok(if applied && !state.is_noop() {
         state.apply();
         let persona = state.persona_action();
         match state.saved {
@@ -980,6 +996,32 @@ mod tests {
         assert!(s.persona_label().contains("ghost"));
         assert!(s.persona_label().contains("(active)"));
         assert_eq!(s.persona_action(), PersonaAction::Keep);
+    }
+
+    #[test]
+    fn a_noop_visit_is_detected_so_enter_closes_silently() {
+        // #1665: bare /psyche opens the panel, so browsing-then-Enter must be a
+        // no-op — nothing applied, nothing reported. Moving the selection is
+        // not a change; touching a dial (even back to its original value) is.
+        let _g = GlobalSettingsGuard::acquire();
+        let mut s = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        assert!(s.is_noop(), "fresh panel: nothing to apply");
+        s.down();
+        s.up();
+        assert!(s.is_noop(), "row selection alone is not a change");
+        // Touch the cognition dial: dirty even after cycling back — a deliberate
+        // same-value re-apply is still an operator action.
+        s.down(); // persona → cognition
+        s.cycle(1);
+        assert!(!s.is_noop(), "a touched dial is a change");
+        s.cycle(-1);
+        assert!(!s.is_noop(), "cycled back is still dirty (re-apply)");
+        // A persona switch is a change too.
+        let mut p = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        while p.persona_idx != 0 {
+            p.cycle(-1);
+        }
+        assert!(!p.is_noop(), "persona Clear is a change");
     }
 
     #[test]

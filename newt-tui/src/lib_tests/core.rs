@@ -1073,6 +1073,23 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
     assert!(help_lines().iter().any(|l| l.contains("/docs")));
     assert!(help_lines().iter().any(|l| l.contains("/allow")));
     assert!(help_lines().iter().any(|l| l.contains("/plan")));
+    // #1665: /psyche is the one advertised dial surface; the retired top-level
+    // /tenacity + /cognition lines are gone from the corpus (their help PAGES
+    // survive as redirects for /help tenacity muscle memory).
+    assert!(help_lines().iter().any(|l| l.contains("/psyche")));
+    assert!(!help_lines()
+        .iter()
+        .any(|l| l.contains("/tenacity") || l.contains("/cognition")));
+    let tenacity_page = command_help_page("tenacity").expect("tenacity redirect page");
+    assert!(
+        tenacity_page.contains("/psyche tenacity"),
+        "{tenacity_page}"
+    );
+    let cognition_page = command_help_page("cognition").expect("cognition redirect page");
+    assert!(
+        cognition_page.contains("/psyche cognition"),
+        "{cognition_page}"
+    );
     let spill_help = command_help_page("spill").expect("spill help page");
     assert!(spill_help.contains("Space or Enter"));
     assert!(spill_help.contains("⧉"));

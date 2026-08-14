@@ -176,8 +176,9 @@ pub(crate) fn run_psyche_panel(
     } else {
         // rich-tui compiled but stdout is not a TTY (piped / headless): no overlay.
         print_newt(
-            "the psyche panel needs an interactive rich terminal — use /psyche for the \
-             text view, or /cognition / /tenacity to change the dials.",
+            "the psyche panel needs an interactive rich terminal — use /psyche status \
+             for the text view, or /psyche cognition / /psyche tenacity <level> to \
+             change the dials.",
             color,
             verbose,
         );
@@ -10296,46 +10297,49 @@ the model works. Off: just the answer. Persist with [tui] thinking in config."
         }
         "tenacity" => {
             "\
-/tenacity [level|list] — how hard the harness pushes the model from reading to acting
+/tenacity — folded into /psyche (#1665)
 
-  /tenacity              show the active level and what it does
-  /tenacity list         list every level, patient → forcing
-  /tenacity <level>      set relaxed | standard | insistent | relentless
-  /tenacity auto         clear the override; inherit from persona / config / family
+  /psyche                open the dial panel (TTY); ←/→ dials tenacity
+  /psyche tenacity <level>   set relaxed | standard | insistent | relentless
+  /psyche tenacity auto      clear the override; inherit persona / config / family
+  /psyche tenacity list      list every level, patient → forcing
 
 Higher tenacity forces an edit after fewer read-only rounds and makes
-exit_plan_mode require a concrete edit. This session-scoped override wins over
-the persona declaration and [tenacity] config; `/tenacity auto` (aliases
-`inherit` / `reset`) releases it. Persist per-family in [tenacity]."
+exit_plan_mode require a concrete edit. The session-scoped override wins over
+the persona declaration and [tenacity] config; `auto` (aliases `inherit` /
+`reset`) releases it. Persist per-family in [tenacity]."
         }
         "cognition" => {
             "\
-/cognition [level|off|auto|list] — how much reasoning the model spends per call
+/cognition — folded into /psyche (#1665)
 
-  /cognition             show the session setting
-  /cognition list        list every level, light → deep
-  /cognition <level>     set glancing | pondering | deliberating | contemplating
-  /cognition off         send no reasoning controls (override any persona)
-  /cognition auto        follow the active persona's cognition (default)
+  /psyche                open the dial panel (TTY); ←/→ dials cognition
+  /psyche cognition <level>  set glancing | pondering | deliberating | contemplating
+  /psyche cognition off      send no reasoning controls (override any persona)
+  /psyche cognition auto     follow the active persona's cognition (default)
+  /psyche cognition list     list every level, light → deep
 
 Responses maps the level to OpenAI reasoning.effort (glancing=minimal …
 contemplating=high). Chat Completions maps it to local generation controls only
 when the endpoint explicitly advertises that capability; unknown endpoints are
-unchanged. This session override beats the active persona's cognition; a
+unchanged. The session override beats the active persona's cognition; a
 persona sets its own default via `cognition:`."
         }
         "psyche" => {
             "\
-/psyche [edit|obsessive] — the agent's effort posture: cognition, tenacity, crew
+/psyche — the agent's effort posture: cognition, tenacity, crew
 
-  /psyche                show the three dials and how to change each
-  /psyche edit           open the config panel to adjust the dials (TTY)
+  /psyche                open the dial panel (TTY): ↑↓ select, ←→ dial,
+                         Enter apply, Esc leave (nothing changed → just exits)
+  /psyche status         the read-only text view (also what piped/lean gets)
+  /psyche cognition <level|off|auto|list>   text setter for the cognition dial
+  /psyche tenacity <level|auto|list>        text setter for the tenacity dial
   /psyche obsessive      engage the max-everything posture's live dials
 
 The three orthogonal psyche dials:
-  cognition   backend-specific reasoning depth per call      (/cognition)
-  tenacity    how hard the loop pushes read → act            (/tenacity)
-  crew        how many minds work the task                   (NEWT_TEAM / newt crew)
+  cognition   backend-specific reasoning depth per call
+  tenacity    how hard the loop pushes read → act
+  crew        how many minds work the task    (NEWT_TEAM / newt crew)
 
 obsessive = contemplating + relentless + crew on — newt's 'ultra'. In-session
 /psyche obsessive sets cognition + tenacity live; crew is a launch gate, so
@@ -10919,7 +10923,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers",
         "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
-        "  /tenacity [level|list]   - how hard to push from reading to acting (relaxed→relentless)",
+        "  /psyche                  - effort dial panel: cognition, tenacity, persona (Esc exits; /psyche obsessive = max)",
         "  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)",
         "  /spill [status|N|reset|summary|excerpt] - tool rows / one-line collapse",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",

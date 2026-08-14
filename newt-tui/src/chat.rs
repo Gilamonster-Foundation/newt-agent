@@ -3858,7 +3858,16 @@ pub(crate) fn run_chat(
                         println!();
                         continue;
                     }
-                    if slash_body == "psyche edit" {
+                    // #1665: bare `/psyche` IS the panel now (`psyche edit` stays
+                    // as a muscle-memory alias). The panel needs a rich-tui TTY;
+                    // otherwise bare `/psyche` falls through to dispatch_slash,
+                    // which renders the text status view — so piped, headless,
+                    // and lean sessions keep a working `/psyche` with zero noise.
+                    let wants_psyche_panel = slash_body == "psyche edit"
+                        || (slash_body == "psyche"
+                            && cfg!(feature = "rich-tui")
+                            && std::io::IsTerminal::is_terminal(&std::io::stdout()));
+                    if wants_psyche_panel {
                         // The harness config panel (#14): a transient overlay for
                         // the psyche operator dials. It applies dials through the
                         // same globals the slash commands do (picked up next turn,
@@ -3945,11 +3954,11 @@ pub(crate) fn run_chat(
                             if let Some(name) = &saved_name {
                                 print_newt(&format!("saved persona '{name}'"), color, verbose);
                             }
-                            if !applied {
-                                if saved_name.is_none() {
-                                    print_newt("psyche edit cancelled", color, verbose);
-                                }
-                            } else {
+                            // #1665: a cancelled / no-op visit prints nothing —
+                            // bare /psyche opens the panel, so browse-and-leave
+                            // must be as quiet as never having opened it. (A
+                            // lone :w still reports its save above.)
+                            if applied {
                                 if let Some(action) = persona_action {
                                     let persona_command = match action {
                                         PersonaAction::Keep => None,
@@ -4009,8 +4018,8 @@ pub(crate) fn run_chat(
                         #[cfg(not(feature = "rich-tui"))]
                         print_newt(
                             "the psyche panel needs an interactive rich terminal — use \
-                             /psyche for the text view, or /cognition / /tenacity to \
-                             change the dials.",
+                             /psyche status for the text view, or /psyche cognition / \
+                             /psyche tenacity <level> to change the dials.",
                             color,
                             verbose,
                         );

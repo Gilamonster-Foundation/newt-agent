@@ -1,9 +1,12 @@
 //! `/prompt` · `/vi` · `/emacs` · `/nano` · `/edit-mode` · `/thinking` · `/nudge` ·
-//! `/tenacity` · `/cognition` · `/psyche` — the session-setting commands. The
-//! editor-family ones set an `NEWT_*` env var a later step in `run_chat` picks
-//! up; the psyche dials (`/tenacity`, `/cognition`) mutate a process-global and
-//! `/psyche` renders all three effort dials read-only. Moved from the
-//! `dispatch_slash` match in `lib.rs`.
+//! `/psyche` — the session-setting commands. The editor-family ones set an
+//! `NEWT_*` env var a later step in `run_chat` picks up; `/psyche` owns every
+//! effort dial (#1665): bare `/psyche` opens the panel (intercepted in
+//! `chat.rs` on a rich TTY; here it renders the text status view for the
+//! piped/lean path), and `/psyche cognition|tenacity <level>` are the text
+//! setters that mutate the process-globals. The retired top-level
+//! `/cognition` + `/tenacity` print a redirect and mutate NOTHING. Moved from
+//! the `dispatch_slash` match in `lib.rs`.
 
 use newt_core::agentic::print_newt;
 
@@ -156,19 +159,32 @@ pub(crate) fn dispatch(
             _ => print_newt("usage: /thinking <on|off>", color, verbose),
         },
 
-        // #tenacity / #12: how hard the harness pushes the model from reading to
-        // acting. `/tenacity` shows the active level; `/tenacity <level>` sets an
-        // explicit override that wins over `[tenacity]` config + the CLI flag.
-        "tenacity" => print_newt(&tenacity_command(arg1), color, verbose),
+        // #1665: retired top-levels. Redirect WITHOUT mutating — a habitual
+        // `/tenacity relentless` must not half-work through a deprecation shim,
+        // or the shim never gets to die.
+        "tenacity" | "cognition" => print_newt(
+            &format!(
+                "/{cmd} folded into /psyche — /psyche opens the dial panel; \
+                 text: /psyche {cmd} <level>  (nothing changed)"
+            ),
+            color,
+            verbose,
+        ),
 
-        // Psyche cognition: the backend-neutral per-call reasoning depth.
-        // `/cognition` shows the session override; `/cognition <level>` forces it,
-        // `/cognition off` suppresses the field, `/cognition auto` follows persona.
-        "cognition" => print_newt(&cognition_command(arg1), color, verbose),
-
-        // The psyche panel: all three effort dials (cognition/tenacity/crew) at a
-        // glance. `/psyche obsessive` engages the max-everything live dials.
-        "psyche" => print_newt(&psyche_command(arg1), color, verbose),
+        // /psyche owns the dials (#1665): bare = panel (intercepted in chat.rs
+        // on a rich TTY; HERE bare renders the text status for piped/lean),
+        // `status` = text view, `cognition`/`tenacity` = text setters,
+        // `obsessive` = max the live dials. Subcommand args live past arg1, so
+        // re-derive the full remainder from the raw input.
+        "psyche" => {
+            let rest = input
+                .trim_start()
+                .trim_start_matches('/')
+                .strip_prefix("psyche")
+                .unwrap_or("")
+                .trim();
+            print_newt(&psyche_command(rest), color, verbose);
+        }
 
         other => {
             unreachable!("commands::settings::dispatch routed a non-setting command: {other:?}")
@@ -187,7 +203,7 @@ fn tenacity_command(arg: &str) -> String {
         "" | "status" | "show" => {
             let t = effective_tenacity();
             format!(
-                "tenacity: {} — {}  (/tenacity <auto|relaxed|standard|insistent|relentless>|list)",
+                "tenacity: {} — {}  (/psyche tenacity <auto|relaxed|standard|insistent|relentless>|list)",
                 t.label(),
                 t.describe()
             )
@@ -223,7 +239,7 @@ fn tenacity_command(arg: &str) -> String {
                 format!("tenacity → {} — {}", level.label(), level.describe())
             }
             Err(e) => {
-                format!("{e}  (/tenacity <auto|level>|list|status)")
+                format!("{e}  (/psyche tenacity <auto|level>|list|status)")
             }
         },
     }
@@ -237,7 +253,7 @@ fn tenacity_command(arg: &str) -> String {
 fn cognition_command(arg: &str) -> String {
     use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
     use newt_core::role_profile::Cognition;
-    let usage = "(/cognition <glancing|pondering|deliberating|contemplating>|off|auto|list)";
+    let usage = "(/psyche cognition <glancing|pondering|deliberating|contemplating>|off|auto|list)";
     match arg.trim() {
         "" | "status" | "show" => {
             match cli_cognition() {
@@ -287,20 +303,24 @@ fn cognition_command(arg: &str) -> String {
     }
 }
 
-/// Build the `/psyche` panel — the agent's effort posture at a glance: the three
-/// orthogonal dials (cognition / tenacity / crew) and how to change each. Reads
-/// the live session state — the cognition + tenacity process-globals and the
-/// crew `NEWT_TEAM` startup gate (the same gate newt-cli reads to build the crew
-/// runner). The three are kept factored on purpose: cognition rides the wire
-/// request, tenacity steers the harness loop, crew sets how many minds work.
-fn psyche_command(arg: &str) -> String {
+/// `/psyche` — every effort dial under one command (#1665). `rest` is the raw
+/// remainder after "psyche": empty / `status` renders the text posture view
+/// (bare `/psyche` only reaches here on the piped/lean path — a rich TTY
+/// intercepts it in `chat.rs` and opens the panel), `cognition …` /
+/// `tenacity …` delegate to the text setters, `obsessive` maxes the live
+/// dials, and `edit` points at the panel's TTY requirement.
+fn psyche_command(rest: &str) -> String {
     use newt_core::cognition::{cli_cognition, CognitionOverride};
     use newt_core::tenacity::effective_tenacity;
+    let rest = rest.trim();
+    let (sub, arg) = match rest.split_once(char::is_whitespace) {
+        Some((s, a)) => (s, a.trim()),
+        None => (rest, ""),
+    };
     // `/psyche obsessive` — engage the max-everything posture's two LIVE dials.
     // Crew is a startup gate (crew_runner is built once at launch), so it can't
     // be turned on mid-session; say so honestly and point at the launch flag.
-    let a = arg.trim();
-    if a.eq_ignore_ascii_case("obsessive") || a.eq_ignore_ascii_case("obsessive-relentless") {
+    if sub.eq_ignore_ascii_case("obsessive") || sub.eq_ignore_ascii_case("obsessive-relentless") {
         let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
         return format!(
             "obsessive engaged (live): cognition → {}, tenacity → {}.\n\
@@ -309,6 +329,24 @@ fn psyche_command(arg: &str) -> String {
             cog.label(),
             ten.label()
         );
+    }
+    match sub {
+        "cognition" => return cognition_command(arg),
+        "tenacity" => return tenacity_command(arg),
+        // Reached only where chat.rs did NOT open the panel (piped / lean).
+        "edit" => {
+            return "the dial panel needs an interactive rich terminal — \
+                    /psyche status shows the text view; /psyche cognition / \
+                    /psyche tenacity <level> change the dials."
+                .to_string()
+        }
+        "" | "status" | "show" => {}
+        other => {
+            return format!(
+                "unknown /psyche subcommand `{other}` — usage: /psyche \
+                 [status|cognition <level>|tenacity <level>|obsessive]"
+            )
+        }
     }
     // Show the EFFECTIVE cognition + where it resolves from (review-2 #6): a
     // status view, not just an override inspector.
@@ -332,20 +370,20 @@ fn psyche_command(arg: &str) -> String {
     let mut out = String::from("psyche — how hard the agent works (three orthogonal dials):");
     out.push_str(&format!("\n  cognition   {cog}"));
     out.push_str(
-        "\n              backend-specific reasoning depth                    (/cognition)",
+        "\n              backend-specific reasoning depth             (/psyche cognition)",
     );
     out.push_str(&format!(
         "\n  tenacity    {} — {}",
         ten.label(),
         ten.describe()
     ));
-    out.push_str("\n              how hard the loop pushes read → act            (/tenacity)");
+    out.push_str("\n              how hard the loop pushes read → act     (/psyche tenacity)");
     out.push_str(&format!("\n  crew        {crew}"));
     out.push_str(
         "\n              how many minds work the task                   (NEWT_TEAM / newt crew)",
     );
     out.push_str("\nobsessive = the max-everything posture: contemplating + relentless + crew on.");
-    out.push_str("\n/psyche edit — open the config panel to adjust these dials (TTY).");
+    out.push_str("\n/psyche — open the dial panel (TTY) · /psyche cognition|tenacity <level> — text setters.");
     out
 }
 
@@ -362,10 +400,11 @@ mod tests {
         let restore = cli_cognition();
         set_cli_cognition(CognitionOverride::Unset);
 
-        // Status (unset) explains it follows the persona and shows usage.
+        // Status (unset) explains it follows the persona and shows usage —
+        // pointing at the /psyche subcommand form, not the retired top-level.
         let status = cognition_command("");
         assert!(status.starts_with("cognition: auto"), "{status}");
-        assert!(status.contains("/cognition"), "{status}");
+        assert!(status.contains("/psyche cognition"), "{status}");
         // List enumerates every level plus off/auto.
         let list = cognition_command("list");
         for label in [
@@ -404,8 +443,13 @@ mod tests {
             assert!(out.contains(k), "psyche panel missing '{k}': {out}");
         }
         assert!(
-            out.contains("/cognition") && out.contains("/tenacity"),
-            "panel should point at how to change each dial: {out}"
+            out.contains("/psyche cognition") && out.contains("/psyche tenacity"),
+            "status view points at the /psyche subcommand setters: {out}"
+        );
+        assert!(
+            !out.contains("/psyche edit"),
+            "bare /psyche IS the panel now — the footer must not advertise \
+             the old edit subcommand: {out}"
         );
     }
 
@@ -447,7 +491,7 @@ mod tests {
         // Status names the active level and the usage hint (no mutation).
         let status = tenacity_command("");
         assert!(status.starts_with("tenacity: "), "{status}");
-        assert!(status.contains("/tenacity"), "{status}");
+        assert!(status.contains("/psyche tenacity"), "{status}");
         // List enumerates every level, patient → forcing, marking the active one.
         let list = tenacity_command("list");
         for label in ["relaxed", "standard", "insistent", "relentless"] {
@@ -460,6 +504,87 @@ mod tests {
         // An unknown level explains itself rather than silently doing nothing.
         let err = tenacity_command("banana");
         assert!(err.contains("unknown tenacity"), "{err}");
+    }
+
+    #[test]
+    fn psyche_subcommands_route_to_the_dial_setters() {
+        // #1665: /psyche cognition|tenacity <level> are the text setters — the
+        // same functions the retired top-levels used, reached through /psyche.
+        use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+        use newt_core::role_profile::Cognition;
+        use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
+
+        let msg = super::psyche_command("cognition deliberating");
+        assert!(msg.contains("deliberating"), "{msg}");
+        assert_eq!(
+            cli_cognition(),
+            CognitionOverride::Set(Cognition::Deliberating)
+        );
+        let msg = super::psyche_command("tenacity relentless");
+        assert!(msg.contains("relentless"), "{msg}");
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
+        // Bare subcommand = that dial's status view, no mutation.
+        let status = super::psyche_command("cognition");
+        assert!(status.starts_with("cognition:"), "{status}");
+        // `status`/`show`/empty render the posture view; `edit` explains the
+        // TTY requirement (only reached where chat.rs did not open the panel).
+        for rest in ["", "status", "show"] {
+            let out = super::psyche_command(rest);
+            assert!(out.contains("psyche — how hard"), "{rest:?}: {out}");
+        }
+        let edit = super::psyche_command("edit");
+        assert!(edit.contains("interactive rich terminal"), "{edit}");
+        // An unknown subcommand explains itself.
+        let err = super::psyche_command("banana");
+        assert!(err.contains("unknown /psyche subcommand"), "{err}");
+
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
+    }
+
+    #[test]
+    fn retired_top_level_dials_redirect_without_mutating() {
+        // #1665: `/tenacity relentless` and `/cognition contemplating` must NOT
+        // half-work through the deprecation shim — redirect only, zero writes.
+        use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+        use newt_core::tenacity::{cli_tenacity, set_cli_tenacity, Tenacity};
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
+
+        super::dispatch(
+            "tenacity",
+            "relentless",
+            "/tenacity relentless",
+            ".",
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            cli_tenacity(),
+            Some(Tenacity::Standard),
+            "retired /tenacity must not mutate the override"
+        );
+        super::dispatch(
+            "cognition",
+            "contemplating",
+            "/cognition contemplating",
+            ".",
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            cli_cognition(),
+            CognitionOverride::Unset,
+            "retired /cognition must not mutate the override"
+        );
+
+        set_cli_tenacity(Tenacity::Standard);
     }
 
     #[test]
