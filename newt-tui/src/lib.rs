@@ -45,6 +45,10 @@ mod rich_input;
 // operator dials. Gated with the other rich TTY surfaces so wyvern/lean strip it.
 #[cfg(feature = "rich-tui")]
 mod config_panel;
+// The backend chooser/editor panel (#1667) — same grammar, same gating; its
+// persistence rides the setup wizard's crash-safe lock + plan machinery.
+#[cfg(feature = "rich-tui")]
+mod backend_panel;
 #[cfg(feature = "rich-tui")]
 mod vi;
 // The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
@@ -10251,28 +10255,34 @@ Tab through what's installed with /models.
         }
         "backend" => {
             "\
-/backend <openai|ollama> [model] — switch the backend wire protocol
+/backend — the backend panel (chooser · editor), plus the wire-kind toggle
 
-Repoint the session at an Ollama or OpenAI-compatible endpoint, optionally
-naming a model in one step. Endpoints/keys come from config ([[backends]]).
-  /backend ollama deepseek-r1
+Bare /backend on a rich interactive terminal opens the backend panel: ←/→
+spins through the configured backends (plus the bare openai/ollama kind
+toggles), ◀ marks the active one; Enter applies the pick with exactly the
+/backends <name> semantics; Esc leaves silently. `e` edits the selected
+entry, `a` adds one (name, kind, url, model, api-key env/file — written
+crash-safe to ~/.newt/backends/<name>.toml), and `:d <name>` removes one
+(the active backend only together with a new selection, one transaction).
+
+The text forms keep working everywhere (piped, lean build, headless):
+  /backend ollama deepseek-r1   session-only wire-kind toggle (not persisted)
   /backend openai gpt-4.1
-
-Transient session-only kind toggle — it does NOT stick across runs. Use
-/backends <name> or /model <name> to make a choice persist."
+Use /backends <name> or /model <name> to make a choice persist."
         }
         "backends" => {
             "\
-/backends [name] — list configured backends, or switch to one by name
+/backends [name] — alias of /backend: panel, text list, or switch by name
 
-Where /backend toggles the coarse openai-vs-ollama wire protocol, /backends
-picks a NAMED [[backends]] endpoint (dgx1, gnuc, openai, …) regardless of its
-protocol — the single-coder \"which box am I talking to\" switch.
+Bare /backends on a rich interactive terminal opens the same backend panel
+as /backend (chooser · edit · add · remove). The text forms remain:
   /backends            list every configured backend, ◀ the active one
   /backends dgx1       repoint this session at the 'dgx1' backend
 
-Your choice sticks across runs (saved to ~/.newt/settings.toml); an explicit
-NEWT_PROVIDER or a --loadout still overrides it. Edit [[backends]] to add one."
+Where /backend's kind toggle picks the coarse openai-vs-ollama wire protocol,
+/backends <name> picks a NAMED backend (dgx1, gnuc, openai, …) regardless of
+its protocol. Your choice sticks across runs (~/.newt/settings.toml); an
+explicit NEWT_PROVIDER or a --loadout still overrides it."
         }
         "crew" => {
             "\
@@ -10864,8 +10874,9 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /models                  - list models on the active endpoint",
         "  /models capabilities     - tool-conformance matrix (cached)",
         "  /model <name>            - switch model on the active backend (sticks across runs)",
-        "  /backend <openai|ollama> [model] - switch backend (e.g. /backend ollama deepseek-r1)",
-        "  /backends [name]         - list configured backends; /backends <name> switches (e.g. dgx1, gnuc)",
+        "  /backend                 - backend panel on a rich TTY: choose · edit · add · remove",
+        "  /backend <openai|ollama> [model] - text form: switch the wire kind (e.g. /backend ollama deepseek-r1)",
+        "  /backends [name]         - alias of /backend; text list stays: bare lists (piped/lean), /backends <name> switches",
         "  /thinking <on|off>       - toggle the reasoning spinner for this session",
         "  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)",
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",

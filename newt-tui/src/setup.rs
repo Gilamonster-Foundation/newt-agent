@@ -1853,6 +1853,7 @@ fn persist_verified_setup(
                 endpoint: normalized,
                 path: found.path.clone(),
                 body: None,
+                replace: false,
             });
             continue;
         }
@@ -1865,6 +1866,7 @@ fn persist_verified_setup(
                 endpoint: normalized,
                 path: found.path.clone(),
                 body: None,
+                replace: false,
             });
             continue;
         }
@@ -1878,6 +1880,7 @@ fn persist_verified_setup(
             name,
             endpoint: normalized,
             body: Some(body.into_bytes()),
+            replace: false,
         });
     }
 
@@ -1957,6 +1960,10 @@ struct PlannedSetupBackend {
     endpoint: String,
     path: PathBuf,
     body: Option<Vec<u8>>,
+    /// `true` = durably REPLACE an existing drop-in (the backend panel's edit,
+    /// #1667); `false` = create-only, refusing to clobber a file that appeared
+    /// concurrently (the setup wizard's add semantics, #1660).
+    replace: bool,
 }
 
 impl PlannedSetupBackend {
@@ -2183,7 +2190,11 @@ fn commit_setup_plan_with(
     for backend in planned {
         if let Some(body) = backend.body.as_deref() {
             let destination = setup_config_destination(&backend.path)?;
-            staged_backends.push((guard.stage(&destination, body, None)?, destination));
+            staged_backends.push((
+                guard.stage(&destination, body, None)?,
+                destination,
+                backend.replace,
+            ));
         }
     }
     let config_permissions = setup_file_permissions(config_destination.as_path())?;
@@ -2231,9 +2242,17 @@ fn commit_setup_plan_with(
         );
     }
 
-    for (temp, destination) in &staged_backends {
-        commit_backend_no_clobber(temp, destination)?;
-        guard.created.push(destination.as_path().to_path_buf());
+    for (temp, destination, replace) in &staged_backends {
+        if *replace {
+            // The backend panel's EDIT (#1667): durably replace the existing
+            // drop-in. Deliberately NOT registered for rollback — the original
+            // bytes are gone once replaced, and the new content is itself a
+            // valid drop-in, so a later failure must not delete it.
+            destination.durable_replace(temp)?;
+        } else {
+            commit_backend_no_clobber(temp, destination)?;
+            guard.created.push(destination.as_path().to_path_buf());
+        }
     }
     if config_stage.is_some() && read_setup_config(config_destination.as_path())? != old_config {
         anyhow::bail!(
@@ -2279,6 +2298,115 @@ fn commit_setup_plan_with(
         }
     }
     Ok(guard.finish())
+}
+
+// ---------------------------------------------------------------------------
+// Backend panel persistence (#1667) — REUSES the wizard's crash-safe machinery
+// (acquire_setup_lock → plan → commit_setup_plan, #1660); the panel never gets
+// a second write path.
+// ---------------------------------------------------------------------------
+
+/// Write the panel's add/edit form as the drop-in `backends/<name>.toml`, under
+/// the setup lock, via the staged [`commit_setup_plan`] commit. An EDIT
+/// (`edit.replace`) loads the existing drop-in first and overlays ONLY the six
+/// form-managed fields, so operator- or probe-set fields the form does not show
+/// (tiers, serving, engine, host, provenance, …) round-trip untouched. An ADD
+/// refuses to clobber an existing file. `config.toml` is never rewritten (the
+/// default pointer is the chooser's job, not the editor's). Returns the written
+/// path.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn persist_panel_backend(
+    config_path: &Path,
+    edit: &crate::backend_panel::BackendEdit,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(!edit.name.trim().is_empty(), "backend needs a name");
+    if let Some(parent) = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let setup_lock = acquire_setup_lock(config_path)?;
+    let old_config = read_setup_config(setup_lock.destination.as_path())?;
+    let path = config_path
+        .with_file_name("backends")
+        .join(format!("{}.toml", edit.name));
+    let endpoint = normalize_setup_endpoint(&edit.endpoint)?;
+    let mut backend: BackendConfig = if edit.replace {
+        let body = std::fs::read_to_string(&path)
+            .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+        toml::from_str(&body)
+            .map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?
+    } else if path.exists() {
+        anyhow::bail!("backend '{}' already exists — edit it instead", edit.name);
+    } else {
+        BackendConfig::default()
+    };
+    backend.name.clone_from(&edit.name);
+    backend.endpoint.clone_from(&edit.endpoint);
+    backend.kind = edit.kind;
+    backend.model.clone_from(&edit.model);
+    backend.api_key_env.clone_from(&edit.api_key_env);
+    backend.api_key_file.clone_from(&edit.api_key_file);
+    let body = toml::to_string(&backend)?;
+    let planned = [PlannedSetupBackend {
+        name: edit.name.clone(),
+        endpoint,
+        path: path.clone(),
+        body: Some(body.into_bytes()),
+        replace: edit.replace,
+    }];
+    // old == updated: the plan stages/commits ONLY the drop-in; config.toml is
+    // left byte-for-byte alone (no backup dance, no default_backend rewrite).
+    commit_setup_plan(
+        config_path,
+        &setup_lock.destination,
+        &old_config,
+        &old_config,
+        &planned,
+    )?;
+    Ok(path)
+}
+
+/// Delete the drop-in `backends/<name>.toml` under the setup lock, durably
+/// syncing the parent directory — the panel's `:d <name>` (#1667). The caller
+/// (the panel) refuses to remove the ACTIVE backend unless a different named
+/// selection is applied in the same transaction; this function only guards the
+/// filesystem invariants (a sane file-stem name, and the file existing).
+#[cfg(feature = "rich-tui")]
+pub(crate) fn remove_panel_backend(config_path: &Path, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+        "invalid backend name '{name}'"
+    );
+    let _lock = acquire_setup_lock(config_path)?;
+    let path = config_path
+        .with_file_name("backends")
+        .join(format!("{name}.toml"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            let _ = newt_core::atomic_fs::sync_parent(&path);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+            "no backend drop-in named '{name}' ({})",
+            path.display()
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The names of the per-file backend drop-ins next to `config_path` — which
+/// chooser entries the panel may edit/remove (inline `[[backends]]` in
+/// config.toml stay read-only there). Reuses the wizard's directory reader.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn panel_backend_file_names(config_path: &Path) -> Vec<String> {
+    read_existing_setup_backends(&config_path.with_file_name("backends"))
+        .map(|found| found.into_iter().map(|item| item.name).collect())
+        .unwrap_or_default()
 }
 
 /// Build the new-shape setup result (#1140): a backend DROP-IN (one endpoint,
@@ -3537,12 +3665,14 @@ mod tests {
                 endpoint: "http://first:8000".into(),
                 path: backend_dir.join("first.toml"),
                 body: Some(b"name = \"first\"\n".to_vec()),
+                replace: false,
             },
             PlannedSetupBackend {
                 name: "second".into(),
                 endpoint: "http://second:8000".into(),
                 path: blocked_parent.join("second.toml"),
                 body: Some(b"name = \"second\"\n".to_vec()),
+                replace: false,
             },
         ];
 
@@ -3562,6 +3692,135 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "leftover staged files: {leftovers:?}");
         assert!(!config_path.exists());
+    }
+
+    /// #1667: the backend panel's ADD persists through the SAME setup-lock plan
+    /// commit as the wizard (#1660) — a fresh drop-in appears, config.toml is
+    /// never rewritten, a duplicate add is refused, and the lock is released.
+    #[cfg(feature = "rich-tui")]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn panel_backend_add_creates_a_dropin_and_never_touches_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "# operator config\n").unwrap();
+        let edit = crate::backend_panel::BackendEdit {
+            name: "dgx1".into(),
+            kind: Some(BackendKind::Openai),
+            endpoint: "http://dgx1:8000".into(),
+            model: Some("gpt-oss-120b".into()),
+            api_key_env: Some("DGX_KEY".into()),
+            api_key_file: None,
+            replace: false,
+        };
+        let path = persist_panel_backend(&config_path, &edit).unwrap();
+        assert_eq!(path, dir.path().join("backends/dgx1.toml"));
+        let written: BackendConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.name, "dgx1");
+        assert_eq!(written.endpoint, "http://dgx1:8000");
+        assert_eq!(written.kind, Some(BackendKind::Openai));
+        assert_eq!(written.model.as_deref(), Some("gpt-oss-120b"));
+        assert_eq!(written.api_key_env.as_deref(), Some("DGX_KEY"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "# operator config\n",
+            "the editor never rewrites config.toml"
+        );
+        // Adding the same name again is refused (no clobber)…
+        let error = persist_panel_backend(&config_path, &edit).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error:#}");
+        // …the drop-in list names it for the chooser's editability marker…
+        assert_eq!(
+            panel_backend_file_names(&config_path),
+            vec!["dgx1".to_string()]
+        );
+        // …and the setup lock was released (a fresh acquire succeeds).
+        drop(acquire_setup_lock(&config_path).unwrap());
+    }
+
+    /// #1667: the panel's EDIT overlays ONLY the six form-managed fields —
+    /// wizard/probe-written fields the form does not show (tiers, serving)
+    /// round-trip untouched through the load-mutate-replace commit.
+    #[cfg(feature = "rich-tui")]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn panel_backend_edit_overlays_form_fields_and_preserves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let backend_dir = dir.path().join("backends");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        std::fs::write(
+            backend_dir.join("gnuc.toml"),
+            "name = \"gnuc\"\nendpoint = \"http://gnuc:11434\"\nmodel = \"qwen3:30b\"\n\
+             tiers = [\"FAST\"]\nkind = \"ollama\"\nserving = \"multiplexer\"\n",
+        )
+        .unwrap();
+        let edit = crate::backend_panel::BackendEdit {
+            name: "gnuc".into(),
+            kind: Some(BackendKind::Ollama),
+            endpoint: "http://gnuc:11434".into(),
+            model: Some("llama3.1:8b".into()),
+            api_key_env: None,
+            api_key_file: None,
+            replace: true,
+        };
+        let path = persist_panel_backend(&config_path, &edit).unwrap();
+        let written: BackendConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written.model.as_deref(),
+            Some("llama3.1:8b"),
+            "the form field applied"
+        );
+        assert_eq!(
+            written.serving,
+            Some(newt_core::Serving::Multiplexer),
+            "an unmanaged field survived the edit"
+        );
+        assert_eq!(
+            written.tiers,
+            vec![Tier::Fast],
+            "an unmanaged field survived the edit"
+        );
+        // Editing a drop-in that vanished is a visible error, not a create.
+        let ghost = crate::backend_panel::BackendEdit {
+            name: "ghost".into(),
+            replace: true,
+            ..edit
+        };
+        assert!(persist_panel_backend(&config_path, &ghost).is_err());
+        assert!(!backend_dir.join("ghost.toml").exists());
+    }
+
+    /// #1667: `:d <name>` deletes exactly one drop-in under the setup lock;
+    /// a missing name and a path-traversal shape are refused visibly.
+    #[cfg(feature = "rich-tui")]
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn panel_backend_remove_deletes_the_dropin_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let backend_dir = dir.path().join("backends");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        std::fs::write(
+            backend_dir.join("old.toml"),
+            "name = \"old\"\nendpoint = \"http://old:1\"\n",
+        )
+        .unwrap();
+        remove_panel_backend(&config_path, "old").unwrap();
+        assert!(!backend_dir.join("old.toml").exists());
+        let error = remove_panel_backend(&config_path, "old").unwrap_err();
+        assert!(
+            error.to_string().contains("no backend drop-in"),
+            "{error:#}"
+        );
+        let error = remove_panel_backend(&config_path, "../evil").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid backend name"),
+            "{error:#}"
+        );
+        drop(acquire_setup_lock(&config_path).unwrap());
     }
 
     /// Real-filesystem grounding for the detected-setup config failpoint: a
@@ -3584,6 +3843,7 @@ mod tests {
             body: Some(
                 b"name = \"example\"\nendpoint = \"https://inference.example.test\"\n".to_vec(),
             ),
+            replace: false,
         }];
         let destination = setup_config_destination(&config_path).unwrap();
 
