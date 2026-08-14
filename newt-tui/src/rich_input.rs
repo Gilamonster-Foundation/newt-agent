@@ -75,7 +75,7 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::chat::BackgroundJob;
-use crate::palette::{palette_lines, PaletteState};
+use crate::palette::{palette_lines, palette_step, PaletteState, PaletteStep};
 use crate::{footer_continues, InputSurface, ReadOutcome};
 
 // Opt-in wide-gutter width (`NEWT_GUTTER=auto`/`tui.gutter=N`): a fixed left
@@ -1074,6 +1074,12 @@ impl RichSurface {
         // Opens on `/` at an empty prompt; filters as you type; ↑/↓ (C-p/C-n)
         // move; Tab/Enter complete (never submit); Esc closes.
         let mut palette = PaletteState::from_corpus();
+        // A `/` that arrived as TYPE-AHEAD (typed while the last turn ran)
+        // must open the palette exactly as a live keypress would — run the
+        // same buffer sync over the prefill (review of #1674). A longer
+        // prefilled `/cmd…` line follows the same rule as any non-`/` edit:
+        // it does not open the palette.
+        palette.on_buffer_change("", &textarea.lines().join("\n"));
         loop {
             // Grow/shrink the inline viewport to the input. The prompt is always
             // inline now — on the first row, either in a wide left gutter or as
@@ -1165,57 +1171,18 @@ impl RichSurface {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            // #1674: while the palette is open it owns navigation + completion
-            // keys (checked BEFORE history recall, so ↑/↓ move the highlight,
-            // not the history). Every other key falls through to the editor
-            // and re-filters via the buffer sync below.
-            if palette.is_open() {
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                match key.code {
-                    KeyCode::Up => {
-                        palette.move_up();
-                        continue;
-                    }
-                    KeyCode::Down => {
-                        palette.move_down();
-                        continue;
-                    }
-                    KeyCode::Char('p') if ctrl => {
-                        palette.move_up();
-                        continue;
-                    }
-                    KeyCode::Char('n') if ctrl => {
-                        palette.move_down();
-                        continue;
-                    }
-                    // Esc closes the palette, typed text intact (it does NOT
-                    // reach the editor, so vi stays in INSERT).
-                    KeyCode::Esc => {
-                        palette.close();
-                        continue;
-                    }
-                    // Tab completes; with nothing to complete it is swallowed
-                    // (never a literal tab into a slash line).
-                    KeyCode::Tab => {
-                        if let Some(text) = palette.completion() {
-                            textarea = textarea_with(self.edit, &text);
-                        }
-                        palette.close();
-                        continue;
-                    }
-                    // Enter completes the highlighted command — it does NOT
-                    // submit. With nothing highlighted (no match) it closes
-                    // the palette and falls through to the normal submit.
-                    KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if let Some(text) = palette.completion() {
-                            textarea = textarea_with(self.edit, &text);
-                            palette.close();
-                            continue;
-                        }
-                        palette.close();
-                    }
-                    _ => {}
+            // #1674: the palette sees every key FIRST (before history recall,
+            // so ↑/↓ move the highlight, not the history). The decision is
+            // the pure `palette_step` — the loop only acts on its verdict, so
+            // the interception contracts are unit-tested in palette.rs.
+            match palette_step(&mut palette, &key) {
+                PaletteStep::Swallowed => continue,
+                PaletteStep::CompleteTo(text) => {
+                    // A COMPLETION into the prompt — never a submit.
+                    textarea = textarea_with(self.edit, &text);
+                    continue;
                 }
+                PaletteStep::PassThrough => {}
             }
             // History recall on ↑/↓ — but only at a vertical edge of the buffer
             // (top row for ↑, bottom row for ↓) so multi-line cursor movement

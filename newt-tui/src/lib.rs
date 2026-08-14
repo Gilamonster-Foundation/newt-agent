@@ -89,6 +89,8 @@ use newt_core::recover_context_window_400;
 use prompt::expand_prompt_tokens;
 #[cfg(feature = "rich-tui")]
 use prompt::resolve_gutter_setting;
+#[cfg(feature = "rich-tui")]
+use prompt::rich_surface_selected;
 use prompt::{
     current_prompt_and_preview, debug_mode, footer_mode, footer_rich_enabled, prompt_str,
     prompt_token_help, resolve_edit_mode, strip_one_quote_pair, trace_mode, verbose_mode,
@@ -10953,6 +10955,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /retrieval [turn N] [human|model|diff] - retrieval ledger",
         "  /compare semantic lexical | turn A B | index - compare retrieval",
         "  /export json|markdown    - export retrieval ledger",
+        "  /help [command]          - this command list, or one command's detail page",
         "  /exit  /quit  exit  quit - leave the session",
         "",
         "  Add --help (or -h) to any command — or /help <command> — for its detail page.",

@@ -25,6 +25,7 @@
 //! from config_panel.rs) and fully unit-tested; [`palette_lines`] is the thin
 //! render fn the rich surface draws through its existing inline viewport.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -88,15 +89,40 @@ pub(crate) fn parse_help_corpus(lines: &[&str]) -> Vec<PaletteEntry> {
                     .map(|alt| entry(alt, String::new())),
             );
         } else {
-            // "/probe window [model]" — leading literal words are the command;
-            // the first `<…>` / `[…]` / quoted token starts the placeholders.
-            let split = tokens
-                .iter()
-                .position(|tok| !is_literal_word(tok))
-                .unwrap_or(tokens.len());
+            // Bare `|` alternation AFTER the command token ("json|markdown",
+            // "… | turn A B | index") is usage notation for alternative
+            // ARGUMENT forms — never part of a dispatchable command. When it
+            // appears, only the first token is the command and everything
+            // after is the argument pattern (review of #1674: parsing
+            // "/export json|markdown" as cmd "/export json|markdown" invented
+            // a non-dispatchable literal). Pipes INSIDE `<…>`/`[…]` are
+            // ordinary placeholders and don't trigger this.
+            let bare_alt = tokens[1..].iter().any(|tok| {
+                tok.contains('|')
+                    && !tok.starts_with('<')
+                    && !tok.starts_with('[')
+                    && !tok.starts_with('"')
+            });
+            // Otherwise: "/probe window [model]" — leading literal words are
+            // the command; the first `<…>` / `[…]` / quoted token starts the
+            // placeholders.
+            let split = if bare_alt {
+                1
+            } else {
+                tokens
+                    .iter()
+                    .position(|tok| !is_literal_word(tok))
+                    .unwrap_or(tokens.len())
+            };
             out.push(entry(&tokens[..split].join(" "), tokens[split..].join(" ")));
         }
     }
+    // Corpus wart (review of #1674): `help_lines()` carries `/search` twice —
+    // once in the main list, once in the navigator block. `/help` keeps the
+    // corpus verbatim, but the palette shows each COMMAND once: first corpus
+    // occurrence wins.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|e| seen.insert(e.cmd.clone()));
     out
 }
 
@@ -185,12 +211,19 @@ impl PaletteState {
     }
 
     /// Re-rank the match set for `filter`. The highlight and scroll window
-    /// reset to the top on every change (Claude Code convention).
+    /// reset to the top on every change (Claude Code convention). ZERO matches
+    /// close the palette outright (review of #1674): an open-but-invisible
+    /// palette would keep swallowing ↑/↓/Esc — silently breaking history
+    /// recall and vi's Esc-to-NORMAL with no visual cue. Nothing to show means
+    /// the palette is not open; the typed text is untouched.
     fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
         self.matched = ranked_matches(&self.entries, filter);
         self.highlight = 0;
         self.scroll = 0;
+        if self.matched.is_empty() {
+            self.close();
+        }
     }
 
     /// Move the highlight up one row, clamped at the top (the config_panel
@@ -289,6 +322,84 @@ fn ranked_matches(entries: &[PaletteEntry], filter: &str) -> Vec<usize> {
         }
     }
     out
+}
+
+/// What the event loop should do with a key after the palette has seen it —
+/// the PURE key-interception decision (review of #1674), so the loop's
+/// contracts (Enter completes but never submits; the palette owns ↑/↓ before
+/// history recall; Esc is swallowed; a closed palette touches nothing) are
+/// unit-testable without a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaletteStep {
+    /// The palette consumed the key; the loop moves to the next event.
+    Swallowed,
+    /// Replace the input buffer with this completion (the palette closed).
+    /// This is a COMPLETION, never a submit.
+    CompleteTo(String),
+    /// The palette is closed or uninterested; the key flows on to history
+    /// recall and the editor unchanged.
+    PassThrough,
+}
+
+/// Feed one key press to the palette. Open, it owns navigation (↑/↓,
+/// `C-p`/`C-n`), Esc (close, typed text intact), Tab (complete; swallowed
+/// even with nothing to complete, so a literal tab never lands in a slash
+/// line), and plain Enter (complete — NOT submit; Shift-Enter passes through
+/// as the editor's newline). Closed, every key passes through untouched.
+pub(crate) fn palette_step(state: &mut PaletteState, key: &KeyEvent) -> PaletteStep {
+    if !state.is_open() {
+        return PaletteStep::PassThrough;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Up => {
+            state.move_up();
+            PaletteStep::Swallowed
+        }
+        KeyCode::Down => {
+            state.move_down();
+            PaletteStep::Swallowed
+        }
+        KeyCode::Char('p') if ctrl => {
+            state.move_up();
+            PaletteStep::Swallowed
+        }
+        KeyCode::Char('n') if ctrl => {
+            state.move_down();
+            PaletteStep::Swallowed
+        }
+        KeyCode::Esc => {
+            state.close();
+            PaletteStep::Swallowed
+        }
+        KeyCode::Tab => match state.completion() {
+            Some(text) => {
+                state.close();
+                PaletteStep::CompleteTo(text)
+            }
+            None => {
+                state.close();
+                PaletteStep::Swallowed
+            }
+        },
+        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            match state.completion() {
+                Some(text) => {
+                    state.close();
+                    PaletteStep::CompleteTo(text)
+                }
+                // Defensive: an open palette always has a highlight now that
+                // zero matches auto-close, but if there is ever nothing to
+                // complete, Enter closes and falls through to the normal
+                // submit path.
+                None => {
+                    state.close();
+                    PaletteStep::PassThrough
+                }
+            }
+        }
+        _ => PaletteStep::PassThrough,
+    }
 }
 
 /// Render the visible window as styled rows — the thin presentation layer over
@@ -429,17 +540,20 @@ mod tests {
     }
 
     /// The parity contract (#1674): the palette IS the `help_lines()` corpus.
-    /// Every slash line parses to at least one entry, and every parsed entry
-    /// round-trips — its description and command tokens all come verbatim from
-    /// a corpus line. No second command list anywhere.
+    /// Every slash line parses to at least one entry, and structural
+    /// invariants pin that parsing never INVENTS a command: a parsed cmd is
+    /// `/`-led literal words only — no `|` alternation, no placeholder
+    /// characters, no second `/`-command glued on. (Multi-word cmds like
+    /// `/models capabilities` are deliberate subcommand completions.)
     #[test]
-    fn corpus_parity_every_slash_line_parses_and_every_entry_round_trips() {
+    fn corpus_parity_every_slash_line_parses_and_no_command_is_invented() {
         let lines = crate::help_lines();
         let entries = corpus_entries();
         assert!(!entries.is_empty(), "the real corpus yields entries");
         // corpus_entries derives from help_lines — the single source of truth.
         assert_eq!(entries, parse_help_corpus(lines).as_slice());
-        // Every slash line parses.
+        // Every slash line parses (in isolation, so the /search dedupe can't
+        // mask a line that stopped parsing).
         for line in lines {
             if line.trim_start().starts_with('/') {
                 assert!(
@@ -448,15 +562,90 @@ mod tests {
                 );
             }
         }
-        // Every entry round-trips from some corpus line.
+        // The "nothing invents commands" pin: every completable cmd is made
+        // of plain `/`-led literal words, with args/alternation kept out.
         for e in entries {
+            let mut toks = e.cmd.split(' ');
+            let first = toks.next().unwrap_or("");
             assert!(
-                lines.iter().any(|l| {
-                    l.contains(&e.desc) && e.cmd.split(' ').all(|tok| l.contains(tok))
-                }),
-                "entry does not round-trip from the corpus: {e:?}"
+                first.starts_with('/') && first.len() > 1,
+                "cmd must start with a /command token: {e:?}"
+            );
+            for tok in e.cmd.split(' ').skip(1) {
+                assert!(
+                    tok.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric()),
+                    "subcommand tokens are plain words: {e:?}"
+                );
+            }
+            for banned in ['|', '<', '[', '"'] {
+                assert!(
+                    !e.cmd.contains(banned),
+                    "cmd contains usage notation ({banned:?}) — an invented, \
+                     non-dispatchable literal: {e:?}"
+                );
+            }
+            assert!(
+                !e.desc.is_empty(),
+                "every entry keeps its description: {e:?}"
             );
         }
+    }
+
+    /// Review finding 1 (#1674): bare `|` alternation in NON-first tokens is
+    /// usage notation for argument forms, never command text. Replays the
+    /// real corpus rows that carry it and pins their EXACT (cmd, args), plus
+    /// the bracketed-pipe rows that must NOT trigger the rule.
+    #[test]
+    fn corpus_replay_bare_pipe_alternation_stays_out_of_commands() {
+        let pin = |cmd: &str| {
+            corpus_entries()
+                .iter()
+                .find(|e| e.cmd == cmd)
+                .unwrap_or_else(|| panic!("no corpus entry for {cmd}"))
+                .args
+                .clone()
+        };
+        // "json|markdown" is two argument forms of plain /export — the old
+        // parse invented the non-dispatchable literal "/export json|markdown".
+        assert_eq!(pin("/export"), "json|markdown");
+        // The /compare row is three alternative argument forms of /compare.
+        assert_eq!(pin("/compare"), "semantic lexical | turn A B | index");
+        // Pipes INSIDE `[…]`/`<…>` are ordinary placeholders: subcommand cmds
+        // survive and the placeholder stays in args.
+        assert_eq!(
+            pin("/context compaction"),
+            "[headroom_aware|message_count|reset]"
+        );
+        assert_eq!(pin("/backend"), "<openai|ollama> [model]");
+        // The pipe-GROUP rule (first token) still expands alternatives.
+        assert_eq!(pin("/callers"), "<sym>");
+        assert_eq!(pin("/hierarchy"), "<sym>");
+        // Quoted placeholder ends the command.
+        assert_eq!(pin("/prompt set"), "\"<template>\"");
+        // Review finding 6: /help is a dispatchable, completable entry.
+        assert_eq!(pin("/help"), "[command]");
+    }
+
+    /// Review finding 8 (#1674): `help_lines()` carries `/search` twice (a
+    /// corpus wart kept verbatim for `/help`); the palette dedupes by command,
+    /// first occurrence winning.
+    #[test]
+    fn duplicate_corpus_commands_collapse_to_the_first_occurrence() {
+        let dupes = parse_help_corpus(&[
+            "  /search <query>          - semantic code search",
+            "  /search [query|preview]  - the same cockpit, second listing",
+        ]);
+        assert_eq!(dupes.len(), 1, "one row per command");
+        assert_eq!(dupes[0].args, "<query>", "first occurrence wins");
+        // And on the real corpus: exactly one /search entry, the first row's.
+        let searches: Vec<_> = corpus_entries()
+            .iter()
+            .filter(|e| e.cmd == "/search")
+            .collect();
+        assert_eq!(searches.len(), 1, "the duplicated corpus row is deduped");
+        assert_eq!(searches[0].args, "<query>");
     }
 
     #[test]
@@ -547,13 +736,128 @@ mod tests {
     fn viewport_rows_cap_at_max_visible_matches_and_budget() {
         let closed = PaletteState::new(fixture());
         assert_eq!(closed.viewport_rows(100), 0, "closed → no rows");
-        let s = open_palette(""); // 10 matches
+        let s = open_palette(""); // 11 matches
         assert_eq!(s.viewport_rows(100), MAX_VISIBLE, "capped at MAX_VISIBLE");
         assert_eq!(s.viewport_rows(3), 3, "capped by the terminal budget");
         let s = open_palette("compact"); // 1 match
         assert_eq!(s.viewport_rows(100), 1, "capped by the match count");
-        let s = open_palette("zzzz"); // 0 matches
+        let s = open_palette("zzzz"); // 0 matches → auto-closed
         assert_eq!(s.viewport_rows(100), 0, "nothing to show");
+    }
+
+    /// Review finding 2 (#1674): a zero-match filter CLOSES the palette —
+    /// never an invisible open state that keeps swallowing keys. Closed, ↑
+    /// passes through (history recall works right after typing an unknown
+    /// "/…zzz") and Esc passes through (vi reaches NORMAL).
+    #[test]
+    fn zero_matches_auto_close_so_keys_reach_history_and_the_editor() {
+        let mut s = open_palette("mo");
+        assert!(s.is_open());
+        s.on_buffer_change("/mo", "/mozzz");
+        assert!(!s.is_open(), "zero matches → closed, not invisibly open");
+        for code in [KeyCode::Up, KeyCode::Esc, KeyCode::Enter] {
+            assert_eq!(
+                palette_step(&mut s, &KeyEvent::new(code, KeyModifiers::NONE)),
+                PaletteStep::PassThrough,
+                "closed palette must not swallow {code:?}"
+            );
+        }
+    }
+
+    /// Review finding 4 (#1674): the event-loop interception contracts, unit-
+    /// tested through the pure `palette_step` seam the loop dispatches on.
+    #[test]
+    fn palette_step_owns_navigation_completion_and_esc_while_open() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        // Palette-before-history: while open, ↑/↓ (and C-p/C-n) are consumed
+        // and move the HIGHLIGHT — they can never reach history recall.
+        let mut s = open_palette("");
+        assert_eq!(
+            palette_step(&mut s, &key(KeyCode::Down)),
+            PaletteStep::Swallowed
+        );
+        assert_eq!(s.highlight, 1);
+        assert_eq!(palette_step(&mut s, &ctrl('n')), PaletteStep::Swallowed);
+        assert_eq!(s.highlight, 2);
+        assert_eq!(
+            palette_step(&mut s, &key(KeyCode::Up)),
+            PaletteStep::Swallowed
+        );
+        assert_eq!(palette_step(&mut s, &ctrl('p')), PaletteStep::Swallowed);
+        assert_eq!(s.highlight, 0);
+
+        // Enter COMPLETES the highlighted command — never a submit
+        // (CompleteTo, not PassThrough) — and the palette closes.
+        let mut s = open_palette("model");
+        assert_eq!(
+            palette_step(&mut s, &key(KeyCode::Enter)),
+            PaletteStep::CompleteTo("/models".to_string())
+        );
+        assert!(!s.is_open());
+
+        // Shift-Enter stays the editor's newline (the buffer sync then
+        // closes on the multi-line buffer).
+        let mut s = open_palette("model");
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(palette_step(&mut s, &shift_enter), PaletteStep::PassThrough);
+
+        // Tab completes too, and is swallowed rather than typing a literal
+        // tab into the slash line.
+        let mut s = open_palette("model");
+        assert_eq!(
+            palette_step(&mut s, &key(KeyCode::Tab)),
+            PaletteStep::CompleteTo("/models".to_string())
+        );
+
+        // Esc is swallowed (closes the palette; the editor never sees it, so
+        // vi stays in INSERT with the typed text intact)…
+        let mut s = open_palette("mo");
+        assert_eq!(
+            palette_step(&mut s, &key(KeyCode::Esc)),
+            PaletteStep::Swallowed
+        );
+        assert!(!s.is_open());
+
+        // …and ordinary typing passes through to the editor (the buffer sync
+        // does the filtering).
+        let mut s = open_palette("mo");
+        assert_eq!(
+            palette_step(&mut s, &key(KeyCode::Char('d'))),
+            PaletteStep::PassThrough
+        );
+
+        // Closed: EVERY interception key passes through untouched.
+        let mut s = PaletteState::new(fixture());
+        for k in [
+            key(KeyCode::Up),
+            key(KeyCode::Down),
+            key(KeyCode::Tab),
+            key(KeyCode::Enter),
+            key(KeyCode::Esc),
+            ctrl('p'),
+            ctrl('n'),
+        ] {
+            assert_eq!(palette_step(&mut s, &k), PaletteStep::PassThrough);
+        }
+    }
+
+    /// Recalled history lines and multi-character type-ahead prefills are not
+    /// "typing `/` at an empty prompt": only a lone `/` opens. (Review
+    /// finding 5: the same sync now runs over the type-ahead prefill, so a
+    /// prefilled lone `/` opens exactly like a live keypress.)
+    #[test]
+    fn recalled_or_prefilled_full_lines_never_open_but_a_lone_slash_does() {
+        let mut s = PaletteState::new(fixture());
+        s.on_buffer_change("", "/version");
+        assert!(
+            !s.is_open(),
+            "a recalled/prefilled command line stays closed"
+        );
+        s.on_buffer_change("/version", "");
+        s.on_buffer_change("", "/");
+        assert!(s.is_open(), "a prefilled lone `/` opens like a keypress");
     }
 
     #[test]
@@ -640,16 +944,28 @@ mod tests {
     }
 
     /// #1674 gating: the palette's ONLY construction site is the rich
-    /// surface's event loop, which chat.rs selects solely when the `rich-tui`
-    /// feature is compiled (this module doesn't exist otherwise), the footer
-    /// resolves rich, AND stdout is a real TTY. These predicate cases are the
-    /// piped / headless / `--plain` paths — all false, so lean surfaces can
-    /// never reach palette code: zero behavior change off the rich TTY path.
+    /// surface's event loop, selected by `rich_surface_selected` in chat.rs —
+    /// compiled only under `rich-tui` (this module doesn't exist otherwise).
+    /// Review finding 7: `footer_rich_enabled` ALONE does not protect a piped
+    /// run — `FooterMode::On` forces the rich PROMPT STRING even off a TTY
+    /// (it lands in logfiles by design). What protects piped/headless is the
+    /// TTY conjunction in [`crate::prompt::rich_surface_selected`], pinned
+    /// here across the whole mode × TTY matrix.
     #[test]
-    fn gating_predicate_refuses_piped_headless_and_plain() {
+    fn gating_is_the_tty_conjunction_not_the_footer_predicate_alone() {
+        use crate::prompt::{footer_rich_enabled, rich_surface_selected};
         use newt_core::FooterMode;
-        assert!(!crate::prompt::footer_rich_enabled(FooterMode::Auto, false));
-        assert!(!crate::prompt::footer_rich_enabled(FooterMode::Off, true));
-        assert!(!crate::prompt::footer_rich_enabled(FooterMode::Off, false));
+        // The footer predicate alone would let a forced-on footer through a
+        // pipe — a rich prompt STRING is fine in a logfile…
+        assert!(footer_rich_enabled(FooterMode::On, false));
+        // …but the rich SURFACE (and with it the palette) is refused off a
+        // TTY in every mode:
+        assert!(!rich_surface_selected(FooterMode::On, false));
+        assert!(!rich_surface_selected(FooterMode::Auto, false));
+        assert!(!rich_surface_selected(FooterMode::Off, false));
+        // On a TTY, the footer mode decides (Off = --plain stays lean):
+        assert!(rich_surface_selected(FooterMode::On, true));
+        assert!(rich_surface_selected(FooterMode::Auto, true));
+        assert!(!rich_surface_selected(FooterMode::Off, true));
     }
 }

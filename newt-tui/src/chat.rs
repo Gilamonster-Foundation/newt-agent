@@ -1200,7 +1200,10 @@ pub(crate) fn run_chat(
     let mut surface: Box<dyn InputSurface> = {
         #[cfg(feature = "rich-tui")]
         {
-            if footer_on && io::stdout().is_terminal() {
+            // The rich-surface gate (`rich_surface_selected`): footer resolves
+            // rich AND stdout is a TTY. Kept as a named pure predicate so the
+            // #1674 palette's gating test pins exactly this composition.
+            if rich_surface_selected(footer_mode(), io::stdout().is_terminal()) {
                 surface_is_rich = true;
                 Box::new(rich_input::RichSurface::new(history_path)?)
             } else {
