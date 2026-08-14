@@ -846,10 +846,12 @@ pub(crate) fn run_chat(
 ) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
-    // Report lifecycle state to Herdr when running inside a Herdr pane
-    // (no-op everywhere else). The guard releases lifecycle authority on
-    // every orderly exit path of this function, early `?` returns included.
-    let _herdr_lifecycle = crate::lifecycle::session_guard();
+    // Integration listener for the lifecycle events emitted below: when this
+    // process runs inside a Herdr pane it reports state to the cockpit, and
+    // outside one it subscribes to nothing at all. The guard releases
+    // lifecycle authority on every orderly exit path of this function, early
+    // `?` returns included.
+    let _herdr = crate::herdr::session_guard(workspace);
 
     // Header line — one-time print, then normal scroll from here.
     if color {
@@ -1598,6 +1600,9 @@ pub(crate) fn run_chat(
         ),
     };
     tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
+    newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::SessionStarted {
+        session_id: ctx.session_id.clone(),
+    });
 
     // Build system prompt now that SoulProvider has loaded its soul file.
     system = rebuild_system_prompt(
@@ -1994,7 +1999,8 @@ pub(crate) fn run_chat(
                             parent: pending.parent.clone(),
                         }
                     });
-            crate::lifecycle::set_idle();
+            // The human has the floor: not "blocked", just waiting.
+            newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::Waiting);
             (surface.read_line(&prompt)?, origin)
         };
         match outcome {
@@ -2005,7 +2011,7 @@ pub(crate) fn run_chat(
                 if task.is_empty() {
                     continue;
                 }
-                crate::lifecycle::set_working();
+                newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
                 model_input_origin = upgrade_origin_for_interrupted_objective(
                     model_input_origin,
                     &task,
@@ -5049,6 +5055,7 @@ pub(crate) fn run_chat(
                     }
 
                     print_thinking(color);
+                    newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::Thinking);
                     let t0 = std::time::Instant::now();
 
                     // The active route may have changed since the previous turn
@@ -6103,6 +6110,9 @@ pub(crate) fn run_chat(
                         clean_exit = true;
                         break;
                     } else if turn_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        newt_core::lifecycle::emit(
+                            newt_core::lifecycle::LifecycleEvent::TurnCancelled,
+                        );
                         let note = if turn_hard.load(std::sync::atomic::Ordering::Relaxed) {
                             "⊘ stopped — back to you"
                         } else {
@@ -6111,6 +6121,11 @@ pub(crate) fn run_chat(
                         print_newt(note, color, verbose);
                         println!();
                     } else {
+                        newt_core::lifecycle::emit(if response.is_ok() {
+                            newt_core::lifecycle::LifecycleEvent::TurnCompleted
+                        } else {
+                            newt_core::lifecycle::LifecycleEvent::TurnFailed { reason: None }
+                        });
                         match response {
                             Ok((reply, was_streamed, usage, hallucinations)) => {
                                 if !was_streamed {
