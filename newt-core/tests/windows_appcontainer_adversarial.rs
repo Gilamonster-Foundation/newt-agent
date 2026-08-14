@@ -217,6 +217,36 @@ fn stage_netprobe() -> Option<(tempfile::TempDir, PathBuf)> {
     Some((dir, dest))
 }
 
+/// How long a MUST-ARRIVE signal (a positive control's connection, payload, or
+/// relay) may take end to end on a loaded CI runner. Success returns early, so
+/// a generous budget costs wall clock only when the test is already failing;
+/// a tight one turns runner load into flakes. Keep negative "must NOT arrive"
+/// windows short and separate — widening those only slows every denial test.
+const ARRIVAL_WAIT: Duration = Duration::from_secs(30);
+
+/// The loopback listeners' accept window. This clock starts at listener
+/// creation — BEFORE the AppContainer child is even launched — so it must
+/// comfortably cover a cold `powershell.exe` start inside a fresh AppContainer
+/// on a loaded hosted runner. With the old 3s deadline the accept thread could
+/// exit (dropping its channel sender) while `launch()` was still blocked on
+/// the child, so the deputy's later relay hit a dead port and `relay_rx` saw
+/// `Disconnected` — the `appcontainer_named_pipe_deputy` flake: same SHA red
+/// on one run, green on its twin. Kept above [`ARRIVAL_WAIT`] so the listener
+/// covers the launch delay plus the first receiver's wait; on the success path
+/// the relay lands before `launch()` even returns, so the window only shapes
+/// how a failure reports (`Disconnected` vs `Timeout`), never what passes.
+const ACCEPT_WINDOW: Duration = Duration::from_secs(60);
+
+/// The child-execution budget for MUST-SUCCEED control runs (`constrained_run`
+/// / `constrained_cmd` calls whose output is then asserted on). The deadline
+/// starts after spawn and absorbs launcher init + AppContainer profile
+/// bring-up + a cold child start; at expiry the child tree is killed and the
+/// run reports empty stdout, so a tight budget turns runner load straight into
+/// a red assert — the same flake class as [`ACCEPT_WINDOW`]. Success returns
+/// early; only already-failing runs pay the wider ceiling. Deliberately NOT
+/// used for the intentional-timeout run (500ms), which exists to expire.
+const CONTROL_BUDGET: Duration = Duration::from_secs(30);
+
 fn tcp_listener() -> (u16, mpsc::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     listener
@@ -225,7 +255,7 @@ fn tcp_listener() -> (u16, mpsc::Receiver<Vec<u8>>) {
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + ACCEPT_WINDOW;
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -693,7 +723,7 @@ fn appcontainer_child_does_not_inherit_provider_credentials() {
             "/c".to_string(),
             "echo %OPENAI_API_KEY% & echo %OPENAI_BASE_URL%".to_string(),
         ],
-        Duration::from_secs(5),
+        CONTROL_BUDGET,
         vec![
             ("OPENAI_API_KEY", "explicit-grant".to_string()),
             ("OPENAI_BASE_URL", "https://explicit.invalid".to_string()),
@@ -715,11 +745,18 @@ fn appcontainer_child_does_not_inherit_provider_credentials() {
             "/c".to_string(),
             "echo %OPENAI_API_KEY% & echo %OPENAI_BASE_URL%".to_string(),
         ],
-        Duration::from_secs(5),
+        CONTROL_BUDGET,
         Vec::new(),
     )
     .expect("env denial run");
     assert_appcontainer(&denied);
+    // The denial is only proven by a run that actually completed: a child
+    // killed at the budget would report empty stdout and vacuously satisfy the
+    // no-leak assert below, proving nothing.
+    assert!(
+        denied.success,
+        "env denial control must complete before its output can prove anything: {denied:?}"
+    );
     let stdout = String::from_utf8_lossy(&denied.stdout);
     assert!(
         !stdout.contains("sk-newt-windows-secret") && !stdout.contains("secret.invalid"),
@@ -745,7 +782,7 @@ fn appcontainer_denies_direct_tcp() {
         "host netprobe control must connect"
     );
     assert!(
-        host_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        host_rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
         "host control listener must observe the connection"
     );
 
@@ -886,7 +923,7 @@ fn appcontainer_loopback_behavior() {
         String::from_utf8_lossy(&allowed.stderr)
     );
     assert!(
-        allow_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        allow_rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
         "parent listener must observe loopback-exemption connection"
     );
 }
@@ -959,14 +996,14 @@ fn appcontainer_named_pipe_deputy() {
         String::from_utf8_lossy(&out.stderr)
     );
     let pipe_payload = pipe_rx
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(ARRIVAL_WAIT)
         .expect("named pipe deputy should receive payload");
     assert!(
         pipe_payload.contains(PIPE_MARKER),
         "named pipe deputy payload mismatch: {pipe_payload:?}"
     );
     assert!(
-        relay_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+        relay_rx.recv_timeout(ARRIVAL_WAIT).is_ok(),
         "AppContainer child caused a host named-pipe deputy to relay over loopback"
     );
 }
@@ -1081,7 +1118,7 @@ fn appcontainer_inheritable_handle_inheritance() {
         workspace.path(),
         "cmd.exe",
         vec!["/c".to_string(), "echo HANDLE-PROBE-RAN".to_string()],
-        Duration::from_secs(5),
+        CONTROL_BUDGET,
         Vec::new(),
     )
     .expect("handle control run");
@@ -1109,7 +1146,7 @@ fn appcontainer_inheritable_handle_inheritance() {
             "-Command".to_string(),
             script,
         ],
-        Duration::from_secs(5),
+        CONTROL_BUDGET,
         Vec::new(),
     )
     .expect("handle inheritance probe");
@@ -1308,7 +1345,7 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
             "/c".to_string(),
             "echo QUICK-RAN".to_string(),
         ],
-        Duration::from_secs(5),
+        CONTROL_BUDGET,
         Vec::new(),
     )
     .expect("quick timeout control");
@@ -1337,8 +1374,13 @@ fn appcontainer_timeout_cleanup_is_distinct_from_authority() {
         slow.timed_out,
         "slow child must be reported timed out: {slow:?}"
     );
+    // The child's spin loop runs on the order of minutes, so any cap well under
+    // that still proves the host tore it down at the 500ms budget rather than
+    // blocking behind the full child wait. 15s (not 4s) leaves room for
+    // AppContainer spawn + teardown overhead on a loaded runner — this is a
+    // promptness proof, not a latency benchmark.
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(15),
         "timeout cleanup must not block behind the Windows child wait"
     );
     assert!(
