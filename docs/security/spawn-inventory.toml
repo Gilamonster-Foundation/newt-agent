@@ -67,3 +67,4 @@
 "newt-cli/src/web_cmd.rs"                  = { count = 1, class = "trusted-infra", note = "operator web command" }
 "newt-core/src/tty/pty_notice_test.rs"     = { count = 1, class = "test", note = "PTY test harness" }
 "newt-tui/src/prompt_visibility_test.rs"   = { count = 2, class = "test", note = "real-PTY prompt-visibility test" }
+"newt-tui/src/transcript_pager_pty_test.rs" = { count = 1, class = "test", note = "real-PTY transcript-pager lifecycle test (#1677): re-executes THIS test binary (std::env::current_exe) with a --exact filter so the child runs one ignored #[test] against a pty. Fixed argv, no shell, no attacker-controlled input; the child is the same binary cargo just built, so it cannot be a stale or foreign executable." }

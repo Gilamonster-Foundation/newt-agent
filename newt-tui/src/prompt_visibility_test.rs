@@ -17,7 +17,9 @@ const CHILD_TEST: &str = "prompt_visibility_test::prompt_scenario_child";
 
 const HUMAN_THINKING_TIME: Duration = Duration::from_millis(600);
 
-fn wait_for_child(
+// `pub(crate)`: shared with `transcript_pager_pty_test` (#1677) — the reuse
+// discipline says one child-reaper for the real-PTY tier, not a copy per test.
+pub(crate) fn wait_for_child(
     child: &mut std::process::Child,
     timeout: Duration,
 ) -> Option<std::process::ExitStatus> {

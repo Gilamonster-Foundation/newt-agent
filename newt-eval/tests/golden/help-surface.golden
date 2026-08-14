@@ -24,6 +24,7 @@
   /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)
   /start [title]           - begin a new conversation, leaving the current one open to /resume
   /rename <title>          - retitle the current conversation so it is easy to find in /resume
+  /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)
   /conversation list       - list saved conversations
   /conversation show <id>  - show a saved conversation
   /conversation restore <id> - restore a saved conversation

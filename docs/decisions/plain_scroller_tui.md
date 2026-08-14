@@ -63,6 +63,26 @@ across the whole chat path:
   **preserved, not bent**: the only path that gains richness is the one that was already
   opt-in and severable.
 
+- **Explicitly-invoked modal surfaces are permitted on RichTUI — including the
+  alternate screen** (clarified 2026-08-14, #1677). Rule 2 lists "alternate screen"
+  among the things the LEAN path never gets; the #416 carve-out below is careful to be
+  *inline, not alt-screen* because it is **always-on** while you type. A surface the
+  operator **asks for by name**, which owns the terminal only until they leave it, is a
+  different thing, and it is allowed here. The conditions are what make it honest:
+  - **Operator-invoked and modal.** It opens on an explicit command (`/transcript`), not
+    ambiently, and never during a turn.
+  - **It restores the terminal on every exit path**, panic included — an RAII guard, not
+    happy-path control flow. Leaking the alternate screen strands the whole session
+    invisible, which is worse than any bug inside the surface.
+  - **Compile-gated to `rich-tui`, not merely runtime-checked.** The lean binary must not
+    contain the surface at all (`ratatui`/`crossterm` being non-optional dependencies is
+    not a licence to compile it in).
+  - **It reads durable state; it never redefines it.** The conversation record stays the
+    single source of truth, terminal frame state is never authoritative, and closing the
+    surface loses nothing but a view. Scrollback keeps the canonical printed lines.
+  The LEAN answer to the same command must remain expressible as scrolled lines
+  (`/transcript` prints the spine), or the revisit rule applies instead.
+
 **What is unchanged.** The four standing carve-outs below and the revisit trigger still
 govern the LEAN surface. Canonical *output* stays GFM-Markdown printed lines on every
 surface (a RichTUI pane is a projection of that same source, never a second conversation
@@ -137,11 +157,16 @@ The practical wins compound with the architectural one:
 
 1. **The chat path stays a plain scroller.** Line-oriented input
    (rustyline), line-oriented output, terminal-owned scrollback. Like bash.
-2. **No advanced TUI in newt.** The following do not get added to the chat
-   path: alternate screen, raw-mode UI loops, scroll regions, panes/splits,
+2. **No advanced TUI on the LEAN chat path.** The following do not get added
+   to it: alternate screen, raw-mode UI loops, scroll regions, panes/splits,
    persistent status bars, full-screen widget frameworks (ratatui, cursive,
    …), mouse handling, or live-updating dashboards. Multi-line redraws are
    limited to the standing carve-outs below.
+   *(Scope: as written in 2026-03 this rule said "in newt" and governed the
+   whole chat path. The 2026-08-11 amendment below moved the line between the
+   LEAN and RICH surfaces; the wording here now matches that scope so the two
+   sections cannot be read against each other. Nothing about the LEAN surface
+   is relaxed — it is exactly as constrained as it was.)*
 3. **Feature pressure gets redirected, not absorbed.** Wants for richer UI
    belong in **gilamonster-agent** (the feature-rich agent matrix that
    inherits newt's published crates) or the **monitor-agent** repos. If a
