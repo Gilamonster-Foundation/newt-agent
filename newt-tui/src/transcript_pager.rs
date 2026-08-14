@@ -42,11 +42,17 @@ pub(crate) enum RowKind {
 }
 
 /// One flattened, styled-by-kind pager row. Long lines are CLIPPED by the
-/// renderer, not wrapped: the pager is a navigation surface and exact
-/// row-per-line math keeps scrolling and jumps testable; the full text always
-/// remains in normal scrollback (searchable, copy-pasteable — the charter's
-/// scrollback guarantees are about the primary surface, which this never
-/// replaces).
+/// renderer, not wrapped: the pager is a navigation surface, and exact
+/// row-per-line math is what keeps scrolling and jump targets testable.
+///
+/// Where the full text lives, stated accurately (#1677 review): for turns THIS
+/// terminal printed, it is in normal scrollback. For a **resumed** conversation
+/// it is not — those turns were never printed here — so the fallback for full
+/// text is `/conversation show <id>`, or `/transcript` on the LEAN surface,
+/// which prints the spine unclipped. The pager offers no wrap toggle and no
+/// horizontal scroll; a wrap mode is follow-up work on #1672. Saying
+/// "scrollback always has it" would be false for exactly the case this command
+/// exists to serve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PagerRow {
     pub kind: RowKind,
@@ -334,11 +340,23 @@ mod terminal {
     impl AltScreenGuard {
         pub(crate) fn enter() -> io::Result<Self> {
             enable_raw_mode()?;
-            if let Err(e) = crossterm::execute!(io::stdout(), EnterAlternateScreen) {
-                let _ = disable_raw_mode();
-                return Err(e);
-            }
-            Ok(Self)
+            // Bind the guard BEFORE the fallible `execute!`, so Drop owns the
+            // restore from this point on — the same shape `SplashScreenGuard`
+            // uses (lib.rs), whose doc records that the hand-rolled rollback
+            // this replaces "was itself one of the three leaks" (#1411).
+            //
+            // The asymmetry mattered: `execute!` queues into `io::stdout()`'s
+            // LineWriter and then flushes, and a FAILED flush RETAINS the
+            // unwritten `?1049h` in that process-global buffer. The old
+            // rollback could give raw mode back but could never emit
+            // `?1049l` — so the next print (the caller's own "transcript
+            // pager error: …" line) flushed the retained bytes and put the
+            // session on the alternate screen with no owner alive to leave
+            // it, for the rest of its life. Reviewer-reproduced against real
+            // crossterm on a would-block fd (#1677 review).
+            let guard = Self;
+            crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+            Ok(guard)
         }
     }
 
