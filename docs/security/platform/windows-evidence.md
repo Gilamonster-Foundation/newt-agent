@@ -60,6 +60,15 @@ kernel denial. Each hostile fixture therefore proves the attempt happened
   ran really is `ab-netprobe` rather than a stale or silent executable.
 - Must-succeed control runs assert `success` plus their expected stdout, so a
   child killed at its budget cannot stand in for a denial.
+- The inheritable-HANDLE fixture *classifies* a residual rather than asserting a
+  denial, so its guard gates the classification instead: without the marker it
+  reports `PROBE_DID_NOT_RUN` and draws no conclusion. This immediately caught a
+  live gap — on GitHub-hosted `windows-latest` the PowerShell child of the
+  `ConstrainedExecutor` route exits 1 with empty stdout and stderr (the
+  `cmd.exe` control in the same fixture runs fine), so every CI run before this
+  guard recorded `CLOSED_ON_THIS_RUNNER` without evidence. The platform row
+  stays ACTIVE regardless. Set `BRIDLE_REQUIRE_HANDLE_PROBE=1` on a host where
+  the probe is expected to work to make the gap fatal.
 - The launcher/probe requirements above (`BRIDLE_REQUIRE_*`) turn a missing
   artifact into a hard failure rather than a skip.
 
