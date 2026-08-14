@@ -294,85 +294,7 @@ pub(crate) fn dispatch(
                     verbose,
                 );
             } else {
-                // Model override on the ACTIVE backend — whatever it is. A pinned
-                // [[backends]] entry, an OpenAI backend, and the historical DGX
-                // path all read NEWT_DGX_MODEL in `resolve_backend_choice`, so
-                // this one axis switches the model everywhere, and it does not
-                // edit config. Mirrors how `/backend ollama <model>` works.
-                //
-                // The old `newt dgx use <model>` persist was the bug the user hit:
-                // it wrote the DGX `active_model`, but a pinned named backend
-                // resolves its OWN static `model`, so the saved value was never
-                // consulted and the switch silently did nothing.
-                // #1122: validate the model is actually SERVED by the active
-                // backend BEFORE applying or persisting. A typo would otherwise
-                // be written to ~/.newt/settings.toml, which silently overrides
-                // config.toml and 404s every future launch. Best-effort: an
-                // unreachable backend (can't list models) is not blocked.
-                let gate_cfg = newt_core::Config::resolve().unwrap_or_default();
-                let gate_choice = resolve_backend_choice(&gate_cfg);
-                let served: Option<Vec<String>> = fetch_models_for(
-                    &gate_choice.url,
-                    gate_choice.kind,
-                    gate_choice.api_key.as_deref(),
-                )
-                .ok();
-                if !model_choice_ok(arg1, served.as_deref()) {
-                    let served = served.unwrap_or_default();
-                    match suggest_model(arg1, &served) {
-                        Some(s) => print_newt(
-                            &format!(
-                                "no model `{arg1}` on {} — did you mean `{s}`? (not applied)",
-                                gate_choice.url
-                            ),
-                            color,
-                            verbose,
-                        ),
-                        None => print_newt(
-                            &format!(
-                                "no model `{arg1}` on {} — run /models to list (not applied)",
-                                gate_choice.url
-                            ),
-                            color,
-                            verbose,
-                        ),
-                    }
-                    return Ok(true);
-                }
-                // SAFETY: single-threaded REPL; the post-command re-resolve reads it.
-                unsafe { std::env::set_var("NEWT_DGX_MODEL", arg1) };
-                // Persist the choice so it sticks across runs (#545): records
-                // `model` in ~/.newt/settings.toml (provider left as-is), to be
-                // restored next start at the lowest precedence (an explicit
-                // NEWT_DGX_MODEL or a --loadout model still wins). Skipped in an
-                // ephemeral session, which must leave no trace; the live switch
-                // above still applies. Best-effort — a write never blocks it.
-                if newt_core::settings::should_persist(is_ephemeral_session()) {
-                    newt_core::settings::record_model(arg1);
-                }
-                let cfg = newt_core::Config::resolve().unwrap_or_default();
-                let choice = resolve_backend_choice(&cfg);
-                // Warm-up only applies to Ollama: vLLM and OpenAI-compatible
-                // endpoints keep their served model resident at all times.
-                if choice.kind == newt_core::BackendKind::Ollama {
-                    warmup_if_cold(
-                        &choice.url,
-                        &choice.model,
-                        &keep_alive_str(&cfg),
-                        choice.api_key.as_deref(),
-                        color,
-                        verbose,
-                    );
-                } else {
-                    print_newt(
-                        &format!(
-                            "Switched to {} — takes effect on next message.",
-                            choice.model
-                        ),
-                        color,
-                        verbose,
-                    );
-                }
+                apply_model_choice(arg1, color, verbose);
             }
         }
 
@@ -542,6 +464,84 @@ pub(crate) fn dispatch(
 /// list means the backend couldn't be listed (unreachable) — allowed
 /// best-effort, since we can't validate an offline endpoint. A `Some` list must
 /// contain the exact name.
+/// Switch the ACTIVE backend's model to `name` — the single application path
+/// shared by `/model <name>` and the psyche panel's model spinner (#1666), so
+/// there is exactly one set of gates:
+///
+/// - Model override on the ACTIVE backend — whatever it is. A pinned
+///   [[backends]] entry, an OpenAI backend, and the historical DGX path all
+///   read NEWT_DGX_MODEL in `resolve_backend_choice`, so this one axis
+///   switches the model everywhere, and it does not edit config. (The old
+///   `newt dgx use <model>` persist wrote a value a pinned named backend never
+///   consulted — the switch silently did nothing.)
+/// - #1122: validate the model is actually SERVED by the active backend
+///   BEFORE applying or persisting. A typo would otherwise be written to
+///   ~/.newt/settings.toml, which silently overrides config.toml and 404s
+///   every future launch. Best-effort: an unreachable backend (can't list
+///   models) is not blocked.
+/// - #545: persist via `settings::record_model` so the choice sticks across
+///   runs — skipped in an ephemeral session, which must leave no trace.
+/// - Warm-up only applies to Ollama: vLLM and OpenAI-compatible endpoints
+///   keep their served model resident at all times.
+pub(crate) fn apply_model_choice(name: &str, color: bool, verbose: bool) {
+    let gate_cfg = newt_core::Config::resolve().unwrap_or_default();
+    let gate_choice = resolve_backend_choice(&gate_cfg);
+    let served: Option<Vec<String>> = fetch_models_for(
+        &gate_choice.url,
+        gate_choice.kind,
+        gate_choice.api_key.as_deref(),
+    )
+    .ok();
+    if !model_choice_ok(name, served.as_deref()) {
+        let served = served.unwrap_or_default();
+        match suggest_model(name, &served) {
+            Some(s) => print_newt(
+                &format!(
+                    "no model `{name}` on {} — did you mean `{s}`? (not applied)",
+                    gate_choice.url
+                ),
+                color,
+                verbose,
+            ),
+            None => print_newt(
+                &format!(
+                    "no model `{name}` on {} — run /models to list (not applied)",
+                    gate_choice.url
+                ),
+                color,
+                verbose,
+            ),
+        }
+        return;
+    }
+    // SAFETY: single-threaded REPL; the post-command re-resolve reads it.
+    unsafe { std::env::set_var("NEWT_DGX_MODEL", name) };
+    if newt_core::settings::should_persist(is_ephemeral_session()) {
+        newt_core::settings::record_model(name);
+    }
+    let cfg = newt_core::Config::resolve().unwrap_or_default();
+    let choice = resolve_backend_choice(&cfg);
+    if choice.kind == newt_core::BackendKind::Ollama {
+        warmup_if_cold(
+            &choice.url,
+            &choice.model,
+            &keep_alive_str(&cfg),
+            choice.api_key.as_deref(),
+            color,
+            verbose,
+        );
+    } else {
+        print_newt(
+            &format!(
+                "Switched to {} — takes effect on next message.",
+                choice.model
+            ),
+            color,
+            verbose,
+        );
+    }
+}
+
 fn model_choice_ok(name: &str, served: Option<&[String]>) -> bool {
     served.is_none_or(|models| models.iter().any(|m| m == name))
 }

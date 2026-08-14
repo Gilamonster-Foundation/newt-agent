@@ -3935,11 +3935,44 @@ pub(crate) fn run_chat(
                                         config_panel::SaveResult::Failed(e)
                                     }
                                 };
+                            // #1666: the model spinner's option list — fetched
+                            // HERE (the panel stays network-free) via the same
+                            // seam /models uses, tagged with cached conformance
+                            // symbols. An unreachable backend → None → the row
+                            // renders but won't dial.
+                            let panel_choice = resolve_backend_choice(&cfg);
+                            let served_models = fetch_models_for(
+                                &panel_choice.url,
+                                panel_choice.kind,
+                                panel_choice.api_key.as_deref(),
+                            )
+                            .ok()
+                            .map(|names| {
+                                let cache = probe::load_cache();
+                                names
+                                    .into_iter()
+                                    .map(|name| {
+                                        let tag = cache
+                                            .get(&probe::cap_key(
+                                                newt_core::Serving::Multiplexer,
+                                                "",
+                                                &name,
+                                            ))
+                                            .map(|e| e.conformance.symbol().to_string())
+                                            .unwrap_or_default();
+                                        config_panel::ModelChoice { name, tag }
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
                             let outcome = run_psyche_panel(
-                                personas,
-                                current_persona,
-                                backend,
-                                base_tenacity,
+                                config_panel::PanelSeed {
+                                    personas,
+                                    current_persona,
+                                    backend,
+                                    base_tenacity,
+                                    models: served_models,
+                                    current_model: panel_choice.model.clone(),
+                                },
                                 persist,
                                 color,
                                 verbose,
@@ -3947,15 +3980,21 @@ pub(crate) fn run_chat(
                             // Commit (review-3 §1/§2): the file (if any) was persisted
                             // inside the panel; dials were applied inside run() on an
                             // explicit apply. Here we report the save, apply the persona
-                            // action, reroute the backend, then report the committed
-                            // posture from FRESH runtime state (never the working copy).
-                            let (persona_action, saved_name, applied) = match outcome {
-                                PanelOutcome::Cancelled => (None, None, false),
-                                PanelOutcome::Saved { name } => (None, Some(name), false),
-                                PanelOutcome::Applied { persona } => (Some(persona), None, true),
-                                PanelOutcome::SavedAndApplied { name, persona } => {
-                                    (Some(persona), Some(name), true)
+                            // action, reroute the backend, route the model pick through
+                            // the /model path, then report the committed posture from
+                            // FRESH runtime state (never the working copy).
+                            let (persona_action, saved_name, chosen_model, applied) = match outcome
+                            {
+                                PanelOutcome::Cancelled => (None, None, None, false),
+                                PanelOutcome::Saved { name } => (None, Some(name), None, false),
+                                PanelOutcome::Applied { persona, model } => {
+                                    (Some(persona), None, model, true)
                                 }
+                                PanelOutcome::SavedAndApplied {
+                                    name,
+                                    persona,
+                                    model,
+                                } => (Some(persona), Some(name), model, true),
                             };
                             if let Some(name) = &saved_name {
                                 print_newt(&format!("saved persona '{name}'"), color, verbose);
@@ -4006,6 +4045,38 @@ pub(crate) fn run_chat(
                                             verbose,
                                         );
                                     }
+                                }
+                                // #1666: the model pick goes through the /model
+                                // path — same #1122 served-validation gate, same
+                                // #545 persistence rules, same Ollama warmup.
+                                // AFTER the persona reroute deliberately: a visit
+                                // that switched persona (new backend) AND picked
+                                // a model validates the pick against the NEW
+                                // backend — served → applies; not served → the
+                                // gate refuses with its usual message.
+                                if let Some(model) = &chosen_model {
+                                    commands::model::apply_model_choice(model, color, verbose);
+                                    // The panel path `continue`s BEFORE the loop's
+                                    // post-command refresh, so do here what the
+                                    // /model slash path gets there: repoint the
+                                    // session at the (possibly) new model and
+                                    // capture the operator baseline (review P1#2)
+                                    // a later `/persona clear` reverts to. The
+                                    // URL cannot change on a model pick, so the
+                                    // DGX re-probe is deliberately skipped.
+                                    cfg = newt_core::Config::resolve().unwrap_or_default();
+                                    let _ = refresh_backend(
+                                        &cfg,
+                                        &mut choice,
+                                        &mut inf_url,
+                                        &mut inf_model,
+                                        &mut inf_kind,
+                                        &mut inf_key,
+                                        &mut inf_context_window,
+                                        color,
+                                        verbose,
+                                    );
+                                    base_model = std::env::var("NEWT_DGX_MODEL").ok();
                                 }
                                 // Recompute + report from FRESH runtime state (§2).
                                 // #1139: one resolved snapshot is the single source
