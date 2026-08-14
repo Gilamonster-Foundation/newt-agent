@@ -1779,25 +1779,33 @@ pub(crate) fn run_chat(
     // the session actually holds. A claim-refused resume dropped us onto a
     // fresh conversation instead: applying the held one's pin there would put
     // a conversation the operator never pinned on someone else's posture.
-    if resumed_at_start && !claim_refused {
-        let url_changed = restore_preference_pin(ConversationPreferenceSwitch {
-            store: conversation_store.as_ref(),
-            conversation_id: &active_conversation_id,
-            baseline: &preference_baseline,
-            persona: active_persona.as_ref(),
-            pending: &mut pending_preference_actions,
-            base_provider: &mut base_provider,
-            base_model: &mut base_model,
-            cfg: &cfg,
-            choice: &mut choice,
-            inf_url: &mut inf_url,
-            inf_model: &mut inf_model,
-            inf_kind: &mut inf_kind,
-            inf_key: &mut inf_key,
-            inf_context_window: &mut inf_context_window,
-            color,
-            verbose,
-        });
+    let startup_conversation = match (resumed_at_start, claim_refused) {
+        (false, _) => StartupConversation::Fresh,
+        (true, false) => StartupConversation::ResumedHeld,
+        (true, true) => StartupConversation::ResumedRefused,
+    };
+    {
+        let url_changed = apply_startup_preference_pin(
+            startup_conversation,
+            ConversationPreferenceSwitch {
+                store: conversation_store.as_ref(),
+                conversation_id: &active_conversation_id,
+                baseline: &preference_baseline,
+                persona: active_persona.as_ref(),
+                pending: &mut pending_preference_actions,
+                base_provider: &mut base_provider,
+                base_model: &mut base_model,
+                cfg: &cfg,
+                choice: &mut choice,
+                inf_url: &mut inf_url,
+                inf_model: &mut inf_model,
+                inf_kind: &mut inf_kind,
+                inf_key: &mut inf_key,
+                inf_context_window: &mut inf_context_window,
+                color,
+                verbose,
+            },
+        );
         // Same re-probe discipline as every other backend switch (review
         // finding 5): a pin that repointed the endpoint must repoint the DGX
         // telemetry sampler too, or verbose `hw:` lines report the old box.
@@ -4111,6 +4119,48 @@ pub(crate) fn run_chat(
                             pending_clarification = None;
                             ephemeral_artifact_store =
                                 session_artifact_store(ephemeral_session, &active_conversation_id)?;
+                            // #1668 review-2 finding 1: `/persona clear` and
+                            // `/persona set <name>` (without --keep-context)
+                            // ROTATE the conversation id, which makes them
+                            // conversation switches every bit as much as
+                            // `/new` — and therefore subject to the same rule:
+                            // reset the projected preference cells to the
+                            // invocation baseline, and drop actions marked for
+                            // the OUTGOING conversation so they cannot land on
+                            // the incoming row. Without this the outgoing
+                            // conversation's pinned dials stayed installed and
+                            // silently outranked the incoming persona's own
+                            // declared cognition/tenacity (the CLI layer sits
+                            // above the persona layer in `effective_*`).
+                            //
+                            // The freshly-minted conversation has no stored
+                            // pin, so this is the reset half only — the same
+                            // call the `/new` family makes above, deliberately
+                            // reusing that seam rather than open-coding a
+                            // second reset that could drift from it.
+                            let url_changed =
+                                restore_preference_pin(ConversationPreferenceSwitch {
+                                    store: conversation_store.as_ref(),
+                                    conversation_id: &active_conversation_id,
+                                    baseline: &preference_baseline,
+                                    persona: active_persona.as_ref(),
+                                    pending: &mut pending_preference_actions,
+                                    base_provider: &mut base_provider,
+                                    base_model: &mut base_model,
+                                    cfg: &cfg,
+                                    choice: &mut choice,
+                                    inf_url: &mut inf_url,
+                                    inf_model: &mut inf_model,
+                                    inf_kind: &mut inf_kind,
+                                    inf_key: &mut inf_key,
+                                    inf_context_window: &mut inf_context_window,
+                                    color,
+                                    verbose,
+                                });
+                            if url_changed && verbose {
+                                dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                    .map(|d| d.into_sampler(2));
+                            }
                         }
                         // FR-4 (#1041): only warn when this command actually
                         // activated a (possibly new) persona — not on every
@@ -4348,6 +4398,31 @@ pub(crate) fn run_chat(
                                         }
                                     };
                                     if let Some(cmd) = persona_command {
+                                        // #1668 review-2 finding 3: the panel
+                                        // has ALREADY marked its dirty dials
+                                        // (PanelState::apply) for the
+                                        // conversation the operator was in
+                                        // when they pressed Enter. `persona
+                                        // clear` rotates the conversation id,
+                                        // so draining at the loop top would
+                                        // write those dials onto the WRONG
+                                        // (incoming) row. Settle them against
+                                        // the outgoing conversation first —
+                                        // the action belongs to where it was
+                                        // taken.
+                                        if let Err(warning) = persist_preference_actions(
+                                            conversation_store.as_ref(),
+                                            &active_conversation_id,
+                                            &mut pending_preference_actions,
+                                            &mut base_provider,
+                                            &mut base_model,
+                                        ) {
+                                            print_newt(
+                                                &format!("warning: {warning}"),
+                                                color,
+                                                verbose,
+                                            );
+                                        }
                                         let mut reset_ctx = ConversationResetContext {
                                             memory: &mut memory,
                                             system: &mut system,

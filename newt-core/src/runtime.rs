@@ -213,6 +213,25 @@ pub struct PreferenceApplyPlan {
     pub notices: Vec<String>,
 }
 
+/// What a [`BackendAxisAction::Route`] does to the session-model override.
+///
+/// The distinction is load-bearing (#1668 review-2 finding 2): "the pin named
+/// no model" and "this invocation OWNS the model axis" both used to arrive as
+/// `None`, so routing a pinned backend under an operator-supplied
+/// `NEWT_DGX_MODEL` DELETED that model — the opposite of the rule that an
+/// explicit input for this run outranks a stored preference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteModel {
+    /// The pin named a model — install it.
+    Set(String),
+    /// The pin named no model — clear the override so the backend's own
+    /// default applies, exactly as `/backends <name>` does.
+    Clear,
+    /// This invocation owns the model axis (a flag or exported env named it):
+    /// leave the operator's model exactly as they supplied it.
+    Keep,
+}
+
 /// The backend-axis half of a [`PreferenceApplyPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendAxisAction {
@@ -221,13 +240,9 @@ pub enum BackendAxisAction {
     /// flags own the axis. Fail-open: the caller applies its baseline for the
     /// axis rather than anything from the pin.
     Leave,
-    /// Route to `provider` with `model` as the session-model override.
-    /// `model: None` CLEARS the override, exactly as `/backends <name>` does
-    /// (mirrors `persona_provider_env`'s shape).
-    Route {
-        provider: String,
-        model: Option<String>,
-    },
+    /// Route to `provider`, with [`RouteModel`] saying what happens to the
+    /// session-model override.
+    Route { provider: String, model: RouteModel },
     /// Only the model override was pinned; the provider stays untouched
     /// (the `/model <name>` case).
     ModelOnly(String),
@@ -548,7 +563,15 @@ impl OperatorPreferencePin {
                 if configured.contains(&name.as_str()) {
                     BackendAxisAction::Route {
                         provider: name.clone(),
-                        model: model.cloned(),
+                        // `Keep` ONLY when this run owns the model axis. A pin
+                        // that simply names no model still clears the override
+                        // (the `/backends <name>` rule) — conflating the two
+                        // is what deleted an operator's exported model.
+                        model: match (model, owned.model) {
+                            (Some(m), _) => RouteModel::Set(m.clone()),
+                            (None, true) => RouteModel::Keep,
+                            (None, false) => RouteModel::Clear,
+                        },
                     }
                 } else {
                     notices.push(format!(
@@ -881,13 +904,13 @@ mod tests {
             plan.backend_axis,
             BackendAxisAction::Route {
                 provider: "sol".into(),
-                model: Some("gpt-5.6-sol".into()),
+                model: RouteModel::Set("gpt-5.6-sol".into()),
             }
         );
         assert!(plan.notices.is_empty());
 
         // A backend pin WITHOUT a model clears the override (/backends
-        // semantics): Route with model None, not Leave.
+        // semantics): Route with RouteModel::Clear, not Leave.
         let bare = OperatorPreferencePin {
             backend: Some("sol".into()),
             ..Default::default()
@@ -897,8 +920,50 @@ mod tests {
                 .backend_axis,
             BackendAxisAction::Route {
                 provider: "sol".into(),
-                model: None,
+                model: RouteModel::Clear,
             }
+        );
+    }
+
+    #[test]
+    fn an_owned_model_axis_survives_a_pinned_backend_route() {
+        // #1668 review-2 finding 2 (HIGH). `NEWT_DGX_MODEL=x newt --resume A`
+        // where A pins {backend, model}: the model axis is OWNED by this
+        // invocation, so the pin's model is filtered out — but the route must
+        // then KEEP the operator's model, not clear it. Clearing was the old
+        // behavior and it deleted the very value the operator supplied, while
+        // the caller printed a notice claiming the flag had won.
+        let pin = OperatorPreferencePin {
+            backend: Some("sol".into()),
+            model: Some("pinned-model".into()),
+            ..Default::default()
+        };
+        let owned = PreferenceAxes {
+            model: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            pin.apply_plan(&["sol"], owned).backend_axis,
+            BackendAxisAction::Route {
+                provider: "sol".into(),
+                model: RouteModel::Keep,
+            },
+            "an owned model axis is KEPT, never cleared, by a pinned route"
+        );
+
+        // The same pin with the axis NOT owned still clears to the backend's
+        // default only when the pin itself names no model.
+        let bare = OperatorPreferencePin {
+            backend: Some("sol".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            bare.apply_plan(&["sol"], owned).backend_axis,
+            BackendAxisAction::Route {
+                provider: "sol".into(),
+                model: RouteModel::Keep,
+            },
+            "owning the axis keeps the operator's model even when the pin names none"
         );
     }
 

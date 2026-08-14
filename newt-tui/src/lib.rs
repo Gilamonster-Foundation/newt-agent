@@ -4435,6 +4435,56 @@ pub(crate) struct ConversationPreferenceSwitch<'a> {
     pub verbose: bool,
 }
 
+/// How this launch's conversation actually resolved — the input to "may the
+/// startup preference pin apply?".
+///
+/// #1668 review-2 finding 6: this used to be a bare `resumed_at_start &&
+/// !claim_refused` expression inline in `run_chat`, which no test could reach.
+/// The test for the rule therefore hand-modelled the ordering by passing the
+/// replacement id it had computed itself, so re-introducing the bug — applying
+/// the HELD conversation's pin after a refused claim — would not have failed
+/// it. Making the outcome a value lets `run_chat` and the test drive the same
+/// gate, in [`apply_startup_preference_pin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupConversation {
+    /// Minted fresh this launch — there is no stored pin to restore.
+    Fresh,
+    /// Resumed AND the claim was granted: this session holds the conversation.
+    ResumedHeld,
+    /// Resume refused (another live newt holds it); the session dropped onto a
+    /// fresh replacement conversation instead.
+    ResumedRefused,
+}
+
+impl StartupConversation {
+    /// A pin applies only for a conversation this session actually HOLDS.
+    ///
+    /// A refused resume is the load-bearing case: the operator asked for a
+    /// conversation someone else has open, so the session is now on a fresh
+    /// replacement they never pinned. Applying the held one's posture there
+    /// would push one operator's backend, model, and dials into another
+    /// operator's session.
+    pub(crate) fn applies_pin(self) -> bool {
+        matches!(self, Self::ResumedHeld)
+    }
+}
+
+/// The startup half of the pin restore: apply `sw` only when this session holds
+/// the conversation the pin belongs to.
+///
+/// Exists so the gate is a seam rather than an inline conjunction — see
+/// [`StartupConversation`]. It refuses on the outcome alone, so it is safe even
+/// against a caller that passes the held conversation's id after a refusal.
+pub(crate) fn apply_startup_preference_pin(
+    outcome: StartupConversation,
+    sw: ConversationPreferenceSwitch<'_>,
+) -> bool {
+    if !outcome.applies_pin() {
+        return false;
+    }
+    restore_preference_pin(sw)
+}
+
 /// #1668: re-seat the session posture for the conversation being switched to —
 /// the one step every conversation switch runs (session-start resume,
 /// `/resume`, `/conversation restore`, `/roadmap next`, and `/new`).
@@ -4550,13 +4600,25 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
             model: pinned_model,
         } => {
             applied.push(match &pinned_model {
-                Some(m) => format!("backend {pinned} (model {m})"),
-                None => format!("backend {pinned}"),
+                newt_core::RouteModel::Set(m) => format!("backend {pinned} (model {m})"),
+                newt_core::RouteModel::Clear => format!("backend {pinned}"),
+                // Say so out loud: the operator's own model survived a pinned
+                // backend, which is the precedence rule doing its job.
+                newt_core::RouteModel::Keep => {
+                    format!("backend {pinned} (this run's model kept)")
+                }
             });
             provider = Some(pinned);
-            // A backend pin without a model clears the override, exactly as
-            // `/backends <name>` does.
-            model = pinned_model;
+            match pinned_model {
+                // A backend pin that names a model installs it.
+                newt_core::RouteModel::Set(m) => model = Some(m),
+                // A backend pin with no model clears the override so the
+                // backend's own default applies — the `/backends <name>` rule.
+                newt_core::RouteModel::Clear => model = None,
+                // This invocation owns the model axis: leave what the operator
+                // supplied exactly as it is (review-2 finding 2).
+                newt_core::RouteModel::Keep => {}
+            }
         }
         newt_core::BackendAxisAction::ModelOnly(pinned_model) => {
             applied.push(format!("model {pinned_model}"));
@@ -4778,11 +4840,51 @@ mod resumed_preference_tests {
             baseline: &PreferenceBaseline,
             cfg: &newt_core::Config,
         ) -> bool {
-            restore_preference_pin(ConversationPreferenceSwitch {
+            self.switch_with_persona(store, id, baseline, cfg, None)
+        }
+
+        /// The startup half, through the REAL gate `run_chat` uses — so a test
+        /// can drive a refused claim instead of hand-modelling its consequence
+        /// (review-2 finding 6).
+        fn switch_at_startup(
+            &mut self,
+            outcome: StartupConversation,
+            store: Option<&newt_core::ConversationStore>,
+            id: &str,
+            baseline: &PreferenceBaseline,
+            cfg: &newt_core::Config,
+        ) -> bool {
+            apply_startup_preference_pin(outcome, self.switch_args(store, id, baseline, cfg, None))
+        }
+
+        /// Switch with a persona active — the branch every earlier test left
+        /// unexercised by always passing `persona: None` (review-2 finding 7),
+        /// which is where the documented "a pin outranks the persona's declared
+        /// backend" precedence actually lives.
+        fn switch_with_persona(
+            &mut self,
+            store: Option<&newt_core::ConversationStore>,
+            id: &str,
+            baseline: &PreferenceBaseline,
+            cfg: &newt_core::Config,
+            persona: Option<&Persona>,
+        ) -> bool {
+            restore_preference_pin(self.switch_args(store, id, baseline, cfg, persona))
+        }
+
+        fn switch_args<'a>(
+            &'a mut self,
+            store: Option<&'a newt_core::ConversationStore>,
+            id: &'a str,
+            baseline: &'a PreferenceBaseline,
+            cfg: &'a newt_core::Config,
+            persona: Option<&'a Persona>,
+        ) -> ConversationPreferenceSwitch<'a> {
+            ConversationPreferenceSwitch {
                 store,
                 conversation_id: id,
                 baseline,
-                persona: None,
+                persona,
                 pending: &mut self.pending,
                 base_provider: &mut self.base_provider,
                 base_model: &mut self.base_model,
@@ -4795,7 +4897,7 @@ mod resumed_preference_tests {
                 inf_context_window: &mut self.inf_context_window,
                 color: false,
                 verbose: false,
-            })
+            }
         }
 
         /// One chat-loop iteration's drain — the real persistence seam.
@@ -5192,9 +5294,16 @@ mod resumed_preference_tests {
 
     /// #1668 / review finding 6: a claim-refused startup resume neither applies
     /// nor captures the held conversation's pin — the session runs the fresh
-    /// replacement conversation on the invocation baseline. Models the ordering
-    /// `run_chat` now uses: claim first, switch posture only for the
-    /// conversation the session actually holds.
+    /// replacement conversation on the invocation baseline.
+    ///
+    /// Review-2 finding 6: this drives the REAL gate
+    /// ([`apply_startup_preference_pin`]) that `run_chat` calls, and points it
+    /// at the HELD conversation on purpose. Hand-modelling the ordering — by
+    /// passing the replacement id the test computed itself — proved only that
+    /// a conversation with no pin applies no pin, which is vacuous. Aiming the
+    /// refused outcome squarely at the pinned row is what makes re-introducing
+    /// the bug fail: restore the old `resumed_at_start`-only condition and this
+    /// applies `other` + `Relentless` and the assertions below fail.
     #[test]
     fn a_claim_refused_resume_neither_applies_nor_captures_the_pin() {
         let _g = GlobalSettingsGuard::acquire();
@@ -5217,15 +5326,42 @@ mod resumed_preference_tests {
 
         let baseline = PreferenceBaseline::snapshot(None, None);
         let mut session = Session::new(&cfg);
-        // The claim guard resolved to a FRESH conversation, so that — never the
-        // held one — is what the posture switch runs against.
-        let replacement = store.create("replacement", None).unwrap();
-        session.switch_to(Some(&store), &replacement, &baseline, &cfg);
+        // Aimed at the HELD id, with the outcome that says we do not hold it:
+        // the gate must refuse on the outcome alone.
+        let applied = session.switch_at_startup(
+            StartupConversation::ResumedRefused,
+            Some(&store),
+            &held,
+            &baseline,
+            &cfg,
+        );
+        assert!(!applied, "a refused claim applies nothing");
         assert!(
             std::env::var("NEWT_PROVIDER").is_err(),
             "the held conversation's pin must not be applied"
         );
         assert_eq!(cli_tenacity(), None);
+
+        // And the positive control: the SAME pin, the same seam, with the claim
+        // granted — so the test above cannot pass merely because the plumbing
+        // is inert.
+        let mut holder = Session::new(&cfg);
+        holder.switch_at_startup(
+            StartupConversation::ResumedHeld,
+            Some(&store),
+            &held,
+            &baseline,
+            &cfg,
+        );
+        assert_eq!(
+            std::env::var("NEWT_PROVIDER").ok().as_deref(),
+            Some("other"),
+            "held: the pin DOES apply, so the refusal above is a real refusal"
+        );
+        assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
+        reset_globals();
+
+        let replacement = store.create("replacement", None).unwrap();
         session.drain(Some(&store), &replacement);
         assert_eq!(
             store
@@ -5236,6 +5372,84 @@ mod resumed_preference_tests {
                 .as_deref(),
             Some("other"),
             "and the held conversation's row is untouched"
+        );
+    }
+
+    /// A persona declaring `backend:` + `model:`, for the persona-branch tests.
+    fn persona_routing_to(backend: &str, model: Option<&str>) -> Persona {
+        let mut front = format!("+++\nbackend = \"{backend}\"\n");
+        if let Some(m) = model {
+            front.push_str(&format!("model = \"{m}\"\n"));
+        }
+        front.push_str("+++\nbe helpful\n");
+        Persona {
+            name: "router".to_string(),
+            prompt: "be helpful".to_string(),
+            path: std::path::PathBuf::from("/dev/null"),
+            profile: newt_core::RoleProfile::parse(&front).expect("front-matter parses"),
+        }
+    }
+
+    /// #1668 review-2 finding 7: the persona branch of the switch. Every
+    /// earlier test in this module passed `persona: None`, so the documented
+    /// precedence — a conversation's PIN outranks the active persona's declared
+    /// `backend:` — was asserted nowhere and could have regressed silently.
+    ///
+    /// Both directions, because only the pair is meaningful: with no pin the
+    /// persona's route is what survives the switch, and with a pin the pin wins.
+    #[test]
+    fn a_pin_outranks_the_active_personas_declared_backend() {
+        let _g = GlobalSettingsGuard::acquire();
+        reset_globals();
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = store_in(root.path(), ws.path());
+        let cfg = cfg_with(&["sol", "other"]);
+        // The persona's model MUST match what the config already resolves to
+        // ("m0"): the harness keeps this tier network-free by never letting a
+        // route change the resolved url/model, which is what fires
+        // `refresh_backend`'s served-adoption probe.
+        let persona = persona_routing_to("sol", Some("m0"));
+        let baseline = PreferenceBaseline::snapshot(None, None);
+
+        // 1. No pin on the incoming conversation: the persona's route stands.
+        let unpinned = durable_conversation(&store, "unpinned");
+        let mut session = Session::new(&cfg);
+        session.switch_with_persona(Some(&store), &unpinned, &baseline, &cfg, Some(&persona));
+        assert_eq!(
+            std::env::var("NEWT_PROVIDER").ok().as_deref(),
+            Some("sol"),
+            "with nothing pinned, the persona's declared backend routes"
+        );
+        assert_eq!(
+            std::env::var("NEWT_DGX_MODEL").ok().as_deref(),
+            Some("m0"),
+            "and the persona's declared model with it"
+        );
+
+        // 2. A pin naming a DIFFERENT backend outranks it.
+        let pinned = durable_conversation(&store, "pinned");
+        store
+            .update_preference_pin(
+                &pinned,
+                &OperatorPreferencePin {
+                    backend: Some("other".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        session.switch_with_persona(Some(&store), &pinned, &baseline, &cfg, Some(&persona));
+        assert_eq!(
+            std::env::var("NEWT_PROVIDER").ok().as_deref(),
+            Some("other"),
+            "the conversation's pin outranks the persona's declared backend"
+        );
+        // And the pin named no model, so the override clears to the backend's
+        // own default rather than inheriting the persona's model — the
+        // `/backends <name>` rule, which a pin must not quietly opt out of.
+        assert!(
+            std::env::var("NEWT_DGX_MODEL").is_err(),
+            "a pinned backend with no model clears the override, persona or not"
         );
     }
 
@@ -6820,6 +7034,22 @@ fn restore_conversation_into_session(
         },
         None => *ctx.active_persona = None,
     }
+    // #1668 review-2 finding 5: `active_persona` is only half of activating a
+    // persona — `handle_persona_command` also re-seats the PERSONA COGNITION
+    // LAYER that `effective_cognition` ranks beneath the CLI layer. A restore
+    // that swapped the struct but left that layer alone carried the OUTGOING
+    // conversation's persona cognition into the incoming one, so resuming a
+    // plain conversation from a `contemplating` persona kept contemplating with
+    // nothing on screen naming a persona to explain it.
+    //
+    // Derived from the persona now installed rather than from `record.persona`,
+    // so the load-failure arm (persona named but unavailable) clears the layer
+    // instead of leaving a stale one behind a persona that is not active.
+    newt_core::cognition::set_persona_cognition(
+        ctx.active_persona
+            .as_ref()
+            .and_then(|p| p.profile.cognition),
+    );
     ctx.compress_state.reset();
     *ctx.active_conversation_id = record.id.clone();
     *ctx.system = rebuild_system_prompt(

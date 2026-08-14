@@ -2762,3 +2762,108 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
     // The lone-sided summary record never dispatches an empty message.
     assert!(!messages.iter().any(|m| m.content.is_empty()));
 }
+
+/// #1668 review-2 finding 5: restoring a conversation re-seats the PERSONA
+/// COGNITION LAYER, not merely the `active_persona` struct.
+///
+/// `handle_persona_command` always sets both, but `restore_conversation_into_session`
+/// set only the struct. `effective_cognition` ranks the persona layer beneath the
+/// CLI layer and above the default, so the outgoing conversation's persona
+/// cognition stayed in force after switching to a conversation with a different
+/// persona — or with none at all — while the banner named the incoming persona.
+/// The operator saw one persona and ran another's dial.
+///
+/// Drives the real restore seam in all three directions, because the load-bearing
+/// case is the CLEARING one: a stale layer is invisible precisely when the
+/// incoming conversation declares nothing to overwrite it with.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn conversation_restore_reseats_the_persona_cognition_layer() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let state = tmp.path().join("state");
+    let store = newt_core::ConversationStore::new(&state, &workspace, 100).unwrap();
+
+    // Two personas: one declaring a cognition dial, one declaring none.
+    let persona_dir = tmp.path().join("personas");
+    fs::create_dir_all(&persona_dir).unwrap();
+    fs::write(
+        persona_dir.join("thinker.md"),
+        "+++\ncognition = \"contemplating\"\n+++\nThink hard.\n",
+    )
+    .unwrap();
+    fs::write(persona_dir.join("plain.md"), "No front-matter here.\n").unwrap();
+    let persona_store = PersonaStore::new(persona_dir);
+
+    let thinking = store.create("Thinking work", Some("thinker")).unwrap();
+    store.append_turn(&thinking, "q", "a").unwrap();
+    let plain = store.create("Plain work", Some("plain")).unwrap();
+    store.append_turn(&plain, "q", "a").unwrap();
+    let personaless = store.create("No persona", None).unwrap();
+    store.append_turn(&personaless, "q", "a").unwrap();
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::RollingWindow::new(5));
+    let workspace_str = workspace.to_str().unwrap();
+    let mut system = rebuild_system_prompt(workspace_str, &memory, None, "test-session");
+    let mut active_persona = None;
+    let mut active_conversation_id = newt_core::new_conversation_id();
+    let mut compress_state = newt_core::CompressState::new();
+    let scratchpad_store = newt_core::SessionScratchpadStore::default();
+    let step_ledger = newt_core::SessionStepLedger::default();
+    let mut active_prompt_context = None;
+    let mode_states = ConversationModeStates::default();
+    let mut ctx = ConversationCommandContext {
+        store: &store,
+        persona_store: &persona_store,
+        workspace: workspace_str,
+        memory: &mut memory,
+        system: &mut system,
+        active_persona: &mut active_persona,
+        active_conversation_id: &mut active_conversation_id,
+        compress_state: &mut compress_state,
+        scratchpad: &scratchpad_store,
+        step_ledger: &step_ledger,
+        active_prompt_context: &mut active_prompt_context,
+        mode_states: &mode_states,
+    };
+
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    newt_core::cognition::set_persona_cognition(None);
+
+    // 1. Restoring a persona that declares a dial SEATS it.
+    restore_conversation_into_session(&mut ctx, &thinking).unwrap();
+    assert_eq!(
+        newt_core::cognition::persona_cognition(),
+        Some(newt_core::role_profile::Cognition::Contemplating),
+        "restoring a conversation whose persona declares cognition seats that layer"
+    );
+
+    // 2. Restoring a persona that declares NONE clears it. This is the bug:
+    //    the struct swapped to `plain` while the layer stayed contemplating.
+    restore_conversation_into_session(&mut ctx, &plain).unwrap();
+    assert_eq!(
+        ctx.active_persona.as_ref().map(|p| p.name.as_str()),
+        Some("plain")
+    );
+    assert_eq!(
+        newt_core::cognition::persona_cognition(),
+        None,
+        "a persona declaring no cognition must not inherit the outgoing persona's dial"
+    );
+
+    // 3. And restoring a conversation with NO persona clears it too.
+    restore_conversation_into_session(&mut ctx, &thinking).unwrap();
+    assert_eq!(
+        newt_core::cognition::persona_cognition(),
+        Some(newt_core::role_profile::Cognition::Contemplating)
+    );
+    restore_conversation_into_session(&mut ctx, &personaless).unwrap();
+    assert!(ctx.active_persona.is_none());
+    assert_eq!(
+        newt_core::cognition::persona_cognition(),
+        None,
+        "a conversation with no persona runs with no persona dial"
+    );
+}

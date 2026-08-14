@@ -643,3 +643,47 @@ mod validate_tests {
         assert_eq!(levenshtein("", "abc"), 3);
     }
 }
+
+#[cfg(test)]
+mod mark_tests {
+    use super::*;
+    use newt_core::runtime::drain_preference_actions;
+    use newt_core::test_guard::GlobalSettingsGuard;
+
+    /// #1668 review-2 finding 8: the load-bearing NEGATIVE of the whole
+    /// preference-pin design was asserted nowhere.
+    ///
+    /// The original finding 1 was that merely *looking* at settings pinned them,
+    /// which is what made a pin worthless — a conversation acquired a backend it
+    /// never chose. The fix was to mark only on a SUCCESSFUL named pick, but the
+    /// tests only ever covered the positive path, so a future edit that hoisted
+    /// `mark_backend_pick` above the `any(|b| b.name == arg1)` guard — the exact
+    /// shape of the original bug — would have gone green.
+    ///
+    /// Both no-op arms, driven through the real `dispatch`: a bare `/backends`
+    /// LISTING, and a `/backends <unknown>`. Neither touches the network.
+    #[test]
+    fn browsing_backends_marks_no_preference_action() {
+        let _g = GlobalSettingsGuard::acquire();
+        let _ = drain_preference_actions();
+
+        dispatch("backends", "", "", false, false).expect("listing must not error");
+        assert!(
+            drain_preference_actions().is_empty(),
+            "a bare /backends LISTING must pin nothing — browsing is not choosing"
+        );
+
+        dispatch(
+            "backends",
+            "definitely-not-a-configured-backend",
+            "",
+            false,
+            false,
+        )
+        .expect("an unknown name must not error");
+        assert!(
+            drain_preference_actions().is_empty(),
+            "a REFUSED /backends <unknown> must pin nothing — a failed switch is not a choice"
+        );
+    }
+}

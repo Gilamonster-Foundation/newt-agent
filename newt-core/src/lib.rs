@@ -193,7 +193,7 @@ pub use navigator::{
 pub use project_map::ProjectMapProvider;
 pub use runtime::{
     BackendAxisAction, BackendState, OperatorPreferencePin, PreferenceActions, PreferenceApplyPlan,
-    PreferenceAxes, RuntimeSettingsSnapshot,
+    PreferenceAxes, RouteModel, RuntimeSettingsSnapshot,
 };
 pub use tenacity::Tenacity;
 pub use where_is::{
