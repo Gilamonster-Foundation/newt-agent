@@ -162,14 +162,7 @@ pub(crate) fn dispatch(
         // #1665: retired top-levels. Redirect WITHOUT mutating — a habitual
         // `/tenacity relentless` must not half-work through a deprecation shim,
         // or the shim never gets to die.
-        "tenacity" | "cognition" => print_newt(
-            &format!(
-                "/{cmd} folded into /psyche — /psyche opens the dial panel; \
-                 text: /psyche {cmd} <level>  (nothing changed)"
-            ),
-            color,
-            verbose,
-        ),
+        "tenacity" | "cognition" => print_newt(&retired_dial_redirect(cmd), color, verbose),
 
         // /psyche owns the dials (#1665): bare = panel (intercepted in chat.rs
         // on a rich TTY; HERE bare renders the text status for piped/lean),
@@ -301,6 +294,16 @@ fn cognition_command(arg: &str) -> String {
             Err(e) => format!("{e}  {usage}"),
         },
     }
+}
+
+/// The retired top-level dials' redirect line (#1665) — pure so the exact
+/// wording is pinned by test: it must name the panel AND the text-setter form,
+/// and say plainly that nothing changed.
+fn retired_dial_redirect(cmd: &str) -> String {
+    format!(
+        "/{cmd} folded into /psyche — /psyche opens the dial panel; \
+         text: /psyche {cmd} <level>  (nothing changed)"
+    )
 }
 
 /// `/psyche` — every effort dial under one command (#1665). `rest` is the raw
@@ -543,6 +546,17 @@ mod tests {
 
         set_cli_cognition(CognitionOverride::Unset);
         set_cli_tenacity(Tenacity::Standard);
+    }
+
+    #[test]
+    fn the_redirect_line_names_both_the_panel_and_the_text_setter() {
+        // #1665 review: the redirect wording was previously unasserted anywhere.
+        for cmd in ["tenacity", "cognition"] {
+            let line = super::retired_dial_redirect(cmd);
+            assert!(line.contains("folded into /psyche"), "{line}");
+            assert!(line.contains(&format!("/psyche {cmd} <level>")), "{line}");
+            assert!(line.contains("(nothing changed)"), "{line}");
+        }
     }
 
     #[test]

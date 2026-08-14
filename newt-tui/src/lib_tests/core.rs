@@ -1314,6 +1314,30 @@ fn slash_unknown_returns_true() {
 }
 
 #[test]
+fn retired_dials_through_the_real_router_mutate_nothing() {
+    // #1665 review: the earlier no-mutation test called settings::dispatch
+    // directly, bypassing lib.rs routing. Drive the FULL router. Residual gap,
+    // stated honestly: with no stdout capture in this suite, deleting the
+    // "tenacity"/"cognition" tokens from dispatch_slash degrades them to the
+    // unknown-command print — observably identical here. What this DOES pin:
+    // the router path never half-applies a retired dial, whatever it prints.
+    use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+    use newt_core::tenacity::{cli_tenacity, set_cli_tenacity, Tenacity};
+    let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    set_cli_cognition(CognitionOverride::Unset);
+    set_cli_tenacity(Tenacity::Standard);
+    assert!(dispatch_slash("/tenacity relentless", "/ws", false, false, false).unwrap());
+    assert!(dispatch_slash("/cognition contemplating", "/ws", false, false, false).unwrap());
+    assert_eq!(cli_tenacity(), Some(Tenacity::Standard));
+    assert_eq!(cli_cognition(), CognitionOverride::Unset);
+    // And the surviving /psyche text setters DO mutate through the router —
+    // proving the routing distinction, not just shared inertness.
+    assert!(dispatch_slash("/psyche tenacity relentless", "/ws", false, false, false).unwrap());
+    assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
+    set_cli_tenacity(Tenacity::Standard);
+}
+
+#[test]
 fn slash_dgx_no_subcmd_returns_true() {
     assert!(dispatch_slash("/dgx", "/ws", false, false, false).unwrap());
 }

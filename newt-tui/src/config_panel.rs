@@ -831,19 +831,30 @@ pub(crate) fn run(
     // the loop (via `persist`). Now apply the dials — but ONLY on an explicit
     // apply — then hand the persona action to the caller, which applies it, reroutes
     // the backend, recomputes, and reports from fresh runtime state.
-    Ok(if applied && !state.is_noop() {
+    Ok(close_outcome(applied, &state))
+}
+
+/// The panel's exit contract, factored out of the raw-mode loop so it is
+/// unit-testable without a TTY (adversarial-review finding on #1665): given
+/// whether the operator explicitly applied (Enter / a `:wq` whose save landed)
+/// and the final working state, produce the [`PanelOutcome`] — running
+/// [`PanelState::apply`] as a side effect ONLY on a real (non-noop) apply.
+/// The noop downgrade lives HERE: Enter with nothing changed maps to
+/// `Cancelled` (or `Saved` after a lone `:w`, so the save is still reported).
+fn close_outcome(applied: bool, state: &PanelState) -> PanelOutcome {
+    if applied && !state.is_noop() {
         state.apply();
         let persona = state.persona_action();
-        match state.saved {
+        match state.saved.clone() {
             Some(name) => PanelOutcome::SavedAndApplied { name, persona },
             None => PanelOutcome::Applied { persona },
         }
     } else {
-        match state.saved {
+        match state.saved.clone() {
             Some(name) => PanelOutcome::Saved { name },
             None => PanelOutcome::Cancelled,
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1173,16 +1184,68 @@ mod tests {
         s.begin_command("w keep");
         s.run_command(&mut persist);
         assert_eq!(s.saved.as_deref(), Some("keep"));
-        // Simulate the cancel branch of `run` (applied = false):
-        let outcome = match s.saved.clone() {
-            Some(name) => PanelOutcome::Saved { name },
-            None => PanelOutcome::Cancelled,
-        };
+        // The REAL exit path (close_outcome), not a hand-copied match: a save
+        // happened but the loop was cancelled → Saved, never a posture summary.
         assert_eq!(
-            outcome,
+            close_outcome(false, &s),
             PanelOutcome::Saved {
                 name: "keep".to_string()
             }
         );
+        // And an Enter AFTER a lone :w with no dial/persona change: still Saved
+        // (the save is reported; the noop "apply" stays silent), NOT
+        // SavedAndApplied.
+        assert_eq!(
+            close_outcome(true, &s),
+            PanelOutcome::Saved {
+                name: "keep".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn close_outcome_downgrades_a_noop_enter_and_applies_a_real_one() {
+        // Adversarial-review findings on #1665: (1) the Enter downgrade
+        // `applied && !is_noop()` must be exercised through the REAL exit path;
+        // (2) the tenacity term of is_noop needs a tenacity-ONLY dirty case —
+        // dropping `!self.tenacity.is_dirty()` from is_noop silently discarded
+        // a tenacity-only edit (apply() skipped, Cancelled returned).
+        use newt_core::cognition::{set_cli_cognition, CognitionOverride};
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
+
+        // Noop visit: Enter and Esc are indistinguishable — both Cancelled.
+        let s = panel(None, two_personas(), Tenacity::Standard);
+        assert_eq!(close_outcome(true, &s), PanelOutcome::Cancelled);
+        assert_eq!(close_outcome(false, &s), PanelOutcome::Cancelled);
+        assert_eq!(cli_tenacity(), Some(Tenacity::Standard), "nothing applied");
+
+        // Tenacity-ONLY dirty + Enter → a real Applied, and the override is
+        // actually written through apply().
+        let mut t = panel(None, two_personas(), Tenacity::Standard);
+        t.down(); // persona → cognition
+        t.down(); // cognition → tenacity
+        t.cycle(1); // standard → insistent (dirty)
+        let out = close_outcome(true, &t);
+        assert_eq!(
+            out,
+            PanelOutcome::Applied {
+                persona: PersonaAction::Keep
+            }
+        );
+        assert_eq!(
+            cli_tenacity(),
+            Some(Tenacity::Insistent),
+            "the tenacity-only edit was applied, not silently discarded"
+        );
+        // The same dirty state WITHOUT the explicit apply stays Cancelled and
+        // writes nothing further.
+        set_cli_tenacity(Tenacity::Standard);
+        assert_eq!(close_outcome(false, &t), PanelOutcome::Cancelled);
+        assert_eq!(cli_tenacity(), Some(Tenacity::Standard));
+
+        set_cli_cognition(CognitionOverride::Unset);
+        set_cli_tenacity(Tenacity::Standard);
     }
 }
