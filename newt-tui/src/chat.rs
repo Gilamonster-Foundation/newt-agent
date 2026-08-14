@@ -894,6 +894,17 @@ pub(crate) fn run_chat(
     // routing never touches it (review P1#2). `None` ⇒ the configured default.
     let mut base_provider = std::env::var("NEWT_PROVIDER").ok();
     let mut base_model = std::env::var("NEWT_DGX_MODEL").ok();
+    // #1668: the INVOCATION baseline — this posture, captured once, is what
+    // every conversation switch resets to before layering the incoming
+    // conversation's own pin, and what an UNPINNED axis resolves to. Taken
+    // here: the CLI flags have installed theirs (newt-cli runs before the TUI)
+    // and no conversation pin has been applied yet.
+    let preference_baseline =
+        PreferenceBaseline::snapshot(base_provider.clone(), base_model.clone());
+    // #1668: operator posture actions marked but not yet persisted — a fresh
+    // conversation has no durable row until its first saved turn, so its
+    // actions wait here instead of being lost.
+    let mut pending_preference_actions = newt_core::PreferenceActions::default();
     // P2#4 visibility: warn ONCE if cognition is set on a backend that ignores it
     // (Responses-only) so the dial isn't silently dropped.
     let mut cognition_scope_noted = false;
@@ -1602,6 +1613,11 @@ pub(crate) fn run_chat(
 
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
+    //
+    // #1668: whether this session ADOPTED an existing conversation at startup —
+    // the precondition for applying that conversation's preference pin, which
+    // happens after the claim guard below (review finding 6).
+    let mut resumed_at_start = false;
     if let Some(store) = conversation_store.as_ref() {
         let mut resume_ctx = ConversationCommandContext {
             store,
@@ -1617,12 +1633,13 @@ pub(crate) fn run_chat(
             active_prompt_context: &mut active_prompt_context,
             mode_states: &conversation_mode_states,
         };
-        match &session_start {
+        resumed_at_start = match &session_start {
             // NEWT_CONVERSATION_ID: an explicit override — errors are hard
             // (silently starting fresh would betray the operator's ask).
             SessionStart::ResumeExact(id) => {
                 let banner = resume_exact_conversation(&mut resume_ctx, id)?;
                 print_newt(&banner, color, verbose);
+                true
             }
             // #1671 `--resume <name>`: id/prefix first (the exact contract),
             // then title matching — then the SAME one restore path as above.
@@ -1635,6 +1652,7 @@ pub(crate) fn run_chat(
                 };
                 let banner = resume_exact_conversation(&mut resume_ctx, &id)?;
                 print_newt(&banner, color, verbose);
+                true
             }
             // [conversations] resume = true: latest by §6 activity tick.
             // Failure here degrades to a fresh conversation with a warning
@@ -1642,18 +1660,26 @@ pub(crate) fn run_chat(
             SessionStart::ResumeLatest => {
                 if should_auto_resume(&session_start, session_opted_fresh) {
                     match auto_resume_latest(&mut resume_ctx) {
-                        Ok(Some(banner)) => print_newt(&banner, color, verbose),
-                        Ok(None) => {} // no conversations yet — fresh, silent
-                        Err(e) => print_newt(
-                            &format!("warning: auto-resume failed ({e}) — starting fresh"),
-                            color,
-                            verbose,
-                        ),
+                        Ok(Some(banner)) => {
+                            print_newt(&banner, color, verbose);
+                            true
+                        }
+                        Ok(None) => false, // no conversations yet — fresh, silent
+                        Err(e) => {
+                            print_newt(
+                                &format!("warning: auto-resume failed ({e}) — starting fresh"),
+                                color,
+                                verbose,
+                            );
+                            false
+                        }
                     }
+                } else {
+                    false
                 }
             }
-            SessionStart::Ephemeral | SessionStart::Fresh => {}
-        }
+            SessionStart::Ephemeral | SessionStart::Fresh => false,
+        };
         if let Some(parent) = active_prompt_context.as_ref() {
             if let Some(pending) =
                 rehydrate_pending_clarification(store, &active_conversation_id, parent)?
@@ -1669,10 +1695,15 @@ pub(crate) fn run_chat(
     // granted; only a NEWT_CONVERSATION_ID / `resume = true` opt-in can point at
     // a conversation another live newt already holds — we refuse to attach (that
     // is the turn-interleaving bug) and start a fresh conversation instead.
+    // #1668 (review finding 6): whether the claim was REFUSED — the session
+    // then runs a fresh replacement conversation, so the held conversation's
+    // preference pin must be neither applied nor captured.
+    let mut claim_refused = false;
     if let Some(store) = conversation_store.as_ref() {
         match store.claim(&active_conversation_id) {
             Ok(newt_core::ClaimOutcome::Claimed) => {}
             Ok(newt_core::ClaimOutcome::HeldBy { host, pid }) => {
+                claim_refused = true;
                 print_newt(
                     &format!(
                         "that conversation is open in another newt (pid {pid} on {host}) — \
@@ -1714,6 +1745,40 @@ pub(crate) fn run_chat(
         }
     }
 
+    // #1668: apply the resumed conversation's preference pin — AFTER the claim
+    // guard above (review finding 6), so this runs only for the conversation
+    // the session actually holds. A claim-refused resume dropped us onto a
+    // fresh conversation instead: applying the held one's pin there would put
+    // a conversation the operator never pinned on someone else's posture.
+    if resumed_at_start && !claim_refused {
+        let url_changed = restore_preference_pin(ConversationPreferenceSwitch {
+            store: conversation_store.as_ref(),
+            conversation_id: &active_conversation_id,
+            baseline: &preference_baseline,
+            persona: active_persona.as_ref(),
+            pending: &mut pending_preference_actions,
+            base_provider: &mut base_provider,
+            base_model: &mut base_model,
+            cfg: &cfg,
+            choice: &mut choice,
+            inf_url: &mut inf_url,
+            inf_model: &mut inf_model,
+            inf_kind: &mut inf_kind,
+            inf_key: &mut inf_key,
+            inf_context_window: &mut inf_context_window,
+            color,
+            verbose,
+        });
+        // Same re-probe discipline as every other backend switch (review
+        // finding 5): a pin that repointed the endpoint must repoint the DGX
+        // telemetry sampler too, or verbose `hw:` lines report the old box.
+        if url_changed && verbose {
+            dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url).map(|d| d.into_sampler(2));
+        }
+        // The capability identity is re-derived at the head of every inference
+        // turn, so a pin-driven backend/model change needs nothing here.
+    }
+
     // retry technique (increment 2b): the re-prompt budget for the *current* user
     // turn, and a queued corrective re-prompt. When `pending_retry` is `Some`, the
     // next loop iteration runs it instead of reading user input — so a fabricating
@@ -1752,6 +1817,29 @@ pub(crate) fn run_chat(
     };
 
     loop {
+        // #1668: the ONE preference-pin persistence site. Every operator
+        // posture ACTION marked since the last pass — a successful
+        // `/backends <name>` / `/model <name>` / `/backend <kind> <model>`, a
+        // `/psyche` dial setter, a psyche-panel apply — is drained here, folded
+        // into the operator baseline, and merged PER AXIS into the active
+        // conversation's stored pin. Draining at the top of the iteration
+        // catches every command path uniformly, including the psyche panel's
+        // early `continue`, and runs before the next prompt is drawn.
+        //
+        // Action-scoped on purpose (2026-08-13 review, findings 1/2/3/7): the
+        // old per-turn snapshot of session globals could not tell an operator
+        // choice from a persona's route or an applied pin's residue, so it
+        // recorded "what was ambient when a turn last saved" while claiming to
+        // record "what the operator pinned for this conversation".
+        if let Err(warning) = persist_preference_actions(
+            conversation_store.as_ref(),
+            &active_conversation_id,
+            &mut pending_preference_actions,
+            &mut base_provider,
+            &mut base_model,
+        ) {
+            print_newt(&format!("warning: {warning}"), color, verbose);
+        }
         // The input surface can panic (assertion `fd != -1`) when the terminal
         // file descriptor becomes invalid — most commonly from file-descriptor
         // exhaustion after spawning many subprocesses (e.g., `cargo test`
@@ -3306,6 +3394,39 @@ pub(crate) fn run_chat(
                             }
                             let _ = store.claim(&active_conversation_id);
                         }
+                        // #1668: `/new` · `/clear` · `/end` · `/restart` ·
+                        // `/start` are conversation boundaries too — reset the
+                        // session posture to the invocation baseline so the
+                        // fresh conversation does not inherit the outgoing
+                        // one's pinned backend or dials (review finding 2). A
+                        // brand-new conversation has no pin, so this is the
+                        // reset half only.
+                        let url_changed = restore_preference_pin(ConversationPreferenceSwitch {
+                            store: conversation_store.as_ref(),
+                            conversation_id: &active_conversation_id,
+                            baseline: &preference_baseline,
+                            persona: active_persona.as_ref(),
+                            pending: &mut pending_preference_actions,
+                            base_provider: &mut base_provider,
+                            base_model: &mut base_model,
+                            cfg: &cfg,
+                            choice: &mut choice,
+                            inf_url: &mut inf_url,
+                            inf_model: &mut inf_model,
+                            inf_kind: &mut inf_kind,
+                            inf_key: &mut inf_key,
+                            inf_context_window: &mut inf_context_window,
+                            color,
+                            verbose,
+                        });
+                        if url_changed {
+                            dgx_rx = if verbose {
+                                dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                    .map(|d| d.into_sampler(2))
+                            } else {
+                                None
+                            };
+                        }
                         // Step 26.4 (#583): drop scratchpad state so a fresh task
                         // never inherits the previous conversation's variables.
                         {
@@ -3452,6 +3573,37 @@ pub(crate) fn run_chat(
                             let store = conversation_store.as_ref().ok_or_else(|| {
                                 anyhow::anyhow!("durable conversation restore lost its store")
                             })?;
+                            // #1668: a conversation boundary (`/conversation
+                            // restore` AND `/conversation new`) — reset the
+                            // session to the invocation baseline, then apply
+                            // whatever THIS conversation pinned.
+                            let url_changed =
+                                restore_preference_pin(ConversationPreferenceSwitch {
+                                    store: Some(store),
+                                    conversation_id: &active_conversation_id,
+                                    baseline: &preference_baseline,
+                                    persona: active_persona.as_ref(),
+                                    pending: &mut pending_preference_actions,
+                                    base_provider: &mut base_provider,
+                                    base_model: &mut base_model,
+                                    cfg: &cfg,
+                                    choice: &mut choice,
+                                    inf_url: &mut inf_url,
+                                    inf_model: &mut inf_model,
+                                    inf_kind: &mut inf_kind,
+                                    inf_key: &mut inf_key,
+                                    inf_context_window: &mut inf_context_window,
+                                    color,
+                                    verbose,
+                                });
+                            if url_changed {
+                                dgx_rx = if verbose {
+                                    dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                        .map(|d| d.into_sampler(2))
+                                } else {
+                                    None
+                                };
+                            }
                             pending_clarification = match active_prompt_context.as_ref() {
                                 Some(parent) => match rehydrate_pending_clarification(
                                     store,
@@ -3599,6 +3751,43 @@ pub(crate) fn run_chat(
                                                 ) {
                                                     Ok(banner) => {
                                                         turns_this_conversation = 0;
+                                                        // #1668: conversation boundary —
+                                                        // reset to the invocation
+                                                        // baseline, then apply THIS
+                                                        // conversation's pin.
+                                                        let url_changed = restore_preference_pin(
+                                                            ConversationPreferenceSwitch {
+                                                                store: Some(store),
+                                                                conversation_id:
+                                                                    &active_conversation_id,
+                                                                baseline: &preference_baseline,
+                                                                persona: active_persona.as_ref(),
+                                                                pending:
+                                                                    &mut pending_preference_actions,
+                                                                base_provider: &mut base_provider,
+                                                                base_model: &mut base_model,
+                                                                cfg: &cfg,
+                                                                choice: &mut choice,
+                                                                inf_url: &mut inf_url,
+                                                                inf_model: &mut inf_model,
+                                                                inf_kind: &mut inf_kind,
+                                                                inf_key: &mut inf_key,
+                                                                inf_context_window:
+                                                                    &mut inf_context_window,
+                                                                color,
+                                                                verbose,
+                                                            },
+                                                        );
+                                                        if url_changed {
+                                                            dgx_rx = if verbose {
+                                                                dgx_probe::DgxTelemetry::try_connect(
+                                                                    &inf_url,
+                                                                )
+                                                                .map(|d| d.into_sampler(2))
+                                                            } else {
+                                                                None
+                                                            };
+                                                        }
                                                         pending_clarification = match active_prompt_context.as_ref() {
                                                             Some(parent) => match rehydrate_pending_clarification(
                                                                 store,
@@ -3730,6 +3919,40 @@ pub(crate) fn run_chat(
                                                         ) {
                                                             Ok(banner) => {
                                                                 turns_this_conversation = 0;
+                                                                // #1668: conversation
+                                                                // boundary — reset to the
+                                                                // invocation baseline, then
+                                                                // apply THIS conversation's
+                                                                // pin.
+                                                                let url_changed =
+                                                                    restore_preference_pin(
+                                                                        ConversationPreferenceSwitch {
+                                                                            store: Some(store),
+                                                                            conversation_id: &active_conversation_id,
+                                                                            baseline: &preference_baseline,
+                                                                            persona: active_persona.as_ref(),
+                                                                            pending: &mut pending_preference_actions,
+                                                                            base_provider: &mut base_provider,
+                                                                            base_model: &mut base_model,
+                                                                            cfg: &cfg,
+                                                                            choice: &mut choice,
+                                                                            inf_url: &mut inf_url,
+                                                                            inf_model: &mut inf_model,
+                                                                            inf_kind: &mut inf_kind,
+                                                                            inf_key: &mut inf_key,
+                                                                            inf_context_window: &mut inf_context_window,
+                                                                            color,
+                                                                            verbose,
+                                                                        },
+                                                                    );
+                                                                if url_changed {
+                                                                    dgx_rx = if verbose {
+                                                                        dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                                                            .map(|d| d.into_sampler(2))
+                                                                    } else {
+                                                                        None
+                                                                    };
+                                                                }
                                                                 pending_clarification = match active_prompt_context.as_ref() {
                                                                     Some(parent) => match rehydrate_pending_clarification(
                                                                         store,
@@ -4098,11 +4321,19 @@ pub(crate) fn run_chat(
                                     // The panel path `continue`s BEFORE the loop's
                                     // post-command refresh, so do here what the
                                     // /model slash path gets there: repoint the
-                                    // session at the (possibly) new model and
-                                    // capture the operator baseline (review P1#2)
-                                    // a later `/persona clear` reverts to. The
+                                    // session at the (possibly) new model. The
                                     // URL cannot change on a model pick, so the
                                     // DGX re-probe is deliberately skipped.
+                                    //
+                                    // #1668: the operator baseline is NOT
+                                    // re-derived from env here. `apply_model_choice`
+                                    // already marked the model axis past its
+                                    // validation gate, and the loop's single drain
+                                    // owns the baseline — re-reading env would
+                                    // rebuild the (provider, model) pair from two
+                                    // independently-mutated sources and could pair
+                                    // the operator's provider with a persona
+                                    // backend's model.
                                     cfg = newt_core::Config::resolve().unwrap_or_default();
                                     let _ = refresh_backend(
                                         &cfg,
@@ -4115,7 +4346,6 @@ pub(crate) fn run_chat(
                                         color,
                                         verbose,
                                     );
-                                    base_model = std::env::var("NEWT_DGX_MODEL").ok();
                                 }
                                 // Recompute + report from FRESH runtime state (§2).
                                 // #1139: one resolved snapshot is the single source
@@ -4192,15 +4422,15 @@ pub(crate) fn run_chat(
                             None
                         };
                     }
-                    // Review P1#2: an operator backend command (/backends, /model,
-                    // /backend) just wrote its explicit choice to the env — capture
-                    // it as the baseline a later `/persona clear` reverts to. A
-                    // persona's own routing runs in a separate branch that never
-                    // reaches here, so it can never pollute the operator baseline.
-                    if is_operator_backend_command(slash_body) {
-                        base_provider = std::env::var("NEWT_PROVIDER").ok();
-                        base_model = std::env::var("NEWT_DGX_MODEL").ok();
-                    }
+                    // Review P1#2 (the baseline a later `/persona clear` reverts
+                    // to) is now maintained by the #1668 drain at the head of the
+                    // loop, from the operator ACTIONS the commands marked — not by
+                    // re-reading env after a command whose NAME looks like a
+                    // backend command. That name test matched a bare `/backends`
+                    // LISTING too, so under an active persona it absorbed the
+                    // persona's route into the operator baseline (2026-08-13
+                    // review, findings 1 and 7); marking at the success sites
+                    // makes that unrepresentable.
                     if cap.reapply(resolve_tui(&cfg), workspace) {
                         print_newt(
                             "permissions can only narrow within a session — restart newt to widen",
@@ -5687,6 +5917,14 @@ pub(crate) fn run_chat(
                                                 verbose,
                                             );
                                         }
+                                        // #1668: the preference pin is deliberately
+                                        // NOT written here. A per-turn snapshot of
+                                        // the session's posture cannot tell an
+                                        // operator choice from ambient state, so the
+                                        // pin is written only where an operator
+                                        // ACTION is known to have succeeded — drained
+                                        // once per loop iteration at the head of the
+                                        // loop (`persist_preference_actions`).
                                         // The transcript remains the source for
                                         // reply text. Append its digest-only
                                         // outcome only after the transcript save

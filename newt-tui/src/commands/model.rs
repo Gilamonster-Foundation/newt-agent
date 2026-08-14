@@ -339,6 +339,12 @@ pub(crate) fn dispatch(
                 // resolution. Avoids mutating saved config on a live A/B switch.
                 if arg1 == "ollama" && !arg2.is_empty() {
                     unsafe { std::env::set_var("NEWT_DGX_MODEL", arg2) };
+                    // #1668: the model half of this switch IS an operator
+                    // posture action, so it joins the conversation's pin. The
+                    // coarse openai-vs-ollama *kind* is deliberately not a pin
+                    // axis — a pin names a `[[backends]]` entry (`/backends`),
+                    // which is the durable way to say where a conversation runs.
+                    newt_core::runtime::mark_model_pick(arg2);
                 }
                 let choice =
                     resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
@@ -391,6 +397,12 @@ pub(crate) fn dispatch(
                     std::env::set_var("NEWT_PROVIDER", arg1);
                     std::env::remove_var("NEWT_DGX_MODEL");
                 }
+                // #1668: a SUCCESSFUL named-backend pick is an operator posture
+                // action — the one thing that pins this conversation's backend
+                // axis (and clears its model, as above). Marked here, where
+                // success is known: the listing arm above and the unknown-name
+                // arm below mark nothing, so merely LOOKING never pins.
+                newt_core::runtime::mark_backend_pick(arg1);
                 // Persist the choice so it sticks across runs (#545): records
                 // `provider` and clears `model` in ~/.newt/settings.toml, to be
                 // restored next start at the lowest precedence (an explicit
@@ -516,6 +528,11 @@ pub(crate) fn apply_model_choice(name: &str, color: bool, verbose: bool) {
     }
     // SAFETY: single-threaded REPL; the post-command re-resolve reads it.
     unsafe { std::env::set_var("NEWT_DGX_MODEL", name) };
+    // #1668: past the #1122 gate ⇒ the pick really applied, so it is an
+    // operator posture action on the MODEL axis alone. A refused pick returned
+    // above and marks nothing; the backend the operator happens to be on
+    // (possibly a persona's route) is never adopted here.
+    newt_core::runtime::mark_model_pick(name);
     if newt_core::settings::should_persist(is_ephemeral_session()) {
         newt_core::settings::record_model(name);
     }

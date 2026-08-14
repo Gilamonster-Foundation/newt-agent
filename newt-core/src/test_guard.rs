@@ -34,6 +34,12 @@
 //!   model-selection path installs the active family, both process-wide, so a
 //!   test exercising either leaked a per-family default / active family into a
 //!   sibling test's `effective_tenacity()`.
+//! - [`crate::runtime::PreferenceRuntimeSnapshot`] (#1668): the posture-ACTION
+//!   accumulator and the recorded CLI posture axes. Neither feeds
+//!   `effective_*`, but both are process-global operator state written by the
+//!   same commands: an action marked by one test and never drained would be
+//!   attributed to the NEXT test's conversation, and a recorded CLI axis would
+//!   silently suppress another test's pin apply.
 //!
 //! Plus the env vars below, which are *upstream* (model / backend selection →
 //! `ACTIVE_FAMILY`) or *downstream* (cognition wire emission) of the resolutions
@@ -44,6 +50,7 @@
 //! resolution fn, so it is intentionally out of scope here.
 
 use crate::cognition::CognitionRuntimeSnapshot;
+use crate::runtime::PreferenceRuntimeSnapshot;
 use crate::tenacity::TenacityRuntimeSnapshot;
 use std::sync::{Mutex, MutexGuard};
 
@@ -70,6 +77,7 @@ pub struct GlobalSettingsGuard {
     // `Option` only so `Drop` can move the snapshot out into the restore fns.
     cognition: Option<CognitionRuntimeSnapshot>,
     tenacity: Option<TenacityRuntimeSnapshot>,
+    posture: Option<PreferenceRuntimeSnapshot>,
     env: Vec<(&'static str, Option<String>)>,
 }
 
@@ -86,6 +94,7 @@ impl GlobalSettingsGuard {
             _lock: lock,
             cognition: Some(crate::cognition::snapshot_runtime_state()),
             tenacity: Some(crate::tenacity::snapshot_runtime_state()),
+            posture: Some(crate::runtime::snapshot_runtime_state()),
             env,
         }
     }
@@ -98,6 +107,9 @@ impl Drop for GlobalSettingsGuard {
         }
         if let Some(snap) = self.tenacity.take() {
             crate::tenacity::restore_runtime_state(snap);
+        }
+        if let Some(snap) = self.posture.take() {
+            crate::runtime::restore_runtime_state(snap);
         }
         for (k, v) in &self.env {
             // SAFETY: the guard holds the settings lock, so no other guarded test

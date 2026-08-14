@@ -1048,6 +1048,19 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // NEWT_PROVIDER to the backend so the tier→backend selector picks exactly
     // it. This is the explicit escape hatch against discovery/probe drop-ins
     // silently rerouting the session (the local-ollama-fallback incident).
+    //
+    // #1668: an axis THIS invocation set explicitly is recorded, so a resumed
+    // conversation's stored preference pin never overwrites the flag the
+    // operator just typed (the same precedence the `--backend-*` doc above
+    // states). An ambient `NEWT_PROVIDER`/`NEWT_DGX_MODEL` exported by the
+    // operator counts too — config.rs already documents it as always-wins —
+    // but the #545 sticky settings restore below deliberately does NOT: that
+    // is last run's choice, and this conversation's pin outranks it.
+    newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+        backend: std::env::var_os("NEWT_PROVIDER").is_some(),
+        model: std::env::var_os("NEWT_DGX_MODEL").is_some(),
+        ..Default::default()
+    });
     {
         let over = cli.backend.to_override();
         if !over.is_empty() {
@@ -1057,6 +1070,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             if has_destination {
                 // SAFETY: single-threaded before the TUI starts any async work.
                 unsafe { std::env::set_var("NEWT_PROVIDER", provider) };
+                newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+                    backend: true,
+                    ..Default::default()
+                });
             }
         }
     }
@@ -1068,6 +1085,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // the same var the crew-runner build below reads — for full effect.
     if cli.obsessive {
         let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
+        // #1668: both dials were set explicitly this run — a stored pin must
+        // not quietly undo them.
+        newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+            cognition: true,
+            tenacity: true,
+            ..Default::default()
+        });
         // SAFETY: single-threaded before the TUI starts any async work.
         unsafe { std::env::set_var("NEWT_TEAM", "1") };
         eprintln!(
@@ -1081,6 +1105,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // agentic loop reads when it builds each turn's WorkflowRuntimeState.
     if let Some(level) = cli.tenacity {
         newt_core::tenacity::set_cli_tenacity(level);
+        // #1668: explicit this run — beats a resumed conversation's pin.
+        newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+            tenacity: true,
+            ..Default::default()
+        });
     }
 
     // CLI `--cognition`: install the session cognition override (→ the
@@ -1091,6 +1120,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         newt_core::cognition::set_cli_cognition(newt_core::cognition::CognitionOverride::Set(
             level,
         ));
+        // #1668: explicit this run — beats a resumed conversation's pin.
+        newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+            cognition: true,
+            ..Default::default()
+        });
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
@@ -1163,6 +1197,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                         if std::env::var_os("NEWT_PROVIDER").is_none() {
                             if let Some(p) = &loadout.provider {
                                 std::env::set_var("NEWT_PROVIDER", p);
+                                // #1668: a --loadout axis is explicit this run.
+                                newt_core::runtime::record_cli_preference_axes(
+                                    newt_core::PreferenceAxes {
+                                        backend: true,
+                                        ..Default::default()
+                                    },
+                                );
                             }
                         }
                         // Model selection: the catalog resolves `@variant` (catalog
@@ -1172,6 +1213,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                             if let Some(m) = &loadout.model {
                                 let bare = m.split('@').next().unwrap_or(m);
                                 std::env::set_var("NEWT_DGX_MODEL", bare);
+                                // #1668: a --loadout axis is explicit this run.
+                                newt_core::runtime::record_cli_preference_axes(
+                                    newt_core::PreferenceAxes {
+                                        model: true,
+                                        ..Default::default()
+                                    },
+                                );
                             }
                         }
                     }

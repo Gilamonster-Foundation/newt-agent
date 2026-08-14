@@ -2194,6 +2194,88 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Persist a conversation's operator preference pin (#1668) — the
+    /// [`crate::OperatorPreferencePin`] is serialized to JSON and written to the
+    /// conversation row's `preference_pin` column so resuming the conversation
+    /// can re-apply the operator's pinned backend/model/cognition/tenacity.
+    ///
+    /// Like [`update_scratchpad`](Self::update_scratchpad) /
+    /// [`update_plan_snapshot`](Self::update_plan_snapshot) this is metadata,
+    /// not activity: it does **not** tick the §6 clock, so it cannot perturb
+    /// MRU ordering, and the pin is NOT part of the §6 content chain (it rides
+    /// the conversation row, never a turn's canonical encoding) — session
+    /// preference, not provenance. Workspace-fenced and idempotent: an id from
+    /// another workspace resolves as absent and the UPDATE matches nothing.
+    ///
+    /// Authority boundary (see [`crate::OperatorPreferencePin`]'s type doc):
+    /// this column carries operator PREFERENCE only — never OCAP grants,
+    /// caveat clamps, sandbox/capability state, credentials, or endpoints.
+    /// `backend` is a NAME resolved against the operator's own `Config` at
+    /// apply time, so a row can select among backends the operator already
+    /// configured but can never define or reach one.
+    pub fn update_preference_pin(
+        &self,
+        id: &str,
+        pin: &crate::OperatorPreferencePin,
+    ) -> anyhow::Result<()> {
+        let id = self.resolve_id(id)?;
+        let json = serde_json::to_string(pin)?;
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE conversations SET preference_pin = ?2 WHERE id = ?1 AND workspace_key = ?3",
+            rusqlite::params![id, json, self.workspace_id],
+        )?;
+        Ok(())
+    }
+
+    /// Test-only seam (#1668): write RAW text into the `preference_pin` column
+    /// so tests — including ones in dependent crates, which cannot reach the
+    /// private connection — can exercise the tampered / corrupt-row fail-open
+    /// path. Exposed for the same reason [`crate::test_guard`] is: the
+    /// behavior under test spans crates. Production code must use
+    /// [`update_preference_pin`](Self::update_preference_pin), which can only
+    /// ever write a well-formed pin.
+    #[doc(hidden)]
+    pub fn set_raw_preference_pin_for_test(&self, id: &str, raw: &str) -> anyhow::Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE conversations SET preference_pin = ?2 WHERE id = ?1",
+            rusqlite::params![id, raw],
+        )?;
+        Ok(())
+    }
+
+    /// This conversation's operator preference pin (#1668), or `None` when no
+    /// row exists yet (a fresh session's record is created lazily on the first
+    /// saved turn). Workspace-fenced like [`title`](Self::title). Strict
+    /// decode — never hand back garbage (same discipline as the scratchpad /
+    /// plan columns), and `deny_unknown_fields` on the pin makes that strictness
+    /// the authority guard too: a row tampered with authority-shaped keys is
+    /// REFUSED, not silently narrowed. A pre-#1668 row carries the `'{}'`
+    /// backfill and parses to the empty pin, which resume treats as a no-op.
+    pub fn preference_pin(&self, id: &str) -> anyhow::Result<Option<crate::OperatorPreferencePin>> {
+        let conn = self.lock_conn();
+        let json = conn
+            .query_row(
+                "SELECT preference_pin FROM conversations WHERE id = ?1 AND workspace_key = ?2",
+                rusqlite::params![id, self.workspace_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match json {
+            Some(json) => {
+                let pin = serde_json::from_str(&json).map_err(|e| {
+                    anyhow::anyhow!(
+                        "conversation `{id}`: preference_pin column is not a valid \
+                         operator preference pin ({e}); refusing to load garbage"
+                    )
+                })?;
+                Ok(Some(pin))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Delete a conversation (its turns cascade) and, best-effort, its
     /// per-session plan dir (issue #220).
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
@@ -3127,7 +3209,8 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              scratchpad         TEXT NOT NULL DEFAULT '{}', -- JSON scratchpad <state> snapshot (#713); working memory, NOT hashed (§6 chain unchanged)
              plan               TEXT NOT NULL DEFAULT '{}', -- JSON plan-ledger snapshot (#715); working memory, NOT hashed (§6 chain unchanged)
              roadmap_id         TEXT,                      -- #1030: roadmap this conv's Plan node belongs to (NULL = ad-hoc chat); thin pointer, tree lives in `roadmaps`
-             node_id            TEXT                       -- #1030: the `roadmaps` tree Subtask id this conversation realizes (NULL = ad-hoc chat)
+             node_id            TEXT,                      -- #1030: the `roadmaps` tree Subtask id this conversation realizes (NULL = ad-hoc chat)
+             preference_pin     TEXT NOT NULL DEFAULT '{}' -- JSON OperatorPreferencePin (#1668): operator-pinned backend/model/cognition/tenacity; metadata, NOT hashed (§6 chain unchanged)
          );
          CREATE TABLE IF NOT EXISTS turns (
              conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -3357,6 +3440,16 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             // so every existing tip_hash chain still verifies byte-for-byte.
             ("roadmap_id", "TEXT"),
             ("node_id", "TEXT"),
+            // #1668: the operator PREFERENCE pin (backend/model/cognition/
+            // tenacity picks) a conversation carries across resume. Additive —
+            // an older db gains it on open with the historically-true empty
+            // backfill (`{}` = nothing pinned, so resume changes nothing). It
+            // rides the conversation row, NOT a turn, so it is NEVER part of
+            // the §6 canonical encoding: session metadata, not provenance.
+            // Named `preference_pin`, not `posture`, so it is never confused
+            // with #307's `ActivePosture` authority clamp — which is
+            // process-lifetime and deliberately NOT persisted anywhere.
+            ("preference_pin", "TEXT NOT NULL DEFAULT '{}'"),
         ],
     ),
     (
@@ -4502,6 +4595,162 @@ mod tests {
 
         // Workspace fence: another workspace cannot read this title.
         assert_eq!(store_b.title(&id).unwrap(), None);
+    }
+
+    /// #1668: the posture pin round-trips through the conversation row,
+    /// defaults to the empty pin (`'{}'`), and is workspace-fenced like the
+    /// other row metadata.
+    #[test]
+    fn preference_pin_round_trips_defaults_empty_and_is_workspace_fenced() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let store_a = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+
+        let id = store_a.create("pinned work", None).unwrap();
+        // A fresh row carries the '{}' default — the EMPTY pin, not None and
+        // not an error (resume treats it as a no-op).
+        let fresh = store_a.preference_pin(&id).unwrap().expect("row exists");
+        assert!(fresh.is_empty(), "fresh row must read as nothing pinned");
+
+        let pin = crate::OperatorPreferencePin {
+            backend: Some("sol".into()),
+            model: Some("gpt-5.6-sol".into()),
+            cognition: Some("off".into()),
+            tenacity: Some(crate::Tenacity::Relentless),
+        };
+        store_a.update_preference_pin(&id, &pin).unwrap();
+        assert_eq!(store_a.preference_pin(&id).unwrap(), Some(pin.clone()));
+
+        // A not-yet-persisted id has no row — None, not an error.
+        assert_eq!(
+            store_a.preference_pin("no-such-conversation").unwrap(),
+            None
+        );
+
+        // Workspace fence: another workspace can neither read nor write it.
+        assert_eq!(store_b.preference_pin(&id).unwrap(), None);
+        assert!(store_b
+            .update_preference_pin(&id, &crate::OperatorPreferencePin::default())
+            .is_err());
+        assert_eq!(store_a.preference_pin(&id).unwrap(), Some(pin));
+    }
+
+    /// #1668: posture writes are metadata — they must not tick the §6
+    /// activity clock, so pinning posture can never perturb MRU ordering
+    /// (same contract as `rename` / `update_scratchpad`).
+    #[test]
+    fn update_preference_pin_does_not_tick_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+        let older = store.create("older", None).unwrap();
+        store.append_turn(&older, "q", "a").unwrap();
+        let newer = store.create("newer", None).unwrap();
+        store.append_turn(&newer, "q", "a").unwrap();
+
+        let tick_of = |id: &str| -> i64 {
+            let conn = store.lock_conn();
+            conn.query_row(
+                "SELECT activity_tick FROM conversations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let before = tick_of(&older);
+        store
+            .update_preference_pin(
+                &older,
+                &crate::OperatorPreferencePin {
+                    tenacity: Some(crate::Tenacity::Relaxed),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(tick_of(&older), before, "posture must not bump the tick");
+        assert_eq!(store.latest_open().unwrap().unwrap().id, newer);
+    }
+
+    /// #1668: a database written by an older newt (no `posture` column) gains
+    /// the column on open via the additive schema reconciliation, with the
+    /// empty backfill — old conversations read as "nothing pinned".
+    #[test]
+    fn older_database_gains_the_preference_pin_column_on_open() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let id;
+        {
+            let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+            id = store.create("pre-1668 conversation", None).unwrap();
+            let conn = store.lock_conn();
+            // Simulate the pre-#1668 schema by dropping the column outright.
+            conn.execute_batch("ALTER TABLE conversations DROP COLUMN preference_pin")
+                .unwrap();
+        }
+        let reopened = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let pin = reopened.preference_pin(&id).unwrap().expect("row survives");
+        assert!(pin.is_empty(), "backfill must read as nothing pinned");
+    }
+
+    /// #1668: strict decode — a corrupted `preference_pin` column is an error,
+    /// never a silently-garbled pin (same discipline as the scratchpad/plan
+    /// columns; resume callers degrade the error to a fail-open notice).
+    #[test]
+    fn corrupt_preference_pin_column_refuses_to_load_garbage() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let id = store.create("garbled", None).unwrap();
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "UPDATE conversations SET preference_pin = 'not json' WHERE id = ?1",
+                [&id],
+            )
+            .unwrap();
+        }
+        let err = store.preference_pin(&id).unwrap_err().to_string();
+        assert!(err.contains("refusing to load garbage"), "{err}");
+    }
+
+    /// #1668 authority boundary: a `preference_pin` column tampered with
+    /// authority-shaped keys — credentials, endpoints, caveat clamps, sandbox
+    /// or permission state — is REFUSED, so the persistence layer cannot
+    /// smuggle authority into a session even when the row is hostile. The
+    /// resume path degrades the refusal to a notice and runs on the invocation
+    /// baseline (`a_corrupt_pin_falls_open_to_the_invocation_baseline` in
+    /// newt-tui grounds that half).
+    #[test]
+    fn a_tampered_preference_pin_column_cannot_carry_authority_state() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let id = store.create("tampered", None).unwrap();
+        for hostile in [
+            r#"{"backend":"sol","api_key":"sk-evil"}"#,
+            r#"{"backend":"sol","endpoint":"http://evil.example:9"}"#,
+            r#"{"caveats":{"fs":"unrestricted"}}"#,
+            r#"{"sandbox":"off","permissions":["all"]}"#,
+            r#"{"ocap":["fs:/"],"cognition":"off"}"#,
+        ] {
+            store.set_raw_preference_pin_for_test(&id, hostile).unwrap();
+            let err = store
+                .preference_pin(&id)
+                .expect_err(&format!("must refuse: {hostile}"))
+                .to_string();
+            assert!(err.contains("refusing to load garbage"), "{err}");
+        }
+        // And a WELL-FORMED pin still round-trips — the refusal is about the
+        // smuggled keys, not about pins in general.
+        let honest = crate::OperatorPreferencePin {
+            backend: Some("sol".into()),
+            ..Default::default()
+        };
+        store.update_preference_pin(&id, &honest).unwrap();
+        assert_eq!(store.preference_pin(&id).unwrap(), Some(honest));
     }
 
     #[test]
