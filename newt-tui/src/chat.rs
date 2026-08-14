@@ -1204,7 +1204,8 @@ pub(crate) fn run_chat(
     // #1640: remember which morphology we chose. Only the RICH surface has an
     // interactive spill viewport, so only it should collapse committed tool
     // output into a truncated excerpt; the LEAN surface shows the whole thing
-    // (see `committed_spill_lines`).
+    // (see `committed_spill_lines`). The transcript pager (#1670) gates on the
+    // same flag — scrollable regions are rich-only.
     let surface_is_rich;
     let mut surface: Box<dyn InputSurface> = {
         #[cfg(feature = "rich-tui")]
@@ -2651,6 +2652,69 @@ pub(crate) fn run_chat(
                             color,
                             verbose,
                         );
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // #1670 (meta-scroller Layer 2): the transcript view. On the
+                    // RICH surface a full-screen pager — pinned green spine,
+                    // foldable grey tool blocks, the whole stored conversation.
+                    // On LEAN, the plain printed spine (`conversation_show_message`)
+                    // — the plain-scroller charter: no scroll regions, ever.
+                    if slash_md == "transcript" {
+                        match conversation_store.as_ref() {
+                            Some(store) => match store.exists(&active_conversation_id) {
+                                Ok(true) => match store.load(&active_conversation_id) {
+                                    Ok(record) if record.turns.is_empty() => print_newt(
+                                        "no saved turns yet — the transcript begins after \
+                                         the first completed turn.",
+                                        color,
+                                        verbose,
+                                    ),
+                                    Ok(record) => {
+                                        if surface_is_rich {
+                                            let mut pager =
+                                                crate::transcript_pager::PagerState::new(
+                                                    &record.title,
+                                                    &record.turns,
+                                                );
+                                            if let Err(e) =
+                                                crate::transcript_pager::run_pager(&mut pager)
+                                            {
+                                                print_newt(
+                                                    &format!("transcript pager error: {e}"),
+                                                    color,
+                                                    verbose,
+                                                );
+                                            }
+                                        } else {
+                                            print_newt(
+                                                &conversation_show_message(&record),
+                                                color,
+                                                verbose,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => print_newt(
+                                        &format!("could not load this conversation: {e}"),
+                                        color,
+                                        verbose,
+                                    ),
+                                },
+                                Ok(false) => print_newt(
+                                    "no saved turns yet — the transcript begins after the \
+                                     first completed turn.",
+                                    color,
+                                    verbose,
+                                ),
+                                Err(e) => print_newt(
+                                    &format!("could not read the conversation store: {e}"),
+                                    color,
+                                    verbose,
+                                ),
+                            },
+                            None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
+                        }
                         surface.save_history();
                         println!();
                         continue;

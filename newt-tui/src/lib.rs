@@ -30,6 +30,7 @@ mod prompt;
 mod prompt_visibility_test;
 #[cfg(feature = "live-spill")]
 mod spill_view;
+mod transcript_pager;
 mod type_ahead;
 // OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).
 mod mcp;
@@ -10517,6 +10518,25 @@ Markers: ▶ current · ● open in another newt · ○ resumable. Reopening a
 conversation another live newt holds is refused (it would mix turns) —
 this is how #1030 keeps multiple newts from colliding."
         }
+        "transcript" => {
+            "\
+/transcript — review the WHOLE current conversation (#1670)
+
+On the RICH surface: a full-screen pager where the conversation spine —
+your › prompts and the model's ▸ replies — is the structure. Scroll
+freely; the grey per-turn tool blocks are folded behind ⚙ headers.
+
+  q / Esc          leave the pager (the screen is restored)
+  ↑↓ / j k         scroll by line        PgUp/PgDn      page
+  Ctrl-U / Ctrl-D  half page             g / G          top / bottom
+  n / p            next / previous message (jump the spine)
+  Enter/Space/Tab  fold or unfold the current turn's tool block
+
+On the LEAN surface the same command PRINTS the spine into scrollback —
+the plain scroller has no scroll regions, by charter. Tool detail shown
+is the stored summary (name · ok · duration); raw tool output is never
+persisted."
+        }
         "roadmap" => {
             "\
 /roadmap [sub] — manage the per-session planning roadmap
@@ -10944,6 +10964,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)",
         "  /start [title]           - begin a new conversation, leaving the current one open to /resume",
         "  /rename <title>          - retitle the current conversation so it is easy to find in /resume",
+        "  /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)",
         "  /conversation list       - list saved conversations",
         "  /conversation show <id>  - show a saved conversation",
         "  /conversation restore <id> - restore a saved conversation",
