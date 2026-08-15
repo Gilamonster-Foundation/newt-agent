@@ -835,6 +835,33 @@ fn overflow_decision() -> DecisionLock {
     }
 }
 
+/// Negative-imperative cues that mark a clause as a PROHIBITION over a list,
+/// not an ambiguous choice the operator must resolve. "Do NOT implement A,
+/// B, or C" enumerates forbidden actions; it is not "should we implement A
+/// or B?" — the `" or "` + trigger-word heuristic below cannot tell those
+/// apart without this check (#1707). #1689 item 5 tracks moving this and the
+/// sibling needle lists into the droppable `DispositionLexicon`; kept as a
+/// plain list here to keep this fix narrow.
+const NEGATION_CUES: &[&str] = &[
+    "do not ",
+    "don't ",
+    "does not ",
+    "doesn't ",
+    "must not ",
+    "must never ",
+    "should not ",
+    "shouldn't ",
+    "never ",
+    "avoid ",
+];
+
+/// A clause that OPENS with a negation cue is a prohibition, never an
+/// ambiguous choice — regardless of how many items it enumerates with "or".
+fn is_negative_imperative(lower: &str) -> bool {
+    let trimmed = lower.trim_start();
+    NEGATION_CUES.iter().any(|cue| trimmed.starts_with(cue))
+}
+
 fn needs_operator_decision(lower: &str) -> bool {
     contains_any(
         lower,
@@ -849,7 +876,9 @@ fn needs_operator_decision(lower: &str) -> bool {
             "which backend",
             "which provider",
         ],
-    ) || (lower.contains(" or ") && contains_any(lower, &["should", "use", "implement"]))
+    ) || (!is_negative_imperative(lower)
+        && lower.contains(" or ")
+        && contains_any(lower, &["should", "use", "implement"]))
 }
 
 /// A destructive verb with a bare demonstrative/pronoun has no grounded
@@ -1201,6 +1230,40 @@ mod tests {
 
         let grounded = PromptIntake::analyze("Delete scratch/obsolete.txt.");
         assert_eq!(grounded.disposition(), PromptDisposition::Act);
+    }
+
+    #[test]
+    fn negated_enumeration_is_not_an_ambiguous_decision() {
+        // #1707 field regression: a live session hung at the clarification
+        // gate on a scoped task prompt containing this exact scope-discipline
+        // bullet. `needs_operator_decision`'s `" or " + trigger-word` branch
+        // (meant for "should we use X or Y") cannot tell that from "Do NOT
+        // implement A, B, or C" — a prohibition over a list, not a choice.
+        let prompt = "Do NOT implement execution lifecycle, Brush streaming, \
+             RemoteFence, OpenShell, or Wyvern integration here.";
+        let intake = PromptIntake::analyze(prompt);
+        assert_eq!(
+            intake.disposition(),
+            PromptDisposition::Act,
+            "a negated enumeration must not block execution on a bogus decision lock: {:#?}",
+            intake.manifest().decisions()
+        );
+        assert_eq!(intake.manifest().pending_decision_count(), 0);
+
+        // Sibling phrasings from the same field prompt must stay unaffected.
+        let also_negated = PromptIntake::analyze(
+            "Do not create a second proxy supervisor in execution, \
+             tool-shell, Wyvern, or transport code.",
+        );
+        assert_eq!(also_negated.disposition(), PromptDisposition::Act);
+
+        let never_form =
+            PromptIntake::analyze("Never implement caching or memoization in this layer.");
+        assert_eq!(never_form.disposition(), PromptDisposition::Act);
+
+        // A genuine ambiguous choice — no negation — must still be caught.
+        let genuine = PromptIntake::analyze("Should we use SQLite or Postgres for the cache?");
+        assert_eq!(genuine.disposition(), PromptDisposition::Ask);
     }
 
     #[test]
