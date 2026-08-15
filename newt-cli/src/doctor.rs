@@ -424,8 +424,26 @@ mod tests {
         let lines = security_posture_lines(&report);
         assert_eq!(lines.len(), Guarantee::ALL.len() + 1);
         assert_eq!(lines[0], "platform: linux");
-        // Disclosure filtering is enforced on the live path; the render says so.
-        assert!(lines.iter().any(|l| l == "disclosure-filtering: enforced"));
+        // #1711: disclosure filtering is a per-THREAD probe, not a build-wide
+        // constant. `doctor` runs with no session filter installed, so the
+        // honest render is OPEN — and, like the b1 rows below, it names its
+        // deviation rather than silently claiming the guarantee.
+        assert!(lines
+            .iter()
+            .any(|l| l == "disclosure-filtering: OPEN (disclosure-gate-live-path)"));
+        // …and the render still tracks the verifier: with the backstop actually
+        // installed on this thread, the same code path says enforced. Without
+        // this half the assertion above would pass against a render that had
+        // simply hard-coded the row.
+        {
+            let mut filter = newt_core::ocap::DisclosureFilter::new();
+            filter.register("sk-probe-9f3a2b7c1d4e6a8b");
+            let _guard = newt_core::ocap::scoped_session_disclosure(filter);
+            let live = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+            assert!(security_posture_lines(&live)
+                .iter()
+                .any(|l| l == "disclosure-filtering: enforced"));
+        }
         // b1-gated guarantees are honestly OPEN, not silently claimed.
         assert!(lines
             .iter()
