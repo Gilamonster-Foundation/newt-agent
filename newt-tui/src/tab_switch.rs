@@ -1137,6 +1137,140 @@ mod state_machine_tests {
         );
     }
 
+    /// The ADR's #1668 contract test: **two tabs with DIFFERENT pins**.
+    ///
+    /// The unpinned-vs-pinned case above proves a tab does not inherit; this
+    /// proves the stronger thing — two tabs each carrying their own pin swap
+    /// the whole route quintet and both dials cleanly, in both directions, with
+    /// no residue from the other.
+    #[test]
+    fn two_tabs_with_different_pins_swap_cleanly_in_both_directions() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol", "other"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        h.store
+            .update_preference_pin(
+                &a,
+                &newt_core::OperatorPreferencePin {
+                    backend: Some("sol".into()),
+                    tenacity: Some(newt_core::Tenacity::Relentless),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let b = h.durable("B");
+        h.store
+            .update_preference_pin(
+                &b,
+                &newt_core::OperatorPreferencePin {
+                    backend: Some("other".into()),
+                    cognition: Some("contemplating".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        h.open_tab_on(&mut tabs, &b);
+
+        let posture = |h: &Harness| {
+            (
+                std::env::var("NEWT_PROVIDER").ok(),
+                h.choice.name.clone(),
+                h.inf_url.clone(),
+                h.inf_model.clone(),
+                h.inf_kind,
+                newt_core::cognition::cli_cognition(),
+                newt_core::tenacity::cli_tenacity(),
+            )
+        };
+
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+        let on_a = posture(&h);
+        assert_eq!(on_a.0.as_deref(), Some("sol"));
+        assert_eq!(on_a.6, Some(newt_core::Tenacity::Relentless));
+        assert_eq!(
+            newt_core::cognition::cli_cognition(),
+            newt_core::cognition::CognitionOverride::Unset,
+            "A pins no cognition, so it must show the baseline — not B's"
+        );
+
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 1).unwrap();
+        }
+        let on_b = posture(&h);
+        assert_eq!(on_b.0.as_deref(), Some("other"));
+        assert_eq!(
+            on_b.6, None,
+            "B pins no tenacity, so A's Relentless must NOT survive the switch"
+        );
+
+        // And back — history-independent, so A's posture is byte-identical.
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+        assert_eq!(
+            posture(&h),
+            on_a,
+            "A→B→A restores A's whole posture exactly"
+        );
+    }
+
+    /// The outgoing tab keeps its claim across a switch — that is what makes it
+    /// a tab rather than a replaced conversation. Only close and exit release.
+    #[test]
+    fn the_outgoing_tabs_claim_is_held_across_a_switch() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        let b = h.durable("B");
+        h.open_tab_on(&mut tabs, &b);
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+            activate_tab(&mut ctx, &mut tabs, 1).unwrap();
+        }
+        // Both conversations are still this session's, and both tabs still name
+        // them — a switch released nothing.
+        let mut held = tabs.claimed_conversations();
+        held.sort_unstable();
+        let mut expected = vec![a.as_str(), b.as_str()];
+        expected.sort_unstable();
+        assert_eq!(held, expected, "both claims survive the switch");
+    }
+
+    /// Close is release-WITHOUT-end: the conversation stays open and resumable.
+    #[test]
+    fn closing_a_tab_leaves_its_conversation_resumable() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let b = h.durable("B");
+        h.open_tab_on(&mut tabs, &b);
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+            close_tab(&mut ctx, &mut tabs, 1).unwrap();
+        }
+        assert!(
+            h.store.exists(&b).unwrap(),
+            "close must not end the conversation — /end is that verb"
+        );
+        // Released, so it can be claimed and resumed again.
+        assert!(matches!(
+            h.store.claim(&b).unwrap(),
+            newt_core::ClaimOutcome::Claimed
+        ));
+        assert!(
+            tabs.find_by_conversation(&b).is_none(),
+            "and no tab still names it"
+        );
+    }
+
     // ── 5-7. duplicate conversations are impossible ───────────────────────
 
     /// Blocker 2, front door one: `/resume`'s target.
