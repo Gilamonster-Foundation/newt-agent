@@ -10567,6 +10567,15 @@ pub(crate) trait SpillInput: Sync {
     fn scroll_down(&self) -> bool;
     #[cfg(unix)]
     fn toggle_expanded(&self) -> bool;
+    /// #1704: expand the viewport to half the visible console height.
+    #[cfg(unix)]
+    fn expand_half(&self) -> bool;
+    /// #1704: is the user scrolled back (explore mode, not following the tail)?
+    #[cfg(unix)]
+    fn is_exploring(&self) -> bool;
+    /// #1704: leave explore mode — snap back to following the tail.
+    #[cfg(unix)]
+    fn exit_explore(&self) -> bool;
     #[cfg(unix)]
     fn refresh_geometry(&self) -> bool;
     // #1303 step 5: editor-mode nav targets (vi `gg`/`G`/`C-d`/`C-u`, emacs
@@ -10596,6 +10605,21 @@ impl SpillInput for live_spill::LiveSpillRenderer {
     #[cfg(unix)]
     fn toggle_expanded(&self) -> bool {
         self.toggle_expanded()
+    }
+
+    #[cfg(unix)]
+    fn expand_half(&self) -> bool {
+        self.expand_half()
+    }
+
+    #[cfg(unix)]
+    fn is_exploring(&self) -> bool {
+        self.is_exploring()
+    }
+
+    #[cfg(unix)]
+    fn exit_explore(&self) -> bool {
+        self.exit_explore()
     }
 
     #[cfg(unix)]
@@ -10630,6 +10654,9 @@ enum TurnKey {
     Up,
     Down,
     ToggleExpanded,
+    /// Ctrl-t (#1704): expand the spill viewport to half the visible console
+    /// height — a middle stop between collapsed and full-expand (Space).
+    ExpandHalf,
     // #1303 step 5: editor-mode nav targets (vi `gg`/`G`/`C-d`/`C-u`, emacs
     // paging). Produced and dispatched only under `live-spill` — the wyvern
     // build never links them.
@@ -10897,6 +10924,16 @@ impl TurnKeyDecoder {
     /// in) is layered on top; every remaining ground byte becomes type-ahead
     /// text instead of vanishing.
     fn push_ground_key(&mut self, byte: u8, keys: &mut Vec<TurnKey>) {
+        // Ctrl-t (#1704): expand to half the console. A control key, never
+        // type-ahead text, and valid whether or not the buffer is empty.
+        if byte == 0x14 {
+            keys.push(TurnKey::ExpandHalf);
+            #[cfg(feature = "live-spill")]
+            {
+                self.pending_g = false;
+            }
+            return;
+        }
         if matches!(byte, b' ' | b'\r' | b'\n') && self.text.is_empty() {
             keys.push(TurnKey::ToggleExpanded);
             #[cfg(feature = "live-spill")]
@@ -11011,6 +11048,9 @@ fn dispatch_turn_keys(decoder: &mut TurnKeyDecoder, bytes: &[u8], spill: Option<
             }
             TurnKey::ToggleExpanded => {
                 spill.toggle_expanded();
+            }
+            TurnKey::ExpandHalf => {
+                spill.expand_half();
             }
             #[cfg(feature = "live-spill")]
             TurnKey::Top => {
@@ -11513,6 +11553,15 @@ mod interrupt_tests {
                 self.toggled.fetch_add(1, Ordering::Relaxed);
                 true
             }
+            fn expand_half(&self) -> bool {
+                true
+            }
+            fn is_exploring(&self) -> bool {
+                false
+            }
+            fn exit_explore(&self) -> bool {
+                true
+            }
             fn refresh_geometry(&self) -> bool {
                 true
             }
@@ -11585,6 +11634,136 @@ mod interrupt_tests {
         assert_eq!(spill.toggled.load(Ordering::Relaxed), 1);
         assert!(!cancel.load(Ordering::Relaxed));
         assert!(!hard.load(Ordering::Relaxed));
+    }
+
+    /// #1704: while the spill viewport is in explore mode (scrolled back off the
+    /// tail), a lone Esc must LEAVE explore mode — not cancel the turn. A second
+    /// Esc, now that the view follows the tail again, is the real interrupt.
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn watcher_esc_exits_explore_before_interrupting() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        #[derive(Default)]
+        struct ExploringSpill {
+            exploring: AtomicBool,
+            exited: AtomicUsize,
+        }
+        impl SpillInput for ExploringSpill {
+            fn scroll_up(&self) -> bool {
+                true
+            }
+            fn scroll_down(&self) -> bool {
+                true
+            }
+            fn toggle_expanded(&self) -> bool {
+                true
+            }
+            fn expand_half(&self) -> bool {
+                true
+            }
+            fn is_exploring(&self) -> bool {
+                self.exploring.load(Ordering::Relaxed)
+            }
+            fn exit_explore(&self) -> bool {
+                self.exited.fetch_add(1, Ordering::Relaxed);
+                // Leaving explore mode → the view now follows the tail again.
+                self.exploring.store(false, Ordering::Relaxed);
+                true
+            }
+            fn refresh_geometry(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn scroll_to_top(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn scroll_to_bottom(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn half_page_up(&self) -> bool {
+                true
+            }
+            #[cfg(feature = "live-spill")]
+            fn half_page_down(&self) -> bool {
+                true
+            }
+        }
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let cancel = AtomicBool::new(false);
+        let hard = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        let spill = ExploringSpill {
+            exploring: AtomicBool::new(true),
+            ..ExploringSpill::default()
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                watch_for_interrupt_fd(
+                    pipe[0],
+                    &cancel,
+                    &hard,
+                    &stop,
+                    Some(&spill),
+                    newt_core::EditMode::Nano,
+                    false,
+                    10,
+                    // Short grace so a lone Esc resolves quickly in the test.
+                    30,
+                );
+            });
+            let write = |bytes: &[u8]| {
+                assert_eq!(
+                    unsafe { libc::write(pipe[1], bytes.as_ptr().cast(), bytes.len()) },
+                    bytes.len() as isize
+                );
+            };
+            let wait_for = |cond: &dyn Fn() -> bool| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                while !cond() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+
+            // 1st lone Esc while exploring → exits explore, NO cancel.
+            write(&[0x1b]);
+            wait_for(&|| spill.exited.load(Ordering::Relaxed) == 1);
+            assert_eq!(spill.exited.load(Ordering::Relaxed), 1);
+            assert!(
+                !cancel.load(Ordering::Relaxed),
+                "exploring Esc must not cancel the turn"
+            );
+
+            // 2nd lone Esc, now following the tail → the real interrupt.
+            write(&[0x1b]);
+            wait_for(&|| cancel.load(Ordering::Relaxed));
+            assert!(
+                cancel.load(Ordering::Relaxed),
+                "Esc after leaving explore cancels"
+            );
+            assert_eq!(spill.exited.load(Ordering::Relaxed), 1);
+
+            stop.store(true, Ordering::Relaxed);
+            write(b"x");
+        });
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// #1704: Ctrl-t (0x14) decodes to the half-expand key.
+    #[test]
+    fn ctrl_t_decodes_to_expand_half() {
+        let mut d = TurnKeyDecoder::default();
+        assert_eq!(d.feed(b"\x14"), vec![TurnKey::ExpandHalf]);
+        // And it does not leak into the type-ahead text buffer.
+        assert!(d.take_text().is_empty());
     }
 }
 
@@ -11796,7 +11975,18 @@ fn watch_for_interrupt_fd(
             };
             let m = unsafe { libc::poll(&mut pfd2, 1, escape_grace_ms) };
             if m <= 0 {
-                interrupt = true;
+                // A real lone Esc press. #1704: if the spill viewport is in
+                // explore mode (scrolled back off the tail), the FIRST Esc
+                // leaves explore mode and restores follow-tail — it must NOT
+                // cancel the turn. Only an Esc pressed while following the tail
+                // (or with no live spill) is an interrupt.
+                if spill.is_some_and(|s| s.is_exploring()) {
+                    if let Some(s) = spill {
+                        s.exit_explore();
+                    }
+                } else {
+                    interrupt = true;
+                }
             } else {
                 // Feed Esc and its continuation through one persistent decoder;
                 // `[A`/`[B` may themselves be split across later reads.

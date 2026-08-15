@@ -235,6 +235,31 @@ impl LiveSpillRenderer {
         self.scroll(SpillView::toggle_expanded)
     }
 
+    /// #1704 (Ctrl-t): expand to half the console height.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub(crate) fn expand_half(&self) -> bool {
+        self.scroll(SpillView::expand_half)
+    }
+
+    /// #1704: is the user scrolled back off the tail (explore mode)?
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub(crate) fn is_exploring(&self) -> bool {
+        let state = self.lock_state();
+        state
+            .view
+            .as_ref()
+            .is_some_and(|view| !view.is_following_tail())
+    }
+
+    /// #1704 (Esc while exploring): leave explore mode — snap back to the tail.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub(crate) fn exit_explore(&self) -> bool {
+        self.scroll(SpillView::scroll_to_bottom)
+    }
+
     // #1303 step 5: editor-mode nav (vi `gg`/`G`/`C-d`/`C-u`, emacs paging),
     // each riding the same single-owner `scroll` write discipline. Reached ONLY
     // through the `#[cfg(unix)]` keyboard-watcher `SpillInput` impl (no test
@@ -738,6 +763,7 @@ fn run_input_repaint(
     }
 }
 
+#[allow(dead_code)]
 fn erase_generation(
     output: &Mutex<OutputState>,
     abandoned_through: &AtomicU64,
@@ -756,6 +782,7 @@ fn erase_generation(
     }
 }
 
+#[allow(dead_code)]
 fn erase_output(
     output: &mut OutputState,
     columns: usize,
@@ -796,6 +823,7 @@ fn is_abandoned(abandoned_through: &AtomicU64, generation: u64) -> bool {
     generation <= abandoned_through.load(Ordering::Acquire)
 }
 
+#[allow(dead_code)]
 fn rendered_width(text: &str) -> usize {
     text.chars()
         .map(|ch| {
