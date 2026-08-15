@@ -835,18 +835,25 @@ fn overflow_decision() -> DecisionLock {
     }
 }
 
-/// Negative-imperative cues that mark a clause as a PROHIBITION over a list,
-/// not an ambiguous choice the operator must resolve. "Do NOT implement A,
-/// B, or C" enumerates forbidden actions; it is not "should we implement A
-/// or B?" — the `" or "` + trigger-word heuristic below cannot tell those
-/// apart without this check (#1707). #1689 item 5 tracks moving this and the
-/// sibling needle lists into the droppable `DispositionLexicon`; kept as a
-/// plain list here to keep this fix narrow.
+/// Cues that mark a clause as a directive negation — "do not do X",
+/// commanding the operator — rather than a descriptive one. Deliberately
+/// excludes `"does not "` / `"doesn't "`: those are third-person indicative
+/// ("the shim does not use SQLite or Postgres" describes behavior, it does
+/// not command anything), and folding them into a "prohibition" cue list
+/// would claim a mood this classifier cannot actually detect (#1708).
+///
+/// `"never "` and `"don't "` are kept even though English also permits an
+/// indicative reading of both ("it never does X", "they don't do X"). This
+/// classifier does not attempt that disambiguation beyond the interrogative
+/// check in [`is_directive_prohibition`] — a rare indicative "never"/"don't"
+/// clause that also contains " or " + a trigger word can still be misread
+/// as a prohibition. #1689 item 6 tracks the general problem; #1689 item 5
+/// tracks moving this and the sibling needle lists into the droppable
+/// `DispositionLexicon`. Both are out of scope here — kept as a plain list
+/// to keep this fix narrow.
 const NEGATION_CUES: &[&str] = &[
     "do not ",
     "don't ",
-    "does not ",
-    "doesn't ",
     "must not ",
     "must never ",
     "should not ",
@@ -855,30 +862,80 @@ const NEGATION_CUES: &[&str] = &[
     "avoid ",
 ];
 
-/// A clause that OPENS with a negation cue is a prohibition, never an
-/// ambiguous choice — regardless of how many items it enumerates with "or".
-fn is_negative_imperative(lower: &str) -> bool {
-    let trimmed = lower.trim_start();
-    NEGATION_CUES.iter().any(|cue| trimmed.starts_with(cue))
+/// Leading words that can precede a directive without changing its mood: a
+/// politeness filler or an explicit second-person subject. Stripped before
+/// testing for a negation cue, so "Please do not X" and "You must not X"
+/// are recognized the same as "Do not X" (#1708).
+const DIRECTIVE_SUBJECT_PREFIXES: &[&str] = &["please ", "you "];
+
+/// Strip a leading single-word "Label: " prefix — "Constraint:", "Rule:",
+/// "Note:" — before testing for a negation cue (#1708). Generic on purpose:
+/// instruction labels are free-form operator vocabulary, not a fixed phrase
+/// list to keep in sync. Deliberately requires a single alphabetic word (no
+/// spaces) immediately before the colon so an unrelated mid-clause colon —
+/// "the old value was: never mind" — is never mistaken for a label.
+fn strip_leading_label(s: &str) -> &str {
+    if let Some(colon) = s.find(':') {
+        let (label, rest) = s.split_at(colon);
+        if (2..=20).contains(&label.len())
+            && label.chars().all(|c| c.is_ascii_alphabetic())
+            && rest.starts_with(": ")
+        {
+            return rest[": ".len()..].trim_start();
+        }
+    }
+    s
 }
 
+/// Is `lower` (an already-lowercased atomic ask) a directive prohibition —
+/// a negated command to the operator — rather than a question or a
+/// descriptive statement?
+///
+/// A question mark is decisive either way: "Shouldn't we use X or Y?" opens
+/// with a negated auxiliary but is asking, not commanding, so a `?`
+/// anywhere in the clause vetoes prohibition classification outright. This
+/// is intentionally cruder than parsing subject-auxiliary inversion — it
+/// will also (wrongly) veto a genuine prohibition that ends in a
+/// rhetorical "...understood?", which is an accepted, narrow limitation
+/// (#1708) rather than a claim this function does not make.
+fn is_directive_prohibition(lower: &str) -> bool {
+    if lower.contains('?') {
+        return false;
+    }
+    let mut clause = strip_leading_label(lower.trim_start());
+    while let Some(rest) = DIRECTIVE_SUBJECT_PREFIXES
+        .iter()
+        .find_map(|prefix| clause.strip_prefix(prefix))
+    {
+        clause = rest;
+    }
+    NEGATION_CUES.iter().any(|cue| clause.starts_with(cue))
+}
+
+/// A clause needs an explicit operator decision only when it poses a real
+/// choice. "Do NOT implement A, B, or C" and "Never select A or B" name a
+/// prohibition, not a question — [`is_directive_prohibition`] gates both
+/// the `choose`/`select`/`pick` needles and the `" or "` + trigger-word
+/// heuristic below so a prohibited clause cannot trip either (#1707,
+/// #1708). It intentionally does NOT gate `"either "`/`"tbd"`/`"which
+/// ..."`: a negated form of those is rare and out of scope for this fix.
 fn needs_operator_decision(lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "either ",
-            "choose ",
-            "select ",
-            "pick ",
-            "tbd",
-            "to be decided",
-            "which option",
-            "which backend",
-            "which provider",
-        ],
-    ) || (!is_negative_imperative(lower)
-        && lower.contains(" or ")
-        && contains_any(lower, &["should", "use", "implement"]))
+    let prohibition = is_directive_prohibition(lower);
+    (!prohibition && contains_any(lower, &["choose ", "select ", "pick "]))
+        || contains_any(
+            lower,
+            &[
+                "either ",
+                "tbd",
+                "to be decided",
+                "which option",
+                "which backend",
+                "which provider",
+            ],
+        )
+        || (!prohibition
+            && lower.contains(" or ")
+            && contains_any(lower, &["should", "use", "implement"]))
 }
 
 /// A destructive verb with a bare demonstrative/pronoun has no grounded
@@ -1264,6 +1321,93 @@ mod tests {
         // A genuine ambiguous choice — no negation — must still be caught.
         let genuine = PromptIntake::analyze("Should we use SQLite or Postgres for the cache?");
         assert_eq!(genuine.disposition(), PromptDisposition::Ask);
+    }
+
+    /// #1708: `is_directive_prohibition` must recognize a negation wrapped
+    /// in a politeness filler, a second-person subject, or a "Label: "
+    /// prefix — not just a bare clause-initial cue.
+    #[test]
+    fn wrapped_prohibitions_still_produce_zero_pending_decisions() {
+        for prompt in [
+            "Please do not use A or B.",
+            "You must not implement A or B.",
+            "Constraint: do not implement A or B.",
+        ] {
+            let intake = PromptIntake::analyze(prompt);
+            assert_eq!(
+                intake.manifest().pending_decision_count(),
+                0,
+                "{prompt:?} must not be read as an operator decision: {:#?}",
+                intake.manifest().decisions()
+            );
+            assert_eq!(intake.disposition(), PromptDisposition::Act, "{prompt:?}");
+        }
+    }
+
+    /// #1708: a negated auxiliary that is actually a QUESTION must remain a
+    /// blocking decision — the `?` guard in `is_directive_prohibition`
+    /// exists precisely so "shouldn't" is not read as the same mood as
+    /// "should not" (a genuine field risk: `NEGATION_CUES` includes
+    /// `"shouldn't "`, and without the guard this exact prompt would have
+    /// been wrongly suppressed).
+    #[test]
+    fn interrogative_negation_remains_a_blocking_decision() {
+        let hostile = PromptIntake::analyze(
+            "Shouldn't we use SQLite or Postgres for the cache? Implement the cache.",
+        );
+        assert_eq!(
+            hostile.disposition(),
+            PromptDisposition::Ask,
+            "a genuine unresolved question must still block, not silently resolve: {:#?}",
+            hostile.manifest().decisions()
+        );
+        assert!(hostile.manifest().pending_decision_count() >= 1);
+    }
+
+    /// #1708: `"does not "` / `"doesn't "` are indicative, not imperative,
+    /// and must NOT be treated as an automatically-resolved prohibition —
+    /// `is_directive_prohibition` leaves them alone entirely, so this
+    /// clause's classification is whatever the pre-existing `" or "` +
+    /// trigger-word heuristic already gave it (unchanged by #1707/#1708).
+    #[test]
+    fn indicative_negation_is_not_treated_as_a_directive_prohibition() {
+        let indicative =
+            PromptIntake::analyze("This module does not implement caching or memoization.");
+        assert_eq!(
+            indicative.disposition(),
+            PromptDisposition::Ask,
+            "a descriptive 'does not' statement is not a prohibition this classifier may \
+             silently resolve — it is left to the pre-existing heuristic: {:#?}",
+            indicative.manifest().decisions()
+        );
+    }
+
+    /// #1708: extend prohibition reasoning to the `choose`/`select`/`pick`
+    /// needles — "Do not choose A or B" is a constraint, not a decision the
+    /// operator must lock, exactly like the `" or "` + trigger-word case.
+    #[test]
+    fn negated_choose_select_pick_are_constraints_not_decisions() {
+        for prompt in ["Do not choose A or B.", "Never select A or B."] {
+            let intake = PromptIntake::analyze(prompt);
+            assert_eq!(
+                intake.manifest().pending_decision_count(),
+                0,
+                "{prompt:?} is a constraint, not an operator decision: {:#?}",
+                intake.manifest().decisions()
+            );
+            assert_eq!(intake.disposition(), PromptDisposition::Act, "{prompt:?}");
+        }
+    }
+
+    /// #1708: the positive controls for the choose/select/pick and " or "
+    /// heuristics must still fire with no negation present.
+    #[test]
+    fn unnegated_choice_language_still_blocks() {
+        let should_use = PromptIntake::analyze("Should we use SQLite or Postgres?");
+        assert_eq!(should_use.disposition(), PromptDisposition::Ask);
+
+        let choose = PromptIntake::analyze("Choose SQLite or Postgres.");
+        assert_eq!(choose.disposition(), PromptDisposition::Ask);
     }
 
     #[test]
