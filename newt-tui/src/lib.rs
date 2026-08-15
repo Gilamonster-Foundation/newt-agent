@@ -9201,7 +9201,7 @@ fn narration_nudge_cap(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.narration_nudge_cap).unwrap_or(1)
 }
 
-const EFFECTIVELY_UNLIMITED_TOOL_ROUNDS: usize = 10_000;
+const EFFECTIVELY_UNLIMITED_TOOL_ROUNDS: usize = newt_core::tenacity::RELENTLESS_TOOL_ROUND_TARGET;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolRoundLimitCommand {
@@ -9209,6 +9209,7 @@ enum ToolRoundLimitCommand {
     Set(usize),
     Double,
     Reset,
+    Configured,
     Unlimited,
 }
 
@@ -9228,8 +9229,11 @@ fn tool_round_limit_command_arg(input: &str) -> Option<&str> {
         })
 }
 
-/// Parse `/rounds [show|<n>|double|reset|unlimited]`, the human-controlled
-/// session override for the agentic loop's tool-call round safety valve.
+/// Parse `/rounds [show|<n>|double|reset|config|unlimited]`, the
+/// human-controlled session override for the agentic loop's tool-call round
+/// safety valve. `reset`/`default`/`auto` return to the derived posture default;
+/// `config` deliberately chooses the configured/model-tuned number even when
+/// explicit Relentless tenacity would otherwise raise it.
 fn parse_tool_round_limit_command(input: &str) -> anyhow::Result<ToolRoundLimitCommand> {
     let Some(arg) = tool_round_limit_command_arg(input) else {
         anyhow::bail!("not a tool-round limit command");
@@ -9242,13 +9246,14 @@ fn parse_tool_round_limit_command(input: &str) -> anyhow::Result<ToolRoundLimitC
     match normalized.as_str() {
         "show" | "status" => Ok(ToolRoundLimitCommand::Show),
         "double" | "x2" | "2x" => Ok(ToolRoundLimitCommand::Double),
-        "reset" | "default" | "config" | "auto" => Ok(ToolRoundLimitCommand::Reset),
+        "reset" | "default" | "auto" => Ok(ToolRoundLimitCommand::Reset),
+        "config" | "configured" => Ok(ToolRoundLimitCommand::Configured),
         "unlimited" | "infinite" | "finish" | "until-finished" | "run-until-finished"
         | "until finished" | "run until finished" => Ok(ToolRoundLimitCommand::Unlimited),
         _ => {
             let n = arg.parse::<usize>().map_err(|_| {
                 anyhow::anyhow!(
-                    "unknown /rounds argument '{arg}' (use show, <n>, double, reset, unlimited)"
+                    "unknown /rounds argument '{arg}' (use show, <n>, double, reset, config, unlimited)"
                 )
             })?;
             if n == 0 {
@@ -9264,14 +9269,59 @@ fn parse_tool_round_limit_command(input: &str) -> anyhow::Result<ToolRoundLimitC
     }
 }
 
-fn effective_tool_round_limit(configured: usize, session_override: Option<usize>) -> usize {
-    session_override.unwrap_or(configured)
+fn tenacity_tool_round_limit(
+    configured: usize,
+    explicit_tenacity: Option<newt_core::Tenacity>,
+) -> usize {
+    newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, None)
+}
+
+fn effective_tool_round_limit(
+    configured: usize,
+    explicit_tenacity: Option<newt_core::Tenacity>,
+    session_override: Option<usize>,
+) -> usize {
+    newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, session_override)
 }
 
 fn double_tool_round_limit(current: usize) -> usize {
-    current
-        .saturating_mul(2)
-        .clamp(1, EFFECTIVELY_UNLIMITED_TOOL_ROUNDS)
+    if current >= EFFECTIVELY_UNLIMITED_TOOL_ROUNDS {
+        // The sentinel is an "effectively unlimited" target, not a maximum
+        // valid configuration. Never make `/rounds double` lower a larger
+        // config/model value.
+        current
+    } else {
+        current
+            .saturating_mul(2)
+            .clamp(1, EFFECTIVELY_UNLIMITED_TOOL_ROUNDS)
+    }
+}
+
+/// Apply a parsed `/rounds` command to the session-override cell. Keeping this
+/// transition pure makes the two different reset intents explicit and testable:
+/// `Reset` removes the override (so tenacity/config derive the next value),
+/// while `Configured` installs the raw config/model number as an override.
+fn apply_tool_round_limit_command(
+    configured: usize,
+    explicit_tenacity: Option<newt_core::Tenacity>,
+    session_override: Option<usize>,
+    command: ToolRoundLimitCommand,
+) -> Option<usize> {
+    match command {
+        ToolRoundLimitCommand::Show => session_override,
+        ToolRoundLimitCommand::Set(rounds) => Some(rounds),
+        ToolRoundLimitCommand::Double => Some(double_tool_round_limit(effective_tool_round_limit(
+            configured,
+            explicit_tenacity,
+            session_override,
+        ))),
+        ToolRoundLimitCommand::Reset => None,
+        ToolRoundLimitCommand::Configured => Some(configured),
+        ToolRoundLimitCommand::Unlimited => Some(
+            effective_tool_round_limit(configured, explicit_tenacity, session_override)
+                .max(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS),
+        ),
+    }
 }
 
 fn describe_tool_round_limit(rounds: usize) -> String {
@@ -9282,18 +9332,49 @@ fn describe_tool_round_limit(rounds: usize) -> String {
     }
 }
 
-fn tool_round_limit_status(configured: usize, session_override: Option<usize>) -> String {
+fn tool_round_limit_status(
+    configured: usize,
+    explicit_tenacity: Option<newt_core::Tenacity>,
+    session_override: Option<usize>,
+) -> String {
+    let posture_default = tenacity_tool_round_limit(configured, explicit_tenacity);
+    let explicit_relentless = explicit_tenacity == Some(newt_core::Tenacity::Relentless);
     match session_override {
+        Some(rounds) if explicit_relentless => format!(
+            "tool-call round limit: {} this session (explicit relentless tenacity default {}; config/model default {})",
+            describe_tool_round_limit(rounds),
+            describe_tool_round_limit(posture_default),
+            describe_tool_round_limit(configured),
+        ),
         Some(rounds) => format!(
             "tool-call round limit: {} this session (config/model default {})",
-            describe_tool_round_limit(rounds),
-            describe_tool_round_limit(configured)
+            describe_tool_round_limit(rounds), describe_tool_round_limit(configured),
+        ),
+        None if explicit_relentless => format!(
+            "tool-call round limit: {posture_default} (effectively unlimited; explicit relentless tenacity; config/model default {})",
+            describe_tool_round_limit(configured),
         ),
         None => format!(
             "tool-call round limit: {} (config/model default)",
             describe_tool_round_limit(configured)
         ),
     }
+}
+
+/// Rich `/psyche` applies several controls at once. Pair its resolved posture
+/// summary with the exact same round-budget diagnostic `/rounds` uses so a
+/// pre-existing session override is never hidden by an "applied" message.
+#[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+fn psyche_apply_summary(
+    runtime_summary: &str,
+    configured: usize,
+    explicit_tenacity: Option<newt_core::Tenacity>,
+    session_override: Option<usize>,
+) -> String {
+    format!(
+        "{runtime_summary}\n{}",
+        tool_round_limit_status(configured, explicit_tenacity, session_override)
+    )
 }
 
 /// Ollama context-window cap. Resolution order:
@@ -11685,15 +11766,17 @@ This is the interactive wrapper around `newt summarizer ...`."
         }
         "rounds" => {
             "\
-/rounds [show|<n>|double|reset|unlimited] — session tool-call round limit
+/rounds [show|<n>|double|reset|config|unlimited] — session tool-call round limit
 
 Human-only override for how many tool-call rounds the agent may run in a
 single turn. It does not edit config and lasts only for this session.
   /rounds             show the effective limit
   /rounds 50          allow 50 tool-call rounds per turn
   /rounds double      double the current effective limit
-  /rounds reset       return to config/model tuning
-  /rounds unlimited   set 10000 rounds, effectively run-until-finished
+  /rounds reset       clear the override; derive from tenacity + config/model
+                      (`default` and `auto` are aliases)
+  /rounds config      use config/model tuning even under relentless tenacity
+  /rounds unlimited   raise to at least 10000 rounds (effectively run-until-finished)
 
 Aliases: /tool-rounds, /max-rounds."
         }
@@ -12189,7 +12272,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic (alias: /compact)",
         "  /summarizer              - show or change the summarizer backend and knobs",
-        "  /rounds [n|double|reset|unlimited] - set this session's tool-call round limit",
+        "  /rounds [n|double|reset|config|unlimited] - set this session's tool-call round limit",
         "  /context                 - show the active context manager + features",
         "  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)",
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
@@ -15331,6 +15414,7 @@ mod persona_helper_tests {
         let mut active_conversation_id = String::from("test-session");
         let mode_states = ConversationModeStates::default();
 
+        let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
         // show: reports the active persona, does not reset anything.
         let msg = {
             let mut ctx = ConversationResetContext {
@@ -15471,6 +15555,7 @@ mod persona_helper_tests {
         let mut active_conversation_id = String::from("test-session");
         let mode_states = ConversationModeStates::default();
 
+        let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
         let msg = {
             let mut ctx = ConversationResetContext {
                 memory: &mut memory,

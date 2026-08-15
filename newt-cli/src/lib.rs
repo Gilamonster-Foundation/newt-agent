@@ -167,7 +167,9 @@ pub struct Cli {
     /// forces an edit sooner (nudge after 6/3/2/1 read-only rounds) and makes
     /// plan-mode exit hand off to a mandatory edit. Default `standard`
     /// (behaviour-preserving). Small models that over-explore benefit from
-    /// `insistent`/`relentless`.
+    /// `insistent`/`relentless`. In interactive code sessions and `solve`,
+    /// explicit `relentless` also makes the default tool-round budget effectively
+    /// unlimited; an explicit round limit wins.
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
     pub tenacity: Option<newt_core::Tenacity>,
 
@@ -183,7 +185,9 @@ pub struct Cli {
     /// Obsessive (#psyche): the max-everything posture — newt's "ultra". A named
     /// launch act that moves three orthogonal dials at once: cognition to
     /// `contemplating` (deepest reasoning.effort), tenacity to `relentless` (most
-    /// forcing), and the crew ON (as if `NEWT_TEAM` were set). An explicit
+    /// forcing), and the crew ON (as if `NEWT_TEAM` were set). For interactive
+    /// code sessions and `solve`, Relentless makes the default round budget
+    /// effectively unlimited. An explicit
     /// `--tenacity` alongside still wins. In-session, `/psyche obsessive` engages
     /// the two live dials; crew needs a launch with this flag. Alias
     /// `--obsessive-relentless` names the tenacity axis explicitly.

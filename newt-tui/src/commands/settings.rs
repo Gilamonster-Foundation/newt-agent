@@ -186,6 +186,18 @@ pub(crate) fn dispatch(
     Ok(true)
 }
 
+/// The round-budget side effect is intentionally keyed to the raw operator
+/// override, not an automatic persona/config/model-family resolution.
+fn explicit_relentless_round_note() -> Option<&'static str> {
+    matches!(
+        newt_core::tenacity::cli_tenacity(),
+        Some(newt_core::Tenacity::Relentless)
+    )
+    .then_some(
+        "explicit relentless tenacity makes the default tool-round budget effectively unlimited; an explicit `/rounds` override still wins",
+    )
+}
+
 /// Build the `/tenacity` response and, when `arg` names a level, install it as an
 /// explicit override (the highest-priority input in
 /// [`newt_core::tenacity::effective_tenacity`]). Pure for the show/list/error
@@ -195,8 +207,11 @@ fn tenacity_command(arg: &str) -> String {
     match arg.trim() {
         "" | "status" | "show" => {
             let t = effective_tenacity();
+            let rounds = explicit_relentless_round_note()
+                .map(|note| format!("  {note}."))
+                .unwrap_or_default();
             format!(
-                "tenacity: {} — {}  (/psyche tenacity <auto|relaxed|standard|insistent|relentless>|list)",
+                "tenacity: {} — {}{rounds}  (/psyche tenacity <auto|relaxed|standard|insistent|relentless>|list)",
                 t.label(),
                 t.describe()
             )
@@ -213,6 +228,9 @@ fn tenacity_command(arg: &str) -> String {
             for t in Tenacity::all() {
                 let active = if t == active_level { " ← active" } else { "" };
                 out.push_str(&format!("\n  {:<10} {}{active}", t.label(), t.describe()));
+            }
+            if let Some(note) = explicit_relentless_round_note() {
+                out.push_str(&format!("\n  rounds     {note}."));
             }
             out
         }
@@ -236,7 +254,16 @@ fn tenacity_command(arg: &str) -> String {
                 // #1668: marked beside the setter, so only a PARSED level
                 // pins — the error arm below mutates and marks nothing.
                 newt_core::runtime::mark_tenacity_choice(Some(level));
-                format!("tenacity → {} — {}", level.label(), level.describe())
+                let rounds = if level == Tenacity::Relentless {
+                    "; default tool-round budget → effectively unlimited (an explicit `/rounds` override still wins)"
+                } else {
+                    ""
+                };
+                format!(
+                    "tenacity → {} — {}{rounds}",
+                    level.label(),
+                    level.describe()
+                )
             }
             Err(e) => {
                 format!("{e}  (/psyche tenacity <auto|level>|list|status)")
@@ -343,7 +370,9 @@ fn psyche_command(rest: &str) -> String {
         ));
         newt_core::runtime::mark_tenacity_choice(Some(ten));
         return format!(
-            "obsessive engaged (live): cognition → {}, tenacity → {}.\n\
+            "obsessive engaged (live): cognition → {}, tenacity → {}, \
+             default tool-round budget → effectively unlimited (an explicit \
+             `/rounds` override still wins).\n\
              crew is a launch gate — relaunch with `newt --obsessive` (or set \
              NEWT_TEAM) to add the crew this session.",
             cog.label(),
@@ -411,6 +440,9 @@ fn psyche_command(rest: &str) -> String {
         ten.describe()
     ));
     out.push_str("\n              how hard the loop pushes read → act     (/psyche tenacity)");
+    if let Some(note) = explicit_relentless_round_note() {
+        out.push_str(&format!("\n              {note}."));
+    }
     out.push_str(&format!("\n  crew        {crew}"));
     out.push_str(
         "\n              how many minds work the task                   (NEWT_TEAM / newt crew)",
@@ -509,6 +541,8 @@ mod tests {
         // The message is honest about crew being a launch gate.
         assert!(out.to_lowercase().contains("crew"), "{out}");
         assert!(out.contains("--obsessive"), "{out}");
+        assert!(out.contains("round"), "{out}");
+        assert!(out.contains("/rounds"), "{out}");
 
         set_cli_cognition(CognitionOverride::Unset);
         set_cli_tenacity(Tenacity::Standard);
@@ -540,6 +574,23 @@ mod tests {
         // An unknown level explains itself rather than silently doing nothing.
         let err = tenacity_command("banana");
         assert!(err.contains("unknown tenacity"), "{err}");
+    }
+
+    #[test]
+    fn explicit_relentless_status_views_explain_the_round_budget() {
+        use newt_core::tenacity::{set_cli_tenacity, Tenacity};
+
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        set_cli_tenacity(Tenacity::Relentless);
+
+        for out in [
+            tenacity_command("status"),
+            tenacity_command("list"),
+            super::psyche_command("status"),
+        ] {
+            assert!(out.contains("effectively unlimited"), "{out}");
+            assert!(out.contains("/rounds"), "{out}");
+        }
     }
 
     #[test]
@@ -717,6 +768,8 @@ mod tests {
         let restore = effective_tenacity();
         let msg = tenacity_command("relentless");
         assert!(msg.contains("relentless"), "{msg}");
+        assert!(msg.contains("effectively unlimited"), "{msg}");
+        assert!(msg.contains("/rounds"), "{msg}");
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
         // review-2 #2: `/tenacity auto` releases the override (was un-undoable).
         let msg = tenacity_command("auto");

@@ -3787,22 +3787,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    // #867: the evidence for this summary was just trimmed away, which is
-    // exactly when a model fabricates plausible file paths — verify every
-    // cited path against the workspace and append a visible refutation for
-    // any that don't exist. Appends only; the model's prose is never edited.
-    let text = claim_check::annotate_against_workspace(text, workspace);
-    // #1214: the sibling check for claimed ACTIONS (commits, branches, pushes,
-    // passing tests) — refuted against the workspace's real git state across
-    // this turn. Fail-quiet off-repo (no evidence, no annotation).
-    let text = claim_check::annotate_action_claims(
-        text,
-        claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
-    );
-    // Disclosure gate on the final answer: the model may have echoed a secret it
-    // read earlier, so value-filter the summary before it leaves the loop — the
-    // same by-value gate the tool-result chokepoint applies.
-    let text = redact_model_facing(disclosure, text);
+    let text = finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -5169,13 +5154,18 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[St
     // still verbatim in context; absence must be stated, not papered over.
     let mut nudge = format!(
         "You have reached the tool-call limit ({max_tool_rounds} rounds). \
-         Do NOT call any more tools. Summarize what you found across the tool \
-         calls above and give your best final answer now. Cite only file paths \
+         Do NOT call any more tools. Give the operator a concise progress update \
+         that separates completed and verified work, the current state or blocker, \
+         and remaining work. The tool loop has stopped at the cap. Report whether \
+         the operator's objective is complete or what remains; do not infer completion \
+         merely because tools are disabled. Cite only file paths \
          that appear verbatim in the messages above — if the evidence you need \
          was in the omitted messages, say so plainly instead of reconstructing \
-         file names or line numbers from memory. Do not answer with an intention \
-         to keep working (for example, \"let me read/edit/verify\"); if work remains, \
-         list it as remaining work and state that the round cap stopped further tool calls. \
+         file names or line numbers from memory. Do not narrate an intention to \
+         keep working now (for example, \"let me read/edit/verify\"); list those \
+         actions as remaining work and state that they have not run because the \
+         round cap stopped further tool calls. Do not reproduce literal `<plan>` \
+         or `<state>` tags from the working memory below. \
          Report an ACTION (an edit made, a test run or passing, a branch created, a \
          commit, a push, a PR opened) ONLY if a successful tool result above confirms \
          it — if you did not see the tool result, the action did not happen; list it \
@@ -5223,15 +5213,28 @@ fn cap_exit_advice(max_tool_rounds: usize, wasted_calls: usize) -> &'static str 
          could not find a working edit/shell path, which is usually a tooling or \
          permissions issue rather than too few rounds; check `newt doctor`"
     } else {
-        "raise [tui].max_tool_rounds in your config, or ask a more focused question"
+        "increase the tool-round limit for the next attempt, or ask a more focused question"
     }
 }
 
 fn cap_exit_progress_block(label: &str, progress: Option<&str>) -> String {
     match progress {
-        Some(p) => format!("\n\n{label}:\n{p}"),
+        Some(p) => format!("\n\n{label}:\n{}", humanize_cap_exit_progress(p)),
         None => String::new(),
     }
+}
+
+/// The plan and scratchpad are deliberately represented with lightweight XML
+/// inside model context. Those tags are protocol framing, not user-facing UI;
+/// deterministic cap fallbacks render the same saved content as ordinary text.
+fn humanize_cap_exit_progress(progress: &str) -> String {
+    progress
+        .replace("<plan>", "Plan:\n")
+        .replace("</plan>", "")
+        .replace("<state>", "Current state:\n")
+        .replace("</state>", "")
+        .trim()
+        .to_string()
 }
 
 fn cap_exit_fallback(
@@ -5244,34 +5247,76 @@ fn cap_exit_fallback(
     let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
     let salvaged = cap_exit_progress_block("Progress captured before the summary failed", progress);
     format!(
-        "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}, \
-         and the final summarization request also failed — {advice}){salvaged}"
+        "Paused at the tool-call limit of {max_tool_rounds} rounds{tokens_hint}. \
+         The final summarization request also failed while preparing a progress \
+         update; {advice}.{salvaged}"
     )
 }
 
-fn cap_exit_action_handoff_fallback(
+/// Preserve the model-authored progress update while making the objective state
+/// unambiguous. A pending-action classification is useful at a cap (it often
+/// carries the best remaining-work handoff); the footer prevents those future
+/// actions from being mistaken for completed work.
+fn cap_exit_progress_handoff(
     max_tool_rounds: usize,
     accumulated: Option<crate::TokenUsage>,
-    wasted_calls: usize,
+    content: &str,
+    has_pending_actions: bool,
     progress: Option<&str>,
 ) -> String {
     let tokens_hint = cap_exit_tokens_hint(max_tool_rounds, accumulated);
-    let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
-    let salvaged = cap_exit_progress_block("Progress captured at the tool-call limit", progress);
+    let pending = if has_pending_actions {
+        " The proposed next actions in this update have not run yet."
+    } else {
+        ""
+    };
+    let captured = cap_exit_progress_block("Captured working state", progress);
     format!(
-        "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}; \
-         the final tools-disabled summary described future tool actions instead \
-         of final state, so Newt preserved the verified progress instead of \
-         accepting that handoff — {advice}){salvaged}"
+        "{content}\n\nThe tool loop reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}. \
+         This progress handoff preserves the model's update.{pending}{captured}"
     )
 }
 
 fn cap_exit_summary_is_action_handoff(content: &str) -> bool {
     crate::NudgeClassifier::load_default()
         .classify(content)
-        .class
-        == crate::NudgeClass::PendingAction
+        .is_pending_action()
         || looks_like_unverified_stale_file_blocker(content)
+}
+
+/// Leave a clean, completed model summary untouched. Only add the deterministic
+/// handoff wrapper when the model still proposes work or core has structured
+/// plan/state to preserve. Interactive callers use `TurnEndReason::RoundCap` to
+/// add their own resume affordance independently of this textual shape.
+fn cap_exit_model_reply(
+    max_tool_rounds: usize,
+    accumulated: Option<crate::TokenUsage>,
+    content: &str,
+    progress: Option<&str>,
+) -> String {
+    let pending = cap_exit_summary_is_action_handoff(content);
+    if pending || progress.is_some() {
+        cap_exit_progress_handoff(max_tool_rounds, accumulated, content, pending, progress)
+    } else {
+        content.to_string()
+    }
+}
+
+/// Apply the same evidence and disclosure gates to every provider's cap-exit
+/// handoff. The Responses wire used to bypass all three checks even though the
+/// shared summary prompt promised the workspace would be verified.
+fn finalize_cap_exit_text(
+    text: String,
+    workspace: &str,
+    turn_start_head: Option<&str>,
+    disclosure: Option<&crate::ocap::DisclosureFilter>,
+) -> String {
+    let text = claim_check::annotate_against_workspace(text, workspace);
+    let text = claim_check::annotate_action_claims(
+        text,
+        claim_check::collect_git_evidence(workspace, turn_start_head).as_ref(),
+    );
+    redact_model_facing(disclosure, text)
 }
 
 /// The cap-exit context threaded into a final tools-disabled summary (Step
@@ -5402,19 +5447,17 @@ async fn final_summary_ollama(
                     false,
                     accumulated,
                 ))
-            } else if cap_exit_summary_is_action_handoff(&content) {
+            } else {
                 Ok((
-                    cap_exit_action_handoff_fallback(
+                    cap_exit_model_reply(
                         max_tool_rounds,
                         accumulated,
-                        wasted_calls,
+                        &content,
                         progress.as_deref(),
                     ),
                     false,
                     total,
                 ))
-            } else {
-                Ok((content, false, total))
             }
         }
         // On any failure (including exhausted retries), still return the
@@ -5609,19 +5652,17 @@ async fn final_summary_openai(
                     false,
                     accumulated,
                 ))
-            } else if cap_exit_summary_is_action_handoff(&content) {
+            } else {
                 Ok((
-                    cap_exit_action_handoff_fallback(
+                    cap_exit_model_reply(
                         max_tool_rounds,
                         accumulated,
-                        wasted_calls,
+                        &content,
                         progress.as_deref(),
                     ),
                     false,
                     total,
                 ))
-            } else {
-                Ok((content, false, total))
             }
         }
         Err(_) => Ok((
@@ -7243,19 +7284,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    // #867: same path-claim refutation as the Ollama cap exit.
-    let text = claim_check::annotate_against_workspace(text, workspace);
-    // #1214: the sibling check for claimed ACTIONS (commits, branches, pushes,
-    // passing tests) — refuted against the workspace's real git state across
-    // this turn. Fail-quiet off-repo (no evidence, no annotation).
-    let text = claim_check::annotate_action_claims(
-        text,
-        claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
-    );
-    // Disclosure gate on the final answer: the model may have echoed a secret it
-    // read earlier, so value-filter the summary before it leaves the loop — the
-    // same by-value gate the tool-result chokepoint applies.
-    let text = redact_model_facing(disclosure, text);
+    let text = finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -7625,19 +7654,17 @@ async fn final_summary_anthropic(
                     false,
                     accumulated,
                 ))
-            } else if cap_exit_summary_is_action_handoff(&content) {
+            } else {
                 Ok((
-                    cap_exit_action_handoff_fallback(
+                    cap_exit_model_reply(
                         max_tool_rounds,
                         accumulated,
-                        wasted_calls,
+                        &content,
                         progress.as_deref(),
                     ),
                     false,
                     total,
                 ))
-            } else {
-                Ok((content, false, total))
             }
         }
         Err(_) => Ok((
@@ -9167,17 +9194,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    // #867: same path-claim refutation as the OpenAI cap exit.
-    let text = claim_check::annotate_against_workspace(text, workspace);
-    // #1214: the sibling check for claimed ACTIONS (mirrors the OpenAI path).
-    let text = claim_check::annotate_action_claims(
-        text,
-        claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
-    );
-    // Disclosure gate on the final answer: the model may have echoed a secret it
-    // read earlier, so value-filter the summary before it leaves the loop — the
-    // same by-value gate the tool-result chokepoint applies.
-    let text = redact_model_facing(disclosure, text);
+    let text = finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -9440,7 +9457,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         compress_state,
         mut tool_events,
         mut phantom_reaches,
-        end_reason: _,
+        mut end_reason,
         solve_obs: _,
         mut permission_gate,
         mut on_round_usage,
@@ -9621,6 +9638,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_unsupported_notified = false;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // Keep the same cap-exit evidence ledger as the three chat-shaped wires.
+    // It must record before result offload/compaction removes the source text.
+    let mut observed_paths = claim_check::ObservedPaths::default();
+    let observed_resolver = claim_check::workspace_resolver(workspace);
+    let turn_start_head = claim_check::git_head(workspace);
 
     let reasoning = responses_reasoning_field(cognition);
     let build_body = |input: &[serde_json::Value], with_tools: bool| {
@@ -10152,6 +10174,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     });
                 }
             }
+            observed_paths.record(&result, &observed_resolver);
             input.push(serde_json::json!({
                 "type": "function_call_output",
                 "call_id": call_id,
@@ -10160,6 +10183,18 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             }));
         }
     }
+
+    // The Responses wire reaches the same semantic cap as the chat backends:
+    // ask for a grounded progress handoff, then return it as a resumable pause.
+    // Keep the pre-summary usage separate so the footer's "across N rounds"
+    // count does not include this extra tools-disabled completion.
+    let cap_accumulated = accumulated_usage;
+    let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    let observed = observed_paths.into_vec();
+    input.push(serde_json::json!({
+        "role": "user",
+        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
+    }));
 
     // #1528 B3: proactively compact the tools-DISABLED final summary if it is
     // LOCALLY over budget. No round to protect (the loop is over), so it is a
@@ -10217,37 +10252,121 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         spill: spill_store,
         compaction: compaction_store,
     };
-    let validated =
-        responses_wire_validation::validate_responses_request(&body, &policy).map_err(|e| {
-            match summary_rejection.take() {
+    let validated = match responses_wire_validation::validate_responses_request(&body, &policy) {
+        Ok(validated) => validated,
+        Err(e) => {
+            let error = match summary_rejection.take() {
                 Some(reason) => anyhow::Error::new(e).context(reason.to_string()),
                 None => anyhow::Error::new(e),
+            };
+            tracing::warn!(
+                error = %error,
+                "Responses cap-exit summary validation failed; returning captured progress"
+            );
+            let text = finalize_cap_exit_text(
+                cap_exit_fallback(
+                    max_tool_rounds,
+                    cap_accumulated,
+                    repeat_calls.total_failures(),
+                    progress.as_deref(),
+                ),
+                workspace,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::RoundCap);
             }
-        })?;
+            return Ok((text, false, accumulated_usage, hallucination_count));
+        }
+    };
     // Shared retrying dispatch (R5): the tools-disabled final summary retries
     // transient transport failures exactly like every round, so a 500 / timeout /
     // reset on the LAST request no longer discards the turn after all tool rounds
     // were spent.
-    let json = dispatch_responses_json(&client, &responses_url, api_key, &validated, &retry, color)
-        .await?;
-    // Fail-closed decode (invariant #2): this text-only follow-up must not return
-    // a failed, truncated, or empty body's text as a successful reply. A refusal
-    // is the model's final answer; every other error is surfaced.
+    let json =
+        match dispatch_responses_json(&client, &responses_url, api_key, &validated, &retry, color)
+            .await
+        {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Responses cap-exit summary dispatch failed; returning captured progress"
+                );
+                let text = finalize_cap_exit_text(
+                    cap_exit_fallback(
+                        max_tool_rounds,
+                        cap_accumulated,
+                        repeat_calls.total_failures(),
+                        progress.as_deref(),
+                    ),
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                if let Some(slot) = &mut end_reason {
+                    **slot = Some(crate::TurnEndReason::RoundCap);
+                }
+                return Ok((text, false, accumulated_usage, hallucination_count));
+            }
+        };
+    // Fail closed on provider output: unusable text never becomes the model's
+    // answer. At this already-reached cap, however, the deterministic progress
+    // handoff is still a successful paused turn so the interactive caller can
+    // persist it and retain the continuation link.
     let decoded = match crate::responses_wire::decode_response(&json) {
         Ok(d) => d,
         Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
             accumulated_usage = merge_round_usage(accumulated_usage, usage);
-            return Ok((
-                format!("(the model refused the request) {message}"),
+            let text = cap_exit_progress_handoff(
+                max_tool_rounds,
+                cap_accumulated,
+                &format!("The model refused the progress-summary request: {message}"),
                 false,
-                accumulated_usage,
-                hallucination_count,
-            ));
+                progress.as_deref(),
+            );
+            let text =
+                finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::RoundCap);
+            }
+            return Ok((text, false, accumulated_usage, hallucination_count));
         }
-        Err(e) => return Err(anyhow::anyhow!("Responses turn not usable: {e}")),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Responses cap-exit summary decode failed; returning captured progress"
+            );
+            let text = finalize_cap_exit_text(
+                cap_exit_fallback(
+                    max_tool_rounds,
+                    cap_accumulated,
+                    repeat_calls.total_failures(),
+                    progress.as_deref(),
+                ),
+                workspace,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::RoundCap);
+            }
+            return Ok((text, false, accumulated_usage, hallucination_count));
+        }
     };
     accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
-    Ok((decoded.text, false, accumulated_usage, hallucination_count))
+    let text = cap_exit_model_reply(
+        max_tool_rounds,
+        cap_accumulated,
+        &decoded.text,
+        progress.as_deref(),
+    );
+    let text = finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    if let Some(slot) = &mut end_reason {
+        **slot = Some(crate::TurnEndReason::RoundCap);
+    }
+    Ok((text, false, accumulated_usage, hallucination_count))
 }
 
 /// Whether the reasoning spinner is enabled: `NEWT_THINKING` (set by
@@ -10967,6 +11086,15 @@ mod cap_exit_unit_tests {
         let nudge = cap_exit_nudge(5, None, &[]);
         assert!(nudge.contains("5 rounds"), "got: {nudge}");
         assert!(nudge.contains("Do NOT call any more tools"));
+        assert!(
+            nudge.contains("progress update"),
+            "the cap turn asks for a handoff, not a fake final answer: {nudge}"
+        );
+        assert!(
+            nudge.contains("tool loop has stopped at the cap")
+                && nudge.contains("operator's objective is complete or what remains"),
+            "the model should distinguish a stopped loop from objective completion: {nudge}"
+        );
         // #867: the grounding constraint — the trim just deleted the evidence,
         // so the nudge must forbid reconstructing paths from memory.
         assert!(
@@ -11035,7 +11163,7 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn cap_exit_fallback_usage_advice_and_salvage() {
-        // wasted_calls < rounds → the standard "raise max_tool_rounds" advice.
+        // wasted_calls < rounds → caller-neutral advice to increase the limit.
         let with = cap_exit_fallback(
             4,
             Some(crate::TokenUsage {
@@ -11046,7 +11174,10 @@ mod cap_exit_unit_tests {
             None,
         );
         assert!(with.contains("12 in / 34 out tokens"), "got: {with}");
-        assert!(with.contains("max_tool_rounds"), "got: {with}");
+        assert!(
+            with.contains("increase the tool-round limit"),
+            "got: {with}"
+        );
 
         let without = cap_exit_fallback(4, None, 0, None);
         assert!(!without.contains("tokens consumed"), "got: {without}");
@@ -11064,42 +11195,86 @@ mod cap_exit_unit_tests {
         // Step 27.5: progress is salvaged even when the summary failed.
         let salvaged = cap_exit_fallback(4, None, 0, Some("<state>cwd=/x</state>"));
         assert!(salvaged.contains("Progress captured"), "got: {salvaged}");
-        assert!(
-            salvaged.contains("<state>cwd=/x</state>"),
-            "got: {salvaged}"
-        );
+        assert!(salvaged.contains("Current state:"), "got: {salvaged}");
+        assert!(salvaged.contains("cwd=/x"), "got: {salvaged}");
+        assert!(!salvaged.contains("<state>"), "got: {salvaged}");
     }
 
     #[test]
-    fn cap_exit_summary_action_handoff_is_rejected() {
+    fn cap_exit_summary_detects_every_pending_action_handoff() {
         let handoff = "I have two issues: duplicate topic_has_rollups and a stray brace. Let me fix both — read around 490 to see what needs removing, then verify with a build check.";
         assert!(cap_exit_summary_is_action_handoff(handoff));
+        let plan_update = "Summary\n\nI reached the tool-call limit.\n\nNext Steps Required\n\nTo continue, I would need to remove the duplicate function using edit_file, verify cargo check, then finish the plan.";
+        assert!(
+            cap_exit_summary_is_action_handoff(plan_update),
+            "plan-shaped progress handoffs also contain pending actions"
+        );
         assert!(!cap_exit_summary_is_action_handoff(
             "The duplicate helper definitions and stray brace were removed, and the build check passed."
         ));
 
-        let fallback = cap_exit_action_handoff_fallback(
+        let paused = cap_exit_progress_handoff(
             25,
             None,
-            2,
-            Some("<plan>1. [ ] fix duplicate helper definitions</plan>"),
+            plan_update,
+            true,
+            Some("<plan>1. [ ] remove duplicate helper</plan><state>check=pending</state>"),
         );
-        assert!(fallback.contains("tool-call limit of 25"), "{fallback}");
+        assert!(paused.contains("tool-call limit of 25"), "{paused}");
         assert!(
-            fallback.contains("described future tool actions"),
-            "{fallback}"
-        );
-        assert!(
-            fallback.contains("preserved the verified progress"),
-            "{fallback}"
+            paused.contains("Next Steps Required"),
+            "the model-authored progress update survives: {paused}"
         );
         assert!(
-            !fallback.contains("final summarization request also failed"),
-            "{fallback}"
+            paused.contains("have not run yet"),
+            "pending work is not presented as completed: {paused}"
+        );
+        assert!(paused.contains("progress handoff"), "{paused}");
+        assert!(paused.contains("Captured working state"), "{paused}");
+        assert!(paused.contains("remove duplicate helper"), "{paused}");
+        assert!(paused.contains("Current state:"), "{paused}");
+        assert!(!paused.contains("<plan>"), "{paused}");
+    }
+
+    #[test]
+    fn cap_exit_model_reply_only_wraps_real_progress_handoffs() {
+        let completed = "The duplicate helper was removed and cargo check passed.";
+        assert_eq!(cap_exit_model_reply(25, None, completed, None), completed);
+
+        let pending = "Next steps: remove the duplicate helper, then run cargo check.";
+        let pending_reply = cap_exit_model_reply(25, None, pending, None);
+        assert!(pending_reply.starts_with(pending), "{pending_reply}");
+        assert!(
+            pending_reply.contains("progress handoff"),
+            "{pending_reply}"
         );
         assert!(
-            fallback.contains("Progress captured at the tool-call limit"),
-            "{fallback}"
+            pending_reply.contains("have not run yet"),
+            "{pending_reply}"
+        );
+
+        let captured = cap_exit_model_reply(
+            25,
+            None,
+            completed,
+            Some("<state>cargo check still pending</state>"),
+        );
+        assert!(captured.contains("Captured working state"), "{captured}");
+        assert!(captured.contains("cargo check still pending"), "{captured}");
+    }
+
+    #[test]
+    fn cap_exit_finalizer_applies_workspace_claim_checks() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let text = finalize_cap_exit_text(
+            "Updated src/definitely_not_present.rs and verified it.".to_string(),
+            &workspace.path().to_string_lossy(),
+            None,
+            None,
+        );
+        assert!(
+            text.contains("⚠ claim check (#867)"),
+            "cap handoffs must use the same path grounding gate on every provider: {text}"
         );
     }
 
@@ -11760,7 +11935,7 @@ mod tool_round_cap_tests {
         let (reply, _, _, _) = chat_complete(context, &mut NoMcp)
             .await
             .expect("cap exit succeeds");
-        assert_eq!(reply, "cap summary");
+        assert!(reply.starts_with("cap summary"), "{reply}");
         assert!(pair_seen.load(Ordering::SeqCst));
         assert!(
             omission_seen.load(Ordering::SeqCst),
@@ -11798,7 +11973,7 @@ mod tool_round_cap_tests {
         let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
             .await
             .expect("cap exit succeeds");
-        assert_eq!(reply, "cap summary");
+        assert!(reply.starts_with("cap summary"), "{reply}");
         assert!(pair_seen.load(Ordering::SeqCst));
         assert!(
             omission_seen.load(Ordering::SeqCst),
@@ -11839,7 +12014,7 @@ mod tool_round_cap_tests {
         let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
             .await
             .expect("cap exit succeeds");
-        assert_eq!(reply, "cap summary");
+        assert!(reply.starts_with("cap summary"), "{reply}");
         assert!(
             first_plan_seen.load(Ordering::SeqCst),
             "the tools-disabled cap-exit request must retain the first current-turn plan"
@@ -12003,7 +12178,7 @@ mod tool_round_cap_tests {
         assert_eq!(served.load(Ordering::SeqCst), cap);
         // The cap-exit issued a final tools-disabled completion and returned
         // its text — NOT the dead placeholder.
-        assert_eq!(reply, "here is my partial summary");
+        assert!(reply.starts_with("here is my partial summary"), "{reply}");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
         // The cap exit reports itself (acceptance forensics, commit 4).
@@ -12085,7 +12260,7 @@ mod tool_round_cap_tests {
     }
 
     #[tokio::test]
-    async fn ollama_cap_exit_rejects_action_intent_summary() {
+    async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
@@ -12121,18 +12296,22 @@ mod tool_round_cap_tests {
 
         assert!(!streamed);
         assert!(reply.contains("tool-call limit of 25"), "{reply}");
-        assert!(reply.contains("described future tool actions"), "{reply}");
-        assert!(reply.contains("preserved the verified progress"), "{reply}");
         assert!(
-            !reply.contains("Let me fix both"),
-            "must not accept action-intent cap summary: {reply}"
+            reply.contains("Let me fix both"),
+            "the model's progress prose should survive the pause: {reply}"
         );
+        assert!(
+            reply.contains("have not run"),
+            "future actions must be clearly marked as pending: {reply}"
+        );
+        assert!(reply.contains("progress handoff"), "{reply}");
         assert!(
             !reply.contains("final summarization request also failed"),
             "{reply}"
         );
+        assert!(reply.contains("Captured working state"), "{reply}");
         assert!(
-            reply.contains("Progress captured at the tool-call limit"),
+            reply.contains("fix duplicate helper definitions"),
             "{reply}"
         );
         let requests = server
@@ -12141,6 +12320,75 @@ mod tool_round_cap_tests {
             .expect("wiremock request journal");
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["options"]["num_ctx"], 4_096);
+    }
+
+    #[tokio::test]
+    async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "Summary of Findings\n\nThe configuration path is wired.\n\nNext Steps Required\n\nRun cargo check and open the pull request."
+                    }
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let (reply, streamed, usage) = final_summary_openai(
+            &client,
+            &format!("{}/v1/chat/completions", server.uri()),
+            "test-model",
+            None,
+            Vec::new(),
+            generation_policy::GenerationPolicy::default(),
+            CapExit {
+                max_tool_rounds: 40,
+                accumulated: Some(crate::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                }),
+                wasted_calls: 0,
+                progress: None,
+                observed: Vec::new(),
+                request_budget: None,
+                calibration: 1.0,
+                estimation: crate::tokens::TokenEstimation::default(),
+                ollama_num_ctx: None,
+            },
+        )
+        .await
+        .expect("OpenAI cap summary should become a paused handoff");
+
+        assert!(!streamed);
+        assert!(reply.contains("Summary of Findings"), "{reply}");
+        assert!(reply.contains("have not run"), "{reply}");
+        assert!(reply.contains("progress handoff"), "{reply}");
+        assert_eq!(
+            usage,
+            Some(crate::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 58,
+            })
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request journal");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("tools").is_none(),
+            "cap request stays tools-disabled"
+        );
+        assert!(
+            body["messages"].to_string().contains("progress update"),
+            "the model is explicitly asked for a resumable progress update"
+        );
     }
 
     #[tokio::test]
@@ -13457,11 +13705,14 @@ mod tool_round_cap_tests {
         ctx.max_ok_input = None;
         ctx.recover_cw_400 = None;
         ctx.max_tool_rounds = 0;
+        let mut end_reason = None;
+        ctx.end_reason = Some(&mut end_reason);
 
         let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
             .await
             .expect("the tools-disabled summary is proactively compacted and dispatches");
         assert_eq!(reply, "summarized");
+        assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
 
         let reqs = server.received_requests().await.expect("requests recorded");
         assert_eq!(reqs.len(), 1, "only the final summary dispatched");
@@ -13476,6 +13727,46 @@ mod tool_round_cap_tests {
                 .contains("newt-compaction-summary"),
             "the tools-disabled summary was proactively compacted before dispatch"
         );
+        assert!(
+            body["input"].to_string().contains("progress update"),
+            "Responses receives the same resumable cap handoff as chat backends"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_unusable_cap_summary_returns_a_round_cap_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "failed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let task = "report progress at the cap";
+        let messages = vec![MemMessage::system("base policy"), MemMessage::user(task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.num_ctx = None;
+        ctx.max_tool_rounds = 0;
+        let mut end_reason = None;
+        ctx.end_reason = Some(&mut end_reason);
+
+        let (reply, streamed, usage, _) = openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("an unusable final summary becomes an honest paused fallback");
+        assert!(!streamed);
+        assert_eq!(usage, None);
+        assert!(reply.contains("Paused at the tool-call limit"), "{reply}");
+        assert!(
+            reply.contains("final summarization request also failed"),
+            "{reply}"
+        );
+        assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
     }
 
     // --- #1528 B3 transactional helper unit tests (B3-CG-004/005) ---
@@ -14644,6 +14935,7 @@ mod tool_round_cap_tests {
         let messages = msgs();
         let caveats = Caveats::top();
         let cap = 2;
+        let mut end_reason: Option<crate::TurnEndReason> = None;
         let (reply, streamed, _usage, _hallu) = openai_chat_complete(
             ChatCtx {
                 url: &server.uri(),
@@ -14701,7 +14993,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
-                end_reason: None,
+                end_reason: Some(&mut end_reason),
                 solve_obs: None,
                 permission_gate: None,
                 on_round_usage: None,
@@ -14724,9 +15016,10 @@ mod tool_round_cap_tests {
         .expect("openai_chat_complete should succeed");
 
         assert_eq!(served.load(Ordering::SeqCst), cap);
-        assert_eq!(reply, "openai partial answer");
+        assert!(reply.starts_with("openai partial answer"), "{reply}");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
+        assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
     }
 
     /// 17.6: with a recorder lent in `ChatCtx.tool_events`, the Ollama loop
@@ -15105,10 +15398,10 @@ mod tool_round_cap_tests {
         .await
         .expect("chat_complete should succeed even when final summary errors");
 
-        // Fallback names the limit + the knob — strictly better than the bare
+        // Fallback names the limit + recovery direction — strictly better than the bare
         // placeholder.
         assert!(reply.contains("tool-call limit"));
-        assert!(reply.contains("max_tool_rounds"));
+        assert!(reply.contains("increase the tool-round limit"));
     }
 
     /// `run_command` called with a tool name as the first word must return a

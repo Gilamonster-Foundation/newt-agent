@@ -1163,7 +1163,10 @@ async fn empty_final_summary_yields_cap_fallback() {
         .expect("chat_complete should succeed");
 
     assert!(reply.contains("tool-call limit of 2"), "got: {reply}");
-    assert!(reply.contains("max_tool_rounds"), "names the knob");
+    assert!(
+        reply.contains("increase the tool-round limit"),
+        "gives caller-neutral recovery advice"
+    );
 }
 
 /// #867 regression: the cap-exit summary cites a file that does not
@@ -2364,7 +2367,7 @@ async fn openai_cap_exit_fallback_when_final_summary_errors() {
         .await
         .expect("must succeed even when the summary errors");
     assert!(reply.contains("tool-call limit of 2"), "got: {reply}");
-    assert!(reply.contains("max_tool_rounds"));
+    assert!(reply.contains("increase the tool-round limit"));
 }
 
 // -- Narrate-then-stop rescue: bounded no-tool-call auto-continue ---------

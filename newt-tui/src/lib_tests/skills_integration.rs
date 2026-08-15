@@ -384,6 +384,7 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
         .unwrap();
     newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
 
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let message = {
         let mut ctx = ConversationResetContext {
             memory: &mut memory,
@@ -1865,6 +1866,7 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
         mode_states: &mode_states,
     };
 
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let message = handle_conversation_command(
         &format!("/conversation restore {id}"),
         &mut conversation_ctx,
@@ -1933,6 +1935,7 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
 
 #[tokio::test]
 async fn prompt_only_restore_rehydrates_receipt_without_replaying_it_as_input() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
@@ -2147,6 +2150,7 @@ fn resume_fixture() -> (
 
 #[tokio::test]
 async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let (_state, workspace, store, persona_store) = resume_fixture();
     // Two conversations; then the OLDER one gets a new turn, giving it
     // the highest §6 activity tick. Insertion order would pick `newer`;
@@ -2242,6 +2246,7 @@ fn auto_resume_empty_workspace_is_silent_fresh_start() {
 
 #[tokio::test]
 async fn resume_exact_restores_that_conversation() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let (_state, workspace, store, persona_store) = resume_fixture();
     let target = store.create("Target work", None).unwrap();
     store
@@ -2294,6 +2299,7 @@ async fn resume_exact_restores_that_conversation() {
 /// cleared and replaced by the resumed snapshot — never merged.
 #[tokio::test]
 async fn resume_rehydrates_scratchpad_state_into_live_store() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     use newt_core::ScratchpadStore;
     let (_state, workspace, store, persona_store) = resume_fixture();
     let id = store.create("Resume with state", None).unwrap();
@@ -2360,6 +2366,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
 /// from a prior conversation is cleared and replaced, never merged.
 #[tokio::test]
 async fn resume_rehydrates_plan_into_live_ledger() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     use newt_core::StepLedger;
     let (_state, workspace, store, persona_store) = resume_fixture();
     let id = store.create("Resume with plan", None).unwrap();
@@ -2744,6 +2751,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
     };
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     handle_conversation_command(&format!("/conversation restore {id}"), &mut ctx).unwrap();
 
     let messages = memory2.build_messages(&system, "next task");
