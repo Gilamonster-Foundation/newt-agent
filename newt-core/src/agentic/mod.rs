@@ -204,8 +204,8 @@ pub use observability::{
 };
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
-    AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
-    PromptComprehensionManifest, PromptDisposition, PromptIntake,
+    AtomicAsk, ClarificationRejection, DecisionLock, DecisionSource, DecisionStatus,
+    DispositionLexicon, PromptComprehensionManifest, PromptDisposition, PromptIntake,
 };
 #[cfg(test)]
 pub(crate) use prompt_read::response_repository_policy_tokens;

@@ -197,6 +197,13 @@ pub struct PromptIntake {
     /// temporarily changes the live disposition to `Ask`; an explicit answer
     /// restores this value once every decision is locked.
     post_lock_disposition: PromptDisposition,
+    /// Why the LAST clarification reply failed to lock the batch, if it did.
+    ///
+    /// #1689 item 1. Set only by [`Self::resolve_with_operator_answer`]; a
+    /// freshly analyzed intake has none. The harness reads it to say what was
+    /// wrong instead of re-emitting the identical block, which is the whole
+    /// difference between a blocked session and one that looks hung.
+    last_rejection: Option<ClarificationRejection>,
 }
 
 impl PromptIntake {
@@ -234,6 +241,7 @@ impl PromptIntake {
                 },
                 disposition: PromptDisposition::Ask,
                 post_lock_disposition: PromptDisposition::Explain,
+                last_rejection: None,
             };
             debug_assert!(intake.validate().is_ok());
             return intake;
@@ -259,6 +267,7 @@ impl PromptIntake {
             },
             disposition,
             post_lock_disposition,
+            last_rejection: None,
         };
         debug_assert!(intake.validate().is_ok());
         intake
@@ -302,25 +311,62 @@ impl PromptIntake {
     /// content intentionally never enters model/system context or artifact
     /// metadata; it is presented directly by the harness and the turn ends.
     pub fn clarification_batch(&self) -> String {
-        let pending = self
-            .manifest
-            .decisions
-            .iter()
-            .enumerate()
-            .filter(|(_, decision)| decision.status == DecisionStatus::Pending)
-            .collect::<Vec<_>>();
+        let pending = self.pending_indices();
         if pending.is_empty() {
             return String::new();
         }
 
-        let mut rendered = String::from(
-            "I need these decisions locked before I can execute. Reply using an explicit ordinal for every item, for example `1: …`:\n",
-        );
-        for (ordinal, decision) in pending {
+        // #1689 item 3: singular phrasing for a single item. "these decisions"
+        // and "every item" over a one-item list is what made a COMPLETE batch
+        // read as a truncated one, and sent an operator hunting for output that
+        // had never been withheld.
+        let mut rendered = String::from(if pending.len() == 1 {
+            "I need this decision locked before I can execute. Reply with an explicit ordinal, for example `1: …`:\n"
+        } else {
+            "I need these decisions locked before I can execute. Reply using an explicit ordinal for every item, for example `1: …`:\n"
+        });
+        // #1689 item 4: ordinals come from the SAME mapping the resolver reads
+        // (`pending_indices`), so a displayed "3." is always the "3:" that
+        // resolves. The old code enumerated BEFORE filtering, numbering by
+        // absolute position in `decisions` while the resolver indexed into the
+        // pending-only slice. Unreachable today only because locking is
+        // all-or-nothing; the moment anything locks a decision on its own — the
+        // policy resolver the comment below anticipates — the two diverge, and
+        // the gate starts displaying "3." while accepting only "1:".
+        for (ordinal, index) in pending.iter().enumerate() {
+            let decision = &self.manifest.decisions[*index];
             let question = truncate_chars(&decision.question, MAX_CLARIFICATION_BYTES);
             rendered.push_str(&format!("{}. {}\n", ordinal + 1, question));
         }
         rendered.trim_end().to_string()
+    }
+
+    /// Why the last clarification reply was refused, if it was (#1689 item 1).
+    ///
+    /// `None` on a freshly analyzed intake and after a reply that locked the
+    /// batch. The harness prints [`ClarificationRejection::explain`] above the
+    /// re-emitted batch so a second identical block is never the whole
+    /// response to a rejected answer.
+    pub fn last_rejection(&self) -> Option<&ClarificationRejection> {
+        self.last_rejection.as_ref()
+    }
+
+    /// The absolute `decisions` indices that are still pending, in order.
+    ///
+    /// #1689 item 4. This is the ONE mapping between a displayed ordinal and a
+    /// decision: position `n` here is the ordinal `n + 1` the operator types,
+    /// for both [`Self::clarification_batch`] and `explicit_answer_indices`.
+    /// Keeping render and resolve on one function is what makes them unable to
+    /// disagree, rather than merely observed to agree.
+    fn pending_indices(&self) -> Vec<usize> {
+        self.manifest
+            .decisions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, decision)| {
+                (decision.status == DecisionStatus::Pending).then_some(index)
+            })
+            .collect()
     }
 
     /// Resolve only explicit operator answers against this pending manifest.
@@ -353,22 +399,21 @@ impl PromptIntake {
             return self.clone();
         }
         let mut resolved = self.clone();
-        let pending = resolved
-            .manifest
-            .decisions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, decision)| {
-                (decision.status == DecisionStatus::Pending).then_some(index)
-            })
-            .collect::<Vec<_>>();
+        // #1689 item 4: the same mapping `clarification_batch` renders from.
+        let pending = resolved.pending_indices();
 
-        if let Some(indices) = explicit_answer_indices(answer, &pending) {
-            for index in indices {
-                let decision = &mut resolved.manifest.decisions[index];
-                decision.status = DecisionStatus::Locked;
-                decision.source = Some(DecisionSource::Operator);
+        match explicit_answer_outcome(answer, &pending) {
+            Ok(indices) => {
+                for index in indices {
+                    let decision = &mut resolved.manifest.decisions[index];
+                    decision.status = DecisionStatus::Locked;
+                    decision.source = Some(DecisionSource::Operator);
+                }
+                resolved.last_rejection = None;
             }
+            // #1689 item 1: carry WHY, so the harness can say something other
+            // than the identical block a second time.
+            Err(rejection) => resolved.last_rejection = Some(rejection),
         }
 
         resolved.disposition = if resolved.manifest.pending_decision_count() == 0 {
@@ -835,12 +880,66 @@ fn has_ambiguous_destructive_target(lower: &str) -> bool {
     .any(|phrase| lower.contains(phrase))
 }
 
-fn explicit_answer_indices(answer: &str, pending: &[usize]) -> Option<Vec<usize>> {
+/// Why an operator's clarification reply did not lock the batch.
+///
+/// #1689 item 1. The gate used to re-emit a byte-identical block on every
+/// rejection, which is what made a blocked session indistinguishable from a
+/// hung one: nothing said what was wrong, and nothing named the way out. The
+/// model is never called on this path, so if the harness does not explain the
+/// refusal, nothing will.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClarificationRejection {
+    /// Nothing that parsed as `N: value` appeared anywhere in the reply.
+    NoOrdinals,
+    /// Ordinals parsed, but not for every pending decision.
+    Incomplete { answered: usize, expected: usize },
+    /// An ordinal outside the pending range was used.
+    OutOfRange { ordinal: usize, expected: usize },
+    /// The reply read as a question rather than an answer, and carried no
+    /// ordinals to override that reading.
+    ReadsAsQuestion,
+}
+
+impl ClarificationRejection {
+    /// One line stating what was wrong and how to get out — always naming the
+    /// escape hatch, because the operator's real problem is usually that they
+    /// disagree with the gate rather than that they mistyped.
+    pub fn explain(&self) -> String {
+        let detail = match self {
+            Self::NoOrdinals => {
+                "no `N: value` line was found — each answer needs its ordinal, like `1: use the second option`".to_string()
+            }
+            Self::Incomplete { answered, expected } => format!(
+                "{answered} of {expected} decisions were answered — locking is all-or-nothing, so answer every ordinal in one reply"
+            ),
+            Self::OutOfRange { ordinal, expected } => format!(
+                "ordinal {ordinal} is outside this batch — the pending items are numbered 1..={expected}"
+            ),
+            Self::ReadsAsQuestion => {
+                "the reply read as a question rather than an answer — prefix each answer with its ordinal (`1: …`) and it will be accepted even if it contains a `?`".to_string()
+            }
+        };
+        format!(
+            "that reply did not lock the batch: {detail}.\n\
+             (`/new` abandons this prompt and starts a fresh conversation.)"
+        )
+    }
+}
+
+/// Resolve explicit operator answers, or say why the reply was refused.
+///
+/// #1689 items 1 and 2.
+fn explicit_answer_outcome(
+    answer: &str,
+    pending: &[usize],
+) -> Result<Vec<usize>, ClarificationRejection> {
     let answer = answer.trim();
-    if answer.is_empty() || looks_like_unresolved_question(answer) {
-        return None;
+    if answer.is_empty() {
+        return Err(ClarificationRejection::NoOrdinals);
     }
     let mut resolved = BTreeSet::new();
+    let mut saw_ordinal = false;
+    let mut out_of_range = None;
     for line in answer.lines() {
         let line = line.trim();
         let line = line.strip_prefix("decision ").unwrap_or(line);
@@ -853,12 +952,53 @@ fn explicit_answer_indices(answer: &str, pending: &[usize]) -> Option<Vec<usize>
         let Ok(ordinal) = ordinal.trim().parse::<usize>() else {
             continue;
         };
-        let pending_ordinal = ordinal.checked_sub(1)?;
-        if let Some(index) = pending.get(pending_ordinal) {
-            resolved.insert(*index);
+        saw_ordinal = true;
+        let Some(pending_ordinal) = ordinal.checked_sub(1) else {
+            out_of_range = Some(ordinal);
+            continue;
+        };
+        match pending.get(pending_ordinal) {
+            Some(index) => {
+                resolved.insert(*index);
+            }
+            None => out_of_range = Some(ordinal),
         }
     }
-    (resolved.len() == pending.len()).then(|| resolved.into_iter().collect())
+
+    // #1689 item 2: the question heuristic applies ONLY when the reply carried
+    // no usable ordinals. It used to reject the WHOLE answer for a `?` anywhere
+    // in it, so `1: drain before rotation — sound right?` was refused: a
+    // perfectly good answer with a thought attached. An explicit `N: value` is
+    // the operator stating a decision, and that outranks a punctuation guess.
+    if !saw_ordinal {
+        if looks_like_unresolved_question(answer) {
+            return Err(ClarificationRejection::ReadsAsQuestion);
+        }
+        return Err(ClarificationRejection::NoOrdinals);
+    }
+    if let Some(ordinal) = out_of_range {
+        if resolved.len() != pending.len() {
+            return Err(ClarificationRejection::OutOfRange {
+                ordinal,
+                expected: pending.len(),
+            });
+        }
+    }
+    if resolved.len() != pending.len() {
+        return Err(ClarificationRejection::Incomplete {
+            answered: resolved.len(),
+            expected: pending.len(),
+        });
+    }
+    Ok(resolved.into_iter().collect())
+}
+
+/// The pre-#1689 shape, kept for the existing parser tests: outcome without a
+/// reason. Production reads `explicit_answer_outcome` so a refusal can be
+/// explained instead of silently repeated.
+#[cfg(test)]
+fn explicit_answer_indices(answer: &str, pending: &[usize]) -> Option<Vec<usize>> {
+    explicit_answer_outcome(answer, pending).ok()
 }
 
 fn looks_like_unresolved_question(answer: &str) -> bool {
@@ -1356,5 +1496,210 @@ mod tests {
         // The empty-prompt Ask terminal is untouched by any lexicon.
         let empty = PromptIntake::analyze_with("   ", &lex);
         assert_eq!(empty.disposition(), PromptDisposition::Ask);
+    }
+}
+
+/// #1689: the clarification gate's rejection reporting, ordinal mapping, and
+/// narrowed question heuristic.
+///
+/// The originating session looked hung: the gate printed a one-item batch whose
+/// text said "every item", then reprinted that identical block for every
+/// subsequent message while making no API calls. Nothing was truncated and
+/// nothing was wedged — the operator's replies were being refused silently.
+#[cfg(test)]
+mod clarification_gate_tests {
+    use super::*;
+
+    /// A prompt that trips exactly one decision needle.
+    fn one_decision() -> PromptIntake {
+        let intake = PromptIntake::analyze(
+            "Mark-then-rotate should be ordered so the drain sees the conversation \
+             the action belonged to (drain before rotation, or stamp actions with \
+             the conversation id).",
+        );
+        assert_eq!(
+            intake.manifest.pending_decision_count(),
+            1,
+            "fixture must produce exactly one pending decision"
+        );
+        intake
+    }
+
+    /// Item 3: a single-item batch says "this decision", not "these decisions
+    /// … every item". The plural-over-one phrasing is what made a COMPLETE
+    /// batch read as a truncated one.
+    #[test]
+    fn a_single_item_batch_does_not_speak_in_the_plural() {
+        let rendered = one_decision().clarification_batch();
+        assert!(
+            rendered.contains("I need this decision locked"),
+            "singular phrasing for one item, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("every item"),
+            "'every item' over a one-item list reads as truncation: {rendered}"
+        );
+    }
+
+    /// Item 2: an explicit ordinal outranks the `?` heuristic. Answering
+    /// `1: drain before rotation — sound right?` used to be refused outright
+    /// because a question mark appeared ANYWHERE in the reply.
+    #[test]
+    fn an_ordinal_answer_survives_a_question_mark() {
+        let resolved =
+            one_decision().resolve_with_operator_answer("1: drain before rotation — sound right?");
+        assert_eq!(
+            resolved.manifest.pending_decision_count(),
+            0,
+            "an explicit ordinal is an answer even with a '?' attached"
+        );
+        assert!(resolved.last_rejection().is_none());
+    }
+
+    /// …but a reply carrying NO ordinals and reading as a question is still
+    /// refused — and now says so.
+    #[test]
+    fn a_bare_question_is_still_refused_but_explains_itself() {
+        let resolved = one_decision().resolve_with_operator_answer("which one do you prefer?");
+        assert_eq!(resolved.manifest.pending_decision_count(), 1);
+        let rejection = resolved
+            .last_rejection()
+            .expect("a refusal must record why");
+        assert_eq!(*rejection, ClarificationRejection::ReadsAsQuestion);
+        let explained = rejection.explain();
+        assert!(explained.contains("read as a question"), "{explained}");
+        assert!(
+            explained.contains("/new"),
+            "every refusal names the escape hatch: {explained}"
+        );
+    }
+
+    /// Item 1: prose with no ordinal at all is the common case, and the reason
+    /// must distinguish it from the question case.
+    #[test]
+    fn prose_without_an_ordinal_reports_the_missing_ordinal() {
+        let resolved = one_decision().resolve_with_operator_answer("drain before rotation");
+        let rejection = resolved.last_rejection().expect("must record why");
+        assert_eq!(*rejection, ClarificationRejection::NoOrdinals);
+        assert!(rejection.explain().contains("`N: value`"));
+    }
+
+    /// Item 1: a partial answer locks nothing, and now says how many landed
+    /// rather than leaving the operator to guess.
+    #[test]
+    fn a_partial_answer_reports_how_many_were_missing() {
+        let intake = PromptIntake::analyze(
+            "Should we use SQLite or Postgres for the cache?\n\
+             Pick either the polling or the streaming transport.",
+        );
+        let expected = intake.manifest.pending_decision_count();
+        assert!(expected >= 2, "fixture needs at least two decisions");
+        let resolved = intake.resolve_with_operator_answer("1: sqlite");
+        assert_eq!(
+            resolved.manifest.pending_decision_count(),
+            expected,
+            "locking is all-or-nothing"
+        );
+        match resolved.last_rejection().expect("must record why") {
+            ClarificationRejection::Incomplete {
+                answered,
+                expected: e,
+            } => {
+                assert_eq!(*answered, 1);
+                assert_eq!(*e, expected);
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+    }
+
+    /// An out-of-range ordinal is reported as such — and only matters when the
+    /// batch is not otherwise fully answered.
+    ///
+    /// This pins a small behavior change rather than leaving it incidental. The
+    /// old parser was inconsistent here: `0:` hard-rejected the whole reply (a
+    /// `?` on `checked_sub(1)` returned `None` for the entire function), while a
+    /// stray HIGH ordinal was silently skipped and tolerated as long as every
+    /// pending item was covered. Same operator mistake, two different outcomes.
+    /// Both now behave the same way, and the reason names the valid range.
+    #[test]
+    fn an_out_of_range_ordinal_is_named_and_only_blocks_an_incomplete_reply() {
+        // Incomplete + out of range → the operator is told the valid range.
+        let resolved = one_decision().resolve_with_operator_answer("7: chosen");
+        assert_eq!(resolved.manifest.pending_decision_count(), 1);
+        match resolved.last_rejection().expect("must record why") {
+            ClarificationRejection::OutOfRange { ordinal, expected } => {
+                assert_eq!(*ordinal, 7);
+                assert_eq!(*expected, 1);
+            }
+            other => panic!("expected OutOfRange, got {other:?}"),
+        }
+
+        // A stray ordinal alongside a COMPLETE answer still locks — the batch
+        // got what it needed. `0:` and `7:` agree now; they did not before.
+        for stray in ["0: junk", "7: junk"] {
+            let resolved =
+                one_decision().resolve_with_operator_answer(&format!("1: chosen\n{stray}"));
+            assert_eq!(
+                resolved.manifest.pending_decision_count(),
+                0,
+                "a complete answer locks despite the stray `{stray}`"
+            );
+            assert!(resolved.last_rejection().is_none());
+        }
+    }
+
+    /// Item 4, the landmine: every ordinal the batch DISPLAYS must be one the
+    /// resolver ACCEPTS.
+    ///
+    /// The old code enumerated before filtering, so displayed numbers were
+    /// absolute indices into `decisions` while the resolver indexed the
+    /// pending-only slice. It could not diverge while locking stayed
+    /// all-or-nothing, so a parser-only test could not see it. This drives
+    /// render → parse → resolve as a round trip, which is what would catch a
+    /// future policy resolver locking one decision on its own.
+    #[test]
+    fn every_displayed_ordinal_is_one_the_resolver_accepts() {
+        let mut intake = PromptIntake::analyze(
+            "Should we use SQLite or Postgres for the cache?\n\
+             Pick either the polling or the streaming transport.\n\
+             Choose the retention window.",
+        );
+        let total = intake.manifest.decisions.len();
+        assert!(total >= 3, "fixture needs at least three decisions");
+
+        // Simulate exactly what today's code cannot: something locks the FIRST
+        // decision without operator input, so pending no longer starts at 0.
+        intake.manifest.decisions[0].status = DecisionStatus::Locked;
+        intake.manifest.decisions[0].source = Some(DecisionSource::Operator);
+        let pending_now = intake.manifest.pending_decision_count();
+        assert!(pending_now >= 2);
+
+        // Read the ordinals the operator would actually see.
+        let rendered = intake.clarification_batch();
+        let displayed: Vec<usize> = rendered
+            .lines()
+            .filter_map(|line| line.trim().split_once('.'))
+            .filter_map(|(n, _)| n.trim().parse::<usize>().ok())
+            .collect();
+        assert_eq!(
+            displayed.len(),
+            pending_now,
+            "the batch renders one line per pending decision: {rendered}"
+        );
+
+        // Answer using precisely those ordinals. If render and resolve used
+        // different mappings, this would fail to lock the batch.
+        let answer = displayed
+            .iter()
+            .map(|n| format!("{n}: chosen"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let resolved = intake.resolve_with_operator_answer(&answer);
+        assert_eq!(
+            resolved.manifest.pending_decision_count(),
+            0,
+            "answering every DISPLAYED ordinal must lock the batch; \
+             rendered:\n{rendered}\nanswer:\n{answer}"
+        );
     }
 }
