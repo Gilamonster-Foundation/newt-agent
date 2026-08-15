@@ -7234,6 +7234,47 @@ pub(crate) fn prepare_conversation_restore(
     })
 }
 
+/// What COMMIT is allowed to touch.
+///
+/// #1669 PR-A. Deliberately **has no `store` and no `persona_store`**. That is
+/// the whole guard: the prepare/commit split is only a real transaction while
+/// commit performs no fallible read, and a comment saying so decays the first
+/// time someone needs "just one more lookup" on the apply path. With no handle
+/// to read from, that edit does not compile.
+///
+/// Every field here is one `ConversationCommandContext` already owns; this is a
+/// narrowing reborrow, not a second source of truth.
+pub(crate) struct CommitContext<'a> {
+    pub workspace: &'a str,
+    pub memory: &'a mut newt_core::MemoryManager,
+    pub system: &'a mut String,
+    pub active_persona: &'a mut Option<Persona>,
+    pub active_conversation_id: &'a mut String,
+    pub compress_state: &'a mut newt_core::CompressState,
+    pub scratchpad: &'a dyn newt_core::ScratchpadStore,
+    pub step_ledger: &'a dyn newt_core::StepLedger,
+    pub active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
+    pub mode_states: &'a ConversationModeStates,
+}
+
+impl<'a> ConversationCommandContext<'a> {
+    /// Narrow to what commit may touch — dropping the two stores.
+    pub(crate) fn commit_context(&mut self) -> CommitContext<'_> {
+        CommitContext {
+            workspace: self.workspace,
+            memory: self.memory,
+            system: self.system,
+            active_persona: self.active_persona,
+            active_conversation_id: self.active_conversation_id,
+            compress_state: self.compress_state,
+            scratchpad: self.scratchpad,
+            step_ledger: self.step_ledger,
+            active_prompt_context: self.active_prompt_context,
+            mode_states: self.mode_states,
+        }
+    }
+}
+
 /// COMMIT — install a prepared restore. Infallible by construction.
 ///
 /// Performs no store read: everything it needs was resolved by
@@ -7241,7 +7282,7 @@ pub(crate) fn prepare_conversation_restore(
 /// prepare → deactivate → switch → commit and know the commit cannot strand it
 /// half-way.
 pub(crate) fn commit_conversation_restore(
-    ctx: &mut ConversationCommandContext<'_>,
+    ctx: &mut CommitContext<'_>,
     prepared: PreparedConversationRestore,
 ) -> (newt_core::ConversationRecord, Option<String>) {
     let PreparedConversationRestore {
@@ -7260,11 +7301,14 @@ fn restore_conversation_into_session(
     // The un-split entry point every non-tab caller still uses: prepare then
     // commit, so there is exactly ONE restore implementation.
     let prepared = prepare_conversation_restore(ctx.store, ctx.persona_store, id)?;
-    Ok(commit_conversation_restore(ctx, prepared))
+    Ok(commit_conversation_restore(
+        &mut ctx.commit_context(),
+        prepared,
+    ))
 }
 
 fn commit_prepared(
-    ctx: &mut ConversationCommandContext<'_>,
+    ctx: &mut CommitContext<'_>,
     record: newt_core::ConversationRecord,
     restored_prompt_context: Option<newt_core::TurnPromptContext>,
     prepared_persona: Option<Persona>,
