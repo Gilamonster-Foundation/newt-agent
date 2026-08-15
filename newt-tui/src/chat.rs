@@ -5054,10 +5054,23 @@ pub(crate) fn run_chat(
                             continue;
                         };
                         let clarification = prompt_intake.clarification_batch();
+                        // #1689 item 1: when a reply was REFUSED, say why
+                        // before repeating the batch. The gate never calls the
+                        // model, so an identical re-emit is the entire response
+                        // the operator gets — which is exactly what made a
+                        // blocked session read as a hung one. The explanation
+                        // also names `/new` as the way out, because the usual
+                        // reason a reply keeps failing is that the operator
+                        // disagrees that a decision was needed at all.
+                        let rejection = prompt_intake.last_rejection().map(|r| r.explain());
                         pending_clarification = Some(PendingClarification {
                             parent: Box::new(parent),
                             intake: prompt_intake,
                         });
+                        if let Some(reason) = rejection {
+                            print_newt(&reason, color, verbose);
+                            println!();
+                        }
                         print_newt(&clarification, color, verbose);
                         println!();
                         continue;
