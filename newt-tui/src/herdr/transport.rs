@@ -186,6 +186,151 @@ mod unix {
 #[cfg(not(unix))]
 pub(crate) use fallback::SocketSink;
 
+// ---------------------------------------------------------------------------
+// CLI fallback sink (HERDR_BIN_PATH)
+// ---------------------------------------------------------------------------
+//
+// The socket is the preferred transport, but it only exists on unix. Where it
+// does not — Windows, or a pane whose socket path is absent — an explicit
+// `HERDR_BIN_PATH` pointing at the `herdr` binary keeps the integration alive:
+// each call is one short-lived `herdr pane <verb>` process. That is a process
+// spawn per lifecycle change, so this is strictly a fallback, never the
+// default; the reporter worker absorbs the spawn cost, never the agent loop.
+//
+// Fail-open is preserved: a missing/exiting-nonzero binary just returns
+// `false`, and the state machine redelivers on the next event.
+pub(crate) mod cli {
+    use super::{Call, Sink};
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    /// Delivers calls by invoking the `herdr` CLI from `HERDR_BIN_PATH`.
+    pub(crate) struct CliSink {
+        bin: PathBuf,
+    }
+
+    impl CliSink {
+        pub(crate) fn new(bin: PathBuf) -> Self {
+            Self { bin }
+        }
+
+        /// Build the argv for one call. Returns `None` for a method the CLI
+        /// has no typed subcommand for (unknown future methods fail open).
+        fn argv(call: &Call) -> Option<Vec<String>> {
+            let p = &call.params;
+            let pane = p.get("pane_id")?.as_str()?.to_string();
+            let mut v = vec!["pane".to_string()];
+            match call.method {
+                "pane.report_agent" => {
+                    v.push("report-agent".into());
+                    v.push(pane);
+                    v.push("--source".into());
+                    v.push(p.get("source")?.as_str()?.to_string());
+                    v.push("--agent".into());
+                    v.push(p.get("agent")?.as_str()?.to_string());
+                    v.push("--state".into());
+                    v.push(p.get("state")?.as_str()?.to_string());
+                    if let Some(m) = p.get("message").and_then(|m| m.as_str()) {
+                        v.push("--message".into());
+                        v.push(m.to_string());
+                    }
+                }
+                "pane.report_agent_session" => {
+                    v.push("report-agent-session".into());
+                    v.push(pane);
+                    v.push("--source".into());
+                    v.push(p.get("source")?.as_str()?.to_string());
+                    v.push("--agent".into());
+                    v.push(p.get("agent")?.as_str()?.to_string());
+                    if let Some(id) = p.get("agent_session_id").and_then(|s| s.as_str()) {
+                        v.push("--agent-session-id".into());
+                        v.push(id.to_string());
+                    }
+                    if let Some(path) = p.get("agent_session_path").and_then(|s| s.as_str()) {
+                        v.push("--agent-session-path".into());
+                        v.push(path.to_string());
+                    }
+                }
+                "pane.release_agent" => {
+                    v.push("release-agent".into());
+                    v.push(pane);
+                }
+                // report_metadata_title and anything else: no CLI verb → skip.
+                _ => return None,
+            }
+            Some(v)
+        }
+    }
+
+    impl Sink for CliSink {
+        fn deliver(&mut self, call: &Call) -> bool {
+            let Some(argv) = Self::argv(call) else {
+                return false;
+            };
+            // No stdin, no captured stdout: herdr prints nothing we need, and
+            // a null stdin keeps the child from ever waiting on us.
+            Command::new(&self.bin)
+                .args(&argv)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::super::protocol::{release_agent, report_agent, PaneAgentState};
+        use super::*;
+
+        #[test]
+        fn report_agent_maps_to_the_typed_cli_verb() {
+            let call = report_agent("w1:p2", PaneAgentState::Working, Some("read_file"));
+            let argv = CliSink::argv(&call).unwrap();
+            assert_eq!(
+                argv,
+                vec![
+                    "pane",
+                    "report-agent",
+                    "w1:p2",
+                    "--source",
+                    "custom:newt",
+                    "--agent",
+                    "newt",
+                    "--state",
+                    "working",
+                    "--message",
+                    "read_file",
+                ]
+            );
+        }
+
+        #[test]
+        fn release_agent_maps_to_the_typed_cli_verb() {
+            let call = release_agent("w1:p2");
+            let argv = CliSink::argv(&call).unwrap();
+            assert_eq!(argv, vec!["pane", "release-agent", "w1:p2"]);
+        }
+
+        #[test]
+        fn a_method_with_no_cli_verb_fails_open() {
+            // report_metadata has no CLI subcommand; argv is None and deliver
+            // returns false rather than inventing an invocation.
+            let call = super::super::super::protocol::report_metadata_title("w1:p2", "title");
+            assert!(CliSink::argv(&call).is_none());
+        }
+
+        #[test]
+        fn a_missing_binary_delivers_false_not_panic() {
+            let mut sink = CliSink::new(PathBuf::from("/no/such/herdr-binary"));
+            let call = release_agent("w1:p2");
+            assert!(!sink.deliver(&call));
+        }
+    }
+}
+
 #[cfg(not(unix))]
 mod fallback {
     use super::{Call, Sink};
