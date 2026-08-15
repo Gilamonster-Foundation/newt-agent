@@ -105,11 +105,23 @@ static OBSERVERS: RwLock<Vec<(u64, Option<String>, Observer)>> = RwLock::new(Vec
 /// and a tool call runs inside whichever session's turn is executing, and the
 /// REPL runs turns synchronously so exactly one session can be in either state.
 ///
-/// What would invalidate it: genuinely parallel turns inside ONE process. Tabs
-/// (#1669) do not — the ADR keeps one active tab with synchronous turns — but a
-/// future that runs two turns concurrently in-process must replace this cell
-/// with a real per-session context, and the call sites above are the two that
-/// would need plumbing. Separate processes are unaffected: each has its own.
+/// **That reasoning held only while turns were synchronous, and they no longer
+/// are.** This doc used to say: "what would invalidate it: genuinely parallel
+/// turns inside ONE process… a future that runs two turns concurrently
+/// in-process must replace this cell with a real per-session context, and the
+/// call sites above are the two that would need plumbing." That future is the
+/// cockpit work (#1669), and this is that replacement — with one correction to
+/// the prediction: the two call sites need **no** plumbing.
+///
+/// [`scoped_active_session`] scopes ownership to a *thread* instead. Because a
+/// session that runs concurrently owns its own thread, both emitters stay
+/// ambient and become correct for free — "whose work is this?" is answered by
+/// where it is running, not by a process-wide guess about who is visible.
+///
+/// This cell survives as the **fallback** for work that has no thread scope:
+/// the single-threaded REPL, `newt solve`, headless and worker tiers, each of
+/// which has exactly one session and for which the old reasoning still holds
+/// exactly. Separate processes are unaffected: each has its own.
 static ACTIVE_SESSION: RwLock<Option<String>> = RwLock::new(None);
 /// Mirror of `OBSERVERS.len()`, so the (overwhelmingly common) unobserved
 /// case costs one relaxed load and never touches the lock.
@@ -256,12 +268,77 @@ pub fn clear_active_session() {
 }
 
 /// The session that currently owns the agent, if any.
+///
+/// Resolves the **current thread's** scope first ([`scoped_active_session`]),
+/// falling back to the process-wide cell. On a single-threaded session the two
+/// are the same answer; when a session runs its turn on its own thread, the
+/// thread scope is what makes that turn's events its own.
 #[must_use]
 pub fn active_session() -> Option<String> {
+    if let Some(scoped) = current_thread_session() {
+        return Some(scoped);
+    }
     ACTIVE_SESSION
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .clone()
+}
+
+std::thread_local! {
+    /// The session owning work on THIS thread, if any. See
+    /// [`scoped_active_session`].
+    static THREAD_SESSION: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn current_thread_session() -> Option<String> {
+    THREAD_SESSION
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Restores the previous thread-scoped session on drop.
+///
+/// The `Rc` marker keeps the guard on the thread whose slot it owns — the
+/// same construction [`crate::ocap::ScopedSessionDisclosure`] uses, and for
+/// the same reason: a guard that could travel would be attesting to state it
+/// no longer controls.
+#[must_use]
+pub struct ScopedActiveSession {
+    previous: Option<String>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for ScopedActiveSession {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = THREAD_SESSION.try_with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Declare that work on THIS thread belongs to `session_id`, until the
+/// returned guard drops.
+///
+/// This is what lets two sessions run at once without their events crossing.
+/// The two deepest emitters — `tty::arbiter::notify_prompt_observer` (the line
+/// arbiter is a singleton: one terminal, one writer) and
+/// `agentic::announce_tool_activity` (deep in tool dispatch) — have no session
+/// handle and cannot cheaply be given one. Ambient attribution is still the
+/// right answer for them; what changes is the *grain* of "ambient". A session
+/// that owns its thread makes both correct with no plumbing, because the
+/// question "whose work is this?" is answered by *where it is running* rather
+/// than by a process-wide guess about who is visible.
+///
+/// Nests in lexical (LIFO) order. Install it once, around a session's work, on
+/// the thread that performs it.
+pub fn scoped_active_session(session_id: &SessionId) -> ScopedActiveSession {
+    let previous =
+        THREAD_SESSION.with(|slot| slot.borrow_mut().replace(session_id.as_str().to_string()));
+    ScopedActiveSession {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
 }
 
 /// Is anyone listening? Call sites that would have to allocate to build an
@@ -345,6 +422,189 @@ mod tests {
             }
         });
         (sub, seen)
+    }
+
+    /// Records `(session_id, event)` from ANY thread, keeping only the ids
+    /// this test owns. The thread-filtering collectors above cannot be used
+    /// for concurrency tests — the whole point is to observe another thread —
+    /// and unique ids keep sibling tests out without serializing the suite.
+    #[allow(clippy::type_complexity)]
+    fn cross_thread_collector(
+        want: Vec<String>,
+    ) -> (
+        Subscription,
+        Arc<Mutex<Vec<(Option<String>, LifecycleEvent)>>>,
+    ) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let sub = subscribe(move |e| {
+            if e.session_id
+                .as_deref()
+                .is_some_and(|id| want.iter().any(|w| w == id))
+            {
+                sink.lock()
+                    .unwrap()
+                    .push((e.session_id.clone(), e.event.clone()));
+            }
+        });
+        (sub, seen)
+    }
+
+    /// THE property the cockpit train needs: two sessions working at once,
+    /// each on its own thread under its own scope, produce event streams that
+    /// are disjoint and complete.
+    ///
+    /// Before this change every ambient `emit()` resolved through one
+    /// process-wide cell, so whichever session wrote that cell last would have
+    /// claimed BOTH threads' events.
+    #[test]
+    fn two_threads_under_their_own_scopes_partition_their_events() {
+        // Serialize against sibling tests that also write the process-wide
+        // ownership cell — the same lock those tests already take.
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+
+        let a = new_session_id();
+        let b = new_session_id();
+        let (_sub, seen) =
+            cross_thread_collector(vec![a.as_str().to_string(), b.as_str().to_string()]);
+
+        // A process-wide owner that is NEITHER of them: if the thread scope
+        // were ignored, every event below would be attributed to this instead
+        // and the assertions would find nothing.
+        let bystander = new_session_id();
+        set_active_session(&bystander);
+
+        let workers: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|id| {
+                std::thread::spawn(move || {
+                    let _scope = scoped_active_session(&id);
+                    for _ in 0..25 {
+                        emit(LifecycleEvent::Thinking);
+                        emit(LifecycleEvent::ToolActivity {
+                            tool: "run_command".into(),
+                        });
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().expect("worker");
+        }
+        clear_active_session();
+
+        let got = seen.lock().unwrap().clone();
+        let for_a = got
+            .iter()
+            .filter(|(id, _)| id.as_deref() == Some(a.as_str()))
+            .count();
+        let for_b = got
+            .iter()
+            .filter(|(id, _)| id.as_deref() == Some(b.as_str()))
+            .count();
+        assert_eq!(for_a, 50, "every event A emitted is attributed to A");
+        assert_eq!(for_b, 50, "every event B emitted is attributed to B");
+        assert_eq!(
+            for_a + for_b,
+            got.len(),
+            "and nothing else leaked into either stream"
+        );
+    }
+
+    /// The guard is thread-bound, so a thread that never installed one falls
+    /// back to the process cell rather than inheriting a sibling's identity.
+    #[test]
+    fn a_thread_without_a_scope_does_not_inherit_another_threads_session() {
+        // Serialize against sibling tests that also write the process-wide
+        // ownership cell — the same lock those tests already take.
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+
+        let scoped = new_session_id();
+        let ambient = new_session_id();
+        let (_sub, seen) = cross_thread_collector(vec![
+            scoped.as_str().to_string(),
+            ambient.as_str().to_string(),
+        ]);
+        set_active_session(&ambient);
+
+        let scoped_for_thread = scoped.clone();
+        std::thread::spawn(move || {
+            let _scope = scoped_active_session(&scoped_for_thread);
+            emit(LifecycleEvent::Thinking);
+        })
+        .join()
+        .expect("scoped worker");
+
+        std::thread::spawn(|| emit(LifecycleEvent::Blocked))
+            .join()
+            .expect("unscoped worker");
+        clear_active_session();
+
+        let got = seen.lock().unwrap().clone();
+        assert!(
+            got.iter()
+                .any(|(id, e)| id.as_deref() == Some(scoped.as_str())
+                    && matches!(e, LifecycleEvent::Thinking)),
+            "the scoped thread's event is its own"
+        );
+        assert!(
+            got.iter()
+                .any(|(id, e)| id.as_deref() == Some(ambient.as_str())
+                    && matches!(e, LifecycleEvent::Blocked)),
+            "the unscoped thread falls back to the process cell"
+        );
+    }
+
+    /// Scopes restore in LIFO order and leave nothing behind — a session that
+    /// finishes must not keep claiming the thread.
+    #[test]
+    fn scopes_nest_and_restore() {
+        let outer = new_session_id();
+        let inner = new_session_id();
+        assert_eq!(current_thread_session(), None);
+        {
+            let _o = scoped_active_session(&outer);
+            assert_eq!(current_thread_session().as_deref(), Some(outer.as_str()));
+            {
+                let _i = scoped_active_session(&inner);
+                assert_eq!(current_thread_session().as_deref(), Some(inner.as_str()));
+            }
+            assert_eq!(
+                current_thread_session().as_deref(),
+                Some(outer.as_str()),
+                "the inner scope restored the outer one, not None"
+            );
+        }
+        assert_eq!(current_thread_session(), None, "and the thread is clean");
+    }
+
+    /// A thread scope outranks the process cell — that is what makes the
+    /// background-tab case safe. Without this the visible tab would claim a
+    /// working tab's events.
+    #[test]
+    fn the_thread_scope_wins_over_the_process_cell() {
+        // Serialize against sibling tests that also write the process-wide
+        // ownership cell — the same lock those tests already take.
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+
+        let visible = new_session_id();
+        let working = new_session_id();
+        set_active_session(&visible);
+        assert_eq!(active_session().as_deref(), Some(visible.as_str()));
+        {
+            let _scope = scoped_active_session(&working);
+            assert_eq!(
+                active_session().as_deref(),
+                Some(working.as_str()),
+                "work running here belongs to the session that owns this thread"
+            );
+        }
+        assert_eq!(
+            active_session().as_deref(),
+            Some(visible.as_str()),
+            "and the process cell is intact afterward"
+        );
+        clear_active_session();
     }
 
     #[test]
