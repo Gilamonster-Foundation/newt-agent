@@ -183,9 +183,6 @@ mod unix {
     }
 }
 
-#[cfg(not(unix))]
-pub(crate) use fallback::SocketSink;
-
 // ---------------------------------------------------------------------------
 // CLI fallback sink (HERDR_BIN_PATH)
 // ---------------------------------------------------------------------------
@@ -327,28 +324,6 @@ pub(crate) mod cli {
             let mut sink = CliSink::new(PathBuf::from("/no/such/herdr-binary"));
             let call = release_agent("w1:p2");
             assert!(!sink.deliver(&call));
-        }
-    }
-}
-
-#[cfg(not(unix))]
-mod fallback {
-    use super::{Call, Sink};
-    use std::path::PathBuf;
-
-    /// Herdr panes speak a unix socket; elsewhere the integration is simply
-    /// unavailable and every delivery fails silently.
-    pub(crate) struct SocketSink;
-
-    impl SocketSink {
-        pub(crate) fn new(_path: PathBuf) -> Self {
-            Self
-        }
-    }
-
-    impl Sink for SocketSink {
-        fn deliver(&mut self, _call: &Call) -> bool {
-            false
         }
     }
 }

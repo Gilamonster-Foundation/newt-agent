@@ -64,7 +64,9 @@ use std::time::Duration;
 use newt_core::lifecycle::{self, LifecycleEnvelope, LifecycleEvent, Subscription};
 
 use protocol::{Call, PaneAgentState, SessionStartSource};
-use transport::{cli, Sink, SocketSink};
+#[cfg(unix)]
+use transport::SocketSink;
+use transport::{cli, Sink};
 
 /// One-shot calls (session identity, tab title) queued for the worker. Small
 /// on purpose: these are startup facts, not a stream.
