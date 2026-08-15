@@ -686,9 +686,23 @@ mod tests {
 
     /// Non-destructive probe: has the worker delivered everything it can?
     /// (`next_step` mutates, so tests must never use it to wait.)
+    ///
+    /// #1662: identity counts. When session reporting moved off the one-shot
+    /// queue onto desired-vs-delivered, this probe kept checking only
+    /// `oneshots` and the state machine — so a session whose id had NOT yet
+    /// reached the pane read as idle. Every test that waits on this could then
+    /// race ahead and assert against an identity still in flight, which is the
+    /// failure mode the desired/delivered model exists to make impossible.
     fn worker_is_idle(inner: &Arc<Mutex<Inner>>) -> bool {
         let guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
-        !guard.shutdown && guard.oneshots.is_empty() && guard.machine.pending().is_none()
+        let identity_settled = match &guard.desired_session {
+            Some((id, _)) => guard.delivered_session.as_deref() == Some(id.as_str()),
+            None => true,
+        };
+        !guard.shutdown
+            && guard.oneshots.is_empty()
+            && guard.machine.pending().is_none()
+            && identity_settled
     }
 
     /// Wait (bounded) until `f` holds; keeps the tests free of sleeps that are
@@ -1033,6 +1047,49 @@ mod tests {
             },
         );
         assert!(eventually(|| worker_is_idle(&reporter.inner)));
+    }
+
+    /// #1662: a session whose identity has NOT reached the pane is not idle.
+    ///
+    /// When session reporting moved off the one-shot queue onto
+    /// desired-vs-delivered, `worker_is_idle` kept checking only `oneshots` and
+    /// the state machine. So a reporter with an undelivered identity reported
+    /// idle, and every test that waits on this probe — `start_session` among
+    /// them — could race ahead and assert against an identity still in flight.
+    /// A helper that returns before the thing it waits for has happened is
+    /// worse than no helper: it turns a real ordering bug into a flake.
+    ///
+    /// The predicate is targeted directly. An earlier version of this test used
+    /// a never-delivering sink, which left the STATE machine pending too — so
+    /// `worker_is_idle` was false for the wrong reason and the test passed even
+    /// with the identity check deleted. Here everything is driven to genuinely
+    /// idle first, then ONLY the identity is dirtied, so the assertion can fail
+    /// for exactly one reason.
+    #[test]
+    fn an_undelivered_session_identity_is_not_idle() {
+        let sink = FakeSink::new();
+        let (adapter, reporter) = harness(sink);
+        start_session(&adapter, &reporter, "s1");
+        assert!(
+            worker_is_idle(&reporter.inner),
+            "precondition: a delivered session with a settled machine is idle"
+        );
+
+        // Now a NEW identity is desired and has not been delivered. Nothing
+        // else changes: no queued one-shots, no pending state.
+        {
+            let mut g = reporter.inner.lock().unwrap();
+            g.desired_session = Some(("s2".to_string(), SessionStartSource::Startup));
+            assert!(g.oneshots.is_empty(), "fixture leaves no queued one-shots");
+            assert!(
+                g.machine.pending().is_none(),
+                "fixture leaves no pending state"
+            );
+        }
+        assert!(
+            !worker_is_idle(&reporter.inner),
+            "an identity still in flight is not idle"
+        );
     }
 
     #[test]

@@ -1589,15 +1589,15 @@ pub(crate) fn run_chat(
     // Step 26.6b (#586): session-scoped plan ledger for the scheduled view.
     // Task-specific → CLEARED on /new (like the scratchpad).
     let step_ledger = newt_core::SessionStepLedger::default();
+    // #1662: THE identity of this running Newt, stable for its whole lifetime
+    // and distinct from any conversation id. The previous scheme was
+    // `SystemTime::now().as_secs()`, so two Newts launched in the same second —
+    // a script, a tab restore, a Herdr layout opening several panes — shared
+    // one lifecycle identity and each answered to the other's events.
+    let lifecycle_session = newt_core::lifecycle::new_session_id();
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
-        session_id: format!(
-            "{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        ),
+        session_id: lifecycle_session.to_string(),
     };
     tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
     // #1662: declare ownership BEFORE announcing the start, so the two
@@ -1606,11 +1606,11 @@ pub(crate) fn run_chat(
     // events to this session from the first one. The start itself is emitted
     // with an explicit id rather than relying on the cell, so it is
     // self-describing regardless of ownership ordering.
-    newt_core::lifecycle::set_active_session(ctx.session_id.clone());
+    newt_core::lifecycle::set_active_session(&lifecycle_session);
     newt_core::lifecycle::emit_for(
-        Some(ctx.session_id.clone()),
+        Some(lifecycle_session.to_string()),
         newt_core::lifecycle::LifecycleEvent::SessionStarted {
-            session_id: ctx.session_id.clone(),
+            session_id: lifecycle_session.to_string(),
         },
     );
 
@@ -3480,20 +3480,25 @@ pub(crate) fn run_chat(
                         pending_clarification = None;
                         ephemeral_artifact_store =
                             session_artifact_store(ephemeral_session, &active_conversation_id)?;
-                        // #1662: `/new` (and its aliases) re-anchor the session,
-                        // so integrations must be told the NEW id. Ownership is
-                        // moved first for the same reason as at startup, then the
-                        // start is announced explicitly. A burst of these
-                        // coalesces downstream — the reporter tracks desired vs
-                        // delivered identity, so Herdr converges on the newest id
-                        // rather than being walked through every intermediate one.
-                        newt_core::lifecycle::set_active_session(active_conversation_id.clone());
-                        newt_core::lifecycle::emit_for(
-                            Some(active_conversation_id.clone()),
-                            newt_core::lifecycle::LifecycleEvent::SessionStarted {
-                                session_id: active_conversation_id.clone(),
-                            },
-                        );
+                        // #1662: `/new` starts a new CONVERSATION, not a new
+                        // SESSION — the process, the tab, and the Herdr pane are
+                        // all unchanged — so it deliberately emits no lifecycle
+                        // event and does not touch ownership.
+                        //
+                        // An earlier revision of this PR re-anchored ownership
+                        // here to `active_conversation_id`. That put two
+                        // different kinds of identity in one field: startup
+                        // stamped a session id, `/new` stamped a conversation
+                        // id, and an observer had no way to tell which it held.
+                        // A pane that had adopted the session then saw later
+                        // events under an id it did not recognize. Ownership is
+                        // now set once at startup and never becomes stale
+                        // because it never changes.
+                        //
+                        // Conversation identity is tracked separately (the
+                        // store's `active_conversation_id`). If Herdr should one
+                        // day display it, that is a distinct field carrying a
+                        // distinct id — not a second meaning on this one.
                         // #1030: pre-title a `/start <title>` conversation by
                         // creating its (empty) record up front, so it appears in
                         // `/resume` with that title immediately; the first turn

@@ -162,13 +162,90 @@ fn register(want: Option<String>, observer: Observer) -> Subscription {
     Subscription { id }
 }
 
-/// Declare which session owns the agent from now on. Called when a session
-/// starts or is re-anchored by `/new`; see [`ACTIVE_SESSION`] for why the two
-/// infrastructure emitters need it.
-pub fn set_active_session(session_id: impl Into<String>) {
+/// A fresh, collision-free identity for one Newt SESSION.
+///
+/// # What a lifecycle `session_id` means
+///
+/// It identifies **one running Newt** — one process, one tab, one pane — and is
+/// stable for that session's entire lifetime. It is deliberately NOT the
+/// conversation id:
+///
+/// | | changes when | scope |
+/// |---|---|---|
+/// | **session id** (this) | never, after startup | the running Newt / its Herdr pane |
+/// | conversation id ([`crate::new_conversation_id`]) | `/new`, `/resume`, `/conversation restore`, roadmap navigation, persona rotation | one thread of conversation *within* a session |
+///
+/// Mixing them is what #1662 was reopened to fix. `run_chat` stamped startup
+/// events with the session id and `/new` re-stamped ownership with the
+/// CONVERSATION id, so one field carried two different kinds of identity and an
+/// observer could not tell which it had. A Herdr pane that had adopted a
+/// session then saw later events bearing a conversation id it did not
+/// recognize — a name for the same agent that simply failed to match.
+///
+/// Conversation switching is therefore NOT a lifecycle ownership event: the
+/// owner is set once, at startup, and never becomes stale because it never
+/// changes. If a future feature needs Herdr to track the active conversation,
+/// that is a distinct field carrying a distinct id, not a second meaning
+/// overloaded onto this one.
+///
+/// Same shape as [`crate::new_conversation_id`] — nanosecond clock plus a v4
+/// UUID — deliberately reusing that proven generator rather than standing a
+/// second scheme beside it. The previous session id was
+/// `SystemTime::now().as_secs()`, so two Newts launched in the same second (a
+/// script, a tab-restore, a Herdr layout opening several panes) shared one
+/// lifecycle identity and each would answer to the other's events.
+#[must_use]
+pub fn new_session_id() -> SessionId {
+    SessionId(format!("session-{}", crate::new_conversation_id()))
+}
+
+/// The identity of one running Newt session — see [`new_session_id`].
+///
+/// A newtype rather than a `String`, deliberately. The bug this reopened #1662
+/// was a *conversation* id being handed to [`set_active_session`], and that is
+/// exactly the sort of mistake the repo's "make the bug unrepresentable" rule
+/// exists for: there is no public way to build a `SessionId` from an arbitrary
+/// string, so `set_active_session(active_conversation_id.clone())` no longer
+/// compiles. The two identity domains cannot be confused by accident again —
+/// only by someone deliberately reaching for the test-only constructor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(String);
+
+impl SessionId {
+    /// Borrow the wire form (what rides in [`LifecycleEnvelope::session_id`]).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Rebuild a `SessionId` from a string that is ALREADY a session id.
+    ///
+    /// For tests and for any future path that legitimately restores a session
+    /// identity it previously issued (a resumed pane, a supervisor handing an
+    /// id down). Never call this with a conversation id — that reintroduces
+    /// precisely the confusion the newtype prevents.
+    #[must_use]
+    pub fn from_issued(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Declare which session owns the agent from now on.
+///
+/// Called ONCE, when the session starts. A conversation switch is not an
+/// ownership change — see [`new_session_id`] for why the two identities are
+/// kept apart, and [`ACTIVE_SESSION`] for why the two infrastructure emitters
+/// need an ambient owner at all.
+pub fn set_active_session(session_id: &SessionId) {
     *ACTIVE_SESSION
         .write()
-        .unwrap_or_else(PoisonError::into_inner) = Some(session_id.into());
+        .unwrap_or_else(PoisonError::into_inner) = Some(session_id.as_str().to_string());
 }
 
 /// Forget the owning session (the session ended and nothing replaced it).
@@ -415,7 +492,8 @@ mod tests {
         // It must attribute to whoever owns the agent.
         let _g = crate::test_guard::GlobalSettingsGuard::acquire();
         let (sub, seen) = session_collector("owner");
-        set_active_session("owner");
+        let owner = SessionId::from_issued("owner");
+        set_active_session(&owner);
         emit(LifecycleEvent::Blocked);
         clear_active_session();
         emit(LifecycleEvent::Unblocked); // now unscoped — must not arrive
@@ -424,6 +502,90 @@ mod tests {
             *seen.lock().unwrap(),
             vec![LifecycleEvent::Blocked],
             "scoped while owned; unscoped after clearing"
+        );
+    }
+
+    /// #1662: two sessions created back to back must not share an identity.
+    ///
+    /// The old id was `SystemTime::now().as_secs()`, so any two Newts launched
+    /// inside the same second — a script, a shell tab restore, a Herdr layout
+    /// opening several panes at once — were literally the same session as far
+    /// as this seam was concerned, and each would answer to the other's events.
+    /// A loop is the honest test: it fails on the old scheme (all identical)
+    /// and passes on nanos + UUID.
+    #[test]
+    fn concurrently_created_sessions_have_distinct_identities() {
+        let ids: std::collections::BTreeSet<String> =
+            (0..64).map(|_| new_session_id().to_string()).collect();
+        assert_eq!(ids.len(), 64, "every session identity must be unique");
+
+        // And across real threads, which is the case that actually occurs.
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| new_session_id().to_string()))
+            .collect();
+        let threaded: std::collections::BTreeSet<String> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(threaded.len(), 8, "concurrent creation must not collide");
+    }
+
+    /// #1662: a conversation switch must not change who owns lifecycle events.
+    ///
+    /// The regression: `/new` used to call `set_active_session` with the new
+    /// CONVERSATION id, so one field carried two kinds of identity. A pane that
+    /// had adopted the session then saw later `Thinking` / tool events stamped
+    /// with an id it did not recognize — the agent renamed itself mid-session.
+    ///
+    /// The newtype makes the original mistake uncompilable, so what this pins
+    /// is the SEMANTIC half: ownership survives any number of conversation
+    /// switches, and events after them still reach the session's observer.
+    #[test]
+    fn a_conversation_switch_cannot_misattribute_later_events() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        let session = new_session_id();
+        let (sub, seen) = session_collector(session.as_str());
+        set_active_session(&session);
+
+        // Startup announces the session.
+        emit_for(
+            Some(session.to_string()),
+            LifecycleEvent::SessionStarted {
+                session_id: session.to_string(),
+            },
+        );
+        emit(LifecycleEvent::Thinking);
+
+        // Now switch conversations several times. `/new`, `/resume`,
+        // `/conversation restore`, roadmap navigation and persona rotation all
+        // mint or adopt a conversation id; NONE of them is a lifecycle
+        // ownership event, so none of them touches the cell.
+        for _ in 0..3 {
+            let _conversation = crate::new_conversation_id();
+        }
+
+        // Events after the switches still belong to the same session.
+        emit(LifecycleEvent::Thinking);
+        emit(LifecycleEvent::ToolActivity {
+            tool: "run_command".to_string(),
+        });
+        emit(LifecycleEvent::TurnCompleted);
+        drop(sub);
+
+        let got = seen.lock().unwrap().clone();
+        assert!(
+            got.contains(&LifecycleEvent::TurnCompleted),
+            "events after a conversation switch must still reach the session: {got:?}"
+        );
+        assert_eq!(
+            got.iter()
+                .filter(|e| matches!(e, LifecycleEvent::Thinking))
+                .count(),
+            2,
+            "both Thinking events belong to this session: {got:?}"
+        );
+        assert_eq!(
+            active_session().as_deref(),
+            Some(session.as_str()),
+            "a conversation switch must not re-anchor lifecycle ownership"
         );
     }
 
