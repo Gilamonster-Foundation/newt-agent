@@ -88,11 +88,16 @@ spec:
         fsGroup: 100
         fsGroupChangePolicy: OnRootMismatch
       serviceAccountName: drake-interactive
+      # The home PVC is local to nuc. Pin explicitly because /workspaces uses
+      # the same local backing directory, avoiding a loopback NFS mount whose
+      # hard timeout can prevent this pod from being created.
+      nodeSelector:
+        kubernetes.io/hostname: nuc
       volumes:
         - name: home
           persistentVolumeClaim: { claimName: drake-interactive-home }
         - name: agent-workspace
-          persistentVolumeClaim: { claimName: agent-workspace }
+          hostPath: { path: /srv/ontap-sim/agent-workspace, type: Directory }
         - name: nats-nkeys
           secret: { secretName: drake-nats-nkey, defaultMode: 256 }
         - name: api-keys
@@ -112,3 +117,5 @@ spec:
           secret: { secretName: drake-interactive-hostkeys, defaultMode: 384 }
         - name: scratch
           emptyDir: { sizeLimit: 50Gi }
+
+# Model: not exposed by harness | Harness: Codex | Operator: Shawn Hartsock | Time: 12:33 UTC | Date: 2026-08-15
