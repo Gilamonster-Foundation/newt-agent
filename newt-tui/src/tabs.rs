@@ -68,6 +68,39 @@ pub struct TabSidecar {
     pub interrupted_objective: Option<TurnPromptContext>,
 }
 
+/// What a tab owns while its conversation has **no durable row yet**.
+///
+/// #1669 PR-A (P0). `ConversationStore` claims an id before any row exists —
+/// rows materialize on the first submitted prompt — so `/tab new` leaves a real
+/// interval in which the tab is live but the store has nothing to write to.
+/// Three things were silently lost or cross-contaminated in that window:
+///
+/// - **persona** is session-global `active_persona` with no per-tab home, so a
+///   rowless tab picked up whichever persona the tab it switched to had, and
+///   then got STAMPED with it at materialization. The stamp is permanent:
+///   `persona` is write-once at row birth (`create_with_id` / `begin_prompt`);
+///   there is no UPDATE path in the store at all.
+/// - **preference actions** buffer in a session-global `pending`, which
+///   `restore_preference_pin` zeroes on every switch — so a `/model` or
+///   `/backends` choice made in a fresh tab vanished on the next `/tab`.
+/// - **rename** materializes the row itself, stamping whatever persona happened
+///   to be active rather than the renamed tab's own.
+///
+/// This is NOT a second copy of a durable conversation's pin: it exists only
+/// while there is no row to hold that state, and it is consumed the moment one
+/// appears.
+#[derive(Debug, Clone, Default)]
+pub struct FreshSeed {
+    /// The persona this conversation will be stamped with when its row is
+    /// created. Captured at `/tab new` from the active persona — matching
+    /// `/new`, which keeps it — and owned by THIS tab from then on.
+    pub persona: Option<crate::Persona>,
+    /// Preference actions taken before the row existed, held here because
+    /// `persist_preference_actions` has nowhere durable to put them and the
+    /// next switch would otherwise discard them.
+    pub pending: newt_core::PreferenceActions,
+}
+
 /// One tab: one session, holding one conversation.
 #[derive(Debug, Clone)]
 pub struct TabState {
@@ -80,6 +113,9 @@ pub struct TabState {
     pub sidecar: TabSidecar,
     /// Unsubmitted prompt text, restored when this tab is reactivated.
     pub input_stash: String,
+    /// `Some` only while this tab's conversation has no durable row — see
+    /// [`FreshSeed`]. Dropped as soon as the row materializes.
+    pub fresh_seed: Option<FreshSeed>,
     /// `Some` when this tab's pinned posture could NOT be established, so the
     /// tab is running at baseline instead (ADR blocker 4).
     ///
@@ -209,6 +245,7 @@ impl TabSet {
                 conversation_id: conversation_id.into(),
                 sidecar: TabSidecar::default(),
                 input_stash: String::new(),
+                fresh_seed: None,
                 pin_degraded: None,
             }],
             active: 0,
@@ -242,6 +279,12 @@ impl TabSet {
     #[must_use]
     pub fn tabs(&self) -> &[TabState] {
         &self.tabs
+    }
+
+    /// Mutable access for the seam that must edit a NON-active tab — renaming
+    /// tab 3 from tab 1 consumes tab 3's seed, not the active tab's.
+    pub fn tabs_mut(&mut self) -> &mut [TabState] {
+        &mut self.tabs
     }
 
     /// The tab at `index`, if it is open.
@@ -281,6 +324,7 @@ impl TabSet {
                 conversation_id: conversation_id.into(),
                 sidecar: TabSidecar::default(),
                 input_stash: String::new(),
+                fresh_seed: None,
                 pin_degraded: None,
             },
         );
@@ -317,10 +361,14 @@ impl TabSet {
 
     /// Close the tab at `index`.
     ///
-    /// Refuses the last tab. Closing the ACTIVE tab activates a neighbor first
-    /// — the returned [`Closed::handoff`] is `Some`, and the caller must apply
-    /// it BEFORE releasing the closed tab's claim, so no window exists in which
-    /// the process has no owner or still names a tab that is gone.
+    /// Refuses the last tab, and fixes the active index when a tab before it is
+    /// removed.
+    ///
+    /// This does NOT hand ownership off: `tab_switch::close_tab` activates the
+    /// neighbor through the normal transactional switch BEFORE calling this, so
+    /// by the time a tab is removed here it is already inactive. Returning a
+    /// handoff would imply a second, weaker activation path — exactly the thing
+    /// the transactional close removed.
     ///
     /// Numbering is positional, so remaining tabs renumber on close exactly as
     /// vim does. `<n>gt` is positional-absolute, so a stored monotonic number
@@ -334,21 +382,13 @@ impl TabSet {
         if self.tabs.len() == 1 {
             return Err(TabError::LastTab);
         }
-        let was_active = index == self.active;
         let removed = self.tabs.remove(index);
         // Fix the active index BEFORE reporting, so the handoff names a tab
         // that is actually open.
         if self.active > index || self.active == self.tabs.len() {
             self.active -= 1;
         }
-        let handoff = was_active.then(|| OwnerHandoff {
-            from: Some(removed.session_id.clone()),
-            to: self.tabs[self.active].session_id.clone(),
-        });
-        Ok(Closed {
-            tab: removed,
-            handoff,
-        })
+        Ok(Closed { tab: removed })
     }
 
     /// Move the tab at `from` to index `to`, preserving which tab is active.
@@ -393,9 +433,6 @@ pub struct Closed {
     /// `/resume`-able — close releases the claim, it does not end the
     /// conversation.
     pub tab: TabState,
-    /// Present only when the CLOSED tab was active: the neighbor that must be
-    /// made the lifecycle owner before the closed tab's claim is released.
-    pub handoff: Option<OwnerHandoff>,
 }
 
 /// What the operator asked the tab engine to do.
@@ -708,14 +745,13 @@ mod tests {
         let _ = set.activate(1).unwrap(); // active = conv-2
         let closed = set.close(1).unwrap();
         assert_eq!(closed.tab.conversation_id(), "conv-2");
-        let handoff = closed
-            .handoff
-            .expect("closing the ACTIVE tab must hand ownership off");
-        assert_eq!(handoff.from, Some(sid(2)));
+        // Ownership handoff is the SWITCH layer's job now (it activates the
+        // neighbor before removing anything); the model's job is only to keep
+        // `active` pointing at an open tab.
         assert_eq!(
-            handoff.to,
-            *set.active().session_id(),
-            "the handoff names the tab that is now active — and it is still open"
+            set.active_index(),
+            1,
+            "the active index still names an open tab"
         );
         assert!(
             !set.tabs().iter().any(|t| *t.session_id() == sid(2)),
@@ -729,10 +765,7 @@ mod tests {
         let _ = set.activate(2).unwrap();
         let active = set.active().session_id().clone();
         let closed = set.close(0).unwrap();
-        assert!(
-            closed.handoff.is_none(),
-            "no ownership change — the active tab did not move"
-        );
+        assert_eq!(closed.tab.conversation_id(), "conv-1");
         assert_eq!(
             *set.active().session_id(),
             active,
@@ -745,8 +778,7 @@ mod tests {
     fn closing_the_last_positional_tab_while_active_steps_back() {
         let mut set = three_tabs();
         let _ = set.activate(2).unwrap();
-        let closed = set.close(2).unwrap();
-        assert!(closed.handoff.is_some());
+        let _closed = set.close(2).unwrap();
         assert_eq!(set.active_index(), 1, "active never dangles past the end");
         assert_eq!(set.len(), 2);
     }
@@ -1006,10 +1038,7 @@ mod ownership_tests {
 
         // Close the INACTIVE tab A while B is active.
         let closed = set.close(0).unwrap();
-        assert!(
-            closed.handoff.is_none(),
-            "closing an inactive tab is not an ownership event"
-        );
+        assert_eq!(closed.tab.conversation_id(), "conv-a");
         assert_eq!(
             lifecycle::active_session().as_deref(),
             Some(b.as_str()),
@@ -1018,8 +1047,14 @@ mod ownership_tests {
         assert_eq!(*set.active().session_id(), b);
     }
 
+    /// The ordering itself now lives in `tab_switch::close_tab`, which
+    /// ACTIVATES the neighbor through the normal transactional switch before
+    /// removing anything — proven end-to-end by
+    /// `tab_switch::state_machine_tests::closing_the_active_tab_activates_the_neighbor_before_releasing`.
+    /// What the pure model still owes is narrower: after a removal, ownership
+    /// must name a tab that is still open.
     #[test]
-    fn closing_the_active_tab_activates_the_neighbor_before_ownership_is_cleared() {
+    fn after_a_close_the_owner_still_names_an_open_tab() {
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
         let a = new_session_id();
         let b = new_session_id();
@@ -1028,17 +1063,16 @@ mod ownership_tests {
         open.apply();
         assert_eq!(lifecycle::active_session().as_deref(), Some(b.as_str()));
 
-        // Close B, the ACTIVE tab.
+        // The switch layer activates A first...
+        set.activate(0).unwrap().apply();
+        // ...and only then is B removed.
         let closed = set.close(1).unwrap();
-        let handoff = closed.handoff.expect("closing the active tab hands off");
-        handoff.apply();
+        assert_eq!(closed.tab.conversation_id(), "conv-b");
         assert_eq!(
             lifecycle::active_session().as_deref(),
             Some(a.as_str()),
-            "the neighbor owns the REPL — there is never an unowned instant"
+            "there is never an unowned instant"
         );
-        // The closed tab's identity is gone from the set, so nothing can be
-        // attributed to it through the tab model afterwards.
         assert!(!set.tabs().iter().any(|t| *t.session_id() == b));
     }
 

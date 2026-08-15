@@ -7132,18 +7132,142 @@ fn handle_conversation_command(
 /// conversation's id is adopted BEFORE the system prompt rebuild so the
 /// prompt names that conversation's plan file (issue #220) — resuming a
 /// conversation resumes its plan.
+/// Everything a restore needs, already read and validated — so applying it
+/// cannot fail.
+///
+/// #1669 PR-A (P0): restore used to be one function whose fallible store reads
+/// happened to precede its first mutation. That is a correct ORDER but not a
+/// transaction: a caller could only preflight what it knew to preflight, and a
+/// tab switch preflighted `exists` + `load` while restore also validated the
+/// prompt receipt and its context. A conversation whose row loaded but whose
+/// receipt did not would therefore fail AFTER the outgoing tab had been
+/// deactivated and the active pointer moved.
+///
+/// Splitting it makes the transaction explicit: PREPARE performs every fallible
+/// read and mutates nothing; COMMIT consumes this and performs no fallible
+/// store read at all, so it cannot fail and there is no error for a caller to
+/// swallow.
+pub(crate) struct PreparedConversationRestore {
+    record: newt_core::ConversationRecord,
+    /// Validated prompt lineage, resolved during prepare.
+    prompt_context: Option<newt_core::TurnPromptContext>,
+    /// Resolved during prepare too — the persona store is a second fallible
+    /// source, and leaving it in commit would keep a read on the apply path.
+    persona: Option<Persona>,
+    /// Set when the record NAMES a persona that could not be loaded. Not an
+    /// error: the restore proceeds with no persona and the caller reports it.
+    persona_warning: Option<String>,
+}
+
+/// Forces a post-`load` prepare failure for one conversation, on one test
+/// thread. Compiled out of the shipped binary.
+///
+/// Exists because the P0 hazard cannot be reached by corrupting a row: it needs
+/// the row to load cleanly and a SUBSEQUENT read — the prompt receipt or its
+/// context — to fail. Deterministic, no sleeps, no filesystem surgery.
+#[cfg(test)]
+pub(crate) mod restore_prepare_seam {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FAILING: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Make preparing `id` fail AFTER its row loads.
+    pub(crate) fn fail_after_load_for(id: &str) {
+        FAILING.with(|f| *f.borrow_mut() = Some(id.to_string()));
+    }
+
+    pub(crate) fn clear() {
+        FAILING.with(|f| *f.borrow_mut() = None);
+    }
+
+    pub(crate) fn forced_failure(id: &str) -> Option<String> {
+        FAILING.with(|f| {
+            f.borrow()
+                .as_deref()
+                .filter(|failing| *failing == id)
+                .map(|_| "prompt receipt context failed to validate (test seam)".to_string())
+        })
+    }
+}
+
+/// PREPARE — every fallible read for restoring `id`, mutating zero live state.
+///
+/// Callers that must not half-apply (a tab switch, an adoption) call this
+/// BEFORE they deactivate anything. A failure here means nothing has moved.
+pub(crate) fn prepare_conversation_restore(
+    store: &newt_core::ConversationStore,
+    persona_store: &PersonaStore,
+    id: &str,
+) -> anyhow::Result<PreparedConversationRestore> {
+    let record = store.load(id)?;
+    // Test seam modelling the exact P0 hazard: the ROW loads, and a LATER
+    // validation fails. Placed after `load` on purpose — a seam before it would
+    // only re-prove what a load-only preflight already caught.
+    #[cfg(test)]
+    if let Some(e) = restore_prepare_seam::forced_failure(id) {
+        anyhow::bail!(e);
+    }
+    // Prompt receipts are a parallel immutable log, not presentation history.
+    // Resolving them HERE is the whole point of the split: a corrupt receipt
+    // must fail the restore while the session is still entirely on the
+    // outgoing conversation.
+    let prompt_context = match store.latest_prompt(&record.id)? {
+        Some(receipt) => store.turn_prompt_context(&record.id, receipt.id())?,
+        None => None,
+    };
+    let (persona, persona_warning) = match record.persona.as_deref() {
+        Some(name) => match persona_store.load(name) {
+            Ok(persona) => (Some(persona), None),
+            Err(e) => (None, Some(format!("persona `{name}` unavailable: {e}"))),
+        },
+        None => (None, None),
+    };
+    Ok(PreparedConversationRestore {
+        record,
+        prompt_context,
+        persona,
+        persona_warning,
+    })
+}
+
+/// COMMIT — install a prepared restore. Infallible by construction.
+///
+/// Performs no store read: everything it needs was resolved by
+/// [`prepare_conversation_restore`]. That is what lets a caller order
+/// prepare → deactivate → switch → commit and know the commit cannot strand it
+/// half-way.
+pub(crate) fn commit_conversation_restore(
+    ctx: &mut ConversationCommandContext<'_>,
+    prepared: PreparedConversationRestore,
+) -> (newt_core::ConversationRecord, Option<String>) {
+    let PreparedConversationRestore {
+        record,
+        prompt_context,
+        persona,
+        persona_warning,
+    } = prepared;
+    commit_prepared(ctx, record, prompt_context, persona, persona_warning)
+}
+
 fn restore_conversation_into_session(
     ctx: &mut ConversationCommandContext<'_>,
     id: &str,
 ) -> anyhow::Result<(newt_core::ConversationRecord, Option<String>)> {
-    let record = ctx.store.load(id)?;
-    // Prompt receipts are a parallel immutable log, not presentation history.
-    // Resolve and verify them before mutating any live session state, so a
-    // corrupt receipt makes restore fail without partially switching memory.
-    let restored_prompt_context = match ctx.store.latest_prompt(&record.id)? {
-        Some(receipt) => ctx.store.turn_prompt_context(&record.id, receipt.id())?,
-        None => None,
-    };
+    // The un-split entry point every non-tab caller still uses: prepare then
+    // commit, so there is exactly ONE restore implementation.
+    let prepared = prepare_conversation_restore(ctx.store, ctx.persona_store, id)?;
+    Ok(commit_conversation_restore(ctx, prepared))
+}
+
+fn commit_prepared(
+    ctx: &mut ConversationCommandContext<'_>,
+    record: newt_core::ConversationRecord,
+    restored_prompt_context: Option<newt_core::TurnPromptContext>,
+    prepared_persona: Option<Persona>,
+    warning: Option<String>,
+) -> (newt_core::ConversationRecord, Option<String>) {
     // Restore is a conversation boundary. Clear the legacy model-entered plan
     // clamp only after the record and prompt receipt validate, so a failed
     // restore cannot partially mutate the live session.
@@ -7169,17 +7293,8 @@ fn restore_conversation_into_session(
     // Rehydrate the verified metadata so prompt handles remain resolvable,
     // while leaving the input queue untouched (no auto-execution).
     *ctx.active_prompt_context = restored_prompt_context;
-    let mut warning = None;
-    match record.persona.as_deref() {
-        Some(name) => match ctx.persona_store.load(name) {
-            Ok(persona) => *ctx.active_persona = Some(persona),
-            Err(e) => {
-                *ctx.active_persona = None;
-                warning = Some(format!("persona `{name}` unavailable: {e}"));
-            }
-        },
-        None => *ctx.active_persona = None,
-    }
+    // Resolved during PREPARE — no fallible read on the apply path.
+    *ctx.active_persona = prepared_persona;
     // #1668 review-2 finding 5: `active_persona` is only half of activating a
     // persona — `handle_persona_command` also re-seats the PERSONA COGNITION
     // LAYER that `effective_cognition` ranks beneath the CLI layer. A restore
@@ -7204,7 +7319,7 @@ fn restore_conversation_into_session(
         ctx.active_persona.as_ref(),
         ctx.active_conversation_id,
     );
-    Ok((record, warning))
+    (record, warning)
 }
 
 /// Resume `id` into the session and return the 17.7 resume banner.

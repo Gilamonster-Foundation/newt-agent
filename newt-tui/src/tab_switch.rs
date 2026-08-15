@@ -31,7 +31,7 @@
 //! Claims are held throughout: both the outgoing and incoming conversations
 //! stay claimed across a switch. Only **close** and **exit** release.
 
-use crate::tabs::{Closed, OwnerHandoff, TabError, TabSet};
+use crate::tabs::{TabError, TabSet};
 
 /// The live session state a switch reads and rewrites.
 ///
@@ -76,14 +76,30 @@ pub(crate) struct TabSwitchCtx<'a> {
 }
 
 /// What a completed switch tells the caller.
-#[derive(Debug)]
-pub(crate) struct Switched {
-    /// Whether the backend endpoint moved, so the caller re-probes DGX
-    /// telemetry exactly as every other backend switch does.
+/// The single result shape for ANY operation that can make a tab active.
+///
+/// #1669 PR-A (P1). `create_fresh_tab` used to return only an `OwnerHandoff`
+/// and discard its `PinRestore`, so `/tab new` always reported `url_changed =
+/// false` — and a tab pinned to endpoint X followed by a fresh baseline tab at
+/// endpoint Y is an endpoint change whose telemetry never re-probed. Endpoint
+/// movement is a fact the restore reports; it must never be inferred from
+/// whether ownership happened to change.
+#[derive(Debug, Default)]
+pub(crate) struct TransitionOutcome {
+    /// The endpoint moved — the caller re-probes DGX telemetry.
     pub url_changed: bool,
-    /// `Some` when the activated tab's pin could not be established, so it is
+    /// `Some` when the now-active tab's pin could not be established, so it is
     /// running at baseline and must refuse turns until resolved.
     pub degraded: Option<crate::PinDegraded>,
+}
+
+impl TransitionOutcome {
+    fn from_restore(restored: &crate::PinRestore) -> Self {
+        Self {
+            url_changed: restored.url_changed,
+            degraded: restored.degraded.clone(),
+        }
+    }
 }
 
 impl TabSwitchCtx<'_> {
@@ -103,6 +119,26 @@ impl TabSwitchCtx<'_> {
             self.base_model,
         ) {
             crate::print_newt(&format!("warning: {warning}"), self.color, self.verbose);
+        }
+        // The rowless interval, handled explicitly. If the row has since
+        // materialized, the seed's job is done and it is dropped — its persona
+        // was stamped at row birth and its pin actions now have somewhere
+        // durable to go. If it has NOT, capture what the store cannot hold:
+        // this tab's persona and its unwritten preference actions.
+        let materialized = self
+            .store
+            .exists(tabs.active().conversation_id())
+            .unwrap_or(false);
+        if let Some(seed) = tabs.active_mut().fresh_seed.as_mut() {
+            if materialized {
+                // fall through: cleared below
+            } else {
+                seed.persona = self.active_persona.clone();
+                seed.pending = std::mem::take(self.pending);
+            }
+        }
+        if materialized {
+            tabs.active_mut().fresh_seed = None;
         }
         let outgoing = tabs.active_mut();
         outgoing.sidecar.turns_this_conversation = *self.turns_this_conversation as u32;
@@ -160,33 +196,43 @@ impl TabSwitchCtx<'_> {
 /// semantics: nothing else in newt writes a row before there is something to
 /// record, and an empty row would show up in `/resume` listings as a
 /// conversation that never happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Incoming {
-    /// A durable row exists and reads cleanly.
-    Materialized,
+enum PreparedIncoming {
+    /// A durable row, fully read and validated — applying it cannot fail.
+    Materialized(Box<crate::PreparedConversationRestore>),
     /// Claimed, no row yet: activation resets to a clean conversation under
-    /// that id rather than loading one.
+    /// that id rather than loading one. Nothing to prepare, nothing to fail.
     Fresh,
 }
 
 /// Stage 0 — prove the incoming conversation can be activated, mutating nothing.
 ///
+/// #1669 PR-A (P0). This used to be `exists() + load()`, which is a weaker
+/// claim than it appeared: `restore_conversation_into_session` ALSO validated
+/// the prompt receipt and its context, so a conversation whose row loaded but
+/// whose receipt did not would fail after the outgoing tab had already been
+/// deactivated and the active pointer moved. Preflight now performs the whole
+/// prepare, so what Stage 0 proves is exactly what commit needs.
+///
 /// A store error is NOT "absent" (the #1030 hazard): a transient SQLITE_BUSY or
 /// NFS IO error must abort the switch, never be mistaken for a fresh tab and
 /// silently reset a conversation that actually has content.
-fn preflight(store: &newt_core::ConversationStore, id: &str) -> Result<Incoming, TabError> {
+fn preflight(
+    store: &newt_core::ConversationStore,
+    persona_store: &crate::PersonaStore,
+    id: &str,
+) -> Result<PreparedIncoming, TabError> {
     #[cfg(test)]
     if let Some(reason) = test_seam::forced_failure(id) {
         return Err(TabError::PreflightFailed { reason });
     }
     match store.exists(id) {
-        Ok(true) => match store.load(id) {
-            Ok(_) => Ok(Incoming::Materialized),
+        Ok(true) => match crate::prepare_conversation_restore(store, persona_store, id) {
+            Ok(prepared) => Ok(PreparedIncoming::Materialized(Box::new(prepared))),
             Err(e) => Err(TabError::PreflightFailed {
                 reason: format!("its conversation could not be read ({e})"),
             }),
         },
-        Ok(false) => Ok(Incoming::Fresh),
+        Ok(false) => Ok(PreparedIncoming::Fresh),
         Err(e) => Err(TabError::PreflightFailed {
             reason: format!("the conversation store could not be queried ({e})"),
         }),
@@ -220,15 +266,20 @@ impl TabSwitchCtx<'_> {
         .clear();
     }
 
-    /// Stages 3–5 for whichever tab is now active.
-    fn hydrate(
+    /// Stages 4–6 for whichever tab is now active.
+    ///
+    /// Takes the PREPARED incoming state by value, so there is no fallible
+    /// store read here and therefore no restore error for this function to
+    /// swallow — the earlier shape logged a late failure and carried on, which
+    /// is precisely the half-applied switch the split removes.
+    fn commit_incoming(
         &mut self,
         tabs: &TabSet,
         incoming_id: &str,
-        incoming: Incoming,
+        incoming: PreparedIncoming,
     ) -> crate::PinRestore {
         match incoming {
-            Incoming::Materialized => {
+            PreparedIncoming::Materialized(prepared) => {
                 let mut restore = crate::ConversationCommandContext {
                     store: self.store,
                     persona_store: self.persona_store,
@@ -243,18 +294,44 @@ impl TabSwitchCtx<'_> {
                     active_prompt_context: self.active_prompt_context,
                     mode_states: self.mode_states,
                 };
-                if let Ok((_, Some(w))) =
-                    crate::restore_conversation_into_session(&mut restore, incoming_id)
-                {
+                let (_, warning) = crate::commit_conversation_restore(&mut restore, *prepared);
+                if let Some(w) = warning {
                     crate::print_newt(&format!("warning: {w}"), self.color, self.verbose);
                 }
             }
-            Incoming::Fresh => {
+            PreparedIncoming::Fresh => {
                 *self.active_conversation_id = incoming_id.to_string();
                 self.reset_to_clean_conversation();
+                // A rowless tab's persona lives in its seed, because the store
+                // has no row to read it back from. Without this the tab would
+                // silently keep whichever persona the OUTGOING tab had — and
+                // then be stamped with it, permanently, at materialization.
+                let seeded = tabs
+                    .active()
+                    .fresh_seed
+                    .as_ref()
+                    .and_then(|s| s.persona.clone());
+                *self.active_persona = seeded;
+                newt_core::cognition::set_persona_cognition(
+                    self.active_persona
+                        .as_ref()
+                        .and_then(|p| p.profile.cognition),
+                );
+                *self.system = crate::rebuild_system_prompt(
+                    self.workspace,
+                    self.memory,
+                    self.active_persona.as_ref(),
+                    self.active_conversation_id,
+                );
             }
         }
         let restored = self.reset_and_overlay();
+        // AFTER the overlay, which zeroes `pending` on every switch: a rowless
+        // tab's unwritten preference actions are restored here so a `/model` or
+        // `/backends` choice made before the first prompt survives a switch.
+        if let Some(seed) = tabs.active().fresh_seed.as_ref() {
+            *self.pending = seed.pending.clone();
+        }
         self.hydrate_sidecar(tabs);
         restored
     }
@@ -281,29 +358,26 @@ pub(crate) fn activate_tab(
     ctx: &mut TabSwitchCtx<'_>,
     tabs: &mut TabSet,
     target: usize,
-) -> Result<Switched, TabError> {
+) -> Result<TransitionOutcome, TabError> {
     let incoming_id = tabs
         .get(target)
         .ok_or(TabError::OutOfRange { open: tabs.len() })?
         .conversation_id()
         .to_string();
     if target == tabs.active_index() {
-        return Ok(Switched {
+        return Ok(TransitionOutcome {
             url_changed: false,
             degraded: tabs.active().pin_degraded.clone(),
         });
     }
-    let incoming = preflight(ctx.store, &incoming_id)?;
+    let incoming = preflight(ctx.store, ctx.persona_store, &incoming_id)?;
 
     ctx.deactivate(tabs);
     let handoff = tabs.activate(target)?;
-    let restored = ctx.hydrate(tabs, &incoming_id, incoming);
+    let restored = ctx.commit_incoming(tabs, &incoming_id, incoming);
     tabs.active_mut().pin_degraded = restored.degraded.clone();
     handoff.apply();
-    Ok(Switched {
-        url_changed: restored.url_changed,
-        degraded: restored.degraded,
-    })
+    Ok(TransitionOutcome::from_restore(&restored))
 }
 
 /// **Create a fresh tab** — a genuinely new conversation, not a relabelled one.
@@ -314,7 +388,7 @@ pub(crate) fn activate_tab(
 pub(crate) fn create_fresh_tab(
     ctx: &mut TabSwitchCtx<'_>,
     tabs: &mut TabSet,
-) -> Result<OwnerHandoff, TabError> {
+) -> Result<TransitionOutcome, TabError> {
     let fresh = newt_core::new_conversation_id();
     match ctx.store.claim(&fresh) {
         Ok(newt_core::ClaimOutcome::Claimed) => {}
@@ -329,15 +403,27 @@ pub(crate) fn create_fresh_tab(
             })
         }
     }
+    // Captured BEFORE deactivate, which may itself change nothing but reads
+    // clearer as "the persona this tab is born with".
+    let inherited_persona = ctx.active_persona.clone();
     ctx.deactivate(tabs);
     let (_, handoff) = tabs.open(newt_core::lifecycle::new_session_id(), &fresh);
+    // A fresh tab keeps the persona active when it was opened — the same rule
+    // `/new` follows — and OWNS it from here, so another tab cannot overwrite
+    // it and no other tab's persona can be stamped onto this conversation.
+    tabs.active_mut().fresh_seed = Some(crate::tabs::FreshSeed {
+        persona: inherited_persona,
+        pending: newt_core::PreferenceActions::default(),
+    });
     // A fresh tab is a NEW conversation: same reset `/new` performs, so it
     // cannot inherit conversation-shaped state from the tab it was opened
     // from. `Incoming::Fresh` routes through exactly that primitive.
-    let restored = ctx.hydrate(tabs, &fresh, Incoming::Fresh);
-    tabs.active_mut().pin_degraded = restored.degraded;
+    let restored = ctx.commit_incoming(tabs, &fresh, PreparedIncoming::Fresh);
+    tabs.active_mut().pin_degraded = restored.degraded.clone();
     handoff.apply();
-    Ok(handoff)
+    // The endpoint CAN move here: leaving a tab pinned to X for a fresh tab at
+    // the baseline Y is a real route change, and the caller must re-probe.
+    Ok(TransitionOutcome::from_restore(&restored))
 }
 
 /// A deterministic way to make one conversation fail Stage 0.
@@ -390,11 +476,14 @@ pub(crate) fn refusal_text(e: &TabError) -> String {
 }
 
 /// What adopting a conversation did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum Adopted {
     /// It was already open in another tab; that tab was ACTIVATED. No second
     /// tab now points at it.
-    ActivatedExistingTab { index: usize, url_changed: bool },
+    ActivatedExistingTab {
+        index: usize,
+        outcome: TransitionOutcome,
+    },
     /// It is the conversation the active tab already holds.
     AlreadyHere,
     /// No tab holds it — the caller may adopt it into the ACTIVE tab using its
@@ -426,16 +515,22 @@ pub(crate) fn adopt_conversation(
         if index == tabs.active_index() {
             return Ok(Adopted::AlreadyHere);
         }
-        let switched = activate_tab(ctx, tabs, index)?;
-        return Ok(Adopted::ActivatedExistingTab {
-            index,
-            url_changed: switched.url_changed,
-        });
+        let outcome = activate_tab(ctx, tabs, index)?;
+        return Ok(Adopted::ActivatedExistingTab { index, outcome });
     }
     if *ctx.active_conversation_id == target {
         return Ok(Adopted::AlreadyHere);
     }
     Ok(Adopted::ProceedInActiveTab)
+}
+
+/// The switch-level result of a close: the removed tab plus the neighbor
+/// activation's [`TransitionOutcome`]. Kept here rather than on the pure
+/// model's `Closed`, which must not know about pins or endpoints.
+#[derive(Debug)]
+pub(crate) struct ClosedTab {
+    pub tab: crate::tabs::TabState,
+    pub outcome: TransitionOutcome,
 }
 
 /// **Close a tab.** Closing the ACTIVE one is a normal activation of a
@@ -458,13 +553,14 @@ pub(crate) fn close_tab(
     ctx: &mut TabSwitchCtx<'_>,
     tabs: &mut TabSet,
     target: usize,
-) -> Result<Closed, TabError> {
+) -> Result<ClosedTab, TabError> {
     if target >= tabs.len() {
         return Err(TabError::OutOfRange { open: tabs.len() });
     }
     if tabs.len() == 1 {
         return Err(TabError::LastTab);
     }
+    let mut outcome = TransitionOutcome::default();
     if target == tabs.active_index() {
         // The neighbor vim would pick: the tab to the right, else the left.
         let neighbor = if target + 1 < tabs.len() {
@@ -475,7 +571,7 @@ pub(crate) fn close_tab(
         // Full transactional activation. On failure NOTHING has been removed,
         // released, or re-anchored — the tab the operator tried to close is
         // still the live one.
-        activate_tab(ctx, tabs, neighbor)?;
+        outcome = activate_tab(ctx, tabs, neighbor)?;
     }
     let closed = tabs.close(target)?;
     // Released LAST, after ownership has demonstrably moved.
@@ -486,7 +582,10 @@ pub(crate) fn close_tab(
             ctx.verbose,
         );
     }
-    Ok(closed)
+    Ok(ClosedTab {
+        tab: closed.tab,
+        outcome,
+    })
 }
 
 /// The ONE tab-action handler.
@@ -502,7 +601,7 @@ pub(crate) fn handle_tab_action(
     action: crate::tabs::TabAction,
     ctx: &mut TabSwitchCtx<'_>,
     tabs: &mut TabSet,
-) -> bool {
+) -> TransitionOutcome {
     use crate::tabs::TabAction;
     let color = ctx.color;
     let verbose = ctx.verbose;
@@ -534,21 +633,22 @@ pub(crate) fn handle_tab_action(
     match action {
         TabAction::List => {
             list_tabs(ctx, tabs);
-            false
+            TransitionOutcome::default()
         }
-        TabAction::New => {
-            match create_fresh_tab(ctx, tabs) {
-                Ok(_) => crate::print_newt(
+        TabAction::New => match create_fresh_tab(ctx, tabs) {
+            Ok(outcome) => {
+                crate::print_newt(
                     &format!("tab {} — new conversation", tabs.active_index() + 1),
                     color,
                     verbose,
-                ),
-                Err(e) => refuse(e, tabs),
+                );
+                outcome
             }
-            // A fresh conversation resolves to the baseline backend, which the
-            // reset already applied; no endpoint move to re-probe.
-            false
-        }
+            Err(e) => {
+                refuse(e, tabs);
+                TransitionOutcome::default()
+            }
+        },
         TabAction::Retry => {
             // Re-run the reset ⊕ overlay for the active tab. Success clears the
             // degraded marker and turns are allowed again; failure re-reports,
@@ -556,7 +656,7 @@ pub(crate) fn handle_tab_action(
             let restored = ctx.reset_and_overlay();
             let still_degraded = restored.degraded.is_some();
             tabs.active_mut().pin_degraded = restored.degraded.clone();
-            match restored.degraded {
+            match restored.degraded.as_ref() {
                 None => crate::print_newt(
                     "pin applied — this tab is no longer degraded",
                     color,
@@ -569,7 +669,7 @@ pub(crate) fn handle_tab_action(
                 ),
             }
             let _ = still_degraded;
-            restored.url_changed
+            TransitionOutcome::from_restore(&restored)
         }
         TabAction::Next => switch_to(ctx, tabs, (tabs.active_index() + 1) % tabs.len(), refuse),
         TabAction::Prev(n) => {
@@ -590,11 +690,14 @@ pub(crate) fn handle_tab_action(
                         color,
                         verbose,
                     );
-                    closed.handoff.is_some()
+                    // Endpoint movement comes from the neighbor's restore, not
+                    // from whether ownership changed.
+                    report_degraded(ctx, tabs);
+                    closed.outcome
                 }
                 Err(e) => {
                     refuse(e, tabs);
-                    false
+                    TransitionOutcome::default()
                 }
             }
         }
@@ -603,26 +706,49 @@ pub(crate) fn handle_tab_action(
                 Ok(()) => list_tabs(ctx, tabs),
                 Err(e) => refuse(e, tabs),
             }
-            false
+            TransitionOutcome::default()
         }
         TabAction::Rename { index, title } => {
             let target = index.unwrap_or_else(|| tabs.active_index());
             match tabs.get(target).map(|t| t.conversation_id().to_string()) {
                 Some(id) => {
-                    let persona = ctx.active_persona.as_ref().map(|p| p.name.clone());
+                    // `rename_conversation` CREATES the row for a rowless tab,
+                    // stamping its persona permanently. Use the TARGET tab's
+                    // own persona — its seed when rowless, else the live one
+                    // for the active tab — never whatever happens to be active
+                    // while renaming some other tab.
+                    let persona = tabs
+                        .get(target)
+                        .and_then(|t| t.fresh_seed.as_ref())
+                        .map(|seed| seed.persona.as_ref().map(|p| p.name.clone()))
+                        .unwrap_or_else(|| {
+                            if target == tabs.active_index() {
+                                ctx.active_persona.as_ref().map(|p| p.name.clone())
+                            } else {
+                                None
+                            }
+                        });
                     match crate::rename_conversation(ctx.store, &id, &title, persona.as_deref()) {
-                        Ok(()) => crate::print_newt(
-                            &format!("tab {} renamed to '{title}'", target + 1),
-                            color,
-                            verbose,
-                        ),
+                        Ok(()) => {
+                            // The row now exists, so the seed has been consumed
+                            // — its persona is stamped and its pin actions have
+                            // a durable home.
+                            if let Some(t) = tabs.tabs_mut().get_mut(target) {
+                                t.fresh_seed = None;
+                            }
+                            crate::print_newt(
+                                &format!("tab {} renamed to '{title}'", target + 1),
+                                color,
+                                verbose,
+                            );
+                        }
                         Err(e) => crate::print_newt(&format!("rename failed: {e}"), color, verbose),
                     }
-                    false
+                    TransitionOutcome::default()
                 }
                 None => {
                     refuse(TabError::OutOfRange { open: tabs.len() }, tabs);
-                    false
+                    TransitionOutcome::default()
                 }
             }
         }
@@ -634,7 +760,7 @@ fn switch_to(
     tabs: &mut TabSet,
     target: usize,
     refuse: impl Fn(TabError, &TabSet),
-) -> bool {
+) -> TransitionOutcome {
     match activate_tab(ctx, tabs, target) {
         Ok(switched) => {
             // A tab whose pin did not take says so on arrival, every time —
@@ -652,12 +778,31 @@ fn switch_to(
                 ctx.color,
                 ctx.verbose,
             );
-            switched.url_changed
+            switched
         }
         Err(e) => {
             refuse(e, tabs);
-            false
+            TransitionOutcome::default()
         }
+    }
+}
+
+/// Say `!pin` out loud for the tab that is active NOW.
+///
+/// #1669 PR-A (P1). Direct `/tab <n>` already reported it; adoption and
+/// active-close did not, so `/resume`ing into a degraded tab or closing into a
+/// degraded neighbor left the operator to discover it by having a turn refused.
+/// The refusal must be the SECOND thing they learn, never the first.
+pub(crate) fn report_degraded(ctx: &TabSwitchCtx<'_>, tabs: &TabSet) {
+    if let Some(d) = tabs.active().pin_degraded.as_ref() {
+        crate::print_newt(
+            &format!(
+                "{} — turns are refused on this tab until the pin is in force (`/tab retry`)",
+                d.summary()
+            ),
+            ctx.color,
+            ctx.verbose,
+        );
     }
 }
 
@@ -676,9 +821,16 @@ fn list_tabs(ctx: &TabSwitchCtx<'_>, tabs: &TabSet) {
         } else {
             String::new()
         };
+        // With no pixels in this slice the list IS the tab-state view, so a
+        // degraded tab must be visible here — not only on the switch that
+        // produced it, which the operator may have scrolled past.
+        let degraded = match tab.pin_degraded.as_ref() {
+            Some(d) => format!("  {}", d.summary()),
+            None => String::new(),
+        };
         crate::print_newt(
             &format!(
-                "{marker} {}. {}{identity}",
+                "{marker} {}. {}{degraded}{identity}",
                 i + 1,
                 crate::tab_label(ctx.store, tab.conversation_id())
             ),
@@ -858,8 +1010,9 @@ mod state_machine_tests {
             ctx.deactivate(tabs);
             let (_, handoff) = tabs.open(new_session_id(), id);
             *ctx.active_conversation_id = id.to_string();
-            let incoming = preflight(ctx.store, id).expect("fixture row must preflight");
-            ctx.hydrate(tabs, id, incoming);
+            let incoming =
+                preflight(ctx.store, ctx.persona_store, id).expect("fixture row must preflight");
+            ctx.commit_incoming(tabs, id, incoming);
             handoff.apply();
         }
 
@@ -872,40 +1025,82 @@ mod state_machine_tests {
 
         /// Everything the ADR promises is restored exactly, as one comparable
         /// value — so a round-trip assertion cannot quietly omit a field.
-        fn snapshot(&self) -> Snapshot {
+        fn snapshot(&self, tabs: &TabSet) -> Snapshot {
+            use newt_core::{ScratchpadStore, StepLedger};
+            let scratchpad: Vec<(String, String)> = self.scratchpad.entries().into_iter().collect();
             Snapshot {
                 conversation_id: self.active_conversation_id.clone(),
+                inf_url: self.inf_url.clone(),
+                inf_model: self.inf_model.clone(),
+                inf_kind: self.inf_kind,
+                inf_key_fingerprint: fingerprint(self.inf_key.as_deref()),
+                inf_context_window: self.inf_context_window,
+                choice_name: self.choice.name.clone(),
                 provider: std::env::var("NEWT_PROVIDER").ok(),
                 model: std::env::var("NEWT_DGX_MODEL").ok(),
                 cognition: newt_core::cognition::cli_cognition(),
                 tenacity: newt_core::tenacity::cli_tenacity(),
-                inf_url: self.inf_url.clone(),
-                inf_model: self.inf_model.clone(),
-                inf_kind: self.inf_kind,
-                choice_name: self.choice.name.clone(),
+                persona_cognition: newt_core::cognition::persona_cognition(),
+                persona: self.active_persona.as_ref().map(|p| p.name.clone()),
+                scratchpad,
+                plan_steps: self.step_ledger.steps(),
+                has_prompt_context: self.active_prompt_context.is_some(),
+                system: self.system.clone(),
                 turns: self.turns_this_conversation,
                 roadmap: self.active_roadmap_id.clone(),
+                resume_listing: self.last_resume_listing.clone(),
                 input_stash: self.input_stash.clone(),
-                system: self.system.clone(),
+                degraded: tabs.active().pin_degraded.as_ref().map(|d| d.summary()),
             }
         }
     }
 
+    /// The whole state surface a transition may touch.
+    ///
+    /// Every field here is compared exactly. `inf_key` is represented by a
+    /// non-reversible fingerprint rather than its value, so a mismatch can be
+    /// DETECTED without a secret ever reaching a test log or a panic message —
+    /// an assertion that prints the API key on failure would be a worse bug
+    /// than the one it was written to catch.
     #[derive(Debug, Clone, PartialEq)]
     struct Snapshot {
         conversation_id: String,
+        // backend quintet
+        inf_url: String,
+        inf_model: String,
+        inf_kind: newt_core::BackendKind,
+        inf_key_fingerprint: Option<u64>,
+        inf_context_window: Option<u32>,
+        choice_name: String,
+        // projected dials + route env
         provider: Option<String>,
         model: Option<String>,
         cognition: newt_core::cognition::CognitionOverride,
         tenacity: Option<newt_core::Tenacity>,
-        inf_url: String,
-        inf_model: String,
-        inf_kind: newt_core::BackendKind,
-        choice_name: String,
+        persona_cognition: Option<newt_core::role_profile::Cognition>,
+        // conversation-owned live state
+        persona: Option<String>,
+        scratchpad: Vec<(String, String)>,
+        plan_steps: Vec<newt_core::Step>,
+        has_prompt_context: bool,
+        system: String,
+        // sidecar + input
         turns: usize,
         roadmap: Option<String>,
+        resume_listing: Vec<String>,
         input_stash: String,
-        system: String,
+        degraded: Option<String>,
+    }
+
+    /// Non-reversible, stable within a process — enough to prove "unchanged" or
+    /// "changed" without ever materializing the secret.
+    fn fingerprint(secret: Option<&str>) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        secret.map(|s| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            s.hash(&mut h);
+            h.finish()
+        })
     }
 
     fn guard() -> newt_core::test_guard::GlobalSettingsGuard {
@@ -997,6 +1192,178 @@ mod state_machine_tests {
         assert_eq!(tabs.active_index(), 1);
     }
 
+    // ── P0-2: the claimed-but-unmaterialized interval ─────────────────────
+
+    fn persona_named(name: &str) -> crate::Persona {
+        crate::test_persona(name, "be helpful", std::path::PathBuf::from("/dev/null"))
+    }
+
+    /// A fresh tab owns its persona rather than borrowing the session's.
+    ///
+    /// Create B while persona **P** is active, visit a conversation whose
+    /// persona is **Q**, return to still-rowless B: B must be back on P.
+    /// Before the seed, the `Fresh` arm restored no persona at all, so B
+    /// silently ran under Q — and would have been STAMPED with Q at its first
+    /// prompt, permanently, since the store has no persona UPDATE path.
+    #[test]
+    fn a_rowless_tab_keeps_its_own_persona_across_a_visit_to_another() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+
+        // P is active when B is created.
+        h.active_persona = Some(persona_named("P"));
+        {
+            let mut ctx = h.ctx();
+            let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
+        }
+        let b = h.active_conversation_id.clone();
+        assert!(!h.store.exists(&b).unwrap(), "B is rowless");
+        assert_eq!(
+            h.active_persona.as_ref().map(|p| p.name.as_str()),
+            Some("P"),
+            "a fresh tab keeps the persona active when it was opened, as /new does"
+        );
+
+        // Visit A, which has no persona at all (the Q=None case), then return.
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+        assert_eq!(h.active_persona.as_ref().map(|p| p.name.as_str()), None);
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 1).unwrap();
+        }
+        assert_eq!(
+            h.active_persona.as_ref().map(|p| p.name.as_str()),
+            Some("P"),
+            "returning to the rowless tab restores ITS persona, not the other tab's"
+        );
+        assert!(
+            !h.store.exists(&b).unwrap(),
+            "and visiting a tab still creates no ghost /resume row"
+        );
+    }
+
+    /// Renaming an INACTIVE rowless tab materializes its row — and must stamp
+    /// that tab's persona, not whatever is active in the tab doing the renaming.
+    #[test]
+    fn renaming_an_inactive_rowless_tab_does_not_capture_the_live_persona() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+
+        // B is created with NO persona.
+        h.active_persona = None;
+        {
+            let mut ctx = h.ctx();
+            let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
+        }
+        let b = h.active_conversation_id.clone();
+        // Back to A, and make Q active there.
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+        h.active_persona = Some(persona_named("Q"));
+
+        // Rename the inactive rowless tab B from here.
+        {
+            let mut ctx = h.ctx();
+            handle_tab_action(
+                TabAction::Rename {
+                    index: Some(1),
+                    title: "B titled".into(),
+                },
+                &mut ctx,
+                &mut tabs,
+            );
+        }
+        assert!(h.store.exists(&b).unwrap(), "rename materialized B's row");
+        let record = h.store.load(&b).unwrap();
+        assert_eq!(
+            record.persona, None,
+            "B was created with no persona; renaming it from a Q tab must not stamp Q"
+        );
+        assert_eq!(record.title, "B titled");
+        assert!(
+            tabs.get(1).unwrap().fresh_seed.is_none(),
+            "the seed is consumed once the row exists"
+        );
+    }
+
+    /// A preference change made in a rowless tab survives a switch away and
+    /// back. `persist_preference_actions` cannot write it (no row) and the
+    /// overlay zeroes `pending` on every switch, so without the seed it was
+    /// silently discarded by the next `/tab`.
+    #[test]
+    fn a_preference_change_in_a_rowless_tab_survives_a_switch() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol", "other"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        {
+            let mut ctx = h.ctx();
+            let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
+        }
+        let b = h.active_conversation_id.clone();
+
+        // Operator picks a backend in the rowless tab.
+        newt_core::runtime::mark_backend_pick("other");
+        {
+            let mut ctx = h.ctx();
+            *ctx.pending = newt_core::runtime::drain_preference_actions();
+            activate_tab(&mut ctx, &mut tabs, 0).expect("switch away");
+        }
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 1).expect("switch back");
+        }
+        assert!(
+            !h.pending.is_empty(),
+            "the rowless tab's unwritten preference action came back with it"
+        );
+        assert!(!h.store.exists(&b).unwrap(), "still no ghost row");
+
+        // And once the row materializes, the held action lands on it.
+        h.store.create_with_id(&b, "B", None).unwrap();
+        crate::persist_preference_actions(
+            Some(&h.store),
+            &b,
+            &mut h.pending,
+            &mut h.base_provider,
+            &mut h.base_model,
+        )
+        .unwrap();
+        assert_eq!(
+            h.store.preference_pin(&b).unwrap().and_then(|p| p.backend),
+            Some("other".to_string()),
+            "the first durable write materializes the preference chosen while rowless"
+        );
+    }
+
+    /// `/tab new` alone still creates no `/resume`-visible row — the rule the
+    /// seed exists to preserve rather than work around.
+    #[test]
+    fn tab_new_alone_creates_no_ghost_resume_row() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let before = h.store.list().map(|v| v.len()).unwrap_or(0);
+        {
+            let mut ctx = h.ctx();
+            let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
+            let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
+        }
+        assert_eq!(
+            h.store.list().map(|v| v.len()).unwrap_or(0),
+            before,
+            "two fresh tabs, zero new rows in the resume listing"
+        );
+    }
+
     // ── 3. A -> B -> A exact restoration ──────────────────────────────────
 
     /// The ADR's round-trip property, over every field the contract promises —
@@ -1019,7 +1386,7 @@ mod state_machine_tests {
         h.turns_this_conversation = 4;
         h.active_roadmap_id = Some("road-a".into());
         h.input_stash = "half typed in A".into();
-        let a_before = h.snapshot();
+        let a_before = h.snapshot(&tabs);
 
         {
             let mut ctx = h.ctx();
@@ -1034,7 +1401,7 @@ mod state_machine_tests {
             activate_tab(&mut ctx, &mut tabs, 0).expect("B→A");
         }
         assert_eq!(
-            h.snapshot(),
+            h.snapshot(&tabs),
             a_before,
             "A must come back exactly as it was left"
         );
@@ -1385,7 +1752,7 @@ mod state_machine_tests {
         }
         h.input_stash = "typed in A".into();
         h.turns_this_conversation = 3;
-        let before = h.snapshot();
+        let before = h.snapshot(&tabs);
         let active_before = tabs.active_index();
         let owner_before = newt_core::lifecycle::active_session();
 
@@ -1395,9 +1762,129 @@ mod state_machine_tests {
             activate_tab(&mut ctx, &mut tabs, 9).unwrap_err()
         };
         assert!(matches!(err, TabError::OutOfRange { .. }));
-        assert_eq!(h.snapshot(), before, "a refused switch mutates nothing");
+        assert_eq!(
+            h.snapshot(&tabs),
+            before,
+            "a refused switch mutates nothing"
+        );
         assert_eq!(tabs.active_index(), active_before);
         assert_eq!(newt_core::lifecycle::active_session(), owner_before);
+    }
+
+    /// **P0 — Stage 0 is a transaction, not an ordering.**
+    ///
+    /// The row `load()`s cleanly and a LATER validation — the prompt receipt's
+    /// context — fails. Under the previous shape, preflight proved only
+    /// `exists + load`, so this failure surfaced INSIDE the restore, after the
+    /// outgoing tab had been deactivated and the active pointer moved; the
+    /// hydrate then logged a warning and carried on, leaving the session with
+    /// one conversation's memory under another's identity.
+    ///
+    /// Asserts the whole state surface is byte-identical: active index,
+    /// lifecycle owner, conversation id, claims, memory/system, persona,
+    /// scratchpad, plan, prompt context, the backend quintet, projected dials,
+    /// sidecar, and input.
+    #[test]
+    fn a_late_validation_failure_leaves_the_session_completely_untouched() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol", "other"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        let b = h.durable("B");
+        h.open_tab_on(&mut tabs, &b);
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).expect("settle on A");
+        }
+        // Give A a full, distinguishable live state.
+        {
+            use newt_core::ScratchpadStore;
+            h.scratchpad.set("current_task", "A's task".into());
+        }
+        h.turns_this_conversation = 6;
+        h.active_roadmap_id = Some("road-a".into());
+        h.last_resume_listing = vec!["row-1".into()];
+        h.input_stash = "half typed in A".into();
+
+        let before = h.snapshot(&tabs);
+        let active_before = tabs.active_index();
+        let owner_before = newt_core::lifecycle::active_session();
+        let claims_before = {
+            let mut c = tabs.claimed_conversations();
+            c.sort_unstable();
+            c.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+        // The row loads; the receipt context does not validate.
+        assert!(h.store.exists(&b).unwrap(), "B's row exists and loads");
+        crate::restore_prepare_seam::fail_after_load_for(&b);
+
+        let err = {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 1).unwrap_err()
+        };
+        crate::restore_prepare_seam::clear();
+
+        assert!(
+            matches!(err, TabError::PreflightFailed { .. }),
+            "a late validation failure must abort at Stage 0, got {err:?}"
+        );
+        assert_eq!(
+            h.snapshot(&tabs),
+            before,
+            "no field of the live session may change on a refused switch"
+        );
+        assert_eq!(tabs.active_index(), active_before, "active tab unchanged");
+        assert_eq!(
+            newt_core::lifecycle::active_session(),
+            owner_before,
+            "lifecycle ownership did not move"
+        );
+        let mut claims_after = tabs.claimed_conversations();
+        claims_after.sort_unstable();
+        assert_eq!(
+            claims_after
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            claims_before,
+            "no claim was taken or released"
+        );
+        // And the session is still usable: switching to a HEALTHY tab works.
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).expect("A is still activatable");
+        }
+    }
+
+    /// The same failure reached through the ADOPTION seam rather than `/tab <n>`,
+    /// because a transaction that only holds for one front door is not a
+    /// transaction.
+    #[test]
+    fn a_late_validation_failure_through_adoption_also_changes_nothing() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        let b = h.durable("B");
+        h.open_tab_on(&mut tabs, &b);
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+        let before = h.snapshot(&tabs);
+        let owner_before = newt_core::lifecycle::active_session();
+
+        crate::restore_prepare_seam::fail_after_load_for(&b);
+        let outcome = {
+            let mut ctx = h.ctx();
+            adopt_conversation(&mut ctx, &mut tabs, &b)
+        };
+        crate::restore_prepare_seam::clear();
+
+        assert!(outcome.is_err(), "adoption must propagate the abort");
+        assert_eq!(h.snapshot(&tabs), before);
+        assert_eq!(newt_core::lifecycle::active_session(), owner_before);
+        assert_eq!(tabs.active_index(), 0);
     }
 
     /// Closing the ACTIVE tab activates the neighbor BEFORE the closing tab's
@@ -1454,7 +1941,7 @@ mod state_machine_tests {
         }
         h.input_stash = "typed in B".into();
         h.turns_this_conversation = 5;
-        let before = h.snapshot();
+        let before = h.snapshot(&tabs);
         let owner_before = newt_core::lifecycle::active_session();
 
         // A (the neighbor) becomes unactivatable.
@@ -1468,7 +1955,7 @@ mod state_machine_tests {
         assert!(matches!(err, TabError::PreflightFailed { .. }), "{err:?}");
         assert_eq!(tabs.len(), 2, "nothing was removed");
         assert_eq!(tabs.active_index(), 1, "B is still the active tab");
-        assert_eq!(h.snapshot(), before, "B's live state is untouched");
+        assert_eq!(h.snapshot(&tabs), before, "B's live state is untouched");
         assert_eq!(
             newt_core::lifecycle::active_session(),
             owner_before,
@@ -1600,6 +2087,136 @@ mod state_machine_tests {
             Some("later"),
             "and the pin is now actually in force"
         );
+    }
+
+    // ── P1: transition results and degraded visibility ───────────────────
+
+    /// P1-3. A tab pinned to endpoint X, then `/tab new` onto the baseline
+    /// endpoint Y, is an ENDPOINT CHANGE. `create_fresh_tab` discarded its
+    /// `PinRestore`, so `/tab new` reported `url_changed = false` and telemetry
+    /// kept pointing at the box the previous tab was talking to.
+    /// Runs on a runtime because a REAL endpoint change is what we are proving,
+    /// and `refresh_backend` fires its served-adoption probe on one — that probe
+    /// is the "normal reprobe path" the brief asks this to exercise. The hosts
+    /// are unresolvable, so it fails fast without touching a network.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tab_new_from_a_pinned_tab_reports_the_endpoint_change() {
+        let _g = guard();
+        // Two DIFFERENT endpoints, so a route change is a real url change.
+        let mut cfg = cfg_with(&["sol", "other"]);
+        cfg.backends[1].endpoint = "http://elsewhere.test:2".to_string();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        h.cfg = cfg;
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        h.store
+            .update_preference_pin(
+                &a,
+                &newt_core::OperatorPreferencePin {
+                    backend: Some("other".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Land on A so its pin is in force at endpoint Y.
+        let b = h.durable("B");
+        h.open_tab_on(&mut tabs, &b);
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+        assert_eq!(h.inf_url, "http://elsewhere.test:2", "A is pinned away");
+
+        // `/tab new` returns to the baseline endpoint — that IS a url change.
+        let outcome = {
+            let mut ctx = h.ctx();
+            create_fresh_tab(&mut ctx, &mut tabs).unwrap()
+        };
+        assert_eq!(
+            h.inf_url, "http://backend.test:1",
+            "fresh tab is at baseline"
+        );
+        assert!(
+            outcome.url_changed,
+            "a fresh tab that moves the endpoint must report it so telemetry re-probes"
+        );
+    }
+
+    /// P1-4. Adopting an already-open DEGRADED tab must report `!pin`
+    /// immediately — the operator must not first learn of it from a refused
+    /// turn.
+    #[test]
+    fn adopting_a_degraded_tab_reports_the_degradation_in_its_outcome() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        let b = h.durable("B");
+        h.store
+            .update_preference_pin(
+                &b,
+                &newt_core::OperatorPreferencePin {
+                    backend: Some("a-backend-that-is-gone".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        h.open_tab_on(&mut tabs, &b);
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+
+        let adopted = {
+            let mut ctx = h.ctx();
+            adopt_conversation(&mut ctx, &mut tabs, &b).unwrap()
+        };
+        match adopted {
+            Adopted::ActivatedExistingTab { index, outcome } => {
+                assert_eq!(index, 1);
+                let d = outcome
+                    .degraded
+                    .expect("adoption must carry the degradation, not drop it");
+                assert!(d.summary().starts_with("!pin"), "{}", d.summary());
+            }
+            other => panic!("expected an activation, got {other:?}"),
+        }
+        assert!(
+            tabs.active().pin_degraded.is_some(),
+            "and the tab itself is marked, which is what refuses turns"
+        );
+    }
+
+    /// P1-4. Closing into a degraded NEIGHBOR reports it too.
+    #[test]
+    fn closing_into_a_degraded_neighbor_reports_the_degradation() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        h.store
+            .update_preference_pin(
+                &a,
+                &newt_core::OperatorPreferencePin {
+                    backend: Some("also-gone".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let b = h.durable("B");
+        h.open_tab_on(&mut tabs, &b);
+        // active = B (index 1); close it, landing on the degraded A.
+        let closed = {
+            let mut ctx = h.ctx();
+            close_tab(&mut ctx, &mut tabs, 1).unwrap()
+        };
+        assert_eq!(closed.tab.conversation_id(), b);
+        let d = closed
+            .outcome
+            .degraded
+            .expect("close must carry the neighbor's degradation");
+        assert!(d.summary().starts_with("!pin"), "{}", d.summary());
+        assert!(tabs.active().pin_degraded.is_some());
     }
 
     // ── 13. authority/security state is untouched by tab machinery ────────

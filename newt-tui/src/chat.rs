@@ -2665,11 +2665,12 @@ pub(crate) fn run_chat(
                                 Err(usage) => print_newt(&usage, color, verbose),
                                 Ok(action) => {
                                     let mut tab_ctx = tab_ctx!(store);
-                                    let url_changed = crate::tab_switch::handle_tab_action(
+                                    let outcome = crate::tab_switch::handle_tab_action(
                                         action,
                                         &mut tab_ctx,
                                         &mut tabs,
                                     );
+                                    let url_changed = outcome.url_changed;
                                     // Same re-probe discipline as every other
                                     // backend switch: a tab whose pin repoints
                                     // the endpoint must repoint DGX telemetry
@@ -3845,7 +3846,7 @@ pub(crate) fn run_chat(
                                     }
                                     Ok(crate::tab_switch::Adopted::ActivatedExistingTab {
                                         index,
-                                        url_changed,
+                                        outcome,
                                     }) => {
                                         print_newt(
                                             &format!(
@@ -3855,7 +3856,18 @@ pub(crate) fn run_chat(
                                             color,
                                             verbose,
                                         );
-                                        if url_changed && verbose {
+                                        if let Some(d) = &outcome.degraded {
+                                            print_newt(
+                                                &format!(
+                                                    "{} — turns are refused on this tab until \
+                                                     the pin is in force (`/tab retry`)",
+                                                    d.summary()
+                                                ),
+                                                color,
+                                                verbose,
+                                            );
+                                        }
+                                        if outcome.url_changed && verbose {
                                             dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
                                                 .map(|d| d.into_sampler(2));
                                         }
@@ -4058,7 +4070,7 @@ pub(crate) fn run_chat(
                                         }
                                         Ok(crate::tab_switch::Adopted::ActivatedExistingTab {
                                             index,
-                                            url_changed,
+                                            outcome,
                                         }) => {
                                             print_newt(
                                                 &format!(
@@ -4068,7 +4080,21 @@ pub(crate) fn run_chat(
                                                 color,
                                                 verbose,
                                             );
-                                            if url_changed && verbose {
+                                            // P1: `!pin` must be visible here
+                                            // too — never discovered later by a
+                                            // surprise turn refusal.
+                                            if let Some(d) = &outcome.degraded {
+                                                print_newt(
+                                                    &format!(
+                                                        "{} — turns are refused on this tab \
+                                                         until the pin is in force (`/tab retry`)",
+                                                        d.summary()
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                );
+                                            }
+                                            if outcome.url_changed && verbose {
                                                 dgx_rx =
                                                     dgx_probe::DgxTelemetry::try_connect(&inf_url)
                                                         .map(|d| d.into_sampler(2));
@@ -5198,6 +5224,42 @@ pub(crate) fn run_chat(
                 {
                     clean_exit = true;
                     break;
+                } else if tabs.active().pin_degraded.is_some() {
+                    // #1669 PR-A (item 5) — CONTRACT: while a tab's pinned
+                    // posture is not in force, the operator prompt is NOT
+                    // ACCEPTED. Nothing durable is written for it.
+                    //
+                    // Chosen over "accept durably, refuse inference" because the
+                    // prompt receipt chain is the conversation's authority
+                    // lineage: admitting a prompt that never ran would leave a
+                    // receipt whose ancestry, current-objective and clarification
+                    // state describe a turn that does not exist, and `/resume`
+                    // would later rehydrate it as real. A refused turn should
+                    // leave the conversation exactly as it was.
+                    //
+                    // Placed here — AFTER every slash and `!host` command has
+                    // been dispatched above, BEFORE `begin_model_prompt` — so
+                    // the recovery commands stay reachable. `/tab retry`,
+                    // `/backends`, `/psyche` and `/tab` all still work on a
+                    // degraded tab; a gate the operator cannot escape would be
+                    // worse than the bug it guards.
+                    let degraded = tabs
+                        .active()
+                        .pin_degraded
+                        .as_ref()
+                        .expect("checked immediately above");
+                    print_newt(
+                        &format!(
+                            "{} — this tab's pinned posture is not in force, so the prompt was \
+                             not accepted. Fix what the pin names (usually a [[backends]] entry) \
+                             then `/tab retry`, or `/psyche` to repin.",
+                            degraded.summary()
+                        ),
+                        color,
+                        verbose,
+                    );
+                    println!();
+                    continue;
                 } else {
                     // Durable ingress is the FIRST operation in the final
                     // model-input branch. It precedes hardware probes,
@@ -5242,34 +5304,6 @@ pub(crate) fn run_chat(
                             println!();
                             continue;
                         }
-                    }
-
-                    // #1669 PR-A / ADR blocker 4: refuse the turn while this
-                    // tab's pinned posture is NOT actually in force.
-                    //
-                    // The tab says it is pinned to a backend/model; activation
-                    // could not establish it, so the session is at baseline.
-                    // Running anyway would execute under a model, endpoint, and
-                    // runtime posture the operator did not choose and cannot
-                    // see — which is the whole failure this gate exists to
-                    // prevent. Warning and continuing is not enough.
-                    //
-                    // Deliberately placed AFTER slash/host dispatch: `/backends`,
-                    // `/psyche`, `/tab retry` and friends must keep working, or
-                    // the operator has no way to fix the thing being refused.
-                    if let Some(degraded) = tabs.active().pin_degraded.clone() {
-                        print_newt(
-                            &format!(
-                                "{} — this tab's pinned posture is not in force, so the turn \
-                                 was not sent. Fix what the pin names (usually a [[backends]] \
-                                 entry) and run `/tab retry`, or `/psyche` to repin.",
-                                degraded.summary()
-                            ),
-                            color,
-                            verbose,
-                        );
-                        println!();
-                        continue;
                     }
 
                     // Prompt comprehension is deliberately after receipt
