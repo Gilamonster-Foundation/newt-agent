@@ -311,6 +311,21 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         .to_string_lossy()
         .into_owned();
 
+    // Herdr: report this headless run through the SAME lifecycle seam the TUI
+    // uses (no surface-specific wiring). Inside a Herdr pane this installs the
+    // bounded reporter actor and announces the session; outside one it is a
+    // no-op subscription and `emit` stays a single atomic load. The guard
+    // releases pane authority on every exit path of this function.
+    let _herdr = newt_tui::herdr::session_guard(&workspace);
+    let solve_session = newt_core::lifecycle::new_session_id();
+    newt_core::lifecycle::set_active_session(&solve_session);
+    newt_core::lifecycle::emit_for(
+        Some(solve_session.as_str().to_string()),
+        newt_core::lifecycle::LifecycleEvent::SessionStarted {
+            session_id: solve_session.as_str().to_string(),
+        },
+    );
+
     // 5. Drive one full turn (== a complete multi-round agentic solve).
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
@@ -362,6 +377,9 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     driver
         .submit(instruction.trim())
         .map_err(|e| anyhow::anyhow!("submit failed: {e:?}"))?;
+    // A `solve` run IS a real model turn — announce it through the seam so the
+    // pane shows Working for the duration of the driver loop.
+    newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
 
     let outcome = loop {
         match driver.poll() {
@@ -372,6 +390,21 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             }
         }
     };
+    match &outcome {
+        Ok(o) if o.error.is_none() => {
+            newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnCompleted);
+        }
+        Ok(o) => {
+            newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnFailed {
+                reason: o.error.clone(),
+            });
+        }
+        Err(e) => {
+            newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnFailed {
+                reason: Some(e.clone()),
+            });
+        }
+    }
     let elapsed = started.elapsed();
     let wall_secs = elapsed.as_secs_f64();
     // Contract timing is integral milliseconds.

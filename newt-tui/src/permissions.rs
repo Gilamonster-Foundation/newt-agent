@@ -877,8 +877,11 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> newt_core
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
+        // Blocking on the operator's decision surfaces to the cockpit through
+        // the lifecycle seam: `Terminal::suspend_for_prompt` routes through the
+        // tty arbiter, which emits Blocked/Unblocked. No surface-specific wiring.
         let w = Terminal::suspend_for_prompt();
-        match prompt_user_input(&w, question) {
+        let outcome = match prompt_user_input(&w, question) {
             // A submitted line (including an explicitly empty one) is an answer.
             Ok(ModalLine::Line(answer)) => HumanQuestionOutcome::Answer(answer),
             // EOF is the input stream closing — NOT an empty human answer.
@@ -897,7 +900,8 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> newt_core
             }
             // A read error is distinct from a missing operator.
             Err(_) => HumanQuestionOutcome::InputFailed,
-        }
+        };
+        outcome
     }
 }
 

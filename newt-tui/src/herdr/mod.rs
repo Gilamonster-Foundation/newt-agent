@@ -51,8 +51,8 @@
 //! | Queue full                   | `try_send` fails; state cell already set  |
 //! | Reporter thread dies         | Channel disconnects; emits stay bounded   |
 
-pub(crate) mod protocol;
-pub(crate) mod transport;
+pub mod protocol;
+pub mod transport;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ use std::time::Duration;
 use newt_core::lifecycle::{self, LifecycleEnvelope, LifecycleEvent, Subscription};
 
 use protocol::{Call, PaneAgentState, SessionStartSource};
-use transport::{Sink, SocketSink};
+use transport::{cli, Sink, SocketSink};
 
 /// One-shot calls (session identity, tab title) queued for the worker. Small
 /// on purpose: these are startup facts, not a stream.
@@ -82,21 +82,41 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HerdrEnv {
     pane: String,
-    socket: PathBuf,
+    /// Preferred transport. `None` when the pane advertises no socket (e.g.
+    /// Windows) — then `bin` is the only way to reach Herdr.
+    socket: Option<PathBuf>,
+    /// `HERDR_BIN_PATH`: fallback transport via the `herdr` CLI. Used when
+    /// there is no usable socket. `None` when unset.
+    bin: Option<PathBuf>,
 }
 
 impl HerdrEnv {
     /// Pure resolution, so incompleteness is unit-testable without mutating
     /// process env.
-    fn from_parts(env: Option<&str>, pane: Option<&str>, socket: Option<&str>) -> Option<Self> {
+    ///
+    /// Detection requires `HERDR_ENV=1`, a pane id, and at least one reachable
+    /// transport (a socket path OR an explicit `HERDR_BIN_PATH`). A pane with
+    /// neither cannot be reported to, so it is "not in Herdr" and the whole
+    /// integration stays a no-op.
+    fn from_parts(
+        env: Option<&str>,
+        pane: Option<&str>,
+        socket: Option<&str>,
+        bin: Option<&str>,
+    ) -> Option<Self> {
         if env != Some("1") {
             return None;
         }
         let pane = pane.filter(|p| !p.is_empty())?;
-        let socket = socket.filter(|s| !s.is_empty())?;
+        let socket = socket.filter(|s| !s.is_empty()).map(PathBuf::from);
+        let bin = bin.filter(|b| !b.is_empty()).map(PathBuf::from);
+        if socket.is_none() && bin.is_none() {
+            return None;
+        }
         Some(Self {
             pane: pane.to_string(),
-            socket: PathBuf::from(socket),
+            socket,
+            bin,
         })
     }
 
@@ -104,7 +124,42 @@ impl HerdrEnv {
         let env = std::env::var("HERDR_ENV").ok();
         let pane = std::env::var("HERDR_PANE_ID").ok();
         let socket = std::env::var("HERDR_SOCKET_PATH").ok();
-        Self::from_parts(env.as_deref(), pane.as_deref(), socket.as_deref())
+        let bin = std::env::var("HERDR_BIN_PATH").ok();
+        Self::from_parts(
+            env.as_deref(),
+            pane.as_deref(),
+            socket.as_deref(),
+            bin.as_deref(),
+        )
+    }
+
+    /// The sink this environment should report through. Preference order:
+    ///
+    /// 1. **unix + socket path** → the direct socket sink (fastest, no spawn).
+    /// 2. **`HERDR_BIN_PATH` set** → the CLI fallback. This is also the ONLY
+    ///    working transport off unix: the socket sink is a fail-stub there, so
+    ///    even an advertised socket path loses to the binary on Windows.
+    /// 3. Otherwise → [`NullSink`] (defensive; `from_parts` guarantees one).
+    fn sink(&self) -> Box<dyn Sink> {
+        #[cfg(unix)]
+        if let Some(socket) = &self.socket {
+            return Box::new(SocketSink::new(socket.clone()));
+        }
+        if let Some(bin) = &self.bin {
+            return Box::new(cli::CliSink::new(bin.clone()));
+        }
+        // from_parts guarantees one transport; this arm is reachable only on
+        // non-unix with a socket but no binary (socket sink is a stub there).
+        Box::new(NullSink)
+    }
+}
+
+/// Delivers nothing; used only when no transport exists (unreachable via
+/// `from_parts`, kept so `sink()` is total). Always reports failure.
+struct NullSink;
+impl Sink for NullSink {
+    fn deliver(&mut self, _call: &protocol::Call) -> bool {
+        false
     }
 }
 
@@ -505,7 +560,10 @@ impl Reporter {
 /// this process is inside a Herdr pane, and does nothing at all otherwise;
 /// dropping it releases lifecycle authority on every orderly exit path,
 /// including `?` early returns.
-pub(crate) struct SessionGuard {
+///
+/// `pub` so the headless `newt solve` entry (in `newt-cli`, which already
+/// depends on this crate) reports through the exact same seam as the TUI.
+pub struct SessionGuard {
     subscription: Option<Subscription>,
     reporter: Option<Reporter>,
 }
@@ -522,7 +580,7 @@ impl Drop for SessionGuard {
 
 /// Install the Herdr integration for this session. Outside a Herdr pane this
 /// subscribes to nothing, so lifecycle emission stays a single atomic load.
-pub(crate) fn session_guard(workspace: &str) -> SessionGuard {
+pub fn session_guard(workspace: &str) -> SessionGuard {
     let Some(env) = HerdrEnv::from_process_env() else {
         return SessionGuard {
             subscription: None,
@@ -532,7 +590,7 @@ pub(crate) fn session_guard(workspace: &str) -> SessionGuard {
     let title = std::path::Path::new(workspace)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned());
-    install(&env, title, Box::new(SocketSink::new(env.socket.clone())))
+    install(&env, title, env.sink())
 }
 
 fn install(env: &HerdrEnv, title: Option<String>, sink: Box<dyn Sink>) -> SessionGuard {
@@ -673,7 +731,7 @@ mod tests {
     }
 
     fn test_env() -> HerdrEnv {
-        HerdrEnv::from_parts(Some("1"), Some("w1:p2"), Some("/tmp/herdr-test.sock")).unwrap()
+        HerdrEnv::from_parts(Some("1"), Some("w1:p2"), Some("/tmp/herdr-test.sock"), None).unwrap()
     }
 
     /// Build an adapter + reporter directly (bypassing the process-global
@@ -723,13 +781,37 @@ mod tests {
     // Herdr absent, or any marker missing: the integration is unavailable.
     #[test]
     fn env_absent_or_incomplete_disables_integration() {
-        assert_eq!(HerdrEnv::from_parts(None, None, None), None);
-        assert_eq!(HerdrEnv::from_parts(Some("0"), Some("p"), Some("/s")), None);
-        assert_eq!(HerdrEnv::from_parts(Some("1"), None, Some("/s")), None);
-        assert_eq!(HerdrEnv::from_parts(Some("1"), Some(""), Some("/s")), None);
-        assert_eq!(HerdrEnv::from_parts(Some("1"), Some("p"), None), None);
-        assert_eq!(HerdrEnv::from_parts(Some("1"), Some("p"), Some("")), None);
-        assert!(HerdrEnv::from_parts(Some("1"), Some("p"), Some("/s")).is_some());
+        assert_eq!(HerdrEnv::from_parts(None, None, None, None), None);
+        assert_eq!(
+            HerdrEnv::from_parts(Some("0"), Some("p"), Some("/s"), None),
+            None
+        );
+        assert_eq!(
+            HerdrEnv::from_parts(Some("1"), None, Some("/s"), None),
+            None
+        );
+        assert_eq!(
+            HerdrEnv::from_parts(Some("1"), Some(""), Some("/s"), None),
+            None
+        );
+        // Neither transport → undetectable, integration stays a no-op.
+        assert_eq!(HerdrEnv::from_parts(Some("1"), Some("p"), None, None), None);
+        assert_eq!(
+            HerdrEnv::from_parts(Some("1"), Some("p"), Some(""), None),
+            None
+        );
+        assert_eq!(
+            HerdrEnv::from_parts(Some("1"), Some("p"), Some(""), Some("")),
+            None
+        );
+        // A socket alone suffices.
+        assert!(HerdrEnv::from_parts(Some("1"), Some("p"), Some("/s"), None).is_some());
+        // A CLI binary alone suffices (the Windows / socket-less fallback).
+        let env = HerdrEnv::from_parts(Some("1"), Some("p"), None, Some("/usr/bin/herdr"));
+        assert!(env.is_some());
+        let env = env.unwrap();
+        assert_eq!(env.socket, None);
+        assert_eq!(env.bin, Some(PathBuf::from("/usr/bin/herdr")));
     }
 
     // Outside a Herdr pane nothing is installed: no subscription, no worker.
@@ -807,6 +889,72 @@ mod tests {
             ],
             "tool activity and turn outcome ride along as status tokens"
         );
+    }
+
+    // Req #7: `/commands`, `!shell`, help, and `exit` are NOT model turns.
+    // The chat loop emits `Waiting` when the operator has the floor and only
+    // emits `TurnStarted` from the final model-input branch — so a command
+    // (which produces NO lifecycle event, or at most another `Waiting`) must
+    // never flip the pane to Working. This test drives exactly the command
+    // path's event sequence — session start, then Waiting with no intervening
+    // TurnStarted — and asserts the pane stays idle.
+    #[test]
+    fn a_command_line_never_becomes_working() {
+        let sink = FakeSink::new();
+        let (adapter, mut reporter) = harness(sink.clone());
+        adapter.on_bare(
+            None,
+            LifecycleEvent::SessionStarted {
+                session_id: "s-cmd".into(),
+            },
+        );
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        // The operator runs /help, then !ls, then /cd, then exits. Each is a
+        // fresh prompt-floor wait; none is a turn. Emit the Waiting each one
+        // returns to, with NO TurnStarted between (that is the whole point).
+        for _ in 0..4 {
+            adapter.on_bare(None, LifecycleEvent::Waiting);
+            assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        }
+        reporter.shutdown();
+
+        assert!(
+            sink.states().iter().all(|s| s == "idle"),
+            "no command may produce a Working report, got {:?}",
+            sink.states()
+        );
+    }
+
+    // Req #8 (`newt solve`): the headless surface announces its own session
+    // and brackets the driver loop in TurnStarted/TurnCompleted — a solve run
+    // IS always a real model turn, so Working is exact. This drives the same
+    // event sequence solve.rs emits and asserts the pane tracks it.
+    #[test]
+    fn a_solve_run_reports_working_then_idle() {
+        let sink = FakeSink::new();
+        let (adapter, mut reporter) = harness(sink.clone());
+        adapter.on_bare(
+            None,
+            LifecycleEvent::SessionStarted {
+                session_id: "session-solve".into(),
+            },
+        );
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        adapter.on_bare(None, LifecycleEvent::TurnStarted);
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        adapter.on_bare(None, LifecycleEvent::TurnCompleted);
+        assert!(eventually(|| worker_is_idle(&reporter.inner)));
+        reporter.shutdown();
+
+        assert_eq!(
+            sink.seen().first(),
+            Some(&(
+                "pane.report_agent_session".to_string(),
+                "session-solve".to_string()
+            )),
+            "solve announces its own session identity first"
+        );
+        assert_eq!(sink.states(), ["idle", "working", "idle"]);
     }
 
     // Blocked is a real state with real nesting: entered once on the outermost
