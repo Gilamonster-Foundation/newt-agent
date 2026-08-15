@@ -173,6 +173,28 @@ impl RetryPolicy {
         })
     }
 
+    /// A bounded policy for paid / hosted inference endpoints.
+    ///
+    /// A hosted request can consume the full inference deadline before it
+    /// fails. Reusing the seven-attempt home-lab policy therefore turns a
+    /// 120-second timeout into roughly fifteen minutes of duplicate requests.
+    /// One retry still absorbs a transient edge failure without creating that
+    /// retry storm. Environment overrides remain authoritative.
+    pub fn for_hosted_inference() -> Self {
+        Self::from_env_or(Self::hosted_inference_defaults())
+    }
+
+    /// Pure hosted defaults, split from environment resolution so tests never
+    /// depend on or race an operator's legitimate `NEWT_HTTP_*` overrides.
+    fn hosted_inference_defaults() -> Self {
+        Self {
+            max_retries: 1,
+            base: Duration::from_millis(500),
+            max: Duration::from_secs(8),
+            jitter: true,
+        }
+    }
+
     /// A zero-delay policy with `max_retries` retries — for tests that want to
     /// exercise the retry loop without sleeping.
     pub fn immediate(max_retries: u32) -> Self {
@@ -207,16 +229,9 @@ impl RetryPolicy {
     }
 }
 
-/// Drive a fallible async operation under `policy`, calling `on_retry` before
-/// each sleep so the caller can log or display a retry indicator.
-///
-/// `on_retry(attempt, delay)` is called synchronously before sleeping:
-/// `attempt` is 1-based (1 = first retry), `delay` is the sleep duration.
-///
-/// Calls `op` until it succeeds, the error is [`Retryability::Fatal`], or
-/// `policy.max_retries` is exhausted. On exhaustion the *last* error is
-/// returned.
-pub async fn with_backoff_notify<T, F, Fut, N>(
+/// Like [`with_backoff_notify`], but also supplies the failed attempt's error
+/// to the callback so callers can render typed diagnostics.
+pub async fn with_backoff_notify_error<T, F, Fut, N>(
     policy: &RetryPolicy,
     mut op: F,
     mut on_retry: N,
@@ -224,7 +239,7 @@ pub async fn with_backoff_notify<T, F, Fut, N>(
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
-    N: FnMut(u32, Duration),
+    N: FnMut(u32, Duration, &anyhow::Error),
 {
     let mut retries = 0u32;
     loop {
@@ -236,7 +251,7 @@ where
                 }
                 retries += 1;
                 let delay = policy.delay_for(retries);
-                on_retry(retries, delay);
+                on_retry(retries, delay, &err);
                 tracing::warn!(
                     attempt = retries,
                     delay_ms = delay.as_millis() as u64,
@@ -247,6 +262,31 @@ where
             }
         }
     }
+}
+
+/// Drive a fallible async operation under `policy`, calling `on_retry` before
+/// each sleep so the caller can log or display a retry indicator.
+///
+/// `on_retry(attempt, delay)` is called synchronously before sleeping:
+/// `attempt` is 1-based (1 = first retry), `delay` is the sleep duration.
+///
+/// Calls `op` until it succeeds, the error is [`Retryability::Fatal`], or
+/// `policy.max_retries` is exhausted. On exhaustion the *last* error is
+/// returned.
+pub async fn with_backoff_notify<T, F, Fut, N>(
+    policy: &RetryPolicy,
+    op: F,
+    mut on_retry: N,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+    N: FnMut(u32, Duration),
+{
+    with_backoff_notify_error(policy, op, |attempt, delay, _| {
+        on_retry(attempt, delay);
+    })
+    .await
 }
 
 /// Drive a fallible async operation under `policy`.
@@ -527,6 +567,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn error_aware_retry_callback_receives_the_failed_attempt() {
+        let calls = Cell::new(0u32);
+        let saw_error = Cell::new(false);
+        let result: anyhow::Result<&str> = with_backoff_notify_error(
+            &RetryPolicy::immediate(1),
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                async move {
+                    if n == 1 {
+                        Err(err("vLLM returned 503 sentinel"))
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            },
+            |_, _, error| {
+                saw_error.set(error.to_string().contains("sentinel"));
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), "ok");
+        assert!(saw_error.get(), "callback receives the typed retry error");
+    }
+
     #[test]
     fn for_local_inference_is_more_patient_than_default() {
         let local = RetryPolicy::for_local_inference();
@@ -539,6 +605,17 @@ mod tests {
             local.max > default.max,
             "local policy must have a longer backoff ceiling"
         );
+    }
+
+    #[test]
+    fn hosted_inference_defaults_retry_only_once() {
+        let hosted = RetryPolicy::hosted_inference_defaults();
+        assert_eq!(
+            hosted.max_retries, 1,
+            "a hosted 120-second deadline must not expand into a seven-attempt retry storm"
+        );
+        assert_eq!(hosted.base, Duration::from_millis(500));
+        assert_eq!(hosted.max, Duration::from_secs(8));
     }
 
     #[test]

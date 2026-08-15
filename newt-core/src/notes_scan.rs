@@ -285,7 +285,7 @@ fn scan_curl_exfil(text: &str) -> anyhow::Result<()> {
 /// Loopback / private-network hosts that a note may legitimately reference
 /// (local model endpoints like `http://localhost:11434` are exactly what a
 /// local-first agent's notes describe).
-fn is_local_host(host: &str) -> bool {
+pub(crate) fn is_local_host(host: &str) -> bool {
     let host = host.trim_matches(|c| c == '[' || c == ']').to_lowercase();
     if host == "localhost" || host == "0.0.0.0" {
         return true;

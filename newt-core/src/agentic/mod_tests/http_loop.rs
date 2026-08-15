@@ -1364,6 +1364,24 @@ async fn chat_complete_dispatches_openai_kind_and_returns_first_round_answer() {
     assert_eq!(hallu, 0);
 }
 
+#[test]
+fn inference_endpoint_locality_distinguishes_hosted_from_home_lab_names() {
+    assert!(!inference_endpoint_is_local("https://api.moonshot.ai"));
+    assert!(inference_endpoint_is_local("http://dgx1.home.lab:8080"));
+    assert!(inference_endpoint_is_local("http://dgx1:8000"));
+    assert!(inference_endpoint_is_local("http://127.0.0.1:8000"));
+    assert!(inference_endpoint_is_local("http://[fd00::1]:8000"));
+    assert!(inference_endpoint_is_local("http://[fe80::1]:8000"));
+}
+
+#[test]
+fn openai_progress_label_exposes_attempt_and_deadline() {
+    assert_eq!(
+        inference_progress_label("kimi-k3", 2, 2, 120),
+        "waiting for kimi-k3 · attempt 2/2 · 120s deadline…"
+    );
+}
+
 /// Regression for the live full-access incident: the model narrated an exec
 /// denial without ever calling the advertised tool. The harness must spend one
 /// bounded round demanding a real probe instead of presenting that invention
