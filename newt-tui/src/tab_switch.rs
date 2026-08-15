@@ -524,6 +524,85 @@ pub(crate) fn adopt_conversation(
     Ok(Adopted::ProceedInActiveTab)
 }
 
+/// **Session exit** — flush the active tab, then release every claim.
+///
+/// #1669 PR-A (ADR "exit flushes then releases ALL claims"). Two halves, and
+/// the FLUSH half was missing entirely: exit released claims but never
+/// deactivated the active tab, so the operator's last unwritten preference
+/// actions — a `/model` or `/psyche` change made after the final turn — were
+/// dropped on the way out. Every other way of leaving a tab flushes; leaving
+/// newt did not.
+///
+/// Order matters for the same reason it does in `close_tab`: flush while the
+/// tab is still ours, release after.
+pub(crate) fn exit_release_all(ctx: &mut TabSwitchCtx<'_>, tabs: &mut TabSet) -> Vec<String> {
+    ctx.deactivate(tabs);
+    let held: Vec<String> = tabs
+        .claimed_conversations()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for id in &held {
+        if let Err(e) = ctx.store.release(id) {
+            crate::print_newt(
+                &format!("warning: releasing `{id}` on exit failed: {e}"),
+                ctx.color,
+                ctx.verbose,
+            );
+        }
+    }
+    held
+}
+
+/// Why the `/tab` family is unavailable in this session, if it is.
+///
+/// #1669 PR-A. Extracted from an inline `match` arm so the refusal is a tested
+/// value rather than a string literal buried in `run_chat` — the audit found
+/// all three refusals unreachable from any test as written.
+pub(crate) fn tab_surface_refusal(
+    surface_is_rich: bool,
+    ephemeral: bool,
+    has_store: bool,
+) -> Option<&'static str> {
+    if !surface_is_rich {
+        // Tabs are RichTUI presentation over conversation switching; lean
+        // expresses the same capability as scrolled lines. Never silence, never
+        // unknown-command — the namespace stays discoverable and the doctrine
+        // line explicit.
+        return Some(
+            "tabs are a rich-TUI feature; this session is single-conversation — \
+             use /resume, /new and /rename",
+        );
+    }
+    if ephemeral {
+        return Some(
+            "tabs need conversation persistence; this session is ephemeral and \
+             leaves no trace by design",
+        );
+    }
+    if !has_store {
+        return Some("tabs need conversation persistence; this session has no store");
+    }
+    None
+}
+
+/// The message shown when a degraded tab refuses a turn, or `None` when the
+/// pin is in force and the turn may proceed.
+///
+/// Extracted for the same reason: the refusal was inline in `run_chat` and the
+/// audit found no test asserting it — the claim "which is what refuses turns"
+/// was an assertion about untested code.
+pub(crate) fn degraded_turn_refusal(degraded: Option<&crate::PinDegraded>) -> Option<String> {
+    degraded.map(|d| {
+        format!(
+            "{} — this tab's pinned posture is not in force, so the prompt was not accepted. \
+             Fix what the pin names (usually a [[backends]] entry) then `/tab retry`, or \
+             `/psyche` to repin.",
+            d.summary()
+        )
+    })
+}
+
 /// The switch-level result of a close: the removed tab plus the neighbor
 /// activation's [`TransitionOutcome`]. Kept here rather than on the pure
 /// model's `Closed`, which must not know about pins or endpoints.
@@ -2217,6 +2296,264 @@ mod state_machine_tests {
             .expect("close must carry the neighbor's degradation");
         assert!(d.summary().starts_with("!pin"), "{}", d.summary());
         assert!(tabs.active().pin_degraded.is_some());
+    }
+
+    // ── ADR slice tests the audit found missing or vacuous ────────────────
+
+    /// S7 — exit flushes the active tab AND releases every claim.
+    ///
+    /// The flush half did not exist: exit released claims but never deactivated
+    /// the active tab, so a `/model` or `/psyche` change made after the last
+    /// turn was dropped on the way out. Every other way of leaving a tab
+    /// flushes; leaving newt did not.
+    #[test]
+    fn exit_flushes_the_active_tab_and_releases_every_claim() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol", "other"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        let b = h.durable("B");
+        h.open_tab_on(&mut tabs, &b);
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+        // An operator choice made after the last turn, not yet written.
+        newt_core::runtime::mark_backend_pick("other");
+        h.pending = newt_core::runtime::drain_preference_actions();
+        assert!(!h.pending.is_empty(), "fixture: an unwritten action exists");
+
+        let released = {
+            let mut ctx = h.ctx();
+            exit_release_all(&mut ctx, &mut tabs)
+        };
+
+        assert_eq!(
+            h.store.preference_pin(&a).unwrap().and_then(|p| p.backend),
+            Some("other".to_string()),
+            "the active tab's last choice is flushed on exit, not dropped"
+        );
+        let mut expect = vec![a.clone(), b.clone()];
+        expect.sort();
+        let mut got = released;
+        got.sort();
+        assert_eq!(
+            got, expect,
+            "every open tab's claim is released, not just the active one"
+        );
+    }
+
+    /// S9 — the lean / ephemeral / no-store refusals, now a tested value rather
+    /// than a string literal inside an 8000-line function.
+    #[test]
+    fn the_tab_surface_refusals_are_explicit_and_ordered() {
+        // Lean wins outright: it is a surface fact, true regardless of storage.
+        let lean = tab_surface_refusal(false, false, true).expect("lean refuses");
+        assert!(lean.contains("rich-TUI"), "{lean}");
+        assert!(
+            lean.contains("/resume"),
+            "names the lean equivalent: {lean}"
+        );
+        // Ephemeral next.
+        let eph = tab_surface_refusal(true, true, true).expect("ephemeral refuses");
+        assert!(eph.contains("ephemeral"), "{eph}");
+        // No store at all.
+        let none = tab_surface_refusal(true, false, false).expect("a storeless session refuses");
+        assert!(none.contains("no store"), "{none}");
+        // And the one case that proceeds.
+        assert!(tab_surface_refusal(true, false, true).is_none());
+        // Lean + ephemeral reports the SURFACE reason — the operator cannot fix
+        // ephemerality into tabs on a lean surface, so naming lean is the
+        // actionable message.
+        assert!(tab_surface_refusal(false, true, true)
+            .expect("still refuses")
+            .contains("rich-TUI"));
+    }
+
+    /// S3b — the turn refusal itself, which the audit found asserted only by a
+    /// comment. The message must name the recovery path, because the operator's
+    /// only way out is a command.
+    #[test]
+    fn a_degraded_tab_refuses_the_turn_and_names_the_way_out() {
+        let clean = degraded_turn_refusal(None);
+        assert!(clean.is_none(), "a healthy tab does not refuse");
+
+        let degraded = crate::PinDegraded {
+            reasons: vec!["pinned backend `gone` is not configured".into()],
+            pin: newt_core::OperatorPreferencePin {
+                backend: Some("gone".into()),
+                ..Default::default()
+            },
+        };
+        let msg = degraded_turn_refusal(Some(&degraded)).expect("a degraded tab refuses");
+        assert!(msg.starts_with("!pin"), "visible marker first: {msg}");
+        assert!(
+            msg.contains("was not accepted"),
+            "the contract is that the PROMPT is not accepted, not merely unsent: {msg}"
+        );
+        assert!(
+            msg.contains("/tab retry"),
+            "names the recovery command: {msg}"
+        );
+    }
+
+    /// S8 — `/resume` onto a conversation NOT open in any tab stays a resume:
+    /// the seam hands it back rather than converting it into an activation.
+    ///
+    /// The activation branch is covered elsewhere; this is the opposite
+    /// property, and the regression it guards is exactly "someone simplifies
+    /// resume and activate into one operation".
+    #[test]
+    fn resume_of_an_unopened_conversation_stays_a_resume() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        // A durable conversation that NO tab holds.
+        let elsewhere = h.durable("not open anywhere");
+        let before = h.snapshot(&tabs);
+
+        let adopted = {
+            let mut ctx = h.ctx();
+            adopt_conversation(&mut ctx, &mut tabs, &elsewhere).unwrap()
+        };
+        assert!(
+            matches!(adopted, Adopted::ProceedInActiveTab),
+            "the seam must hand an unopened conversation back to the resume verb, \
+             not activate it: got {adopted:?}"
+        );
+        assert_eq!(
+            h.snapshot(&tabs),
+            before,
+            "and the seam itself mutates nothing — resume's sparse overlay runs at the caller"
+        );
+        assert_eq!(tabs.len(), 1, "no tab was opened for it either");
+    }
+
+    /// S1 — `interrupted_objective` really is per-tab. The audit found the
+    /// existing coverage vacuous: no test ever set it to `Some(..)`, so it rode
+    /// on a `TabSidecar::default()` comparison that could not fail.
+    #[test]
+    fn an_interrupted_objective_does_not_leak_into_another_tab() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+        // A REAL prompt context, from a real receipt.
+        let receipt = h
+            .store
+            .begin_prompt(
+                &a,
+                "A",
+                None,
+                newt_core::NewPrompt::operator(b"objective".to_vec(), b"objective".to_vec()),
+            )
+            .unwrap();
+        h.interrupted_objective = Some(receipt);
+        assert!(h.interrupted_objective.is_some(), "fixture precondition");
+
+        let b = h.durable("B");
+        h.open_tab_on(&mut tabs, &b);
+        assert!(
+            h.interrupted_objective.is_none(),
+            "tab A's interrupted objective must not follow into B — otherwise B's bare \
+             `continue` would silently resume A's work"
+        );
+
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).expect("back to A");
+        }
+        assert!(
+            h.interrupted_objective.is_some(),
+            "and it comes back with A, which is why it is stashed rather than dropped"
+        );
+    }
+
+    /// P1 — activation is history-independent over the PROJECTED posture, not
+    /// merely over the tab model. `A→B` and `C→B` must land byte-identical.
+    #[test]
+    fn activation_is_history_independent_over_the_full_projected_state() {
+        let _g = guard();
+        let build = || {
+            let (mut h, mut tabs) = Harness::new(&["sol", "other"]);
+            let a = h.active_conversation_id.clone();
+            h.store.create_with_id(&a, "A", None).unwrap();
+            h.store
+                .update_preference_pin(
+                    &a,
+                    &newt_core::OperatorPreferencePin {
+                        backend: Some("other".into()),
+                        tenacity: Some(newt_core::Tenacity::Relentless),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let b = h.durable("B");
+            h.store
+                .update_preference_pin(
+                    &b,
+                    &newt_core::OperatorPreferencePin {
+                        backend: Some("sol".into()),
+                        cognition: Some("contemplating".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let c = h.durable("C");
+            h.open_tab_on(&mut tabs, &b);
+            h.open_tab_on(&mut tabs, &c);
+            (h, tabs)
+        };
+
+        // Reached from A (index 0).
+        let (mut from_a, mut tabs_a) = build();
+        {
+            let mut ctx = from_a.ctx();
+            activate_tab(&mut ctx, &mut tabs_a, 0).unwrap();
+            activate_tab(&mut ctx, &mut tabs_a, 1).unwrap();
+        }
+        let via_a = from_a.snapshot(&tabs_a);
+
+        // Reached from C (index 2).
+        let (mut from_c, mut tabs_c) = build();
+        {
+            let mut ctx = from_c.ctx();
+            activate_tab(&mut ctx, &mut tabs_c, 2).unwrap();
+            activate_tab(&mut ctx, &mut tabs_c, 1).unwrap();
+        }
+        let via_c = from_c.snapshot(&tabs_c);
+
+        // Conversation ids differ per harness (fresh tempdirs), so compare
+        // everything the ADR promises is history-independent.
+        assert_eq!(via_a.provider, via_c.provider);
+        assert_eq!(via_a.model, via_c.model);
+        assert_eq!(via_a.cognition, via_c.cognition);
+        assert_eq!(via_a.tenacity, via_c.tenacity);
+        assert_eq!(via_a.persona_cognition, via_c.persona_cognition);
+        assert_eq!(via_a.inf_url, via_c.inf_url);
+        assert_eq!(via_a.inf_model, via_c.inf_model);
+        assert_eq!(via_a.inf_kind, via_c.inf_kind);
+        assert_eq!(via_a.choice_name, via_c.choice_name);
+        assert_eq!(via_a.inf_context_window, via_c.inf_context_window);
+        assert_eq!(via_a.persona, via_c.persona);
+        assert_eq!(via_a.scratchpad, via_c.scratchpad);
+        assert_eq!(via_a.plan_steps, via_c.plan_steps);
+        assert_eq!(via_a.turns, via_c.turns);
+        assert_eq!(via_a.roadmap, via_c.roadmap);
+        assert_eq!(via_a.input_stash, via_c.input_stash);
+        assert_eq!(via_a.degraded, via_c.degraded);
+        assert_eq!(
+            via_a.cognition,
+            newt_core::cognition::CognitionOverride::Set(
+                newt_core::role_profile::Cognition::Contemplating
+            ),
+            "B's own pin is in force either way"
+        );
+        assert_eq!(
+            via_a.tenacity, None,
+            "and A's tenacity never survives into B, from either predecessor"
+        );
     }
 
     // ── 13. authority/security state is untouched by tab machinery ────────

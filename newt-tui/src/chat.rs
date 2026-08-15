@@ -2641,25 +2641,15 @@ pub(crate) fn run_chat(
                         // Tabs are RichTUI presentation over conversation
                         // switching; lean expresses the same capability as
                         // scrolled lines via /resume, /new and /rename.
-                        let refusal = if !surface_is_rich {
-                            Some(
-                                "tabs are a rich-TUI feature; this session is \
-                                 single-conversation — use /resume, /new and /rename",
-                            )
-                        } else if ephemeral_session {
-                            Some(
-                                "tabs need conversation persistence; this session is \
-                                 ephemeral and leaves no trace by design",
-                            )
-                        } else {
-                            None
-                        };
+                        let refusal = crate::tab_switch::tab_surface_refusal(
+                            surface_is_rich,
+                            ephemeral_session,
+                            conversation_store.is_some(),
+                        );
                         match (refusal, conversation_store.as_ref()) {
                             (Some(why), _) => print_newt(why, color, verbose),
-                            (None, None) => print_newt(
-                                "tabs need conversation persistence; this session has no store",
-                                color,
-                                verbose,
+                            (None, None) => unreachable!(
+                                "tab_surface_refusal returns Some when there is no store"
                             ),
                             (None, Some(store)) => match crate::tabs::parse_tab_command(arg) {
                                 Err(usage) => print_newt(&usage, color, verbose),
@@ -5224,7 +5214,9 @@ pub(crate) fn run_chat(
                 {
                     clean_exit = true;
                     break;
-                } else if tabs.active().pin_degraded.is_some() {
+                } else if let Some(refusal) =
+                    crate::tab_switch::degraded_turn_refusal(tabs.active().pin_degraded.as_ref())
+                {
                     // #1669 PR-A (item 5) — CONTRACT: while a tab's pinned
                     // posture is not in force, the operator prompt is NOT
                     // ACCEPTED. Nothing durable is written for it.
@@ -5234,30 +5226,13 @@ pub(crate) fn run_chat(
                     // lineage: admitting a prompt that never ran would leave a
                     // receipt whose ancestry, current-objective and clarification
                     // state describe a turn that does not exist, and `/resume`
-                    // would later rehydrate it as real. A refused turn should
-                    // leave the conversation exactly as it was.
+                    // would later rehydrate it as real.
                     //
-                    // Placed here — AFTER every slash and `!host` command has
-                    // been dispatched above, BEFORE `begin_model_prompt` — so
-                    // the recovery commands stay reachable. `/tab retry`,
-                    // `/backends`, `/psyche` and `/tab` all still work on a
-                    // degraded tab; a gate the operator cannot escape would be
-                    // worse than the bug it guards.
-                    let degraded = tabs
-                        .active()
-                        .pin_degraded
-                        .as_ref()
-                        .expect("checked immediately above");
-                    print_newt(
-                        &format!(
-                            "{} — this tab's pinned posture is not in force, so the prompt was \
-                             not accepted. Fix what the pin names (usually a [[backends]] entry) \
-                             then `/tab retry`, or `/psyche` to repin.",
-                            degraded.summary()
-                        ),
-                        color,
-                        verbose,
-                    );
+                    // Placed AFTER every slash and `!host` command has been
+                    // dispatched above, BEFORE `begin_model_prompt`, so the
+                    // recovery commands stay reachable: `/tab retry`,
+                    // `/backends`, `/psyche` and `/tab` all still work.
+                    print_newt(&refusal, color, verbose);
                     println!();
                     continue;
                 } else {
@@ -6970,9 +6945,8 @@ pub(crate) fn run_chat(
     // a fresh newt would refuse and start a replacement instead. Release
     // exactly what the tabs hold.
     if let Some(store) = conversation_store.as_ref() {
-        for held in tabs.claimed_conversations() {
-            let _ = store.release(held);
-        }
+        let mut tab_ctx = tab_ctx!(store);
+        crate::tab_switch::exit_release_all(&mut tab_ctx, &mut tabs);
     }
 
     surface.save_history();
