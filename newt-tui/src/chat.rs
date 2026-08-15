@@ -2021,7 +2021,12 @@ pub(crate) fn run_chat(
                 if task.is_empty() {
                     continue;
                 }
-                newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
+                // NOTE: `TurnStarted` is NOT emitted here. A non-empty line is
+                // not yet a turn — it may still be intercepted as a `!shell`
+                // escape, a `/command`, `exit`, or a help request below, and
+                // none of those is a model turn (review req: Working must mean
+                // a REAL inference turn). The emission lives in the final
+                // model-input `else` branch, past every interception.
                 model_input_origin = upgrade_origin_for_interrupted_objective(
                     model_input_origin,
                     &task,
@@ -4891,6 +4896,10 @@ pub(crate) fn run_chat(
                     clean_exit = true;
                     break;
                 } else {
+                    // Past every interception (`!shell`, `/command`, help,
+                    // `exit`): this line IS a model turn. Announce Working now
+                    // — and only now — so commands never flip the pane state.
+                    newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
                     // Durable ingress is the FIRST operation in the final
                     // model-input branch. It precedes hardware probes,
                     // retrieval, inference, and every tool-capable path. Raw
