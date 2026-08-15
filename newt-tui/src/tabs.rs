@@ -80,6 +80,15 @@ pub struct TabState {
     pub sidecar: TabSidecar,
     /// Unsubmitted prompt text, restored when this tab is reactivated.
     pub input_stash: String,
+    /// `Some` when this tab's pinned posture could NOT be established, so the
+    /// tab is running at baseline instead (ADR blocker 4).
+    ///
+    /// While this is set the tab is **visibly degraded and refuses turns**: the
+    /// alternative is executing a turn under a model, backend, or runtime
+    /// posture the tab says is pinned but which is not actually in force. The
+    /// stored pin rides along so a retry has something to retry once the
+    /// operator restores whatever was missing.
+    pub pin_degraded: Option<crate::PinDegraded>,
 }
 
 impl TabState {
@@ -106,7 +115,7 @@ impl TabState {
 }
 
 /// Why an operation on the tab set was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabError {
     /// The index named no open tab. Carries how many tabs are open, so the
     /// caller can say `1..=n` rather than "invalid".
@@ -115,6 +124,10 @@ pub enum TabError {
     /// zero-tab state has no meaning (there would be no session to own the
     /// REPL).
     LastTab,
+    /// Stage 0 refused: the incoming conversation could not be proven
+    /// activatable. **Nothing was mutated** — this is the abort that keeps a
+    /// failed switch from half-applying.
+    PreflightFailed { reason: String },
 }
 
 /// What the caller must do to make an activation truthful.
@@ -196,6 +209,7 @@ impl TabSet {
                 conversation_id: conversation_id.into(),
                 sidecar: TabSidecar::default(),
                 input_stash: String::new(),
+                pin_degraded: None,
             }],
             active: 0,
         }
@@ -267,6 +281,7 @@ impl TabSet {
                 conversation_id: conversation_id.into(),
                 sidecar: TabSidecar::default(),
                 input_stash: String::new(),
+                pin_degraded: None,
             },
         );
         self.active = at;
@@ -407,6 +422,12 @@ pub enum TabAction {
     Close(Option<usize>),
     /// Reorder, preserving which tab is active (1-based).
     Move { from: usize, to: usize },
+    /// Re-apply the ACTIVE tab's pin after a failure (ADR blocker 4).
+    ///
+    /// The degraded state retains the pin, so once the operator restores what
+    /// it names — usually a `[[backends]]` entry — this is how they get out of
+    /// it without abandoning the conversation.
+    Retry,
     /// Retitle tab `n`'s conversation, or the active tab's when `None`.
     /// Slash-only; targets a non-active tab, which is why the rename helper is
     /// extracted rather than inlined in the `/rename` arm.
@@ -437,6 +458,7 @@ pub fn parse_tab_command(args: &str) -> Result<TabAction, String> {
 
     match head {
         "new" => Ok(TabAction::New),
+        "retry" => Ok(TabAction::Retry),
         "next" => Ok(TabAction::Next),
         "prev" => Ok(TabAction::Prev(1)),
         "close" => match rest.as_slice() {
@@ -471,7 +493,8 @@ pub fn parse_tab_command(args: &str) -> Result<TabAction, String> {
         }
         other => Err(format!(
             "unknown: /tab {other} — try /tab, /tab new, /tab <n>, \
-             /tab next|prev, /tab close [n], /tab move <a> <b>, /tab rename [n] <title>"
+             /tab next|prev, /tab close [n], /tab move <a> <b>, \
+             /tab rename [n] <title>, /tab retry"
         )),
     }
 }

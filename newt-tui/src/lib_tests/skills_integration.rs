@@ -461,12 +461,20 @@ async fn new_conversation_preserves_active_persona() {
         conversation_id: &mut active_conversation_id,
         mode_states: &mode_states,
     };
+    let scratchpad = newt_core::SessionScratchpadStore::default();
+    let ledger = newt_core::SessionStepLedger::default();
+    let mut prompt_ctx = None;
     let message = handle_new_conversation(
         workspace,
         active_persona.as_ref(),
         &mut ctx,
         &mut compress_state,
         &mut session_opted_fresh,
+        &mut ConversationScopedState {
+            scratchpad: &scratchpad,
+            step_ledger: &ledger,
+            active_prompt_context: &mut prompt_ctx,
+        },
     );
 
     assert!(

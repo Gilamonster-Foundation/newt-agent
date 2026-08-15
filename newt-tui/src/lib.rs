@@ -4445,6 +4445,39 @@ pub(crate) struct ConversationPreferenceSwitch<'a> {
     pub verbose: bool,
 }
 
+/// The result of applying a conversation's preference pin.
+///
+/// #1669 PR-A / ADR blocker 4: this used to be a bare `bool` (did the endpoint
+/// move?), so a pin that could NOT be applied — a backend the config no longer
+/// defines, a pin row that would not read — printed a notice and the session
+/// carried on at baseline. That is exactly the silent-wrong-posture case the
+/// ADR forbids: the tab says it is pinned to one backend and the next turn runs
+/// somewhere else.
+pub(crate) struct PinRestore {
+    /// Whether the backend endpoint moved, so the caller re-probes telemetry.
+    pub url_changed: bool,
+    /// `Some` when the pin could not be fully established. The session is at a
+    /// known baseline; the caller marks the tab degraded and refuses turns.
+    pub degraded: Option<PinDegraded>,
+}
+
+/// A pin that could not be established, and enough to retry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinDegraded {
+    /// Operator-facing reasons, verbatim from the apply plan.
+    pub reasons: Vec<String>,
+    /// The pin as stored — retained so a retry has something to retry once the
+    /// operator fixes what was missing (usually a `[[backends]]` entry).
+    pub pin: newt_core::OperatorPreferencePin,
+}
+
+impl PinDegraded {
+    /// One line for the footer/list and for the turn refusal.
+    pub fn summary(&self) -> String {
+        format!("!pin — {}", self.reasons.join("; "))
+    }
+}
+
 /// How this launch's conversation actually resolved — the input to "may the
 /// startup preference pin apply?".
 ///
@@ -4492,7 +4525,7 @@ pub(crate) fn apply_startup_preference_pin(
     if !outcome.applies_pin() {
         return false;
     }
-    restore_preference_pin(sw)
+    restore_preference_pin(sw).url_changed
 }
 
 /// #1668: re-seat the session posture for the conversation being switched to —
@@ -4523,7 +4556,7 @@ pub(crate) fn apply_startup_preference_pin(
 ///
 /// Returns whether the endpoint URL changed, so the caller re-probes DGX
 /// telemetry only when it matters (same contract as [`apply_persona_backend`]).
-pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bool {
+pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> PinRestore {
     let ConversationPreferenceSwitch {
         store,
         conversation_id,
@@ -4548,6 +4581,7 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
     // Fail-open on a bad read: a corrupt pin must never block a resume, and
     // must never leave the session on the previous conversation's posture —
     // the baseline reset below still runs.
+    let mut pin_read_failed = false;
     let pin = match store.map(|s| s.preference_pin(conversation_id)) {
         Some(Ok(Some(pin))) => pin,
         None | Some(Ok(None)) => newt_core::OperatorPreferencePin::default(),
@@ -4560,6 +4594,7 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
                 color,
                 verbose,
             );
+            pin_read_failed = true;
             newt_core::OperatorPreferencePin::default()
         }
     };
@@ -4568,6 +4603,20 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
     let plan = pin.apply_plan(&configured, owned);
     for notice in &plan.notices {
         print_newt(notice, color, verbose);
+    }
+    // ADR blocker 4: a notice means the pin asked for something this process
+    // could not establish. The baseline reset below still runs — so the session
+    // lands somewhere KNOWN — but the caller must be told, because "at baseline
+    // while claiming to be pinned" is a posture the operator did not choose.
+    let mut degraded = (!plan.notices.is_empty() || pin_read_failed).then(|| PinDegraded {
+        reasons: plan.notices.clone(),
+        pin: pin.clone(),
+    });
+    if let Some(d) = degraded.as_mut() {
+        if d.reasons.is_empty() {
+            d.reasons
+                .push("the stored preference pin could not be read".to_string());
+        }
     }
 
     // ---- 1. reset the dials to the invocation baseline ----------------
@@ -4693,7 +4742,10 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
             verbose,
         );
     }
-    url_changed
+    PinRestore {
+        url_changed,
+        degraded,
+    }
 }
 
 /// #1668: fold the operator posture ACTIONS marked since the last drain into
@@ -4921,7 +4973,7 @@ mod resumed_preference_tests {
             cfg: &newt_core::Config,
             persona: Option<&Persona>,
         ) -> bool {
-            restore_preference_pin(self.switch_args(store, id, baseline, cfg, persona))
+            restore_preference_pin(self.switch_args(store, id, baseline, cfg, persona)).url_changed
         }
 
         fn switch_args<'a>(
@@ -6105,6 +6157,19 @@ enum ConversationCommand {
     Delete(String),
 }
 
+/// The conversation a `/conversation …` command would SELECT, if any.
+///
+/// #1669 PR-A blocker 2: `/conversation restore` is a conversation-selection
+/// path, so it must consult the tab-aware adoption seam before it runs —
+/// otherwise it can point a second tab at a conversation another tab holds.
+/// Parsing is pure and cheap, so the caller asks first and dispatches after.
+pub(crate) fn conversation_command_target(input: &str) -> Option<String> {
+    match parse_conversation_command(input).ok()? {
+        ConversationCommand::Restore(id) => Some(id),
+        _ => None,
+    }
+}
+
 fn parse_conversation_command(input: &str) -> anyhow::Result<ConversationCommand> {
     let body = input.trim().trim_start_matches('/').trim();
     let mut parts = body.split_whitespace();
@@ -6587,12 +6652,40 @@ pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_durable: b
     }
 }
 
+/// The per-CONVERSATION live state a boundary must clear.
+///
+/// #1669 PR-A. Deliberately not the whole session: the semantic index, the
+/// experiential ledger, and the nav warmup are **shared across tabs on
+/// purpose** (ADR, "Global (shared across tabs)"), so they are task-scoped
+/// concerns that `/new` handles and `/tab new` must NOT touch — clearing them
+/// would let opening a tab throw away work another tab is relying on.
+pub(crate) struct ConversationScopedState<'a> {
+    pub scratchpad: &'a dyn newt_core::ScratchpadStore,
+    pub step_ledger: &'a dyn newt_core::StepLedger,
+    pub active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
+}
+
+impl ConversationScopedState<'_> {
+    /// Drop everything that belonged to the outgoing conversation.
+    ///
+    /// Step 26.4 (#583) scratchpad, Step 26.6b (#586) plan ledger, and the
+    /// prompt receipt. One place, so `/new` and `/tab new` cannot drift: a
+    /// fresh tab that inherited any of these would be a new conversation
+    /// wearing the previous one's working memory.
+    pub fn clear(&mut self) {
+        self.scratchpad.clear();
+        self.step_ledger.clear();
+        *self.active_prompt_context = None;
+    }
+}
+
 fn handle_new_conversation(
     workspace: &str,
     active_persona: Option<&Persona>,
     ctx: &mut ConversationResetContext<'_>,
     compress_state: &mut newt_core::CompressState,
     session_opted_fresh: &mut bool,
+    scoped: &mut ConversationScopedState<'_>,
 ) -> String {
     // A new conversation gets a fresh id, which rotates the per-session plan
     // path to a new `.scratch/sessions/<id>/` dir (issue #220).
@@ -6604,6 +6697,7 @@ fn handle_new_conversation(
     // (`should_auto_resume` consults the flag) — resume never undoes /new.
     *session_opted_fresh = true;
     reset_conversation(workspace, active_persona, ctx);
+    scoped.clear();
     new_conversation_message(active_persona)
 }
 
