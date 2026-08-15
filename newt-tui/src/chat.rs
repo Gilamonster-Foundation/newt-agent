@@ -846,6 +846,13 @@ pub(crate) fn run_chat(
 ) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
+    // Integration listener for the lifecycle events emitted below: when this
+    // process runs inside a Herdr pane it reports state to the cockpit, and
+    // outside one it subscribes to nothing at all. The guard releases
+    // lifecycle authority on every orderly exit path of this function, early
+    // `?` returns included.
+    let _herdr = crate::herdr::session_guard(workspace);
+
     // Header line — one-time print, then normal scroll from here.
     if color {
         execute!(
@@ -1582,17 +1589,30 @@ pub(crate) fn run_chat(
     // Step 26.6b (#586): session-scoped plan ledger for the scheduled view.
     // Task-specific → CLEARED on /new (like the scratchpad).
     let step_ledger = newt_core::SessionStepLedger::default();
+    // #1662: THE identity of this running Newt, stable for its whole lifetime
+    // and distinct from any conversation id. The previous scheme was
+    // `SystemTime::now().as_secs()`, so two Newts launched in the same second —
+    // a script, a tab restore, a Herdr layout opening several panes — shared
+    // one lifecycle identity and each answered to the other's events.
+    let lifecycle_session = newt_core::lifecycle::new_session_id();
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
-        session_id: format!(
-            "{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        ),
+        session_id: lifecycle_session.to_string(),
     };
     tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
+    // #1662: declare ownership BEFORE announcing the start, so the two
+    // infrastructure emitters that have no session handle — the tty arbiter's
+    // Blocked/Unblocked and tool dispatch's ToolActivity — attribute their
+    // events to this session from the first one. The start itself is emitted
+    // with an explicit id rather than relying on the cell, so it is
+    // self-describing regardless of ownership ordering.
+    newt_core::lifecycle::set_active_session(&lifecycle_session);
+    newt_core::lifecycle::emit_for(
+        Some(lifecycle_session.to_string()),
+        newt_core::lifecycle::LifecycleEvent::SessionStarted {
+            session_id: lifecycle_session.to_string(),
+        },
+    );
 
     // Build system prompt now that SoulProvider has loaded its soul file.
     system = rebuild_system_prompt(
@@ -1989,6 +2009,8 @@ pub(crate) fn run_chat(
                             parent: pending.parent.clone(),
                         }
                     });
+            // The human has the floor: not "blocked", just waiting.
+            newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::Waiting);
             (surface.read_line(&prompt)?, origin)
         };
         match outcome {
@@ -1999,6 +2021,7 @@ pub(crate) fn run_chat(
                 if task.is_empty() {
                     continue;
                 }
+                newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
                 model_input_origin = upgrade_origin_for_interrupted_objective(
                     model_input_origin,
                     &task,
@@ -3457,6 +3480,25 @@ pub(crate) fn run_chat(
                         pending_clarification = None;
                         ephemeral_artifact_store =
                             session_artifact_store(ephemeral_session, &active_conversation_id)?;
+                        // #1662: `/new` starts a new CONVERSATION, not a new
+                        // SESSION — the process, the tab, and the Herdr pane are
+                        // all unchanged — so it deliberately emits no lifecycle
+                        // event and does not touch ownership.
+                        //
+                        // An earlier revision of this PR re-anchored ownership
+                        // here to `active_conversation_id`. That put two
+                        // different kinds of identity in one field: startup
+                        // stamped a session id, `/new` stamped a conversation
+                        // id, and an observer had no way to tell which it held.
+                        // A pane that had adopted the session then saw later
+                        // events under an id it did not recognize. Ownership is
+                        // now set once at startup and never becomes stale
+                        // because it never changes.
+                        //
+                        // Conversation identity is tracked separately (the
+                        // store's `active_conversation_id`). If Herdr should one
+                        // day display it, that is a distinct field carrying a
+                        // distinct id — not a second meaning on this one.
                         // #1030: pre-title a `/start <title>` conversation by
                         // creating its (empty) record up front, so it appears in
                         // `/resume` with that title immediately; the first turn
@@ -5042,6 +5084,7 @@ pub(crate) fn run_chat(
                     }
 
                     print_thinking(color);
+                    newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::Thinking);
                     let t0 = std::time::Instant::now();
 
                     // The active route may have changed since the previous turn
@@ -6096,6 +6139,9 @@ pub(crate) fn run_chat(
                         clean_exit = true;
                         break;
                     } else if turn_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        newt_core::lifecycle::emit(
+                            newt_core::lifecycle::LifecycleEvent::TurnCancelled,
+                        );
                         let note = if turn_hard.load(std::sync::atomic::Ordering::Relaxed) {
                             "⊘ stopped — back to you"
                         } else {
@@ -6104,6 +6150,11 @@ pub(crate) fn run_chat(
                         print_newt(note, color, verbose);
                         println!();
                     } else {
+                        newt_core::lifecycle::emit(if response.is_ok() {
+                            newt_core::lifecycle::LifecycleEvent::TurnCompleted
+                        } else {
+                            newt_core::lifecycle::LifecycleEvent::TurnFailed { reason: None }
+                        });
                         match response {
                             Ok((reply, was_streamed, usage, hallucinations)) => {
                                 if !was_streamed {

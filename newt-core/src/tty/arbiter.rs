@@ -438,6 +438,12 @@ impl Terminal {
             e.erase();
         }
 
+        // 3. Only NOW is the process truly blocked on a human: stdin ownership
+        //    has succeeded and the screen is prompt-ready. Observing earlier
+        //    would report intent (possibly still waiting on another stdin
+        //    owner) rather than reality.
+        notify_prompt_observer(true);
+
         PromptWindow {
             _seal: Seal,
             stdin: Some(stdin),
@@ -645,7 +651,20 @@ impl Drop for PromptWindow {
         // Stdin last: the terminal mode goes back to whatever the turn watcher
         // had set up only after the screen is whole again.
         self.stdin = None;
+        notify_prompt_observer(false);
     }
+}
+
+/// Announce that a live [`PromptWindow`] opened (`true`) or closed (`false`)
+/// as a generic lifecycle event — i.e. exactly when the process starts and
+/// stops blocking on a human. This module knows nothing about who listens;
+/// see [`crate::lifecycle`]. The test stub never fires it.
+fn notify_prompt_observer(open: bool) {
+    crate::lifecycle::emit(if open {
+        crate::lifecycle::LifecycleEvent::Blocked
+    } else {
+        crate::lifecycle::LifecycleEvent::Unblocked
+    });
 }
 
 #[cfg(test)]
@@ -848,5 +867,50 @@ mod tests {
         assert!(!suspended());
         drop(w);
         assert!(!suspended());
+    }
+
+    /// Blocked/Unblocked describe reality, not intent: `Blocked` is emitted
+    /// only once stdin ownership and suspension have succeeded (observable
+    /// here as stdin already being prompt-owned when the observer runs),
+    /// `Unblocked` on drop, and the inert test stub emits neither.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn blocked_is_emitted_after_stdin_acquisition_and_unblocked_on_drop() {
+        use crate::lifecycle::LifecycleEvent;
+
+        // (event, stdin_owned_at_callback), recorded only for this thread —
+        // the lifecycle registry is process-global and sibling tests emit
+        // concurrently.
+        let log: Arc<Mutex<Vec<(LifecycleEvent, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let me = std::thread::current().id();
+        let sub = crate::lifecycle::subscribe(move |event| {
+            if std::thread::current().id() == me {
+                sink.lock()
+                    .unwrap()
+                    .push((event.event.clone(), prompt_stdin_active()));
+            }
+        });
+
+        {
+            let _stub = PromptWindow::test_stub();
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the stub must not emit lifecycle events"
+        );
+
+        let w = Terminal::suspend_for_prompt();
+        drop(w);
+        drop(sub);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                (LifecycleEvent::Blocked, true),
+                (LifecycleEvent::Unblocked, false)
+            ],
+            "Blocked is emitted exactly once, with stdin already owned \
+             (post-acquire, not intent); Unblocked on drop, after stdin is released"
+        );
     }
 }
