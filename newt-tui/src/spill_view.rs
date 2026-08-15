@@ -584,6 +584,19 @@ impl SpillView {
         self.lines.len() + usize::from(!self.current.is_empty() || self.current_truncated)
     }
 
+    /// Terminal-safe retained text, without viewport gutters. Completed-spill
+    /// archival reuses this decoder so reopening output cannot replay ANSI or
+    /// control sequences into the terminal.
+    pub(crate) fn retained_display_lines(&self) -> Vec<String> {
+        (0..self.retained_line_count())
+            .map(|line| self.line_at(line).display_text())
+            .collect()
+    }
+
+    pub(crate) fn dropped_line_count(&self) -> usize {
+        self.dropped_lines
+    }
+
     fn line_at(&self, relative: usize) -> StoredLine {
         if let Some(line) = self.lines.get(relative) {
             line.clone()

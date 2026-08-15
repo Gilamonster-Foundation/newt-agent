@@ -15,6 +15,8 @@ mod navigator_cmds;
 // the permission prompt to show a system-computed blast-radius line and refuse a
 // plain `[s]ession allow` for high-danger targets.
 mod commands;
+#[cfg(feature = "live-spill")]
+mod completed_spill;
 mod danger;
 pub mod dgx_probe;
 mod herdr;
@@ -8691,6 +8693,10 @@ enum SpillCommand {
     Summary,
     /// #1640 Layer 1: restore the multi-row excerpt.
     Excerpt,
+    /// Open the newest retained completed result.
+    Last,
+    /// Open one stable, session-local retained result.
+    Open(u64),
 }
 
 /// Apply a parsed `/spill` command to the two session overrides. Pure and
@@ -8707,6 +8713,7 @@ fn apply_spill_command(
         SpillCommand::Set(rows) => *lines_override = Some(rows),
         SpillCommand::Summary => *summary_override = Some(true),
         SpillCommand::Excerpt => *summary_override = Some(false),
+        SpillCommand::Last | SpillCommand::Open(_) => {}
         SpillCommand::Reset => {
             *lines_override = None;
             *summary_override = None;
@@ -8730,11 +8737,23 @@ fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
     }
 
     let arg = rest.trim();
-    match arg.to_ascii_lowercase().as_str() {
+    let normalized = arg.to_ascii_lowercase();
+    if let Some(value) = normalized.strip_prefix("open ") {
+        let id = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("/spill open needs a positive result id"))?;
+        if id == 0 || value.split_whitespace().count() != 1 {
+            anyhow::bail!("/spill open needs one positive result id");
+        }
+        return Ok(SpillCommand::Open(id));
+    }
+    match normalized.as_str() {
         "" | "show" | "status" => Ok(SpillCommand::Status),
         "reset" | "default" | "config" | "auto" => Ok(SpillCommand::Reset),
         "summary" | "collapse" => Ok(SpillCommand::Summary),
         "excerpt" | "expand" | "rows" => Ok(SpillCommand::Excerpt),
+        "last" => Ok(SpillCommand::Last),
         _ => arg
             .parse::<usize>()
             .map(SpillCommand::Set)
@@ -11903,7 +11922,7 @@ was launched in unless overridden."
         }
         "spill" => {
             "\
-/spill [status|N|reset|summary|excerpt] — tool-output rows for this session
+/spill [status|N|reset|summary|excerpt|last|open ID] — tool-output controls
 
   /spill                 show the effective row count and live availability
   /spill <N>             set collapsed live and completed rows for later tools
@@ -11911,9 +11930,12 @@ was launched in unless overridden."
   /spill 0               disable live display; show completed output unbounded
   /spill summary         collapse spilled results to one line (rich default)
   /spill excerpt         restore the multi-row excerpt for spilled results
+  /spill last            open the newest retained result (rich, this session)
+  /spill open <ID>       open the retained result named by a collapse marker
 
 While a tool is active, Up/Down scroll retained output. Space or Enter toggles
-the boundary: ⧉ expands up to the terminal's safe capacity; ▣ collapses it."
+the boundary: ⧉ expands up to the terminal's safe capacity; ▣ collapses it.
+Completed bodies are memory-only and bounded; older IDs can expire."
         }
         "config" => {
             "\
@@ -12220,7 +12242,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /psyche                  - effort dial panel: cognition, tenacity, persona (Esc exits; /psyche obsessive = max)",
         "  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)",
-        "  /spill [status|N|reset|summary|excerpt] - tool rows / one-line collapse",
+        "  /spill [status|N|reset|summary|excerpt|last|open ID] - tool output",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",

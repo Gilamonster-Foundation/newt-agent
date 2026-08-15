@@ -515,6 +515,17 @@ fn spill_commands_parse_expected_forms() {
         parse_spill_command("/spill excerpt").unwrap(),
         SpillCommand::Excerpt
     );
+    assert_eq!(
+        parse_spill_command("/spill last").unwrap(),
+        SpillCommand::Last
+    );
+    assert_eq!(
+        parse_spill_command("/spill open 17").unwrap(),
+        SpillCommand::Open(17)
+    );
+    assert!(parse_spill_command("/spill open").is_err());
+    assert!(parse_spill_command("/spill open 0").is_err());
+    assert!(parse_spill_command("/spill open 3 extra").is_err());
     assert!(parse_spill_command("/spillage 7").is_err());
     assert!(parse_spill_command("/spill many").is_err());
 }
