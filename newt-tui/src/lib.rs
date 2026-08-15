@@ -33,6 +33,15 @@ mod prompt;
 mod prompt_visibility_test;
 #[cfg(feature = "live-spill")]
 mod spill_view;
+/// #1669 PR-A — the staged tab switch and the one tab-action handler, against
+/// live session state. Separate from the pure model so the staging discipline
+/// (Stage-0 read, deactivate, hydrate, reset⊕overlay, owner handoff) reads in
+/// one place instead of inside `run_chat`.
+mod tab_switch;
+/// #1669 PR-A — the pure session-tab model. TTY-free and unit-tested on its
+/// own; `chat.rs` performs the staged switch and the lifecycle owner handoff
+/// this module only reports.
+mod tabs;
 /// #1677 — the PTY acceptance proof that the transcript pager hands the
 /// terminal back (cooked mode + primary screen) on every exit path, including
 /// a panic. Same tier and same reasoning as `prompt_visibility_test`: a
@@ -4438,6 +4447,39 @@ pub(crate) struct ConversationPreferenceSwitch<'a> {
     pub verbose: bool,
 }
 
+/// The result of applying a conversation's preference pin.
+///
+/// #1669 PR-A / ADR blocker 4: this used to be a bare `bool` (did the endpoint
+/// move?), so a pin that could NOT be applied — a backend the config no longer
+/// defines, a pin row that would not read — printed a notice and the session
+/// carried on at baseline. That is exactly the silent-wrong-posture case the
+/// ADR forbids: the tab says it is pinned to one backend and the next turn runs
+/// somewhere else.
+pub(crate) struct PinRestore {
+    /// Whether the backend endpoint moved, so the caller re-probes telemetry.
+    pub url_changed: bool,
+    /// `Some` when the pin could not be fully established. The session is at a
+    /// known baseline; the caller marks the tab degraded and refuses turns.
+    pub degraded: Option<PinDegraded>,
+}
+
+/// A pin that could not be established, and enough to retry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinDegraded {
+    /// Operator-facing reasons, verbatim from the apply plan.
+    pub reasons: Vec<String>,
+    /// The pin as stored — retained so a retry has something to retry once the
+    /// operator fixes what was missing (usually a `[[backends]]` entry).
+    pub pin: newt_core::OperatorPreferencePin,
+}
+
+impl PinDegraded {
+    /// One line for the footer/list and for the turn refusal.
+    pub fn summary(&self) -> String {
+        format!("!pin — {}", self.reasons.join("; "))
+    }
+}
+
 /// How this launch's conversation actually resolved — the input to "may the
 /// startup preference pin apply?".
 ///
@@ -4485,7 +4527,7 @@ pub(crate) fn apply_startup_preference_pin(
     if !outcome.applies_pin() {
         return false;
     }
-    restore_preference_pin(sw)
+    restore_preference_pin(sw).url_changed
 }
 
 /// #1668: re-seat the session posture for the conversation being switched to —
@@ -4516,7 +4558,7 @@ pub(crate) fn apply_startup_preference_pin(
 ///
 /// Returns whether the endpoint URL changed, so the caller re-probes DGX
 /// telemetry only when it matters (same contract as [`apply_persona_backend`]).
-pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bool {
+pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> PinRestore {
     let ConversationPreferenceSwitch {
         store,
         conversation_id,
@@ -4541,6 +4583,7 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
     // Fail-open on a bad read: a corrupt pin must never block a resume, and
     // must never leave the session on the previous conversation's posture —
     // the baseline reset below still runs.
+    let mut pin_read_failed = false;
     let pin = match store.map(|s| s.preference_pin(conversation_id)) {
         Some(Ok(Some(pin))) => pin,
         None | Some(Ok(None)) => newt_core::OperatorPreferencePin::default(),
@@ -4553,6 +4596,7 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
                 color,
                 verbose,
             );
+            pin_read_failed = true;
             newt_core::OperatorPreferencePin::default()
         }
     };
@@ -4561,6 +4605,20 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
     let plan = pin.apply_plan(&configured, owned);
     for notice in &plan.notices {
         print_newt(notice, color, verbose);
+    }
+    // ADR blocker 4: a notice means the pin asked for something this process
+    // could not establish. The baseline reset below still runs — so the session
+    // lands somewhere KNOWN — but the caller must be told, because "at baseline
+    // while claiming to be pinned" is a posture the operator did not choose.
+    let mut degraded = (!plan.notices.is_empty() || pin_read_failed).then(|| PinDegraded {
+        reasons: plan.notices.clone(),
+        pin: pin.clone(),
+    });
+    if let Some(d) = degraded.as_mut() {
+        if d.reasons.is_empty() {
+            d.reasons
+                .push("the stored preference pin could not be read".to_string());
+        }
     }
 
     // ---- 1. reset the dials to the invocation baseline ----------------
@@ -4686,7 +4744,10 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
             verbose,
         );
     }
-    url_changed
+    PinRestore {
+        url_changed,
+        degraded,
+    }
 }
 
 /// #1668: fold the operator posture ACTIONS marked since the last drain into
@@ -4707,6 +4768,48 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
 ///
 /// `Err` carries a one-line warning for the caller to print; the session is
 /// never blocked by a posture write.
+/// A tab's display label: the conversation's title, else `#<short-id>`.
+///
+/// #1669 PR-A, factored from the #1671 footer rule (`chat.rs:1997-2007`) so the
+/// bar, the `/tab` list, and the footer cannot disagree. **Labels are never
+/// stored** — computed fresh at every read — so `/rename` honesty is free and a
+/// title can never go stale in a list.
+pub(crate) fn tab_label(store: &newt_core::ConversationStore, conversation_id: &str) -> String {
+    store
+        .title(conversation_id)
+        .ok()
+        .flatten()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| format!("#{}", short_conversation_id(conversation_id)))
+}
+
+/// Retitle `conversation_id`, creating its row if it has none yet.
+///
+/// #1669 PR-A, extracted from the `/rename` arm so it can target a tab that is
+/// NOT the active conversation — the `/tab rename [n] <title>` case.
+///
+/// **The #1030 guard is preserved verbatim and is the reason this matches on
+/// `exists()` rather than using `unwrap_or(false)`:** a transient store error
+/// (SQLITE_BUSY, or NFS IO under concurrent-newt contention) must never read as
+/// "absent" and route into `create_with_id`, whose `INSERT OR REPLACE` would
+/// destroy the live conversation and CASCADE-drop its turns. An error stays an
+/// error.
+pub(crate) fn rename_conversation(
+    store: &newt_core::ConversationStore,
+    conversation_id: &str,
+    title: &str,
+    persona: Option<&str>,
+) -> anyhow::Result<()> {
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("a title cannot be empty");
+    }
+    match store.exists(conversation_id)? {
+        true => store.rename(conversation_id, title),
+        false => store.create_with_id(conversation_id, title, persona),
+    }
+}
+
 pub(crate) fn persist_preference_actions(
     store: Option<&newt_core::ConversationStore>,
     conversation_id: &str,
@@ -4872,7 +4975,7 @@ mod resumed_preference_tests {
             cfg: &newt_core::Config,
             persona: Option<&Persona>,
         ) -> bool {
-            restore_preference_pin(self.switch_args(store, id, baseline, cfg, persona))
+            restore_preference_pin(self.switch_args(store, id, baseline, cfg, persona)).url_changed
         }
 
         fn switch_args<'a>(
@@ -6056,6 +6159,19 @@ enum ConversationCommand {
     Delete(String),
 }
 
+/// The conversation a `/conversation …` command would SELECT, if any.
+///
+/// #1669 PR-A blocker 2: `/conversation restore` is a conversation-selection
+/// path, so it must consult the tab-aware adoption seam before it runs —
+/// otherwise it can point a second tab at a conversation another tab holds.
+/// Parsing is pure and cheap, so the caller asks first and dispatches after.
+pub(crate) fn conversation_command_target(input: &str) -> Option<String> {
+    match parse_conversation_command(input).ok()? {
+        ConversationCommand::Restore(id) => Some(id),
+        _ => None,
+    }
+}
+
 fn parse_conversation_command(input: &str) -> anyhow::Result<ConversationCommand> {
     let body = input.trim().trim_start_matches('/').trim();
     let mut parts = body.split_whitespace();
@@ -6538,12 +6654,40 @@ pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_durable: b
     }
 }
 
+/// The per-CONVERSATION live state a boundary must clear.
+///
+/// #1669 PR-A. Deliberately not the whole session: the semantic index, the
+/// experiential ledger, and the nav warmup are **shared across tabs on
+/// purpose** (ADR, "Global (shared across tabs)"), so they are task-scoped
+/// concerns that `/new` handles and `/tab new` must NOT touch — clearing them
+/// would let opening a tab throw away work another tab is relying on.
+pub(crate) struct ConversationScopedState<'a> {
+    pub scratchpad: &'a dyn newt_core::ScratchpadStore,
+    pub step_ledger: &'a dyn newt_core::StepLedger,
+    pub active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
+}
+
+impl ConversationScopedState<'_> {
+    /// Drop everything that belonged to the outgoing conversation.
+    ///
+    /// Step 26.4 (#583) scratchpad, Step 26.6b (#586) plan ledger, and the
+    /// prompt receipt. One place, so `/new` and `/tab new` cannot drift: a
+    /// fresh tab that inherited any of these would be a new conversation
+    /// wearing the previous one's working memory.
+    pub fn clear(&mut self) {
+        self.scratchpad.clear();
+        self.step_ledger.clear();
+        *self.active_prompt_context = None;
+    }
+}
+
 fn handle_new_conversation(
     workspace: &str,
     active_persona: Option<&Persona>,
     ctx: &mut ConversationResetContext<'_>,
     compress_state: &mut newt_core::CompressState,
     session_opted_fresh: &mut bool,
+    scoped: &mut ConversationScopedState<'_>,
 ) -> String {
     // A new conversation gets a fresh id, which rotates the per-session plan
     // path to a new `.scratch/sessions/<id>/` dir (issue #220).
@@ -6555,6 +6699,7 @@ fn handle_new_conversation(
     // (`should_auto_resume` consults the flag) — resume never undoes /new.
     *session_opted_fresh = true;
     reset_conversation(workspace, active_persona, ctx);
+    scoped.clear();
     new_conversation_message(active_persona)
 }
 
@@ -6989,18 +7134,142 @@ fn handle_conversation_command(
 /// conversation's id is adopted BEFORE the system prompt rebuild so the
 /// prompt names that conversation's plan file (issue #220) — resuming a
 /// conversation resumes its plan.
+/// Everything a restore needs, already read and validated — so applying it
+/// cannot fail.
+///
+/// #1669 PR-A (P0): restore used to be one function whose fallible store reads
+/// happened to precede its first mutation. That is a correct ORDER but not a
+/// transaction: a caller could only preflight what it knew to preflight, and a
+/// tab switch preflighted `exists` + `load` while restore also validated the
+/// prompt receipt and its context. A conversation whose row loaded but whose
+/// receipt did not would therefore fail AFTER the outgoing tab had been
+/// deactivated and the active pointer moved.
+///
+/// Splitting it makes the transaction explicit: PREPARE performs every fallible
+/// read and mutates nothing; COMMIT consumes this and performs no fallible
+/// store read at all, so it cannot fail and there is no error for a caller to
+/// swallow.
+pub(crate) struct PreparedConversationRestore {
+    record: newt_core::ConversationRecord,
+    /// Validated prompt lineage, resolved during prepare.
+    prompt_context: Option<newt_core::TurnPromptContext>,
+    /// Resolved during prepare too — the persona store is a second fallible
+    /// source, and leaving it in commit would keep a read on the apply path.
+    persona: Option<Persona>,
+    /// Set when the record NAMES a persona that could not be loaded. Not an
+    /// error: the restore proceeds with no persona and the caller reports it.
+    persona_warning: Option<String>,
+}
+
+/// Forces a post-`load` prepare failure for one conversation, on one test
+/// thread. Compiled out of the shipped binary.
+///
+/// Exists because the P0 hazard cannot be reached by corrupting a row: it needs
+/// the row to load cleanly and a SUBSEQUENT read — the prompt receipt or its
+/// context — to fail. Deterministic, no sleeps, no filesystem surgery.
+#[cfg(test)]
+pub(crate) mod restore_prepare_seam {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FAILING: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Make preparing `id` fail AFTER its row loads.
+    pub(crate) fn fail_after_load_for(id: &str) {
+        FAILING.with(|f| *f.borrow_mut() = Some(id.to_string()));
+    }
+
+    pub(crate) fn clear() {
+        FAILING.with(|f| *f.borrow_mut() = None);
+    }
+
+    pub(crate) fn forced_failure(id: &str) -> Option<String> {
+        FAILING.with(|f| {
+            f.borrow()
+                .as_deref()
+                .filter(|failing| *failing == id)
+                .map(|_| "prompt receipt context failed to validate (test seam)".to_string())
+        })
+    }
+}
+
+/// PREPARE — every fallible read for restoring `id`, mutating zero live state.
+///
+/// Callers that must not half-apply (a tab switch, an adoption) call this
+/// BEFORE they deactivate anything. A failure here means nothing has moved.
+pub(crate) fn prepare_conversation_restore(
+    store: &newt_core::ConversationStore,
+    persona_store: &PersonaStore,
+    id: &str,
+) -> anyhow::Result<PreparedConversationRestore> {
+    let record = store.load(id)?;
+    // Test seam modelling the exact P0 hazard: the ROW loads, and a LATER
+    // validation fails. Placed after `load` on purpose — a seam before it would
+    // only re-prove what a load-only preflight already caught.
+    #[cfg(test)]
+    if let Some(e) = restore_prepare_seam::forced_failure(id) {
+        anyhow::bail!(e);
+    }
+    // Prompt receipts are a parallel immutable log, not presentation history.
+    // Resolving them HERE is the whole point of the split: a corrupt receipt
+    // must fail the restore while the session is still entirely on the
+    // outgoing conversation.
+    let prompt_context = match store.latest_prompt(&record.id)? {
+        Some(receipt) => store.turn_prompt_context(&record.id, receipt.id())?,
+        None => None,
+    };
+    let (persona, persona_warning) = match record.persona.as_deref() {
+        Some(name) => match persona_store.load(name) {
+            Ok(persona) => (Some(persona), None),
+            Err(e) => (None, Some(format!("persona `{name}` unavailable: {e}"))),
+        },
+        None => (None, None),
+    };
+    Ok(PreparedConversationRestore {
+        record,
+        prompt_context,
+        persona,
+        persona_warning,
+    })
+}
+
+/// COMMIT — install a prepared restore. Infallible by construction.
+///
+/// Performs no store read: everything it needs was resolved by
+/// [`prepare_conversation_restore`]. That is what lets a caller order
+/// prepare → deactivate → switch → commit and know the commit cannot strand it
+/// half-way.
+pub(crate) fn commit_conversation_restore(
+    ctx: &mut ConversationCommandContext<'_>,
+    prepared: PreparedConversationRestore,
+) -> (newt_core::ConversationRecord, Option<String>) {
+    let PreparedConversationRestore {
+        record,
+        prompt_context,
+        persona,
+        persona_warning,
+    } = prepared;
+    commit_prepared(ctx, record, prompt_context, persona, persona_warning)
+}
+
 fn restore_conversation_into_session(
     ctx: &mut ConversationCommandContext<'_>,
     id: &str,
 ) -> anyhow::Result<(newt_core::ConversationRecord, Option<String>)> {
-    let record = ctx.store.load(id)?;
-    // Prompt receipts are a parallel immutable log, not presentation history.
-    // Resolve and verify them before mutating any live session state, so a
-    // corrupt receipt makes restore fail without partially switching memory.
-    let restored_prompt_context = match ctx.store.latest_prompt(&record.id)? {
-        Some(receipt) => ctx.store.turn_prompt_context(&record.id, receipt.id())?,
-        None => None,
-    };
+    // The un-split entry point every non-tab caller still uses: prepare then
+    // commit, so there is exactly ONE restore implementation.
+    let prepared = prepare_conversation_restore(ctx.store, ctx.persona_store, id)?;
+    Ok(commit_conversation_restore(ctx, prepared))
+}
+
+fn commit_prepared(
+    ctx: &mut ConversationCommandContext<'_>,
+    record: newt_core::ConversationRecord,
+    restored_prompt_context: Option<newt_core::TurnPromptContext>,
+    prepared_persona: Option<Persona>,
+    warning: Option<String>,
+) -> (newt_core::ConversationRecord, Option<String>) {
     // Restore is a conversation boundary. Clear the legacy model-entered plan
     // clamp only after the record and prompt receipt validate, so a failed
     // restore cannot partially mutate the live session.
@@ -7026,17 +7295,8 @@ fn restore_conversation_into_session(
     // Rehydrate the verified metadata so prompt handles remain resolvable,
     // while leaving the input queue untouched (no auto-execution).
     *ctx.active_prompt_context = restored_prompt_context;
-    let mut warning = None;
-    match record.persona.as_deref() {
-        Some(name) => match ctx.persona_store.load(name) {
-            Ok(persona) => *ctx.active_persona = Some(persona),
-            Err(e) => {
-                *ctx.active_persona = None;
-                warning = Some(format!("persona `{name}` unavailable: {e}"));
-            }
-        },
-        None => *ctx.active_persona = None,
-    }
+    // Resolved during PREPARE — no fallible read on the apply path.
+    *ctx.active_persona = prepared_persona;
     // #1668 review-2 finding 5: `active_persona` is only half of activating a
     // persona — `handle_persona_command` also re-seats the PERSONA COGNITION
     // LAYER that `effective_cognition` ranks beneath the CLI layer. A restore
@@ -7061,7 +7321,7 @@ fn restore_conversation_into_session(
         ctx.active_persona.as_ref(),
         ctx.active_conversation_id,
     );
-    Ok((record, warning))
+    (record, warning)
 }
 
 /// Resume `id` into the session and return the 17.7 resume banner.

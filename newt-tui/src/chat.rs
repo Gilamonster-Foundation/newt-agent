@@ -1792,6 +1792,63 @@ pub(crate) fn run_chat(
     let mut interrupted_objective: Option<newt_core::TurnPromptContext> = None;
     let mut pending_clarification: Option<PendingClarification> = None;
 
+    // #1669 PR-A: the open tabs. Seeded with this session's first tab, whose
+    // SessionId is the one minted above — so the startup tab IS the session
+    // that already owns lifecycle events, not a second identity layered over
+    // it. Later tabs mint their own; switching between them never mints.
+    //
+    // The per-tab locals (sidecar fields, input stash) stay locals while a tab
+    // is ACTIVE and are stashed into `TabState` on deactivation, per the ADR's
+    // staged switch. That keeps the hot path untouched: an active tab reads
+    // plain locals exactly as before tabs existed.
+    let mut tabs = crate::tabs::TabSet::new(lifecycle_session.clone(), &active_conversation_id);
+    // Unsubmitted prompt text for the ACTIVE tab. PR-C threads this to the
+    // rich input's type-ahead seam; in PR-A it is the stash slot the staged
+    // switch reads and writes, so the switch contract is complete and
+    // testable before any key binding exists to fill it.
+    let mut tab_input_stash = String::new();
+    // One definition of the tab-switch context, so the `/tab` family, the
+    // adoption seam, and any later front door cannot drift into subtly
+    // different views of the same session. A macro rather than a helper
+    // because every field is a distinct `&mut` borrow of a `run_chat` local;
+    // a function would have to take them all as arguments anyway.
+    macro_rules! tab_ctx {
+        ($store:expr) => {
+            crate::tab_switch::TabSwitchCtx {
+                store: $store,
+                persona_store: &persona_store,
+                workspace,
+                memory: &mut memory,
+                system: &mut system,
+                active_persona: &mut active_persona,
+                active_conversation_id: &mut active_conversation_id,
+                compress_state: &mut compress_state,
+                scratchpad: &scratchpad_store,
+                step_ledger: &step_ledger,
+                active_prompt_context: &mut active_prompt_context,
+                mode_states: &conversation_mode_states,
+                baseline: &preference_baseline,
+                pending: &mut pending_preference_actions,
+                base_provider: &mut base_provider,
+                base_model: &mut base_model,
+                cfg: &cfg,
+                choice: &mut choice,
+                inf_url: &mut inf_url,
+                inf_model: &mut inf_model,
+                inf_kind: &mut inf_kind,
+                inf_key: &mut inf_key,
+                inf_context_window: &mut inf_context_window,
+                turns_this_conversation: &mut turns_this_conversation,
+                last_resume_listing: &mut last_resume_listing,
+                active_roadmap_id: &mut active_roadmap_id,
+                interrupted_objective: &mut interrupted_objective,
+                input_stash: &mut tab_input_stash,
+                color,
+                verbose,
+            }
+        };
+    }
+
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
     //
@@ -1905,6 +1962,11 @@ pub(crate) fn run_chat(
                     &mut reset_ctx,
                     &mut compress_state,
                     &mut session_opted_fresh,
+                    &mut ConversationScopedState {
+                        scratchpad: &scratchpad_store,
+                        step_ledger: &step_ledger,
+                        active_prompt_context: &mut active_prompt_context,
+                    },
                 );
                 active_prompt_context = None;
                 pending_clarification = None;
@@ -2028,6 +2090,30 @@ pub(crate) fn run_chat(
             &mut base_model,
         ) {
             print_newt(&format!("warning: {warning}"), color, verbose);
+        }
+        // #1669 PR-A: the ACTIVE tab always names the conversation the session
+        // actually holds. Conversation identity changes down many paths —
+        // `/resume`, `/new`, persona rotation, roadmap navigation — and each is
+        // a conversation switch, not a tab switch: the tab keeps its SessionId
+        // and simply comes to hold a different conversation.
+        //
+        // Reconciled once here rather than at each of those sites, because that
+        // enumeration is exactly what #1691 records going stale. A tab switch
+        // sets both consistently, so this is a no-op on that path.
+        if tabs.active().conversation_id() != active_conversation_id {
+            // The uniqueness invariant, asserted where it could break: every
+            // path that SELECTS a conversation routes through
+            // `adopt_conversation` first, so by the time we get here no other
+            // tab can already hold this id. If one does, a new selection path
+            // was added without going through the seam — which is the bug this
+            // catches, rather than silently pointing two tabs at one row.
+            debug_assert!(
+                tabs.find_by_conversation(&active_conversation_id)
+                    .is_none_or(|i| i == tabs.active_index()),
+                "two tabs would hold the same conversation: a conversation-selection \
+                 path bypassed tab_switch::adopt_conversation"
+            );
+            tabs.active_mut().hold_conversation(&active_conversation_id);
         }
         // The input surface can panic (assertion `fd != -1`) when the terminal
         // file descriptor becomes invalid — most commonly from file-descriptor
@@ -2676,6 +2762,54 @@ pub(crate) fn run_chat(
                             color,
                             verbose,
                         );
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // #1669 PR-A: the `/tab` family. Text-only in this slice —
+                    // no bar, no vi keys, no mouse — so this IS the whole tab
+                    // surface, and `/tab` with no argument is the piped-visible
+                    // view of tab state.
+                    if slash_command == "tab" || slash_command.starts_with("tab ") {
+                        let arg = slash_command.strip_prefix("tab").unwrap_or("").trim();
+                        // Lean and ephemeral refuse honestly rather than going
+                        // silent or reading as an unknown command: the namespace
+                        // stays discoverable and the doctrine line explicit.
+                        // Tabs are RichTUI presentation over conversation
+                        // switching; lean expresses the same capability as
+                        // scrolled lines via /resume, /new and /rename.
+                        let refusal = crate::tab_switch::tab_surface_refusal(
+                            surface_is_rich,
+                            ephemeral_session,
+                            conversation_store.is_some(),
+                        );
+                        match (refusal, conversation_store.as_ref()) {
+                            (Some(why), _) => print_newt(why, color, verbose),
+                            (None, None) => unreachable!(
+                                "tab_surface_refusal returns Some when there is no store"
+                            ),
+                            (None, Some(store)) => match crate::tabs::parse_tab_command(arg) {
+                                Err(usage) => print_newt(&usage, color, verbose),
+                                Ok(action) => {
+                                    let mut tab_ctx = tab_ctx!(store);
+                                    let outcome = crate::tab_switch::handle_tab_action(
+                                        action,
+                                        &mut tab_ctx,
+                                        &mut tabs,
+                                    );
+                                    let url_changed = outcome.url_changed;
+                                    // Same re-probe discipline as every other
+                                    // backend switch: a tab whose pin repoints
+                                    // the endpoint must repoint DGX telemetry
+                                    // too, or verbose `hw:` lines report the
+                                    // box the other tab was talking to.
+                                    if url_changed && verbose {
+                                        dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                            .map(|d| d.into_sampler(2));
+                                    }
+                                }
+                            },
+                        }
                         surface.save_history();
                         println!();
                         continue;
@@ -3630,6 +3764,11 @@ pub(crate) fn run_chat(
                             &mut reset_ctx,
                             &mut compress_state,
                             &mut session_opted_fresh,
+                            &mut ConversationScopedState {
+                                scratchpad: &scratchpad_store,
+                                step_ledger: &step_ledger,
+                                active_prompt_context: &mut active_prompt_context,
+                            },
                         );
                         active_prompt_context = None;
                         pending_clarification = None;
@@ -3678,7 +3817,7 @@ pub(crate) fn run_chat(
                         // one's pinned backend or dials (review finding 2). A
                         // brand-new conversation has no pin, so this is the
                         // reset half only.
-                        let url_changed = restore_preference_pin(ConversationPreferenceSwitch {
+                        let pin_restore = restore_preference_pin(ConversationPreferenceSwitch {
                             store: conversation_store.as_ref(),
                             conversation_id: &active_conversation_id,
                             baseline: &preference_baseline,
@@ -3696,7 +3835,11 @@ pub(crate) fn run_chat(
                             color,
                             verbose,
                         });
-                        if url_changed {
+                        // ADR blocker 4: a conversation switch that could not
+                        // establish the incoming pin leaves this tab degraded,
+                        // and the loop refuses turns until it is resolved.
+                        tabs.active_mut().pin_degraded = pin_restore.degraded;
+                        if pin_restore.url_changed {
                             dgx_rx = if verbose {
                                 dgx_probe::DgxTelemetry::try_connect(&inf_url)
                                     .map(|d| d.into_sampler(2))
@@ -3822,6 +3965,70 @@ pub(crate) fn run_chat(
                     let slash_body = task.trim_start_matches('/');
                     if slash_body == "conversation" || slash_body.starts_with("conversation ") {
                         let conversation_id_before = active_conversation_id.clone();
+                        // #1669 PR-A blocker 2: `/conversation restore` selects a
+                        // conversation, so it goes through the SAME adoption seam
+                        // `/resume` uses. Without this it could point a second tab
+                        // at a conversation another tab already holds.
+                        let restore_target = conversation_command_target(&task);
+                        let adopted_elsewhere = match (&restore_target, conversation_store.as_ref())
+                        {
+                            (Some(target), Some(store)) => {
+                                let adopted = {
+                                    let mut tab_ctx = tab_ctx!(store);
+                                    crate::tab_switch::adopt_conversation(
+                                        &mut tab_ctx,
+                                        &mut tabs,
+                                        target,
+                                    )
+                                };
+                                match adopted {
+                                    Err(e) => {
+                                        print_newt(
+                                            &crate::tab_switch::refusal_text(&e),
+                                            color,
+                                            verbose,
+                                        );
+                                        true
+                                    }
+                                    Ok(crate::tab_switch::Adopted::ActivatedExistingTab {
+                                        index,
+                                        outcome,
+                                    }) => {
+                                        print_newt(
+                                            &format!(
+                                                "tab {} — already open there, switched to it",
+                                                index + 1
+                                            ),
+                                            color,
+                                            verbose,
+                                        );
+                                        if let Some(d) = &outcome.degraded {
+                                            print_newt(
+                                                &format!(
+                                                    "{} — turns are refused on this tab until \
+                                                     the pin is in force (`/tab retry`)",
+                                                    d.summary()
+                                                ),
+                                                color,
+                                                verbose,
+                                            );
+                                        }
+                                        if outcome.url_changed && verbose {
+                                            dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                                .map(|d| d.into_sampler(2));
+                                        }
+                                        true
+                                    }
+                                    Ok(_) => false,
+                                }
+                            }
+                            _ => false,
+                        };
+                        if adopted_elsewhere {
+                            surface.save_history();
+                            println!();
+                            continue;
+                        }
                         match conversation_store.as_ref() {
                             Some(store) => {
                                 let mut conversation_ctx = ConversationCommandContext {
@@ -3874,6 +4081,8 @@ pub(crate) fn run_chat(
                                     color,
                                     verbose,
                                 });
+                            tabs.active_mut().pin_degraded = url_changed.degraded.clone();
+                            let url_changed = url_changed.url_changed;
                             if url_changed {
                                 dgx_rx = if verbose {
                                     dgx_probe::DgxTelemetry::try_connect(&inf_url)
@@ -3978,7 +4187,73 @@ pub(crate) fn run_chat(
                                     },
                                 };
                                 if let Some(id) = target {
-                                    if id == active_conversation_id {
+                                    // #1669 PR-A blocker 2: ask the ONE
+                                    // tab-aware adoption seam first. It decides
+                                    // whether this conversation is already open
+                                    // in another tab — in which case that tab
+                                    // is ACTIVATED rather than a second tab
+                                    // being pointed at the same row.
+                                    //
+                                    // The two verbs stay distinct: activation
+                                    // is baseline reset ⊕ the target's pin and
+                                    // is history-independent; resume (below) is
+                                    // a sparse overlay over live state.
+                                    let adopted = {
+                                        let mut tab_ctx = tab_ctx!(store);
+                                        crate::tab_switch::adopt_conversation(
+                                            &mut tab_ctx,
+                                            &mut tabs,
+                                            &id,
+                                        )
+                                    };
+                                    let handled = match adopted {
+                                        Err(e) => {
+                                            print_newt(
+                                                &crate::tab_switch::refusal_text(&e),
+                                                color,
+                                                verbose,
+                                            );
+                                            true
+                                        }
+                                        Ok(crate::tab_switch::Adopted::ActivatedExistingTab {
+                                            index,
+                                            outcome,
+                                        }) => {
+                                            print_newt(
+                                                &format!(
+                                                    "tab {} — already open there, switched to it",
+                                                    index + 1
+                                                ),
+                                                color,
+                                                verbose,
+                                            );
+                                            // P1: `!pin` must be visible here
+                                            // too — never discovered later by a
+                                            // surprise turn refusal.
+                                            if let Some(d) = &outcome.degraded {
+                                                print_newt(
+                                                    &format!(
+                                                        "{} — turns are refused on this tab \
+                                                         until the pin is in force (`/tab retry`)",
+                                                        d.summary()
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                );
+                                            }
+                                            if outcome.url_changed && verbose {
+                                                dgx_rx =
+                                                    dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                                        .map(|d| d.into_sampler(2));
+                                            }
+                                            true
+                                        }
+                                        Ok(crate::tab_switch::Adopted::AlreadyHere) => false,
+                                        Ok(crate::tab_switch::Adopted::ProceedInActiveTab) => false,
+                                    };
+                                    if handled {
+                                        // The seam did the work.
+                                    } else if id == active_conversation_id {
                                         // #1030: resuming the CURRENT conversation is a
                                         // no-op — short-circuit so we never release +
                                         // (fail to) re-acquire our own claim, nor reset
@@ -4034,7 +4309,7 @@ pub(crate) fn run_chat(
                                                         // reset to the invocation
                                                         // baseline, then apply THIS
                                                         // conversation's pin.
-                                                        let url_changed = restore_preference_pin(
+                                                        let pin_restore = restore_preference_pin(
                                                             ConversationPreferenceSwitch {
                                                                 store: Some(store),
                                                                 conversation_id:
@@ -4057,7 +4332,9 @@ pub(crate) fn run_chat(
                                                                 verbose,
                                                             },
                                                         );
-                                                        if url_changed {
+                                                        tabs.active_mut().pin_degraded =
+                                                            pin_restore.degraded;
+                                                        if pin_restore.url_changed {
                                                             dgx_rx = if verbose {
                                                                 dgx_probe::DgxTelemetry::try_connect(
                                                                     &inf_url,
@@ -4157,7 +4434,48 @@ pub(crate) fn run_chat(
                                         // node switches to that node's conversation (same
                                         // claim-guarded restore as /resume).
                                         if let Some(target) = outcome.switch_to {
-                                            if target != active_conversation_id {
+                                            // #1669 PR-A blocker 2: roadmap
+                                            // navigation selects a conversation
+                                            // too, so it asks the same seam.
+                                            let adopted = {
+                                                let mut tab_ctx = tab_ctx!(store);
+                                                crate::tab_switch::adopt_conversation(
+                                                    &mut tab_ctx,
+                                                    &mut tabs,
+                                                    &target,
+                                                )
+                                            };
+                                            let elsewhere = match adopted {
+                                                Err(e) => {
+                                                    print_newt(
+                                                        &crate::tab_switch::refusal_text(&e),
+                                                        color,
+                                                        verbose,
+                                                    );
+                                                    true
+                                                }
+                                                Ok(
+                                                    crate::tab_switch::Adopted::ActivatedExistingTab {
+                                                        index,
+                                                        ..
+                                                    },
+                                                ) => {
+                                                    print_newt(
+                                                        &format!(
+                                                            "tab {} — that node's conversation is \
+                                                             already open there, switched to it",
+                                                            index + 1
+                                                        ),
+                                                        color,
+                                                        verbose,
+                                                    );
+                                                    true
+                                                }
+                                                Ok(_) => false,
+                                            };
+                                            if elsewhere {
+                                                // handled by the seam
+                                            } else if target != active_conversation_id {
                                                 match store.claim(&target) {
                                                     Ok(newt_core::ClaimOutcome::HeldBy {
                                                         host,
@@ -4225,6 +4543,10 @@ pub(crate) fn run_chat(
                                                                             verbose,
                                                                         },
                                                                     );
+                                                                tabs.active_mut().pin_degraded =
+                                                                    url_changed.degraded.clone();
+                                                                let url_changed =
+                                                                    url_changed.url_changed;
                                                                 if url_changed {
                                                                     dgx_rx = if verbose {
                                                                         dgx_probe::DgxTelemetry::try_connect(&inf_url)
@@ -4359,6 +4681,8 @@ pub(crate) fn run_chat(
                                     color,
                                     verbose,
                                 });
+                            tabs.active_mut().pin_degraded = url_changed.degraded.clone();
+                            let url_changed = url_changed.url_changed;
                             if url_changed && verbose {
                                 dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
                                     .map(|d| d.into_sampler(2));
@@ -5064,6 +5388,27 @@ pub(crate) fn run_chat(
                 {
                     clean_exit = true;
                     break;
+                } else if let Some(refusal) =
+                    crate::tab_switch::degraded_turn_refusal(tabs.active().pin_degraded.as_ref())
+                {
+                    // #1669 PR-A (item 5) — CONTRACT: while a tab's pinned
+                    // posture is not in force, the operator prompt is NOT
+                    // ACCEPTED. Nothing durable is written for it.
+                    //
+                    // Chosen over "accept durably, refuse inference" because the
+                    // prompt receipt chain is the conversation's authority
+                    // lineage: admitting a prompt that never ran would leave a
+                    // receipt whose ancestry, current-objective and clarification
+                    // state describe a turn that does not exist, and `/resume`
+                    // would later rehydrate it as real.
+                    //
+                    // Placed AFTER every slash and `!host` command has been
+                    // dispatched above, BEFORE `begin_model_prompt`, so the
+                    // recovery commands stay reachable: `/tab retry`,
+                    // `/backends`, `/psyche` and `/tab` all still work.
+                    print_newt(&refusal, color, verbose);
+                    println!();
+                    continue;
                 } else {
                     // Past every interception (`!shell`, `/command`, help,
                     // `exit`): this line IS a model turn. Announce Working now
@@ -6798,8 +7143,15 @@ pub(crate) fn run_chat(
     // #1030: release this process's live-owner claim on the way out so the next
     // launch, another newt, or a later /resume can take the conversation. A
     // crash that skips this leaves a stale claim the next claim reclaims.
+    //
+    // #1669 PR-A: with tabs, this process holds N claims, not one — every open
+    // tab's conversation. Releasing only the active one would leave every other
+    // tab's conversation claimed until a stale-reclaim, so `/resume` on it from
+    // a fresh newt would refuse and start a replacement instead. Release
+    // exactly what the tabs hold.
     if let Some(store) = conversation_store.as_ref() {
-        let _ = store.release(&active_conversation_id);
+        let mut tab_ctx = tab_ctx!(store);
+        crate::tab_switch::exit_release_all(&mut tab_ctx, &mut tabs);
     }
 
     surface.save_history();
