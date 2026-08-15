@@ -1969,6 +1969,18 @@ pub(crate) fn run_chat(
         // enumeration is exactly what #1691 records going stale. A tab switch
         // sets both consistently, so this is a no-op on that path.
         if tabs.active().conversation_id() != active_conversation_id {
+            // The uniqueness invariant, asserted where it could break: every
+            // path that SELECTS a conversation routes through
+            // `adopt_conversation` first, so by the time we get here no other
+            // tab can already hold this id. If one does, a new selection path
+            // was added without going through the seam — which is the bug this
+            // catches, rather than silently pointing two tabs at one row.
+            debug_assert!(
+                tabs.find_by_conversation(&active_conversation_id)
+                    .is_none_or(|i| i == tabs.active_index()),
+                "two tabs would hold the same conversation: a conversation-selection \
+                 path bypassed tab_switch::adopt_conversation"
+            );
             tabs.active_mut().hold_conversation(&active_conversation_id);
         }
         // The input surface can panic (assertion `fd != -1`) when the terminal
