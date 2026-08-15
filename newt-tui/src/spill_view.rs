@@ -347,6 +347,23 @@ impl SpillView {
         self.refresh_visible_rows();
     }
 
+    /// #1704 (Ctrl-t): expand the viewport to half the visible console height —
+    /// a middle stop between the collapsed rows and a full Space-expand (which
+    /// shows every retained line up to `max_visible_rows`). The half-height
+    /// target is `max_visible_rows / 2` (`max_visible_rows` is already the
+    /// terminal height minus the boundary/cursor rows), clamped so it never
+    /// shrinks below the collapsed view. Idempotent: pressing Ctrl-t again
+    /// keeps the half-expanded view rather than toggling back to collapsed.
+    #[cfg(any(unix, test))]
+    pub(crate) fn expand_half(&mut self) {
+        self.expanded = true;
+        let half = (self.max_visible_rows / 2).max(self.collapsed_rows).max(1);
+        self.visible_rows = half.min(self.retained_line_count().max(1));
+        if !self.follow_tail {
+            self.view_start = self.effective_start();
+        }
+    }
+
     pub(crate) fn visible_rows(&self) -> usize {
         self.visible_rows
     }
@@ -443,7 +460,7 @@ impl SpillView {
         self.finished
     }
 
-    #[cfg(test)]
+    #[cfg(any(unix, test))]
     pub(crate) fn is_following_tail(&self) -> bool {
         self.follow_tail
     }
@@ -986,6 +1003,55 @@ mod tests {
         view.toggle_expanded();
         assert_eq!(view.frame().content.len(), 3);
         assert_eq!(view.frame().bottom.line, "⧉ Space expands · ↑↓ scroll");
+    }
+
+    #[test]
+    fn expand_half_targets_half_the_console_and_is_idempotent() {
+        // 80-wide, 3 collapsed rows, 10 max rows (terminal-height-derived cap).
+        let mut view = SpillView::with_limits(80, 3, 10, 80);
+        view.resize(80, 3, 10);
+        feed_lines(
+            &mut view,
+            &["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10"],
+        );
+        assert_eq!(view.frame().content.len(), 3, "starts collapsed");
+
+        // Ctrl-t → half the max (10 / 2 = 5), not the full retained set.
+        view.expand_half();
+        assert_eq!(
+            view.frame().content.len(),
+            5,
+            "Ctrl-t expands to half the console, not full"
+        );
+
+        // Idempotent: a second Ctrl-t stays at half (Space toggles fully).
+        view.expand_half();
+        assert_eq!(view.frame().content.len(), 5, "Ctrl-t is idempotent");
+
+        // Space toggles: from the half-expanded (expanded=true) state it
+        // collapses, and from collapsed it fully expands to all retained lines.
+        view.toggle_expanded();
+        assert_eq!(
+            view.frame().content.len(),
+            3,
+            "Space from half-expanded collapses (toggle)"
+        );
+        view.toggle_expanded();
+        assert_eq!(view.frame().content.len(), 10, "Space shows all retained");
+    }
+
+    #[test]
+    fn expand_half_never_shrinks_below_the_collapsed_view() {
+        // Tiny console: max_rows == collapsed means half == collapsed.
+        let mut view = SpillView::with_limits(80, 4, 4, 80);
+        view.resize(80, 4, 4);
+        feed_lines(&mut view, &["a", "b", "c", "d", "e", "f"]);
+        view.expand_half();
+        assert_eq!(
+            view.frame().content.len(),
+            4,
+            "half clamp never drops below the collapsed rows"
+        );
     }
 
     /// #1263: the LIVE boundary rows advertise their keys at the point of use

@@ -235,6 +235,28 @@ impl LiveSpillRenderer {
         self.scroll(SpillView::toggle_expanded)
     }
 
+    /// #1704 (Ctrl-t): expand to half the console height.
+    #[cfg(any(unix, test))]
+    pub(crate) fn expand_half(&self) -> bool {
+        self.scroll(SpillView::expand_half)
+    }
+
+    /// #1704: is the user scrolled back off the tail (explore mode)?
+    #[cfg(any(unix, test))]
+    pub(crate) fn is_exploring(&self) -> bool {
+        let state = self.lock_state();
+        state
+            .view
+            .as_ref()
+            .is_some_and(|view| !view.is_following_tail())
+    }
+
+    /// #1704 (Esc while exploring): leave explore mode — snap back to the tail.
+    #[cfg(any(unix, test))]
+    pub(crate) fn exit_explore(&self) -> bool {
+        self.scroll(SpillView::scroll_to_bottom)
+    }
+
     // #1303 step 5: editor-mode nav (vi `gg`/`G`/`C-d`/`C-u`, emacs paging),
     // each riding the same single-owner `scroll` write discipline. Reached ONLY
     // through the `#[cfg(unix)]` keyboard-watcher `SpillInput` impl (no test
