@@ -319,25 +319,43 @@ pub(crate) fn emit_compression_notice(
 
 /// Print a visible retry indicator to the TUI so the user knows why there's
 /// a pause rather than seeing a silent hang.
-pub(crate) fn print_retry_indicator(attempt: u32, delay: std::time::Duration, color: bool) {
+pub(crate) fn retry_indicator_text(
+    attempt: u32,
+    max_retries: u32,
+    delay: std::time::Duration,
+    class: Option<super::observability::ErrorClass>,
+) -> String {
+    use super::observability::ErrorClass;
+
+    let reason = match class {
+        Some(ErrorClass::Timeout) => "request timed out",
+        Some(ErrorClass::Transport) => "connection lost",
+        Some(ErrorClass::Model) => "backend returned a retryable error",
+        Some(ErrorClass::Harness) => "request failed in the harness",
+        None => "connection lost",
+    };
     let delay_s = delay.as_secs_f32();
-    let msg = format!("  ↻ connection lost — retrying in {delay_s:.1}s (attempt {attempt})…\n");
-    if color {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(CtColor::Rgb {
-                r: 200,
-                g: 140,
-                b: 0
-            }),
-            Print(&msg),
-            ResetColor,
-        )
-        .ok();
-    } else {
-        print!("{msg}");
-    }
-    io::stdout().flush().ok();
+    format!("  ↻ {reason} — retrying in {delay_s:.1}s (retry {attempt}/{max_retries})…")
+}
+
+pub(crate) fn print_retry_indicator(
+    attempt: u32,
+    max_retries: u32,
+    delay: std::time::Duration,
+    error: &anyhow::Error,
+    color: bool,
+) {
+    let msg = retry_indicator_text(
+        attempt,
+        max_retries,
+        delay,
+        super::observability::error_class(error),
+    );
+    crate::tty::Notice::new(crate::tty::Level::Warn, "", msg).emit(
+        crate::tty::LineCaps::Own,
+        crate::tty::Sink::Stdout,
+        color,
+    );
 }
 
 fn tool_call_lines(name: &str, detail: &str, cols: usize) -> Vec<String> {
@@ -808,10 +826,42 @@ pub(crate) fn print_tool_output(output: &str, _tool_output_lines: usize, color: 
 
 #[cfg(test)]
 mod tests {
+    use super::super::observability::ErrorClass;
     use super::{
-        fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_summary_line,
-        spill_view_lines, tool_call_lines, wrap_to_width, SPILL_RECOVERY_HINT,
+        fmt_tokens, print_harness_notice, print_list_item, print_newt, retry_indicator_text,
+        spill_summary_line, spill_view_lines, tool_call_lines, wrap_to_width, SPILL_RECOVERY_HINT,
     };
+
+    #[test]
+    fn retry_indicator_names_timeout_and_retry_budget() {
+        assert_eq!(
+            retry_indicator_text(
+                1,
+                1,
+                std::time::Duration::from_secs(2),
+                Some(ErrorClass::Timeout),
+            ),
+            "  ↻ request timed out — retrying in 2.0s (retry 1/1)…"
+        );
+    }
+
+    #[test]
+    fn retry_indicator_distinguishes_transport_from_model_errors() {
+        assert!(retry_indicator_text(
+            2,
+            4,
+            std::time::Duration::from_millis(750),
+            Some(ErrorClass::Transport),
+        )
+        .contains("connection lost"));
+        assert!(retry_indicator_text(
+            2,
+            4,
+            std::time::Duration::from_millis(750),
+            Some(ErrorClass::Model),
+        )
+        .contains("backend returned a retryable error"));
+    }
 
     /// #1433: the excerpt is capped by LOGICAL lines, so its "N rows" promise
     /// only holds when the output happens to be narrow. One long line — a

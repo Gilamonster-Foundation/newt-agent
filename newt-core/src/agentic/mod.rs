@@ -305,7 +305,7 @@ pub use trim::trim_for_summary;
 pub use untrusted::{wrap_internal_summary, wrap_untrusted};
 pub use warmup::warmup_if_cold;
 
-use crate::retry::{with_backoff_notify, RetryPolicy};
+use crate::retry::{with_backoff_notify, with_backoff_notify_error, RetryPolicy};
 use compress::{
     compress, compression_trigger, CompressAction, CompressRequest, CompressTrigger,
     CompressionTriggerLimits,
@@ -329,12 +329,51 @@ use trim::{
     ollama_usage, openai_usage, protected_prompt_head_len, PromptTracker,
 };
 
-/// Retry policy for TUI inference calls: more patient than the hosted-API
-/// default because local DGX nodes can drop for 30–60 s under load.
-/// Total resilience window: ~90 s (2+4+8+16+30+30 s between attempts).
-/// All thresholds are overridable via the standard `NEWT_HTTP_*` env vars.
-fn tui_retry_policy() -> RetryPolicy {
-    RetryPolicy::for_local_inference()
+/// Retry policy selected from endpoint locality.
+///
+/// Local inference keeps the patient seven-attempt policy needed while a DGX
+/// loads or sheds pressure. Hosted requests get one retry: each failed attempt
+/// may already have consumed the full inference deadline and may be billable.
+/// All thresholds remain overridable through the standard `NEWT_HTTP_*` vars.
+fn inference_endpoint_is_local(endpoint: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    if crate::notes_scan::is_local_host(&host) {
+        return true;
+    }
+
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if !host.contains('.') && !host.contains(':') {
+        // Single-label DNS names are conventional LAN/service-discovery names
+        // (`dgx1`, `gnuc`, `ollama`) even without a private suffix.
+        return true;
+    }
+    host.parse::<std::net::Ipv6Addr>().is_ok_and(|addr| {
+        let first = addr.segments()[0];
+        (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+    })
+}
+
+fn tui_retry_policy(endpoint: &str) -> RetryPolicy {
+    if inference_endpoint_is_local(endpoint) {
+        RetryPolicy::for_local_inference()
+    } else {
+        RetryPolicy::for_hosted_inference()
+    }
+}
+
+/// Pure status text for the canonical inference spinner.
+fn inference_progress_label(
+    model: &str,
+    attempt: u32,
+    attempts: u32,
+    deadline_secs: u64,
+) -> String {
+    format!("waiting for {model} · attempt {attempt}/{attempts} · {deadline_secs}s deadline…")
 }
 
 /// `Authorization: Bearer <key>` as client default headers for the Ollama
@@ -1922,7 +1961,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
-    let retry = tui_retry_policy();
+    let retry = tui_retry_policy(url);
     // The save_note tool is advertised only when a sink exists (Step 19.3);
     // recall only when a source exists (Step 17.5); memory_fetch only when a
     // memory source exists (#319) — same presence gating.
@@ -2481,7 +2520,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 color,
                 cancellable(
                     cancel,
-                    with_backoff_notify(
+                    with_backoff_notify_error(
                         &retry,
                         || async {
                             // W0 (#1511): classify while the error is TYPED — the
@@ -2510,7 +2549,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 .await
                                 .map_err(anyhow::Error::from)
                         },
-                        |attempt, delay| print_retry_indicator(attempt, delay, color),
+                        |attempt, delay, error| {
+                            print_retry_indicator(attempt, retry.max_retries, delay, error, color);
+                        },
                     ),
                 ),
             )
@@ -3070,7 +3111,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // against the interrupt flag like the probe above.
             let sresp = match cancellable(
                 cancel,
-                with_backoff_notify(
+                with_backoff_notify_error(
                     &retry,
                     || async {
                         stream_client
@@ -3086,7 +3127,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 ))
                             })
                     },
-                    |attempt, delay| print_retry_indicator(attempt, delay, color),
+                    |attempt, delay, error| {
+                        print_retry_indicator(attempt, retry.max_retries, delay, error, color);
+                    },
                 ),
             )
             .await
@@ -5299,7 +5342,7 @@ async fn final_summary_ollama(
     if let Some(num_ctx) = ollama_num_ctx {
         body["options"] = serde_json::json!({ "num_ctx": num_ctx });
     }
-    let retry = tui_retry_policy();
+    let retry = tui_retry_policy(chat_url);
     let result = with_backoff_notify(
         &retry,
         || async {
@@ -5507,7 +5550,7 @@ async fn final_summary_openai(
         "stream": false,
     });
     generation_policy.apply_to_chat_completions_body(&mut body);
-    let retry = tui_retry_policy();
+    let retry = tui_retry_policy(chat_url);
     let result = with_backoff_notify(
         &retry,
         || async {
@@ -5728,7 +5771,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let chat_url = format!("{}/v1/chat/completions", url.trim_end_matches('/'));
-    let retry = tui_retry_policy();
+    let retry = tui_retry_policy(url);
     // The save_note tool is advertised only when a sink exists (Step 19.3);
     // recall only when a source exists (Step 17.5); memory_fetch only when a
     // memory source exists (#319) — mirrors the Ollama path.
@@ -6189,37 +6232,68 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // but the operator-declared local window still bounds Newt's pre-send
             // budget. These endpoints reject oversize requests rather than silently
             // truncating them, so no wire field is needed to enforce the local cap.
-            let dispatch = with_backoff_notify(
+            let max_attempts = retry.max_retries.saturating_add(1);
+            let attempts_started = std::cell::Cell::new(0u32);
+            let spinner_label =
+                inference_progress_label(model, 1, max_attempts, inference_timeout_secs);
+            let spinner = if thinking_stream_enabled() {
+                crate::tty::Spinner::start(&spinner_label, crate::tty::Sink::Stdout, color)
+            } else {
+                None
+            };
+            let dispatch = with_backoff_notify_error(
                 &retry,
-                || async {
-                    let mut req = client.post(&chat_url).json(&body);
-                    if let Some(key) = api_key {
-                        req = req.bearer_auth(key);
+                || {
+                    let attempt = attempts_started.get().saturating_add(1);
+                    attempts_started.set(attempt);
+                    if let Some(spinner) = spinner.as_ref() {
+                        spinner.set_label(&inference_progress_label(
+                            model,
+                            attempt,
+                            max_attempts,
+                            inference_timeout_secs,
+                        ));
                     }
-                    // W0 (#1511): classify while the error is TYPED — the
-                    // DispatchError keeps the historical message text and carries
-                    // the structural class to the driver boundary.
-                    let resp = req.send().await.map_err(|e| {
-                        anyhow::Error::new(observability::DispatchError::from_reqwest(
-                            "request failed",
-                            e,
-                        ))
-                    })?;
-                    if !resp.status().is_success() {
-                        let status = resp.status();
-                        let text = resp.text().await.unwrap_or_default();
-                        return Err(observability::DispatchError::http_status(format!(
-                            "inference endpoint {status}: {text}"
-                        ))
-                        .into());
+                    async {
+                        let mut req = client.post(&chat_url).json(&body);
+                        if let Some(key) = api_key {
+                            req = req.bearer_auth(key);
+                        }
+                        // W0 (#1511): classify while the error is TYPED — the
+                        // DispatchError keeps the historical message text and carries
+                        // the structural class to the driver boundary.
+                        let resp = req.send().await.map_err(|e| {
+                            anyhow::Error::new(observability::DispatchError::from_reqwest(
+                                "request failed",
+                                e,
+                            ))
+                        })?;
+                        if !resp.status().is_success() {
+                            let status = resp.status();
+                            let text = resp.text().await.unwrap_or_default();
+                            return Err(observability::DispatchError::http_status(format!(
+                                "inference endpoint {status}: {text}"
+                            ))
+                            .into());
+                        }
+                        resp.json::<serde_json::Value>()
+                            .await
+                            .map_err(anyhow::Error::from)
                     }
-                    resp.json::<serde_json::Value>()
-                        .await
-                        .map_err(anyhow::Error::from)
                 },
-                |attempt, delay| print_retry_indicator(attempt, delay, color),
+                |attempt, delay, error| {
+                    if let Some(spinner) = spinner.as_ref() {
+                        spinner.set_label(&format!(
+                            "retry {attempt}/{} in {:.1}s…",
+                            retry.max_retries,
+                            delay.as_secs_f32(),
+                        ));
+                    }
+                    print_retry_indicator(attempt, retry.max_retries, delay, error, color);
+                },
             )
             .await;
+            drop(spinner);
             match dispatch {
                 Ok(j) => break (j, round_est_raw),
                 Err(e) => {
@@ -7248,7 +7322,7 @@ async fn anthropic_dispatch_round(
     if !stream {
         let result = cancellable(
             cancel,
-            with_backoff_notify(
+            with_backoff_notify_error(
                 d.retry,
                 || async {
                     let req =
@@ -7273,7 +7347,9 @@ async fn anthropic_dispatch_round(
                         .await
                         .map_err(anyhow::Error::from)
                 },
-                |attempt, delay| print_retry_indicator(attempt, delay, d.color),
+                |attempt, delay, error| {
+                    print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
+                },
             ),
         )
         .await;
@@ -7291,7 +7367,7 @@ async fn anthropic_dispatch_round(
     loop {
         let resp = match cancellable(
             cancel,
-            with_backoff_notify(
+            with_backoff_notify_error(
                 d.retry,
                 || async {
                     let req = anthropic_headers(d.stream_client.post(d.messages_url), d.api_key)
@@ -7312,7 +7388,9 @@ async fn anthropic_dispatch_round(
                     }
                     Ok(resp)
                 },
-                |attempt, delay| print_retry_indicator(attempt, delay, d.color),
+                |attempt, delay, error| {
+                    print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
+                },
             ),
         )
         .await
@@ -7415,7 +7493,7 @@ async fn anthropic_dispatch_round(
                 }
                 stream_retries += 1;
                 let delay = d.retry.delay_for(stream_retries);
-                print_retry_indicator(stream_retries, delay, d.color);
+                print_retry_indicator(stream_retries, d.retry.max_retries, delay, &shaped, d.color);
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -7493,7 +7571,7 @@ async fn final_summary_anthropic(
         None,
         false,
     );
-    let retry = tui_retry_policy();
+    let retry = tui_retry_policy(messages_url);
     let result = with_backoff_notify(
         &retry,
         || async {
@@ -7740,7 +7818,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let messages_url = anthropic_wire::messages_url(url);
-    let retry = tui_retry_policy();
+    let retry = tui_retry_policy(url);
     let dispatcher = AnthropicDispatch {
         client: &client,
         stream_client: &stream_client,
@@ -9234,7 +9312,7 @@ pub async fn openai_responses_complete_with_prompt(
 }
 
 /// One retrying Responses dispatch: POST the VALIDATED body, classify + retry
-/// transient transport failures via [`with_backoff_notify`], surface a typed
+/// transient transport failures via [`with_backoff_notify_error`], surface a typed
 /// HTTP-status error, and parse the JSON body. BOTH the per-round loop and the final
 /// tools-disabled summary go through this, so a transient 500 / timeout /
 /// connection reset on the LAST request no longer discards the turn after every
@@ -9252,7 +9330,7 @@ async fn dispatch_responses_json(
     color: bool,
 ) -> anyhow::Result<serde_json::Value> {
     let body = validated.body();
-    with_backoff_notify(
+    with_backoff_notify_error(
         retry,
         || async {
             let mut req = client.post(url).json(body);
@@ -9278,7 +9356,9 @@ async fn dispatch_responses_json(
                 .await
                 .map_err(anyhow::Error::from)
         },
-        |attempt, delay| print_retry_indicator(attempt, delay, color),
+        |attempt, delay, error| {
+            print_retry_indicator(attempt, retry.max_retries, delay, error, color);
+        },
     )
     .await
 }
@@ -9391,7 +9471,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let responses_url = format!("{}/v1/responses", url.trim_end_matches('/'));
-    let retry = tui_retry_policy();
+    let retry = tui_retry_policy(url);
     let advertise_save_note = note_sink.is_some();
     let advertise_recall = recall_source.is_some();
     let advertise_memory_fetch = memory_source.is_some();
@@ -15508,7 +15588,7 @@ mod tool_round_cap_tests {
                 &url,
                 None,
                 &validated,
-                &tui_retry_policy(),
+                &tui_retry_policy(&url),
                 false,
             )
             .await;
@@ -15633,9 +15713,16 @@ mod tool_round_cap_tests {
             responses_wire_validation::validate_responses_request(&b5_valid_body(), &policy)
                 .expect("a well-formed body validates");
         let client = reqwest::Client::new();
-        super::dispatch_responses_json(&client, &url, None, &validated, &tui_retry_policy(), false)
-            .await
-            .expect("the validated request dispatches");
+        super::dispatch_responses_json(
+            &client,
+            &url,
+            None,
+            &validated,
+            &tui_retry_policy(&url),
+            false,
+        )
+        .await
+        .expect("the validated request dispatches");
         let reqs = server.received_requests().await.expect("journal");
         assert_eq!(reqs.len(), 1, "a validated request dispatches exactly once");
     }

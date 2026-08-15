@@ -4,7 +4,7 @@
 
 use super::display::{print_newt, print_retry_indicator};
 use super::tui_retry_policy;
-use crate::retry::with_backoff_notify;
+use crate::retry::with_backoff_notify_error;
 
 /// Check whether `model` is currently loaded in Ollama's VRAM via `/api/ps`.
 /// Returns `true` when the model is resident and ready; `false` when cold.
@@ -86,13 +86,13 @@ pub fn warmup_if_cold(
         "keep_alive": keep_alive,
         "stream": false,
     });
-    let retry = tui_retry_policy();
+    let retry = tui_retry_policy(endpoint);
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(600))
                 .build()?;
-            with_backoff_notify(
+            with_backoff_notify_error(
                 &retry,
                 || async {
                     let mut req = client.post(&warm_url).json(&body);
@@ -110,7 +110,9 @@ pub fn warmup_if_cold(
                         .await
                         .map_err(anyhow::Error::from)
                 },
-                |attempt, delay| print_retry_indicator(attempt, delay, color),
+                |attempt, delay, error| {
+                    print_retry_indicator(attempt, retry.max_retries, delay, error, color);
+                },
             )
             .await
         })
