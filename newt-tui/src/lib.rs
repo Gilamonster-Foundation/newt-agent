@@ -936,30 +936,6 @@ fn scan_cli_exec_grants() -> Vec<String> {
     Vec::new()
 }
 
-/// The ambient "environment" the agent can see — its own model name, the
-/// harness + version, the backend it's talking to, and the current date/time.
-/// Prepended to the system prompt each turn so these are *current* (the system
-/// prompt itself is frozen at conversation start). Without it the model has no
-/// way to know its identity and confabulates one (e.g. inventing a name for
-/// commit attribution). Kept short — it rides in every request.
-/// The canonical AI-credit trailer the embedded git tool stamps on every commit:
-/// `Co-authored-by: <model> <email>` where `email` comes from the resolved
-/// [`newt_core::AgentIdentity`] (default: GitHub User
-/// [`newt-agent`](https://github.com/newt-agent) no-reply). The model name
-/// credits which model did the work; the email attributes the credit to the
-/// configured harness account. Always well-formed; the model can't fake it.
-fn coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> String {
-    // The `Model:` line pairs with the commit-time Harness/Operator/Time/Date
-    // fields stamped by newt-git's `sign_message`, forming the full footer:
-    //   Co-authored-by: <model> <email>
-    //   Model: <model>
-    //   Harness: <brand> v<ver> | Operator: <op> | Time: <t> | Date: <d>
-    format!(
-        "Co-authored-by: {model} <{}>\nModel: {model}",
-        identity.email
-    )
-}
-
 fn runtime_authority_note() -> Option<&'static str> {
     match (
         newt_core::agentic::ocap_disabled(),
@@ -1012,6 +988,12 @@ fn filesystem_authority_note() -> &'static str {
     }
 }
 
+/// The ambient "environment" the agent can see — its own model name, the
+/// harness + version, the backend it's talking to, and the current date/time.
+/// Prepended to the system prompt each turn so these are *current* (the system
+/// prompt itself is frozen at conversation start). Without it the model has no
+/// way to know its identity and confabulates one (e.g. inventing a name for
+/// commit attribution). Kept short — it rides in every request.
 fn runtime_context_block(
     model: &str,
     endpoint: &str,
@@ -1028,6 +1010,7 @@ fn runtime_context_block(
     };
     let author_email = identity.email.as_str();
     let author_name = identity.name.as_str();
+    let harness = newt_core::build_info::harness_name();
     let runtime_authority = runtime_authority_note()
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
@@ -1045,16 +1028,20 @@ fn runtime_context_block(
          {runtime_authority}\
          # Git commit identity\n\
          Prefer the `git` tool: it commits as `{author_name} <{author_email}>` and \
-         auto-signs `Co-authored-by: {model} <{author_email}>` — do NOT add that \
-         trailer yourself, just write the plain message; for the last commit use \
-         op=amend (don't claim to amend without calling it).\n\
+         auto-signs `Co-authored-by: {model} ({harness}) <{author_email}>` for \
+         every model/harness that materially contributed since the last commit \
+         (not just this one) — do NOT add that trailer yourself, just write the \
+         plain message; for the last commit use op=amend (don't claim to amend \
+         without calling it).\n\
          If you instead commit with the SHELL `git` command (run_command), you \
          MUST set the same identity explicitly — the email is what attributes the \
          commit to the harness account on GitHub. Use:\n\
          `git -c user.name='{author_name}' -c user.email='{author_email}' commit -m \"…\"`\n\
          (the author name may be `{author_name}` or this model's name, but the \
          email must always be `{author_email}`). Never commit with a guessed or \
-         personal email.\n\
+         personal email. The shell path bypasses the harness entirely, so it \
+         gets NO automatic Co-authored-by credit — prefer the `git` tool \
+         whenever multi-contributor attribution matters.\n\
          {filesystem_authority}"
     )
 }
@@ -15224,6 +15211,7 @@ mod tool_round_cap_tests {
                             summary_input_cap_floor_chars: 8_192,
                             exec_floor: None,
                             write_ledger: None,
+                            attribution: None,
                             cancel: None,
                             live_tool_output: None,
                             git_tool: None,

@@ -227,6 +227,7 @@ async fn run_scenario_for(
         summary_input_cap_floor_chars: 8_192,
         exec_floor: None,
         write_ledger: None,
+        attribution: None,
         cancel: None,
         live_tool_output: None,
         git_tool: None,

@@ -1454,6 +1454,16 @@ pub struct ChatCtx<'a> {
     /// `None` (every headless caller, and any profile without `retry`) ⇒ nothing is
     /// recorded and no file is ever reverted — bit-for-bit today's behavior.
     pub write_ledger: Option<&'a std::cell::RefCell<crate::verify_gate::WriteLedger>>,
+    /// #1707/#1709: the session-scoped pending multi-contributor commit
+    /// attribution ledger ([`crate::attribution::AttributionLedger`]). A
+    /// non-read-only tool call that SUCCEEDS records `ctx.model` under the
+    /// current harness identity here; the caller renders it into the NEXT
+    /// commit's `Co-authored-by:` trailers and clears it only once that
+    /// commit actually lands. Shared via [`RefCell`](std::cell::RefCell) for
+    /// the same reason as `write_ledger`: the loop records while the caller
+    /// (and the git-commit path) reads. `None` (every headless / eval
+    /// caller) ⇒ nothing is recorded — bit-for-bit today's behavior there.
+    pub attribution: Option<&'a std::cell::RefCell<crate::attribution::AttributionLedger>>,
     /// User-interrupt flag (Esc / Ctrl-C during a turn). When set mid-turn the
     /// loop abandons at its next checkpoint — the round-loop top, and the two
     /// model awaits (the non-streaming probe and the token stream) — and
@@ -1524,6 +1534,32 @@ fn ledger_note_write(
         let abs = lexical_normalize(&std::path::Path::new(workspace).join(p));
         led.borrow_mut().note_before_write(abs);
     }
+}
+
+/// #1707/#1709: record `model` as a contributor to the pending commit
+/// attribution ledger when this just-completed call `ok` and was not a
+/// read-only query — reusing [`is_read_only_call`], the SAME classifier that
+/// already decides `round_wrote` for read-only-round steering, rather than
+/// re-deriving a second "is this a write" predicate. Called AFTER dispatch
+/// (unlike [`ledger_note_write`], which snapshots BEFORE for revert
+/// purposes): a denied or failed call materially changed nothing and must
+/// not be credited.
+fn ledger_note_attribution(
+    attribution: Option<&std::cell::RefCell<crate::attribution::AttributionLedger>>,
+    model: &str,
+    name: &str,
+    args: &serde_json::Value,
+    ok: bool,
+) {
+    let Some(ledger) = attribution else {
+        return;
+    };
+    if !ok || is_read_only_call(name, args) {
+        return;
+    }
+    ledger
+        .borrow_mut()
+        .record(model, crate::build_info::harness_name());
 }
 
 /// Lexically normalize a path — collapse `.`, resolve `..`, drop empty components —
@@ -1919,6 +1955,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         low_budget_pct,
         exec_floor,
         write_ledger,
+        attribution,
         cancel,
         live_tool_output,
         completed_spill_renderer,
@@ -3698,6 +3735,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember outcomes that should make
             // an exact repeat self-correct next round.
             let ok = tools::tool_result_ok(&result);
+            ledger_note_attribution(attribution, model, name, &args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
@@ -5787,6 +5825,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         low_budget_pct,
         exec_floor,
         write_ledger,
+        attribution,
         cancel,
         live_tool_output,
         git_tool,
@@ -7201,6 +7240,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
+            ledger_note_attribution(attribution, model, name, &args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
@@ -7789,6 +7829,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         low_budget_pct,
         exec_floor,
         write_ledger,
+        attribution,
         cancel,
         live_tool_output,
         git_tool,
@@ -9113,6 +9154,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             }
             // 17.6 + 27.3 — mirrors the OpenAI path.
             let ok = tools::tool_result_ok(&result);
+            ledger_note_attribution(attribution, model, name, &args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
@@ -9469,6 +9511,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         low_budget_pct,
         exec_floor,
         write_ledger,
+        attribution,
         cancel,
         live_tool_output,
         git_tool,
@@ -10147,6 +10190,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
+            ledger_note_attribution(attribution, model, name, &args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             repeat_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
@@ -11884,6 +11928,7 @@ mod tool_round_cap_tests {
             summary_input_cap_floor_chars: 8_192,
             exec_floor: None,
             write_ledger: None,
+            attribution: None,
             cancel: None,
             live_tool_output: None,
             git_tool: None,
@@ -12161,6 +12206,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -12619,6 +12665,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -12720,6 +12767,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: Some(&flag),
                 live_tool_output: None,
                 git_tool: None,
@@ -14888,6 +14936,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -15002,6 +15051,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -15125,6 +15175,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -15259,6 +15310,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -15385,6 +15437,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -15553,6 +15606,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -15730,6 +15784,7 @@ mod tool_round_cap_tests {
                 summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
+                attribution: None,
                 cancel: None,
                 live_tool_output: None,
                 git_tool: None,
@@ -16653,6 +16708,7 @@ mod save_note_loop_tests {
             summary_input_cap_floor_chars: 8_192,
             exec_floor: None,
             write_ledger: None,
+            attribution: None,
             cancel: None,
             live_tool_output: None,
             git_tool: None,
@@ -17161,6 +17217,7 @@ mod compression_loop_tests {
             summary_input_cap_floor_chars: 8_192,
             exec_floor: None,
             write_ledger: None,
+            attribution: None,
             cancel: None,
             live_tool_output: None,
             git_tool: None,
@@ -18548,6 +18605,7 @@ mod observation_hook_tests {
             // #307: test ChatCtx carries no preset exec floor (headless default).
             exec_floor: None,
             write_ledger: None,
+            attribution: None,
             cancel: None,
             live_tool_output: None,
             git_tool: None,

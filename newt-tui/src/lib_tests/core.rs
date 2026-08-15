@@ -25,23 +25,30 @@ fn openai_surface_probe_skips_plain_http_multiplexers() {
     ));
 }
 
+/// #1707/#1709: the session `coauthor_trailer` single-model function this
+/// test used to exercise is gone — attribution now flows through
+/// `newt_core::attribution::AttributionLedger`, recorded per-contributor by
+/// the agent loop and rendered by `chat.rs` into `session_git_tool.coauthor`.
+/// This test exercises that same ledger directly with the identity resolved
+/// the way the session resolves it.
 #[test]
-fn coauthor_trailer_uses_resolved_identity_email() {
+fn attribution_ledger_uses_resolved_identity_email() {
     let id = newt_core::AgentIdentity::default();
-    let tr = coauthor_trailer("nemotron-3-nano:30b", &id);
+    let mut ledger = newt_core::attribution::AttributionLedger::new(id.email.clone());
+    ledger.record("nemotron-3-nano:30b", "newt-agent");
     // Model name credits the work; the email attributes to the resolved
     // harness identity (default: GitHub User https://github.com/newt-agent).
     assert_eq!(
-        tr,
-        "Co-authored-by: nemotron-3-nano:30b <309460085+newt-agent@users.noreply.github.com>\nModel: nemotron-3-nano:30b"
+        ledger.render(),
+        "Co-authored-by: nemotron-3-nano:30b (newt-agent) <309460085+newt-agent@users.noreply.github.com>"
     );
-    assert!(tr.contains(newt_core::DEFAULT_AGENT_EMAIL));
+    assert!(ledger.render().contains(newt_core::DEFAULT_AGENT_EMAIL));
     assert!(
-        !tr.contains("noreply@newt-agent.com"),
+        !ledger.render().contains("noreply@newt-agent.com"),
         "old wrong email is gone"
     );
     assert!(
-        !tr.contains("[bot]"),
+        !ledger.render().contains("[bot]"),
         "default attribution is the User account, not the App bot"
     );
 
@@ -50,9 +57,11 @@ fn coauthor_trailer_uses_resolved_identity_email() {
         email: "my-agent@example.com".into(),
         ..newt_core::AgentIdentity::default()
     };
+    let mut custom_ledger = newt_core::attribution::AttributionLedger::new(custom.email.clone());
+    custom_ledger.record("ornith:35b", "newt-agent");
     assert_eq!(
-        coauthor_trailer("ornith:35b", &custom),
-        "Co-authored-by: ornith:35b <my-agent@example.com>\nModel: ornith:35b"
+        custom_ledger.render(),
+        "Co-authored-by: ornith:35b (newt-agent) <my-agent@example.com>"
     );
 }
 
