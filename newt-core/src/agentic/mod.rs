@@ -1097,6 +1097,15 @@ pub trait LiveToolOutput: Send + Sync {
 /// - Bounded — max 50% of screen height so a single spill can't flood a tmux
 /// - Delimited — visual boundaries (⎵/⎶/⎴) mark scrollable region extents
 pub trait CompletedSpillRenderer: Send + Sync {
+    /// Retain a completed result for an on-demand, session-scoped viewer.
+    ///
+    /// Returns the stable session-local identifier that committed collapse
+    /// markers should name. The default preserves renderers that only provide
+    /// the transient inline viewport.
+    fn retain_completed(&self, _output: &str) -> Option<u64> {
+        None
+    }
+
     /// Render a completed tool result as an interactive spill viewport.
     ///
     /// `output` is the complete (stdout+stderr) tool output. `width` is the

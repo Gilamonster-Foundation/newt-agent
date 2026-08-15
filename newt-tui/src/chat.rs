@@ -1046,6 +1046,12 @@ pub(crate) fn run_chat(
     // surface default (rich collapses spilled results to a one-line summary,
     // lean shows full output); `/spill summary` / `/spill excerpt` override.
     let mut spill_summary_override: Option<bool> = None;
+    // Rich-only completed-result recovery. Bodies stay process-local and are
+    // bounded by CompletedSpillArchive; `/new` deliberately does not turn
+    // this into durable conversation history.
+    #[cfg(feature = "live-spill")]
+    let completed_spills =
+        std::sync::Arc::new(crate::completed_spill::CompletedSpillArchive::default());
     // Human-only per-session override for the agentic loop's tool-call round
     // safety valve. `None` preserves config/model-tuning behavior exactly.
     let mut max_tool_rounds_override: Option<usize> = None;
@@ -2764,6 +2770,42 @@ pub(crate) fn run_chat(
                     if slash_md == "spill" || slash_md.starts_with("spill ") {
                         let configured = spill_lines(&cfg);
                         match parse_spill_command(&task) {
+                            Ok(command @ (SpillCommand::Last | SpillCommand::Open(_))) => {
+                                #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
+                                let opened = if !surface_is_rich {
+                                    Err(anyhow::anyhow!(
+                                        "completed spill viewing requires the Rich TUI"
+                                    ))
+                                } else {
+                                    let spill = match command {
+                                        SpillCommand::Last => completed_spills.latest(),
+                                        SpillCommand::Open(id) => completed_spills.get(id),
+                                        _ => None,
+                                    };
+                                    spill.ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "that spill is not retained in this bounded session archive"
+                                        )
+                                    })
+                                    .and_then(|spill| {
+                                        crate::transcript_pager::run_output_pager(&spill)
+                                            .map_err(anyhow::Error::from)
+                                    })
+                                };
+                                #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
+                                let opened: anyhow::Result<()> = {
+                                    let _ = command;
+                                    Err(anyhow::anyhow!(
+                                        "completed spill viewing requires a Rich TUI build"
+                                    ))
+                                };
+                                if let Err(e) = opened {
+                                    print_newt(&format!("spill viewer: {e}"), color, verbose);
+                                }
+                                surface.save_history();
+                                println!();
+                                continue;
+                            }
                             // #1640 Layer 1: one pure transition for every
                             // form (crate::apply_spill_command, pinned by
                             // test) — Reset returns BOTH knobs to the surface
@@ -2778,7 +2820,7 @@ pub(crate) fn run_chat(
                             Err(e) => {
                                 print_newt(
                                     &format!(
-                                        "error: {e} — use /spill [status|<rows>|reset|summary|excerpt]"
+                                        "error: {e} — use /spill [status|<rows>|reset|summary|excerpt|last|open <id>]"
                                     ),
                                     color,
                                     verbose,
@@ -5838,6 +5880,7 @@ pub(crate) fn run_chat(
                             crate::live_spill::LiveSpillRenderer::stdout(
                                 configured_spill_lines,
                                 color,
+                                completed_spills.clone(),
                             )
                         });
                     // #1640 Layer 1 + review fix (#1663): publish the
@@ -6091,10 +6134,14 @@ pub(crate) fn run_chat(
                                         // #1640: Rich TUI completed spill renderer for interactive
                                         // completed tool output viewport. Only on Rich TUI + live-spill.
                                         #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
-                                        completed_spill_renderer: live_spill.as_ref().map(|spill| {
-                                            spill.clone()
-                                                as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
-                                        }),
+                                        completed_spill_renderer: if surface_is_rich {
+                                            live_spill.as_ref().map(|spill| {
+                                                spill.clone()
+                                                    as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
+                                            })
+                                        } else {
+                                            None
+                                        },
                                         #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
                                         completed_spill_renderer: None,
                                         // PR4 (#461): the embedded git tool, now

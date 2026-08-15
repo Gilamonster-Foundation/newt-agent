@@ -438,6 +438,15 @@ pub(crate) fn spill_summary() -> bool {
 pub(crate) const SPILL_RECOVERY_HINT: &str = "/spill N raises this view";
 
 pub(crate) fn spill_view_lines(output: &str, view: usize, columns: usize) -> Vec<String> {
+    spill_view_lines_with_hint(output, view, columns, SPILL_RECOVERY_HINT)
+}
+
+fn spill_view_lines_with_hint(
+    output: &str,
+    view: usize,
+    columns: usize,
+    recovery_hint: &str,
+) -> Vec<String> {
     // #1433: the budget is spent in RENDERED rows, not logical lines — counting
     // lines let one 4000-char diagnostic consume an unbounded number of them.
     //
@@ -488,7 +497,7 @@ pub(crate) fn spill_view_lines(output: &str, view: usize, columns: usize) -> Vec
         let wrapped = wrap_to_width(tail[0], content_width);
         let dropped = wrapped.len() - view;
         let mut out = vec![format!(
-            "▲ {dropped} more wrapped rows above · {SPILL_RECOVERY_HINT}"
+            "▲ {dropped} more wrapped rows above · {recovery_hint}"
         )];
         for (i, row) in wrapped[dropped..].iter().enumerate() {
             let glyph = if i + 1 == view { '▓' } else { '▒' };
@@ -513,9 +522,7 @@ pub(crate) fn spill_view_lines(output: &str, view: usize, columns: usize) -> Vec
     // ▲/▒/▓ glyphs with the live viewport, so without this hint it masqueraded
     // as the interactive scroller (the diagnosed operator tried to expand it in
     // scrollback). Name the real recovery path at the point of use.
-    out.push(format!(
-        "▲ {hidden} more lines above · {SPILL_RECOVERY_HINT}"
-    ));
+    out.push(format!("▲ {hidden} more lines above · {recovery_hint}"));
     let tail = &lines[..];
     for (i, l) in tail.iter().enumerate() {
         let glyph = if i + 1 == tail.len() { '▓' } else { '▒' };
@@ -557,8 +564,18 @@ pub(crate) fn spills_past(output: &str, view: usize, columns: usize) -> bool {
 /// The tail (the last non-empty line — where errors and results live) is
 /// truncated so the whole marker stays within `columns`; it is dropped
 /// entirely when fewer than 8 columns remain for it. Interpolates
-/// [`SPILL_RECOVERY_HINT`] per the #1433 single-recovery-path doctrine.
+/// Uses [`SPILL_RECOVERY_HINT`] when no retained result ID is available; Rich
+/// renderers replace it with the exact `/spill open <id>` recovery command.
 pub(crate) fn spill_summary_line(output: &str, view: usize, columns: usize) -> Option<String> {
+    spill_summary_line_with_hint(output, view, columns, SPILL_RECOVERY_HINT)
+}
+
+fn spill_summary_line_with_hint(
+    output: &str,
+    view: usize,
+    columns: usize,
+    recovery_hint: &str,
+) -> Option<String> {
     if !spills_past(output, view, columns) {
         return None;
     }
@@ -570,7 +587,7 @@ pub(crate) fn spill_summary_line(output: &str, view: usize, columns: usize) -> O
         .find(|l| !l.is_empty())
         .unwrap_or("");
     let head = format!("▲ {total} lines");
-    let hint = format!(" · {SPILL_RECOVERY_HINT}");
+    let hint = format!(" · {recovery_hint}");
     // Space left for the tail, in chars (the excerpt path also emits unwrapped
     // text and lets the terminal soft-wrap; here we just keep the marker
     // visually one row in the common case). The 4 covers the " · " separator
@@ -696,6 +713,11 @@ impl<W: Write> ToolDisplay<W> {
         } else {
             output
         };
+        let retained_id = self
+            .completed_spill_renderer
+            .as_ref()
+            .and_then(|renderer| renderer.retain_completed(output));
+        let recovery_hint = retained_id.map(|id| format!("/spill open {id} opens this result"));
 
         // The static excerpt is ALWAYS committed first — it is the canonical
         // transcript record on every tier, and it must never depend on an
@@ -706,11 +728,22 @@ impl<W: Write> ToolDisplay<W> {
         // conversation spine (green prompts/replies) stays dominant. A result
         // that fits the budget, and `/spill 0` (unbounded), keep the normal
         // render — `spill_summary_line` returns `None` for both.
-        let rendered = self
-            .summary
-            .then(|| spill_summary_line(output, self.spill_lines, self.cols))
-            .flatten()
-            .unwrap_or_else(|| spill_view_lines(output, self.spill_lines, self.cols).join("\n"));
+        let rendered = if let Some(recovery_hint) = recovery_hint.as_deref() {
+            self.summary
+                .then(|| {
+                    spill_summary_line_with_hint(output, self.spill_lines, self.cols, recovery_hint)
+                })
+                .flatten()
+                .unwrap_or_else(|| {
+                    spill_view_lines_with_hint(output, self.spill_lines, self.cols, recovery_hint)
+                        .join("\n")
+                })
+        } else {
+            self.summary
+                .then(|| spill_summary_line(output, self.spill_lines, self.cols))
+                .flatten()
+                .unwrap_or_else(|| spill_view_lines(output, self.spill_lines, self.cols).join("\n"))
+        };
         if self.color {
             execute!(
                 &mut self.writer,
@@ -1324,6 +1357,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingRenderer {
         terminal: SharedBuf,
+        retained: std::sync::Mutex<Vec<String>>,
         rendered: std::sync::Mutex<Vec<String>>,
         seen_at_render: std::sync::Mutex<Vec<String>>,
         seen_at_erase: std::sync::Mutex<Vec<String>>,
@@ -1341,6 +1375,11 @@ mod tests {
     }
 
     impl crate::agentic::CompletedSpillRenderer for RecordingRenderer {
+        fn retain_completed(&self, output: &str) -> Option<u64> {
+            self.retained.lock().unwrap().push(output.to_string());
+            Some(7)
+        }
+
         fn render_completed(&self, output: &str, _width: usize, _max_height: usize) -> usize {
             self.rendered.lock().unwrap().push(output.to_string());
             self.seen_at_render
@@ -1415,6 +1454,10 @@ mod tests {
             "the committed record is the collapsed marker: {committed}"
         );
         assert!(
+            committed.contains("/spill open 7"),
+            "the marker names the retained result it can actually reopen: {committed}"
+        );
+        assert!(
             !committed.contains("l1"),
             "the hidden body is NOT in the committed record: {committed}"
         );
@@ -1422,6 +1465,11 @@ mod tests {
             renderer.rendered.lock().unwrap().as_slice(),
             [output],
             "the viewport rendered the FULL output, not the marker"
+        );
+        assert_eq!(
+            renderer.retained.lock().unwrap().as_slice(),
+            [output],
+            "the completed result is retained exactly once"
         );
     }
 

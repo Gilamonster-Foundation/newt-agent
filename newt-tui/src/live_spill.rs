@@ -1,5 +1,6 @@
 //! TTY renderer for the turn-scoped active-tool spill viewport.
 
+use crate::completed_spill::CompletedSpillArchive;
 use crate::spill_view::{SpillStream, SpillView};
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::queue;
@@ -101,6 +102,7 @@ pub(crate) struct LiveSpillRenderer {
     state: Arc<Mutex<RenderState>>,
     output: Arc<Mutex<OutputState>>,
     abandoned_through: Arc<AtomicU64>,
+    completed_archive: Option<Arc<CompletedSpillArchive>>,
     #[cfg(any(unix, test))]
     repaint_requested: Arc<AtomicU64>,
     #[cfg(any(unix, test))]
@@ -114,11 +116,16 @@ impl LiveSpillRenderer {
     /// arbiter holds only a `Weak` and the handle stores only a `u64`, so this
     /// is not a reference cycle: the last `Arc` dropping runs `OutputState`'s
     /// drop, which deregisters.
-    pub(crate) fn stdout(rows: usize, color: bool) -> Option<Arc<Self>> {
+    pub(crate) fn stdout(
+        rows: usize,
+        color: bool,
+        completed_archive: Arc<CompletedSpillArchive>,
+    ) -> Option<Arc<Self>> {
         let me = Arc::new(Self::with_output_and_geometry(
             TerminalWriter::Stdout,
             rows,
             color,
+            Some(completed_archive),
             || {
                 crossterm::terminal::size()
                     .ok()
@@ -172,6 +179,7 @@ impl LiveSpillRenderer {
             TerminalWriter::Other(Box::new(writer)),
             desired_rows,
             color,
+            None,
             geometry,
         )
     }
@@ -180,6 +188,7 @@ impl LiveSpillRenderer {
         writer: TerminalWriter,
         desired_rows: usize,
         color: bool,
+        completed_archive: Option<Arc<CompletedSpillArchive>>,
         geometry: impl Fn() -> Option<(usize, usize)> + Send + Sync + 'static,
     ) -> Option<Self> {
         let (columns, terminal_rows) = geometry()?;
@@ -203,6 +212,7 @@ impl LiveSpillRenderer {
                 registration: None,
             })),
             abandoned_through: Arc::new(AtomicU64::new(0)),
+            completed_archive,
             #[cfg(any(unix, test))]
             repaint_requested: Arc::new(AtomicU64::new(0)),
             #[cfg(any(unix, test))]
@@ -824,6 +834,12 @@ fn rendered_width(text: &str) -> usize {
 const COMPLETED_GENERATION: u64 = u64::MAX;
 
 impl CompletedSpillRenderer for LiveSpillRenderer {
+    fn retain_completed(&self, output: &str) -> Option<u64> {
+        self.completed_archive
+            .as_ref()
+            .map(|archive| archive.retain(output))
+    }
+
     /// Render a completed tool result as an interactive spill viewport.
     ///
     /// Reuses the live SpillView frame logic — scrolling, expanding, and

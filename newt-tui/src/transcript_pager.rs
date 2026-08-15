@@ -300,6 +300,8 @@ impl TurnRows {
 // never legitimately enter — `plain_scroller_tui.md`: the lean path has no
 // scroll regions, ever.
 // ---------------------------------------------------------------------------
+#[cfg(all(feature = "rich-tui", feature = "live-spill"))]
+pub(crate) use terminal::run_output_pager;
 #[cfg(feature = "rich-tui")]
 pub(crate) use terminal::run_pager;
 /// Re-exported for the real-PTY acceptance test only (#1677): it drops the
@@ -327,6 +329,9 @@ mod terminal {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
     use std::io;
+
+    #[cfg(feature = "live-spill")]
+    use crate::completed_spill::CompletedSpill;
 
     /// Restore the primary screen + cooked mode on EVERY exit path — error or
     /// panic included. Leaking the alternate screen would strand the whole
@@ -458,6 +463,95 @@ mod terminal {
                 KeyCode::Char('n') => state.next_message(page_rows),
                 KeyCode::Char('p') => state.prev_message(),
                 KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Tab => state.toggle_fold(page_rows),
+                _ => {}
+            }
+        }
+    }
+
+    /// Open one retained completed-tool body. This deliberately shares the
+    /// transcript pager's alternate-screen guard and navigation vocabulary,
+    /// but has no folds: every retained line is immediately visible.
+    #[cfg(feature = "live-spill")]
+    pub(crate) fn run_output_pager(spill: &CompletedSpill) -> io::Result<()> {
+        let _guard = AltScreenGuard::enter()?;
+        let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        terminal.clear()?;
+        let mut scroll = 0usize;
+        loop {
+            let mut page_rows = 1usize;
+            terminal.draw(|f| {
+                let [header, body, footer] = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                ])
+                .areas(f.area());
+                page_rows = body.height.max(1) as usize;
+                let max_scroll = spill.lines().len().saturating_sub(page_rows);
+                scroll = scroll.min(max_scroll);
+
+                let retention = if spill.dropped_lines() == 0 {
+                    format!("{} lines", spill.total_lines())
+                } else {
+                    format!(
+                        "{} of {} lines retained (oldest dropped)",
+                        spill.lines().len(),
+                        spill.total_lines()
+                    )
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            format!(" spill {} ", spill.id()),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("· {retention}"), Style::default().fg(Color::Gray)),
+                    ])),
+                    header,
+                );
+
+                let visible = spill
+                    .lines()
+                    .iter()
+                    .skip(scroll)
+                    .take(page_rows)
+                    .map(|line| {
+                        Line::from(Span::styled(
+                            line.clone(),
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                f.render_widget(Paragraph::new(visible), body);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        " q quit · ↑↓ scroll · PgUp/PgDn page · g/G top/bottom",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    footer,
+                );
+            })?;
+
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let half = (page_rows / 2).max(1);
+            let max_scroll = spill.lines().len().saturating_sub(page_rows);
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('c') if ctrl => return Ok(()),
+                KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => scroll = (scroll + 1).min(max_scroll),
+                KeyCode::PageUp => scroll = scroll.saturating_sub(page_rows),
+                KeyCode::PageDown => scroll = (scroll + page_rows).min(max_scroll),
+                KeyCode::Char('u') if ctrl => scroll = scroll.saturating_sub(half),
+                KeyCode::Char('d') if ctrl => scroll = (scroll + half).min(max_scroll),
+                KeyCode::Char('g') | KeyCode::Home => scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => scroll = max_scroll,
                 _ => {}
             }
         }
