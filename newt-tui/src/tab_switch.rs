@@ -280,9 +280,9 @@ impl TabSwitchCtx<'_> {
     ) -> crate::PinRestore {
         match incoming {
             PreparedIncoming::Materialized(prepared) => {
-                let mut restore = crate::ConversationCommandContext {
-                    store: self.store,
-                    persona_store: self.persona_store,
+                // Built WITHOUT the stores: commit cannot perform a fallible
+                // read because it has nothing to read from.
+                let mut commit = crate::CommitContext {
                     workspace: self.workspace,
                     memory: self.memory,
                     system: self.system,
@@ -294,7 +294,7 @@ impl TabSwitchCtx<'_> {
                     active_prompt_context: self.active_prompt_context,
                     mode_states: self.mode_states,
                 };
-                let (_, warning) = crate::commit_conversation_restore(&mut restore, *prepared);
+                let (_, warning) = crate::commit_conversation_restore(&mut commit, *prepared);
                 if let Some(w) = warning {
                     crate::print_newt(&format!("warning: {w}"), self.color, self.verbose);
                 }
@@ -1422,6 +1422,58 @@ mod state_machine_tests {
             Some("other".to_string()),
             "the first durable write materializes the preference chosen while rowless"
         );
+    }
+
+    /// The seed's LIFETIME, which was previously only an argument: once the row
+    /// materializes, the seed is dropped and can never re-apply stale state.
+    ///
+    /// The hazard it rules out: a tab whose row appeared (first prompt, or a
+    /// rename) still carrying a seed would, on its next activation, overwrite
+    /// the persona the store now owns with the one captured at `/tab new`.
+    /// Since `persona` is write-once at row birth, a stale re-apply would
+    /// disagree with the durable record permanently.
+    #[test]
+    fn the_seed_is_dropped_once_the_row_materializes_and_cannot_re_apply() {
+        let _g = guard();
+        let (mut h, mut tabs) = Harness::new(&["sol"]);
+        let a = h.active_conversation_id.clone();
+        h.store.create_with_id(&a, "A", None).unwrap();
+
+        h.active_persona = Some(persona_named("seeded"));
+        {
+            let mut ctx = h.ctx();
+            let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
+        }
+        let b = h.active_conversation_id.clone();
+        assert!(tabs.active().fresh_seed.is_some(), "rowless: seed present");
+
+        // The row materializes with a DIFFERENT persona than the seed captured
+        // — as it would if the operator switched persona before the first turn.
+        h.store.create_with_id(&b, "B", Some("durable")).unwrap();
+
+        // Any switch away deactivates, which is where the seed is retired.
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+        }
+        assert!(
+            tabs.get(1).unwrap().fresh_seed.is_none(),
+            "the seed is retired the moment the row exists"
+        );
+
+        // Coming back reads the STORE, not the stale seed.
+        {
+            let mut ctx = h.ctx();
+            activate_tab(&mut ctx, &mut tabs, 1).unwrap();
+        }
+        assert_eq!(
+            h.active_persona.as_ref().map(|p| p.name.as_str()),
+            None,
+            "the durable record owns the persona now — `durable` is not loadable from \
+             this test's empty persona dir, so the restore reports no persona rather \
+             than resurrecting the seed's `seeded`"
+        );
+        assert!(tabs.active().fresh_seed.is_none());
     }
 
     /// `/tab new` alone still creates no `/resume`-visible row — the rule the
