@@ -124,6 +124,9 @@ mod plan_mode;
 mod prompt_intake;
 mod prompt_read;
 mod recall;
+// #952/#1669: operator steering submitted mid-turn, drained at the next
+// round boundary as a genuine operator message.
+mod steering;
 // #1004: the `render_report` tool — present collected findings as a rendered
 // Markdown document in the plain scroller (the missing "present" affordance a
 // doer-oriented gather-and-report task otherwise lacks).
@@ -291,6 +294,7 @@ pub use plan_mode::PlanModeControl;
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use send_budget::initial_context_input_budget;
+pub use steering::{ReplaceRejected, Rev, SessionSteeringInbox, SteeringInbox};
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
@@ -1505,6 +1509,21 @@ pub struct ChatCtx<'a> {
     /// entering Plan immediately clamps subsequent calls in the same model
     /// round. `None` means the model-entered Plan phase is unavailable.
     pub plan_mode_control: Option<&'a dyn PlanModeControl>,
+    /// #952/#1669: operator steering submitted while this turn is running.
+    ///
+    /// Drained at the TOP of each tool round — before the next model call, and
+    /// after any tool already in flight has finished — and appended as genuine
+    /// operator user messages, in submission order. So a correction typed
+    /// mid-turn reaches the agent's next reasoning cycle instead of waiting for
+    /// the round cap, without disturbing a request already on the wire.
+    ///
+    /// This is the same shape as `cancel`, one step up: `cancel` signals "stop"
+    /// with a bit, this delivers "do that differently" with a payload. It is
+    /// NOT cancellation and never abandons the turn.
+    ///
+    /// `None` (every headless / eval caller) ⇒ nothing is ever drained and the
+    /// request bodies are bit-for-bit today's.
+    pub steering: Option<&'a dyn SteeringInbox>,
 }
 
 /// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
@@ -1560,6 +1579,41 @@ fn ledger_note_attribution(
     ledger
         .borrow_mut()
         .record(model, crate::build_info::harness_name());
+}
+
+/// Drain operator steering into `messages` as genuine user turns (#952/#1669).
+///
+/// Called at the top of every tool round, after the cancel checkpoint and
+/// before the round's model call, so a correction typed mid-turn is in context
+/// for the agent's next reasoning cycle rather than waiting for the round cap.
+///
+/// The messages are the operator's own words in submission order — not a
+/// harness nudge and not system metadata — because that is what they are. They
+/// deliberately use the SAME `{"role": "user"}` shape the round-start nudges
+/// already push a few lines above each call site, so nothing downstream needs
+/// to learn a new message kind.
+///
+/// Returns how many were delivered, for the caller's trace/telemetry. A no-op
+/// returning 0 when no inbox is lent, which is every headless caller.
+fn drain_steering_into(
+    steering: Option<&dyn SteeringInbox>,
+    messages: &mut Vec<serde_json::Value>,
+    color: bool,
+) -> usize {
+    let Some(inbox) = steering else {
+        return 0;
+    };
+    let pending = inbox.drain_for_round();
+    for text in &pending {
+        messages.push(serde_json::json!({ "role": "user", "content": text }));
+    }
+    if !pending.is_empty() {
+        print_debug(
+            &format!("delivered {} operator steering message(s)", pending.len()),
+            color,
+        );
+    }
+    pending.len()
 }
 
 /// Lexically normalize a path — collapse `.`, resolve `..`, drop empty components —
@@ -1963,6 +2017,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        steering,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
@@ -2254,6 +2309,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
+        // #952/#1669: operator steering, delivered BEFORE this round's model
+        // call and AFTER any tool that was already running finished above.
+        // Steering changes what the agent does NEXT; it never abandons the
+        // turn (that is `cancel`, checked immediately above).
+        drain_steering_into(steering, &mut messages, color);
         if round > 0 {
             // Brief separator between rounds so user can follow the flow.
             if color {
@@ -5832,6 +5892,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        steering,
         completed_spill_renderer,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -6080,6 +6141,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
+        // #952/#1669: operator steering, delivered BEFORE this round's model
+        // call and AFTER any tool that was already running finished above.
+        // Steering changes what the agent does NEXT; it never abandons the
+        // turn (that is `cancel`, checked immediately above).
+        drain_steering_into(steering, &mut messages, color);
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -7836,6 +7902,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        steering,
         completed_spill_renderer,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -8104,6 +8171,11 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
+        // #952/#1669: operator steering, delivered BEFORE this round's model
+        // call and AFTER any tool that was already running finished above.
+        // Steering changes what the agent does NEXT; it never abandons the
+        // turn (that is `cancel`, checked immediately above).
+        drain_steering_into(steering, &mut messages, color);
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -9518,6 +9590,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        steering,
         completed_spill_renderer,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -9724,6 +9797,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         if is_cancelled(cancel) {
             return Ok((String::new(), false, accumulated_usage, hallucination_count));
         }
+        // #952/#1669: operator steering, delivered BEFORE this round's model
+        // call and AFTER any tool that was already running finished above.
+        // Steering changes what the agent does NEXT; it never abandons the
+        // turn (that is `cancel`, checked immediately above).
+        drain_steering_into(steering, &mut input, color);
         // #1528: inner recovery loop — a cw-400 (or a tools-unsupported error)
         // retries THIS logical round IN PLACE. Only a COMPLETED dispatch `break`s
         // out and lets `round` advance, so recovery never consumes a tool-capable
@@ -11935,6 +12013,7 @@ mod tool_round_cap_tests {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            steering: None,
             completed_spill_renderer: None,
         }
     }
@@ -12213,6 +12292,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -12672,6 +12752,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -12774,6 +12855,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -12784,6 +12866,162 @@ mod tool_round_cap_tests {
         assert!(!streamed);
         assert!(usage.is_none());
         assert_eq!(hallu, 0);
+    }
+
+    /// Serves one tool call, and — simulating the operator typing WHILE that
+    /// request is on the wire — submits a steering message from inside the
+    /// responder. The next round's request body must carry it.
+    ///
+    /// Submitting from the responder rather than pre-loading the queue is the
+    /// point: a pre-loaded queue would also pass if steering were only ever
+    /// drained once, before the turn started. This can only pass if the drain
+    /// really happens at each round boundary.
+    struct SteersMidTurn {
+        inbox: std::sync::Arc<SessionSteeringInbox>,
+        requests_seen: Arc<AtomicUsize>,
+        steer: String,
+        final_answer: String,
+    }
+
+    impl Respond for SteersMidTurn {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            if self.requests_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.inbox.submit(self.steer.clone());
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "function": { "name": "definitely_not_a_real_tool", "arguments": {} }
+                        }]
+                    }
+                }));
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": self.final_answer }
+            }))
+        }
+    }
+
+    /// Every user-role content string in an Ollama request body.
+    fn user_contents(req: &wiremock::Request) -> Vec<String> {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+        body["messages"]
+            .as_array()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| m["role"] == "user")
+                    .filter_map(|m| m["content"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #952/#1669: the operator's mid-turn correction reaches the model at the
+    /// NEXT round boundary — not at the round cap, and not never.
+    #[tokio::test]
+    async fn steering_submitted_mid_turn_appears_in_the_next_rounds_request() {
+        const STEER: &str = "don't change the public API";
+        let server = MockServer::start().await;
+        let inbox = std::sync::Arc::new(SessionSteeringInbox::new());
+        let seen = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(SteersMidTurn {
+                inbox: inbox.clone(),
+                requests_seen: seen.clone(),
+                steer: STEER.into(),
+                final_answer: "acknowledged".into(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(
+            &uri,
+            &messages,
+            &caveats,
+            "do the thing",
+            BackendKind::Ollama,
+        );
+        // `hard_budget_ctx` exists to prove the 256-token refusal; this test
+        // is about round boundaries, so give it an ordinary budget.
+        ctx.model = "test-model";
+        ctx.safe_context = None;
+        ctx.max_tool_rounds = 3;
+        ctx.steering = Some(inbox.as_ref() as &dyn SteeringInbox);
+        let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect("turn completes");
+        assert_eq!(reply, "acknowledged");
+
+        let reqs = server.received_requests().await.expect("journal");
+        assert!(
+            reqs.len() >= 2,
+            "need a second round to observe the delivery, got {}",
+            reqs.len()
+        );
+        assert!(
+            !user_contents(&reqs[0]).iter().any(|c| c.contains(STEER)),
+            "the steer did not exist yet when round 0 was sent"
+        );
+        assert!(
+            user_contents(&reqs[1]).iter().any(|c| c.contains(STEER)),
+            "round 1 must carry the operator's mid-turn correction; got {:?}",
+            user_contents(&reqs[1])
+        );
+        assert_eq!(inbox.pending(), 0, "delivery consumes the queue");
+    }
+
+    /// The regression floor: with no inbox lent, nothing about the request
+    /// bodies changes. Every headless / eval caller passes `None`.
+    #[tokio::test]
+    async fn no_inbox_means_no_extra_user_messages() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(AtomicUsize::new(0));
+        let idle = std::sync::Arc::new(SessionSteeringInbox::new());
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(SteersMidTurn {
+                // Submits into an inbox the loop was never given.
+                inbox: idle.clone(),
+                requests_seen: seen.clone(),
+                steer: "never delivered".into(),
+                final_answer: "done".into(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(
+            &uri,
+            &messages,
+            &caveats,
+            "do the thing",
+            BackendKind::Ollama,
+        );
+        ctx.model = "test-model";
+        ctx.safe_context = None;
+        ctx.max_tool_rounds = 3;
+        ctx.steering = None;
+        let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
+            .await
+            .expect("turn completes");
+        assert_eq!(reply, "done");
+
+        let reqs = server.received_requests().await.expect("journal");
+        for r in &reqs {
+            assert!(
+                !user_contents(r)
+                    .iter()
+                    .any(|c| c.contains("never delivered")),
+                "a steer reached the model through an inbox that was never lent"
+            );
+        }
+        assert_eq!(idle.pending(), 1, "it stayed queued, undelivered");
     }
 
     #[test]
@@ -14943,6 +15181,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             Some(&turn_prompt),
@@ -15058,6 +15297,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -15182,6 +15422,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -15317,6 +15558,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -15444,6 +15686,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -15613,6 +15856,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -15791,6 +16035,7 @@ mod tool_round_cap_tests {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                steering: None,
                 completed_spill_renderer: None,
             },
             &mut NoMcp,
@@ -16715,6 +16960,7 @@ mod save_note_loop_tests {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            steering: None,
             completed_spill_renderer: None,
         }
     }
@@ -17224,6 +17470,7 @@ mod compression_loop_tests {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            steering: None,
             completed_spill_renderer: None,
         }
     }
@@ -18612,6 +18859,7 @@ mod observation_hook_tests {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            steering: None,
             completed_spill_renderer: None,
         }
     }

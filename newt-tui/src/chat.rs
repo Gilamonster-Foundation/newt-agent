@@ -6665,6 +6665,15 @@ pub(crate) fn run_chat(
                                             &conversation_mode_states.plan
                                                 as &dyn newt_core::agentic::PlanModeControl,
                                         ),
+                                        // #952/#1669: the loop-side seam is in
+                                        // place, but this surface cannot yet
+                                        // SUBMIT mid-turn — `read_line` does not
+                                        // run while a turn is dispatched, so the
+                                        // operator has no way to enqueue one.
+                                        // Lending an inbox here today would be
+                                        // dead plumbing; it is wired when the
+                                        // editor stays live (the cockpit slice).
+                                        steering: None,
                                     },
                                     active_prompt_context.as_ref(),
                                     prompt_source,
