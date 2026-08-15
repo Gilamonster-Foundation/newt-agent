@@ -277,21 +277,23 @@ fn crew_dispatch_result(report: String, did_land: bool) -> Result<String, String
     }
 }
 
-/// The `Co-authored-by` trailer for a crew's landed commit (#879): the crew's
-/// editing **model** as the display NAME, with the resolved harness identity
-/// EMAIL (default: GitHub User https://github.com/newt-agent). So GitHub
-/// attributes the commit to the configured account while the name records
-/// which model actually ran. Pure.
+/// The `Co-authored-by` trailer for a crew's landed commit (#879, widened
+/// #1707/#1709 to the shared multi-contributor
+/// [`newt_core::attribution::Attribution`] format): the crew's editing
+/// **model**, the `"{harness} crew"` execution context, and the resolved
+/// harness identity EMAIL (default: GitHub User https://github.com/newt-agent).
+/// A crew leaf always has exactly one editing model, so this is a
+/// single-entry ledger rather than the accumulating session ledger — but it
+/// renders through the SAME [`Attribution::trailer`] as the main session
+/// path, so the two commit paths can never format attribution differently.
+/// Pure.
 fn crew_coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> String {
-    // The `Model:` line pairs with the commit-time Harness/Operator/Time/Date
-    // fields stamped by newt-git's `sign_message`, forming the full footer:
-    //   Co-authored-by: <model> <email>
-    //   Model: <model>
-    //   Harness: <brand> v<ver> | Operator: <op> | Time: <t> | Date: <d>
-    format!(
-        "Co-authored-by: {model} <{}>\nModel: {model}",
-        identity.email
+    newt_core::attribution::Attribution::new(
+        model,
+        format!("{} crew", newt_core::build_info::harness_name()),
+        identity.email.clone(),
     )
+    .trailer()
 }
 
 #[async_trait]
@@ -604,15 +606,18 @@ mod tests {
     }
 
     #[test]
-    fn crew_coauthor_trailer_names_the_model_under_resolved_email() {
-        // #879: the editing MODEL is the co-author NAME; the resolved harness
-        // EMAIL makes GitHub attribute the commit to the configured account.
+    fn crew_coauthor_trailer_names_the_model_and_crew_harness_under_resolved_email() {
+        // #879, widened #1707/#1709: the editing MODEL is the co-author name,
+        // the harness is credited as "<harness> crew" (a crew leaf is a
+        // distinct execution context from the main session), and the
+        // resolved harness EMAIL makes GitHub attribute the commit to the
+        // configured account.
         let id = newt_core::AgentIdentity::default();
         let t = crew_coauthor_trailer("ornith:35b", &id);
         assert_eq!(
             t,
             format!(
-                "Co-authored-by: ornith:35b <{}>\nModel: ornith:35b",
+                "Co-authored-by: ornith:35b (newt-agent crew) <{}>",
                 id.email
             )
         );
@@ -628,7 +633,7 @@ mod tests {
         };
         assert_eq!(
             crew_coauthor_trailer("m", &custom),
-            "Co-authored-by: m <custom@example.com>\nModel: m"
+            "Co-authored-by: m (newt-agent crew) <custom@example.com>"
         );
     }
 

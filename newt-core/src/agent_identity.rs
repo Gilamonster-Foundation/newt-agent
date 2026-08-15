@@ -245,9 +245,10 @@ pub struct AgentIdentity {
     /// (GitHub User no-reply for <https://github.com/newt-agent>).
     pub email: String,
 
-    /// Optional model identifier used in the Co-authored-by header.
-    /// When set, the trailer reads `Co-Authored-By: name (model) <email>`.
-    /// When unset, the header omits the model parenthetical.
+    /// Optional model override for [`AgentIdentity::co_author_trailer`]'s
+    /// PREVIEW rendering (`newt identity`). The live commit path does not
+    /// read this field — it stamps whichever models actually contributed,
+    /// via [`crate::attribution::AttributionLedger`] (#1707/#1709).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
@@ -533,17 +534,23 @@ impl AgentIdentity {
         self.operator.clone().or_else(default_operator)
     }
 
-    /// A `Co-Authored-By:` trailer line for commit messages.
+    /// A PREVIEW `Co-authored-by:` trailer line (`newt identity`), in the
+    /// same `Co-authored-by: <model> (<harness>) <email>` format the live
+    /// commit path stamps via [`crate::attribution::AttributionLedger`]
+    /// (#1707/#1709) — the one authoritative trailer shape, so this preview
+    /// can never show something the harness would not actually produce.
     ///
-    /// When `model` is `Some`, the header reads `Co-Authored-By: name (model)
-    /// <email>`; otherwise the header is `Co-Authored-By: name <email>`
-    /// (no model parenthetical).
+    /// Uses [`AgentIdentity::model`] if configured, else a placeholder
+    /// (`<model>`) — the live path always has a real resolved model; this
+    /// static config field rarely does.
     #[must_use]
     pub fn co_author_trailer(&self) -> String {
-        match &self.model {
-            Some(model) => format!("Co-Authored-By: {} ({}) <{}>", self.name, model, self.email),
-            None => format!("Co-Authored-By: {} <{}>", self.name, self.email),
-        }
+        crate::attribution::Attribution::new(
+            self.model.as_deref().unwrap_or("<model>"),
+            crate::build_info::harness_name(),
+            self.email.clone(),
+        )
+        .trailer()
     }
 
     /// The configured signing-key path, tilde-expanded. `None` when unset
@@ -743,23 +750,33 @@ name = "custom[bot]"
     }
 
     #[test]
+    #[serial_test::serial(newt_brand_name_env)]
     fn co_author_trailer_format() {
+        // SAFETY: serialized against other NEWT_BRAND_NAME-mutating tests.
+        unsafe { std::env::remove_var("NEWT_BRAND_NAME") };
         let id = AgentIdentity::default();
+        // #1707/#1709: the preview trailer now matches the live
+        // multi-contributor format — model primary (placeholder when
+        // `AgentIdentity::model` is unset), harness parenthetical, email
+        // last — not `name (model) <email>`.
         assert_eq!(
             id.co_author_trailer(),
-            "Co-Authored-By: newt-agent <309460085+newt-agent@users.noreply.github.com>"
+            "Co-authored-by: <model> (newt-agent) <309460085+newt-agent@users.noreply.github.com>"
         );
     }
 
     #[test]
+    #[serial_test::serial(newt_brand_name_env)]
     fn co_author_trailer_with_model() {
+        // SAFETY: serialized against other NEWT_BRAND_NAME-mutating tests.
+        unsafe { std::env::remove_var("NEWT_BRAND_NAME") };
         let id = AgentIdentity {
             model: Some("sakamakismile/Ornith-1.0-35B-NVFP4".to_string()),
             ..AgentIdentity::default()
         };
         assert_eq!(
             id.co_author_trailer(),
-            "Co-Authored-By: newt-agent (sakamakismile/Ornith-1.0-35B-NVFP4) <309460085+newt-agent@users.noreply.github.com>"
+            "Co-authored-by: sakamakismile/Ornith-1.0-35B-NVFP4 (newt-agent) <309460085+newt-agent@users.noreply.github.com>"
         );
     }
 

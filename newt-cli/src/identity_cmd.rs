@@ -184,7 +184,9 @@ mod tests {
         assert!(out.contains("newt-agent"));
         assert!(out.contains("309460085+newt-agent@users.noreply.github.com"));
         assert!(!out.contains("[bot]"));
-        assert!(out.contains("Co-Authored-By:"));
+        // #1707/#1709: lowercase, matching the live multi-contributor
+        // trailer format (`newt_core::attribution::Attribution::trailer`).
+        assert!(out.contains("Co-authored-by:"));
         assert!(out.contains("signing-key: <none>"));
         assert!(out.contains("github-app:  <none>"));
         assert!(out.contains("tokens:      <none>"));

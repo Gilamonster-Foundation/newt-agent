@@ -986,14 +986,17 @@ fn sign_message(message: &str, coauthor: Option<&str>) -> String {
     }
 }
 
-/// The full attribution footer: the session-built `trailer` (Co-authored-by +
-/// Model line) followed by the commit-time Harness/Operator/Time/Date line.
-/// Pure given the clock + process env; reads `NEWT_BRAND_NAME` /
-/// `NEWT_OPERATOR` / `git config user.name` lazily at commit time.
+/// The full attribution footer: the session-built `trailer` — now
+/// potentially several `Co-authored-by:` lines, one per
+/// [`newt_core::attribution::Attribution`] contributor (#1707/#1709), no
+/// longer a single line + a redundant `Model:` line — followed by the
+/// commit-time Harness/Operator/Time/Date line. Pure given the clock +
+/// process env; reads `NEWT_BRAND_NAME` / `NEWT_OPERATOR` / `git config
+/// user.name` lazily at commit time.
 fn attribution_block(trailer: &str) -> String {
     let harness = format!(
         "{} v{}",
-        brand_name(),
+        newt_core::build_info::harness_name(),
         newt_core::build_info::VERSION_WITH_COMMIT
     );
     let operator = operator_name().unwrap_or_else(|| "unknown".to_string());
@@ -1003,15 +1006,6 @@ fn attribution_block(trailer: &str) -> String {
         now.format("%H:%M %Z"),
         now.format("%Y-%m-%d"),
     )
-}
-
-/// The harness/brand name — `NEWT_BRAND_NAME` so a rebrand (e.g.
-/// gilamonster-agent) stamps its own name; default `newt-agent`.
-fn brand_name() -> String {
-    std::env::var("NEWT_BRAND_NAME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "newt-agent".to_string())
 }
 
 /// The operator name for the footer: `NEWT_OPERATOR` override, then git's

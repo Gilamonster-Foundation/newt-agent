@@ -57,15 +57,50 @@ same way a bug fix without a regression test is incomplete.
 
 ## Model attribution
 
-- If an LLM materially contributes to a commit, identify it with a
-  `Co-authored-by` trailer in the commit message.
-- Use the model/tool identity the session is actually running under. Do not
-  credit a generic "AI Assistant".
-- Known trailers:
-  - `Co-authored-by: Codex <codex@openai.com>`
-  - `Co-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
-- If multiple LLMs contribute to the same commit, include one trailer per
-  contributing model.
+Newt mechanically maintains a **multi-contributor attribution ledger**
+(`newt_core::attribution::AttributionLedger`, #1707/#1709) for every commit
+— not a single "current model" field. Every AI model/harness pair that
+materially contributed to a commit gets its OWN trailer:
+
+```
+Co-authored-by: <MODEL> (<HARNESS>) <EMAIL>
+```
+
+Example — a session that moved through four distinct model/harness pairs
+before landing one commit:
+
+```
+Co-authored-by: GPT-5.6 Sol (newt-agent) <309460085+newt-agent@users.noreply.github.com>
+Co-authored-by: Claude Opus 4.8 (Claude Code) <309460085+newt-agent@users.noreply.github.com>
+Co-authored-by: GPT-5.3-Codex (Codex CLI) <309460085+newt-agent@users.noreply.github.com>
+Co-authored-by: Nemotron (newt-agent crew) <309460085+newt-agent@users.noreply.github.com>
+```
+
+Rules:
+
+- **Identify model AND harness**, e.g. `GPT-5.6 Sol (newt-agent)`, not just
+  the model name. Never a generic "AI Assistant".
+- **One trailer per contributing model/harness pair, unlimited count.** A
+  `/model`, `/backend`, loadout, crew, or delegation switch mid-session ADDS
+  a contributor; it never discards one already accumulated for the pending
+  commit. The same model through two different harnesses (e.g. `Model A
+  (newt-agent)` vs `Model A (Codex)`) is two distinct contributors.
+- **Deduplicate identical `(model, harness, email)` identities**, preserving
+  first-contribution order — do not list the same contributor three times
+  because it made three writes.
+- **Default attribution email:**
+  `309460085+newt-agent@users.noreply.github.com` (the dedicated
+  `github.com/newt-agent` account's noreply address). An explicitly
+  configured `agent-identity.toml` email overrides this. Provider-specific
+  emails (`codex@openai.com`, `noreply@anthropic.com`) are NOT required or
+  used for automatic attribution — every trailer on one commit shares the
+  same configured/default email; only the model and harness vary.
+- **This is mechanical, not a model instruction.** The embedded `git` tool
+  stamps the ledger's accumulated trailers itself; do not hand-write
+  `Co-authored-by` lines yourself when using it — see the per-turn "Git
+  commit identity" guidance the harness already gives you. If you must shell
+  out to `git` directly (bypassing the embedded tool), you get no automatic
+  multi-contributor credit at all — prefer the embedded tool.
 
 ## Coverage floor
 

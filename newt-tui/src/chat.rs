@@ -2052,22 +2052,46 @@ pub(crate) fn run_chat(
     // an `init` op, so it is useful even before a repo exists. The commit author
     // is the resolved AgentIdentity (`newt-agent` User default, overridable).
     let session_identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
-    let session_git_tool: Option<newt_git::LocalGitTool> = {
+    // #1707/#1709: the session-scoped pending multi-contributor attribution
+    // ledger. Every non-read-only tool call that succeeds records the
+    // CURRENTLY resolved model here (see `ledger_note_attribution` in
+    // newt-core's agent loop) — a `/model`/`/backend`/loadout switch mid-turn
+    // therefore ADDS a contributor rather than overwriting the one computed
+    // at session start, which is what silently regressed to single-model,
+    // frozen-at-boot attribution before this fix.
+    let attribution_ledger = std::cell::RefCell::new(
+        newt_core::attribution::AttributionLedger::new(session_identity.email.clone()),
+    );
+    let mut session_git_tool: Option<newt_git::LocalGitTool> = {
         Some(newt_git::LocalGitTool {
             root: std::path::PathBuf::from(workspace),
             author: newt_git::Author {
                 name: session_identity.name.clone(),
                 email: session_identity.email.clone(),
             },
-            // Auto-sign commits with the AI credit (the tool owns this so it is
-            // always present and correctly formatted — the model is told it's
-            // automatic, see runtime_context_block). Model = the session's
-            // model; email = the resolved harness identity.
-            coauthor: Some(coauthor_trailer(&inf_model, &session_identity)),
+            // Auto-sign commits with the AI credit (the tool owns this so it
+            // is always present and correctly formatted — the model is told
+            // it's automatic, see runtime_context_block). Refreshed from
+            // `attribution_ledger` at the top of every loop iteration below,
+            // so it always reflects every contributor accumulated since the
+            // last successful commit, not merely whichever model was active
+            // when the session booted. `None` here (nothing accumulated yet).
+            coauthor: None,
         })
     };
 
     loop {
+        // #1707/#1709: refresh the embedded git tool's coauthor trailer(s)
+        // from the CURRENT attribution ledger state before this turn's
+        // ChatCtx is built, so a contributor recorded on a previous turn
+        // (including one under a model/backend since switched away from) is
+        // reflected in whatever commit this turn might make. `None` (not an
+        // empty string) when nothing is pending, so `sign_message` correctly
+        // treats "no contributor yet" as "do not stamp a trailer".
+        if let Some(tool) = session_git_tool.as_mut() {
+            let rendered = attribution_ledger.borrow().render();
+            tool.coauthor = (!rendered.is_empty()).then_some(rendered);
+        }
         // #1668: the ONE preference-pin persistence site. Every operator
         // posture ACTION marked since the last pass — a successful
         // `/backends <name>` / `/model <name>` / `/backend <kind> <model>`, a
@@ -6603,6 +6627,7 @@ pub(crate) fn run_chat(
                                         // only under a `retry` profile). The write tools
                                         // record into it; the post-turn gate reverts from it.
                                         write_ledger: retry_ledger.as_ref(),
+                                        attribution: Some(&attribution_ledger),
                                         // Esc-to-interrupt flag, tripped by the watcher.
                                         cancel: Some(&turn_cancel),
                                         #[cfg(feature = "live-spill")]
@@ -6658,6 +6683,24 @@ pub(crate) fn run_chat(
                     // error; preserve that transition as unattributed evidence.
                     let artifact_head_after_turn =
                         git_head_snapshot(session_git_tool.as_ref(), &turn_caveats);
+                    // #1707/#1709: HEAD moving this turn IS "a commit landed"
+                    // — the exact fact this snapshot pair already exists to
+                    // observe (`record_observed_head_transition` below), read
+                    // a second time for a different purpose. A successful
+                    // commit consumed whatever the ledger held (stamped via
+                    // `session_git_tool`'s `coauthor`, refreshed at the top of
+                    // this loop), so clear it; anything else — no commit
+                    // attempted, denied, or failed — leaves HEAD unmoved and
+                    // the pending contributors intact for the next attempt.
+                    if artifact_head_before_turn
+                        .as_ref()
+                        .and_then(|s| s.head.as_deref())
+                        != artifact_head_after_turn
+                            .as_ref()
+                            .and_then(|s| s.head.as_deref())
+                    {
+                        attribution_ledger.borrow_mut().clear();
+                    }
                     if let (Some(sink), Some(turn)) =
                         (artifact_sink, active_prompt_context.as_ref())
                     {
