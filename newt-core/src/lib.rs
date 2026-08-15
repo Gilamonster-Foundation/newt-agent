@@ -191,7 +191,10 @@ pub use navigator::{
     RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
 };
 pub use project_map::ProjectMapProvider;
-pub use runtime::{BackendState, RuntimeSettingsSnapshot};
+pub use runtime::{
+    BackendAxisAction, BackendState, OperatorPreferencePin, PreferenceActions, PreferenceApplyPlan,
+    PreferenceAxes, RouteModel, RuntimeSettingsSnapshot,
+};
 pub use tenacity::Tenacity;
 pub use where_is::{
     build_where_is_index, build_where_is_index_from_workspace, execute_where_is,

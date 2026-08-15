@@ -26,6 +26,25 @@ generalizes), #531 (ex-command row), #416/#419 (`InputSurface` seam),
 `docs/decisions/live_spill_viewport.md`, herdr `src/workspace.rs` /
 `src/workspace/tab.rs` (shape reference only).
 
+> **Naming (PR #1684, 2026-08-14):** the type this document calls `PosturePin`
+> ships as **`newt_core::OperatorPreferencePin`**, on the conversation row's
+> `preference_pin` column. It was renamed precisely to enforce the
+> behavior-vs-authority boundary this ADR depends on: `/posture` (#307,
+> `ActivePosture`) is an authority CEILING holding a `Caveats` clamp, is
+> process-lifetime, and is deliberately never persisted — one identifier apart
+> from a persisted, fail-open pin was too close. Read every `PosturePin` below
+> as `OperatorPreferencePin`; the shape and the resume semantics are as
+> described. Its sibling types are `PreferenceApplyPlan`, `PreferenceActions`
+> (the per-axis operator-action record), and `PreferenceAxes` (the axes this
+> invocation's explicit flags own). The store accessors are
+> `update_preference_pin` / `preference_pin`. There is no `PosturePin::capture`
+> — action-scoped capture replaced it with `OperatorPreferencePin::merged`,
+> applied to actions drained once per REPL iteration, so the deactivation
+> flush is belt-and-braces for posture (as §"Naming" below already records)
+> and load-bearing only for the sidecar + input stash. This ADR's
+> `SessionBaseline` ships as `newt_tui::PreferenceBaseline` — the invocation
+> baseline, snapshotted once at session start.
+
 Operator-fixed constraints (non-negotiable inputs to this design):
 bottom-anchored tab bar; one conversation per tab, each carrying its own
 backend+psyche posture via #1668's `PosturePin` applied through the existing

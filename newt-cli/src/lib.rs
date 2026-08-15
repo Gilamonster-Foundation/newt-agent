@@ -465,6 +465,29 @@ impl BackendArgs {
     }
 }
 
+/// Which posture axes the `--backend-*` flag group owns for THIS invocation.
+///
+/// #1668 review-2 finding 4. Axis ownership asks what the operator NAMED on
+/// this command line — not whether they also supplied a destination. Recording
+/// used to live inside the "has a destination" arm, with two consequences:
+/// `--backend-name X --resume A` let A's stored pin reroute the session away
+/// from X, and `--backend-model M` was never recorded on ANY path, so a pin
+/// naming a model beat the flag the operator had just typed. Both are the
+/// precedence inversion #1668 exists to prevent, and neither could even be
+/// REPORTED by the "your flag beats the pin" notice, because that notice is
+/// driven by the same axes.
+///
+/// A bare destination (`--backend-endpoint`, `--backend-model-path`) with no
+/// `--backend-name` still owns the backend axis: it pins where this run talks
+/// to just as firmly as a name does.
+fn backend_flag_axes(over: &newt_core::config::BackendOverride) -> newt_core::PreferenceAxes {
+    newt_core::PreferenceAxes {
+        backend: over.name.is_some() || over.endpoint.is_some() || over.model_path.is_some(),
+        model: over.model.is_some(),
+        ..Default::default()
+    }
+}
+
 fn parse_tier(s: &str) -> Result<newt_core::Tier, String> {
     use newt_core::Tier;
     match s.trim().to_ascii_uppercase().as_str() {
@@ -1048,10 +1071,24 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // NEWT_PROVIDER to the backend so the tier→backend selector picks exactly
     // it. This is the explicit escape hatch against discovery/probe drop-ins
     // silently rerouting the session (the local-ollama-fallback incident).
+    //
+    // #1668: an axis THIS invocation set explicitly is recorded, so a resumed
+    // conversation's stored preference pin never overwrites the flag the
+    // operator just typed (the same precedence the `--backend-*` doc above
+    // states). An ambient `NEWT_PROVIDER`/`NEWT_DGX_MODEL` exported by the
+    // operator counts too — config.rs already documents it as always-wins —
+    // but the #545 sticky settings restore below deliberately does NOT: that
+    // is last run's choice, and this conversation's pin outranks it.
+    newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+        backend: std::env::var_os("NEWT_PROVIDER").is_some(),
+        model: std::env::var_os("NEWT_DGX_MODEL").is_some(),
+        ..Default::default()
+    });
     {
         let over = cli.backend.to_override();
         if !over.is_empty() {
             let has_destination = over.endpoint.is_some() || over.model_path.is_some();
+            newt_core::runtime::record_cli_preference_axes(backend_flag_axes(&over));
             let provider = over.name.clone().unwrap_or_else(|| "cli".to_string());
             newt_core::config::set_cli_backend_override(over);
             if has_destination {
@@ -1068,6 +1105,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // the same var the crew-runner build below reads — for full effect.
     if cli.obsessive {
         let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
+        // #1668: both dials were set explicitly this run — a stored pin must
+        // not quietly undo them.
+        newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+            cognition: true,
+            tenacity: true,
+            ..Default::default()
+        });
         // SAFETY: single-threaded before the TUI starts any async work.
         unsafe { std::env::set_var("NEWT_TEAM", "1") };
         eprintln!(
@@ -1081,6 +1125,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // agentic loop reads when it builds each turn's WorkflowRuntimeState.
     if let Some(level) = cli.tenacity {
         newt_core::tenacity::set_cli_tenacity(level);
+        // #1668: explicit this run — beats a resumed conversation's pin.
+        newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+            tenacity: true,
+            ..Default::default()
+        });
     }
 
     // CLI `--cognition`: install the session cognition override (→ the
@@ -1091,6 +1140,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         newt_core::cognition::set_cli_cognition(newt_core::cognition::CognitionOverride::Set(
             level,
         ));
+        // #1668: explicit this run — beats a resumed conversation's pin.
+        newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+            cognition: true,
+            ..Default::default()
+        });
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
@@ -1163,6 +1217,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                         if std::env::var_os("NEWT_PROVIDER").is_none() {
                             if let Some(p) = &loadout.provider {
                                 std::env::set_var("NEWT_PROVIDER", p);
+                                // #1668: a --loadout axis is explicit this run.
+                                newt_core::runtime::record_cli_preference_axes(
+                                    newt_core::PreferenceAxes {
+                                        backend: true,
+                                        ..Default::default()
+                                    },
+                                );
                             }
                         }
                         // Model selection: the catalog resolves `@variant` (catalog
@@ -1172,6 +1233,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                             if let Some(m) = &loadout.model {
                                 let bare = m.split('@').next().unwrap_or(m);
                                 std::env::set_var("NEWT_DGX_MODEL", bare);
+                                // #1668: a --loadout axis is explicit this run.
+                                newt_core::runtime::record_cli_preference_axes(
+                                    newt_core::PreferenceAxes {
+                                        model: true,
+                                        ..Default::default()
+                                    },
+                                );
                             }
                         }
                     }
@@ -1801,6 +1869,81 @@ async fn run_mcp(persona: Option<&str>) -> anyhow::Result<()> {
     #[cfg(not(unix))]
     {
         newt_mcp_server::run_stdio(persona).await
+    }
+}
+
+#[cfg(test)]
+mod backend_flag_axis_tests {
+    use super::backend_flag_axes;
+    use newt_core::config::BackendOverride;
+
+    fn over() -> BackendOverride {
+        BackendOverride::default()
+    }
+
+    /// #1668 review-2 finding 4: `--backend-name X` owns the backend axis with
+    /// no destination given. Before the fix this returned `backend: false`, so
+    /// `newt --backend-name sol --resume A` let A's pin reroute the session off
+    /// the backend the operator had just named on the command line.
+    #[test]
+    fn a_named_backend_owns_the_backend_axis_without_a_destination() {
+        let axes = backend_flag_axes(&BackendOverride {
+            name: Some("sol".into()),
+            ..over()
+        });
+        assert!(axes.backend, "--backend-name owns the backend axis");
+        assert!(!axes.model, "and says nothing about the model axis");
+    }
+
+    /// #1668 review-2 finding 4: `--backend-model M` owns the MODEL axis. This
+    /// was recorded on no path at all, so a stored pin naming a model silently
+    /// beat the flag — the precedence inversion, inverted.
+    #[test]
+    fn an_explicit_backend_model_owns_the_model_axis() {
+        let axes = backend_flag_axes(&BackendOverride {
+            model: Some("qwen3-coder_30b".into()),
+            ..over()
+        });
+        assert!(axes.model, "--backend-model owns the model axis");
+        assert!(
+            !axes.backend,
+            "naming only a model does not claim the backend axis"
+        );
+    }
+
+    /// A bare destination still owns the backend axis — it pins where this run
+    /// talks to as firmly as a name does. (The pre-fix behavior, preserved.)
+    #[test]
+    fn a_bare_destination_still_owns_the_backend_axis() {
+        assert!(
+            backend_flag_axes(&BackendOverride {
+                endpoint: Some("http://dgx1.test:8080".into()),
+                ..over()
+            })
+            .backend
+        );
+        assert!(
+            backend_flag_axes(&BackendOverride {
+                model_path: Some("/models/x.gguf".into()),
+                ..over()
+            })
+            .backend
+        );
+    }
+
+    /// The negative: unrelated `--backend-*` knobs claim NO posture axis. An
+    /// over-broad rule would suppress a pin the operator never overrode, which
+    /// fails in the quiet direction — the conversation's stored posture simply
+    /// stops applying and nothing says why.
+    #[test]
+    fn unrelated_backend_knobs_own_no_posture_axis() {
+        let axes = backend_flag_axes(&BackendOverride {
+            api_key_env: Some("OPENAI_API_KEY".into()),
+            ram_gib: Some(24.0),
+            ..over()
+        });
+        assert!(!axes.backend);
+        assert!(!axes.model);
     }
 }
 

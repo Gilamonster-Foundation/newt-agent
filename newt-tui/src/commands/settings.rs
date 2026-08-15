@@ -221,6 +221,10 @@ fn tenacity_command(arg: &str) -> String {
         // previously lacked (a session override could not be released).
         "auto" | "inherit" | "reset" => {
             clear_cli_tenacity();
+            // #1668: releasing the dial is an operator action too — it UNPINS
+            // the axis so the conversation follows the invocation baseline
+            // again (an unpin the pin would otherwise have no way to express).
+            newt_core::runtime::mark_tenacity_choice(None);
             format!(
                 "tenacity → auto (override cleared) — now {} (from persona / config / family)",
                 effective_tenacity().label()
@@ -229,6 +233,9 @@ fn tenacity_command(arg: &str) -> String {
         other => match other.parse::<Tenacity>() {
             Ok(level) => {
                 set_cli_tenacity(level);
+                // #1668: marked beside the setter, so only a PARSED level
+                // pins — the error arm below mutates and marks nothing.
+                newt_core::runtime::mark_tenacity_choice(Some(level));
                 format!("tenacity → {} — {}", level.label(), level.describe())
             }
             Err(e) => {
@@ -280,15 +287,20 @@ fn cognition_command(arg: &str) -> String {
         }
         "off" | "none" => {
             set_cli_cognition(CognitionOverride::Off);
+            // #1668: each of these three is an operator posture action on the
+            // cognition axis — including `auto`, which UNPINS it.
+            newt_core::runtime::mark_cognition_choice(CognitionOverride::Off);
             "cognition → off — no reasoning controls will be sent".to_string()
         }
         "auto" | "reset" | "persona" => {
             set_cli_cognition(CognitionOverride::Unset);
+            newt_core::runtime::mark_cognition_choice(CognitionOverride::Unset);
             "cognition → auto — following the active persona".to_string()
         }
         other => match other.parse::<Cognition>() {
             Ok(level) => {
                 set_cli_cognition(CognitionOverride::Set(level));
+                newt_core::runtime::mark_cognition_choice(CognitionOverride::Set(level));
                 format!("cognition → {} — {}", level.label(), level.describe())
             }
             Err(e) => format!("{e}  {usage}"),
@@ -325,6 +337,11 @@ fn psyche_command(rest: &str) -> String {
     // be turned on mid-session; say so honestly and point at the launch flag.
     if sub.eq_ignore_ascii_case("obsessive") || sub.eq_ignore_ascii_case("obsessive-relentless") {
         let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
+        // #1668: `obsessive` sets BOTH live dials, so it pins both axes.
+        newt_core::runtime::mark_cognition_choice(newt_core::cognition::CognitionOverride::Set(
+            cog,
+        ));
+        newt_core::runtime::mark_tenacity_choice(Some(ten));
         return format!(
             "obsessive engaged (live): cognition → {}, tenacity → {}.\n\
              crew is a launch gate — relaunch with `newt --obsessive` (or set \
@@ -570,6 +587,74 @@ mod tests {
 
         set_cli_cognition(CognitionOverride::Unset);
         set_cli_tenacity(Tenacity::Standard);
+    }
+
+    /// #1668: the dial setters mark a posture ACTION on exactly the axis they
+    /// set — and the read-only / refused forms mark nothing, which is what
+    /// keeps merely LOOKING at the dials out of a conversation's pin. Driven
+    /// through the real `/psyche` seam, not a hand-copy of the mark calls.
+    #[test]
+    fn psyche_setters_mark_exactly_the_axis_they_change() {
+        use newt_core::cognition::CognitionOverride;
+        use newt_core::role_profile::Cognition;
+        use newt_core::runtime::drain_preference_actions;
+        use newt_core::tenacity::Tenacity;
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let _ = drain_preference_actions();
+
+        // Status / list / unknown / error forms: read-only, so no action.
+        for rest in [
+            "",
+            "status",
+            "cognition",
+            "cognition list",
+            "cognition transcending",
+            "tenacity",
+            "tenacity list",
+            "tenacity nonsense",
+            "banana",
+            "edit",
+        ] {
+            let _ = super::psyche_command(rest);
+            assert!(
+                drain_preference_actions().is_empty(),
+                "`/psyche {rest}` must not pin anything"
+            );
+        }
+
+        // A level sets exactly its own axis.
+        let _ = super::psyche_command("cognition deliberating");
+        let a = drain_preference_actions();
+        assert_eq!(
+            a.cognition,
+            Some(CognitionOverride::Set(Cognition::Deliberating))
+        );
+        assert_eq!((a.tenacity, a.backend, a.model), (None, None, None));
+
+        let _ = super::psyche_command("tenacity relentless");
+        let a = drain_preference_actions();
+        assert_eq!(a.tenacity, Some(Some(Tenacity::Relentless)));
+        assert_eq!(a.cognition, None);
+
+        // `off` and `auto` are actions too — `auto` UNPINS the axis.
+        let _ = super::psyche_command("cognition off");
+        assert_eq!(
+            drain_preference_actions().cognition,
+            Some(CognitionOverride::Off)
+        );
+        let _ = super::psyche_command("cognition auto");
+        assert_eq!(
+            drain_preference_actions().cognition,
+            Some(CognitionOverride::Unset)
+        );
+        let _ = super::psyche_command("tenacity auto");
+        assert_eq!(drain_preference_actions().tenacity, Some(None));
+
+        // `obsessive` sets BOTH live dials, so it pins both.
+        let _ = super::psyche_command("obsessive");
+        let a = drain_preference_actions();
+        assert!(a.cognition.is_some() && a.tenacity.is_some(), "{a:?}");
+        assert_eq!((a.backend, a.model), (None, None), "crew/backend untouched");
     }
 
     #[test]

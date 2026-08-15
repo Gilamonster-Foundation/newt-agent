@@ -388,12 +388,19 @@ impl PanelState {
     pub(crate) fn apply(&self) {
         if self.cognition.is_dirty() {
             set_cli_cognition(self.cognition.value());
+            // #1668: the panel's DIRTY dials are operator posture actions —
+            // exactly the axes the operator moved, so an untouched row of the
+            // panel never pins anything. (The model spinner's pick is marked
+            // on the `/model` path the caller routes it through, after that
+            // path's served-validation gate.)
+            newt_core::runtime::mark_cognition_choice(self.cognition.value());
         }
         if self.tenacity.is_dirty() {
             match self.tenacity.value() {
                 Some(t) => set_cli_tenacity(t),
                 None => clear_cli_tenacity(),
             }
+            newt_core::runtime::mark_tenacity_choice(self.tenacity.value());
         }
     }
 
@@ -1106,6 +1113,52 @@ mod tests {
             "untouched tenacity stays un-overridden"
         );
         assert_eq!(cli_cognition(), CognitionOverride::Unset);
+    }
+
+    /// #1668: a panel apply marks a posture ACTION for exactly its DIRTY dials
+    /// — so browsing the panel (bare `/psyche` opens it) can never pin, and a
+    /// one-dial edit cannot drag the other dial's ambient value into the pin.
+    #[test]
+    fn apply_marks_a_preference_action_only_for_the_dirty_dials() {
+        use newt_core::runtime::drain_preference_actions;
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        clear_cli_tenacity();
+        let _ = drain_preference_actions();
+
+        // A browse-and-apply with nothing touched marks nothing.
+        let s = panel(None, two_personas(), Tenacity::Standard);
+        s.apply();
+        assert!(
+            drain_preference_actions().is_empty(),
+            "an untouched panel must not pin"
+        );
+
+        // Touch ONLY cognition → only the cognition axis is marked.
+        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        s.down(); // → model
+        s.down(); // → cognition
+        s.cycle(1);
+        assert!(s.cognition.is_dirty() && !s.tenacity.is_dirty());
+        s.apply();
+        let a = drain_preference_actions();
+        assert_eq!(a.cognition, Some(s.cognition.value()));
+        assert_eq!(a.tenacity, None, "an untouched dial must not be pinned");
+        assert_eq!((a.backend, a.model), (None, None), "panel owns dials only");
+
+        // Touch ONLY tenacity, to its `auto` position → the axis is UNPINNED.
+        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        s.down();
+        s.down();
+        s.down(); // → tenacity
+        for _ in 0..tenacity_ladder().len() {
+            s.cycle(-1);
+        }
+        assert_eq!(s.tenacity.value(), None, "reached auto");
+        s.apply();
+        let a = drain_preference_actions();
+        assert_eq!(a.tenacity, Some(None), "auto unpins the axis");
+        assert_eq!(a.cognition, None);
     }
 
     #[test]
