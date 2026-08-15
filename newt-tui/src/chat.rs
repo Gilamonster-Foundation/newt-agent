@@ -1660,6 +1660,22 @@ pub(crate) fn run_chat(
     let mut interrupted_objective: Option<newt_core::TurnPromptContext> = None;
     let mut pending_clarification: Option<PendingClarification> = None;
 
+    // #1669 PR-A: the open tabs. Seeded with this session's first tab, whose
+    // SessionId is the one minted above — so the startup tab IS the session
+    // that already owns lifecycle events, not a second identity layered over
+    // it. Later tabs mint their own; switching between them never mints.
+    //
+    // The per-tab locals (sidecar fields, input stash) stay locals while a tab
+    // is ACTIVE and are stashed into `TabState` on deactivation, per the ADR's
+    // staged switch. That keeps the hot path untouched: an active tab reads
+    // plain locals exactly as before tabs existed.
+    let mut tabs = crate::tabs::TabSet::new(lifecycle_session.clone(), &active_conversation_id);
+    // Unsubmitted prompt text for the ACTIVE tab. PR-C threads this to the
+    // rich input's type-ahead seam; in PR-A it is the stash slot the staged
+    // switch reads and writes, so the switch contract is complete and
+    // testable before any key binding exists to fill it.
+    let mut tab_input_stash = String::new();
+
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
     //
@@ -1896,6 +1912,18 @@ pub(crate) fn run_chat(
             &mut base_model,
         ) {
             print_newt(&format!("warning: {warning}"), color, verbose);
+        }
+        // #1669 PR-A: the ACTIVE tab always names the conversation the session
+        // actually holds. Conversation identity changes down many paths —
+        // `/resume`, `/new`, persona rotation, roadmap navigation — and each is
+        // a conversation switch, not a tab switch: the tab keeps its SessionId
+        // and simply comes to hold a different conversation.
+        //
+        // Reconciled once here rather than at each of those sites, because that
+        // enumeration is exactly what #1691 records going stale. A tab switch
+        // sets both consistently, so this is a no-op on that path.
+        if tabs.active().conversation_id() != active_conversation_id {
+            tabs.active_mut().hold_conversation(&active_conversation_id);
         }
         // The input surface can panic (assertion `fd != -1`) when the terminal
         // file descriptor becomes invalid — most commonly from file-descriptor
@@ -2539,6 +2567,94 @@ pub(crate) fn run_chat(
                             color,
                             verbose,
                         );
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // #1669 PR-A: the `/tab` family. Text-only in this slice —
+                    // no bar, no vi keys, no mouse — so this IS the whole tab
+                    // surface, and `/tab` with no argument is the piped-visible
+                    // view of tab state.
+                    if slash_command == "tab" || slash_command.starts_with("tab ") {
+                        let arg = slash_command.strip_prefix("tab").unwrap_or("").trim();
+                        // Lean and ephemeral refuse honestly rather than going
+                        // silent or reading as an unknown command: the namespace
+                        // stays discoverable and the doctrine line explicit.
+                        // Tabs are RichTUI presentation over conversation
+                        // switching; lean expresses the same capability as
+                        // scrolled lines via /resume, /new and /rename.
+                        let refusal = if !surface_is_rich {
+                            Some(
+                                "tabs are a rich-TUI feature; this session is \
+                                 single-conversation — use /resume, /new and /rename",
+                            )
+                        } else if ephemeral_session {
+                            Some(
+                                "tabs need conversation persistence; this session is \
+                                 ephemeral and leaves no trace by design",
+                            )
+                        } else {
+                            None
+                        };
+                        match (refusal, conversation_store.as_ref()) {
+                            (Some(why), _) => print_newt(why, color, verbose),
+                            (None, None) => print_newt(
+                                "tabs need conversation persistence; this session has no store",
+                                color,
+                                verbose,
+                            ),
+                            (None, Some(store)) => match crate::tabs::parse_tab_command(arg) {
+                                Err(usage) => print_newt(&usage, color, verbose),
+                                Ok(action) => {
+                                    let mut tab_ctx = crate::tab_switch::TabSwitchCtx {
+                                        store,
+                                        persona_store: &persona_store,
+                                        workspace,
+                                        memory: &mut memory,
+                                        system: &mut system,
+                                        active_persona: &mut active_persona,
+                                        active_conversation_id: &mut active_conversation_id,
+                                        compress_state: &mut compress_state,
+                                        scratchpad: &scratchpad_store,
+                                        step_ledger: &step_ledger,
+                                        active_prompt_context: &mut active_prompt_context,
+                                        mode_states: &conversation_mode_states,
+                                        baseline: &preference_baseline,
+                                        pending: &mut pending_preference_actions,
+                                        base_provider: &mut base_provider,
+                                        base_model: &mut base_model,
+                                        cfg: &cfg,
+                                        choice: &mut choice,
+                                        inf_url: &mut inf_url,
+                                        inf_model: &mut inf_model,
+                                        inf_kind: &mut inf_kind,
+                                        inf_key: &mut inf_key,
+                                        inf_context_window: &mut inf_context_window,
+                                        turns_this_conversation: &mut turns_this_conversation,
+                                        last_resume_listing: &mut last_resume_listing,
+                                        active_roadmap_id: &mut active_roadmap_id,
+                                        interrupted_objective: &mut interrupted_objective,
+                                        input_stash: &mut tab_input_stash,
+                                        color,
+                                        verbose,
+                                    };
+                                    let url_changed = crate::tab_switch::handle_tab_action(
+                                        action,
+                                        &mut tab_ctx,
+                                        &mut tabs,
+                                    );
+                                    // Same re-probe discipline as every other
+                                    // backend switch: a tab whose pin repoints
+                                    // the endpoint must repoint DGX telemetry
+                                    // too, or verbose `hw:` lines report the
+                                    // box the other tab was talking to.
+                                    if url_changed && verbose {
+                                        dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                            .map(|d| d.into_sampler(2));
+                                    }
+                                }
+                            },
+                        }
                         surface.save_history();
                         println!();
                         continue;
@@ -3821,7 +3937,64 @@ pub(crate) fn run_chat(
                                     },
                                 };
                                 if let Some(id) = target {
-                                    if id == active_conversation_id {
+                                    // #1669 PR-A: `/resume` on a conversation
+                                    // this session already holds in ANOTHER tab
+                                    // is an **activation**, not a replacement.
+                                    // Resuming it in place would claim one
+                                    // conversation twice in one process and
+                                    // leave two tabs pointing at the same row.
+                                    //
+                                    // Note this is the one place the two verbs
+                                    // meet, and they stay distinct: the target
+                                    // tab is ACTIVATED (baseline reset ⊕ its
+                                    // pin, history-independent), not resumed
+                                    // (sparse overlay over live state).
+                                    let open_in_tab = tabs
+                                        .find_by_conversation(&id)
+                                        .filter(|idx| *idx != tabs.active_index());
+                                    if let Some(idx) = open_in_tab {
+                                        let mut tab_ctx = crate::tab_switch::TabSwitchCtx {
+                                            store,
+                                            persona_store: &persona_store,
+                                            workspace,
+                                            memory: &mut memory,
+                                            system: &mut system,
+                                            active_persona: &mut active_persona,
+                                            active_conversation_id: &mut active_conversation_id,
+                                            compress_state: &mut compress_state,
+                                            scratchpad: &scratchpad_store,
+                                            step_ledger: &step_ledger,
+                                            active_prompt_context: &mut active_prompt_context,
+                                            mode_states: &conversation_mode_states,
+                                            baseline: &preference_baseline,
+                                            pending: &mut pending_preference_actions,
+                                            base_provider: &mut base_provider,
+                                            base_model: &mut base_model,
+                                            cfg: &cfg,
+                                            choice: &mut choice,
+                                            inf_url: &mut inf_url,
+                                            inf_model: &mut inf_model,
+                                            inf_kind: &mut inf_kind,
+                                            inf_key: &mut inf_key,
+                                            inf_context_window: &mut inf_context_window,
+                                            turns_this_conversation: &mut turns_this_conversation,
+                                            last_resume_listing: &mut last_resume_listing,
+                                            active_roadmap_id: &mut active_roadmap_id,
+                                            interrupted_objective: &mut interrupted_objective,
+                                            input_stash: &mut tab_input_stash,
+                                            color,
+                                            verbose,
+                                        };
+                                        let url_changed = crate::tab_switch::handle_tab_action(
+                                            crate::tabs::TabAction::Goto(idx),
+                                            &mut tab_ctx,
+                                            &mut tabs,
+                                        );
+                                        if url_changed && verbose {
+                                            dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                                .map(|d| d.into_sampler(2));
+                                        }
+                                    } else if id == active_conversation_id {
                                         // #1030: resuming the CURRENT conversation is a
                                         // no-op — short-circuit so we never release +
                                         // (fail to) re-acquire our own claim, nor reset
@@ -6593,8 +6766,16 @@ pub(crate) fn run_chat(
     // #1030: release this process's live-owner claim on the way out so the next
     // launch, another newt, or a later /resume can take the conversation. A
     // crash that skips this leaves a stale claim the next claim reclaims.
+    //
+    // #1669 PR-A: with tabs, this process holds N claims, not one — every open
+    // tab's conversation. Releasing only the active one would leave every other
+    // tab's conversation claimed until a stale-reclaim, so `/resume` on it from
+    // a fresh newt would refuse and start a replacement instead. Release
+    // exactly what the tabs hold.
     if let Some(store) = conversation_store.as_ref() {
-        let _ = store.release(&active_conversation_id);
+        for held in tabs.claimed_conversations() {
+            let _ = store.release(held);
+        }
     }
 
     surface.save_history();

@@ -31,6 +31,15 @@ mod prompt;
 mod prompt_visibility_test;
 #[cfg(feature = "live-spill")]
 mod spill_view;
+/// #1669 PR-A — the staged tab switch and the one tab-action handler, against
+/// live session state. Separate from the pure model so the staging discipline
+/// (Stage-0 read, deactivate, hydrate, reset⊕overlay, owner handoff) reads in
+/// one place instead of inside `run_chat`.
+mod tab_switch;
+/// #1669 PR-A — the pure session-tab model. TTY-free and unit-tested on its
+/// own; `chat.rs` performs the staged switch and the lifecycle owner handoff
+/// this module only reports.
+mod tabs;
 /// #1677 — the PTY acceptance proof that the transcript pager hands the
 /// terminal back (cooked mode + primary screen) on every exit path, including
 /// a panic. Same tier and same reasoning as `prompt_visibility_test`: a
@@ -4705,6 +4714,48 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> bo
 ///
 /// `Err` carries a one-line warning for the caller to print; the session is
 /// never blocked by a posture write.
+/// A tab's display label: the conversation's title, else `#<short-id>`.
+///
+/// #1669 PR-A, factored from the #1671 footer rule (`chat.rs:1997-2007`) so the
+/// bar, the `/tab` list, and the footer cannot disagree. **Labels are never
+/// stored** — computed fresh at every read — so `/rename` honesty is free and a
+/// title can never go stale in a list.
+pub(crate) fn tab_label(store: &newt_core::ConversationStore, conversation_id: &str) -> String {
+    store
+        .title(conversation_id)
+        .ok()
+        .flatten()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| format!("#{}", short_conversation_id(conversation_id)))
+}
+
+/// Retitle `conversation_id`, creating its row if it has none yet.
+///
+/// #1669 PR-A, extracted from the `/rename` arm so it can target a tab that is
+/// NOT the active conversation — the `/tab rename [n] <title>` case.
+///
+/// **The #1030 guard is preserved verbatim and is the reason this matches on
+/// `exists()` rather than using `unwrap_or(false)`:** a transient store error
+/// (SQLITE_BUSY, or NFS IO under concurrent-newt contention) must never read as
+/// "absent" and route into `create_with_id`, whose `INSERT OR REPLACE` would
+/// destroy the live conversation and CASCADE-drop its turns. An error stays an
+/// error.
+pub(crate) fn rename_conversation(
+    store: &newt_core::ConversationStore,
+    conversation_id: &str,
+    title: &str,
+    persona: Option<&str>,
+) -> anyhow::Result<()> {
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("a title cannot be empty");
+    }
+    match store.exists(conversation_id)? {
+        true => store.rename(conversation_id, title),
+        false => store.create_with_id(conversation_id, title, persona),
+    }
+}
+
 pub(crate) fn persist_preference_actions(
     store: Option<&newt_core::ConversationStore>,
     conversation_id: &str,
