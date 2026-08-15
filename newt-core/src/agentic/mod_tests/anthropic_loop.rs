@@ -693,6 +693,8 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.max_tool_rounds = 2;
+    let mut end_reason = None;
+    c.end_reason = Some(&mut end_reason);
     let mut mcp = RecordingMcp {
         name: "my_server__get_thing",
         result: "ok",
@@ -702,8 +704,9 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
         .await
         .expect("cap exit should produce the summary");
 
-    assert_eq!(reply, "capped summary");
+    assert!(reply.starts_with("capped summary"), "{reply}");
     assert!(!streamed, "the cap-exit summary is stream:false");
+    assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
     assert_eq!(
         calls.load(Ordering::SeqCst),
         3,

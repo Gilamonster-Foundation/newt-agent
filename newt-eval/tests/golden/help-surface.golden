@@ -13,7 +13,7 @@
   /memory                  - show context window / notes usage
   /compress [focus]        - compress context now, optionally focused on a topic (alias: /compact)
   /summarizer              - show or change the summarizer backend and knobs
-  /rounds [n|double|reset|unlimited] - set this session's tool-call round limit
+  /rounds [n|double|reset|config|unlimited] - set this session's tool-call round limit
   /context                 - show the active context manager + features
   /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)
   /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)

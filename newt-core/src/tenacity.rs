@@ -12,13 +12,19 @@
 //! Tenacity is a single operator-facing LEVEL that maps to concrete
 //! action-forcing knobs, so a per-model-family default can pick one level rather
 //! than tune raw numbers. Higher tenacity forces the edit sooner and makes plan
-//! mode hand off to a mandatory action. [`Tenacity::Standard`] reproduces the
+//! mode hand off to a mandatory action. An explicitly selected
+//! [`Tenacity::Relentless`] posture also raises the default tool-round budget;
+//! automatic family defaults do not. [`Tenacity::Standard`] reproduces the
 //! historical hardcoded behaviour (`READ_ONLY_NUDGE_AFTER = 3`), so it is a
 //! behaviour-preserving default.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+
+/// Bounded sentinel used for an operator-selected relentless run. This is high
+/// enough to behave as "finish the objective" while remaining finite.
+pub const RELENTLESS_TOOL_ROUND_TARGET: usize = 10_000;
 
 /// How insistently the harness drives the model from reading to acting.
 ///
@@ -64,6 +70,20 @@ impl Tenacity {
         matches!(self, Self::Insistent | Self::Relentless)
     }
 
+    /// Project the default tool-round budget when this level was selected by
+    /// the operator. Relentless is the only level that changes the cap: it uses
+    /// the shared effectively-unlimited target without lowering a larger
+    /// configured value. Callers retain explicit round overrides as the final
+    /// precedence layer, and should not apply this to automatic family defaults
+    /// (small loop-prone models often resolve to relentless there).
+    pub fn project_tool_round_limit(self, configured: usize) -> usize {
+        if self == Self::Relentless {
+            configured.max(RELENTLESS_TOOL_ROUND_TARGET)
+        } else {
+            configured
+        }
+    }
+
     /// Stable lowercase label — the wire/config/`/tenacity` spelling.
     pub fn label(self) -> &'static str {
         match self {
@@ -97,6 +117,24 @@ impl Tenacity {
             Self::Relentless,
         ]
     }
+}
+
+/// Compose the tool-round safety valve without losing provenance. Automatic
+/// persona/config/family tenacity is intentionally not accepted here: callers
+/// pass only a direct operator choice, because small loop-prone families often
+/// default to relentless and must not silently receive 10,000 rounds. An
+/// explicit `/rounds`/`--max-rounds` value remains the outermost override.
+#[must_use]
+pub fn resolve_tool_round_limit(
+    configured: usize,
+    explicit_tenacity: Option<Tenacity>,
+    explicit_rounds: Option<usize>,
+) -> usize {
+    explicit_rounds.unwrap_or_else(|| {
+        explicit_tenacity
+            .map(|level| level.project_tool_round_limit(configured))
+            .unwrap_or(configured)
+    })
 }
 
 impl fmt::Display for Tenacity {
@@ -474,6 +512,27 @@ mod tests {
         assert!(!Tenacity::Standard.exit_plan_requires_edit());
         assert!(Tenacity::Insistent.exit_plan_requires_edit());
         assert!(Tenacity::Relentless.exit_plan_requires_edit());
+    }
+
+    #[test]
+    fn relentless_can_project_an_operator_selected_round_target() {
+        for level in [Tenacity::Relaxed, Tenacity::Standard, Tenacity::Insistent] {
+            assert_eq!(level.project_tool_round_limit(40), 40);
+        }
+        assert_eq!(
+            Tenacity::Relentless.project_tool_round_limit(40),
+            RELENTLESS_TOOL_ROUND_TARGET
+        );
+        assert_eq!(
+            Tenacity::Relentless.project_tool_round_limit(20_000),
+            20_000,
+            "the posture must not lower an already larger configured budget"
+        );
+        assert_eq!(
+            resolve_tool_round_limit(40, Some(Tenacity::Relentless), Some(7)),
+            7,
+            "a direct round limit remains the outermost operator choice"
+        );
     }
 
     #[test]

@@ -169,6 +169,14 @@ fn resolve_runtime_posture(cfg: &Config, model: &str) -> RuntimeSettingsSnapshot
     RuntimeSettingsSnapshot::resolve(cfg, None, None)
 }
 
+fn solve_tool_round_limit(
+    configured: usize,
+    explicit_tenacity: Option<newt_core::Tenacity>,
+    explicit_rounds: Option<usize>,
+) -> usize {
+    newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, explicit_rounds)
+}
+
 /// The cognition level this backend can actually receive from Newt. Responses
 /// always has a defined `reasoning.effort` projection; Chat Completions must
 /// explicitly opt into the local generation fields; Ollama has no projection.
@@ -317,9 +325,11 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
     dc.reasoning_replay_scope = backend.reasoning_replay_scope();
-    if let Some(r) = args.max_rounds {
-        dc.max_tool_rounds = r;
-    }
+    dc.max_tool_rounds = solve_tool_round_limit(
+        dc.max_tool_rounds,
+        newt_core::tenacity::cli_tenacity(),
+        args.max_rounds,
+    );
     // OCAP-ON confined lane: replace the default unconfined caveat with a
     // workspace-fenced authority. The tool gate consults `dc.caveats` and the
     // permission_gate stays `None` — an in-fence write auto-consents; an
@@ -743,6 +753,26 @@ mod tests {
         assert_eq!(
             resolve_runtime_posture(&Config::default(), "model").tenacity,
             newt_core::Tenacity::Insistent
+        );
+    }
+
+    #[test]
+    fn explicit_relentless_tenacity_expands_solve_unless_max_rounds_wins() {
+        use newt_core::tenacity::RELENTLESS_TOOL_ROUND_TARGET;
+        use newt_core::Tenacity;
+
+        assert_eq!(
+            solve_tool_round_limit(40, Some(Tenacity::Relentless), None),
+            RELENTLESS_TOOL_ROUND_TARGET
+        );
+        assert_eq!(
+            solve_tool_round_limit(40, Some(Tenacity::Relentless), Some(2)),
+            2
+        );
+        assert_eq!(
+            solve_tool_round_limit(40, None, None),
+            40,
+            "automatic family tenacity must not silently expand the safety cap"
         );
     }
 

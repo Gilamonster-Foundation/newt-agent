@@ -450,6 +450,14 @@ fn tool_round_limit_commands_parse_expected_forms() {
         ToolRoundLimitCommand::Reset
     );
     assert_eq!(
+        parse_tool_round_limit_command("/rounds auto").unwrap(),
+        ToolRoundLimitCommand::Reset
+    );
+    assert_eq!(
+        parse_tool_round_limit_command("/rounds config").unwrap(),
+        ToolRoundLimitCommand::Configured
+    );
+    assert_eq!(
         parse_tool_round_limit_command("/rounds unlimited").unwrap(),
         ToolRoundLimitCommand::Unlimited
     );
@@ -466,24 +474,106 @@ fn tool_round_limit_commands_parse_expected_forms() {
 
 #[test]
 fn tool_round_limit_override_resolves_and_reports() {
-    assert_eq!(effective_tool_round_limit(25, None), 25);
-    assert_eq!(effective_tool_round_limit(25, Some(50)), 50);
+    use newt_core::Tenacity;
+
+    assert_eq!(effective_tool_round_limit(25, None, None), 25);
+    assert_eq!(
+        effective_tool_round_limit(25, Some(Tenacity::Standard), None),
+        25
+    );
+    assert_eq!(
+        effective_tool_round_limit(25, Some(Tenacity::Relentless), None),
+        EFFECTIVELY_UNLIMITED_TOOL_ROUNDS,
+        "an explicitly selected relentless posture should not hit the ordinary safety cap"
+    );
+    assert_eq!(
+        effective_tool_round_limit(25, Some(Tenacity::Relentless), Some(7)),
+        7,
+        "a deliberate /rounds override remains the outermost limit"
+    );
+    assert_eq!(effective_tool_round_limit(25, None, Some(50)), 50);
     assert_eq!(double_tool_round_limit(25), 50);
     assert_eq!(
         double_tool_round_limit(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS),
         EFFECTIVELY_UNLIMITED_TOOL_ROUNDS
     );
     assert_eq!(
-        tool_round_limit_status(25, None),
+        double_tool_round_limit(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS * 2),
+        EFFECTIVELY_UNLIMITED_TOOL_ROUNDS * 2,
+        "doubling must never lower a larger configured/session value"
+    );
+    assert_eq!(
+        tool_round_limit_status(25, None, None),
         "tool-call round limit: 25 (config/model default)"
     );
     assert_eq!(
-        tool_round_limit_status(25, Some(50)),
+        tool_round_limit_status(25, None, Some(50)),
         "tool-call round limit: 50 this session (config/model default 25)"
     );
+    assert_eq!(
+        tool_round_limit_status(25, Some(Tenacity::Relentless), None),
+        "tool-call round limit: 10000 (effectively unlimited; explicit relentless tenacity; config/model default 25)"
+    );
+    assert_eq!(
+        tool_round_limit_status(25, Some(Tenacity::Relentless), Some(7)),
+        "tool-call round limit: 7 this session (explicit relentless tenacity default 10000 (effectively unlimited); config/model default 25)"
+    );
     assert!(
-        tool_round_limit_status(25, Some(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS))
+        tool_round_limit_status(25, None, Some(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS))
             .contains("effectively unlimited")
+    );
+
+    let relentless = Some(Tenacity::Relentless);
+    assert_eq!(
+        apply_tool_round_limit_command(25, relentless, None, ToolRoundLimitCommand::Configured,),
+        Some(25),
+        "config explicitly bypasses the tenacity-derived default"
+    );
+    assert_eq!(
+        apply_tool_round_limit_command(25, relentless, Some(25), ToolRoundLimitCommand::Reset,),
+        None,
+        "reset returns to automatic derivation"
+    );
+    assert_eq!(
+        effective_tool_round_limit(
+            25,
+            relentless,
+            apply_tool_round_limit_command(25, relentless, Some(25), ToolRoundLimitCommand::Reset,),
+        ),
+        EFFECTIVELY_UNLIMITED_TOOL_ROUNDS
+    );
+    assert_eq!(
+        apply_tool_round_limit_command(20_000, relentless, None, ToolRoundLimitCommand::Unlimited,),
+        Some(20_000),
+        "unlimited must not lower an already larger effective limit"
+    );
+    assert!(
+        tool_round_limit_status(20_000, relentless, None).contains("explicit relentless tenacity"),
+        "status keeps operator provenance even when config already exceeds the sentinel"
+    );
+}
+
+#[test]
+fn psyche_apply_summary_includes_the_effective_round_source() {
+    use newt_core::Tenacity;
+
+    let summary = psyche_apply_summary(
+        "psyche: contemplating + relentless",
+        40,
+        Some(Tenacity::Relentless),
+        Some(7),
+    );
+    assert!(
+        summary.starts_with("psyche: contemplating + relentless"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("tool-call round limit: 7 this session"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("relentless tenacity default 10000"),
+        "{summary}"
     );
 }
 

@@ -122,6 +122,44 @@ fn upgrade_origin_for_interrupted_objective(
     }
 }
 
+/// Once a fresh operator objective has a prompt receipt, the prior round-cap
+/// continuation link is stale. Continuations and harness retries keep it; a
+/// fresh objective injected by an attached web client clears it just like a
+/// TUI objective. Slash commands never reach the receipt path, so diagnostics
+/// such as `/rounds` cannot accidentally consume it.
+fn consume_interrupted_objective_for_accepted_prompt(
+    interrupted: &mut Option<newt_core::TurnPromptContext>,
+    origin: &ModelInputOrigin,
+) {
+    if matches!(
+        origin,
+        ModelInputOrigin::Operator | ModelInputOrigin::WebInjected { .. }
+    ) {
+        interrupted.take();
+    }
+}
+
+fn round_cap_pause_footer() -> &'static str {
+    "⏸ If work remains, reply `continue` to resume this objective, or use `/rounds <n>` first to change the per-turn limit."
+}
+
+/// The core handoff is shared by TUI, solve, and web callers, so the interactive
+/// continuation affordance belongs here. Returning the decorated value (rather
+/// than printing a second-only notice) ensures conversation persistence and
+/// memory see exactly what the operator saw.
+fn decorate_round_cap_reply(reply: &str, end_reason: Option<newt_core::TurnEndReason>) -> String {
+    if end_reason != Some(newt_core::TurnEndReason::RoundCap) {
+        return reply.to_string();
+    }
+    let footer = round_cap_pause_footer();
+    if reply.is_empty() {
+        footer.to_string()
+    } else {
+        let separator = if reply.ends_with('\n') { "\n" } else { "\n\n" };
+        format!("{reply}{separator}{footer}")
+    }
+}
+
 #[cfg(test)]
 mod origin_upgrade_tests {
     use super::*;
@@ -191,6 +229,94 @@ mod origin_upgrade_tests {
                 "a pending-clarification link outranks the round-cap link"
             ),
             other => panic!("existing continuation must be preserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn durable_substantive_operator_prompt_consumes_the_round_cap_link() {
+        let mut interrupted = Some(ctx());
+        consume_interrupted_objective_for_accepted_prompt(
+            &mut interrupted,
+            &ModelInputOrigin::Operator,
+        );
+        assert!(
+            interrupted.is_none(),
+            "a fresh accepted objective must not leave the old cap link armed"
+        );
+    }
+
+    #[test]
+    fn accepted_continuations_and_harness_retries_keep_the_round_cap_link() {
+        for origin in [
+            ModelInputOrigin::OperatorContinuation {
+                parent: Box::new(ctx()),
+            },
+            ModelInputOrigin::HarnessRetry {
+                parent: Box::new(ctx()),
+            },
+        ] {
+            let mut interrupted = Some(ctx());
+            consume_interrupted_objective_for_accepted_prompt(&mut interrupted, &origin);
+            assert!(
+                interrupted.is_some(),
+                "continuations and derived input must preserve the objective link"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_web_objective_consumes_the_old_round_cap_link() {
+        let mut interrupted = Some(ctx());
+        consume_interrupted_objective_for_accepted_prompt(
+            &mut interrupted,
+            &ModelInputOrigin::WebInjected {
+                inbox_id: "inbox".to_string(),
+            },
+        );
+        assert!(interrupted.is_none());
+    }
+
+    #[test]
+    fn round_cap_footer_is_deterministic_and_only_decorates_capped_replies() {
+        let reply = "Completed the parser; tests remain.";
+        let capped = decorate_round_cap_reply(reply, Some(newt_core::TurnEndReason::RoundCap));
+        assert!(capped.starts_with(reply), "{capped}");
+        assert!(capped.contains("If work remains"), "{capped}");
+        assert!(capped.contains("`continue`"), "{capped}");
+        assert!(capped.contains("`/rounds <n>`"), "{capped}");
+        assert_eq!(
+            decorate_round_cap_reply(reply, None),
+            reply,
+            "ordinary replies must remain byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn capped_progress_is_persistable_without_duplicate_notices_and_resumes_its_objective() {
+        let parent = ctx();
+        let core_handoff = "Progress captured.\n\nPaused at the tool-call limit of 40 rounds.";
+        let persisted =
+            decorate_round_cap_reply(core_handoff, Some(newt_core::TurnEndReason::RoundCap));
+        assert_eq!(
+            persisted.matches("tool-call limit").count(),
+            1,
+            "the TUI adds only the interactive affordance: {persisted}"
+        );
+        assert_eq!(persisted.matches('⏸').count(), 1, "{persisted}");
+        assert!(persisted.contains("`continue`"), "{persisted}");
+
+        let resumed = upgrade_origin_for_interrupted_objective(
+            ModelInputOrigin::Operator,
+            "continue",
+            Some(&parent),
+        );
+        match resumed {
+            ModelInputOrigin::OperatorContinuation { parent: linked } => assert_eq!(
+                linked.submitted_prompt().id(),
+                parent.submitted_prompt().id(),
+                "the persisted capped turn must resume the interrupted objective"
+            ),
+            other => panic!("capped progress must resume as a continuation, got {other:?}"),
         }
     }
 }
@@ -3176,56 +3302,38 @@ pub(crate) fn run_chat(
                             .find_model_tuning(&inf_model)
                             .and_then(|t| t.max_tool_rounds)
                             .unwrap_or_else(|| max_tool_rounds(&cfg));
+                        let explicit_tenacity = newt_core::tenacity::cli_tenacity();
                         match parse_tool_round_limit_command(&task) {
-                            Ok(ToolRoundLimitCommand::Show) => {
-                                print_newt(
-                                    &tool_round_limit_status(configured, max_tool_rounds_override),
-                                    color,
-                                    verbose,
-                                );
-                            }
-                            Ok(ToolRoundLimitCommand::Set(n)) => {
-                                max_tool_rounds_override = Some(n);
-                                print_newt(
-                                    &tool_round_limit_status(configured, max_tool_rounds_override),
-                                    color,
-                                    verbose,
-                                );
-                            }
-                            Ok(ToolRoundLimitCommand::Double) => {
-                                let current = effective_tool_round_limit(
+                            Ok(command) => {
+                                max_tool_rounds_override = apply_tool_round_limit_command(
                                     configured,
+                                    explicit_tenacity,
+                                    max_tool_rounds_override,
+                                    command,
+                                );
+                                let status = tool_round_limit_status(
+                                    configured,
+                                    explicit_tenacity,
                                     max_tool_rounds_override,
                                 );
-                                max_tool_rounds_override = Some(double_tool_round_limit(current));
+                                let status = match command {
+                                    ToolRoundLimitCommand::Reset => {
+                                        format!("round override cleared — {status}")
+                                    }
+                                    ToolRoundLimitCommand::Configured => {
+                                        format!("configured/model limit selected — {status}")
+                                    }
+                                    _ => status,
+                                };
                                 print_newt(
-                                    &tool_round_limit_status(configured, max_tool_rounds_override),
-                                    color,
-                                    verbose,
-                                );
-                            }
-                            Ok(ToolRoundLimitCommand::Reset) => {
-                                max_tool_rounds_override = None;
-                                print_newt(
-                                    &format!(
-                                        "tool-call round limit reset to {}",
-                                        describe_tool_round_limit(configured)
-                                    ),
-                                    color,
-                                    verbose,
-                                );
-                            }
-                            Ok(ToolRoundLimitCommand::Unlimited) => {
-                                max_tool_rounds_override = Some(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS);
-                                print_newt(
-                                    &tool_round_limit_status(configured, max_tool_rounds_override),
+                                    &status,
                                     color,
                                     verbose,
                                 );
                             }
                             Err(e) => print_newt(
                                 &format!(
-                                    "error: {e} — use /rounds [show|<n>|double|reset|unlimited]"
+                                    "error: {e} — use /rounds [show|<n>|double|reset|config|unlimited]"
                                 ),
                                 color,
                                 verbose,
@@ -3478,6 +3586,7 @@ pub(crate) fn run_chat(
                         );
                         active_prompt_context = None;
                         pending_clarification = None;
+                        interrupted_objective = None;
                         ephemeral_artifact_store =
                             session_artifact_store(ephemeral_session, &active_conversation_id)?;
                         // #1662: `/new` starts a new CONVERSATION, not a new
@@ -3691,6 +3800,7 @@ pub(crate) fn run_chat(
                             None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
                         }
                         if active_conversation_id != conversation_id_before {
+                            interrupted_objective = None;
                             let store = conversation_store.as_ref().ok_or_else(|| {
                                 anyhow::anyhow!("durable conversation restore lost its store")
                             })?;
@@ -3872,6 +3982,7 @@ pub(crate) fn run_chat(
                                                 ) {
                                                     Ok(banner) => {
                                                         turns_this_conversation = 0;
+                                                        interrupted_objective = None;
                                                         // #1668: conversation boundary —
                                                         // reset to the invocation
                                                         // baseline, then apply THIS
@@ -4040,6 +4151,7 @@ pub(crate) fn run_chat(
                                                         ) {
                                                             Ok(banner) => {
                                                                 turns_this_conversation = 0;
+                                                                interrupted_objective = None;
                                                                 // #1668: conversation
                                                                 // boundary — reset to the
                                                                 // invocation baseline, then
@@ -4159,6 +4271,7 @@ pub(crate) fn run_chat(
                         if active_conversation_id != conversation_id_before {
                             active_prompt_context = None;
                             pending_clarification = None;
+                            interrupted_objective = None;
                             ephemeral_artifact_store =
                                 session_artifact_store(ephemeral_session, &active_conversation_id)?;
                             // #1668 review-2 finding 1: `/persona clear` and
@@ -4465,6 +4578,7 @@ pub(crate) fn run_chat(
                                                 verbose,
                                             );
                                         }
+                                        let conversation_id_before = active_conversation_id.clone();
                                         let mut reset_ctx = ConversationResetContext {
                                             memory: &mut memory,
                                             system: &mut system,
@@ -4481,6 +4595,9 @@ pub(crate) fn run_chat(
                                             Ok(msg) => msg,
                                             Err(e) => format!("error: {e}"),
                                         };
+                                        if active_conversation_id != conversation_id_before {
+                                            interrupted_objective = None;
+                                        }
                                         print_newt(&msg, color, verbose);
                                         let _ = apply_persona_backend(
                                             active_persona.as_ref(),
@@ -4548,7 +4665,17 @@ pub(crate) fn run_chat(
                                         .as_ref()
                                         .and_then(|p| p.profile.backend.as_deref()),
                                 );
-                                print_newt(&snap.summary(), color, verbose);
+                                let configured_rounds = cfg
+                                    .find_model_tuning(&inf_model)
+                                    .and_then(|t| t.max_tool_rounds)
+                                    .unwrap_or_else(|| max_tool_rounds(&cfg));
+                                let summary = psyche_apply_summary(
+                                    &snap.summary(),
+                                    configured_rounds,
+                                    newt_core::tenacity::cli_tenacity(),
+                                    max_tool_rounds_override,
+                                );
+                                print_newt(&summary, color, verbose);
                             }
                         }
                         #[cfg(not(feature = "rich-tui"))]
@@ -4909,6 +5036,14 @@ pub(crate) fn run_chat(
                         &model_input_origin,
                     ) {
                         Ok(context) => {
+                            // Receipt creation is the durable acceptance point.
+                            // A fresh substantive operator ask supersedes the
+                            // old capped objective here; a bare continuation was
+                            // upgraded above and deliberately retains the link.
+                            consume_interrupted_objective_for_accepted_prompt(
+                                &mut interrupted_objective,
+                                &model_input_origin,
+                            );
                             // A3/W6: record the durable turn a web-injected prompt
                             // became — the additive, auditable "entered via web"
                             // proof (the receipt itself stays origin=operator, so
@@ -5117,6 +5252,7 @@ pub(crate) fn run_chat(
                         .unwrap_or_else(|| max_tool_rounds(&cfg));
                     let eff_max_tool_rounds = effective_tool_round_limit(
                         configured_max_tool_rounds,
+                        newt_core::tenacity::cli_tenacity(),
                         max_tool_rounds_override,
                     );
                     let eff_workflow_grace_rounds = model_tune
@@ -6170,7 +6306,20 @@ pub(crate) fn run_chat(
                         });
                         match response {
                             Ok((reply, was_streamed, usage, hallucinations)) => {
-                                if !was_streamed {
+                                // Core's cap handoff is caller-neutral. Add the
+                                // interactive TUI affordance before any display,
+                                // memory sync, artifact, or conversation save so
+                                // the visible and persisted replies are identical.
+                                let reply = decorate_round_cap_reply(&reply, turn_end_reason);
+                                if was_streamed
+                                    && turn_end_reason == Some(newt_core::TurnEndReason::RoundCap)
+                                {
+                                    // The model text was emitted incrementally;
+                                    // only the deterministic footer remains to be
+                                    // rendered. Non-streamed replies render the
+                                    // already-decorated value below.
+                                    print_newt(round_cap_pause_footer(), color, verbose);
+                                } else if !was_streamed {
                                     // Step 25.4 (#568): the non-stream fallback also
                                     // renders Markdown when it is active.
                                     if markdown_enabled(&cfg, color, markdown_override) {
