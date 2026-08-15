@@ -15408,6 +15408,7 @@ mod tool_round_cap_tests {
                             crew_runner: None,
                             operating_mode_control: None,
                             plan_mode_control: None,
+                            steering: None,
                             completed_spill_renderer: None,
                         },
                         &mut Mcp::empty(),

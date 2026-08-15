@@ -86,6 +86,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         crew_runner: None,
         operating_mode_control: None,
         plan_mode_control: None,
+        steering: None,
         completed_spill_renderer: None,
     }
 }
