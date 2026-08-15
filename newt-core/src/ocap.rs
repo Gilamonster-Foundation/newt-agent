@@ -280,33 +280,68 @@ pub fn verify_b1() -> Verification {
 /// Verify **disclosure-gate-live-path**: every tool result passes a single
 /// disclosure filter before it is pushed into `messages` (one chokepoint).
 ///
-/// Still [`Verification::Absent`] — but the mechanism now exists. step-6.1a wired
-/// the by-value [`DisclosureFilter`] into the SINGLE live tool-result chokepoint
-/// (`maybe_offload_tool_result`), with the canary ratchet guard proving it redacts
-/// a registered value in any encoding. This stays `Absent` until (a) the caller
-/// registers the session secret into `ChatCtx.disclosure` at session start, and
-/// (b) the next-turn observation + summary paths converge on the same value filter
-/// (today shape-only). Then a canary seeded at session start is provably absent
-/// from the model-facing stream and this returns `Verified`.
+/// Whether the model-ingress disclosure backstop is in effect **on this
+/// thread, right now** — probed, not asserted.
+///
+/// The mechanism is wired: step-6.1a put the by-value [`DisclosureFilter`]
+/// in the tool-result chokepoint (`maybe_offload_tool_result`), and step-6.6
+/// extended it to the summary path (`redact_model_facing`) and the memory /
+/// observation / compaction / spill path (`redact_secrets`), the last of
+/// which reaches its filter ONLY through the [`scoped_session_disclosure`]
+/// thread-local.
+///
+/// That thread-local is why this must be a live probe. [`redact_session_ingress`]
+/// is *the identity function* when no filter is installed on the calling
+/// thread, and [`ScopedSessionDisclosure`] is `!Send` and thread-bound — so
+/// "the backstop protects this text" is a property of a thread, not of the
+/// build. A turn that ran on a thread which never installed the guard would
+/// silently lose value-filtering on those paths.
+///
+/// Returns `Absent` — fail-closed, per this module's contract — whenever the
+/// backstop cannot be shown to be working here. Outside a live turn (`newt
+/// doctor`, startup, headless tooling) that is the *expected* answer and the
+/// `reason` says so; it reports the runtime state, not a build defect.
+///
+/// **This function used to return `Verified` unconditionally** while citing
+/// the TLS backstop as its evidence, which made it a vacuous check: it would
+/// have reported exactly the same thing if the backstop had never been
+/// installed anywhere. See `the_gate_refuses_to_claim_a_backstop_that_is_not_installed`.
 #[must_use]
 pub fn verify_disclosure_gate() -> Verification {
-    // Enforced (step-6.6): the by-value session filter is REGISTERED at session
-    // start (`session_disclosure_filter`, both live builders) and consulted on
-    // EVERY model-ingress funnel — the tool-result chokepoint
-    // (`maybe_offload_tool_result`), the final-summary path (`redact_model_facing`),
-    // and the memory / observation / compaction / spill path (`redact_secrets`) —
-    // via the explicit `&DisclosureFilter` param AND the `scoped_session_disclosure`
-    // TLS backstop, so a registered secret cannot reach model context in any
-    // encoding through any of them. Note: flipping this alone does not enable
-    // `seed_live_credential`, which ALSO requires `verify_b1` (still Absent).
-    Verification::Verified {
-        evidence: "session secret registered + value-filtered at the tool-result, \
-                   summary, memory, and repeat-steer model-ingress funnels (TLS backstop); \
-                   guarded by no_model_ingress_funnel_leaks_a_registered_session_secret + \
-                   redact_secrets_value_filters_a_registered_session_secret + \
-                   repeat_steer_value_filters_a_registered_session_secret"
-            .into(),
-    }
+    const DEVIATION: &str = "disclosure-gate-live-path";
+    SESSION_DISCLOSURE.with(|slot| match &*slot.borrow() {
+        None => Verification::Absent {
+            deviation: DEVIATION,
+            reason: "no session disclosure filter is installed on this thread, so \
+                     `redact_session_ingress` is the identity function here — the \
+                     memory / observation / compaction / spill funnels would not \
+                     value-filter. Expected outside a live turn; inside one it means \
+                     the turn is running on a thread that never installed the guard."
+                .into(),
+        },
+        Some(filter) if !filter.redacts_what_it_registered() => Verification::Absent {
+            deviation: DEVIATION,
+            reason: if filter.is_empty() {
+                "a session disclosure filter is installed on this thread but has no \
+                 registered secrets, so it would catch nothing"
+                    .into()
+            } else {
+                "the session disclosure filter installed on this thread failed its own \
+                 redaction probe — a registered value survived `redact`"
+                    .into()
+            },
+        },
+        Some(_) => Verification::Verified {
+            evidence: "probed live on this thread: the installed session filter redacted \
+                       every value it has registered, so the tool-result, summary, memory \
+                       and repeat-steer model-ingress funnels all value-filter (the last \
+                       via the TLS backstop); guarded by \
+                       no_model_ingress_funnel_leaks_a_registered_session_secret + \
+                       redact_secrets_value_filters_a_registered_session_secret + \
+                       repeat_steer_value_filters_a_registered_session_secret"
+                .into(),
+        },
+    })
 }
 
 /// A live, scoped credential to seed (the `pa login` use case): a short-lived
@@ -455,13 +490,107 @@ mod tests {
         );
     }
 
+    /// A filter for probe tests. High-entropy, obviously synthetic.
+    fn probe_filter() -> DisclosureFilter {
+        let mut f = DisclosureFilter::new();
+        f.register("sk-probe-9f3a2b7c1d4e6a8b");
+        f
+    }
+
+    /// The gate answers the question it is asked — "is the backstop working
+    /// HERE" — rather than restating a build-time belief.
+    ///
+    /// This one test walks all three states in sequence because the contrast
+    /// IS the assertion: the pre-fix implementation returned `Verified` in all
+    /// three, so any test that exercised only one of them would have passed
+    /// against a function that never looked at anything.
     #[test]
-    fn disclosure_gate_verified_after_registration_and_funnel_coverage() {
-        // step-6.6: the disclosure gate is now ENFORCED (session secret registered
-        // + value-filtered at every model-ingress funnel). It reports Verified and
-        // names no open deviation.
-        assert!(verify_disclosure_gate().is_verified());
-        assert_eq!(verify_disclosure_gate().deviation(), None);
+    fn the_gate_distinguishes_the_three_backstop_states() {
+        // 1. Nothing installed → the identity function → refuse to claim.
+        assert!(
+            !verify_disclosure_gate().is_verified(),
+            "with no filter on this thread, redact_session_ingress is identity"
+        );
+        assert_eq!(
+            verify_disclosure_gate().deviation(),
+            Some("disclosure-gate-live-path")
+        );
+
+        // 2. Installed but registering nothing → catches nothing → refuse.
+        {
+            let _g = scoped_session_disclosure(DisclosureFilter::new());
+            assert!(!verify_disclosure_gate().is_verified());
+        }
+
+        // 3. Installed and provably redacting → verified, no deviation.
+        {
+            let _g = scoped_session_disclosure(probe_filter());
+            let v = verify_disclosure_gate();
+            assert!(v.is_verified(), "{v:?}");
+            assert_eq!(v.deviation(), None);
+        }
+
+        // And the guard restores: back to state 1.
+        assert!(!verify_disclosure_gate().is_verified());
+    }
+
+    /// The regression this fix exists for.
+    ///
+    /// `verify_disclosure_gate` used to return `Verified` unconditionally,
+    /// with evidence text that explicitly cited the `scoped_session_disclosure`
+    /// TLS backstop — while performing no check at all. It would have reported
+    /// exactly the same thing if the backstop had never been installed
+    /// anywhere, which is the definition of a vacuous check.
+    #[test]
+    fn the_gate_refuses_to_claim_a_backstop_that_is_not_installed() {
+        let v = verify_disclosure_gate();
+        assert!(!v.is_verified());
+        let reason = match &v {
+            Verification::Absent { reason, .. } => reason.clone(),
+            Verification::Verified { .. } => unreachable!("just asserted not verified"),
+        };
+        assert!(
+            reason.contains("identity function"),
+            "the reason must name the actual consequence, got: {reason}"
+        );
+    }
+
+    /// The property that protects the concurrency work (#1669 / the cockpit
+    /// train): `ScopedSessionDisclosure` is `!Send` and thread-bound, so a
+    /// turn that migrates onto a thread which never installed the guard loses
+    /// value-filtering on the memory / observation / compaction / spill path.
+    /// The gate must report that, not inherit the installing thread's claim.
+    #[test]
+    fn the_backstop_does_not_follow_the_gate_onto_another_thread() {
+        let _g = scoped_session_disclosure(probe_filter());
+        assert!(
+            verify_disclosure_gate().is_verified(),
+            "installed on this thread"
+        );
+
+        let elsewhere = std::thread::spawn(|| verify_disclosure_gate().is_verified())
+            .join()
+            .expect("probe thread");
+        assert!(
+            !elsewhere,
+            "the TLS backstop is per-thread — the gate must never claim it on a \
+             thread that did not install it"
+        );
+    }
+
+    /// The probe runs the real machinery, so it tracks `redact`'s documented
+    /// post-condition across every encoding rather than spot-checking the raw
+    /// form. A filter that only caught the raw value would not verify.
+    #[test]
+    fn the_probe_covers_every_tracked_encoding() {
+        let f = probe_filter();
+        assert!(f.redacts_what_it_registered());
+        // Non-vacuous control: the same predicate is false when there is
+        // nothing registered, so it is reading state rather than returning a
+        // constant.
+        assert!(!DisclosureFilter::new().redacts_what_it_registered());
+        assert!(DisclosureFilter::new().is_empty());
+        assert!(!f.is_empty());
     }
 
     #[test]
@@ -640,6 +769,39 @@ impl DisclosureFilter {
             return "[REDACTED: withheld — disclosed a registered secret]".to_string();
         }
         out
+    }
+
+    /// Has anything been registered? A filter with no secrets catches nothing,
+    /// so it is not a backstop even though it is installed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+
+    /// Prove — by running the real machinery — that this filter redacts every
+    /// value it has registered, in every tracked encoding.
+    ///
+    /// This is what makes [`verify_disclosure_gate`] a check rather than a
+    /// claim. It asserts [`redact`](Self::redact)'s documented post-condition
+    /// (`!leaks(&redact(t))`) using the filter's own authoritative
+    /// [`leaks`](Self::leaks) decision, so a regression in either direction —
+    /// an encoding that stops being excised, or a `leaks` that stops seeing
+    /// one — turns the gate `Absent` instead of leaving it green.
+    ///
+    /// No registered value escapes: the probe strings are built, redacted and
+    /// judged entirely inside this method, and only a `bool` leaves it.
+    /// `false` for an empty filter — there is nothing to prove.
+    #[must_use]
+    pub fn redacts_what_it_registered(&self) -> bool {
+        !self.secrets.is_empty()
+            && self.secrets.iter().all(|s| {
+                Self::encodings(s).iter().all(|enc| {
+                    // A realistic carrier, so the probe exercises inline
+                    // excision rather than a whole-string match.
+                    let probe = format!("probe prefix {enc} probe suffix");
+                    !self.leaks(&self.redact(&probe))
+                })
+            })
     }
 }
 
@@ -1612,11 +1774,30 @@ mod report_tests {
         // NetworkConfinement track their own verifiers (Enforced where the kernel
         // fence is available); process / credential still name b1 (their meet
         // includes the open credential-bearing b1 half).
-        let report = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
-        assert!(matches!(
-            report.achieved(Guarantee::DisclosureFiltering),
-            Achieved::Enforced { .. }
-        ));
+        // Disclosure filtering is now a LIVE, per-thread probe, so the report
+        // tracks it in both directions rather than restating a constant.
+        let bare = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+        assert!(
+            matches!(
+                bare.achieved(Guarantee::DisclosureFiltering),
+                Achieved::Unverified {
+                    deviation: "disclosure-gate-live-path",
+                    ..
+                }
+            ),
+            "no session filter on this thread ⇒ the row must be honest"
+        );
+        {
+            let mut f = DisclosureFilter::new();
+            f.register("sk-probe-9f3a2b7c1d4e6a8b");
+            let _g = scoped_session_disclosure(f);
+            let live = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+            assert!(matches!(
+                live.achieved(Guarantee::DisclosureFiltering),
+                Achieved::Enforced { .. }
+            ));
+        }
+        let report = bare;
         // NetworkConfinement still names the full credential-bearing b1 floor
         // (the seccomp egress deny is opt-in and does not cover run_command).
         assert!(matches!(
@@ -1737,7 +1918,22 @@ mod report_tests {
         let report = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
         let lines = report.summary_lines();
         assert_eq!(lines.len(), Guarantee::ALL.len());
-        assert!(lines.iter().any(|l| l == "disclosure-filtering: enforced"));
+        // Honest means honest in both directions: outside a live turn there is
+        // no thread-local backstop, and the summary says so rather than
+        // reporting a filter that is not there.
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("disclosure-filtering: OPEN (disclosure-gate-live-path)")));
+        {
+            let mut f = DisclosureFilter::new();
+            f.register("sk-probe-9f3a2b7c1d4e6a8b");
+            let _g = scoped_session_disclosure(f);
+            let live = SecurityReport::from_parts(&LINUX_CEILING, &RuntimeEvidence::current());
+            assert!(live
+                .summary_lines()
+                .iter()
+                .any(|l| l == "disclosure-filtering: enforced"));
+        }
         // Network confinement still names the full credential-bearing b1 floor
         // (the seccomp egress deny is opt-in and does not cover run_command).
         assert!(lines
@@ -1763,8 +1959,11 @@ mod report_tests {
             assert!(!report.is_enforced(Guarantee::FsConfinement));
             assert!(!report.is_enforced(Guarantee::FailClosedExecution));
         }
-        // Everywhere: disclosure filtering is process-independent and live.
-        assert!(report.is_enforced(Guarantee::DisclosureFiltering));
+        // Everywhere: disclosure filtering is a per-THREAD probe, not a
+        // process-wide constant. `SecurityReport::current()` runs on a thread
+        // with no session filter installed, so the honest answer is that the
+        // backstop is not in effect here.
+        assert!(!report.is_enforced(Guarantee::DisclosureFiltering));
     }
 }
 
