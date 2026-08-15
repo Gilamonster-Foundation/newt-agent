@@ -1068,3 +1068,61 @@ mod ownership_tests {
         assert_eq!(starts, 0, "a no-op activation announces nothing");
     }
 }
+
+/// #1669 PR-A — the single-turn invariant the whole ownership model rests on.
+///
+/// The ADR preserves a **synchronous single-turn REPL**: there is no legal tab
+/// switch while a model turn is in flight. That is what makes one ambient owner
+/// correct instead of per-session plumbing, so it deserves to be stated where
+/// someone changing it will read it.
+///
+/// **It is enforced by the borrow checker, not by convention.** A tab switch
+/// needs `TabSwitchCtx`, which holds `&mut` to the live session state a turn is
+/// already using — `memory`, `system`, `active_persona`, the backend quintet.
+/// While a turn holds those, no switch can be constructed; the code that would
+/// violate the invariant does not compile. The `/tab` arm therefore runs only
+/// from the command dispatch at the prompt, after the previous turn released
+/// everything.
+///
+/// The runtime test below pins the observable consequence: across a turn's
+/// whole emit sequence, ownership does not move.
+#[cfg(test)]
+mod single_turn_invariant {
+    use super::*;
+    use newt_core::lifecycle::{self, new_session_id, LifecycleEvent};
+
+    #[test]
+    fn there_is_no_supported_tab_switch_during_an_in_flight_turn() {
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let a = new_session_id();
+        let b = new_session_id();
+        let mut set = TabSet::new(a.clone(), "conv-a");
+        let (_i, open) = set.open(b.clone(), "conv-b");
+        open.apply();
+        set.activate(0).unwrap().apply();
+
+        // A turn, start to finish. Every one of these emitters is ambient —
+        // none carries a session — so all of them resolve through the owner.
+        for event in [
+            LifecycleEvent::TurnStarted,
+            LifecycleEvent::Thinking,
+            LifecycleEvent::ToolActivity {
+                tool: "run_command".into(),
+            },
+            LifecycleEvent::Blocked,
+            LifecycleEvent::Unblocked,
+            LifecycleEvent::TurnCompleted,
+        ] {
+            lifecycle::emit(event);
+            assert_eq!(
+                lifecycle::active_session().as_deref(),
+                Some(a.as_str()),
+                "ownership cannot move mid-turn — a switch would need &mut to \
+                 state this turn already holds, so it cannot even be built"
+            );
+        }
+        // And the tab set itself never moved.
+        assert_eq!(set.active_index(), 0);
+        assert_eq!(*set.active().session_id(), a);
+    }
+}
