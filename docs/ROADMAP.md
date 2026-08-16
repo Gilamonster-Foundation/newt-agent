@@ -928,6 +928,160 @@ caveat, example `newt.toml`.
 > at the worker/ACP entry points is Step 9.8's `AgenticConfig` — see the note in
 > Step 15.1's out-of-scope list.
 
+## Step 16 — session tabs (#1669) — the PR-A → PR-D train
+
+**ADR (normative):** `docs/decisions/session_tabs.md`. Treat it, and especially
+its state-transition table, as the acceptance contract for every slice here.
+
+### 16.1 — tab model + `/tab` text engine — **LANDED**
+
+`a2018bf3` (#1695) + `052de84e` (#1706). Session multiplexing works **via text
+today**, zero pixels changed: `/tab`, `/tab new`, `/tab <n>`,
+`/tab next|prev`, `/tab close [n]`, `/tab move <a> <b>`,
+`/tab rename [n] <title>`, `/tab retry`.
+
+What later slices may rely on:
+
+```
+one process
+  -> N stable SessionIds, one per open tab
+  -> exactly ONE active session owns the TERMINAL
+one conversation -> at most one open tab
+```
+
+> **Corrected by the #1717/#1718 execution-topology train.** This said "owns
+> the synchronous REPL" when written, and that is no longer true: #1718 moved
+> session execution off the terminal thread, so the REPL is not synchronous
+> and a session no longer owns it. What a session owns is the *terminal* —
+> keyboard, editor, status, bar, permission UI — while its own execution runs
+> on a session thread beneath. Later slices depend on the corrected form, not
+> the original: a bar that renders while a turn runs is only possible because
+> the terminal is no longer parked inside one.
+>
+> The ownership rule the rest of Step 16 is written against is:
+>
+> ```
+> the terminal owns interaction
+> a session owns execution
+> a turn owns mutable execution context   (SessionId binding, psyche snapshot)
+> ```
+>
+> The third line is load-bearing and was got wrong once already: binding
+> either the active `SessionId` or the psyche snapshot for a session's
+> lifetime freezes them across `/tab` switches and dial changes respectively.
+> See `newt-tui/src/session_worker.rs`.
+
+- Five authoritative operations: `create_fresh_tab`, `activate_tab`,
+  `adopt_conversation`, `close_tab`, `exit_release_all` — all in
+  `newt-tui/src/tab_switch.rs` over the pure model in `newt-tui/src/tabs.rs`.
+- **`activate = baseline ⊕ pin`, history-independent**; `/resume` = sparse
+  overlay. The two verbs are deliberately NOT merged.
+- **Restore is a transaction**: `prepare_conversation_restore` (every fallible
+  read, zero mutation) then `commit_conversation_restore`, which takes a
+  `CommitContext` carrying **no store handles** — a fallible read on the apply
+  path does not compile.
+- **`TransitionOutcome { url_changed, degraded }`** is returned by every
+  tab-activating operation. Consumers READ `degraded`; never infer it.
+- **Rowless tabs** own a `FreshSeed` until their row materializes; `/tab new`
+  creates **no ghost `/resume` row**.
+- Close = **release-without-end**; exit flushes then releases all claims.
+
+### 16.2 — bar render (PR-B)
+
+**Branch:** `step-16.2-tab-bar` · depends: 16.1 · `risk:low` candidate
+**Touches:** `newt-tui/src/rich_input.rs`, `newt-tui/src/chat.rs` (loop-head
+call site only).
+**Implements:** `InputSurface::set_tabs` (default no-op); `RichStatus.tabs`;
+the bottom bar row + ≥2-tab visibility rule + height budget + the
+`want.min(term_rows)` clamp; `layout_tab_cells`; label freshness via the shared
+`tab_label(store, id)` (computed fresh per redraw, never stored) and the
+throttled pending-inject badge; loop-head `set_tabs` beside
+`set_runtime_context`. A degraded tab shows `!pin`, read from
+`TabState::pin_degraded`.
+**Tests:** pure layout / truncation / active-cell windowing; height math; the
+**single-tab zero-row invariant (byte-identical frame)**. Lean untouched.
+**Deliverable:** renders whatever 16.1 reports; green on its own.
+
+### 16.3 — vi keys (PR-C)
+
+**Branch:** `step-16.3-tab-vi-keys` · depends: 16.2 · `risk:low` candidate
+**Implements:** `vi.rs` `Pending::G(Option<usize>)` **with a regression test
+pinning `2gt ⇒ Goto(2)`**; `gt`/`gT`; `:tabnew`/`:tabclose`/`:tabn`/`:tabp` ex
+extensions + help text. `rich_input.rs` `Step::Tab` + `ReadOutcome::Tab`
+threading, and the per-tab `input_stash` capture/restore through the type-ahead
+seam — **16.1 plumbed `input_stash` end to end but nothing fills it until this
+step.**
+**Tests:** pure vi state-machine, no terminal.
+
+### 16.4 — mouse (PR-D)
+
+**Branch:** `step-16.4-tab-mouse` · depends: 16.2 **and** 16.3 · `risk:high`
+**Implements:** prompt-scoped `MouseCaptureGuard` + the double gate;
+`Event::Mouse` arm with per-event size re-read; left-click `Goto`; right-click
+`BarMenu` overlay (static five items, house grammar, rename-by-prefill — no
+text widget).
+**Why last:** it is the only slice touching terminal-mode behavior, and it
+layers on both the bar geometry (16.2) and the key routing (16.3).
+
+### 16.x — execution topology (#1717 → #1718) — **LANDED**
+
+Not originally part of the PR-A→PR-D lettering; it is the substrate the
+cockpit slices stand on, and it landed alongside them.
+
+- **#1717** — the session/terminal channel seam. `SurfaceRequest` mirrors
+  `InputSurface`; `RemoteSurface` is the session-side proxy; `SurfaceError`
+  keeps `UiGone` (never reached the terminal) distinct from `NoReply` (may
+  have run, answer lost) because only the second makes a retry unsafe.
+- **#1718** — `run_chat` becomes the terminal and the old body moves, verbatim,
+  to `session_body` on a scoped thread. Relocated, not decomposed: ~6,250 lines
+  moved as a ~150-line diff.
+
+Two things later slices must not undo:
+
+1. **The worker enters the Tokio runtime** (`rt.enter()`). The body was written
+   against `Handle::current()` being ambient; a bare thread has a handle but
+   has not entered it, and the sites that reach for it panic with "there is no
+   reactor running" — visible only on stderr, so it presents as a session that
+   printed its header and died.
+2. **Turn-scoped bindings stay turn-scoped.** `bind_turn` is called at the
+   dispatch boundary keyed on the *active* tab, beside the OCAP disclosure
+   guard which was already scoped that way.
+
+### Gates before background/concurrent sessions are safe
+
+Recorded here so a later slice does not declare victory early. None of these
+is solved by the topology work; all of them become *possible* because of it.
+
+1. **stdin/input arbitration** — a surface read and a permission prompt are
+   mutually exclusive today only by call ordering, not by construction. The
+   arbiter needs a `surface_reading` flag, and the prompt's wait needs a
+   timeout: hiding a permission prompt is worse than a visible race, so the
+   failure mode must be loud.
+2. **Persistent editor / live steering** — the terminal is now free to service
+   input during a turn; nothing draws a live editor yet. The steering inbox
+   (#1713) is wired loop-side and has no way to be filled.
+3. **Permission-prompt arbitration** — terminal-owned, associated with the
+   requesting turn.
+4. **Tab-aware output routing** — see the debt note below.
+5. **Background session lifecycle** — start, park, resume, reap.
+6. **Tab switch / resume / release semantics under concurrency** — 16.1's
+   activate-vs-resume and release-without-end rules were written for one live
+   session.
+7. **Shutdown and cancellation across multiple active sessions.**
+
+> **Architectural debt, to be paid before background tabs are declared safe:**
+> ~74 open-coded writers in `chat.rs` alone, plus the streaming token path,
+> still write process stdout directly rather than through a funnel that knows
+> which tab they belong to. With one session this is byte-identical and
+> harmless, which is exactly why it is easy to leave. With two, a missed writer
+> puts one tab's output in another tab's scrollback — a defect that is invisible
+> in review and hard to attribute in the field.
+
+### Epic closure
+
+`#1673` (slash-surface consolidation) stays **OPEN** until this train completes
+**and** the resulting surface receives live herdr-pane + dgx1 validation.
+
 ## Step 15.1 — RoleProfile in newt-core + TUI wiring
 
 **Branch:** `step-15.1-role-profiles`
