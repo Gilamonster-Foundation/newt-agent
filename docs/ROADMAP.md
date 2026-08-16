@@ -1563,32 +1563,51 @@ phase when it's ready to schedule.
     human; `loads:` must reject paths escaping the pack root (path-fence).
   - extends the existing `docs/decisions/agent-skills.md` foundation.
 
-- **#1734 — companion train: response tags → speech → desktop → companion**
-  (`enhancement`, design PR #1732, `docs/design/companion-roadmap.md`). Voice
-  I/O, a native desktop host, and an animated on-screen companion — each behind
-  its own feature gate (`speech` / `desktop` / `companion`), never in the LEAN
-  default or the wyvern headless tier. Sequenced A→D, one issue = one PR:
-  - **A1 #1735 response tag table** → widen `newt_core::reasoning::ThinkFilter`
-    into config-driven `OutputStream` tag variants with per-provider overrides
-    (`provider_preset.rs`); tag lists are data (three Cs). Grounds #1506 /
-    #1014 / #860. *Not* a `newt-response-tags` crate.
-  - **A2 #1736 pane contract** → generalise `PanelOutcome`
-    (`docs/decisions/harness_config_panel.md`) + the ephemeral carve-out
-    (`plan_editor_ephemeral_tui.md`); amend `plain_scroller_tui.md`;
-    RichTUI only; coordinate with #1673 / the #1669 tab train. *Not* a
-    `newt-panel` crate or a ratatui host in newt-web (HTMX).
-  - **A3 #1737 kit scoping** → `newt-core/src/kit.rs` + `[bundles.*]`
-    (`loadout-composition.md`, `model-support-kit.md`) *is* the kit system;
-    extend `BundleConfig` with role/exposure/`Caveats` requests. *Not*
-    `newt-kit` / `newt-module`, no `KitPermissions`/`ModulePermissions`.
-  - **B #1738 / #1739 / #1740 speech** → `newt-speech` traits + segmenter +
-    scheduler (mocked); TTS consumes `OutputStream`, STT enters via
-    `SteeringInbox`/`InputSurface`; caveats `audio.in`/`audio.out`; local
-    providers on the weekly tier.
-  - **C #1741 desktop** → Tauri dock client of `NewtDockService` over the
-    newt-web `/attach` seam; separate lockfile like newt-web.
-  - **D #1742 companion** → state machine over `OutputStream` + turn state;
-    static-sprite driver first; open rig format (Cubism SDK is out).
+- **#1734 — companion train: Bridle authority ⇢ Kit + Module ⇢ events / panes /
+  media ⇢ desktop + companion** (`enhancement`, design PR #1732,
+  `docs/design/companion-roadmap.md`; all seven design docs are **Draft**).
+  Voice I/O, a native desktop host, and an animated on-screen companion — each
+  absent from the default feature set and never on the LEAN or wyvern paths.
+  Centre of the design: *Kit* = what code/interface is available · *Module* =
+  who is running + with what Grant · *Bridle* = what authority exists ·
+  *Interface* = what can be composed · *Event* = what happened · *View* = how a
+  host projects it. Merge gates are invariants, not weeks; one issue = one PR:
+  - **Authority (existing, sole plane)** → Agent Bridle: host-minted granted
+    `Caveats` (the *Grant*), `Gate::authorize`, `effective = granted.meet(required)`;
+    principal identity + child attenuation already exist in `newt-identity`
+    (`session_root` → `attenuate` → `enforced_caveats`). **Gate:** no second
+    authority vocabulary anywhere in the train (no `KitPermissions`,
+    `ModulePermissions`, panel topic permissions).
+  - **A3 #1737 Kit + Module** → *Kit* = package / discovery / provenance
+    (`newt-core/src/kit.rs` + `[bundles.*]`; manifest exports carry
+    `required_authority: Caveats` as declaration only; artifact CIDs); *Module*
+    = `AgentKey` principal + granted `Caveats` + kit instances + resource budget
+    + mailbox + lifecycle. **Gate:** `child ⊑ parent` via `newt_identity::attenuate`;
+    trust matrix stated (native dylib = trusted-only; WASM / subprocess / remote
+    = constrained). *Not* `newt-kit`/`newt-module` authority crates.
+  - **A1 #1735 normalized event model** → typed `ResponseEvent` stream from
+    provider adapters (`newt-inference`); the tag parser (`ThinkFilter` lineage,
+    config-driven per-provider table) is a compatibility adapter for text-only
+    models. **Gate:** TTS never receives `Reasoning` unless explicitly routed;
+    voice fails closed on malformed/unclosed markup; no duplicate re-emit.
+    Grounds #1506 / #1014 / #860.
+  - **A2 #1736 presentation extension** → panes declare state/events/actions;
+    each host (RichTUI via a generalised `PaneOutcome`, newt-web HTMX+SSE,
+    desktop WebView) owns rendering; panes receive scoped handles, not buses.
+    Coordinate with #1673 / #1669. **Gate:** no ratatui types in a
+    "host-neutral" contract; `plain_scroller_tui.md` carve-out amended.
+  - **B #1738 / #1739 / #1740 media pipeline (speech)** → session-oriented
+    STT/TTS over `AudioFrame`; `SpeechTimeline` (words/phonemes/visemes/markers);
+    VAD separate from STT; capture/playback capability handles distinct from
+    provider network authority; local providers on the weekly tier.
+  - **C #1741 desktop** → Tauri host = sidecar newt-web server + loopback
+    HTTP/SSE + WebView (HTMX); Tauri v2 capabilities = WebView→native
+    boundary, Bridle = agent→resource boundary; privileged side owns mic
+    capture; signed updater. Workspace-excluded crate like newt-web.
+  - **D #1742 companion** → `PresenceSnapshot` of orthogonal dimensions with a
+    `PrincipalId` actor; model expression tags are untrusted
+    `PresentationHint`s mapped by policy to approved animations; downstream of
+    `ResponseEvent` + turn state; open rig format (Cubism/Spine out).
   - **#1743** exec/MCP interrupt audit follow-ups
     (`docs/findings/2026-08-exec-mcp-interrupt-audit.md`).
 
