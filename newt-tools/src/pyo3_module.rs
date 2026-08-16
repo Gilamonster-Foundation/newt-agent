@@ -321,12 +321,13 @@ pub struct PyJupyterServerParams {
 #[pymethods]
 impl PyJupyterServerParams {
     #[new]
-    #[pyo3(signature = (working_dir=None, port=None, host=None, token=None, password=None, open_browser=None, extra_args=None))]
+    #[pyo3(signature = (working_dir=None, port=None, host=None, token=None, password_hash=None, password=None, open_browser=None, extra_args=None))]
     fn new(
         working_dir: Option<String>,
         port: Option<u16>,
         host: Option<String>,
         token: Option<String>,
+        password_hash: Option<String>,
         password: Option<String>,
         open_browser: Option<bool>,
         extra_args: Option<Vec<String>>,
@@ -337,6 +338,7 @@ impl PyJupyterServerParams {
                 port,
                 host,
                 token,
+                password_hash,
                 password,
                 open_browser,
                 extra_args,
@@ -362,6 +364,11 @@ impl PyJupyterServerParams {
     #[getter]
     fn token(&self) -> Option<&str> {
         self.inner.token.as_deref()
+    }
+
+    #[getter]
+    fn password_hash(&self) -> Option<&str> {
+        self.inner.password_hash.as_deref()
     }
 
     #[getter]

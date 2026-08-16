@@ -53,8 +53,9 @@ Parameters for starting a Jupyter server:
 | `port` | integer | 8888 | Port to run the server on |
 | `host` | string | `127.0.0.1` | Bind address — **must** be loopback (`127.0.0.1` / `::1` / `localhost`); non-loopback is rejected before spawn |
 | `token` | string | auto-generated (32 random chars) | Authentication token |
-| `password` | string | none | Password for authentication (alternative to token) |
-| `open_browser` | boolean | false | Always forced off (`--no-browser`); the field is kept for API compatibility |
+| `password_hash` | string | none | Already-hashed password (`argon2:$argon2id$…` PHC string) passed verbatim to `--NotebookApp.password`. Takes precedence over `password`. |
+| `password` | string | none | Plaintext password; the tool hashes it with argon2 (Jupyter's `argon2:` scheme) before passing to `--NotebookApp.password`. Prefer `password_hash` for persistent configs. |
+| `open_browser` | boolean | false | `True` lets Jupyter open the operator's browser (omits `--no-browser`); `False`/None passes `--no-browser`. |
 | `extra_args` | list[string] | none | Additional `jupyter notebook` flags (caller-controlled — use with care) |
 
 ### JupyterServerResult
@@ -155,7 +156,8 @@ print(f"Stopped: {stopped}")
 - Each `start_jupyter_server` call launches a new independent server with its own handle
 - Use different ports for multiple concurrent servers
 - The token is auto-generated if not provided
-- For password auth, set `password` and leave `token` empty
+- For password auth, pass `password` (plaintext; the tool argon2-hashes it) **or** `password_hash` (already-hashed `argon2:$argon2id$…`; takes precedence). Leave `token` empty when using password auth.
+- `open_browser=True` opens the operator's browser on start; default is headless (`--no-browser`)
 - `extra_args` can pass any `jupyter notebook` flags (caller-controlled — review before use)
 
 ## Error Handling

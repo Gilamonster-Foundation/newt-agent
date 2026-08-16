@@ -22,6 +22,11 @@ regex.workspace = true
 nbformat = { version = "0.7", optional = true }
 reqwest = { version = "0.12", optional = true, features = ["blocking", "json"] }
 rand = { version = "0.8", optional = true }
+# Argon2 for hashing a plaintext `password` into the `argon2:$argon2id$…`
+# PHC string Jupyter's `--NotebookApp.password` expects. Avoids shelling out
+# to `python -c "from notebook.auth import passwd; …"` (which would be another
+# tracked `Command` spawn site).
+argon2 = { version = "0.5", optional = true }
 
 # TODO: depend on thoon-fileops + thoon-toolreg once published.
 
@@ -41,7 +46,7 @@ pyo3 = ["dep:pyo3", "newt-core/pyo3"]
 # Compile the `diffy`-backed PatchApplier. Selectable at runtime with
 # NEWT_PATCH_APPLIER=diffy once enabled.
 applier-diffy = ["dep:diffy"]
-jupyter = ["dep:nbformat", "dep:reqwest", "dep:rand"]
+jupyter = ["dep:nbformat", "dep:reqwest", "dep:rand", "dep:argon2"]
 
 [dev-dependencies]
 tempfile.workspace = true

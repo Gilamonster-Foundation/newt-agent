@@ -261,9 +261,20 @@ pub struct JupyterServerParams {
     pub host: Option<String>,
     /// Token for authentication (default: auto-generated)
     pub token: Option<String>,
-    /// Password for authentication (default: none)
+    /// Already-hashed password for authentication, in the form Jupyter's
+    /// `--NotebookApp.password` expects (`argon2:$argon2id$…` PHC string).
+    /// Passed through verbatim. Takes precedence over `password`.
+    pub password_hash: Option<String>,
+    /// Plaintext password for authentication. The tool hashes this with
+    /// argon2 (matching Jupyter's `argon2:` scheme) and passes the resulting
+    /// hash to `--NotebookApp.password`. Used only when `password_hash` is
+    /// absent. Storing/transporting a plaintext password is discouraged;
+    /// prefer `password_hash` for persistent configs.
     pub password: Option<String>,
-    /// Whether to open browser (default: false; always forced off)
+    /// Whether to open a browser on startup (default: false). Unlike the
+    /// previous stub, this is now honored: `Some(true)` omits `--no-browser`
+    /// so Jupyter opens the operator's browser; anything else passes
+    /// `--no-browser`.
     pub open_browser: Option<bool>,
     /// Additional command line args
     pub extra_args: Option<Vec<String>>,
@@ -356,6 +367,25 @@ fn jupyter_cmd() -> Command {
     cmd
 }
 
+/// Hash a plaintext password into the `argon2:$argon2id$…` PHC string that
+/// Jupyter's `--NotebookApp.password` expects and `notebook.auth.passwd_check`
+/// verifies. Matches Jupyter's `argon2:` prefix scheme (the `argon2-cffi`
+/// `PasswordHasher` produces the suffix after the colon); the argon2id
+/// parameters are the crate defaults, which verify cleanly because
+/// `passwd_check` reads them back from the encoded string.
+#[cfg(feature = "jupyter")]
+fn hash_password(plaintext: &str) -> Result<String> {
+    use argon2::password_hash::{
+        rand_core::OsRng, PasswordHasher, SaltString,
+    };
+    let salt = SaltString::generate(&mut OsRng);
+    let argon = argon2::Argon2::default();
+    let hash = argon
+        .hash_password(plaintext.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("Failed to hash server password: {e}"))?;
+    Ok(format!("argon2:{hash}"))
+}
+
 /// Poll the server's REST API until it answers (or the deadline elapses),
 /// instead of sleeping a fixed delay that races startup.
 #[cfg(feature = "jupyter")]
@@ -417,7 +447,6 @@ pub fn start_server(params: JupyterServerParams) -> Result<JupyterServerResult> 
     // load-bearing and keeps the server off the network.
     let mut cmd = jupyter_cmd();
     cmd.arg("notebook")
-        .arg("--no-browser")
         .arg("--port")
         .arg(port.to_string())
         .arg("--ip")
@@ -426,8 +455,22 @@ pub fn start_server(params: JupyterServerParams) -> Result<JupyterServerResult> 
         .arg(&token)
         .current_dir(&working_dir);
 
-    if let Some(password) = params.password {
-        cmd.arg("--NotebookApp.password").arg(password);
+    // Honor the open_browser flag: only pass --no-browser when the caller
+    // did not explicitly ask for a browser.
+    if !matches!(params.open_browser, Some(true)) {
+        cmd.arg("--no-browser");
+    }
+
+    // Resolve a password for the server. `password_hash` (an already-hashed
+    // `argon2:$argon2id$…` PHC string) is passed through verbatim and wins
+    // over a plaintext `password`. When `password` is supplied we hash it
+    // here with argon2 so the model never has to pre-hash — but the value is
+    // only ever handed to jupyter as a hash, never as plaintext.
+    if let Some(hash) = params.password_hash {
+        cmd.arg("--NotebookApp.password").arg(hash);
+    } else if let Some(plaintext) = params.password {
+        let hash = hash_password(&plaintext)?;
+        cmd.arg("--NotebookApp.password").arg(hash);
     }
 
     if let Some(extra_args) = params.extra_args {
@@ -639,6 +682,7 @@ mod tests {
             port: Some(8888),
             host: Some("localhost".to_string()),
             token: Some("test-token".to_string()),
+            password_hash: None,
             password: None,
             open_browser: Some(false),
             extra_args: None,
@@ -676,6 +720,7 @@ mod tests {
             port: None,
             host: Some("0.0.0.0".to_string()),
             token: None,
+            password_hash: None,
             password: None,
             open_browser: None,
             extra_args: None,
@@ -728,6 +773,7 @@ mod tests {
             port: Some(port),
             host: Some("127.0.0.1".to_string()),
             token: None,
+            password_hash: None,
             password: None,
             open_browser: None,
             extra_args: None,
@@ -762,6 +808,7 @@ mod tests {
             port: Some(port),
             host: Some("127.0.0.1".to_string()),
             token: None,
+            password_hash: None,
             password: None,
             open_browser: None,
             extra_args: None,
@@ -770,5 +817,25 @@ mod tests {
         assert!(!res.success, "should not start on an occupied port");
         assert!(res.handle_id.is_none(), "no handle on failure");
         drop(listener);
+    }
+
+    /// `hash_password` must produce a `argon2:$argon2id$…` PHC string that
+    /// Jupyter's `passwd_check` accepts, and it must verify round-trip.
+    #[test]
+    fn test_hash_password_produces_verifiable_argon2() {
+        use argon2::{Argon2, PasswordHash, PasswordVerifier};
+        let plaintext = "hunter2";
+        let encoded = hash_password(plaintext).unwrap();
+        assert!(
+            encoded.starts_with("argon2:$argon2id$"),
+            "expected argon2 PHC with jupyter prefix, got: {encoded}"
+        );
+        // Jupyter strips the `argon2:` prefix before verifying, so do the
+        // same here to confirm the encoded suffix is a valid argon2 hash.
+        let phc = &encoded["argon2:".len()..];
+        let parsed = PasswordHash::new(phc).unwrap();
+        Argon2::default()
+            .verify_password(plaintext.as_bytes(), &parsed)
+            .expect("hash must verify against the original plaintext");
     }
 }
