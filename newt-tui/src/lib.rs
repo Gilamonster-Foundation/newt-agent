@@ -33,11 +33,6 @@ mod prompt;
 mod prompt_visibility_test;
 #[cfg(feature = "live-spill")]
 mod spill_view;
-/// #1669 PR-B — the bottom-anchored tab bar's pure layout. Terminal-free so
-/// the geometry is unit-testable and PR-D's click routing can reuse the same
-/// windowing rather than re-deriving it.
-#[cfg(feature = "rich-tui")]
-mod tab_bar;
 /// #1669 PR-A — the staged tab switch and the one tab-action handler, against
 /// live session state. Separate from the pure model so the staging discipline
 /// (Stage-0 read, deactivate, hydrate, reset⊕overlay, owner handoff) reads in

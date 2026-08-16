@@ -12,6 +12,8 @@
 //! reaching into a session's mutable state to draw a frame — the same reason
 //! `set_runtime_context` sends values rather than lending a handle.
 
+#![cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+
 /// One tab, projected for rendering.
 ///
 /// Labels are carried, never referenced: they are recomputed by the session
