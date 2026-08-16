@@ -375,9 +375,7 @@ fn jupyter_cmd() -> Command {
 /// `passwd_check` reads them back from the encoded string.
 #[cfg(feature = "jupyter")]
 fn hash_password(plaintext: &str) -> Result<String> {
-    use argon2::password_hash::{
-        rand_core::OsRng, PasswordHasher, SaltString,
-    };
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     let salt = SaltString::generate(&mut OsRng);
     let argon = argon2::Argon2::default();
     let hash = argon
