@@ -608,6 +608,43 @@ mod tests {
         assert_eq!(*sink.events.lock().unwrap(), ["start", "abandon"]);
     }
 
+    /// A tool that asks the operator (`request_user_input`, a permission
+    /// prompt) opens a `PromptWindow` WHILE the tool spinner is live. The
+    /// window suspends and holds every live ephemeral; when it closes and the
+    /// tool returns, the row must be free again for the next round's
+    /// inference spinner — or the model call that follows paints nothing and
+    /// a long think reads as a hang (reported 2026-08-16 against #1733).
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_prompt_window_during_the_tool_does_not_keep_the_row_after_it_returns() {
+        let spinner = ToolSpinner::from_spinner(Some(own_spinner("request_user_input…")));
+        {
+            let _window = crate::tty::Terminal::suspend_for_prompt();
+            // The tool answers; the window closes first (as `ask_question`
+            // scopes it), then the tool returns and the funnel drops the
+            // spinner.
+        }
+        drop(spinner);
+        assert!(
+            row_is_free(),
+            "the row must be free once the window is closed and the tool spinner is dropped"
+        );
+    }
+
+    /// The tighter variant: the window OUTLIVES the tool spinner (a gate that
+    /// keeps its window across the tool's return). Even then, once the window
+    /// drops the row must be free — the arbiter's `resume` list must not pin
+    /// the lease past the window's own life.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_window_that_outlives_the_spinner_frees_the_row_when_it_drops() {
+        let spinner = ToolSpinner::from_spinner(Some(own_spinner("ask…")));
+        let window = crate::tty::Terminal::suspend_for_prompt();
+        drop(spinner);
+        drop(window);
+        assert!(row_is_free(), "the row must be free once both are gone");
+    }
+
     /// No live sink (a non-streaming tool, or the lean tier) — nothing to
     /// wrap, but the spinner STILL covers the call and drops with the funnel.
     /// This is the `experience_recall` / MCP case from #1727.
