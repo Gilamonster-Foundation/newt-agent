@@ -928,6 +928,84 @@ caveat, example `newt.toml`.
 > at the worker/ACP entry points is Step 9.8's `AgenticConfig` — see the note in
 > Step 15.1's out-of-scope list.
 
+## Step 16 — session tabs (#1669) — the PR-A → PR-D train
+
+**ADR (normative):** `docs/decisions/session_tabs.md`. Treat it, and especially
+its state-transition table, as the acceptance contract for every slice here.
+
+### 16.1 — tab model + `/tab` text engine — **LANDED**
+
+`a2018bf3` (#1695) + `052de84e` (#1706). Session multiplexing works **via text
+today**, zero pixels changed: `/tab`, `/tab new`, `/tab <n>`,
+`/tab next|prev`, `/tab close [n]`, `/tab move <a> <b>`,
+`/tab rename [n] <title>`, `/tab retry`.
+
+What later slices may rely on:
+
+```
+one process
+  -> N stable SessionIds, one per open tab
+  -> exactly ONE active session owns the synchronous REPL
+one conversation -> at most one open tab
+```
+
+- Five authoritative operations: `create_fresh_tab`, `activate_tab`,
+  `adopt_conversation`, `close_tab`, `exit_release_all` — all in
+  `newt-tui/src/tab_switch.rs` over the pure model in `newt-tui/src/tabs.rs`.
+- **`activate = baseline ⊕ pin`, history-independent**; `/resume` = sparse
+  overlay. The two verbs are deliberately NOT merged.
+- **Restore is a transaction**: `prepare_conversation_restore` (every fallible
+  read, zero mutation) then `commit_conversation_restore`, which takes a
+  `CommitContext` carrying **no store handles** — a fallible read on the apply
+  path does not compile.
+- **`TransitionOutcome { url_changed, degraded }`** is returned by every
+  tab-activating operation. Consumers READ `degraded`; never infer it.
+- **Rowless tabs** own a `FreshSeed` until their row materializes; `/tab new`
+  creates **no ghost `/resume` row**.
+- Close = **release-without-end**; exit flushes then releases all claims.
+
+### 16.2 — bar render (PR-B)
+
+**Branch:** `step-16.2-tab-bar` · depends: 16.1 · `risk:low` candidate
+**Touches:** `newt-tui/src/rich_input.rs`, `newt-tui/src/chat.rs` (loop-head
+call site only).
+**Implements:** `InputSurface::set_tabs` (default no-op); `RichStatus.tabs`;
+the bottom bar row + ≥2-tab visibility rule + height budget + the
+`want.min(term_rows)` clamp; `layout_tab_cells`; label freshness via the shared
+`tab_label(store, id)` (computed fresh per redraw, never stored) and the
+throttled pending-inject badge; loop-head `set_tabs` beside
+`set_runtime_context`. A degraded tab shows `!pin`, read from
+`TabState::pin_degraded`.
+**Tests:** pure layout / truncation / active-cell windowing; height math; the
+**single-tab zero-row invariant (byte-identical frame)**. Lean untouched.
+**Deliverable:** renders whatever 16.1 reports; green on its own.
+
+### 16.3 — vi keys (PR-C)
+
+**Branch:** `step-16.3-tab-vi-keys` · depends: 16.2 · `risk:low` candidate
+**Implements:** `vi.rs` `Pending::G(Option<usize>)` **with a regression test
+pinning `2gt ⇒ Goto(2)`**; `gt`/`gT`; `:tabnew`/`:tabclose`/`:tabn`/`:tabp` ex
+extensions + help text. `rich_input.rs` `Step::Tab` + `ReadOutcome::Tab`
+threading, and the per-tab `input_stash` capture/restore through the type-ahead
+seam — **16.1 plumbed `input_stash` end to end but nothing fills it until this
+step.**
+**Tests:** pure vi state-machine, no terminal.
+
+### 16.4 — mouse (PR-D)
+
+**Branch:** `step-16.4-tab-mouse` · depends: 16.2 **and** 16.3 · `risk:high`
+**Implements:** prompt-scoped `MouseCaptureGuard` + the double gate;
+`Event::Mouse` arm with per-event size re-read; left-click `Goto`; right-click
+`BarMenu` overlay (static five items, house grammar, rename-by-prefill — no
+text widget).
+**Why last:** it is the only slice touching terminal-mode behavior, and it
+layers on both the bar geometry (16.2) and the key routing (16.3).
+
+### Epic closure
+
+`#1673` (slash-surface consolidation) stays **OPEN** until this train completes
+**and** the resulting surface receives live herdr-pane + dgx1 validation.
+
 ## Step 15.1 — RoleProfile in newt-core + TUI wiring
 
 **Branch:** `step-15.1-role-profiles`
