@@ -27,24 +27,32 @@
 //! `run_chat` runs and *how it asks for a line* — nothing about what it does
 //! between those calls.
 //!
-//! # The two laws this module exists to enforce
+//! # What this module is, and is not
 //!
-//! 1. **A worker never writes terminal bytes.** It publishes state; the UI
-//!    thread draws. Two sessions writing to one terminal is how one tab's
-//!    output lands in another tab's scrollback.
-//! 2. **A turn runs on the thread that installed its guards.** The OCAP
-//!    disclosure guard, the lifecycle session scope, and the psyche capture are
-//!    all thread-bound by construction (`PhantomData<Rc<()>>`). A turn that
-//!    migrated off its thread would silently lose secret redaction on the
-//!    memory / observation / compaction / spill paths — and
-//!    `verify_disclosure_gate` would report it (#1711), but only if something
-//!    asked. [`SessionWorker::spawn`] installs all three at the top of the
-//!    thread and holds them for its whole life, so the question cannot arise.
+//! It is the PROTOCOL: the request vocabulary, the session-side proxy, and an
+//! honest account of how the channel can fail. That is all.
+//!
+//! It is deliberately NOT the place where a session's thread-bound guards live.
+//! An earlier draft of this module owned a `SessionWorker::spawn` that
+//! installed the lifecycle scope and the psyche capture for the whole life of
+//! the thread, and both of those were the wrong lifetime:
+//!
+//! - a session-long `SessionId` binding survives a `/tab` switch, so every
+//!   later turn is still attributed to the tab the process started on;
+//! - a session-long psyche snapshot freezes cognition and tenacity forever, so
+//!   `/psyche` and `/cognition` stop landing on later turns — the inverse of
+//!   what the capture promises.
+//!
+//! Those guards belong at the TURN boundary, with the code that dispatches a
+//! turn, alongside the OCAP disclosure guard which is already scoped exactly
+//! that way. They arrive with the relocation that has a turn boundary to hang
+//! them on; putting them here would have shipped the wrong model first and
+//! then deleted it.
 
-// DELIBERATELY UNWIRED IN THIS SLICE. `run_chat` is not yet relocated onto a
-// worker, so nothing constructs these yet and every item below reads as dead.
-// The seam lands first, with its tests, so the relocation that follows is a
-// mechanical move against a proven channel rather than one large change that
+// DELIBERATELY UNWIRED IN THIS SLICE. `run_chat` is not yet relocated, so
+// nothing constructs these yet and every item below reads as dead. The
+// protocol lands first, with its tests, so the relocation that follows is a
+// mechanical move against a proven channel rather than one change that
 // invents the protocol and moves 5,000 lines at the same time. Delete this
 // attribute in the relocation slice — if it survives past that, the seam was
 // never wired and this module is genuinely dead.
@@ -201,68 +209,6 @@ impl RemoteSurface {
 
     pub(crate) fn set_background_jobs(&mut self, jobs: Vec<BackgroundJob>) {
         self.notify(SurfaceRequest::SetBackgroundJobs(jobs));
-    }
-}
-
-/// A session running on its own thread, with its thread-bound guards
-/// installed for the whole of its life.
-///
-/// The join handle is the session; dropping this without joining detaches it,
-/// which is why `join` is the only way to retire one.
-pub(crate) struct SessionWorker {
-    session_id: newt_core::lifecycle::SessionId,
-    handle: std::thread::JoinHandle<()>,
-}
-
-impl SessionWorker {
-    /// Run `body` on a thread that belongs to `session_id`.
-    ///
-    /// This is the **one** place the "a turn runs on the thread that installed
-    /// its guards" law is expressed, and it is expressed by construction: the
-    /// guards are installed here, before `body` is called, and held until it
-    /// returns. `body` cannot observe a thread without them and cannot move
-    /// them (they are `!Send` by `PhantomData<Rc<()>>`).
-    ///
-    /// Two of the three matter for correctness rather than tidiness:
-    ///
-    /// - the **lifecycle scope** is what makes this session's tool and prompt
-    ///   events its own, so a background session's activity is never
-    ///   attributed to whichever tab happens to be visible (#1714);
-    /// - the **psyche capture** pins cognition and tenacity, so an operator
-    ///   moving a dial in another tab cannot change what this turn resolves
-    ///   mid-flight (#1715).
-    ///
-    /// The OCAP disclosure guard is installed by the caller inside `body`,
-    /// because it needs the session's resolved provider secret — which this
-    /// module deliberately never sees. `verify_disclosure_gate` reports an
-    /// uninstalled backstop as `Absent` (#1711), so the omission is detectable
-    /// rather than silent.
-    pub(crate) fn spawn(
-        session_id: newt_core::lifecycle::SessionId,
-        body: impl FnOnce() + Send + 'static,
-    ) -> Self {
-        let owned = session_id.clone();
-        let handle = std::thread::spawn(move || {
-            let _session = newt_core::lifecycle::scoped_active_session(&owned);
-            let _psyche = newt_core::psyche::capture_turn_psyche();
-            body();
-        });
-        Self { session_id, handle }
-    }
-
-    pub(crate) fn session_id(&self) -> &newt_core::lifecycle::SessionId {
-        &self.session_id
-    }
-
-    /// Has this session finished? Non-blocking, so the UI thread can reap
-    /// without ever parking on a worker.
-    pub(crate) fn is_finished(&self) -> bool {
-        self.handle.is_finished()
-    }
-
-    /// Wait for this session to end.
-    pub(crate) fn join(self) -> std::thread::Result<()> {
-        self.handle.join()
     }
 }
 
@@ -449,103 +395,5 @@ mod tests {
         }
         worker.join().expect("worker").expect("served");
         assert_eq!(served.load(Ordering::Acquire), 1);
-    }
-
-    // ── SessionWorker: the guards are installed by construction ────────────
-
-    /// Two sessions running at once each see their OWN identity, and neither
-    /// can be attributed to the other. This is the whole point of installing
-    /// the lifecycle scope on the worker rather than trusting a process cell.
-    #[test]
-    fn each_worker_runs_under_its_own_session_identity() {
-        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
-        let a = newt_core::lifecycle::new_session_id();
-        let b = newt_core::lifecycle::new_session_id();
-        let seen_a = Arc::new(std::sync::Mutex::new(None));
-        let seen_b = Arc::new(std::sync::Mutex::new(None));
-
-        let (wa, wb) = {
-            let (sa, sb) = (Arc::clone(&seen_a), Arc::clone(&seen_b));
-            (
-                SessionWorker::spawn(a.clone(), move || {
-                    *sa.lock().unwrap() = newt_core::lifecycle::active_session();
-                }),
-                SessionWorker::spawn(b.clone(), move || {
-                    *sb.lock().unwrap() = newt_core::lifecycle::active_session();
-                }),
-            )
-        };
-        assert_eq!(wa.session_id(), &a);
-        assert_eq!(wb.session_id(), &b);
-        wa.join().expect("a");
-        wb.join().expect("b");
-
-        assert_eq!(seen_a.lock().unwrap().as_deref(), Some(a.as_str()));
-        assert_eq!(seen_b.lock().unwrap().as_deref(), Some(b.as_str()));
-    }
-
-    /// The psyche capture is installed BEFORE the body runs, so a dial moved
-    /// after the worker started cannot change what its turn resolves.
-    ///
-    /// Non-vacuous: the body waits until the test has actually mutated the
-    /// dial, so a missing capture would observe the new value.
-    #[test]
-    fn a_workers_psyche_is_captured_before_its_body_runs() {
-        use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
-        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
-        set_cli_tenacity(Tenacity::Relaxed);
-
-        // The handshake is load-bearing: `spawn` installs the capture BEFORE
-        // it calls the body, so the body running at all proves the capture is
-        // already in place. Without waiting for that, the mutation below could
-        // land first and the worker would legitimately capture the NEW value —
-        // a race in the test, not a defect in the capture.
-        let captured = Arc::new(AtomicBool::new(false));
-        let mutated = Arc::new(AtomicBool::new(false));
-        let observed = Arc::new(std::sync::Mutex::new(None));
-        let worker = {
-            let (c, m, o) = (
-                Arc::clone(&captured),
-                Arc::clone(&mutated),
-                Arc::clone(&observed),
-            );
-            SessionWorker::spawn(newt_core::lifecycle::new_session_id(), move || {
-                c.store(true, Ordering::Release);
-                while !m.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-                *o.lock().unwrap() = Some(effective_tenacity());
-            })
-        };
-
-        while !captured.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
-        set_cli_tenacity(Tenacity::Relentless);
-        mutated.store(true, Ordering::Release);
-        worker.join().expect("worker");
-
-        assert_eq!(
-            *observed.lock().unwrap(),
-            Some(Tenacity::Relaxed),
-            "the worker kept the dial it started with, despite the mid-flight change"
-        );
-        set_cli_tenacity(Tenacity::Standard);
-    }
-
-    /// A worker that has ended reports so without blocking — the UI thread
-    /// must be able to reap without ever parking on a session.
-    #[test]
-    fn a_finished_worker_is_observable_without_joining() {
-        let done = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&done);
-        let worker = SessionWorker::spawn(newt_core::lifecycle::new_session_id(), move || {
-            flag.store(true, Ordering::Release);
-        });
-        while !worker.is_finished() {
-            std::hint::spin_loop();
-        }
-        assert!(done.load(Ordering::Acquire));
-        worker.join().expect("worker");
     }
 }
