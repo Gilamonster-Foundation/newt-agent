@@ -2,12 +2,20 @@
 //!
 //! Compiled only when the `pyo3` cargo feature is on. Exposes the four
 //! tool primitives — `read`, `edit`, `search`, `apply_patch`,
-//! `apply_whole_files` — plus the `Hit` result row and Jupyter notebook execution.
+//! `apply_whole_files` — plus the `Hit` result row. The Jupyter notebook
+//! execution surface is gated additionally on `feature = "jupyter"`, mirroring
+//! how `newt-tools` itself exposes that module; the umbrella `newt-agent-py`
+//! crate turns that feature on when building the Python wheel so the bindings
+//! and the underlying Rust module stay wired together (no orphan registrations
+//! in pyo3-only wheels, no orphan code in jupyter-only builds).
+//!
 //! All surfaces are sync (no inference); `pyo3-async-runtimes` is not needed here.
 
+#[cfg(feature = "jupyter")]
 use crate::jupyter::{
-    CellOutputSummary, execute_notebook, get_server_status, JupyterExecuteParams, JupyterExecuteResult,
-    JupyterServerParams, JupyterServerResult, JupyterServerStatus, KernelInfo, start_server, stop_server,
+    execute_notebook, get_server_status, start_server, stop_server, CellOutputSummary,
+    JupyterExecuteParams, JupyterExecuteResult, JupyterServerParams, JupyterServerResult,
+    JupyterServerStatus, KernelInfo,
 };
 use crate::{apply_patch, apply_whole_files, edit, read, search, Hit};
 use pyo3::create_exception;
@@ -120,16 +128,19 @@ fn py_apply_whole_files(workspace: PathBuf, files: &Bound<'_, PyDict>) -> PyResu
 // ---- JupyterExecuteParams ----
 
 /// Parameters for executing a Jupyter notebook.
+#[cfg(feature = "jupyter")]
 #[pyclass(
     name = "JupyterExecuteParams",
     module = "newt_agent._newt_agent.tools",
-    frozen
+    frozen,
+    from_py_object
 )]
 #[derive(Clone)]
 pub struct PyJupyterExecuteParams {
     pub inner: JupyterExecuteParams,
 }
 
+#[cfg(feature = "jupyter")]
 #[pymethods]
 impl PyJupyterExecuteParams {
     #[new]
@@ -181,16 +192,19 @@ impl PyJupyterExecuteParams {
 // ---- CellOutputSummary ----
 
 /// Summary of a single cell's execution output.
+#[cfg(feature = "jupyter")]
 #[pyclass(
     name = "CellOutputSummary",
     module = "newt_agent._newt_agent.tools",
-    frozen
+    frozen,
+    skip_from_py_object
 )]
 #[derive(Clone)]
 pub struct PyCellOutputSummary {
     pub inner: CellOutputSummary,
 }
 
+#[cfg(feature = "jupyter")]
 #[pymethods]
 impl PyCellOutputSummary {
     #[getter]
@@ -222,16 +236,19 @@ impl PyCellOutputSummary {
 // ---- JupyterExecuteResult ----
 
 /// Result of executing a Jupyter notebook.
+#[cfg(feature = "jupyter")]
 #[pyclass(
     name = "JupyterExecuteResult",
     module = "newt_agent._newt_agent.tools",
-    frozen
+    frozen,
+    skip_from_py_object
 )]
 #[derive(Clone)]
 pub struct PyJupyterExecuteResult {
     pub inner: JupyterExecuteResult,
 }
 
+#[cfg(feature = "jupyter")]
 #[pymethods]
 impl PyJupyterExecuteResult {
     #[getter]
@@ -277,6 +294,7 @@ impl PyJupyterExecuteResult {
 // ---- execute_notebook ----
 
 /// Execute a Jupyter notebook using nbconvert.
+#[cfg(feature = "jupyter")]
 #[pyfunction]
 #[pyo3(name = "execute_notebook")]
 fn py_execute_notebook(params: PyJupyterExecuteParams) -> PyResult<PyJupyterExecuteResult> {
@@ -287,16 +305,19 @@ fn py_execute_notebook(params: PyJupyterExecuteParams) -> PyResult<PyJupyterExec
 // ---- JupyterServerParams ----
 
 /// Parameters for starting a Jupyter server.
+#[cfg(feature = "jupyter")]
 #[pyclass(
     name = "JupyterServerParams",
     module = "newt_agent._newt_agent.tools",
-    frozen
+    frozen,
+    from_py_object
 )]
 #[derive(Clone)]
 pub struct PyJupyterServerParams {
     pub inner: JupyterServerParams,
 }
 
+#[cfg(feature = "jupyter")]
 #[pymethods]
 impl PyJupyterServerParams {
     #[new]
@@ -362,16 +383,19 @@ impl PyJupyterServerParams {
 // ---- KernelInfo ----
 
 /// Information about a running Jupyter kernel.
+#[cfg(feature = "jupyter")]
 #[pyclass(
     name = "KernelInfo",
     module = "newt_agent._newt_agent.tools",
-    frozen
+    frozen,
+    skip_from_py_object
 )]
 #[derive(Clone)]
 pub struct PyKernelInfo {
     pub inner: KernelInfo,
 }
 
+#[cfg(feature = "jupyter")]
 #[pymethods]
 impl PyKernelInfo {
     #[getter]
@@ -403,16 +427,19 @@ impl PyKernelInfo {
 // ---- JupyterServerStatus ----
 
 /// Status of a Jupyter server.
+#[cfg(feature = "jupyter")]
 #[pyclass(
     name = "JupyterServerStatus",
     module = "newt_agent._newt_agent.tools",
-    frozen
+    frozen,
+    skip_from_py_object
 )]
 #[derive(Clone)]
 pub struct PyJupyterServerStatus {
     pub inner: JupyterServerStatus,
 }
 
+#[cfg(feature = "jupyter")]
 #[pymethods]
 impl PyJupyterServerStatus {
     #[getter]
@@ -448,16 +475,19 @@ impl PyJupyterServerStatus {
 // ---- JupyterServerResult ----
 
 /// Result of starting a Jupyter server.
+#[cfg(feature = "jupyter")]
 #[pyclass(
     name = "JupyterServerResult",
     module = "newt_agent._newt_agent.tools",
-    frozen
+    frozen,
+    skip_from_py_object
 )]
 #[derive(Clone)]
 pub struct PyJupyterServerResult {
     pub inner: JupyterServerResult,
 }
 
+#[cfg(feature = "jupyter")]
 #[pymethods]
 impl PyJupyterServerResult {
     #[getter]
@@ -494,6 +524,7 @@ impl PyJupyterServerResult {
 // ---- start_server ----
 
 /// Start a Jupyter notebook server.
+#[cfg(feature = "jupyter")]
 #[pyfunction]
 #[pyo3(name = "start_jupyter_server")]
 fn py_start_server(params: PyJupyterServerParams) -> PyResult<PyJupyterServerResult> {
@@ -504,6 +535,7 @@ fn py_start_server(params: PyJupyterServerParams) -> PyResult<PyJupyterServerRes
 // ---- stop_server ----
 
 /// Stop a Jupyter server by PID.
+#[cfg(feature = "jupyter")]
 #[pyfunction]
 #[pyo3(name = "stop_jupyter_server")]
 fn py_stop_server(pid: u32) -> PyResult<bool> {
@@ -513,6 +545,7 @@ fn py_stop_server(pid: u32) -> PyResult<bool> {
 // ---- get_server_status ----
 
 /// Get status of a Jupyter server.
+#[cfg(feature = "jupyter")]
 #[pyfunction]
 #[pyo3(name = "get_jupyter_server_status")]
 fn py_get_server_status(url: String, token: Option<String>) -> PyResult<PyJupyterServerStatus> {
@@ -524,22 +557,25 @@ fn py_get_server_status(url: String, token: Option<String>) -> PyResult<PyJupyte
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(py, "tools")?;
     m.add_class::<PyHit>()?;
-    m.add_class::<PyJupyterExecuteParams>()?;
-    m.add_class::<PyCellOutputSummary>()?;
-    m.add_class::<PyJupyterExecuteResult>()?;
-    m.add_class::<PyJupyterServerParams>()?;
-    m.add_class::<PyKernelInfo>()?;
-    m.add_class::<PyJupyterServerStatus>()?;
-    m.add_class::<PyJupyterServerResult>()?;
     m.add_function(wrap_pyfunction!(py_read, &m)?)?;
     m.add_function(wrap_pyfunction!(py_edit, &m)?)?;
     m.add_function(wrap_pyfunction!(py_search, &m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_patch, &m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_whole_files, &m)?)?;
-    m.add_function(wrap_pyfunction!(py_execute_notebook, &m)?)?;
-    m.add_function(wrap_pyfunction!(py_start_server, &m)?)?;
-    m.add_function(wrap_pyfunction!(py_stop_server, &m)?)?;
-    m.add_function(wrap_pyfunction!(py_get_server_status, &m)?)?;
+    #[cfg(feature = "jupyter")]
+    {
+        m.add_class::<PyJupyterExecuteParams>()?;
+        m.add_class::<PyCellOutputSummary>()?;
+        m.add_class::<PyJupyterExecuteResult>()?;
+        m.add_class::<PyJupyterServerParams>()?;
+        m.add_class::<PyKernelInfo>()?;
+        m.add_class::<PyJupyterServerStatus>()?;
+        m.add_class::<PyJupyterServerResult>()?;
+        m.add_function(wrap_pyfunction!(py_execute_notebook, &m)?)?;
+        m.add_function(wrap_pyfunction!(py_start_server, &m)?)?;
+        m.add_function(wrap_pyfunction!(py_stop_server, &m)?)?;
+        m.add_function(wrap_pyfunction!(py_get_server_status, &m)?)?;
+    }
     m.add("ToolsError", py.get_type::<PyToolsError>())?;
     parent.add_submodule(&m)?;
     Ok(())

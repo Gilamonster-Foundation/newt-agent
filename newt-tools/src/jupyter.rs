@@ -1,13 +1,22 @@
 //! Jupyter notebook execution tool.
 //!
-//! Executes a Jupyter notebook (.ipynb) in-place or at a specified working directory,
-//! capturing outputs and updating the notebook file with execution results.
+//! All symbols in this module are gated behind `feature = "jupyter"`. The
+//! `nbformat` / `reqwest` / `rand` dependencies it uses are likewise only
+//! declared `optional = true` in `Cargo.toml`, so a `--no-default-features`
+//! build of `newt-tools` stays strictly free of jupyter-only deps and has
+//! nothing to link against.
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "jupyter")]
 use std::process::Command;
 
+#[cfg(feature = "jupyter")]
+use anyhow::{Context, Result};
+#[cfg(feature = "jupyter")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "jupyter")]
+use std::path::{Path, PathBuf};
+
+#[cfg(feature = "jupyter")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JupyterExecuteParams {
     /// Path to the notebook file (.ipynb)
@@ -23,6 +32,7 @@ pub struct JupyterExecuteParams {
     pub kernel_name: Option<String>,
 }
 
+#[cfg(feature = "jupyter")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JupyterExecuteResult {
     /// Whether execution succeeded
@@ -41,6 +51,7 @@ pub struct JupyterExecuteResult {
     pub cell_outputs: Vec<CellOutputSummary>,
 }
 
+#[cfg(feature = "jupyter")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CellOutputSummary {
     pub cell_index: usize,
@@ -51,6 +62,7 @@ pub struct CellOutputSummary {
 }
 
 /// Execute a Jupyter notebook using nbconvert
+#[cfg(feature = "jupyter")]
 pub fn execute_notebook(params: JupyterExecuteParams) -> Result<JupyterExecuteResult> {
     let start_time = std::time::Instant::now();
 
@@ -80,7 +92,7 @@ pub fn execute_notebook(params: JupyterExecuteParams) -> Result<JupyterExecuteRe
         .arg(&kernel_name)
         .arg("--ExecutePreprocessor.timeout")
         .arg(timeout.to_string())
-        .arg(&params.notebook_path)  // Use relative path from working_dir
+        .arg(&params.notebook_path) // Use relative path from working_dir
         .current_dir(&working_dir);
 
     if !save_outputs {
@@ -116,15 +128,16 @@ pub fn execute_notebook(params: JupyterExecuteParams) -> Result<JupyterExecuteRe
         error: if success {
             None
         } else {
-            Some(format!("stdout: {}\nstderr: {}", stdout, stderr))
+            Some(format!("stdout: {stdout}\nstderr: {stderr}"))
         },
         cell_outputs,
     })
 }
 
 /// Parse cell outputs from an executed notebook
+#[cfg(feature = "jupyter")]
 fn parse_notebook_outputs(notebook_path: &Path) -> Result<Vec<CellOutputSummary>> {
-    use nbformat::{parse_notebook, Notebook, v4};
+    use nbformat::{parse_notebook, v4, Notebook};
     use std::fs;
 
     let content = fs::read_to_string(notebook_path).context("Failed to read notebook")?;
@@ -157,7 +170,7 @@ fn parse_notebook_outputs(notebook_path: &Path) -> Result<Vec<CellOutputSummary>
             for output in outputs {
                 if let v4::Output::Error(v4::ErrorOutput { ename, evalue, .. }) = output {
                     success = false;
-                    error = Some(format!("{}: {}", ename, evalue));
+                    error = Some(format!("{ename}: {evalue}"));
                     break;
                 }
             }
@@ -176,6 +189,7 @@ fn parse_notebook_outputs(notebook_path: &Path) -> Result<Vec<CellOutputSummary>
 }
 
 /// Parameters for starting a Jupyter server
+#[cfg(feature = "jupyter")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JupyterServerParams {
     /// Working directory for the server (default: current directory)
@@ -195,6 +209,7 @@ pub struct JupyterServerParams {
 }
 
 /// Result of starting a Jupyter server
+#[cfg(feature = "jupyter")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JupyterServerResult {
     /// Whether server started successfully
@@ -212,6 +227,7 @@ pub struct JupyterServerResult {
 }
 
 /// Status of a Jupyter server
+#[cfg(feature = "jupyter")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JupyterServerStatus {
     /// Whether a server is running
@@ -227,6 +243,7 @@ pub struct JupyterServerStatus {
 }
 
 /// Information about a running kernel
+#[cfg(feature = "jupyter")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelInfo {
     pub id: String,
@@ -237,6 +254,7 @@ pub struct KernelInfo {
 }
 
 /// Start a Jupyter server in the background
+#[cfg(feature = "jupyter")]
 pub fn start_server(params: JupyterServerParams) -> Result<JupyterServerResult> {
     let working_dir = params
         .working_dir
@@ -287,7 +305,7 @@ pub fn start_server(params: JupyterServerParams) -> Result<JupyterServerResult> 
         .context("Failed to start jupyter server. Is jupyter installed?")?;
 
     let pid = child.id();
-    let url = format!("http://{}:{}", host, port);
+    let url = format!("http://{host}:{port}");
 
     // Give it a moment to start up
     std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -295,19 +313,23 @@ pub fn start_server(params: JupyterServerParams) -> Result<JupyterServerResult> 
     // Check if process is still alive
     match child.try_wait() {
         Ok(Some(status)) => {
-            let stderr = child.stderr.take().map(|mut s| {
-                use std::io::Read;
-                let mut buf = String::new();
-                s.read_to_string(&mut buf).unwrap_or_default();
-                buf
-            }).unwrap_or_default();
+            let stderr = child
+                .stderr
+                .take()
+                .map(|mut s| {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    s.read_to_string(&mut buf).unwrap_or_default();
+                    buf
+                })
+                .unwrap_or_default();
             Ok(JupyterServerResult {
                 success: false,
                 url: None,
                 pid: None,
                 port: None,
                 token: None,
-                error: Some(format!("Server exited with status: {}\n{}", status, stderr)),
+                error: Some(format!("Server exited with status: {status}\n{stderr}")),
             })
         }
         Ok(None) => {
@@ -323,20 +345,19 @@ pub fn start_server(params: JupyterServerParams) -> Result<JupyterServerResult> 
                 error: None,
             })
         }
-        Err(e) => {
-            Ok(JupyterServerResult {
-                success: false,
-                url: None,
-                pid: None,
-                port: None,
-                token: None,
-                error: Some(format!("Failed to check server status: {}", e)),
-            })
-        }
+        Err(e) => Ok(JupyterServerResult {
+            success: false,
+            url: None,
+            pid: None,
+            port: None,
+            token: None,
+            error: Some(format!("Failed to check server status: {e}")),
+        }),
     }
 }
 
 /// Stop a Jupyter server by PID
+#[cfg(feature = "jupyter")]
 pub fn stop_server(pid: u32) -> Result<bool> {
     #[cfg(unix)]
     {
@@ -360,12 +381,13 @@ pub fn stop_server(pid: u32) -> Result<bool> {
 }
 
 /// Get status of a Jupyter server by querying its API
+#[cfg(feature = "jupyter")]
 pub fn get_server_status(url: &str, token: Option<&str>) -> Result<JupyterServerStatus> {
     let client = reqwest::blocking::Client::new();
     let mut request = client.get(format!("{}/api/kernels", url.trim_end_matches('/')));
 
     if let Some(token) = token {
-        request = request.header("Authorization", format!("token {}", token));
+        request = request.header("Authorization", format!("token {token}"));
     }
 
     match request.send() {
@@ -396,11 +418,9 @@ pub fn get_server_status(url: &str, token: Option<&str>) -> Result<JupyterServer
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "jupyter"))]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
 
     #[test]
     fn test_jupyter_params_serialization() {

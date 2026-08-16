@@ -4,6 +4,7 @@
 //! Thin wrappers — when `thoon-fileops` publishes, this crate delegates
 //! to it rather than reimplementing.
 
+#[cfg(feature = "jupyter")]
 pub mod jupyter;
 pub mod ls;
 pub mod patch;
@@ -13,7 +14,12 @@ pub mod search;
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
-pub use jupyter::{execute_notebook, JupyterExecuteParams, JupyterExecuteResult};
+#[cfg(feature = "jupyter")]
+pub use jupyter::{
+    execute_notebook, get_server_status, start_server, stop_server, CellOutputSummary,
+    JupyterExecuteParams, JupyterExecuteResult, JupyterServerParams, JupyterServerResult,
+    JupyterServerStatus, KernelInfo,
+};
 pub use ls::{list_dir, DirEntry, EntryKind};
 #[cfg(feature = "applier-diffy")]
 pub use patch::DiffyApplier;
