@@ -109,8 +109,10 @@ pub use mouse::install_panic_release_hook;
 mod lean_input;
 // #1669: the channel seam that lets a session's turn stop owning the keyboard.
 mod session_worker;
+// #1669 PR-B: the tab projection that crosses the surface protocol.
 mod setup;
 mod setup_tui;
+mod tab_bar;
 mod wizard;
 
 use anyhow::Context as _;

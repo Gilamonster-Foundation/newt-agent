@@ -962,6 +962,20 @@ pub(crate) trait InputSurface {
     /// Replace the harness-owned jobs whose live state the input surface may
     /// render. Default no-op keeps lean/headless output free of ephemeral UI.
     fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {}
+    /// #1669 PR-B: the open tabs, projected for the bottom bar. Sent once per
+    /// loop head beside `set_runtime_context`, so a `/rename`, a `/tab close`
+    /// or a newly degraded pin is reflected on the next prompt.
+    ///
+    /// Default no-op: only the rich surface has a bar, and lean expresses the
+    /// same capability as scrolled lines via `/tab`.
+    ///
+    /// NOTE for anyone adding the next method here: since #1718 a default body
+    /// is no longer only "lean does not render this". The session reaches the
+    /// terminal through `RemoteSurface`, so a method that proxy does not
+    /// forward silently resolves to this default and the feature is dead while
+    /// still compiling. `session_worker::tests::the_proxy_forwards_every_
+    /// surface_method` exists to make that fail loudly instead.
+    fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {}
 }
 
 pub(crate) fn run_chat(
