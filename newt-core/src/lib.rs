@@ -91,6 +91,7 @@ pub mod session;
 pub mod settings;
 pub mod shell_env;
 pub mod ssh_caveats;
+pub mod stack;
 pub mod store;
 pub mod symbols;
 pub mod templates;
