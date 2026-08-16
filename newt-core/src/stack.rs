@@ -5,6 +5,14 @@
 //! the CLI parse/dispatch thread and the Tokio workers, and `newt-tui` sizes
 //! the per-session thread the chat loop runs on.
 
+/// The floor #746/#747 established.
+///
+/// Named separately from the value below so the compile-time guard compares
+/// two DISTINCT constants — `SESSION_STACK_BYTES >= SESSION_STACK_BYTES` would
+/// be a tautology, the kind of assertion that passes forever while measuring
+/// nothing.
+const WINDOWS_STACK_FLOOR_BYTES: usize = 16 * 1024 * 1024;
+
 /// Minimum stack for a thread that runs deep newt code paths.
 ///
 /// PR #746 hit `STATUS_STACK_OVERFLOW (0xC00000FD)` on Windows parsing the clap
@@ -17,13 +25,6 @@
 /// it a default-sized stack would rediscover the same class of crash on
 /// Windows — with the failure landing mid-session rather than at startup, where
 /// it is far harder to attribute.
-
-/// The floor #746/#747 established. Named separately from the value below so
-/// the guard compares two distinct constants — a `SESSION_STACK_BYTES >=
-/// SESSION_STACK_BYTES` check would be a tautology, which is exactly the kind
-/// of assertion that passes forever while measuring nothing.
-const WINDOWS_STACK_FLOOR_BYTES: usize = 16 * 1024 * 1024;
-
 pub const SESSION_STACK_BYTES: usize = WINDOWS_STACK_FLOOR_BYTES;
 
 // Compile-time guard, mirroring `newt-cli`'s: a future "let's trim it" change
