@@ -651,6 +651,9 @@ struct RichStatus<'a> {
     /// open. `None`/closed → the layout is byte-identical to the pre-palette
     /// surface.
     palette: Option<&'a PaletteState>,
+    /// #1669 PR-B: the open tabs. Fewer than two → **no bar row at all**, so a
+    /// single-conversation session is byte-identical to the pre-bar surface.
+    tabs: &'a [crate::tab_bar::TabCell],
 }
 
 fn draw(
@@ -691,6 +694,28 @@ fn draw(
         }
         _ => body_area,
     };
+    // #1669 PR-B: carve the tab bar off the BOTTOM first, so it is the last
+    // row of the inline region regardless of what else is showing. Zero rows
+    // for fewer than two tabs means the remaining layout is byte-identical to
+    // the pre-bar surface — no `Layout` call, not even a zero-height one.
+    let (body_area, tab_area) = if crate::tab_bar::bar_rows(status.tabs) > 0 {
+        let [rest, bar] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(body_area);
+        (rest, Some(bar))
+    } else {
+        (body_area, None)
+    };
+    if let Some(bar) = tab_area {
+        if let Some(line) = crate::tab_bar::layout_tab_cells(status.tabs, bar.width) {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    line,
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                bar,
+            );
+        }
+    }
     let background = background_line(status.background_jobs, background_frame());
     let (input_area, background_area) = if background.is_some() {
         let [input_area, background_area] =
@@ -1022,6 +1047,9 @@ pub(crate) struct RichSurface {
     gauge: Option<(u32, u32)>,
     /// Harness tasks rendered by this surface while their shared state is live.
     background_jobs: Vec<BackgroundJob>,
+    /// #1669 PR-B: the open tabs, refreshed each loop head. Fewer than two →
+    /// the bar renders no row.
+    tabs: Vec<crate::tab_bar::TabCell>,
     /// #1671: the session display name shown in the header, refreshed per turn.
     session: String,
 }
@@ -1038,6 +1066,7 @@ impl RichSurface {
             endpoint: String::new(),
             gauge: None,
             background_jobs: Vec::new(),
+            tabs: Vec::new(),
             session: String::new(),
         })
     }
@@ -1126,7 +1155,13 @@ impl RichSurface {
             // harness-background row all contribute to the inline viewport.
             let background_extra =
                 u16::from(self.background_jobs.iter().any(BackgroundJob::is_running));
-            let base = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra;
+            // #1669 PR-B: the tab bar is the LAST row of the inline region —
+            // bottom-anchored, below the background row. 0 rows for fewer than
+            // two tabs, which is what keeps the single-conversation surface
+            // byte-identical.
+            let tab_extra = crate::tab_bar::bar_rows(&self.tabs);
+            let base =
+                (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra + tab_extra;
             // #1674: the palette viewport gets what the terminal can spare
             // above the input (capped inside `viewport_rows`), never squeezing
             // the input's own rows. 0 while closed → the height math (and the
@@ -1134,7 +1169,10 @@ impl RichSurface {
             let term_h = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
             let pal_rows = palette.viewport_rows(term_h.saturating_sub(base + 1) as usize);
             palette.set_viewport(pal_rows);
-            let want = base + pal_rows as u16;
+            // Never ask for more rows than the terminal has: an inline
+            // viewport taller than the screen scrolls the whole surface into
+            // scrollback on every redraw.
+            let want = (base + pal_rows as u16).min(term_h.max(1));
             if want != cur_h {
                 // Blank the CURRENT region before resizing. ratatui reserves
                 // space for a taller inline viewport by scrolling whatever is on
@@ -1153,6 +1191,7 @@ impl RichSurface {
                     &editor,
                     self.gutter,
                     RichStatus {
+                        tabs: &self.tabs,
                         model: &self.model,
                         endpoint: &self.endpoint,
                         gauge: self.gauge,
@@ -1339,6 +1378,10 @@ impl InputSurface for RichSurface {
 
     fn set_background_jobs(&mut self, jobs: Vec<BackgroundJob>) {
         self.background_jobs = jobs;
+    }
+
+    fn set_tabs(&mut self, tabs: Vec<crate::tab_bar::TabCell>) {
+        self.tabs = tabs;
     }
 }
 
@@ -1576,6 +1619,114 @@ mod tests {
             .expect("an unbound NORMAL key should surface a hint");
         assert!(msg.contains("insert"), "hint nudges toward insert: {msg:?}");
         assert_eq!(ta.lines(), &["hi"], "`q` still types nothing in NORMAL");
+    }
+
+    /// #1669 PR-B, the load-bearing invariant: with fewer than two tabs the
+    /// frame is **byte-identical** to the pre-bar surface.
+    ///
+    /// Not "an empty row" and not "a row of spaces" — no row at all. Almost
+    /// every session is single-conversation, and the bar is not worth a
+    /// permanent row of their terminal. Comparing the whole rendered buffer
+    /// rather than eyeballing one row is what makes that a guarantee.
+    #[test]
+    fn a_single_tab_frame_is_byte_identical_to_no_bar() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let ed = emacs_editor();
+        let ta = TextArea::new(vec!["hello".to_string()]);
+
+        let render = |tabs: &[crate::tab_bar::TabCell]| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(40, 5)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &ta,
+                    &ed,
+                    Some(1),
+                    RichStatus {
+                        tabs,
+                        ..RichStatus::default()
+                    },
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            (0..5)
+                .map(|y| {
+                    (0..40)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        let none = render(&[]);
+        let one = render(&[crate::tab_bar::TabCell {
+            number: 1,
+            label: "solo".into(),
+            active: true,
+            degraded: false,
+            pending: false,
+        }]);
+        assert_eq!(none, one, "one tab must render exactly like no tabs");
+        assert!(
+            !one.iter().any(|r| r.contains("solo")),
+            "the single tab's label appears nowhere: {one:?}"
+        );
+    }
+
+    /// Two tabs claim exactly one row, at the BOTTOM of the region, and the
+    /// rows above are untouched.
+    #[test]
+    fn two_tabs_add_one_bottom_row_and_disturb_nothing_above() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let ed = emacs_editor();
+        let ta = TextArea::new(vec!["hello".to_string()]);
+        let cell = |n: usize, l: &str, a: bool| crate::tab_bar::TabCell {
+            number: n,
+            label: l.into(),
+            active: a,
+            degraded: false,
+            pending: false,
+        };
+        let render = |tabs: &[crate::tab_bar::TabCell]| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(40, 5)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &ta,
+                    &ed,
+                    Some(1),
+                    RichStatus {
+                        tabs,
+                        ..RichStatus::default()
+                    },
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            (0..5)
+                .map(|y| {
+                    (0..40)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        let none = render(&[]);
+        let two = render(&[cell(1, "build", true), cell(2, "deploy", false)]);
+        assert!(
+            two[4].contains("1:build") && two[4].contains("2:deploy"),
+            "the bar is the LAST row: {:?}",
+            two[4]
+        );
+        assert_eq!(none[0], two[0], "the status header is untouched by the bar");
+        assert!(
+            !none[4].contains("1:build"),
+            "sanity: the no-tab frame has no bar"
+        );
     }
 
     #[test]
