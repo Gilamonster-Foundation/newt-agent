@@ -60,7 +60,7 @@ manifest-path = "newt-agent-py/Cargo.toml"
 python-source = "newt-agent-py/python"
 module-name = "newt_agent._newt_agent"
 bindings = "pyo3"
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "jupyter"]
 # Ship LICENSE inside both the wheel and the sdist so PyPI's
 # License-File metadata validation accepts the upload.
 include = [{ path = "LICENSE", format = ["wheel", "sdist"] }]
