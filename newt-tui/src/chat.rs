@@ -1100,6 +1100,20 @@ fn session_body(
     surface_is_rich: bool,
     to_ui: std::sync::mpsc::SyncSender<crate::session_worker::SurfaceRequest>,
 ) -> anyhow::Result<()> {
+    // ENTER the runtime on this thread before anything else runs.
+    //
+    // The body relied on `Handle::current()` being ambient — it ran ON a
+    // runtime worker, so the context was simply there, and several call sites
+    // deep in the tree (`newt-tui/src/lib.rs`, the `/backend` probes, the
+    // memory bridge) still reach for it. A bare thread has no such context and
+    // those sites panic with "there is no reactor running" — which surfaces as
+    // a dead session that printed its header and nothing else, because the
+    // panic goes to stderr while the operator is watching stdout.
+    //
+    // Entering here restores exactly the property the body was written
+    // against, rather than rewriting those call sites to thread a `Handle`.
+    let _rt_context = rt.enter();
+
     let verbose = verbose_mode();
     // The session's only route to the terminal.
     let mut surface: Box<dyn InputSurface> =
