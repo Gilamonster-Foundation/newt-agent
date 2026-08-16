@@ -1830,12 +1830,6 @@ fn session_body(
     // with an explicit id rather than relying on the cell, so it is
     // self-describing regardless of ownership ordering.
     newt_core::lifecycle::set_active_session(&lifecycle_session);
-    // #1669: bind THIS thread to the session as well. `set_active_session`
-    // above is the process-wide visibility projection (which tab herdr should
-    // report); this is work ownership — it makes every ambient event emitted
-    // on this thread this session's own, and pins the psyche for its turns.
-    // Held for the rest of the session.
-    let _session_guards = crate::session_worker::bind_session_to_thread(&lifecycle_session);
     newt_core::lifecycle::emit_for(
         Some(lifecycle_session.to_string()),
         newt_core::lifecycle::LifecycleEvent::SessionStarted {
@@ -6556,6 +6550,18 @@ fn session_body(
                     // visible throughout.
                     let _disclosure_guard =
                         newt_core::ocap::scoped_session_disclosure(session_disclosure.clone());
+                    // #1669: bind THIS TURN to the tab that is active right
+                    // now, and pin its psyche — both dropped when the turn
+                    // ends, which is what lets the next turn see a `/tab`
+                    // switch and a moved dial.
+                    //
+                    // Scoped exactly like the disclosure guard above, and for
+                    // the same reason: all three describe THIS turn. Hoisting
+                    // any of them to session start would attribute a later
+                    // tab's work to the startup tab and freeze the dials for
+                    // the life of the process.
+                    let _turn_binding =
+                        crate::session_worker::bind_turn(tabs.active().session_id());
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
