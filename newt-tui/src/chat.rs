@@ -975,7 +975,15 @@ pub(crate) fn run_chat(
     // by adopt_backend_choice when the resolved choice still matches its URL.
     prewarm: Option<crate::Prewarm>,
 ) -> anyhow::Result<()> {
-    let verbose = verbose_mode();
+    // #1669: this function is now the TERMINAL. It owns the keyboard, the
+    // editor and the screen, and it owns them for the whole session —
+    // including while a turn is running, which is the entire point. The
+    // session itself runs on its own thread (`session_body`, which is the old
+    // body of this function moved verbatim) and reaches the terminal only by
+    // asking, over a channel, through `RemoteSurface`.
+    //
+    // The surface is built, driven and dropped HERE, on one thread, so it
+    // needs no `Send` bound and `InputSurface` is untouched by any of this.
 
     // Integration listener for the lifecycle events emitted below: when this
     // process runs inside a Herdr pane it reports state to the cockpit, and
@@ -1006,6 +1014,96 @@ pub(crate) fn run_chat(
     // Use the existing tokio runtime from main — block_in_place lets the input
     // surface block the thread while still allowing block_on() inside it.
     let rt = tokio::runtime::Handle::current();
+
+    let surface_is_rich;
+    let mut surface: Box<dyn InputSurface> = {
+        #[cfg(feature = "rich-tui")]
+        {
+            // The rich-surface gate (`rich_surface_selected`): footer resolves
+            // rich AND stdout is a TTY. Kept as a named pure predicate so the
+            // #1674 palette's gating test pins exactly this composition.
+            if rich_surface_selected(footer_mode(), io::stdout().is_terminal()) {
+                surface_is_rich = true;
+                Box::new(rich_input::RichSurface::new(history_path)?)
+            } else {
+                surface_is_rich = false;
+                Box::new(lean_input::LeanSurface::new(history_path)?)
+            }
+        }
+        #[cfg(not(feature = "rich-tui"))]
+        {
+            surface_is_rich = false;
+            Box::new(lean_input::LeanSurface::new(history_path)?)
+        }
+    };
+    // Mark all open fds (terminal, history file, sockets) as O_CLOEXEC so
+    // subprocesses spawned by run_command don't inherit them. This is the
+    // primary defence against EMFILE from cargo test / rustc worker floods.
+    #[cfg(unix)]
+    mark_fds_cloexec();
+
+    // Bounded: a session that outruns the terminal must slow down rather than
+    // grow a backlog of stale status updates the operator will never see.
+    let (to_ui, from_session) = std::sync::mpsc::sync_channel(64);
+
+    // `scope`, not `thread::spawn`: the session borrows `workspace`, `persona`
+    // and `crew_runner` from this frame, and scoped threads are what let those
+    // borrows compile without forcing every caller to own its arguments.
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let session = std::thread::Builder::new()
+            .name("newt-session".to_string())
+            .stack_size(newt_core::stack::SESSION_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                session_body(
+                    workspace,
+                    color,
+                    persona,
+                    altitude,
+                    crew_runner,
+                    prewarm,
+                    rt,
+                    surface_is_rich,
+                    to_ui,
+                )
+            })?;
+
+        // Service the session until it drops its end — which happens when it
+        // returns, after its teardown has had its last `save_history` served.
+        // The pump ending IS the session ending; there is no second handshake.
+        crate::session_worker::pump_surface(&mut *surface, &from_session);
+
+        // Propagate a session panic rather than swallowing it into a silent
+        // clean exit — the operator must not be told "goodbye" by a crash.
+        match session.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// The session: the old body of `run_chat`, moved onto its own thread.
+///
+/// Everything is as it was, with three exceptions, all forced by the move: the
+/// tokio `Handle` and `surface_is_rich` arrive as parameters (the first
+/// because `Handle::current()` needs a runtime thread, the second because the
+/// surface is now built by the caller), and `surface` is a `RemoteSurface`
+/// that asks the terminal thread instead of touching the terminal.
+#[allow(clippy::too_many_arguments)]
+fn session_body(
+    workspace: &str,
+    color: bool,
+    persona: Option<&str>,
+    altitude: Option<newt_core::Altitude>,
+    crew_runner: Option<&dyn newt_core::agentic::CrewRunner>,
+    prewarm: Option<crate::Prewarm>,
+    rt: tokio::runtime::Handle,
+    surface_is_rich: bool,
+    to_ui: std::sync::mpsc::SyncSender<crate::session_worker::SurfaceRequest>,
+) -> anyhow::Result<()> {
+    let verbose = verbose_mode();
+    // The session's only route to the terminal.
+    let mut surface: Box<dyn InputSurface> =
+        Box::new(crate::session_worker::RemoteSurface::new(to_ui));
 
     // Resolve config ONCE per session and reuse it for every read this turn.
     // It is re-read (`Config::resolve`) only after a slash command, the one
@@ -1389,32 +1487,6 @@ pub(crate) fn run_chat(
     // output into a truncated excerpt; the LEAN surface shows the whole thing
     // (see `committed_spill_lines`). The transcript pager (#1670) gates on the
     // same flag — scrollable regions are rich-only.
-    let surface_is_rich;
-    let mut surface: Box<dyn InputSurface> = {
-        #[cfg(feature = "rich-tui")]
-        {
-            // The rich-surface gate (`rich_surface_selected`): footer resolves
-            // rich AND stdout is a TTY. Kept as a named pure predicate so the
-            // #1674 palette's gating test pins exactly this composition.
-            if rich_surface_selected(footer_mode(), io::stdout().is_terminal()) {
-                surface_is_rich = true;
-                Box::new(rich_input::RichSurface::new(history_path)?)
-            } else {
-                surface_is_rich = false;
-                Box::new(lean_input::LeanSurface::new(history_path)?)
-            }
-        }
-        #[cfg(not(feature = "rich-tui"))]
-        {
-            surface_is_rich = false;
-            Box::new(lean_input::LeanSurface::new(history_path)?)
-        }
-    };
-    // Mark all open fds (terminal, history file, sockets) as O_CLOEXEC so
-    // subprocesses spawned by run_command don't inherit them. This is the
-    // primary defence against EMFILE from cargo test / rustc worker floods.
-    #[cfg(unix)]
-    mark_fds_cloexec();
 
     // `mut` so a runtime `/vi` / `/emacs` switch is reflected in the next prompt.
     let mut is_vi = resolve_edit_mode() == newt_core::EditMode::Vi;
@@ -1744,6 +1816,12 @@ pub(crate) fn run_chat(
     // with an explicit id rather than relying on the cell, so it is
     // self-describing regardless of ownership ordering.
     newt_core::lifecycle::set_active_session(&lifecycle_session);
+    // #1669: bind THIS thread to the session as well. `set_active_session`
+    // above is the process-wide visibility projection (which tab herdr should
+    // report); this is work ownership — it makes every ambient event emitted
+    // on this thread this session's own, and pins the psyche for its turns.
+    // Held for the rest of the session.
+    let _session_guards = crate::session_worker::bind_session_to_thread(&lifecycle_session);
     newt_core::lifecycle::emit_for(
         Some(lifecycle_session.to_string()),
         newt_core::lifecycle::LifecycleEvent::SessionStarted {
