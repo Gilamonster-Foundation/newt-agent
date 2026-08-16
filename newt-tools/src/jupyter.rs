@@ -63,7 +63,9 @@ pub struct JupyterExecuteParams {
     /// Optional working directory to execute the notebook in.
     /// If not provided, uses the notebook's parent directory.
     pub working_dir: Option<String>,
-    /// Timeout in seconds for the entire notebook execution (default: 300)
+    /// Per-cell execution timeout in seconds, passed to nbconvert's
+    /// `ExecutePreprocessor.timeout`. A cell that exceeds this is interrupted
+    /// and marks the notebook as failed. Default: 300.
     pub timeout_seconds: Option<u64>,
     /// Whether to save the executed notebook with outputs (default: true)
     pub save_outputs: Option<bool>,
@@ -78,9 +80,9 @@ pub struct JupyterExecuteResult {
     pub success: bool,
     /// Path to the executed notebook
     pub notebook_path: String,
-    /// Number of cells executed
+    /// Number of code cells executed (markdown/raw cells are not counted)
     pub cells_executed: usize,
-    /// Number of cells that failed
+    /// Number of code cells whose execution produced an error
     pub cells_failed: usize,
     /// Execution time in seconds
     pub execution_time_seconds: f64,
@@ -105,13 +107,19 @@ pub struct CellOutputSummary {
 pub fn execute_notebook(params: JupyterExecuteParams) -> Result<JupyterExecuteResult> {
     let start_time = std::time::Instant::now();
 
-    let working_dir = params
-        .working_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // working_dir=None means the notebook's parent directory.
+    let notebook_input = PathBuf::from(&params.notebook_path);
+    let working_dir = match params.working_dir.map(PathBuf::from) {
+        Some(d) => d,
+        None => notebook_input
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
 
-    // Resolve notebook path relative to working_dir
-    let notebook_path = working_dir.join(&params.notebook_path);
+    // Resolve notebook path relative to working_dir.
+    let notebook_path = working_dir.join(&notebook_input);
     if !notebook_path.exists() {
         anyhow::bail!("Notebook not found: {}", notebook_path.display());
     }
@@ -148,15 +156,25 @@ pub fn execute_notebook(params: JupyterExecuteParams) -> Result<JupyterExecuteRe
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Parse outputs from the executed notebook if successful
-    let cell_outputs = if success {
-        parse_notebook_outputs(&notebook_path)?
-    } else {
-        vec![]
+    // Parse outputs from the executed notebook. nbconvert `--inplace` writes
+    // partial outputs (up to and including the failing cell) even on error, so
+    // parse best-effort to surface which cell failed. On a non-success run
+    // where the file is unreadable, fall back to an empty list.
+    let cell_outputs = match parse_notebook_outputs(&notebook_path) {
+        Ok(o) => o,
+        Err(_) if !success => vec![],
+        Err(e) => return Err(e),
     };
 
-    let cells_executed = cell_outputs.len();
-    let cells_failed = cell_outputs.iter().filter(|c| !c.success).count();
+    // Count only executed code cells; markdown/raw cells are not "executed".
+    let cells_executed = cell_outputs
+        .iter()
+        .filter(|c| c.cell_type == "code")
+        .count();
+    let cells_failed = cell_outputs
+        .iter()
+        .filter(|c| c.cell_type == "code" && !c.success)
+        .count();
 
     Ok(JupyterExecuteResult {
         success,
