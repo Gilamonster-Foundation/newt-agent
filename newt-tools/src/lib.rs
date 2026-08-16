@@ -20,6 +20,8 @@ pub use jupyter::{
     JupyterExecuteParams, JupyterExecuteResult, JupyterServerParams, JupyterServerResult,
     JupyterServerStatus, KernelInfo,
 };
+// NOTE: `stop_server` and `get_server_status` are handle-id based — they
+// operate only on servers this process started (registered by `start_server`).
 pub use ls::{list_dir, DirEntry, EntryKind};
 #[cfg(feature = "applier-diffy")]
 pub use patch::DiffyApplier;

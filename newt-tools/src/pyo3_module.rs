@@ -447,14 +447,15 @@ impl PyJupyterServerStatus {
         self.inner.running
     }
 
+    /// The handle this status refers to.
     #[getter]
-    fn url(&self) -> Option<&str> {
-        self.inner.url.as_deref()
+    fn handle_id(&self) -> u64 {
+        self.inner.handle_id
     }
 
     #[getter]
-    fn pid(&self) -> Option<u32> {
-        self.inner.pid
+    fn url(&self) -> Option<&str> {
+        self.inner.url.as_deref()
     }
 
     #[getter]
@@ -493,6 +494,13 @@ impl PyJupyterServerResult {
     #[getter]
     fn success(&self) -> bool {
         self.inner.success
+    }
+
+    /// Opaque handle for later `stop_jupyter_server` / `get_jupyter_server_status`
+    /// calls (None on a failed start).
+    #[getter]
+    fn handle_id(&self) -> Option<u64> {
+        self.inner.handle_id
     }
 
     #[getter]
@@ -534,22 +542,23 @@ fn py_start_server(params: PyJupyterServerParams) -> PyResult<PyJupyterServerRes
 
 // ---- stop_server ----
 
-/// Stop a Jupyter server by PID.
+/// Stop a Jupyter server by handle id (returned by `start_jupyter_server`).
 #[cfg(feature = "jupyter")]
 #[pyfunction]
 #[pyo3(name = "stop_jupyter_server")]
-fn py_stop_server(pid: u32) -> PyResult<bool> {
-    stop_server(pid).map_err(tools_err_to_py)
+fn py_stop_server(handle_id: u64) -> PyResult<bool> {
+    stop_server(handle_id).map_err(tools_err_to_py)
 }
 
 // ---- get_server_status ----
 
-/// Get status of a Jupyter server.
+/// Get status of a Jupyter server by handle id (returned by
+/// `start_jupyter_server`). Only servers this process started can be queried.
 #[cfg(feature = "jupyter")]
 #[pyfunction]
 #[pyo3(name = "get_jupyter_server_status")]
-fn py_get_server_status(url: String, token: Option<String>) -> PyResult<PyJupyterServerStatus> {
-    let result = get_server_status(&url, token.as_deref()).map_err(tools_err_to_py)?;
+fn py_get_server_status(handle_id: u64) -> PyResult<PyJupyterServerStatus> {
+    let result = get_server_status(handle_id).map_err(tools_err_to_py)?;
     Ok(PyJupyterServerStatus { inner: result })
 }
 
