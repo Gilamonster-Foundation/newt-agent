@@ -18,7 +18,7 @@ crate-type = ["cdylib"]
 newt-core = { workspace = true, features = ["pyo3"] }
 newt-data = { workspace = true, features = ["pyo3"] }
 newt-inference = { workspace = true, features = ["pyo3"] }
-newt-tools = { workspace = true, features = ["pyo3"] }
+newt-tools = { workspace = true, features = ["pyo3", "jupyter"] }
 newt-coder = { workspace = true, features = ["pyo3"] }
 newt-eval = { workspace = true, features = ["pyo3"] }
 newt-acp-worker = { workspace = true, features = ["pyo3"] }
@@ -26,6 +26,11 @@ newt-mcp-server = { workspace = true, features = ["pyo3"] }
 pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-async-runtimes = { workspace = true, features = ["tokio-runtime"] }
 tokio = { workspace = true }
+
+[features]
+default = []
+jupyter = ["newt-tools/jupyter"]
+pyo3 = []  # Pass-through feature for maturin
 
 [lints]
 workspace = true
