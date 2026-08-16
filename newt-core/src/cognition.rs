@@ -78,10 +78,60 @@ pub fn persona_cognition() -> Option<Cognition> {
 /// definition of the precedence — read by the loop, `/psyche`, and the panel.
 #[must_use]
 pub fn effective_cognition() -> Option<Cognition> {
+    // A captured turn resolves once, on its own thread, and stops reading the
+    // process dials — see `scoped_effective_cognition`.
+    if let Some(captured) = EFFECTIVE_COGNITION_OVERRIDE.with(std::cell::Cell::get) {
+        return captured;
+    }
     match cli_cognition() {
         CognitionOverride::Unset => persona_cognition(),
         CognitionOverride::Off => None,
         CognitionOverride::Set(c) => Some(c),
+    }
+}
+
+std::thread_local! {
+    /// This thread's pinned cognition, if a turn has captured one.
+    ///
+    /// Two layers of `Option` and both are load-bearing: the OUTER says
+    /// whether a capture is installed at all, the INNER is the captured value
+    /// — and `None` is a perfectly good cognition (`/cognition off` means "no
+    /// `reasoning.effort` field"). Collapsing them would make an explicit
+    /// "off" indistinguishable from "not captured" and silently fall through
+    /// to the process dials.
+    static EFFECTIVE_COGNITION_OVERRIDE: std::cell::Cell<Option<Option<Cognition>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous captured cognition on drop.
+///
+/// The `Rc` marker keeps the guard on the thread whose slot it owns — the same
+/// construction as [`crate::tenacity::ScopedEffectiveTenacity`] and
+/// [`crate::ocap::ScopedSessionDisclosure`].
+#[must_use]
+pub struct ScopedEffectiveCognition {
+    previous: Option<Option<Cognition>>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for ScopedEffectiveCognition {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        let _ = EFFECTIVE_COGNITION_OVERRIDE.try_with(|slot| slot.set(previous));
+    }
+}
+
+/// Pin [`effective_cognition`] on this thread until the returned guard drops.
+///
+/// The sibling of [`crate::tenacity::scoped_effective_tenacity`], and the
+/// cognition half of [`crate::psyche::capture_turn_psyche`] — prefer that
+/// composite at a turn boundary so neither dial is captured without the other.
+/// Nests in lexical (LIFO) order.
+pub fn scoped_effective_cognition(level: Option<Cognition>) -> ScopedEffectiveCognition {
+    let previous = EFFECTIVE_COGNITION_OVERRIDE.with(|slot| slot.replace(Some(level)));
+    ScopedEffectiveCognition {
+        previous,
+        _thread_bound: std::marker::PhantomData,
     }
 }
 
