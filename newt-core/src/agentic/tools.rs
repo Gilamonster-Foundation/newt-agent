@@ -35,7 +35,7 @@ mod catalog;
 pub(crate) mod exposure;
 mod live_output;
 mod output_budget;
-use live_output::{LiveOutputRelay, LiveOutputSession};
+use live_output::{LiveOutputRelay, LiveOutputSession, ToolSpinner};
 
 #[cfg(test)]
 use catalog::lifecycle_tool_definition;
@@ -3564,6 +3564,16 @@ async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
         tool_presentation(name, args, std::path::Path::new(workspace));
     display.call(&presentation_name, &presentation_detail);
     let result = {
+        // #1727: the row under the header is never silent while the tool is
+        // in flight. The spinner is scoped to this block, so it is erased
+        // before `display.result` below on every path — return, cancel, or
+        // panic — and the session's live sink is wrapped so the FIRST live
+        // chunk takes the row over from it. See `ToolSpinner`.
+        let spinner = ToolSpinner::start(&presentation_name, color);
+        let collab = ToolCollaborators {
+            live_tool_output: spinner.wrap(collab.live_tool_output),
+            ..collab
+        };
         let execution = execute_tool_inner(
             display,
             name,

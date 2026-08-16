@@ -85,6 +85,14 @@ struct SpinnerState {
     /// Styling ONLY. Never a capability signal — see [`LineCaps`].
     color: bool,
     finished: AtomicBool,
+    /// Serializes `draw` against `finish`. Without it a tick could pass the
+    /// `finished` check, lose the CPU, and paint AFTER `finish` had erased —
+    /// a stale row that the lease's final erase would then wipe from wherever
+    /// the cursor had moved to. Harmless when the next writer is a permanent
+    /// line on a fresh row; destructive when it is a viewport that has just
+    /// taken this row (#1727's spinner → live-output hand-off). Lock order is
+    /// always gate → stdout, in both holders.
+    paint_gate: Mutex<()>,
 }
 
 impl SpinnerState {
@@ -92,6 +100,10 @@ impl SpinnerState {
     /// and never scrolls, so a line wider than the terminal would wrap and leave
     /// stale rows behind that no single-line erase can reach.
     fn draw(&self) {
+        let _gate = self
+            .paint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.finished.load(Ordering::SeqCst) {
             return;
         }
@@ -135,6 +147,10 @@ impl SpinnerState {
     /// same operation, so teardown can never double-erase a row someone else
     /// has since taken.
     fn finish(&self) {
+        let _gate = self
+            .paint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.finished.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -276,6 +292,7 @@ impl Spinner {
             frame: AtomicUsize::new(0),
             color,
             finished: AtomicBool::new(false),
+            paint_gate: Mutex::new(()),
         });
         let as_ephemeral: Arc<dyn Ephemeral> = state.clone();
         Terminal::register(
