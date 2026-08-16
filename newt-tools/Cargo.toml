@@ -37,7 +37,7 @@ pyo3 = { workspace = true, optional = true }
 
 [features]
 default = []
-pyo3 = ["dep:pyo3", "newt-core/pyo3", "dep:nbformat"]
+pyo3 = ["dep:pyo3", "newt-core/pyo3"]
 # Compile the `diffy`-backed PatchApplier. Selectable at runtime with
 # NEWT_PATCH_APPLIER=diffy once enabled.
 applier-diffy = ["dep:diffy"]
