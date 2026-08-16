@@ -87,6 +87,7 @@ pub(crate) enum SurfaceRequest {
         session: String,
     },
     SetBackgroundJobs(Vec<BackgroundJob>),
+    SetTabs(Vec<crate::tab_bar::TabCell>),
 }
 
 impl SurfaceRequest {
@@ -212,6 +213,10 @@ impl crate::chat::InputSurface for RemoteSurface {
     fn set_background_jobs(&mut self, jobs: Vec<BackgroundJob>) {
         self.notify(SurfaceRequest::SetBackgroundJobs(jobs));
     }
+
+    fn set_tabs(&mut self, tabs: Vec<crate::tab_bar::TabCell>) {
+        self.notify(SurfaceRequest::SetTabs(tabs));
+    }
 }
 
 /// Serve one session's surface requests on the thread that owns the terminal.
@@ -247,6 +252,7 @@ pub(crate) fn pump_surface(
                 session,
             } => surface.set_runtime_context(&model, &endpoint, gauge, &session),
             SurfaceRequest::SetBackgroundJobs(jobs) => surface.set_background_jobs(jobs),
+            SurfaceRequest::SetTabs(tabs) => surface.set_tabs(tabs),
         }
     }
 }
@@ -478,6 +484,147 @@ mod tests {
         }
         worker.join().expect("worker").expect("served");
         assert_eq!(served.load(Ordering::Acquire), 1);
+    }
+
+    // ── proxy completeness ─────────────────────────────────────────────────
+
+    fn a_cell(number: usize, active: bool) -> crate::tab_bar::TabCell {
+        crate::tab_bar::TabCell {
+            number,
+            label: format!("tab{number}"),
+            active,
+            degraded: false,
+            pending: false,
+        }
+    }
+
+    /// A tab projection sent by the session must actually arrive at the
+    /// terminal.
+    ///
+    /// This is the assertion that was missing when the bar was first written:
+    /// `InputSurface::set_tabs` has a default no-op, `RemoteSurface` did not
+    /// override it, and the call therefore compiled, passed every layout test,
+    /// and rendered nothing. The layout tests could not catch it because they
+    /// never cross the channel.
+    #[test]
+    fn a_tab_projection_reaches_the_terminal() {
+        let (to_ui, from_session) = std::sync::mpsc::sync_channel(4);
+        let mut surface = RemoteSurface::new(to_ui);
+        surface.set_tabs(vec![a_cell(1, true), a_cell(2, false)]);
+        drop(surface);
+
+        match from_session.recv().expect("the projection crossed") {
+            SurfaceRequest::SetTabs(cells) => {
+                assert_eq!(cells.len(), 2);
+                assert_eq!(cells[0], a_cell(1, true), "payload survives intact");
+                assert!(cells[1].label.ends_with('2'));
+            }
+            other => panic!("expected SetTabs, got {other:?}"),
+        }
+    }
+
+    /// **The guard for the whole class.** Every `InputSurface` method must be
+    /// forwarded by the proxy, because since #1718 the session reaches the
+    /// terminal only through it — so a method the proxy forgets falls through
+    /// to the trait's default body, compiles without a warning, and is dead at
+    /// runtime.
+    ///
+    /// Non-vacuous by construction: it drives all seven methods through
+    /// `RemoteSurface` and asserts the far side observed all seven. Delete any
+    /// one forwarding impl and the count drops — the exact failure that
+    /// shipped a silent no-op the first time.
+    ///
+    /// If you add an eighth method to `InputSurface`, this test fails until
+    /// the proxy forwards it. That is the point; do not relax the count.
+    #[test]
+    fn the_proxy_forwards_every_surface_method() {
+        let (to_ui, from_session) = std::sync::mpsc::sync_channel(16);
+        let served = std::thread::spawn(move || {
+            let mut recorder = CountingSurface::default();
+            pump_surface(&mut recorder, &from_session);
+            recorder
+        });
+
+        {
+            let mut surface = RemoteSurface::new(to_ui);
+            surface.set_runtime_context("m", "http://h", Some((1, 2)), "s");
+            surface.set_background_jobs(Vec::new());
+            surface.set_tabs(vec![a_cell(1, true)]);
+            surface.add_history("entry");
+            surface.save_history();
+            surface.reload().expect("served");
+            surface.read_line("› ").expect("served");
+        }
+
+        let seen = served.join().expect("terminal thread");
+        assert_eq!(
+            seen.observed(),
+            7,
+            "every InputSurface method must cross the proxy; missing: {:?}",
+            seen.missing()
+        );
+    }
+
+    /// Records which surface methods the terminal was actually asked to run.
+    #[derive(Default)]
+    struct CountingSurface {
+        read_line: usize,
+        add_history: usize,
+        save_history: usize,
+        reload: usize,
+        runtime_context: usize,
+        background_jobs: usize,
+        tabs: usize,
+    }
+
+    impl CountingSurface {
+        fn each(&self) -> [(&'static str, usize); 7] {
+            [
+                ("read_line", self.read_line),
+                ("add_history", self.add_history),
+                ("save_history", self.save_history),
+                ("reload", self.reload),
+                ("set_runtime_context", self.runtime_context),
+                ("set_background_jobs", self.background_jobs),
+                ("set_tabs", self.tabs),
+            ]
+        }
+        fn observed(&self) -> usize {
+            self.each().iter().filter(|(_, n)| *n > 0).count()
+        }
+        fn missing(&self) -> Vec<&'static str> {
+            self.each()
+                .iter()
+                .filter(|(_, n)| *n == 0)
+                .map(|(name, _)| *name)
+                .collect()
+        }
+    }
+
+    impl crate::chat::InputSurface for CountingSurface {
+        fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
+            self.read_line += 1;
+            Ok(ReadOutcome::Eof)
+        }
+        fn add_history(&mut self, _entry: &str) {
+            self.add_history += 1;
+        }
+        fn save_history(&mut self) {
+            self.save_history += 1;
+        }
+        fn reload(&mut self) -> anyhow::Result<()> {
+            self.reload += 1;
+            Ok(())
+        }
+        fn set_runtime_context(&mut self, _m: &str, _e: &str, _g: Option<(u32, u32)>, _s: &str) {
+            self.runtime_context += 1;
+        }
+        fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {
+            self.background_jobs += 1;
+        }
+        fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {
+            self.tabs += 1;
+        }
     }
 
     // ── end-to-end session lifecycle ───────────────────────────────────────
