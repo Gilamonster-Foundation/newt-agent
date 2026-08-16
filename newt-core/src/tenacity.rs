@@ -265,7 +265,8 @@ std::thread_local! {
 /// Restores the prior current-thread override on drop. The `Rc` marker keeps
 /// the guard on the thread whose TLS slot it owns; driven turns use a
 /// current-thread runtime, so the guard safely spans the whole async turn.
-pub(crate) struct ScopedEffectiveTenacity {
+#[must_use]
+pub struct ScopedEffectiveTenacity {
     previous: Option<Tenacity>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -278,7 +279,12 @@ impl Drop for ScopedEffectiveTenacity {
 
 /// Override [`effective_tenacity`] on the current thread until the returned
 /// guard drops. Overrides nest in lexical (LIFO) order.
-pub(crate) fn scoped_effective_tenacity(level: Tenacity) -> ScopedEffectiveTenacity {
+///
+/// `pub` since #1669: a session that runs its turn on its own thread captures
+/// this dial there, so the embedding crate needs it. Prefer
+/// [`crate::psyche::capture_turn_psyche`] at a turn boundary, so tenacity is
+/// never pinned without cognition.
+pub fn scoped_effective_tenacity(level: Tenacity) -> ScopedEffectiveTenacity {
     let previous = EFFECTIVE_TENACITY_OVERRIDE.with(|slot| slot.replace(Some(level)));
     ScopedEffectiveTenacity {
         previous,
