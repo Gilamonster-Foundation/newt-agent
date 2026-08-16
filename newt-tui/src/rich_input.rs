@@ -118,8 +118,18 @@ fn resolve_gutter(setting: Option<u16>, width: u16) -> u16 {
 }
 
 /// One step of the editor: what the loop should do after handling a key.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) enum Step {
+    /// #1669 16.3: the operator asked for a tab action from the KEYBOARD.
+    ///
+    /// The terminal recognises the gesture; the session applies it — tabs are
+    /// session state. Carrying the same `TabAction` the `/tab` text engine
+    /// parses is deliberate: one vocabulary, so a key and a slash command
+    /// cannot drift into meaning different things.
+    ///
+    /// `Step` gave up `Copy` for this (`TabAction::Rename` owns a `String`).
+    /// That cost nothing — no call site depended on it.
+    Tab(crate::tabs::TabAction),
     /// Keep editing.
     Continue,
     /// Accept the buffer as this turn's input.
@@ -1307,6 +1317,10 @@ impl RichSurface {
                     self.pending_end_quit.set(true);
                     return Ok(ReadOutcome::Line(body));
                 }
+                // #1669 16.3: a tab motion leaves the editor immediately —
+                // it is not an edit, and the session owns what happens next.
+                // The buffer is left intact so the draft survives the switch.
+                Step::Tab(action) => return Ok(ReadOutcome::Tab(action)),
                 Step::Eof => return Ok(ReadOutcome::Eof),
             }
         }
@@ -2150,6 +2164,122 @@ mod tests {
     fn textarea_with_prefills_content_for_recall() {
         let ta = textarea_with(Edit::Vi, "recalled prompt");
         assert_eq!(ta.lines(), &["recalled prompt".to_string()]);
+    }
+
+    // ── #1669 16.3: vim tab motions ────────────────────────────────────────
+
+    /// Drive chars from NORMAL and return the last `Step`.
+    ///
+    /// The leading Esc is not decoration: `Editor::new(Edit::Vi)` starts in
+    /// INSERT, so a helper that skips it tests nothing but typing.
+    fn normal_keys(ed: &mut Editor, ta: &mut TextArea, keys: &str) -> Step {
+        ed.input(special(KeyCode::Esc), ta); // INSERT → NORMAL
+        let mut last = Step::Continue;
+        for c in keys.chars() {
+            last = ed.input(key(c), ta);
+        }
+        last
+    }
+
+    /// `gt` with no count is "next tab", not "go to tab 1".
+    ///
+    /// The distinction is the whole reason the count is read as `0 == absent`
+    /// rather than through `take_count()`, which floors at 1.
+    #[test]
+    fn bare_gt_is_next_not_goto_one() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(
+            normal_keys(&mut ed, &mut ta, "gt"),
+            Step::Tab(crate::tabs::TabAction::Next)
+        );
+    }
+
+    /// **`{count}gt` is ABSOLUTE.** `2gt` is "go to tab 2", not "two tabs
+    /// forward" — unusual for a vi count, correct for vim, and exactly the
+    /// kind of thing a later refactor would "fix" into a relative motion.
+    #[test]
+    fn a_counted_gt_goes_to_that_tab_absolutely() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(
+            normal_keys(&mut ed, &mut ta, "2gt"),
+            Step::Tab(crate::tabs::TabAction::Goto(2))
+        );
+        // Multi-digit counts accumulate the same way every other vi count does.
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(
+            normal_keys(&mut ed, &mut ta, "12gt"),
+            Step::Tab(crate::tabs::TabAction::Goto(12))
+        );
+    }
+
+    /// `gT` is relative in BOTH forms — bare is one back, counted is n back.
+    /// Deliberately different from `gt`, matching vim.
+    #[test]
+    fn gt_capital_is_relative_in_both_forms() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(
+            normal_keys(&mut ed, &mut ta, "gT"),
+            Step::Tab(crate::tabs::TabAction::Prev(1))
+        );
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(
+            normal_keys(&mut ed, &mut ta, "3gT"),
+            Step::Tab(crate::tabs::TabAction::Prev(3))
+        );
+    }
+
+    /// The regression that matters most: `gg` still goes to the top.
+    ///
+    /// `g` is now a live prefix for three things, and `gg` is a hot key. If
+    /// adding the tab motions had made `gg` return a `Step::Tab`, or consumed
+    /// its count, the damage would be silent and constant.
+    #[test]
+    fn gg_still_jumps_to_the_top_and_is_not_a_tab_motion() {
+        let mut ed = vi_editor();
+        let mut ta = textarea_with(Edit::Vi, "one\ntwo\nthree");
+        assert_eq!(
+            normal_keys(&mut ed, &mut ta, "gg"),
+            Step::Continue,
+            "gg is a cursor jump, never a tab action"
+        );
+        assert_eq!(ta.cursor().0, 0, "cursor is on the first line");
+    }
+
+    /// An unknown `g`-suffix is swallowed, as before — it must not leak a tab
+    /// action or leave the count armed for the next keystroke.
+    #[test]
+    fn an_unknown_g_suffix_stays_inert() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(normal_keys(&mut ed, &mut ta, "gz"), Step::Continue);
+        // The count from a previous attempt must not survive into the next.
+        assert_eq!(
+            normal_keys(&mut ed, &mut ta, "gt"),
+            Step::Tab(crate::tabs::TabAction::Next),
+            "a stale count would have made this a Goto"
+        );
+    }
+
+    /// Tab motions are NORMAL-mode only: typing `gt` while inserting is text.
+    ///
+    /// A vi user types `g` and `t` constantly. If the tab motion fired from
+    /// INSERT, every word containing "gt" would fling the operator into
+    /// another agent's tab mid-sentence.
+    #[test]
+    fn gt_in_insert_mode_is_just_text() {
+        let mut ed = vi_editor(); // starts in INSERT
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "gt");
+        assert_eq!(
+            ta.lines(),
+            &["gt".to_string()],
+            "insert mode types the characters"
+        );
     }
 
     #[test]

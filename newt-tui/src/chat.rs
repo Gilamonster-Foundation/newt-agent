@@ -44,6 +44,14 @@ pub(crate) fn footer_continues(input: &str) -> bool {
 /// cannot be diagnosed when that channel misbehaves.
 #[derive(Debug)]
 pub(crate) enum ReadOutcome {
+    /// #1669 16.3: a keyboard-issued tab action, on its way to the session
+    /// that owns the tabs. Same vocabulary as `/tab`.
+    ///
+    /// Only the rich surface produces this — the tab keys live in the vi
+    /// state machine — so in the lean (`--no-default-features`) build it is
+    /// constructed nowhere, exactly like `EndAndQuit` below.
+    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+    Tab(crate::tabs::TabAction),
     /// A submitted line. May contain `\`-continued newlines the loop rejoins.
     Line(String),
     /// Ctrl-C — interrupt; the loop exits cleanly.
@@ -1954,6 +1962,27 @@ fn session_body(
         };
     }
 
+    /// Apply a [`TabAction`] and pay its side effects — the ONE place a tab
+    /// action takes effect, whether it came from `/tab` or from the keyboard.
+    ///
+    /// Sibling of `tab_ctx!` and a macro for the same reason: it needs the
+    /// same ~22 live locals by reference, and a free function would have to
+    /// take them all as parameters. Sharing it is not tidiness — a second
+    /// dispatch is how `gt` and `/tab 2` start meaning subtly different things.
+    macro_rules! apply_tab {
+        ($action:expr, $store:expr) => {{
+            let mut tab_ctx = tab_ctx!($store);
+            let outcome = crate::tab_switch::handle_tab_action($action, &mut tab_ctx, &mut tabs);
+            // Same re-probe discipline as every other backend switch: a tab
+            // whose pin repoints the endpoint must repoint DGX telemetry too,
+            // or verbose `hw:` lines report the box the other tab was on.
+            if outcome.url_changed && verbose {
+                dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url).map(|d| d.into_sampler(2));
+            }
+            outcome
+        }};
+    }
+
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
     //
@@ -2386,6 +2415,31 @@ fn session_body(
             (surface.read_line(&prompt)?, origin)
         };
         match outcome {
+            // #1669 16.3: a keyboard tab motion (`gt`/`gT`/`{count}gt`). The
+            // terminal recognised the gesture; the session owns the tabs, so
+            // it lands here and goes through the SAME dispatch `/tab` uses.
+            //
+            // The surface refusal is re-checked rather than assumed: the keys
+            // only exist on the rich surface, but an ephemeral session has no
+            // store to switch within, and that is a runtime fact.
+            ReadOutcome::Tab(action) => {
+                let refusal = crate::tab_switch::tab_surface_refusal(
+                    surface_is_rich,
+                    ephemeral_session,
+                    conversation_store.is_some(),
+                );
+                match (refusal, conversation_store.as_ref()) {
+                    (Some(why), _) => print_newt(why, color, verbose),
+                    (None, None) => {
+                        unreachable!("tab_surface_refusal returns Some when there is no store")
+                    }
+                    (None, Some(store)) => {
+                        apply_tab!(action, store);
+                    }
+                }
+                println!();
+                continue;
+            }
             ReadOutcome::Line(line) => {
                 // Rejoin `\`-continued lines (multi-line entry) into real
                 // newlines; a no-op for single-line input.
@@ -2945,22 +2999,7 @@ fn session_body(
                             (None, Some(store)) => match crate::tabs::parse_tab_command(arg) {
                                 Err(usage) => print_newt(&usage, color, verbose),
                                 Ok(action) => {
-                                    let mut tab_ctx = tab_ctx!(store);
-                                    let outcome = crate::tab_switch::handle_tab_action(
-                                        action,
-                                        &mut tab_ctx,
-                                        &mut tabs,
-                                    );
-                                    let url_changed = outcome.url_changed;
-                                    // Same re-probe discipline as every other
-                                    // backend switch: a tab whose pin repoints
-                                    // the endpoint must repoint DGX telemetry
-                                    // too, or verbose `hw:` lines report the
-                                    // box the other tab was talking to.
-                                    if url_changed && verbose {
-                                        dgx_rx = dgx_probe::DgxTelemetry::try_connect(&inf_url)
-                                            .map(|d| d.into_sampler(2));
-                                    }
+                                    apply_tab!(action, store);
                                 }
                             },
                         }

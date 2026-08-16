@@ -45,6 +45,7 @@ pub(crate) enum Pending {
 /// onto tui-textarea. NORMAL/INSERT · `h l j k w b e 0 ^ $ G gg` (counts) ·
 /// `f F t T` char-search + `; ,` repeat · `i I a A o O` ·
 /// `x X D C s S r{c} u Ctrl-R p J` · `d/c/y{motion}` + `dd/cc/yy` ·
+/// `gt`/`gT`/`{count}gt` tab motions ·
 /// Ctrl-O/Ctrl-I jumplist + `:jumps` · i_CTRL-O insert-normal.
 pub(crate) struct Vi {
     pub(crate) mode: Mode,
@@ -270,9 +271,34 @@ impl Vi {
             }
             Pending::G => {
                 self.pending = Pending::None;
-                if c == 'g' {
-                    self.record_jump(ta); // gg is a jump
-                    ta.move_cursor(CursorMove::Top);
+                // Consumed for EVERY g-suffix, including the unhandled ones —
+                // a count left armed here would silently re-apply to whatever
+                // the operator typed next. 0 means "absent", not "one".
+                let n = std::mem::take(&mut self.count);
+                match c {
+                    'g' => {
+                        self.record_jump(ta); // gg is a jump
+                        ta.move_cursor(CursorMove::Top);
+                    }
+                    // #1669 16.3 — vim's tab motions, unchanged in meaning.
+                    //
+                    // The count is read straight from `self.count`: `g` sets
+                    // this pending state WITHOUT consuming it, so a `2` typed
+                    // before `gt` is still here. No new state was needed.
+                    //
+                    // `gt` with no count is "next"; `2gt` is "go to tab 2",
+                    // ABSOLUTE — which is unusual for a vi count and is
+                    // exactly why it is pinned by a test. `gT` is relative in
+                    // both forms, matching vim.
+                    't' => {
+                        return Step::Tab(if n == 0 {
+                            crate::tabs::TabAction::Next
+                        } else {
+                            crate::tabs::TabAction::Goto(n)
+                        });
+                    }
+                    'T' => return Step::Tab(crate::tabs::TabAction::Prev(n.max(1))),
+                    _ => {}
                 }
                 return Step::Continue;
             }
@@ -300,6 +326,14 @@ impl Vi {
                 self.record_jump(ta); // G is a jump
             }
             apply_motion(ta, c, n);
+            return Step::Continue;
+        }
+        // `g` is a PREFIX, not a command, so it must not consume the pending
+        // count: `{count}gt` needs it downstream, and `take_count()` floors
+        // 0 → 1, erasing the absent/one distinction that separates `gt`
+        // ("next tab") from `1gt` ("go to tab 1").
+        if c == 'g' {
+            self.pending = Pending::G;
             return Step::Continue;
         }
         let n = self.take_count();
@@ -378,7 +412,6 @@ impl Vi {
                 ta.paste();
             }
             'd' | 'c' | 'y' => self.pending = Pending::Op(c),
-            'g' => self.pending = Pending::G,
             // Char-search: `f`/`F`/`t`/`T` wait for a target char (Pending::Find).
             'f' | 'F' | 't' | 'T' => self.pending = Pending::Find(c),
             // `;` repeats the last f/F/t/T; `,` repeats it reversed.
