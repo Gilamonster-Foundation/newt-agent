@@ -38,6 +38,11 @@ pub(crate) fn footer_continues(input: &str) -> bool {
 /// surface's native error type, so each surface (the lean crossterm box, the
 /// ratatui inline rich input — issue #416) can satisfy the same contract without
 /// leaking its own error types into `run_chat`.
+///
+/// `Debug` since #1669: this vocabulary now crosses a channel between the
+/// session thread and the UI thread, and a request that cannot be printed
+/// cannot be diagnosed when that channel misbehaves.
+#[derive(Debug)]
 pub(crate) enum ReadOutcome {
     /// A submitted line. May contain `\`-continued newlines the loop rejoins.
     Line(String),
