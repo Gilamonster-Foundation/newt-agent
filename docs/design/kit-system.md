@@ -1,5 +1,12 @@
 # Feature Proposal: Unified Capability Registry (Kit System)
 
+> **Status (2026-08-16): Draft — partly superseded by existing code.** A "kit" already
+> exists: `newt-core/src/kit.rs` (`Axis`, `Tier`, `RegistryEntry`, `component()`) and
+> `Loadout.kit` naming a `[bundles.*]` in `newt-core/src/config.rs`; `KitPermissions` reduces to
+> the existing `Caveats` / `PermissionGate` / `ExposureProfile`. This doc therefore reduces to
+> "extend `BundleConfig` for role/permission scoping" (roadmap step A3) — no `newt-kit` crate.
+> See the reconciliation table in [companion-roadmap.md](companion-roadmap.md).
+
 ## Overview
 
 Introduce a **Kit System** — a unified, typed registry for all extensibility surfaces in the agent runtime: skills, tools, MCP servers, plugins, and future capability types. Each "kit" declares its capabilities, permissions, and remote-callable policies in a single manifest.
@@ -59,6 +66,8 @@ pub struct KitCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// NOTE: superseded — reuse `newt_core::caveats::Caveats` + `ExposureProfile`
+// (docs/design/tool-exposure-controller.md) instead of a new permissions type.
 pub struct KitPermissions {
     /// Filesystem access patterns
     pub fs: FsPermissionSet,
@@ -135,7 +144,7 @@ impl KitRegistry {
 - Manifest schema + validation
 - In-memory registry with load/unload/query
 - Permission evaluation engine
-- Builtin kit trait + dynamic loading (dlopen / wasm)
+- Builtin kit trait (dynamic loading via dlopen / wasm moved to Open Questions)
 
 ### Phase 2: Migration Adapters
 - `newt-skills` → kit adapter
@@ -166,6 +175,9 @@ impl KitRegistry {
 - WASI component model (wit bindings)
 
 ## Open Questions
+
+0. **Dynamic loading**: `dlopen`/WASM is deferred entirely; process/MCP boundaries first.
+   `KitKind::Speech` is referenced by speech-pipeline.md but not defined here — add it when B1 lands.
 
 1. **WASM vs native plugins**: Start with native `dlopen`, add WASM component model later?
 2. **Kit versioning**: Semver + compatibility matrix, or lockfile-based?

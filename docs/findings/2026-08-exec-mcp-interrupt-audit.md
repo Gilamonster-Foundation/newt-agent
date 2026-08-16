@@ -1,5 +1,22 @@
 # newt-agent: improvements for `pa`/MCP use, hung commands, and Ctrl-C/Ctrl-D
 
+> **Status: findings / audit note, 2026-08.** Relocated from `docs/design/`;
+> this is a snapshot of an investigation, not a live design.
+>
+> **Partly landed:** Fix 1a is in — `host_exec_timeout()`, `kill_on_drop(true)`
+> + own process group, and the `timed_out` / exit-code-124 envelope now live in
+> `newt-core/src/agentic/tools.rs` (~966, ~1090-1103, ~1155). A first-class
+> `git` tool exists (`newt-git` crate; §5a). `run_command` accepts an optional
+> `cwd` (`resolve_exec_cwd`, #1159; §5b).
+>
+> **Still live** (nearest open issues: #1075, #784, #1148, #1720): Fix 1b —
+> racing the turn cancel token against the running exec; Fix 2 — mid-turn
+> Ctrl-D and an OS-level SIGINT/SIGTERM backstop; §3 MCP startup / per-call
+> timeouts, degraded-server handling, child reaping and the `newt doctor` MCP
+> probe; §5c confined-shell `$`/redirection/`/dev/null`; §5d round budget;
+> §5e denial → `request_permissions` hints. Line references below are as of
+> the original investigation and may have drifted.
+
 Findings from an investigation into "ran a program, it got stuck, couldn't Ctrl-C / Ctrl-D."
 File/line references are to the current tree.
 

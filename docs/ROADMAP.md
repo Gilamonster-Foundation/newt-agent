@@ -1563,6 +1563,35 @@ phase when it's ready to schedule.
     human; `loads:` must reject paths escaping the pack root (path-fence).
   - extends the existing `docs/decisions/agent-skills.md` foundation.
 
+- **#1734 — companion train: response tags → speech → desktop → companion**
+  (`enhancement`, design PR #1732, `docs/design/companion-roadmap.md`). Voice
+  I/O, a native desktop host, and an animated on-screen companion — each behind
+  its own feature gate (`speech` / `desktop` / `companion`), never in the LEAN
+  default or the wyvern headless tier. Sequenced A→D, one issue = one PR:
+  - **A1 #1735 response tag table** → widen `newt_core::reasoning::ThinkFilter`
+    into config-driven `OutputStream` tag variants with per-provider overrides
+    (`provider_preset.rs`); tag lists are data (three Cs). Grounds #1506 /
+    #1014 / #860. *Not* a `newt-response-tags` crate.
+  - **A2 #1736 pane contract** → generalise `PanelOutcome`
+    (`docs/decisions/harness_config_panel.md`) + the ephemeral carve-out
+    (`plan_editor_ephemeral_tui.md`); amend `plain_scroller_tui.md`;
+    RichTUI only; coordinate with #1673 / the #1669 tab train. *Not* a
+    `newt-panel` crate or a ratatui host in newt-web (HTMX).
+  - **A3 #1737 kit scoping** → `newt-core/src/kit.rs` + `[bundles.*]`
+    (`loadout-composition.md`, `model-support-kit.md`) *is* the kit system;
+    extend `BundleConfig` with role/exposure/`Caveats` requests. *Not*
+    `newt-kit` / `newt-module`, no `KitPermissions`/`ModulePermissions`.
+  - **B #1738 / #1739 / #1740 speech** → `newt-speech` traits + segmenter +
+    scheduler (mocked); TTS consumes `OutputStream`, STT enters via
+    `SteeringInbox`/`InputSurface`; caveats `audio.in`/`audio.out`; local
+    providers on the weekly tier.
+  - **C #1741 desktop** → Tauri dock client of `NewtDockService` over the
+    newt-web `/attach` seam; separate lockfile like newt-web.
+  - **D #1742 companion** → state machine over `OutputStream` + turn state;
+    static-sprite driver first; open rig format (Cubism SDK is out).
+  - **#1743** exec/MCP interrupt audit follow-ups
+    (`docs/findings/2026-08-exec-mcp-interrupt-audit.md`).
+
 - **drake-foreman dispatch:** each step's branch is the unit of work. The
   goal posted to drake should be the contents of that step's section. The
   worker LLM produces a patch on a fresh checkout of `main`.

@@ -1,12 +1,29 @@
 # Feature Proposal: TUI Dashboard Panel System
 
+> **Status (2026-08-16): Draft — partly superseded by existing code.** Premise correction:
+> `newt-web` is **HTMX** and workspace-excluded (`docs/decisions/newt_web_htmx.md`,
+> `newt_web_docking.md`); the only ratatui host is `newt-tui` behind the `rich-tui` feature. A
+> pane contract already exists: `PanelOutcome` (`newt-tui/src/config_panel.rs`,
+> `docs/decisions/harness_config_panel.md`), `TabSet` (`tabs.rs`), `newt_core::tty` widgets. This
+> doc reduces to "generalise `PanelOutcome`" (roadmap A2), coordinated with #1673 / #1669.
+> See the reconciliation table in [companion-roadmap.md](companion-roadmap.md).
+
+**Scope gate.** Per `docs/decisions/plain_scroller_tui.md`, the LEAN (default) surface and the
+piped/headless/wyvern path stay a plain scroller: no alternate screen, panes, or widgets there.
+Everything below applies only to the feature-gated, severable, TTY-gated RichTUI (`rich-tui`)
+in `newt-tui`; the wyvern tier strips the TUI entirely. Ephemeral alt-screen use follows
+`docs/decisions/plan_editor_ephemeral_tui.md`.
+
+**Naming.** `Panel` is already a `newt-scheduler` diversity-panel type; UI ADRs use **pane** /
+**dock**. Reuse `PanelOutcome` as the outcome contract and prefer "pane" for new UI names.
+
 ## Overview
 
 A **Panel System** for `newt-web` / `gilamonster-web` — a plugin architecture where UI contributions (panels, widgets, tabs, drawers) are registered by kits/modules and composed into a cohesive dashboard. Panels run in isolated contexts (WASM or iframe) and communicate via a typed message bus.
 
 ## Motivation
 
-- `newt-web` (TUI) and `gilamonster-web` (web dashboard) need extensible UI
+- `newt-tui` RichTUI (ratatui, `rich-tui` feature), `newt-web` (HTMX) and `gilamonster-web` need extensible UI
 - Matrix agents should surface custom views (logs, metrics, visualizations)
 - Kits/plugins should contribute UI without forking the dashboard
 - Consistent model across TUI (ratatui) and Web (Leptos/Yew/Solid)
@@ -159,10 +176,10 @@ pub mod topics {
 }
 ```
 
-### TUI Host Implementation (`newt-web`)
+### TUI Host Implementation (`newt-tui`, `rich-tui` feature — *not* `newt-web`)
 
 ```rust
-// newt-web/src/panel_host.rs
+// newt-tui/src/panel_host.rs (rich-tui only)
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
@@ -364,7 +381,7 @@ impl PanelInstance for KitMetricsPanel {
 - Panel registry + lifecycle
 - Config schema validation
 
-### Phase 2: TUI Host (`newt-web`)
+### Phase 2: TUI Host (`newt-tui` RichTUI)
 - Ratatui panel host implementation
 - Tab/drawer/modal layout engine
 - Keyboard navigation + focus management

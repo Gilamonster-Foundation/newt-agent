@@ -1,5 +1,13 @@
 # Feature Proposal: Streaming Response Categoriser
 
+> **Status (2026-08-16): Draft — partly superseded by existing code.** Incremental reasoning
+> categorising already exists: `ThinkFilter` in `newt-core/src/reasoning.rs` and the
+> `OutputStream` enum in `newt-core/src/session.rs:69` (`Stdout|Stderr|AgentThought|ToolCall|Diff…`).
+> This is **not a crate** (`newt-response-tags` / `newt-stream-tags` naming is retired): it is the
+> **response tag table** living in `newt-core` reasoning/session — roadmap step A1 makes
+> `ThinkFilter` tag-table driven with per-provider overrides. Related: #1506 / #1014 / #860.
+> See the reconciliation table in [companion-roadmap.md](companion-roadmap.md).
+
 ## Overview
 
 A **Streaming Response Categoriser** — an incremental parser that extracts XML-like tags from LLM response streams in real-time, enabling:
@@ -27,7 +35,7 @@ A better approach:
 ### Core Types
 
 ```rust
-// newt-response-tags/src/types.rs
+// response tag table (newt-core reasoning/session) — sketch, formerly newt-response-tags/src/types.rs
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -82,7 +90,7 @@ pub enum ArtifactKind {
 ### Streaming Categoriser
 
 ```rust
-// newt-response-tags/src/streaming.rs
+// response tag table (newt-core reasoning/session) — sketch, formerly newt-response-tags/src/streaming.rs
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -173,7 +181,7 @@ impl StreamingCategoriser {
 ### Incremental Parsing Algorithm
 
 ```rust
-// newt-response-tags/src/incremental.rs
+// response tag table (newt-core reasoning/session) — sketch, formerly newt-response-tags/src/incremental.rs
 impl TagStateMachine {
     /// Process chunk, return true if outermost tag just closed
     fn process_chunk(&mut self, chunk: &str, buffer_len: usize) -> Vec<TagEvent> {
@@ -239,7 +247,7 @@ impl TagStateMachine {
 ### TTS Integration
 
 ```rust
-// newt-response-tags/src/tts.rs
+// response tag table (newt-core reasoning/session) — sketch, formerly newt-response-tags/src/tts.rs
 pub struct TtsFilter {
     categoriser: StreamingCategoriser,
     position: usize,
@@ -389,6 +397,18 @@ reasoning_tags = ["think", "reasoning", "reflection"]
 | Artifacts | None | Code blocks, tool calls, citations |
 | Provider configs | None | Per-provider tag presets |
 | Performance | O(n) full parse | O(chunk) state machine |
+
+## Known sketch defects
+
+The code above is a sketch and does not compile / is not correct as written:
+
+- `?` used inside `Poll` returns.
+- `finalize(mut self)` on a pinned field.
+- A `<` at a chunk boundary is mishandled (tag split across chunks is lost).
+- Closing tag name is not validated against the opening tag.
+- Unknown tag defaults to *reasoning*, swallowing generics (`Vec<T>`) and HTML in prose.
+- `TagEvent::Text` is referenced by speech-pipeline.md but not defined here; define it as the
+  plain-text (speech-eligible) event when A1 lands.
 
 ## Open Questions
 

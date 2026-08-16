@@ -1,5 +1,12 @@
 # Feature Proposal: Agent Module Isolation (Module Scopes)
 
+> **Status (2026-08-16): Draft — partly superseded by existing code.** Per-agent scoping
+> already exists piecemeal: `RoleProfile` (`role_profile.rs`), loadouts / `BundleConfig`,
+> `TabSidecar` (`newt-tui/src/tabs.rs`), `CrewRunner`, and `send_budget.rs`. Permissions are
+> `Caveats` / `PermissionGate`. **The Rust below is non-compiling pseudocode** (it clones a
+> `oneshot::Sender`, `.await`s in sync fns, and reads a phantom `self.permissions`) — treat it as
+> intent, not API. See the reconciliation table in [companion-roadmap.md](companion-roadmap.md).
+
 ## Overview
 
 Introduce **Module Scopes** — first-class isolation boundaries for agent instances. Each agent runs in a "module" with its own kit registry view, permission set, resource limits, and lifecycle hooks. Modules can be composed hierarchically (parent/child) and communicate via typed message passing.
@@ -269,6 +276,15 @@ Each level:
 | Lifecycle | Implicit | Explicit hooks + signals |
 | Multi-agent | Manual coordination | Hierarchical modules |
 | Mesh migration | Not supported | Module proxy + mailbox |
+
+## Overlaps with existing code
+
+| Sketch concept | Existing owner |
+|----------------|----------------|
+| `ModuleSpec` role / kit tags | `RoleProfile`, `Loadout.kit` + `[bundles.*]` |
+| Module permissions | `Caveats`, `PermissionGate`, `ExposureProfile` |
+| Resource budgets | `send_budget.rs` |
+| Mailbox / lifecycle | `TabSidecar`, `CrewRunner` |
 
 ## Open Questions
 

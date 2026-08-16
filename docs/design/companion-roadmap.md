@@ -1,100 +1,92 @@
-# Feature Proposals Index
+# Companion Feature Roadmap (index)
 
-This directory contains feature proposals for extending Newt/Gilamonster: a unified extension model (kits, module isolation, dashboard panels), streaming UX, and a voice-and-avatar companion surface (speech I/O, a native desktop shell, an animated on-screen presence). Each proposal is self-contained.
+**Status (2026-08-16): Draft, revised after design review.** This index ties together the
+kit / module / panel / categoriser sketches and the speech / desktop / companion proposals.
+The proposals are *not* self-contained: they build on code that already exists in the
+workspace (see "Reconciliation with existing code"), and several sketches contain
+non-compiling pseudocode that is annotated in place. The `exec-mcp-interrupt` write-up moved
+to `docs/findings/`.
 
 ## Proposals
 
-| Document | Feature | Target Crates | Priority |
-|----------|---------|---------------|----------|
-| [kit-system.md](kit-system.md) | **Unified Capability Registry** — typed registry for skills, tools, MCP, plugins with remote-callable policies | `newt-kit` (new), adapters for `newt-skills`, `newt-tools`, `newt-mcp-*`, `plugins-protocol` | **P0** — Foundation for all others |
-| [module-scopes.md](module-scopes.md) | **Agent Module Isolation** — per-agent module boundaries with kit scope, permissions, resource budgets, lifecycle | `newt-module` (new), `gilamonster-agent` integration | **P0** — Enables matrix architecture |
-| [tui-panel-system.md](tui-panel-system.md) | **TUI Dashboard Panel System** — plugin UI contributions (tabs, drawers, modals) for `newt-web`/`gilamonster-web` | `newt-panel` (new), `newt-web`, `gilamonster-web` | **P1** — Dashboard extensibility |
-| [streaming-response-categoriser.md](streaming-response-categoriser.md) | **Streaming Response Categoriser** — incremental tag extraction, TTS filtering, reasoning/artifact separation | `newt-response-tags` (new), `newt-inference`, `newt-tui`, `newt-web` | **P1** — UX for streaming responses |
-| [speech-pipeline.md](speech-pipeline.md) | **Speech Pipeline (STT/TTS)** — provider-agnostic speech synthesis + transcription, intent-based interrupt/queue scheduling | `newt-speech` (new), `newt-inference`, `newt-tui`, `newt-web` | **P2** — Voice I/O, depends on kit + stream-tags |
-| [desktop-shell.md](desktop-shell.md) | **Desktop Application Shell** — native window/tray host for the existing panel dashboard, capability-scoped bridge, mic/notification permissions | `newt-desktop` (new), `newt-web`, `newt-speech` | **P2** — Native host for `newt-web`, depends on panel system |
-| [animated-companion.md](animated-companion.md) | **Animated Companion** — 2D sprite/Live2D-style character reacting to agent state, lip-synced to TTS output | `newt-companion` (new), `newt-speech`, `newt-desktop`, `newt-web` | **P3** — Presentation layer, depends on speech + desktop/panel hosts |
+| Document | Feature | Where it lands (existing owner) | Priority | Status |
+|----------|---------|----------------------------------|----------|--------|
+| [kit-system.md](kit-system.md) | Capability registry | **Widen existing** `newt_core::kit` (`Axis`, `Tier`, `RegistryEntry`) + `Loadout.kit` / `[bundles.*]` (`config.rs`); permissions = existing `Caveats` / `PermissionGate` / `ExposureProfile` | P1 | Draft — partly superseded |
+| [module-scopes.md](module-scopes.md) | Per-agent scoping | **Widen existing** `RoleProfile`, loadouts, `BundleConfig`, `TabSidecar`, `CrewRunner`, `send_budget` | P2 | Draft — sketch is pseudocode |
+| [tui-panel-system.md](tui-panel-system.md) | Panes / dock contributions | **Widen existing** `PanelOutcome` (`newt-tui/src/config_panel.rs`), `TabSet` (`tabs.rs`), `newt_core::tty` widgets; RichTUI (`rich-tui` feature) only; `newt-web` is HTMX | P1 | Draft — coordinate with #1673 / #1669 |
+| [streaming-response-categoriser.md](streaming-response-categoriser.md) | Response tag table | **Widen existing** `ThinkFilter` (`newt-core/src/reasoning.rs`) + `OutputStream` (`session.rs`); no new crate | P0 | Draft — parser sketch has known defects |
+| [speech-pipeline.md](speech-pipeline.md) | STT/TTS | `newt-speech` (new, feature `speech`), consumer of `OutputStream`; caveats `audio.in` / `audio.out` | P2 | Proposal |
+| [desktop-shell.md](desktop-shell.md) | Native window/tray host | `newt-desktop` (new, feature `desktop`), dock client of `NewtDockService`, own lockfile like `newt-web` | P2 | Proposal |
+| [animated-companion.md](animated-companion.md) | Animated presence | `newt-companion` (new, feature `companion`), state machine over `OutputStream` + turn state | P3 | Proposal |
 
-## Suggested Implementation Order
+## Reconciliation with existing code
+
+| Proposal concept | Existing owner |
+|------------------|----------------|
+| `newt-kit` registry / manifest | `newt-core/src/kit.rs` (`Axis`, `Tier`, `RegistryEntry`, `component()`); `Loadout.kit` naming a `[bundles.*]` (`newt-core/src/config.rs`); `docs/design/loadout-composition.md`, `model-support-kit.md` |
+| `KitPermissions` | `newt-core/src/caveats.rs` (`Caveats`), `PermissionGate`, `ExposureProfile` / `ExposureClass` (`docs/design/tool-exposure-controller.md`) |
+| Kit / plugin manifests | `docs/design/command_plugin_runtime.md` |
+| `newt-module` scopes | `RoleProfile` (`role_profile.rs`), loadouts, `TabSidecar` (`newt-tui/src/tabs.rs`), `CrewRunner`, `send_budget.rs` |
+| `newt-response-tags` / `newt-stream-tags` | `ThinkFilter` (incremental, `newt-core/src/reasoning.rs`); `OutputStream` enum (`newt-core/src/session.rs:69`: `Stdout`, `Stderr`, `AgentThought`, `ToolCall`, `Diff`, …); issues #1506 / #1014 / #860 |
+| `newt-panel` host + `Panel` type | `PanelOutcome` (`newt-tui/src/config_panel.rs`, `docs/decisions/harness_config_panel.md`); `TabSet`; `newt_core::tty`; ephemeral alt-screen carve-out (`docs/decisions/plan_editor_ephemeral_tui.md`); epic #1673. `Panel` is already a `newt-scheduler` diversity-panel type — UI ADRs say **pane** / **dock** |
+| ratatui host in `newt-web` | Wrong premise: `newt-web` is HTMX and workspace-excluded (`docs/decisions/newt_web_htmx.md`, `newt_web_docking.md`); ratatui exists only in `newt-tui` behind `rich-tui` |
+
+## Dependency graph
 
 ```mermaid
 graph TD
-    A[newt-kit] --> B[newt-module]
-    A --> C[newt-panel]
-    A --> D[newt-response-tags]
-    A --> K[newt-speech]
-    B --> E[gilamonster-agent matrix modules]
-    C --> F[newt-web TUI dashboard]
-    C --> G[gilamonster-web dashboard]
-    C --> L[newt-desktop shell]
-    D --> H[newt-inference integration]
-    D --> I[newt-tui reasoning panel]
-    D --> J[newt-web streaming display]
-    D --> K
-    K --> L
-    K --> M[newt-companion]
-    L --> M
-    C --> M
+    T[OutputStream tag table<br/>widen ThinkFilter] --> S[newt-speech]
+    S --> D[newt-desktop]
+    S --> C[newt-companion]
+    P[panes: PanelOutcome / #1673<br/>existing] --> D
+    P --> C
+    K[kits + loadouts: kit.rs / bundles<br/>existing] --> S
+    K --> D
+    D --> C
 ```
 
-### Phase 1: Foundation (Weeks 1-4)
-1. **`newt-kit`** — Core registry, manifest, permissions, builtin/dynamic loading
-2. **Adapters** — Migrate `newt-skills`, `newt-tools`, `newt-mcp-*` to kit adapters
+## Phases
 
-### Phase 2: Module Runtime (Weeks 3-6)
-3. **`newt-module`** — ModuleSpec, scoped registry, mailbox, resource accounting
-4. **`gilamonster-agent` integration** — AgentSpec → ModuleSpec, matrix role → kit tags
+Every step below is **one issue = one PR**, lands in `docs/ROADMAP.md` Backlog first, and
+follows the acceptance contract there. Feature gates `speech`, `desktop`, `companion` are
+**absent** from the wyvern (headless) and LEAN default builds; the plain-scroller rule
+(`docs/decisions/plain_scroller_tui.md`) is unchanged.
 
-### Phase 3: Streaming UX (Weeks 4-8)
-5. **`newt-response-tags`** — Streaming categoriser, TTS filter, artifact extraction
-6. **`newt-inference` integration** — `CategorisedStream` wrapper
-7. **TUI/Web panels** — Live reasoning display, artifact widgets
+**A — Foundation by widening (no new crates)**
+- A1. `OutputStream` tag table: make `ThinkFilter` tag-driven config with per-provider
+  overrides; fix the sketch defects listed in the categoriser doc; grounds #1506/#1014/#860.
+- A2. Generalise `PanelOutcome` into a reusable pane contract; amend the plain-scroller
+  ephemeral carve-out ADR if needed; coordinate with #1673 (slash commands → panes) and #1669.
+- A3. Kit = `kit.rs` + bundle: extend `BundleConfig` for role / permission scoping (reusing
+  `Caveats` / `ExposureProfile`); no separate `newt-kit` crate.
 
-### Phase 4: Dashboard (Weeks 6-10)
-8. **`newt-panel`** — Panel manifest, message bus, host traits
-9. **`newt-web` TUI host** — Ratatui layout, tabs/drawers/modals
-10. **`gilamonster-web` host** — Leptos/Solid implementation
-11. **Matrix panels** — Agent status, task flow, resource usage
+**B — Speech (`newt-speech`, feature `speech`)**
+- B1. Provider traits + segmenter + priority/interrupt scheduler, fully mocked; caveats
+  `audio.in` / `audio.out`.
+- B2. TTS as a consumer of `OutputStream` in RichTUI and `newt-web`.
+- B3. STT into `InputSurface` / steering.
+- B4. Local providers (whisper.cpp, piper) — weekly / release tier only.
 
-### Phase 5: Voice + Native Host (Weeks 10-15)
-12. **`newt-speech`** — Provider traits, segmenter, priority/interrupt scheduling, transcript buffer
-13. **Builtin local providers** — whisper.cpp (STT), piper/coqui (TTS)
-14. **`newt-tui`/`newt-web` voice integration** — mic input, spoken playback
-15. **`newt-desktop`** — Tauri shell hosting the panel dashboard, capability-scoped bridge, tray + hotkey wired to `newt-speech`
+**C — Desktop (`newt-desktop`, feature `desktop`)**
+- C1. Dock client of `NewtDockService`, own lockfile (same pattern as `newt-web`).
+- C2. Capability-scoped bridge enum.
+- C3. Tray + global hotkey wired to `newt-speech`.
 
-### Phase 6: Animated Companion (Weeks 14-18)
-16. **`newt-companion`** — State machine + `CompanionDriver` trait, static-sprite fallback driver
-17. **Live2D-style rig driver** — feature-gated, configurable asset path
-18. **Desktop overlay window + `newt-web` panel hosts**
+**D — Companion (`newt-companion`, feature `companion`)**
+- D1. State machine over `OutputStream` + turn state; static sprite driver.
+- D2. Decide the open rig format (open question — Live2D is proprietary).
+- D3. Web host first (HTMX pane), then desktop overlay window.
 
-## Cross-Cutting Concerns
+## Cross-cutting
 
 | Concern | Approach |
 |---------|----------|
-| **Serialization** | All manifests use `serde` + JSON Schema for validation |
-| **Testing** | Each crate: unit tests + integration tests with test kits/modules/panels |
-| **CLI** | `newt kit`, `newt module`, `newt panel` subcommands |
-| **Config** | TOML config with per-provider/per-role overrides |
-| **Observability** | Structured logging + metrics (prometheus) in each crate |
+| Config | TOML in existing `newt-core` config; per-provider / per-role overrides via loadouts |
+| Testing | Unit tier fully mocked (CLAUDE.md); audio/native hosts on the weekly tier |
+| Naming | `newt-response-tags` / `newt-stream-tags` unified as "response tag table"; `KitKind::Speech`, `caveats.audio`, `TagEvent::Text` are referenced but undefined until B1/A1 define them |
 
-## Migration Strategy
+## Open questions (not in scope until decided)
 
-- **No breaking changes** to existing crates in Phase 1-2
-- **Adapters first** — old APIs delegate to new kit/module system
-- **Feature flags** — `kit-system`, `module-scopes`, `panel-system`, `streaming-tags`
-- **Gradual rollout** — Enable per-agent, per-kit, per-panel
-
-## Related Work (Internal)
-
-- `newt-core::reasoning::split_reasoning` → replaced by `newt-response-tags`
-- `newt-skills` skill registry → becomes kit adapter
-- `plugins-protocol` → becomes kit adapter + panel contributor
-- `newt-mesh` — transports kit calls, module mailbox, panel bus events
-- No existing crate covers voice I/O or a native desktop host — `newt-speech` and `newt-desktop` are net-new additions, not adapters over existing code
-
-## Next Steps
-
-1. **Review & prioritize** — Team discussion on P0 vs P1
-2. **RFC process** — Each P0 feature gets RFC in `rfcs/`
-3. **Prototype** — Spike `newt-kit` + one adapter in a branch
-4. **Benchmarks** — Streaming categoriser throughput vs current
-5. **Design review** — Panel system TUI/Web parity assessment
+- CLI subcommands (`newt kit` / `newt module` / `newt panel`) — probably slash commands / panes instead (#1673).
+- Metrics / prometheus per crate — deferred; no per-crate exporters.
+- Dynamic loading (`dlopen`) of kits — deferred; process/MCP boundaries first.

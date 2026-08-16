@@ -5,9 +5,26 @@
 A provider-agnostic **speech pipeline** crate that turns a token stream from
 inference into scheduled, interruptible audio playback (TTS), and turns a
 microphone/audio stream into transcribed text (STT). Both directions plug
-into the [Kit System](kit-system.md) as `KitKind::Speech` /
-`KitKind::Transcription` providers, so any local or cloud backend can be
-swapped without touching pipeline logic.
+into the existing kit seam (`newt-core/src/kit.rs`, `Loadout.kit` /
+`[bundles.*]` — see [kit-system.md](kit-system.md)) as kit components /
+bundle entries, so any local or cloud backend can be swapped without
+touching pipeline logic. There is no `newt-kit` crate and no
+`KitKind::Speech`; speech providers ride the kit/bundle mechanism that
+already exists.
+
+**Feature gate: `speech`** (on `newt-tui` / `newt-cli`). Never compiled
+into the wyvern/headless path or the LEAN default build — the pipeline is
+severable and additive, per `docs/decisions/plain_scroller_tui.md`.
+
+### Seams this design consumes (all existing)
+
+| Need | Existing seam |
+|------|---------------|
+| Text to speak | `OutputStream` / `OutputChunk` / `OutputSink` (`newt-core/src/session.rs`), filtered to chunks the response tag table marks `Speech`-eligible |
+| What is speakable vs. not | The response tag table (a widening of `ThinkFilter`, `newt-core/src/reasoning.rs`; see [streaming-response-categoriser.md](streaming-response-categoriser.md)) — no `newt-stream-tags` crate |
+| Publishing STT text as input | `SteeringInbox` (`newt-core/src/agentic/steering.rs`) mid-turn; `InputSurface` (`newt-tui/src/chat.rs`) at the prompt |
+| Provider registration/config | `newt-core/src/kit.rs` component + `Loadout.kit` / `[bundles.*]` entry |
+| Permission | `Caveats` (`newt-core/src/caveats.rs`) — new caveat kinds `audio.in` (mic) and `audio.out` (speaker) |
 
 ## Motivation
 
@@ -78,15 +95,26 @@ providers vary) — consumers that don't care about mouth-shape timing just
 ignore the field. This is the only seam [animated-companion.md](animated-companion.md)
 needs from this crate.
 
-Both traits register into `newt_kit::Registry` as `KitKind::Speech` /
-`KitKind::Transcription`, discovered the same way as any other kit (builtin,
-local fs, or a `provider.toml` pointing at a local model path / cloud
-endpoint + credentials).
+Both traits register as kit components in `newt-core/src/kit.rs`, selected
+by a `Loadout.kit` / `[bundles.*]` entry, discovered the same way as any
+other kit component (builtin, local fs, or a bundle `.toml` pointing at a
+local model path / cloud endpoint + credentials).
+
+### Tag table vs. segmenter — who decides what
+
+- The **response tag table** decides *what is speakable*: it classifies
+  each `OutputChunk` (prose, `<think>`, tool-call, code block, custom tags)
+  and only chunks tagged `Speech`-eligible are handed to this crate. That
+  is model/prompt-domain knowledge, so it lives in the tag table's data,
+  not here.
+- The **segmenter** decides *how to chunk* what it is given: sentence /
+  clause boundaries, pause hints, and maximum utterance length. It never
+  re-classifies content; if code is being read aloud, the fix is in the tag
+  table, not the segmenter.
 
 ### Intent-based TTS scheduling
 
-Mirrors the reference pipeline's `behavior: 'queue' | 'interrupt' |
-'replace'` per-intent model — needed so, e.g., a tool-status narration can
+Each intent declares a `behavior` of queue / interrupt / replace — needed so, e.g., a tool-status narration can
 queue behind the current reply, while a user interruption or a new turn can
 cut off playback immediately rather than waiting for the sentence to finish.
 
@@ -101,18 +129,22 @@ pub struct SpeakIntent {
 
 ### Integration points
 
-- **`newt-inference`** — feeds the token stream into the segmenter; segments
-  route through [`newt-stream-tags`](streaming-response-categoriser.md)
-  first so `<think>`/tool-call content is filtered out of what gets spoken
-  (only `TagEvent::Text` reaches the speech pipeline).
-- **`newt-tui`** — mic capture → `TranscriptionPipeline` → inserts final
-  transcript as user input; partials shown as a live "listening…" line.
+- **`OutputStream`** (`newt-core/src/session.rs`) — the pipeline is one
+  more `OutputSink`; the response tag table (widened `ThinkFilter`,
+  [streaming-response-categoriser.md](streaming-response-categoriser.md))
+  runs first so `<think>`/tool-call content is filtered out of what gets
+  spoken (only `Speech`-eligible chunks reach the segmenter). Depends on the
+  tag-table step landing.
+- **`newt-tui`** (feature `speech`) — mic capture → `TranscriptionPipeline`
+  → final transcript is published to `SteeringInbox` while a turn is running,
+  or into `InputSurface` at the prompt; partials shown as a live
+  "listening…" line.
 - **`newt-web`** — browser mic via WebAudio/WebSocket → same
   `TranscriptionPipeline`; playback via `<audio>` element fed by a streamed
   response endpoint.
-- **`newt-kit`** — provider discovery/config; a kit manifest can declare
-  `caveats.audio = { mic: bool, speaker: bool }` so speech capability is an
-  explicit, attenuable permission like fs/net.
+- **`newt-core/src/kit.rs`** — provider discovery/config via a bundle
+  entry; the bundle declares `Caveats` kinds `audio.in` / `audio.out` so
+  speech capability is an explicit, attenuable permission like fs/net.
 
 ### Milestone
 
@@ -129,8 +161,8 @@ pub struct SpeakIntent {
 | Concern | Approach |
 |---------|----------|
 | Real-audio testing | Unit tier fully mocked (fake `SpeechProvider`/`TranscriptionProvider`); real device/mic tests live in the expensive weekly/release tier only, per the repo's testing strategy |
-| Permission model | Mic/speaker access is a kit caveat, not ambient — an agent module without `audio` caveats cannot register a speech provider |
-| Backpressure | Bounded channel between segmenter and TTS scheduler; `ttsMaxConcurrent`-equivalent cap on concurrent synthesis tasks |
+| Permission model | Mic/speaker access is `Caveats` `audio.in` / `audio.out`, not ambient — a bundle without them cannot register a speech provider |
+| Backpressure | Bounded channel between segmenter and TTS scheduler; configurable cap on concurrent synthesis tasks |
 | Silence/VAD | Pluggable voice-activity-detection strategy behind `TranscriptionProvider`, not hardcoded — three-Cs: VAD thresholds are config, not code |
 
 ## Out of scope
