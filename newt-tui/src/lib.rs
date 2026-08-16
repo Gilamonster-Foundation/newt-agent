@@ -107,6 +107,8 @@ pub use mouse::install_panic_release_hook;
 // The lean input surface (issue #527): a dead-simple word-wrapped text box, the
 // flight/wyvern morphology. Always built — it is the footer-off / lean tier.
 mod lean_input;
+// #1669: the channel seam that lets a session's turn stop owning the keyboard.
+mod session_worker;
 mod setup;
 mod setup_tui;
 mod wizard;
