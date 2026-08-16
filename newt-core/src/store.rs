@@ -4091,9 +4091,75 @@ const LIVENESS_STALE_AFTER_NANOS: i64 = 3_600 * 1_000_000_000;
 fn system_liveness(owner: &StoredOwner, now: i64) -> bool {
     let (host, boot_id) = current_host_boot();
     if owner.host == host && owner.boot_id == boot_id {
-        return pid_is_alive(owner.pid);
+        // #1721: pid EXISTENCE is not pid IDENTITY. `pid_max` is commonly ~4M
+        // and wraps within hours on a busy machine, so an unrelated process can
+        // inherit a dead owner's pid — and the claim would then be judged live
+        // forever, wedging the conversation as permanently HeldBy.
+        return pid_is_alive(owner.pid)
+            && pid_identity_matches(pid_start_unix_nanos(owner.pid), owner.heartbeat_tick);
     }
     now.saturating_sub(owner.heartbeat_tick) < LIVENESS_STALE_AFTER_NANOS
+}
+
+/// Does the process now holding `owner.pid` look like the owner that claimed it?
+///
+/// The owner heartbeats for as long as it runs, so its start time is necessarily
+/// EARLIER than its own last heartbeat. A process that started AFTER that
+/// heartbeat therefore cannot be the owner — it inherited the pid after a wrap.
+///
+/// Deliberately NOT a heartbeat-staleness test: a live session can legitimately
+/// go a long time between heartbeats (a single long turn), and reclaiming it
+/// would reintroduce the #1030 turn-interleaving bug. This compares identity,
+/// not freshness, so it never reclaims a running owner however slow it is.
+///
+/// `None` (start time unreadable — non-Linux, permissions, or a pid that exited
+/// mid-probe) fails CLOSED as "still the owner": reclamation requires positive
+/// proof of reuse, never the absence of evidence.
+fn pid_identity_matches(started_at: Option<i64>, heartbeat_tick: i64) -> bool {
+    started_at.is_none_or(|started| started <= heartbeat_tick)
+}
+
+/// Unix-epoch nanos at which the process holding `pid` started, for comparison
+/// against a `live_owners.heartbeat_tick` (also unix nanos, see
+/// [`now_claim_nanos`]). `/proc/<pid>/stat` field 22 is the start time in clock
+/// ticks since boot, which `/proc/stat`'s `btime` rebases onto the wall clock.
+///
+/// Second-granularity truncation biases the result EARLIER, which is the
+/// fail-closed direction: an under-estimate can only make an impostor look like
+/// the owner, never make the owner look like an impostor.
+#[cfg(target_os = "linux")]
+fn pid_start_unix_nanos(pid: i64) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) is parenthesised and may itself contain spaces and
+    // parens, so fields are counted from AFTER its closing paren: the first
+    // token there is field 3, making `starttime` (field 22) index 19.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let start_ticks: i64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+
+    // SAFETY: `sysconf` only reads a system constant.
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_sec <= 0 {
+        return None;
+    }
+
+    let btime_secs: i64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+
+    btime_secs
+        .checked_add(start_ticks / ticks_per_sec)?
+        .checked_mul(1_000_000_000)
+}
+
+/// Non-Linux fallback: no portable start-time probe, so identity is unknown and
+/// [`pid_identity_matches`] fails closed to today's pid-existence behavior.
+#[cfg(not(target_os = "linux"))]
+fn pid_start_unix_nanos(_pid: i64) -> Option<i64> {
+    None
 }
 
 /// Is `pid` a currently-running process? `kill(pid, 0)` delivers no signal but
@@ -4282,6 +4348,62 @@ mod tests {
             None,
             ERROR_INVALID_PARAMETER_FIXTURE
         ));
+    }
+
+    #[test]
+    fn a_pid_reused_after_its_owner_died_is_not_the_owner() {
+        // #1721 regression. `pid_is_alive` answers "SOME process holds this
+        // pid", not "OUR owner is still running" — and pid_max wraps in hours
+        // on a busy box. A live owner heartbeats while it runs, so its start
+        // time always PRECEDES its own last heartbeat; a process that started
+        // AFTER that heartbeat provably inherited the pid and is an impostor.
+        const HEARTBEAT: i64 = 1_000;
+
+        // The genuine owner: started before it last heartbeat.
+        assert!(pid_identity_matches(Some(HEARTBEAT - 1), HEARTBEAT));
+        // Boundary: starting exactly at the heartbeat is still the owner.
+        assert!(pid_identity_matches(Some(HEARTBEAT), HEARTBEAT));
+
+        // An impostor that took the pid after the owner's last heartbeat —
+        // the case that today wedges a dead session's conversation as HeldBy.
+        assert!(!pid_identity_matches(Some(HEARTBEAT + 1), HEARTBEAT));
+
+        // An unreadable start time must fail CLOSED (judged the owner), so a
+        // missing/racy /proc entry can never cause a wrongful reclaim.
+        assert!(pid_identity_matches(None, HEARTBEAT));
+    }
+
+    /// GROUNDS `a_pid_reused_after_its_owner_died_is_not_the_owner` (#1721).
+    ///
+    /// That test is pure — it asserts the DECISION given a start time. It cannot
+    /// tell whether `pid_start_unix_nanos` really produces a unix-epoch value on
+    /// the same scale as `now_claim_nanos`; if the two used different epochs the
+    /// comparison would be nonsense and the pure test would still pass. This
+    /// reads real `/proc` for the running process to prove the scales agree.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_start_time_is_unix_nanos_on_the_same_scale_as_the_claim_clock() {
+        let now = now_claim_nanos();
+        let started = pid_start_unix_nanos(i64::from(std::process::id()))
+            .expect("this process's own /proc/<pid>/stat is readable");
+
+        // Our own start time is in the past...
+        assert!(
+            started <= now,
+            "start {started} must not be after now {now}"
+        );
+        // ...and recent: a test binary is not days old. This is the assertion
+        // that would fail loudly on an epoch/unit mismatch (a boot-relative or
+        // seconds-scale value lands wildly outside this window).
+        const ONE_DAY_NANOS: i64 = 24 * 3_600 * 1_000_000_000;
+        assert!(
+            now - started < ONE_DAY_NANOS,
+            "start {started} implausibly far before now {now}"
+        );
+
+        // The decision function must therefore judge this LIVE process the owner
+        // of a claim it heartbeat just now — the property #1721 depends on.
+        assert!(pid_identity_matches(Some(started), now));
     }
 
     fn insert_prompt_lineage_for_test(
