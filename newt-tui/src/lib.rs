@@ -97,6 +97,11 @@ mod palette;
 mod backend_panel;
 #[cfg(feature = "rich-tui")]
 mod vi;
+// #1669: the cockpit — the terminal owned by the UI thread for the whole
+// session, editor mounted while a turn runs, session output relayed through a
+// pty. Rich + unix: the fd capture is `dup2`/`openpty`.
+#[cfg(all(unix, feature = "rich-tui"))]
+mod cockpit;
 // The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
 // only when an interactive surface is on — the wyvern/lean build never links it.
 // unix-only: the mouse tier's sole construction site (`with_live_spill_watch`)
