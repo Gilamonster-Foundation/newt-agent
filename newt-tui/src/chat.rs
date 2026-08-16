@@ -2348,6 +2348,31 @@ fn session_body(
                     .map(|warmup| vec![warmup.job.clone()])
                     .unwrap_or_default(),
             );
+            // #1669 PR-B: project the live tabs for the bar, once per loop head
+            // beside the runtime context. Labels are computed FRESH from the
+            // store here rather than stored on the tab, so a `/rename` shows up
+            // on the next prompt and a title can never go stale in the bar.
+            #[cfg(feature = "rich-tui")]
+            surface.set_tabs(match conversation_store.as_ref() {
+                Some(store) => tabs
+                    .tabs()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| crate::tab_bar::TabCell {
+                        number: i + 1,
+                        label: tab_label(store, t.conversation_id()),
+                        active: i == tabs.active_index(),
+                        degraded: t.pin_degraded.is_some(),
+                        // PR-B renders the badge; nothing sets pending-inject
+                        // yet. Left false rather than faked, so the bar never
+                        // claims work arrived that did not.
+                        pending: false,
+                    })
+                    .collect(),
+                // An ephemeral session has no store to title from, and `/tab`
+                // refuses there anyway — so there is nothing to draw.
+                None => Vec::new(),
+            });
             let origin =
                 pending_clarification
                     .as_ref()
