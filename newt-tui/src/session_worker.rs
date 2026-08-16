@@ -480,6 +480,160 @@ mod tests {
         assert_eq!(served.load(Ordering::Acquire), 1);
     }
 
+    // ── end-to-end session lifecycle ───────────────────────────────────────
+
+    /// The architectural property this whole PR exists for, exercised as one
+    /// lifecycle rather than as isolated pieces.
+    ///
+    /// Drives the REAL topology `run_chat` now uses — a session on its own
+    /// thread reaching the terminal only through `RemoteSurface`, and the
+    /// terminal servicing it with `pump_surface` — through:
+    ///
+    /// 1. start the machinery;
+    /// 2. begin a turn and BLOCK it mid-flight;
+    /// 3. prove the terminal side is still alive and serving while that turn
+    ///    is demonstrably unfinished;
+    /// 4. let the turn finish;
+    /// 5. run a second turn and prove its bindings are FRESH, not turn 1's;
+    /// 6. shut down;
+    /// 7. prove the worker terminated and nothing is left hanging.
+    ///
+    /// What makes it non-vacuous, in three places:
+    ///
+    /// - step 3 asserts `turn_one_done == false` at the moment the terminal
+    ///   serves, so a pass cannot come from the turn having already finished.
+    ///   Move execution back onto the terminal thread and the pump cannot run
+    ///   here at all — the test deadlocks and fails on the harness timeout
+    ///   rather than passing quietly.
+    /// - step 5 asserts session B and dial P2, which a session-lifetime
+    ///   binding answers as A and P1.
+    /// - step 7 asserts the channel is closed AND the worker joined; a leaked
+    ///   worker or an un-exited pump fails rather than being invisible.
+    ///
+    /// Synchronisation is entirely by channel/atomic rendezvous — no sleeps,
+    /// so it cannot flake into a pass on a loaded machine.
+    #[test]
+    fn a_session_serves_two_turns_and_shuts_down_without_leaking() {
+        use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+
+        let a = newt_core::lifecycle::new_session_id();
+        let b = newt_core::lifecycle::new_session_id();
+        set_cli_tenacity(Tenacity::Relaxed); // P1
+
+        let (to_ui, from_session) = std::sync::mpsc::sync_channel(16);
+        // Rendezvous: the terminal releases turn 1 only after it has proven
+        // itself alive, so "alive during the turn" is ordered, not hoped for.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let turn_one_done = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        std::thread::scope(|scope| {
+            // ── the SESSION: its own thread, exactly as `run_chat` spawns it.
+            let session = {
+                let (a, b) = (a.clone(), b.clone());
+                let (done, seen) = (Arc::clone(&turn_one_done), Arc::clone(&observed));
+                scope.spawn(move || {
+                    let mut surface = RemoteSurface::new(to_ui);
+
+                    // (2) turn 1 — bound, then blocked mid-flight.
+                    {
+                        let _turn = bind_turn(&a);
+                        surface.set_runtime_context("m1", "http://h", None, "s");
+                        seen.lock()
+                            .unwrap()
+                            .push((newt_core::lifecycle::active_session(), effective_tenacity()));
+                        // Park until the terminal says it has served something
+                        // else. If execution were back on the terminal thread,
+                        // nothing could ever send this.
+                        release_rx.recv().expect("terminal releases turn 1");
+                    }
+                    done.store(true, Ordering::Release);
+
+                    // (5) turn 2 — a different tab, and the dial has moved.
+                    {
+                        let _turn = bind_turn(&b);
+                        seen.lock()
+                            .unwrap()
+                            .push((newt_core::lifecycle::active_session(), effective_tenacity()));
+                    }
+                    // (6) session ends; dropping `surface` closes the channel.
+                })
+            };
+
+            // ── the TERMINAL: services the session on this thread.
+            // (3) serve turn 1's status update while the turn is still parked.
+            match from_session.recv().expect("turn 1 published status") {
+                SurfaceRequest::SetRuntimeContext { model, .. } => {
+                    assert_eq!(model, "m1");
+                    assert!(
+                        !turn_one_done.load(Ordering::Acquire),
+                        "the terminal served while turn 1 was still running —                          which is the entire point of the split"
+                    );
+                }
+                other => panic!("expected the turn's status update, got {other:?}"),
+            }
+
+            // The operator moves a dial between turns.
+            set_cli_tenacity(Tenacity::Relentless); // P2
+                                                    // (4) let turn 1 finish.
+            release_tx.send(()).expect("session still listening");
+
+            // (7) drain to channel close — the pump's real exit condition —
+            // then confirm the worker is done.
+            let mut surface = RecordingSurface::default();
+            pump_surface(&mut surface, &from_session);
+            session.join().expect("session thread joined cleanly");
+        });
+
+        // (5) turn-local state was freshly bound on turn 2.
+        let seen = observed.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "two turns ran");
+        assert_eq!(seen[0].0.as_deref(), Some(a.as_str()), "turn 1 is A's");
+        assert_eq!(seen[0].1, Tenacity::Relaxed, "turn 1 held P1");
+        assert_eq!(
+            seen[1].0.as_deref(),
+            Some(b.as_str()),
+            "turn 2 is B's — a session-long binding answers A here"
+        );
+        assert_eq!(
+            seen[1].1,
+            Tenacity::Relentless,
+            "turn 2 sees P2 — a session-long capture answers P1 here"
+        );
+
+        // (7) nothing is left hanging — and this is structural, not asserted.
+        // `thread::scope` cannot return until every thread it spawned has been
+        // joined, so reaching this line at all is the proof that the session
+        // worker terminated. `pump_surface` returning inside the scope is the
+        // matching proof for the channel: its loop ends only when every sender
+        // is dropped. A leaked worker or a pump still parked on `recv` hangs
+        // here instead of passing.
+        set_cli_tenacity(Tenacity::Standard);
+    }
+
+    /// A surface that records what the terminal was asked to do.
+    #[derive(Default)]
+    struct RecordingSurface {
+        history: Vec<String>,
+        saves: usize,
+    }
+
+    impl crate::chat::InputSurface for RecordingSurface {
+        fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
+            Ok(ReadOutcome::Eof)
+        }
+        fn add_history(&mut self, entry: &str) {
+            self.history.push(entry.to_string());
+        }
+        fn save_history(&mut self) {
+            self.saves += 1;
+        }
+        fn reload(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     // ── turn-scoped binding (the #1718 review fix) ─────────────────────────
 
     /// THE regression. A session that switches tabs must attribute each turn's
