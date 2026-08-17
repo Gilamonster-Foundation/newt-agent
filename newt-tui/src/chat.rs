@@ -6984,36 +6984,37 @@ fn session_body(
                     // error; preserve that transition as unattributed evidence.
                     let artifact_head_after_turn =
                         git_head_snapshot(session_git_tool.as_ref(), &turn_caveats);
-                    // #1709 family: clear the contributor ledger ONLY after an
-                    // EXPLICITLY CONFIRMED successful Newt commit — the
-                    // `commit`/`amend`/`rebase` arms incremented
-                    // `commit_succeeded` on a real `eng.*` success. Never clear
-                    // merely because `HEAD` moved: an external/manual `HEAD`
-                    // change (a user `git reset`, a fetch advancing the branch,
-                    // a checkout, …) is NOT a Newt commit and must not discard
-                    // pending contributors (the historical stale-attribution
-                    // class — a `HEAD`-diff proxy both false-positived on
-                    // unrelated moves and false-negatived on unreliable
-                    // snapshots). Draining resets the counter to zero.
+                    // #1709 family — attribution EPOCH boundary. The contributor
+                    // ledger is now consumed AT THE COMMIT BOUNDARY (inside the
+                    // tool round, in newt-core's `ledger_consume_at_commit_epoch`
+                    // — invoked right after a confirmed-successful
+                    // `commit`/`amend`/`rebase` git call), NOT here at the
+                    // end-of-turn drain. Clearing at the epoch boundary consumes
+                    // exactly the contributors that existed BEFORE that commit
+                    // (already credited on it via the loop-top snapshot) and
+                    // resets the ledger's dedup set, so work landing AFTER a
+                    // mid-turn commit (A edits → C1 → A edits more → turn ends →
+                    // switch B → C2) re-records fresh and survives to the next
+                    // commit — C2 credits A + B. The previous end-of-turn blanket
+                    // `clear()` erased that post-commit work, so it is REMOVED
+                    // (req 5): nothing here may clear the ledger. A failed commit
+                    // consumes nothing (the epoch clear is gated on `ok`).
+                    //
+                    // `drain_commit_success` is retained as the explicit
+                    // confirmed-commit telemetry signal (and resets the counter);
+                    // it no longer drives a ledger clear. A `HEAD` move from an
+                    // external/manual action (a user `git reset`, a fetch
+                    // advancing the branch, a checkout, …) is NOT a Newt commit
+                    // and never was a clear trigger.
                     let new_commits = session_git_tool
                         .as_ref()
                         .map_or(0, |t| t.drain_commit_success());
-                    if new_commits > 0 {
-                        attribution_ledger.borrow_mut().clear();
-                        // #1707/#1709 semantic B: the contributor SNAPSHOT on
-                        // the envelope is now consumed AT THE COMMIT BOUNDARY
-                        // (the git tool's `commit`/`amend`/`rebase` arms advance
-                        // `contributors_consumed` past the contributors they
-                        // just credited), not here at the end-of-turn drain.
-                        // So there is nothing to clear on the envelope here — a
-                        // second commit in this same turn already saw an empty
-                        // contributor slice via the cursor, and the next
-                        // loop-top refresh replaces the whole envelope (and
-                        // resets the cursor to 0) off the now-empty ledger.
-                        // The ledger clear above is what prevents consumed
-                        // contributors from carrying into the NEXT turn's
-                        // envelope; the cursor is what prevents re-credit
-                        // WITHIN this turn.
+                    if new_commits > 0 && verbose {
+                        print_newt(
+                            &format!("committed {new_commits} Newt commit(s) this turn"),
+                            color,
+                            verbose,
+                        );
                     }
                     if let (Some(sink), Some(turn)) =
                         (artifact_sink, active_prompt_context.as_ref())

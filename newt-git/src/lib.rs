@@ -234,6 +234,23 @@ impl GitEngine {
         Ok(HeadSnapshot { branch, head })
     }
 
+    /// Read the full commit message of the current HEAD commit (the message an
+    /// `amend` with no new message would preserve). Requires `read` like every
+    /// other repository observation. Returns the empty string for an unborn
+    /// HEAD (no commit yet) — the caller (the `amend` arm) treats that as "no
+    /// message to re-finalize" because `GitEngine::amend` itself refuses an
+    /// unborn HEAD.
+    pub fn head_message(&self, caps: &GitCaveats) -> Result<String, GitError> {
+        if !caps.permits_read() {
+            return Err(GitError::Denied("read"));
+        }
+        let Some(oid) = self.head_oid()? else {
+            return Ok(String::new());
+        };
+        let commit = parse_commit(&self.repo.odb.read(&oid)?.data)?;
+        Ok(commit.message)
+    }
+
     /// `git status` — requires the `read` capability.
     pub fn status(&self, caps: &GitCaveats) -> Result<StatusReport, GitError> {
         if !caps.permits_read() {
@@ -498,6 +515,15 @@ impl GitEngine {
         onto: &str,
         steps: &[RebaseStep],
         author: &Author,
+        // #1709 req 9: an optional commit-message finalizer applied to EVERY
+        // newly created commit's joined message (pick / reword / squash), so
+        // even an ordinary `pick` — which replays the original commit's
+        // message verbatim — receives canonical Newt attribution. The
+        // finalizer is the SAME one `commit`/`amend` use
+        // (`LocalGitTool::finalize_commit_message`), so no rebase path
+        // formats attribution itself. `None` (test scaffolds with no
+        // attribution) leaves messages untouched.
+        finalize: Option<&dyn Fn(&str) -> String>,
     ) -> Result<RebaseReport, GitError> {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
@@ -551,12 +577,16 @@ impl GitEngine {
                 RebaseAction::Pick | RebaseAction::Reword => {
                     // Close any open commit first.
                     if open {
-                        tip = self.write_commit_on(
-                            cur_parent,
-                            cur_tree,
-                            &cur_msgs.join("\n\n"),
-                            author,
-                        )?;
+                        let msg = cur_msgs.join("\n\n");
+                        // #1709 req 9: finalize EVERY newly created commit's
+                        // message — including the one closed here by the next
+                        // pick/reword — so an ordinary pick receives canonical
+                        // attribution, not just reword/squash.
+                        let msg = match finalize {
+                            Some(f) => f(&msg),
+                            None => msg,
+                        };
+                        tip = self.write_commit_on(cur_parent, cur_tree, &msg, author)?;
                         tip_tree = cur_tree;
                         produced += 1;
                     }
@@ -589,7 +619,14 @@ impl GitEngine {
         }
         // Close the final open commit.
         if open {
-            tip = self.write_commit_on(cur_parent, cur_tree, &cur_msgs.join("\n\n"), author)?;
+            let msg = cur_msgs.join("\n\n");
+            // #1709 req 9: the final produced commit receives canonical
+            // attribution too (same finalizer as every other rebase commit).
+            let msg = match finalize {
+                Some(f) => f(&msg),
+                None => msg,
+            };
+            tip = self.write_commit_on(cur_parent, cur_tree, &msg, author)?;
             produced += 1;
         }
         // The single mutating step: advance the branch ref to the new tip.
@@ -1138,13 +1175,37 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             }
             "amend" => {
                 // Optional message: present → reword (signed); absent → keep
-                // HEAD's existing message (which already carries its trailer, so
-                // no re-sign needed).
+                // HEAD's existing message. #1709 req 7: even with NO new
+                // message, read HEAD's existing FULL message and run it through
+                // the canonical attribution finalizer before creating the
+                // amended commit, so attribution is REFRESHED (a `/model`
+                // switch since the original commit replaces the stale Newt
+                // model trailers + provenance; legitimate third-party trailers
+                // and the user subject/body are preserved — the finalizer is
+                // idempotent). When no attribution is configured (test
+                // scaffolds), fall back to the engine's "keep HEAD's message"
+                // path (pass `None`) so an unborn-HEAD amend still reports its
+                // own error rather than a read failure.
                 let msg = args
                     .get("message")
                     .and_then(|v| v.as_str())
                     .filter(|m| !m.trim().is_empty());
-                let signed = msg.map(|m| self.finalize_commit_message(m));
+                let signed = match (&self.attribution, msg) {
+                    (Some(_), Some(m)) => Some(self.finalize_commit_message(m)),
+                    (Some(_), None) => {
+                        let head_msg = eng.head_message(caps).map_err(s)?;
+                        // Unborn HEAD → empty: let `eng.amend(None, …)` report
+                        // "nothing to amend" rather than finalizing an empty
+                        // string into a bogus message.
+                        if head_msg.is_empty() {
+                            None
+                        } else {
+                            Some(self.finalize_commit_message(&head_msg))
+                        }
+                    }
+                    (None, Some(m)) => Some(m.to_string()),
+                    (None, None) => None,
+                };
                 let c = eng
                     .amend(caps, signed.as_deref(), &self.author)
                     .map_err(s)?;
@@ -1163,16 +1224,25 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .and_then(|v| v.as_str())
                     .filter(|o| !o.trim().is_empty())
                     .ok_or("rebase: 'onto' (the base commit/ref to replay onto) is required")?;
-                let steps = parse_rebase_plan(
-                    args,
-                    self.attribution.as_ref(),
-                    self.contributors_consumed
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                )?;
+                let steps = parse_rebase_plan(args)?;
                 if steps.is_empty() {
                     return Err("rebase: 'plan' must list at least one step".to_string());
                 }
-                let r = eng.rebase(caps, onto, &steps, &self.author).map_err(s)?;
+                // #1709 req 9: every newly created rebase commit (pick/reword/
+                // squash) is finalized through the SAME canonical finalizer as
+                // `commit`/`amend` — `finalize_commit_message` reads the
+                // consumption cursor, which is stable for the whole rebase (it
+                // advances once, below, after the rebase lands), so every
+                // rebase commit shares the one frozen contributor slice. `None`
+                // when no attribution is configured (test scaffolds) → messages
+                // pass through untouched.
+                let finalize: Option<&dyn Fn(&str) -> String> = match &self.attribution {
+                    Some(_) => Some(&|m: &str| self.finalize_commit_message(m)),
+                    None => None,
+                };
+                let r = eng
+                    .rebase(caps, onto, &steps, &self.author, finalize)
+                    .map_err(s)?;
                 // #1709 family: a rebase that produces/drops commits landed —
                 // signal it so the ledger clears on confirmed rebase success,
                 // not a `HEAD` diff (a rebase may land at the same tree with a
@@ -1238,16 +1308,12 @@ impl newt_core::agentic::GitTool for LocalGitTool {
 }
 
 /// Parse the `plan` array (`[{commit, action, message?}]`) into `RebaseStep`s.
-/// `reword`/`squash` messages are finalized through the canonical
-/// [`CommitAttribution`] finalizer (the tool owns signing), so rebased
-/// commits keep the AI credit too.
-///
-/// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
-fn parse_rebase_plan(
-    args: &serde_json::Value,
-    attribution: Option<&newt_core::attribution::CommitAttribution>,
-    contributors_consumed: usize,
-) -> Result<Vec<RebaseStep>, String> {
+/// Messages are passed through RAW — finalization (canonical attribution) is
+/// the engine's job now: [`GitEngine::rebase`] applies the shared finalizer to
+/// every newly created commit's joined message (pick / reword / squash), so no
+/// rebase path formats attribution itself and an ordinary `pick` receives
+/// canonical attribution too (#1709 req 9).
+fn parse_rebase_plan(args: &serde_json::Value) -> Result<Vec<RebaseStep>, String> {
     let plan = args
         .get("plan")
         .and_then(|v| v.as_array())
@@ -1271,24 +1337,12 @@ fn parse_rebase_plan(
                 ))
             }
         };
+        // Raw message — the engine finalizes at commit-creation time.
         let message = e
             .get("message")
             .and_then(|v| v.as_str())
             .filter(|m| !m.trim().is_empty())
-            .map(|m| match action {
-                RebaseAction::Reword | RebaseAction::Squash => match attribution {
-                    // #1709 family: respect the consumption cursor — render only
-                    // the UNCONSUMED contributor tail, matching
-                    // `finalize_commit_message`, so a rebase following a commit
-                    // in the same lifecycle does not re-credit spent contributors.
-                    Some(a) => {
-                        let start = contributors_consumed.min(a.contributors.len());
-                        a.finalize_message_with(m, &a.contributors[start..])
-                    }
-                    None => m.to_string(),
-                },
-                _ => m.to_string(),
-            });
+            .map(str::to_string);
         steps.push(RebaseStep {
             commit,
             action,
@@ -2378,6 +2432,75 @@ mod tests {
         );
     }
 
+    /// #1709 req 8: `amend` with NO new message still REFRESHES attribution.
+    /// The amend arm reads HEAD's existing full message and runs it through the
+    /// canonical finalizer before creating the amended commit, so a `/model`
+    /// switch since the original commit replaces the stale Newt model trailers
+    /// and provenance (the user subject/body and third-party trailers are
+    /// preserved).
+    ///
+    /// Real-resource (real git).
+    #[test]
+    fn amend_with_no_message_refreshes_attribution_after_a_model_switch() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let mut t = tool(p);
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-a",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c1.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c1.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "orig under model A"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let before = head_message(p);
+        assert!(
+            before.contains(" | Model: model-a | "),
+            "C1 → model A: {before}"
+        );
+        assert!(before.contains("orig under model A"));
+
+        // `/model model-b`, stage more work, then amend with NO message.
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-b",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c2.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c2.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch("amend", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        let body = head_message(p);
+        assert!(
+            body.contains(" | Model: model-b | "),
+            "amend(no message) → the LIVE model B: {body}"
+        );
+        assert!(
+            !body.contains("model-a"),
+            "stale model A did NOT survive amend(no message): {body}"
+        );
+        // The original subject/body is preserved (not erased by re-finalization).
+        assert!(
+            body.contains("orig under model A"),
+            "amend(no message) preserved the user subject/body: {body}"
+        );
+    }
+
     #[test]
     fn local_git_tool_status_renders_readable_text() {
         let dir = repo_with_commit();
@@ -2601,6 +2724,45 @@ mod tests {
             "old c2 subject gone: {subjects}"
         );
         // b.txt and c.txt still present (changes preserved).
+    }
+
+    /// #1709 req 9: an ordinary `pick` (NOT reword/squash) — which replays the
+    /// original commit's message verbatim — receives canonical Newt attribution
+    /// too. Every newly created rebase commit is finalized through the same
+    /// finalizer as `commit`/`amend`. The user subject/body is preserved; the
+    /// Newt model trailer + Harness provenance are appended. Real-resource.
+    #[test]
+    fn rebase_pick_commit_receives_canonical_attribution() {
+        let (dir, oids) = repo_with_three();
+        let p = dir.path();
+        let t = tool(p);
+        // The picked commit (c3) was authored by "T <t@e.c>" with a bare
+        // subject "c3" and NO attribution. Replay it with a plain `pick`.
+        t.dispatch(
+            "rebase",
+            &serde_json::json!({
+                "onto": oids[0],
+                "plan": [
+                    {"commit": oids[1], "action": "pick"},
+                    {"commit": oids[2], "action": "pick"},
+                ]
+            }),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        // The HEAD commit (c3 replayed) now carries canonical attribution.
+        let body = head_message(p);
+        assert!(
+            body.contains(" | Model: qwen3:30b | "),
+            "pick commit received the live model provenance: {body}"
+        );
+        assert!(
+            body.contains("Co-authored-by: qwen3:30b (newt-agent v"),
+            "pick commit received the model Co-authored-by trailer: {body}"
+        );
+        // The user's original subject/body is preserved.
+        let first_line = body.lines().next().unwrap_or("");
+        assert_eq!(first_line, "c3", "pick preserved the user subject: {body}");
     }
 
     #[test]
