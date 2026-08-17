@@ -27,6 +27,9 @@ const MAX_DECISIONS: usize = 16;
 const MAX_CONCRETE_DECISIONS: usize = MAX_DECISIONS - 1;
 const MAX_ASK_BYTES: usize = 4_096;
 const MAX_CLARIFICATION_BYTES: usize = 384;
+/// Adjudication is one bounded side call, never a second agent turn. A batch
+/// larger than this is refused outright and every candidate stays `Pending`.
+pub const MAX_ADJUDICATION_BATCH: usize = 15;
 const RESEARCH_TOOL_ROUND_LIMIT: usize = 3;
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V1: &str = "prompt_comprehension_manifest_v1";
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V2: &str = "prompt_comprehension_manifest_v2";
@@ -128,6 +131,11 @@ pub struct DecisionLock {
     question: String,
     status: DecisionStatus,
     source: Option<DecisionSource>,
+    /// The explicit interpretation the agent will proceed under. Present iff
+    /// the lock source is [`DecisionSource::AuthorizedAssumption`]: an
+    /// assumption may never be silently inferred, so a lock without stated
+    /// text is invalid and [`PromptIntake::validate`] rejects it.
+    assumption: Option<String>,
     /// An intake-bound overflow is not a decision the operator can answer in
     /// place. The operator must split the request before execution can resume.
     overflow: bool,
@@ -149,6 +157,48 @@ impl DecisionLock {
     pub fn is_overflow(&self) -> bool {
         self.overflow
     }
+
+    /// The recorded assumption for an [`DecisionSource::AuthorizedAssumption`]
+    /// lock. `None` for pending decisions and for operator answers — auditing
+    /// must be able to tell a stated operator answer from a model-adjudicated
+    /// assumption, so the two never share a representation.
+    pub fn assumption(&self) -> Option<&str> {
+        self.assumption.as_deref()
+    }
+}
+
+/// One candidate handed to the adjudicator. `id` is the 1-based ordinal the
+/// model must echo back; it indexes the CANDIDATE list, never the decision
+/// vector, so a model reply can never address a decision that was not offered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdjudicationCandidate {
+    pub id: usize,
+    pub question: String,
+}
+
+/// One adjudicated verdict. This is the entire authority the model has: it may
+/// say "the operator delegated this, and here is the interpretation I will
+/// proceed under". It cannot lock, cannot unlock, and cannot name a decision
+/// that was not in the candidate batch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AdjudicationVerdict {
+    pub decision_id: usize,
+    #[serde(default)]
+    pub delegated_to_agent: bool,
+    #[serde(default)]
+    pub assumption: String,
+}
+
+/// Why an adjudication batch was refused wholesale. Fail-closed: the candidates
+/// stay `Pending` and the operator is asked.
+///
+/// A side call that errors, times out, or returns malformed output is NOT
+/// represented here — that is handled where the call is made, by returning the
+/// intake untouched. This type is only for a batch the harness refuses to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdjudicationRefusal {
+    /// More candidates than one bounded side call may adjudicate.
+    BatchTooLarge { candidates: usize, bound: usize },
 }
 
 /// Content-bearing in-memory comprehension result. Its public accessors expose
@@ -236,6 +286,7 @@ impl PromptIntake {
                         question: "Provide a non-empty task before execution.".to_string(),
                         status: DecisionStatus::Pending,
                         source: None,
+                        assumption: None,
                         overflow: false,
                     }],
                 },
@@ -425,6 +476,171 @@ impl PromptIntake {
         resolved
     }
 
+    /// The pending, non-overflow decisions offered to the adjudicator, in
+    /// order. The heuristic alone decides what appears here; adjudication is
+    /// strictly a filter over this list (#1749).
+    pub fn adjudication_candidates(&self) -> Vec<AdjudicationCandidate> {
+        self.candidate_indices()
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, index)| AdjudicationCandidate {
+                id: ordinal + 1,
+                question: self.manifest.decisions[index].question.clone(),
+            })
+            .collect()
+    }
+
+    /// Absolute `decisions` indices eligible for adjudication.
+    fn candidate_indices(&self) -> Vec<usize> {
+        self.manifest
+            .decisions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, decision)| {
+                (decision.status == DecisionStatus::Pending && !decision.overflow).then_some(index)
+            })
+            .collect()
+    }
+
+    /// Apply model verdicts under harness-owned rules. The model proposes; this
+    /// function is the only thing that may move state, and the ONLY transition
+    /// it can perform is `Pending -> Locked(AuthorizedAssumption)`:
+    ///
+    /// * a `decision_id` outside the candidate batch is discarded;
+    /// * `delegated_to_agent: false` leaves the decision pending;
+    /// * an empty/whitespace assumption is refused — an assumption is never
+    ///   silently inferred (#1749);
+    /// * an already-locked decision is never touched, so a model cannot
+    ///   overwrite or re-source an operator answer;
+    /// * a duplicate `decision_id` after the first is discarded.
+    ///
+    /// An oversized batch refuses wholesale rather than adjudicating a prefix.
+    pub fn apply_adjudications(
+        &self,
+        verdicts: &[AdjudicationVerdict],
+    ) -> Result<Self, AdjudicationRefusal> {
+        let candidates = self.candidate_indices();
+        if candidates.len() > MAX_ADJUDICATION_BATCH {
+            return Err(AdjudicationRefusal::BatchTooLarge {
+                candidates: candidates.len(),
+                bound: MAX_ADJUDICATION_BATCH,
+            });
+        }
+
+        let mut resolved = self.clone();
+        let mut seen = BTreeSet::new();
+        for verdict in verdicts {
+            if !verdict.delegated_to_agent {
+                continue;
+            }
+            let assumption = verdict.assumption.trim();
+            if assumption.is_empty() {
+                continue;
+            }
+            let Some(index) = verdict
+                .decision_id
+                .checked_sub(1)
+                .and_then(|ordinal| candidates.get(ordinal).copied())
+            else {
+                continue;
+            };
+            if !seen.insert(index) {
+                continue;
+            }
+            let decision = &mut resolved.manifest.decisions[index];
+            debug_assert_eq!(decision.status, DecisionStatus::Pending);
+            decision.status = DecisionStatus::Locked;
+            decision.source = Some(DecisionSource::AuthorizedAssumption);
+            decision.assumption = Some(
+                truncate_chars(assumption, MAX_CLARIFICATION_BYTES)
+                    .trim()
+                    .to_string(),
+            );
+        }
+
+        resolved.disposition = if resolved.manifest.pending_decision_count() == 0 {
+            resolved.post_lock_disposition
+        } else {
+            PromptDisposition::Ask
+        };
+        debug_assert!(resolved.validate().is_ok());
+        Ok(resolved)
+    }
+
+    /// Absolute indices of model-authorized locks, in order. Position `n` here
+    /// is the ordinal `n + 1` the operator types to `/undo-lock`. It is its own
+    /// numbering — deliberately NOT shared with the clarification ordinals,
+    /// which the resolver reads (#1689 item 4).
+    fn assumption_indices(&self) -> Vec<usize> {
+        self.manifest
+            .decisions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, decision)| {
+                (decision.source == Some(DecisionSource::AuthorizedAssumption)).then_some(index)
+            })
+            .collect()
+    }
+
+    /// One operator-facing line per model-authorized assumption. An assumption
+    /// the operator never sees is indistinguishable from a silent guess, so
+    /// every lock states its interpretation and how to reopen it.
+    pub fn authorized_assumption_notices(&self) -> Vec<String> {
+        self.assumption_indices()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ordinal, index)| {
+                let assumption = self.manifest.decisions[index].assumption.as_deref()?;
+                Some(format!(
+                    "Assuming: {assumption} — `/undo-lock {}` to reopen",
+                    ordinal + 1
+                ))
+            })
+            .collect()
+    }
+
+    /// Reopen a model-authorized assumption by its `/undo-lock` ordinal.
+    /// Operator answers are NOT reversible this way: `/undo-lock` exists to
+    /// undo the harness's own inference, not to discard what the operator said.
+    pub fn undo_lock(&self, ordinal: usize) -> Option<Self> {
+        let index = *self.assumption_indices().get(ordinal.checked_sub(1)?)?;
+        let mut reopened = self.clone();
+        let decision = &mut reopened.manifest.decisions[index];
+        decision.status = DecisionStatus::Pending;
+        decision.source = None;
+        decision.assumption = None;
+        reopened.disposition = PromptDisposition::Ask;
+        debug_assert!(reopened.validate().is_ok());
+        Some(reopened)
+    }
+
+    /// Test-only: append `extra` pending candidates beyond what the parser can
+    /// produce. `MAX_CONCRETE_DECISIONS` already caps `analyze` at
+    /// `MAX_ADJUDICATION_BATCH`, so the adjudication bound is defense in depth
+    /// against a future parser bound raise — unreachable through parsing, and
+    /// therefore only provable through a direct constructor.
+    #[cfg(test)]
+    pub(super) fn with_extra_pending_candidates(&self, extra: usize) -> Self {
+        let mut widened = self.clone();
+        for index in 0..extra {
+            widened.manifest.decisions.push(DecisionLock {
+                question: format!("Choose the smallest fix for extra-module-{index}."),
+                status: DecisionStatus::Pending,
+                source: None,
+                assumption: None,
+                overflow: false,
+            });
+        }
+        widened.disposition = PromptDisposition::Ask;
+        widened
+    }
+
+    /// Count of locks whose authority is model adjudication rather than an
+    /// operator answer. Auditing must be able to tell the two apart.
+    pub fn authorized_assumption_count(&self) -> usize {
+        self.assumption_indices().len()
+    }
+
     /// Content-free model projection placed inside the protected active-prompt
     /// card. It contains no prompt, decision, or clarification text.
     pub fn model_card(&self) -> String {
@@ -524,6 +740,13 @@ impl PromptIntake {
                 .filter(|decision| decision.status == DecisionStatus::Pending)
                 .map(|decision| digest_metadata(&decision.question))
                 .collect::<Vec<_>>(),
+            "authorized_assumption_digests": self
+                .manifest
+                .decisions
+                .iter()
+                .filter_map(|decision| decision.assumption.as_deref())
+                .map(digest_metadata)
+                .collect::<Vec<_>>(),
         })
     }
 
@@ -556,6 +779,18 @@ impl PromptIntake {
                 (DecisionStatus::Locked, None) => {
                     return Err("locked decision lacks a source".to_string())
                 }
+            }
+            match (decision.source, decision.assumption.as_deref()) {
+                (Some(DecisionSource::AuthorizedAssumption), None | Some("")) => {
+                    return Err("authorized assumption lock lacks a stated assumption".to_string())
+                }
+                (Some(DecisionSource::AuthorizedAssumption), Some(_)) => {}
+                (_, Some(_)) => {
+                    return Err(
+                        "only an authorized assumption may carry assumption text".to_string()
+                    )
+                }
+                (_, None) => {}
             }
         }
         let pending = self.manifest.pending_decision_count();
@@ -817,6 +1052,7 @@ fn extract_decisions(asks: &[AtomicAsk]) -> (Vec<DecisionLock>, bool) {
                 question: ask.text.clone(),
                 status,
                 source,
+                assumption: None,
                 overflow: false,
             });
         }
@@ -831,6 +1067,7 @@ fn overflow_decision() -> DecisionLock {
         ),
         status: DecisionStatus::Pending,
         source: None,
+        assumption: None,
         overflow: true,
     }
 }

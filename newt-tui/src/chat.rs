@@ -1904,6 +1904,10 @@ fn session_body(
     // re-enters that lineage instead of becoming a goal-less fresh prompt.
     let mut interrupted_objective: Option<newt_core::TurnPromptContext> = None;
     let mut pending_clarification: Option<PendingClarification> = None;
+    // The last turn whose decisions were settled by model adjudication, kept
+    // so `/undo-lock` can reopen one. An auto-authorized assumption is only
+    // legitimate because it is cheaply reversible (#1749).
+    let mut last_adjudicated: Option<PendingClarification> = None;
 
     // #1669 PR-A: the open tabs. Seeded with this session's first tab, whose
     // SessionId is the one minted above — so the startup tab IS the session
@@ -3031,6 +3035,49 @@ fn session_body(
                     // apply a named permission preset (an authority floor), and
                     // carry its guidance into each live turn. All three or none.
                     let slash_command = task.trim_start_matches('/');
+                    // #1749: reopen a decision the harness authorized on its
+                    // own. This reverses ONLY model adjudication — an operator
+                    // answer is not something the harness may discard.
+                    if slash_command == "undo-lock" || slash_command.starts_with("undo-lock ") {
+                        let arg = slash_command.strip_prefix("undo-lock").unwrap_or("").trim();
+                        let ordinal = arg.parse::<usize>().ok();
+                        match (ordinal, last_adjudicated.take()) {
+                            (Some(ordinal), Some(previous)) => {
+                                match previous.intake.undo_lock(ordinal) {
+                                    Some(reopened) => {
+                                        let batch = reopened.clarification_batch();
+                                        pending_clarification = Some(PendingClarification {
+                                            parent: previous.parent,
+                                            intake: reopened,
+                                        });
+                                        print_newt(&batch, color, verbose);
+                                    }
+                                    None => {
+                                        last_adjudicated = Some(previous);
+                                        print_newt(
+                                            "no assumption carries that ordinal — the numbers come from the `Assuming:` lines above",
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                            }
+                            (None, previous) => {
+                                last_adjudicated = previous;
+                                print_newt(
+                                    "usage: /undo-lock <n>, where <n> is the ordinal from an `Assuming:` line",
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            (Some(_), None) => {
+                                print_newt("no assumption is open to reopen", color, verbose);
+                            }
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
                     if slash_command == "posture" || slash_command.starts_with("posture ") {
                         let arg = slash_command.strip_prefix("posture").unwrap_or("").trim();
                         handle_posture_command(arg, &cfg, &mut active_posture, color, verbose);
@@ -5824,6 +5871,60 @@ fn session_body(
                         auto_selected,
                     );
                     apply_operating_mode_to_intake(turn_operating_mode, &mut prompt_intake);
+
+                    // #1749: the deterministic detector says a decision MIGHT
+                    // exist; one bounded, tool-less side call says whether the
+                    // operator delegated it. The harness owns the transition —
+                    // the model can only move Pending -> AuthorizedAssumption,
+                    // and every failure path leaves the candidate pending. This
+                    // runs before the manifest artifact so the durable record
+                    // reflects the locks, and before the Ask handoff so a
+                    // delegated decision never reaches the operator as a
+                    // question. Off headless: an assumption nobody reads is
+                    // indistinguishable from a silent guess.
+                    let adjudication_enabled = cfg
+                        .intake
+                        .as_ref()
+                        .map(|intake| {
+                            intake.adjudicate_decisions_enabled(
+                                newt_core::tty::LineCaps::detect().can_own(),
+                            )
+                        })
+                        .unwrap_or_else(|| newt_core::tty::LineCaps::detect().can_own());
+                    if adjudication_enabled
+                        && prompt_intake.disposition() == newt_core::agentic::PromptDisposition::Ask
+                        && !prompt_intake.adjudication_candidates().is_empty()
+                    {
+                        let adjudicator = build_session_summarizer(
+                            &sum_cfg,
+                            &cfg,
+                            &inf_url,
+                            &inf_model,
+                            inf_kind,
+                            &inf_key,
+                            Some(mem_budget),
+                            color,
+                        );
+                        prompt_intake = tokio::task::block_in_place(|| {
+                            rt.block_on(newt_core::agentic::adjudicate_decisions(
+                                &prompt_intake,
+                                &adjudicator,
+                            ))
+                        });
+                        for notice in prompt_intake.authorized_assumption_notices() {
+                            print_newt(&notice, color, verbose);
+                        }
+                        if prompt_intake.authorized_assumption_count() > 0 {
+                            println!();
+                            last_adjudicated =
+                                active_prompt_context
+                                    .clone()
+                                    .map(|parent| PendingClarification {
+                                        parent: Box::new(parent),
+                                        intake: prompt_intake.clone(),
+                                    });
+                        }
+                    }
 
                     // The manifest artifact deliberately contains only bounded
                     // counts and digests. It is written before an Ask handoff

@@ -101,9 +101,26 @@ pub struct IntakeConfig {
     /// cliff, made explicit and tunable. Unknown values fall back to explain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question_mark_disposition: Option<String>,
+    /// Whether a heuristic decision candidate may be settled by one bounded,
+    /// tool-less model adjudication before the operator is asked (#1749).
+    ///
+    /// Unset resolves to [`IntakeConfig::adjudicate_decisions_enabled`]: on for
+    /// an interactive terminal, off headless. An auto-authorized assumption is
+    /// only safe because the operator SEES it and can `/undo-lock` it; where
+    /// nobody is reading, the harness asks instead of assuming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjudicate_decisions: Option<bool>,
 }
 
 impl IntakeConfig {
+    /// Resolve [`IntakeConfig::adjudicate_decisions`] against the surface.
+    /// `interactive` is the harness's "an operator is watching this line"
+    /// signal (`LineCaps::can_own`).
+    #[must_use]
+    pub fn adjudicate_decisions_enabled(&self, interactive: bool) -> bool {
+        self.adjudicate_decisions.unwrap_or(interactive)
+    }
+
     /// Resolve this table over the built-in defaults into the lexicon
     /// [`crate::agentic::PromptIntake::analyze_with`] consumes.
     #[must_use]
