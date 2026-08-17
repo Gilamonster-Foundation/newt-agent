@@ -2178,11 +2178,7 @@ fn prior_scope_for_binding(
     let metadata = metadata?;
     if metadata.resource != resource
         || metadata.issuer != issuer
-        || token
-            .resource
-            .as_deref()
-            .is_some_and(|bound| bound != resource)
-        || token.issuer.as_deref().is_some_and(|bound| bound != issuer)
+        || !token_has_exact_binding(token, metadata)
     {
         return None;
     }
@@ -3847,7 +3843,9 @@ mod tests {
         .is_none());
     }
 
+    /// Real-filesystem grounding for mocked companion-name collision checks.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn companion_suffix_names_cannot_collide_with_another_servers_raw_trio() {
         let temp = tempfile::tempdir().unwrap();
         let ordinary = portable_credential_paths(temp.path(), "server").unwrap();
@@ -3860,7 +3858,9 @@ mod tests {
         assert!(client_named.token.starts_with(temp.path()));
     }
 
+    /// Real-filesystem grounding for mocked hashed-namespace path isolation.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn new_hashed_namespace_cannot_collide_with_raw_or_legacy_hash_names() {
         let temp = tempfile::tempdir().unwrap();
         let unsafe_name = "team/server";
@@ -4829,7 +4829,9 @@ mod tests {
         assert!(error.contains("S256"), "{error}");
     }
 
+    /// Real-filesystem grounding for mocked exact-name and case-fold path mapping.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn exact_server_names_do_not_alias_on_case_or_dots() {
         let dir = Path::new("/tokens");
         assert_ne!(
@@ -4849,7 +4851,9 @@ mod tests {
         );
     }
 
+    /// Real-filesystem grounding for mocked raw-Hermes alias rejection.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn raw_hermes_case_alias_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         write_token_file(
@@ -4937,6 +4941,41 @@ mod tests {
             "https://auth.example/new"
         )
         .is_none());
+    }
+
+    #[test]
+    fn unbound_or_partially_bound_scopes_cannot_widen_explicit_oauth() {
+        let resource = "https://mcp.example/team/mcp";
+        let issuer = "https://auth.example";
+        let metadata = MetaFile {
+            resource: resource.into(),
+            issuer: issuer.into(),
+            authorization_endpoint: None,
+            token_endpoint: format!("{issuer}/token"),
+            code_challenge_methods_supported: vec!["S256".into()],
+            authorization_response_iss_parameter_supported: false,
+            extra: BTreeMap::new(),
+        };
+        let scoped_token =
+            |resource_binding: Option<&str>, issuer_binding: Option<&str>| TokenFile {
+                access_token: "access".into(),
+                refresh_token: None,
+                expires_at: None,
+                resource: resource_binding.map(str::to_owned),
+                issuer: issuer_binding.map(str::to_owned),
+                extra: BTreeMap::from([("scope".into(), serde_json::json!("admin"))]),
+            };
+
+        for token in [
+            scoped_token(None, None),
+            scoped_token(Some(resource), None),
+            scoped_token(None, Some(issuer)),
+        ] {
+            assert!(
+                prior_scope_for_binding(Some(&token), Some(&metadata), resource, issuer).is_none(),
+                "an unbound or partially bound token must not widen explicit OAuth scopes"
+            );
+        }
     }
 
     #[test]
@@ -5322,7 +5361,9 @@ mod tests {
         }
     }
 
+    /// Real-filesystem grounding for mocked atomic manifest commit recovery.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn manifest_commit_point_rejects_every_partial_generation() {
         let interrupted = [
             PublishPhase::GenerationClient,
@@ -5401,7 +5442,9 @@ mod tests {
         assert_eq!(active.client.client_id, "client-new");
     }
 
+    /// Real-filesystem grounding for mocked portable exact-name migration.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn mixed_case_dotted_hermes_trio_migrates_without_renaming() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5422,7 +5465,9 @@ mod tests {
         assert_eq!(active.token.access_token, "legacy");
     }
 
+    /// Real-filesystem grounding for mocked Hermes rotation adoption.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn hermes_token_rotation_is_adopted_instead_of_overwritten() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5459,7 +5504,9 @@ mod tests {
         assert_eq!(std::fs::read(&raw.client).unwrap(), client_before);
     }
 
+    /// Real-filesystem grounding for mocked unbound-rotation refusal.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn stable_unbound_hermes_token_rotation_is_not_adopted() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5503,7 +5550,9 @@ mod tests {
         );
     }
 
+    /// Real-filesystem grounding for mocked refresh-generation precedence.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn newt_refresh_generation_cannot_roll_back_to_an_unchanged_flat_token() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5531,7 +5580,9 @@ mod tests {
         assert_eq!(untouched.access_token, "flat-old");
     }
 
+    /// Real-filesystem grounding for mocked coherent-trio cursor checks.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn hermes_rotation_is_refused_after_a_byte_only_metadata_change() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5557,7 +5608,9 @@ mod tests {
         assert_eq!(active.token.access_token, "old");
     }
 
+    /// Real-filesystem grounding for mocked version-one manifest adoption.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn version_one_manifest_upgrades_and_adopts_one_coherent_rotation() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5594,7 +5647,9 @@ mod tests {
         assert!(upgraded.hermes_token_sha256.is_some());
     }
 
+    /// Real-filesystem grounding for mocked version-one binding enforcement.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn version_one_manifest_upgrade_refuses_unbound_rotation() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5637,7 +5692,9 @@ mod tests {
         assert!(upgraded.hermes_token_sha256.is_some());
     }
 
+    /// Real-filesystem grounding for mocked legacy reauthentication classification.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn unbound_hermes_trio_is_withheld_and_left_for_explicit_reauth() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5689,7 +5746,9 @@ mod tests {
         );
     }
 
+    /// Real-filesystem grounding for mocked manifested-generation precedence.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn manifested_newt_generation_survives_malformed_read_only_hermes_trio() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5719,7 +5778,9 @@ mod tests {
         assert_eq!(std::fs::read(&raw.token).unwrap(), malformed.to_vec());
     }
 
+    /// Real-filesystem grounding for mocked credential snapshot interleaving.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn credential_snapshot_detects_deterministic_interleaving() {
         let temp = tempfile::tempdir().unwrap();
         let name = "server";
@@ -5732,7 +5793,9 @@ mod tests {
         assert!(ensure_credential_snapshot(temp.path(), name, &initial).is_err());
     }
 
+    /// Real-filesystem grounding for mocked manifest digest validation.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn version_two_manifest_rejects_malformed_cursor_digests() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5756,7 +5819,9 @@ mod tests {
         assert!(read_credential_manifest(temp.path(), name).is_err());
     }
 
+    /// Real-filesystem grounding for mocked refresh compare-and-swap checks.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn refresh_cas_rejects_any_flat_state_change() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5792,7 +5857,9 @@ mod tests {
         assert_eq!(active.token.access_token, "old");
     }
 
+    /// Real-filesystem grounding for mocked refresh-race recovery.
     #[tokio::test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     async fn forced_refresh_returns_an_already_rotated_bearer_without_network() {
         let temp = tempfile::tempdir().unwrap();
         let name = "Review.Source";
@@ -5819,7 +5886,9 @@ mod tests {
         assert_eq!(bearer.as_deref(), Some("current"));
     }
 
+    /// Real-filesystem grounding for mocked case-folded credential locking.
     #[test]
+    #[ignore = "real filesystem; weekly/release mcp-import-real lane"]
     fn credential_lock_serializes_case_aliases_and_releases_cleanly() {
         let temp = tempfile::tempdir().unwrap();
         let upper = credential_lock_path(temp.path(), "Review.Source").unwrap();
