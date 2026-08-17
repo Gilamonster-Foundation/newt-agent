@@ -1243,16 +1243,26 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                 let r = eng
                     .rebase(caps, onto, &steps, &self.author, finalize)
                     .map_err(s)?;
-                // #1709 family: a rebase that produces/drops commits landed —
-                // signal it so the ledger clears on confirmed rebase success,
-                // not a `HEAD` diff (a rebase may land at the same tree with a
-                // rewritten history the snapshot proxy could mis-read).
-                self.commit_succeeded
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // #1709 family: the rebase's reword/squash steps finalized from
-                // the same frozen contributor slice; consume it so a later
-                // commit in this lifecycle does not re-credit them.
-                self.consume_contributors();
+                // #1709 family: a rebase is an attribution EPOCH only when it
+                // actually PRODUCED commits (`r.produced > 0`). An all-drop plan
+                // (`produced == 0`) is a successful history operation — it
+                // rewrites nothing and creates no commit — so it is NOT an
+                // attribution epoch: the pending contributors are PRESERVED (a
+                // later commit in this lifecycle still credits them), and
+                // `commit_succeeded` is NOT reported (no Newt commit landed for
+                // the turn telemetry to count). Gating both the explicit
+                // commit-success signal AND the contributor-snapshot consumption
+                // on `produced > 0` keeps the two consumption paths (this
+                // per-tool cursor + the session-loop ledger clear) in agreement:
+                // a 0-produced rebase consumes nothing on either path.
+                if r.produced > 0 {
+                    self.commit_succeeded
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // The rebase's reword/squash steps finalized from the same
+                    // frozen contributor slice; consume it so a later commit in
+                    // this lifecycle does not re-credit them.
+                    self.consume_contributors();
+                }
                 Ok(format!(
                     "rebased onto {onto} → {} ({} commit(s), {} dropped)",
                     r.new_head, r.produced, r.dropped
@@ -2828,6 +2838,82 @@ mod tests {
         assert!(
             !names.contains("c.txt"),
             "dropped commit's file gone: {names}"
+        );
+    }
+
+    /// #1709 family: a rebase that produced ZERO commits (an all-drop plan) is
+    /// a successful history operation but NOT an attribution epoch. It must
+    /// NOT signal `commit_succeeded` and must NOT consume the contributor
+    /// snapshot — pending contributors survive it and a later commit in the
+    /// same lifecycle still credits them. Real git (tempdir + real commits)
+    /// because "the contributor survived onto the next commit" is a property
+    /// of the real commit object, not a mock.
+    #[test]
+    fn rebase_all_drop_preserves_pending_contributors() {
+        let (dir, oids) = repo_with_three();
+        let mut t = tool(dir.path());
+        // Inject one accumulated contributor (model-a) into the envelope.
+        if let Some(a) = t.attribution.as_mut() {
+            a.contributors
+                .push(newt_core::attribution::Attribution::new(
+                    "model-a",
+                    "newt-agent",
+                    newt_core::build_info::PACKAGE_VERSION,
+                    "noreply@newt-agent.com",
+                ));
+        }
+        // All-drop plan: onto c1, drop c2 and c3 → produced == 0, dropped == 2.
+        let out = t
+            .dispatch(
+                "rebase",
+                &serde_json::json!({
+                    "onto": oids[0],
+                    "plan": [
+                        {"commit": oids[1], "action": "drop"},
+                        {"commit": oids[2], "action": "drop"},
+                    ]
+                }),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert!(
+            out.contains("0 commit(s), 2 dropped"),
+            "all-drop rebase produced 0 commits: {out}"
+        );
+        // No Newt commit landed → no commit_succeeded signal.
+        assert_eq!(
+            t.drain_commit_success(),
+            0,
+            "a 0-produced rebase must NOT report commit_succeeded"
+        );
+        // The contributor cursor was NOT advanced: a subsequent commit in the
+        // same lifecycle still credits model-a (the snapshot remains pending).
+        std::fs::write(dir.path().join("d.txt"), "z\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["d.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "after all-drop rebase"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let msg = head_message(dir.path());
+        let version = newt_core::build_info::PACKAGE_VERSION;
+        assert!(
+            msg.contains(&format!(
+                "Co-authored-by: model-a (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "the pending contributor survived the 0-produced rebase and is credited on the next commit: {msg}"
+        );
+        // That next commit IS an epoch (it produced a commit) → it signals.
+        assert_eq!(
+            t.drain_commit_success(),
+            1,
+            "the commit after the all-drop rebase signals normally"
         );
     }
 

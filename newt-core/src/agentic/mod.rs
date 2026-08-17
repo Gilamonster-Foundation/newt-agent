@@ -1641,6 +1641,7 @@ fn ledger_consume_at_commit_epoch(
     name: &str,
     args: &serde_json::Value,
     ok: bool,
+    result: &str,
 ) {
     let Some(ledger) = attribution else {
         return;
@@ -1648,7 +1649,43 @@ fn ledger_consume_at_commit_epoch(
     if !ok || !is_commit_producing_git_call(name, args) {
         return;
     }
+    // A rebase is an attribution EPOCH only when it actually PRODUCED commits.
+    // The tool's rebase arm reports `"{…} ({produced} commit(s), {dropped}
+    // dropped)"`; an all-drop plan yields `produced == 0` — a successful
+    // history operation that creates NO commit, so it is NOT an epoch: pending
+    // contributors are preserved (a later commit still credits them) and the
+    // live ledger is NOT cleared. `commit`/`amend` always produce a commit, so
+    // they are unconditionally epochs. Parse the produced count ONLY for
+    // rebase (the narrow, op-specific result shape); a missing/unparseable
+    // count falls back to clearing (the safe, prior behavior) so a malformed
+    // report can never strand contributors on a commit that did land.
+    if args.get("op").and_then(|v| v.as_str()) == Some("rebase") {
+        if let Some(produced) = parse_rebase_produced(result) {
+            if produced == 0 {
+                return;
+            }
+        }
+    }
     ledger.borrow_mut().clear();
+}
+
+/// Extract the `produced` count from a `git rebase` tool result — the string
+/// `"{new_head} ({produced} commit(s), {dropped} dropped)"`. Returns `None`
+/// when the shape is unrecognized (caller falls back to the safe clear). Pure
+/// parse, no allocation beyond the captured digits.
+fn parse_rebase_produced(result: &str) -> Option<usize> {
+    // Locate " commit(s)" and capture the integer immediately before it.
+    let marker = " commit(s)";
+    let idx = result.rfind(marker)?;
+    let before = &result[..idx];
+    let mut end = before.len();
+    while end > 0 && before.as_bytes()[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    if end == before.len() {
+        return None;
+    }
+    before[end..].parse::<usize>().ok()
 }
 
 /// Drain operator steering into `messages` as genuine user turns (#952/#1669).
@@ -3866,7 +3903,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // an exact repeat self-correct next round.
             let ok = tools::tool_result_ok(&result);
             ledger_note_attribution(attribution, model, name, &args, ok);
-            ledger_consume_at_commit_epoch(attribution, name, &args, ok);
+            ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
@@ -7378,7 +7415,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
             ledger_note_attribution(attribution, model, name, &args, ok);
-            ledger_consume_at_commit_epoch(attribution, name, &args, ok);
+            ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
@@ -9299,7 +9336,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // 17.6 + 27.3 — mirrors the OpenAI path.
             let ok = tools::tool_result_ok(&result);
             ledger_note_attribution(attribution, model, name, &args, ok);
-            ledger_consume_at_commit_epoch(attribution, name, &args, ok);
+            ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
@@ -10342,7 +10379,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
             ledger_note_attribution(attribution, model, name, &args, ok);
-            ledger_consume_at_commit_epoch(attribution, name, &args, ok);
+            ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             repeat_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
@@ -19961,7 +19998,7 @@ mod attribution_epoch_tests {
         // the epoch clear consumes the whole ledger (the pre-commit contributors
         // are already credited on C1 via the loop-top snapshot).
         ledger_note_attribution(attr, "model-a", "git", &commit, true);
-        ledger_consume_at_commit_epoch(attr, "git", &commit, true);
+        ledger_consume_at_commit_epoch(attr, "git", &commit, true, "committed abc123 fix");
         assert!(
             ledger.borrow().is_empty(),
             "C1 epoch boundary consumed the ledger"
@@ -19996,7 +20033,7 @@ mod attribution_epoch_tests {
         // "C2" — the loop-top snapshot of this ledger is exactly what the
         // finalizer merges with the active model, so C2 credits A + B (plus the
         // active-at-commit model, deduped). The epoch invariant holds.
-        ledger_consume_at_commit_epoch(attr, "git", &commit, true);
+        ledger_consume_at_commit_epoch(attr, "git", &commit, true, "committed def456 more");
         assert!(
             ledger.borrow().is_empty(),
             "C2 epoch boundary consumed the ledger"
@@ -20017,7 +20054,7 @@ mod attribution_epoch_tests {
         ledger_note_attribution(attr, "model-a", "edit_file", &write, true);
         // A failed commit records nothing (ok=false) and consumes nothing.
         ledger_note_attribution(attr, "model-a", "git", &commit, false);
-        ledger_consume_at_commit_epoch(attr, "git", &commit, false);
+        ledger_consume_at_commit_epoch(attr, "git", &commit, false, "error: denied");
         assert_eq!(
             ledger.borrow().contributors().len(),
             1,
@@ -20075,5 +20112,73 @@ mod attribution_epoch_tests {
             "run_command",
             &serde_json::json!({"command": "git commit"})
         ));
+    }
+
+    /// `parse_rebase_produced` reads the `produced` count out of the rebase
+    /// tool result string. It is the signal that distinguishes an attribution
+    /// epoch (`produced > 0`) from a successful-but-commitless history op
+    /// (`produced == 0`, e.g. an all-drop plan).
+    #[test]
+    fn parse_rebase_produced_reads_the_commit_count() {
+        assert_eq!(
+            parse_rebase_produced("rebased onto abc → def123 (3 commit(s), 1 dropped)"),
+            Some(3)
+        );
+        // All-drop plan: zero commits produced.
+        assert_eq!(
+            parse_rebase_produced("rebased onto abc → def123 (0 commit(s), 2 dropped)"),
+            Some(0)
+        );
+        // Unrecognized shape → None (caller falls back to the safe clear).
+        assert_eq!(parse_rebase_produced("rebased onto abc"), None);
+        assert_eq!(parse_rebase_produced(""), None);
+    }
+
+    /// The requested regression: a rebase that produced ZERO commits (an
+    /// all-drop plan) is a successful history operation but NOT an attribution
+    /// epoch. The pending contributor ledger/snapshot is PRESERVED — a later
+    /// commit in the same lifecycle still credits those contributors — and the
+    /// epoch clear does NOT fire. A rebase that produced > 0 IS an epoch: the
+    /// ledger is consumed.
+    #[test]
+    fn rebase_all_drop_preserves_pending_contributors() {
+        let ledger = RefCell::new(AttributionLedger::new(
+            crate::agent_identity::DEFAULT_AGENT_EMAIL,
+        ));
+        let attr: Option<&RefCell<AttributionLedger>> = Some(&ledger);
+        let write = serde_json::json!({});
+        let rebase = serde_json::json!({"op": "rebase"});
+
+        // Model A does work → recorded as a pending contributor.
+        ledger_note_attribution(attr, "model-a", "edit_file", &write, true);
+        assert_eq!(ledger.borrow().contributors().len(), 1);
+
+        // All-drop rebase: produced == 0. It is NOT an epoch — the ledger is
+        // preserved (the contributor remains pending for a later commit).
+        ledger_consume_at_commit_epoch(
+            attr,
+            "git",
+            &rebase,
+            true,
+            "rebased onto abc → def123 (0 commit(s), 2 dropped)",
+        );
+        assert_eq!(
+            ledger.borrow().contributors().len(),
+            1,
+            "a 0-produced rebase must NOT consume the pending contributor"
+        );
+
+        // A rebase that DID produce commits is an epoch — the ledger clears.
+        ledger_consume_at_commit_epoch(
+            attr,
+            "git",
+            &rebase,
+            true,
+            "rebased onto abc → def456 (2 commit(s), 0 dropped)",
+        );
+        assert!(
+            ledger.borrow().is_empty(),
+            "a >0-produced rebase IS an epoch: the ledger is consumed"
+        );
     }
 }
