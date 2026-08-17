@@ -232,6 +232,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
             summary_input_cap_floor_chars: 8_192,
             exec_floor: None,
             write_ledger: None,
+            attribution: None,
             cancel: None,
             live_tool_output: None,
             completed_spill_renderer: None,
@@ -239,6 +240,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            steering: None,
         },
         &mut mcp,
     )
