@@ -35,6 +35,11 @@ mod catalog;
 pub(crate) mod exposure;
 mod live_output;
 mod output_budget;
+/// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
+/// silent tool is never a blank row, and the first live byte takes the row
+/// for good. Unix-only — it needs a real pty pair.
+#[cfg(all(test, unix))]
+mod tool_spinner_pty_test;
 use live_output::{LiveOutputRelay, LiveOutputSession, ToolSpinner};
 
 #[cfg(test)]
