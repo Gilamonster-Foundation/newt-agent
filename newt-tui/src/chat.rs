@@ -2013,14 +2013,29 @@ fn session_body(
                 print_newt(&banner, color, verbose);
                 true
             }
-            // #1671 `--resume <name>`: id/prefix first (the exact contract),
-            // then title matching — then the SAME one restore path as above.
-            // Errors stay hard, like every explicit resume ask.
+            // #1671 `--resume <name>`: the SAME consolidated resolver in-chat
+            // `/resume <thing>` uses — id/prefix then title — then the SAME one
+            // restore path as above. Errors stay hard, like every explicit
+            // resume ask (startup has no listing to fall back to FTS against).
             SessionStart::ResumeNamed(name) => {
-                let id = match store.resolve_id(name) {
-                    Ok(id) => id,
-                    Err(_) => crate::resolve_conversation_by_name(&store.list()?, name)
-                        .map_err(|e| anyhow::anyhow!(e))?,
+                let id = match crate::resolve_resume_target(&store.list()?, name) {
+                    crate::ResumeNameResolve::Resolved(id) => id,
+                    crate::ResumeNameResolve::Ambiguous(many) => anyhow::bail!(
+                        "\"{name}\" matches {} conversations — use an id: {}",
+                        many.len(),
+                        many.iter()
+                            .map(|(id, title)| format!(
+                                "{} \"{}\"",
+                                crate::short_conversation_id(id),
+                                title
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    crate::ResumeNameResolve::NotFound => anyhow::bail!(
+                        "no conversation titled \"{name}\" in this workspace — \
+                         run newt and /resume to browse"
+                    ),
                 };
                 let banner = resume_exact_conversation(&mut resume_ctx, &id)?;
                 print_newt(&banner, color, verbose);
@@ -4094,12 +4109,18 @@ fn session_body(
                     // so it is easy to find later in `/resume` (titles are what
                     // `/resume` lists and searches). Renaming before the first
                     // turn pre-titles an (empty) record so it shows up titled.
-                    if verb == "rename" {
+                    // `/name <title>` is the ergonomic alias — same path, same
+                    // semantics (#1736). Keep `/rename` for backward compat.
+                    if verb == "rename" || verb == "name" {
                         match conversation_store.as_ref() {
                             Some(store) => {
                                 let title = verb_arg.trim();
                                 if title.is_empty() {
-                                    print_newt("usage: /rename <new title>", color, verbose);
+                                    print_newt(
+                                        &format!("usage: /{verb} <new title>"),
+                                        color,
+                                        verbose,
+                                    );
                                 } else {
                                     // #1030: match on exists() so a transient store
                                     // error (SQLITE_BUSY / NFS IO under concurrent-
@@ -4357,27 +4378,53 @@ fn session_body(
                                             }
                                         }
                                     }
-                                    ResumeCommand::Query(token) => match store.resolve_id(&token) {
-                                        Ok(id) => Some(id),
-                                        Err(_) => {
-                                            match resume_search_message(
-                                                store,
-                                                &token,
-                                                &active_conversation_id,
-                                            ) {
-                                                Ok((msg, ids)) => {
-                                                    last_resume_listing = ids;
-                                                    print_newt(&msg, color, verbose);
+                                    ResumeCommand::Query(token) => {
+                                        // #1030/#1671: the SAME consolidated
+                                        // resolver startup `--resume <name>`
+                                        // uses — id/prefix, then title (exact,
+                                        // unique substring), then ambiguity,
+                                        // then FTS as the listing fallback.
+                                        match crate::resolve_resume_target(&store.list()?, &token) {
+                                            crate::ResumeNameResolve::Resolved(id) => Some(id),
+                                            crate::ResumeNameResolve::Ambiguous(cands) => {
+                                                match resume_ambiguous_message(
+                                                    store,
+                                                    &token,
+                                                    &cands,
+                                                    &active_conversation_id,
+                                                ) {
+                                                    Ok((msg, ids)) => {
+                                                        last_resume_listing = ids;
+                                                        print_newt(&msg, color, verbose);
+                                                    }
+                                                    Err(e) => print_newt(
+                                                        &format!("error: {e}"),
+                                                        color,
+                                                        verbose,
+                                                    ),
                                                 }
-                                                Err(e) => print_newt(
-                                                    &format!("error: {e}"),
-                                                    color,
-                                                    verbose,
-                                                ),
+                                                None
                                             }
-                                            None
+                                            crate::ResumeNameResolve::NotFound => {
+                                                match resume_search_message(
+                                                    store,
+                                                    &token,
+                                                    &active_conversation_id,
+                                                ) {
+                                                    Ok((msg, ids)) => {
+                                                        last_resume_listing = ids;
+                                                        print_newt(&msg, color, verbose);
+                                                    }
+                                                    Err(e) => print_newt(
+                                                        &format!("error: {e}"),
+                                                        color,
+                                                        verbose,
+                                                    ),
+                                                }
+                                                None
+                                            }
                                         }
-                                    },
+                                    }
                                 };
                                 if let Some(id) = target {
                                     // #1669 PR-A blocker 2: ask the ONE
