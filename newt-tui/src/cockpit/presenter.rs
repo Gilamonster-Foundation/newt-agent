@@ -110,32 +110,16 @@ impl Screen {
 
     /// Insert finished rows into the transcript above the block.
     ///
-    /// Erase the block, write the rows from `top` (each pre-wrapped, each
-    /// followed by a style reset and `\r\n`), scroll whatever is needed so
-    /// the last row ends just above where the block will sit, then move the
-    /// block. All arithmetic, no queries — see the module docs.
+    /// The byte plan is [`render_insert`] (pure, testable); this writes it and
+    /// re-seats the block viewport at its new top. All arithmetic, no queries —
+    /// see the module docs.
     fn insert_rows(&mut self, rows: Vec<Row>) -> io::Result<()> {
         let cols = self.cols as usize;
         let phys: Vec<Row> = rows.iter().flat_map(|r| wrap_row(r, cols)).collect();
-        let Ok(k) = u16::try_from(phys.len()) else {
-            return Ok(());
-        };
-        if k == 0 {
+        if phys.is_empty() || phys.len() > u16::MAX as usize {
             return Ok(());
         }
-        let plan = plan_insert(self.top, self.block_h, self.rows, k);
-        let mut buf = Vec::with_capacity(phys.iter().map(Vec::len).sum::<usize>() + 64);
-        queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
-        for row in &phys {
-            buf.extend_from_slice(row);
-            // A reset per row: styling from the transcript must never leak
-            // into the next row or into the block.
-            buf.extend_from_slice(b"\x1b[0m\r\n");
-        }
-        if plan.extra_scroll > 0 {
-            queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
-            buf.extend(std::iter::repeat_n(b'\n', plan.extra_scroll as usize));
-        }
+        let (buf, plan) = render_insert(self.top, self.block_h, self.rows, &phys)?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
         let moved = plan.new_top != self.top;
@@ -180,14 +164,23 @@ impl Screen {
         editor_rows: u16,
         status_rows: u16,
     ) -> io::Result<()> {
+        let old_top = self.top;
         self.cols = cols.max(1);
         self.rows = rows.max(1);
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
         self.block_h = new_h;
         self.status_rows = status_rows;
         self.top = self.rows - new_h;
+        // Erase from the topmost of the OLD and new block tops, not just the new
+        // one (#4). Both blocks are bottom-anchored — each occupies
+        // `[top, rows)` — so clearing from `min(old_top, new_top)` down wipes the
+        // old cockpit region too. Without it a grown terminal (new top below the
+        // old) leaves the previous status/editor/tab-bar rows stranded above the
+        // new block. Nothing but block chrome ever sits below that row, so no
+        // transcript is lost.
+        let erase_from = resize_erase_from(old_top, self.top, self.rows);
         let mut buf = Vec::new();
-        queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
+        queue!(buf, MoveTo(0, erase_from), Clear(ClearType::FromCursorDown))?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
         self.rebuild_term()
@@ -275,13 +268,88 @@ struct InsertPlan {
     new_top: u16,
 }
 
+/// Build the exact byte sequence that lays `phys` finished rows into the
+/// transcript above a block at `top`, plus where the block lands. Pure so the
+/// scroll bytes can be pinned without a terminal.
+///
+/// **Rows are separated by `\r\n`, never terminated by one (#2).** A trailing
+/// `\r\n` after the last row, once that row already sits on the bottom line,
+/// costs one extra bottom-row scroll — which pushes the just-written rows up
+/// and opens a blank gap between the transcript and the block. The block is
+/// repositioned solely by `plan.extra_scroll` line feeds at the bottom row, and
+/// [`plan_insert`] already accounts for the writing that happens without that
+/// stray terminator.
+fn render_insert(
+    top: u16,
+    block_h: u16,
+    rows: u16,
+    phys: &[Row],
+) -> io::Result<(Vec<u8>, InsertPlan)> {
+    let k = phys.len() as u16;
+    let plan = plan_insert(top, block_h, rows, k);
+    let mut buf = Vec::with_capacity(phys.iter().map(Vec::len).sum::<usize>() + 64);
+    queue!(buf, MoveTo(0, top), Clear(ClearType::FromCursorDown))?;
+    for (i, row) in phys.iter().enumerate() {
+        if i > 0 {
+            // Between rows, not after the last one.
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf.extend_from_slice(row);
+        // A reset per row: styling from the transcript must never leak into the
+        // next row, into a scrolled-in blank line, or into the block.
+        buf.extend_from_slice(b"\x1b[0m");
+    }
+    if plan.extra_scroll > 0 {
+        queue!(buf, MoveTo(0, rows.saturating_sub(1)))?;
+        buf.extend(std::iter::repeat_n(b'\n', plan.extra_scroll as usize));
+    }
+    Ok((buf, plan))
+}
+
+/// Emit the mode restores `open` must undo — line wrap back on, bracketed
+/// paste off, cursor shown — to `w`. Split from [`restore_terminal_modes`] so
+/// the exact sequence is unit-testable against a buffer (`io::stdout` is
+/// captured by the test harness and cannot be read back).
+fn write_mode_restores(w: &mut impl io::Write) -> io::Result<()> {
+    // Queue into an owned buffer (the exact idiom `Screen::shutdown` uses),
+    // then write it — so this composes over any `Write`, `io::stdout()` or a
+    // test's `Vec`, without depending on the macro's reborrow of a `&mut`.
+    let mut buf = Vec::new();
+    queue!(
+        buf,
+        EnableLineWrap,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show
+    )?;
+    w.write_all(&buf)
+}
+
+/// Put the terminal modes `open` took back: raw mode off, then the sequence
+/// above written to `io::stdout()` — the real terminal once the capture has
+/// dropped. This is the body of the session's [`RestoreOnDrop`] guard, named so
+/// it has one definition the guard and the test share. Errors are swallowed:
+/// a Drop path cannot propagate, and a best-effort restore beats none.
+fn restore_terminal_modes() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = write_mode_restores(&mut io::stdout());
+}
+
+/// The row `resize` clears downward from so the OLD cockpit region cannot
+/// survive above the new block (#4). Both blocks are bottom-anchored, so the
+/// topmost of the two tops covers both regions; clamped into the (possibly
+/// smaller) new screen.
+fn resize_erase_from(old_top: u16, new_top: u16, rows: u16) -> u16 {
+    old_top.min(new_top).min(rows.saturating_sub(1))
+}
+
 /// Pure geometry — the part of `insert_rows` that must be exactly right and
 /// can be pinned without a terminal.
 ///
-/// Rows are written from `top`; each `\r\n` at the last screen row scrolls
-/// by one. Afterwards the last written row sits at `min(top+k-1, rows-1)`;
-/// the block wants to start right after it, but no lower than
-/// `rows - block_h`, so whatever overshoot there is becomes extra scroll.
+/// Rows are written from `top` as `\r\n`-separated lines; a `\r\n` issued while
+/// on the last screen row scrolls by one. Afterwards the last written row sits
+/// at `min(top+k-1, rows-1)`; the block wants to start right after it, but no
+/// lower than `rows - block_h`, so whatever overshoot there is becomes extra
+/// scroll.
 fn plan_insert(top: u16, block_h: u16, rows: u16, k: u16) -> InsertPlan {
     let last_row = (top as u32 + k as u32 - 1).min(rows.saturating_sub(1) as u32) as u16;
     let floor = rows.saturating_sub(block_h);
@@ -343,6 +411,16 @@ pub(crate) struct Presenter {
     was_suspended: bool,
     dirty: bool,
     last_draw: Instant,
+    /// Restores the terminal modes `open` took — raw mode, line wrap, bracketed
+    /// paste, cursor visibility — on EVERY exit of the session: a clean return,
+    /// an `io::Error` propagating out of `run`, or a panic (via Drop during
+    /// unwind, the crate's `MouseCaptureGuard` precedent). `Screen::shutdown`
+    /// still does the visible teardown on the clean path, but the MODES are this
+    /// guard's job so a `?` or panic before `shutdown` cannot strand the terminal
+    /// raw / no-wrap / paste-on. Declared LAST so it drops AFTER `capture`, i.e.
+    /// once fd 1 is back on the real terminal, letting its `execute!` land there
+    /// rather than in the pty. Reuses `RestoreOnDrop` (#1411 convention).
+    _restore: crate::RestoreOnDrop<fn()>,
 }
 
 /// The cockpit does not paint through the arbiter — its rows are on the real
@@ -395,6 +473,19 @@ impl Presenter {
             crossterm::event::EnableBracketedPaste,
             DisableLineWrap
         )?;
+        // The terminal's modes are now taken. Bind their restore the instant
+        // after — and crucially BEFORE the fallible capture install below — so
+        // that no `?`, error, or panic between here and a clean `shutdown` can
+        // leave the terminal raw, wrap off, bracketed paste on, cursor hidden.
+        // The bug is made unrepresentable, not fixed per-path (#1411): the
+        // terminal cannot be taken without binding something that gives it back.
+        // Non-capturing closure → `fn()`. It writes to `io::stdout()`, which is
+        // the pty while the capture is installed and the real terminal again
+        // once `capture` has dropped — and this guard is the last-declared field,
+        // so it always drops after `capture`.
+        let restore: crate::RestoreOnDrop<fn()> = crate::RestoreOnDrop {
+            restore: restore_terminal_modes,
+        };
         let capture = PtyCapture::install(cols, rows)?;
         let tty = capture.tty().try_clone()?;
         let backend = CrosstermBackend::new(tty.try_clone()?);
@@ -432,6 +523,7 @@ impl Presenter {
             was_suspended: false,
             dirty: true,
             last_draw: Instant::now(),
+            _restore: restore,
         })
     }
 
@@ -799,6 +891,75 @@ mod tests {
                 new_top: 20
             }
         );
+    }
+
+    fn crlf_count(buf: &[u8]) -> usize {
+        buf.windows(2).filter(|w| *w == b"\r\n").count()
+    }
+
+    /// #2 regression: with the block at the bottom, inserting `k` rows must emit
+    /// exactly `k-1` `\r\n` separators and NO trailing line feed — the old
+    /// per-row terminator scrolled the bottom row one extra time at
+    /// `k == block_h` (and above), opening a blank gap over the block. Covers
+    /// the boundary (`block_h`), one past it (`block_h + 1`), and a large burst.
+    #[test]
+    fn insert_at_the_bottom_emits_no_trailing_line_feed() {
+        for k in [4usize, 5, 40] {
+            let phys: Vec<Row> = (0..k).map(|i| format!("row {i}").into_bytes()).collect();
+            let (buf, plan) = render_insert(20, 4, 24, &phys).unwrap();
+            assert_eq!(
+                crlf_count(&buf),
+                k - 1,
+                "k={k}: rows are separated by \\r\\n, never terminated by one"
+            );
+            assert!(
+                !buf.ends_with(b"\r\n"),
+                "k={k}: the buffer must not end on a line feed"
+            );
+            assert_eq!(plan.new_top, 20, "k={k}: the block stays bottom-anchored");
+        }
+    }
+
+    /// Below the fold there is no scroll at all: the buffer ends on a style
+    /// reset (the last row), not a line feed, and the block moves down by `k`.
+    #[test]
+    fn insert_below_the_fold_ends_on_a_reset_not_a_line_feed() {
+        let phys: Vec<Row> = (0..3).map(|i| format!("r{i}").into_bytes()).collect();
+        let (buf, plan) = render_insert(5, 4, 24, &phys).unwrap();
+        assert_eq!(plan.extra_scroll, 0);
+        assert_eq!(plan.new_top, 8);
+        assert_eq!(crlf_count(&buf), 2);
+        assert!(buf.ends_with(b"\x1b[0m"), "last row ends on a reset, no LF");
+    }
+
+    /// #1: the guard's restore sequence re-enables line wrap, disables bracketed
+    /// paste, and shows the cursor — the output-side modes `open` took. The
+    /// "runs on every exit path" property (the actual defect class) is proven by
+    /// the crate's `splash_guard_tests`, which drive this same `RestoreOnDrop`;
+    /// this pins the bytes the cockpit's guard emits. Asserted against a buffer
+    /// because `io::stdout` is captured by the harness.
+    #[test]
+    fn the_mode_restores_re_enable_wrap_disable_paste_and_show_the_cursor() {
+        let mut buf = Vec::new();
+        write_mode_restores(&mut buf).unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("?7h"), "line wrap re-enabled: {s:?}");
+        assert!(s.contains("?2004l"), "bracketed paste disabled: {s:?}");
+        assert!(s.contains("?25h"), "cursor shown: {s:?}");
+    }
+
+    /// #4: `resize` clears from the higher of the old and new block tops, so the
+    /// old cockpit region can't be stranded above a lower new block.
+    #[test]
+    fn resize_erases_from_the_higher_of_the_old_and_new_block_tops() {
+        // Terminal grew 24->30, block 4: old top 20, new top 26 — clear from 20.
+        assert_eq!(resize_erase_from(20, 26, 30), 20);
+        // Block grew taller on the same screen: old top 20, new top 12.
+        assert_eq!(resize_erase_from(20, 12, 24), 12);
+        // Screen shrank 24->10: the old top is off-screen; clamp to the new top.
+        assert_eq!(resize_erase_from(20, 6, 10), 6);
+        // Unchanged geometry clears from the shared top.
+        assert_eq!(resize_erase_from(20, 20, 24), 20);
     }
 
     #[test]

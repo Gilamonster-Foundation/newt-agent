@@ -5,8 +5,10 @@
 //! question, a tracing `WARN`. This module is the ONE place that decides what
 //! is a finished line (goes into scrollback above the cockpit), what is the
 //! in-progress row (shown as the cockpit's status row), and what must be
-//! forwarded to the real terminal untouched (a mode switch such as mouse
-//! capture or bracketed paste — meaningless to a line, meaningful to the tty).
+//! forwarded to the real terminal untouched (an allowlisted mouse-tracking
+//! mode — meaningful to the tty; see [`private_mode_forwarded`]). Bracketed
+//! paste, the alternate screen, cursor show/hide and autowrap belong to the
+//! presenter, so a child or tool cannot toggle them through this gate.
 //!
 //! It is a scanner over the sequences *newt itself emits* (crossterm output),
 //! not a VT emulator. Cursor motion is dropped on purpose: under the cockpit
@@ -30,7 +32,8 @@ enum Token {
     EraseInLine(u8),
     /// `ESC[nG` — 1-based column.
     MoveToColumn(usize),
-    /// `ESC[?…h` / `ESC[?…l` — DEC private mode set/reset. Forwarded verbatim.
+    /// `ESC[?…h` / `ESC[?…l` — an allowlisted (mouse-tracking) DEC private mode,
+    /// forwarded verbatim. Presenter-owned modes never become this token.
     PrivateMode(Vec<u8>),
     /// Anything else the scanner could delimit — dropped.
     Other,
@@ -86,8 +89,32 @@ fn scan(bytes: &[u8]) -> (Vec<Token>, Vec<u8>) {
             }
         }
     }
+    // Hold back an incomplete trailing UTF-8 sequence, exactly as the escape
+    // scanner holds back an incomplete `ESC[`: a multibyte char split across a
+    // chunk boundary (a spinner glyph, CJK, a combining mark) must not be
+    // tokenised as two partial `Text` runs, or its width is mis-measured and it
+    // decodes to replacement characters. What remains in `text` is all complete
+    // chars; the carried tail is prepended to the next chunk by `feed`.
+    let carry = split_incomplete_utf8(&mut text);
     flush_text(&mut text, &mut out);
-    (out, Vec::new())
+    (out, carry)
+}
+
+/// Split off any trailing bytes of `text` that begin — but do not complete — a
+/// UTF-8 character, returning them to be carried into the next chunk. A
+/// genuinely invalid sequence in the interior is left in place for lossy
+/// decoding; only a truncation at the very end is held back.
+fn split_incomplete_utf8(text: &mut Vec<u8>) -> Vec<u8> {
+    match std::str::from_utf8(text) {
+        Ok(_) => Vec::new(),
+        // `error_len() == None` is std's signal for "valid so far, but the
+        // input ended mid-character" — precisely the chunk-boundary split. The
+        // incomplete bytes start at `valid_up_to`.
+        Err(e) if e.error_len().is_none() => text.split_off(e.valid_up_to()),
+        // A real encoding error (`Some(len)`) is not a boundary artefact; leave
+        // it for `from_utf8_lossy` to replace so we still make progress.
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Delimit one escape sequence starting at `bytes[0] == ESC`. Returns the
@@ -115,7 +142,18 @@ fn scan_escape(bytes: &[u8]) -> Option<(Token, usize)> {
                 b'm' => Token::Sgr(seq.to_vec()),
                 b'K' => Token::EraseInLine(first_param(params).unwrap_or(0) as u8),
                 b'G' => Token::MoveToColumn(first_param(params).unwrap_or(1).max(1)),
-                b'h' | b'l' if params.first() == Some(&b'?') => Token::PrivateMode(seq.to_vec()),
+                // A DEC private mode. Forward ONLY the allowlisted mouse family
+                // to the real terminal; drop everything else so a child or tool
+                // printing to the pty cannot switch the alternate screen, hide
+                // the cursor, retoggle bracketed paste, or disable autowrap —
+                // all state the presenter owns (#3). `params[1..]` skips the `?`.
+                b'h' | b'l' if params.first() == Some(&b'?') => {
+                    if private_mode_forwarded(&params[1..]) {
+                        Token::PrivateMode(seq.to_vec())
+                    } else {
+                        Token::Other
+                    }
+                }
                 _ => Token::Other,
             };
             Some((tok, j + 1))
@@ -150,6 +188,38 @@ fn first_param(params: &[u8]) -> Option<usize> {
         return None;
     }
     std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
+/// DEC private modes the cockpit forwards from the session's pty to the real
+/// terminal — the mouse-tracking family and its coordinate encodings only.
+/// These change what the terminal DELIVERS to stdin (input side); they touch
+/// none of the presenter-owned OUTPUT state. Deliberately excluded, and dropped
+/// by [`private_mode_forwarded`]: alternate screen (47 / 1047 / 1048 / 1049),
+/// cursor visibility (25), bracketed paste (2004), autowrap (7), and every
+/// other unlisted mode — the presenter owns each of those and a child/tool must
+/// not be able to move them out from under it.
+const FORWARDED_PRIVATE_MODES: &[u16] = &[1000, 1002, 1003, 1005, 1006, 1015, 1016];
+
+/// Whether a DEC private-mode parameter list — the bytes between `?` and the
+/// final `h`/`l` — may be forwarded. True only when it is non-empty and EVERY
+/// `;`-separated parameter is allowlisted; an empty, mixed, or unparseable set
+/// is dropped whole. Default-deny is the safe posture here (the module's own
+/// doctrine: "forwarding is the dangerous default").
+fn private_mode_forwarded(params: &[u8]) -> bool {
+    let mut any = false;
+    for part in params.split(|&b| b == b';') {
+        any = true;
+        let Ok(text) = std::str::from_utf8(part) else {
+            return false;
+        };
+        let Ok(mode) = text.parse::<u16>() else {
+            return false;
+        };
+        if !FORWARDED_PRIVATE_MODES.contains(&mode) {
+            return false;
+        }
+    }
+    any
 }
 
 /// One row of styled bytes with no `\n`/`\r` and no cursor motion — safe to
@@ -402,14 +472,56 @@ mod tests {
         assert_eq!(visible_width(b"\x1b[1mab\x1b[0m"), 2);
     }
 
-    /// DEC private modes (mouse capture, bracketed paste) are for the real
+    /// Allowlisted DEC private modes (the mouse family) are for the real
     /// terminal, not for a line: forwarded verbatim, never in a row.
     #[test]
-    fn private_modes_pass_through_and_leave_no_trace_in_rows() {
+    fn allowlisted_private_modes_pass_through_and_leave_no_trace_in_rows() {
         let mut s = TranscriptStream::new();
         let d = s.feed(b"\x1b[?1000h\x1b[?1006hhello\n\x1b[?1000l");
         assert_eq!(d.passthrough, b"\x1b[?1000h\x1b[?1006h\x1b[?1000l");
         assert_eq!(d.lines, vec![b"hello".to_vec()]);
+    }
+
+    /// #3 hardening: presenter-owned modes from child/tool output are DROPPED,
+    /// never forwarded — a tool cannot switch the alternate screen, hide the
+    /// cursor, retoggle bracketed paste, or disable autowrap under the cockpit.
+    #[test]
+    fn presenter_owned_private_modes_are_dropped_not_forwarded() {
+        let mut s = TranscriptStream::new();
+        let d = s.feed(b"\x1b[?1049h\x1b[?25l\x1b[?2004l\x1b[?7lhi\n\x1b[?1049l\x1b[?25h\x1b[?7h");
+        assert!(
+            d.passthrough.is_empty(),
+            "alt-screen/cursor/paste/wrap must never reach the terminal: {:?}",
+            d.passthrough
+        );
+        assert_eq!(d.lines, vec![b"hi".to_vec()], "text between them survives");
+    }
+
+    /// The mouse-tracking family — single and `;`-combined, enable and disable —
+    /// is the one allowlisted family, so newt's own capture and an interactive
+    /// child tool keep working.
+    #[test]
+    fn mouse_tracking_private_modes_are_forwarded() {
+        let mut s = TranscriptStream::new();
+        let d = s.feed(b"\x1b[?1000h\x1b[?1002;1003;1006h\x1b[?1000;1006l");
+        assert_eq!(
+            d.passthrough,
+            b"\x1b[?1000h\x1b[?1002;1003;1006h\x1b[?1000;1006l",
+        );
+    }
+
+    /// Default-deny: a mouse mode paired with a presenter-owned one in one `;`
+    /// set is dropped whole, not partially applied.
+    #[test]
+    fn a_mixed_private_mode_set_is_dropped_whole() {
+        let mut s = TranscriptStream::new();
+        let d = s.feed(b"\x1b[?1000;25hx\n");
+        assert!(
+            d.passthrough.is_empty(),
+            "1000 is allowlisted but 25 is not — deny the set: {:?}",
+            d.passthrough
+        );
+        assert_eq!(d.lines, vec![b"x".to_vec()]);
     }
 
     /// Cursor motion is DROPPED, not forwarded — forwarding would move the
@@ -447,6 +559,58 @@ mod tests {
         );
         let d2 = s.feed(b"8;5;1mb\n");
         assert_eq!(d2.lines, vec![b"a\x1b[38;5;1mb".to_vec()]);
+    }
+
+    /// #5: a multibyte glyph split across a chunk boundary is reassembled, not
+    /// mangled into replacement characters. The braille spinner frame `⠋` (E2
+    /// A0 8B) arrives two bytes then one.
+    #[test]
+    fn a_spinner_glyph_split_across_chunks_is_reassembled_not_mangled() {
+        let mut s = TranscriptStream::new();
+        let d1 = s.feed(b"\r\x1b[K\xe2\xa0");
+        assert!(d1.lines.is_empty());
+        assert_eq!(s.partial(), b"", "the half glyph is held back, not shown");
+        s.feed(b"\x8b thinking");
+        let partial = String::from_utf8_lossy(s.partial());
+        assert_eq!(partial, "⠋ thinking", "reassembled cleanly");
+        assert!(
+            !partial.contains('\u{fffd}'),
+            "no replacement char: {partial:?}"
+        );
+    }
+
+    /// #5: a wide CJK char split across chunks keeps its width and its bytes.
+    #[test]
+    fn a_cjk_char_split_across_chunks_keeps_its_width() {
+        let mut s = TranscriptStream::new();
+        s.feed(b"ab\xe4\xb8"); // "ab" + first two bytes of 世 (E4 B8 96)
+        assert_eq!(
+            s.partial(),
+            b"ab",
+            "the half CJK char is not in the row yet"
+        );
+        let d = s.feed(b"\x96 world\n");
+        assert_eq!(d.lines, vec!["ab世 world".as_bytes().to_vec()]);
+        assert_eq!(
+            visible_width(&d.lines[0]),
+            2 + 2 + 6,
+            "ab + 世(2) + ' world'"
+        );
+    }
+
+    /// #5: a combining mark split from its base still measures zero width once
+    /// reattached — the split does not inflate the column count.
+    #[test]
+    fn a_combining_mark_split_from_its_base_stays_zero_width() {
+        let mut s = TranscriptStream::new();
+        s.feed(b"e\xcc"); // 'e' + first byte of the combining acute (CC 81)
+        let d = s.feed(b"\x81\n");
+        assert_eq!(d.lines, vec!["e\u{301}".as_bytes().to_vec()]);
+        assert_eq!(
+            visible_width(&d.lines[0]),
+            1,
+            "base + combining is one cell"
+        );
     }
 
     #[test]

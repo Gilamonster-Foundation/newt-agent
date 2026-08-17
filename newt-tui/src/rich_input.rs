@@ -1116,10 +1116,17 @@ impl RichSurface {
         history
     }
 
+    /// The editor mode, for the cockpit's persistently-mounted editor. The
+    /// classic per-turn `event_loop` reads `self.edit` directly, so this
+    /// accessor exists only for the unix cockpit — hence the `cfg`, without
+    /// which it is dead code on the Windows (classic-only) build.
+    #[cfg(unix)]
     pub(crate) fn edit(&self) -> Edit {
         self.edit
     }
 
+    /// The gutter setting, for the cockpit (see [`RichSurface::edit`]).
+    #[cfg(unix)]
     pub(crate) fn gutter(&self) -> Option<u16> {
         self.gutter
     }
@@ -1129,7 +1136,11 @@ impl RichSurface {
         self.pending_end_quit.set(true);
     }
 
-    /// Consume the armed `:wq` (see `arm_end_quit`).
+    /// Consume the armed `:wq` (see `arm_end_quit`). The cockpit's `ReadLine`
+    /// handler checks this between turns; the classic surface consumes
+    /// `pending_end_quit` inline in its own `read`, so this accessor is
+    /// cockpit-only and would be dead code on the Windows classic-only build.
+    #[cfg(unix)]
     pub(crate) fn take_end_quit(&self) -> bool {
         self.pending_end_quit.replace(false)
     }
@@ -1301,13 +1312,20 @@ impl MountedEditor {
     }
 
     /// Replace the history (a `/vi`·`/emacs` reload rebuilds the editor; the
-    /// cockpit refreshes after each `add_history`).
+    /// cockpit refreshes after each `add_history`). Only the cockpit keeps an
+    /// editor mounted long enough to mutate its history in place — the classic
+    /// loop rebuilds per turn — so this is `cfg(unix)` to stay off the dead-code
+    /// list on the Windows classic-only build.
+    #[cfg(unix)]
     pub(crate) fn set_history(&mut self, history: Vec<String>) {
         self.hist_pos = history.len();
         self.history = history;
     }
 
     /// The current draft, for a driver that must keep it across a rebuild.
+    /// Cockpit-only (the classic loop never rebuilds a live editor); see
+    /// [`MountedEditor::set_history`].
+    #[cfg(unix)]
     pub(crate) fn draft(&self) -> String {
         self.textarea.lines().join("\n")
     }

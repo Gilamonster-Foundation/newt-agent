@@ -15,10 +15,18 @@
 //! their answer, and the bytes still come to us. Children of `run_command`
 //! that inherit fd 1 see a terminal too, exactly as they do today.
 //!
+//! **fd 2 is captured only when it is itself a terminal.** fd 1 is always the
+//! presenter's to take — the cockpit opens only when stdout is a tty. But
+//! stderr may have been redirected (`newt 2>log`, a pipe): swinging *that* onto
+//! the pty would divert into the presenter the very bytes the operator pointed
+//! at their file, and a child inheriting fd 2 would lose the redirection too.
+//! So we redirect fd 2 only if `isatty(2)`; otherwise it is left exactly as it
+//! was and stderr keeps flowing to its original destination.
+//!
 //! The real terminal survives as a `dup` of the original fd 1, which is the
-//! ONLY writer the presenter uses. `Drop` puts fd 1/2 back — on the normal
-//! exit and on a panic — so the process never ends with its stdout still
-//! pointed at a pty nobody is draining.
+//! ONLY writer the presenter uses. `Drop` puts fd 1 back — and fd 2 too when it
+//! was captured — on the normal exit and on a panic, so the process never ends
+//! with its stdout still pointed at a pty nobody is draining.
 
 use std::fs::File;
 use std::io;
@@ -31,8 +39,10 @@ pub(crate) struct PtyCapture {
     /// The real terminal (a `dup` of the original fd 1). The presenter's one
     /// and only writer.
     tty: File,
-    /// The original fd 2, restored on drop alongside fd 1.
-    saved_err: RawFd,
+    /// The original fd 2, restored on drop alongside fd 1 — but only present
+    /// when fd 2 was itself a terminal and we redirected it onto the slave.
+    /// `None` when stderr was pointed elsewhere and left untouched.
+    saved_err: Option<RawFd>,
 }
 
 impl PtyCapture {
@@ -64,9 +74,15 @@ impl PtyCapture {
                 tio.c_lflag &= !libc::ECHO;
                 let _ = libc::tcsetattr(slave, libc::TCSANOW, &tio);
             }
+            // fd 1 is always ours (the cockpit opens only when stdout is a
+            // terminal). fd 2 is captured ONLY when it is a terminal too:
+            // hijacking a redirected stderr (`newt 2>log`, a pipe) onto the pty
+            // would swallow the bytes the operator aimed at that destination.
+            // When it is not a tty we never dup or dup2 it — it stays put.
+            let capture_err = libc::isatty(2) == 1;
             let saved_out = libc::dup(1);
-            let saved_err = libc::dup(2);
-            if saved_out < 0 || saved_err < 0 {
+            let saved_err = if capture_err { libc::dup(2) } else { -1 };
+            if saved_out < 0 || (capture_err && saved_err < 0) {
                 let err = io::Error::last_os_error();
                 libc::close(master);
                 libc::close(slave);
@@ -80,11 +96,24 @@ impl PtyCapture {
             }
             // The saved terminal and the master must not leak into children.
             libc::fcntl(saved_out, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(saved_err, libc::F_SETFD, libc::FD_CLOEXEC);
+            if capture_err {
+                libc::fcntl(saved_err, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
             libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
-            if libc::dup2(slave, 1) < 0 || libc::dup2(slave, 2) < 0 {
+            if libc::dup2(slave, 1) < 0 {
                 let err = io::Error::last_os_error();
-                // Undo whichever half landed.
+                libc::dup2(saved_out, 1);
+                libc::close(master);
+                libc::close(slave);
+                libc::close(saved_out);
+                if saved_err >= 0 {
+                    libc::close(saved_err);
+                }
+                return Err(err);
+            }
+            if capture_err && libc::dup2(slave, 2) < 0 {
+                let err = io::Error::last_os_error();
+                // Undo the fd 1 half we just landed, then fd 2.
                 libc::dup2(saved_out, 1);
                 libc::dup2(saved_err, 2);
                 libc::close(master);
@@ -97,7 +126,7 @@ impl PtyCapture {
             Ok(Self {
                 master: File::from_raw_fd(master),
                 tty: File::from_raw_fd(saved_out),
-                saved_err,
+                saved_err: capture_err.then_some(saved_err),
             })
         }
     }
@@ -146,11 +175,15 @@ impl PtyCapture {
 impl Drop for PtyCapture {
     fn drop(&mut self) {
         // SAFETY: restoring the descriptors this capture displaced. `tty`
-        // (saved_out) is closed by its own File drop after this body.
+        // (saved_out) is closed by its own File drop after this body. fd 2 is
+        // put back only when it was captured; a redirected stderr was never
+        // touched, so there is nothing to restore.
         unsafe {
             libc::dup2(self.tty.as_raw_fd(), 1);
-            libc::dup2(self.saved_err, 2);
-            libc::close(self.saved_err);
+            if let Some(saved_err) = self.saved_err {
+                libc::dup2(saved_err, 2);
+                libc::close(saved_err);
+            }
         }
     }
 }
@@ -206,15 +239,90 @@ mod tests {
         out
     }
 
+    /// Point `fd` at `target` for the length of a test, putting the original
+    /// back on drop — lets a test choose whether stderr is a terminal or a pipe.
+    struct RedirectFd {
+        fd: RawFd,
+        saved: RawFd,
+    }
+
+    impl RedirectFd {
+        fn to(fd: RawFd, target: RawFd) -> Self {
+            // SAFETY: dup/dup2 on descriptors the test owns; restored in Drop.
+            unsafe {
+                let saved = libc::dup(fd);
+                assert!(saved >= 0, "dup of fd {fd}");
+                assert!(libc::dup2(target, fd) >= 0, "dup2 onto fd {fd}");
+                Self { fd, saved }
+            }
+        }
+    }
+
+    impl Drop for RedirectFd {
+        fn drop(&mut self) {
+            // SAFETY: putting the descriptor back and closing the save.
+            unsafe {
+                libc::dup2(self.saved, self.fd);
+                libc::close(self.saved);
+            }
+        }
+    }
+
+    /// A bare pty pair the test opens to make some fd a terminal.
+    struct TestPty {
+        master: RawFd,
+        slave: RawFd,
+    }
+
+    impl TestPty {
+        fn open() -> Self {
+            // SAFETY: openpty into locals we own; closed in Drop.
+            unsafe {
+                let (mut master, mut slave) = (-1, -1);
+                assert_eq!(
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    ),
+                    0,
+                    "openpty for the test's own terminal"
+                );
+                Self { master, slave }
+            }
+        }
+    }
+
+    impl Drop for TestPty {
+        fn drop(&mut self) {
+            // SAFETY: closing the pair we opened.
+            unsafe {
+                libc::close(self.master);
+                libc::close(self.slave);
+            }
+        }
+    }
+
     /// Ground truth for the whole cockpit: after `install`, a write to FD 1
     /// (not `println!`, which the test harness captures) comes out of the
     /// master byte-for-byte — no ONLCR translation — and fd 1/2 are put back
-    /// on drop. Real pty, real descriptors: the property is about the
-    /// process's own fds and no mock can stand in for that. Serial because
-    /// fd 1 is process-global.
+    /// on drop. fd 2 is made a terminal of the test's own so the capture branch
+    /// is exercised whatever the harness did with stderr. Real pty, real
+    /// descriptors: the property is about the process's own fds and no mock can
+    /// stand in for that. Serial because fd 1 is process-global.
     #[serial_test::serial(tty_arbiter)]
     #[test]
-    fn install_captures_fd1_and_fd2_verbatim_and_drop_restores_them() {
+    fn install_captures_fd1_and_a_terminal_fd2_verbatim_and_drop_restores_them() {
+        let err_pty = TestPty::open();
+        let _err = RedirectFd::to(2, err_pty.slave);
+        // SAFETY: isatty on fd 2, now our pty slave.
+        assert_eq!(
+            unsafe { libc::isatty(2) },
+            1,
+            "precondition: stderr is a tty"
+        );
         let before_out = inode(1);
         let before_err = inode(2);
         {
@@ -232,6 +340,74 @@ mod tests {
         }
         assert_eq!(inode(1), before_out, "fd 1 restored on drop");
         assert_eq!(inode(2), before_err, "fd 2 restored on drop");
+    }
+
+    /// #6 regression: a redirected stderr (`newt 2>log`) must NOT be hijacked
+    /// onto the pty. When fd 2 is not a terminal, `install` leaves it exactly
+    /// where it was, so stderr bytes still reach that destination (a pipe here)
+    /// and never leak into the presenter's scrollback. Grounds the mock belief
+    /// that the cockpit preserves fd-2 redirection topology.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn install_leaves_a_redirected_stderr_untouched() {
+        // A pipe stands in for `2>log`: a non-terminal stderr.
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe() fills a 2-int array we own.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe()");
+        let (pipe_r, pipe_w) = (fds[0], fds[1]);
+        let _err = RedirectFd::to(2, pipe_w);
+        // SAFETY: isatty on fd 2, now the pipe write end.
+        assert_eq!(
+            unsafe { libc::isatty(2) },
+            0,
+            "precondition: stderr is a pipe"
+        );
+        let before_err = inode(2);
+        {
+            let cap = PtyCapture::install(80, 24).expect("openpty");
+            // SAFETY: isatty on fd 1.
+            assert_eq!(unsafe { libc::isatty(1) }, 1, "fd 1 is still captured");
+            assert_eq!(
+                inode(2),
+                before_err,
+                "the redirected stderr was left in place"
+            );
+            assert_ne!(
+                inode(1),
+                inode(2),
+                "fd 2 did not join fd 1 on the pty slave"
+            );
+            // A write to fd 2 reaches the pipe, not the presenter's master.
+            write_fd(2, b"to the file\n");
+            let mut buf = [0u8; 64];
+            // SAFETY: read from the pipe's read end into a buffer we own.
+            let n = unsafe { libc::read(pipe_r, buf.as_mut_ptr().cast(), buf.len()) };
+            assert!(n > 0, "the stderr byte should have reached the pipe");
+            assert_eq!(&buf[..n as usize], b"to the file\n", "verbatim to the pipe");
+            // A stdout marker proves the master is alive and lets `drain` return
+            // promptly; the stderr bytes must be absent from it.
+            write_fd(1, b"stdout-marker\n");
+            let got = drain(&cap);
+            let got = String::from_utf8_lossy(&got);
+            assert!(
+                got.contains("stdout-marker"),
+                "stdout still captured: {got:?}"
+            );
+            assert!(
+                !got.contains("to the file"),
+                "redirected stderr must not leak to the pty: {got:?}"
+            );
+        }
+        assert_eq!(
+            inode(2),
+            before_err,
+            "fd 2 never moved — nothing to restore"
+        );
+        // SAFETY: closing the pipe ends the test opened.
+        unsafe {
+            libc::close(pipe_r);
+            libc::close(pipe_w);
+        }
     }
 
     #[serial_test::serial(tty_arbiter)]
