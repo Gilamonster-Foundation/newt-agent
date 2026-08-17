@@ -11,6 +11,23 @@ Long-term it's also the **drake-swarm training ground** — every PR
 review here will be done by an arbiter LLM voting against a real CI
 gate. The gates must be honest. Do not game them.
 
+**newt-agent is transitional** — see
+`docs/decisions/agent_family_inheritance.md`. The agent family descends
+**wyvern-agent → newt-agent → gilamonster-agent**, complexity increasing;
+wyvern is the base (barest working harness, OCAP, no real TUI — a near-pure
+scroller whose lines read correctly under `journalctl`) and gilamonster is
+everything-and-the-kitchen-sink with OCAP off by default. Aspirationally
+wyvern ends up a **rewrite of newt-agent — lighter, faster, smaller** — and
+the others inherit from it, at which point newt-agent's crates are retired in
+favour of rewrites.
+
+The practical consequence for work here: **contracts survive a rewrite,
+implementations do not.** Wire types, identity, ownership/provenance chains,
+data formats and capability vocabulary are the highest-leverage things to get
+right; de-duplicating an implementation pays back twice downstream; surface
+polish a descendant will rewrite is worth less. This makes the three Cs and
+the reuse discipline below *more* load-bearing, not less.
+
 ## Architectural style — the three Cs
 
 > Canonical home: the line's craft doctrine is the **Craft Register** —
