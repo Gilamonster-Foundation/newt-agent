@@ -2244,6 +2244,10 @@ fn session_body(
             // confirmed successful `eng.*` call, and the loop drains it below
             // to clear the ledger ONLY on a real Newt commit (not a `HEAD` diff).
             commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
+            // #1709 family: the contributor-consumption cursor — starts at 0,
+            // reset to 0 at the top of every loop iteration (below) when the
+            // envelope is refreshed from the live model + ledger snapshot.
+            contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
         })
     };
 
@@ -2285,6 +2289,18 @@ fn session_body(
             // that consumed them.
             ca.contributors = attribution_ledger.borrow().contributors().to_vec();
             tool.attribution = Some(ca);
+            // #1709 family: reset the contributor-consumption cursor to 0. The
+            // envelope above is a FRESH snapshot of the ledger taken at this
+            // loop-top, so none of its contributors have been consumed yet by
+            // a commit in THIS lifecycle. The cursor advances past credited
+            // contributors at each confirmed commit boundary (inside the git
+            // tool's `commit`/`amend`/`rebase` arms), so a second commit in
+            // the same turn re-credits nobody from the first. Resetting here
+            // means a new turn starts unconsumed even if the prior turn left
+            // the cursor advanced (e.g. it committed but the end-of-turn
+            // drain ran before this refresh).
+            tool.contributors_consumed
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
         // #1668: the ONE preference-pin persistence site. Every operator
         // posture ACTION marked since the last pass — a successful
@@ -6981,18 +6997,20 @@ fn session_body(
                         .map_or(0, |t| t.drain_commit_success());
                     if new_commits > 0 {
                         attribution_ledger.borrow_mut().clear();
-                        // #1707/#1709 semantic B: the envelope's `contributors`
-                        // snapshot was stamped at the top of this loop; a
-                        // successful commit consumed it, so drop it too —
-                        // otherwise a SECOND commit in the same turn (before
-                        // the next loop-top refresh) would re-credit the
-                        // already-committed contributors. The next refresh
-                        // re-snapshots the now-empty ledger.
-                        if let Some(tool) = session_git_tool.as_mut() {
-                            if let Some(ca) = tool.attribution.as_mut() {
-                                ca.contributors.clear();
-                            }
-                        }
+                        // #1707/#1709 semantic B: the contributor SNAPSHOT on
+                        // the envelope is now consumed AT THE COMMIT BOUNDARY
+                        // (the git tool's `commit`/`amend`/`rebase` arms advance
+                        // `contributors_consumed` past the contributors they
+                        // just credited), not here at the end-of-turn drain.
+                        // So there is nothing to clear on the envelope here — a
+                        // second commit in this same turn already saw an empty
+                        // contributor slice via the cursor, and the next
+                        // loop-top refresh replaces the whole envelope (and
+                        // resets the cursor to 0) off the now-empty ledger.
+                        // The ledger clear above is what prevents consumed
+                        // contributors from carrying into the NEXT turn's
+                        // envelope; the cursor is what prevents re-credit
+                        // WITHIN this turn.
                     }
                     if let (Some(sink), Some(turn)) =
                         (artifact_sink, active_prompt_context.as_ref())
@@ -8070,6 +8088,7 @@ mod prompt_ingress_tests {
             },
             attribution: None,
             commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
+            contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut denied = newt_core::Caveats::top();
         denied.fs_read = newt_core::Scope::none();

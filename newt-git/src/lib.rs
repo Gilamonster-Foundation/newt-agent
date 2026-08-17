@@ -971,6 +971,21 @@ pub struct LocalGitTool {
     /// unreliable still clears. Atomic for cross-thread visibility (the
     /// session runs on its own thread; the drain runs on the loop thread).
     pub commit_succeeded: std::sync::atomic::AtomicUsize,
+    /// #1709 family — the per-lifecycle contributor-consumption cursor. The
+    /// envelope's `contributors` snapshot is FROZEN for the turn (the field
+    /// is owned, and [`GitTool::dispatch`] takes `&self`, so it cannot be
+    /// mutated at the commit boundary). This cursor is the interior-mutable
+    /// view of how many of those frozen contributors a confirmed successful
+    /// commit has already consumed: [`LocalGitTool::finalize_commit_message`]
+    /// renders only `contributors[cursor..]`, and each `commit`/`amend`/
+    /// `rebase` arm advances `cursor → contributors.len()` on success. So a
+    /// SECOND commit in the SAME tool/turn lifecycle (C1 → more work → C2)
+    /// sees an empty contributor slice and re-credits nobody from C1 — the
+    /// snapshot is consumed at the actual commit boundary, not deferred to
+    /// the end-of-turn drain. Reset to 0 by the session loop when it
+    /// refreshes the envelope at the top of each iteration. Atomic for the
+    /// same cross-thread reason as `commit_succeeded`.
+    pub contributors_consumed: std::sync::atomic::AtomicUsize,
 }
 
 impl LocalGitTool {
@@ -998,8 +1013,33 @@ impl LocalGitTool {
             // `finalize_message_with`, so every contributing model is
             // credited. An empty snapshot yields the single active-model
             // floor (semantic A).
-            Some(a) => a.finalize_message(message),
+            //
+            // #1709 family: the snapshot is CONSUMED at the commit boundary,
+            // not the end-of-turn boundary. `contributors_consumed` is a
+            // cursor into the frozen `contributors` Vec — render only the
+            // UNCONSUMED tail `contributors[cursor..]`. A prior successful
+            // commit in this same lifecycle advanced the cursor past the
+            // contributors it already credited, so this commit re-credits
+            // none of them (C1 → more work → C2: C2's slice is empty).
+            Some(a) => {
+                let cursor = self
+                    .contributors_consumed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let start = cursor.min(a.contributors.len());
+                a.finalize_message_with(message, &a.contributors[start..])
+            }
             None => message.to_string(),
+        }
+    }
+
+    /// Consume the contributor snapshot at the confirmed-successful commit
+    /// boundary — advance the cursor past every contributor the just-landed
+    /// commit credited, so a subsequent commit in the SAME lifecycle re-credits
+    /// none of them. No-op when no attribution is configured (test scaffolds).
+    fn consume_contributors(&self) {
+        if let Some(a) = &self.attribution {
+            self.contributors_consumed
+                .store(a.contributors.len(), std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1089,6 +1129,11 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                 // ledger off THIS, not a `HEAD` diff.
                 self.commit_succeeded
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // #1709 family: consume the contributor snapshot AT the commit
+                // boundary — the contributors this commit just credited are
+                // spent, so a second commit in this same lifecycle re-credits
+                // none of them.
+                self.consume_contributors();
                 Ok(format!("committed {}: {}", c.short_id, c.summary))
             }
             "amend" => {
@@ -1106,6 +1151,10 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                 // #1709 family: amend creates a commit too — signal it.
                 self.commit_succeeded
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // #1709 family: amend finalized from the same frozen snapshot;
+                // consume it here too so a later commit in this lifecycle does
+                // not re-credit the contributors amend just stamped.
+                self.consume_contributors();
                 Ok(format!("amended {}: {}", c.short_id, c.summary))
             }
             "rebase" => {
@@ -1114,7 +1163,12 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .and_then(|v| v.as_str())
                     .filter(|o| !o.trim().is_empty())
                     .ok_or("rebase: 'onto' (the base commit/ref to replay onto) is required")?;
-                let steps = parse_rebase_plan(args, self.attribution.as_ref())?;
+                let steps = parse_rebase_plan(
+                    args,
+                    self.attribution.as_ref(),
+                    self.contributors_consumed
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )?;
                 if steps.is_empty() {
                     return Err("rebase: 'plan' must list at least one step".to_string());
                 }
@@ -1125,6 +1179,10 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                 // rewritten history the snapshot proxy could mis-read).
                 self.commit_succeeded
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // #1709 family: the rebase's reword/squash steps finalized from
+                // the same frozen contributor slice; consume it so a later
+                // commit in this lifecycle does not re-credit them.
+                self.consume_contributors();
                 Ok(format!(
                     "rebased onto {onto} → {} ({} commit(s), {} dropped)",
                     r.new_head, r.produced, r.dropped
@@ -1188,6 +1246,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
 fn parse_rebase_plan(
     args: &serde_json::Value,
     attribution: Option<&newt_core::attribution::CommitAttribution>,
+    contributors_consumed: usize,
 ) -> Result<Vec<RebaseStep>, String> {
     let plan = args
         .get("plan")
@@ -1218,7 +1277,14 @@ fn parse_rebase_plan(
             .filter(|m| !m.trim().is_empty())
             .map(|m| match action {
                 RebaseAction::Reword | RebaseAction::Squash => match attribution {
-                    Some(a) => a.finalize_message(m),
+                    // #1709 family: respect the consumption cursor — render only
+                    // the UNCONSUMED contributor tail, matching
+                    // `finalize_commit_message`, so a rebase following a commit
+                    // in the same lifecycle does not re-credit spent contributors.
+                    Some(a) => {
+                        let start = contributors_consumed.min(a.contributors.len());
+                        a.finalize_message_with(m, &a.contributors[start..])
+                    }
                     None => m.to_string(),
                 },
                 _ => m.to_string(),
@@ -1647,6 +1713,7 @@ mod tests {
                 "noreply@newt-agent.com",
             )),
             commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
+            contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1744,6 +1811,119 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.drain_commit_success(), 1, "amend signals a commit");
+    }
+
+    /// #1709 family: the contributor snapshot is CONSUMED at the actual
+    /// successful commit boundary, not deferred to the end-of-turn drain.
+    /// Within ONE tool/turn lifecycle (one frozen envelope), commit C1
+    /// credits the envelope's accumulated contributors, then "more work" →
+    /// commit C2 in the SAME lifecycle must NOT re-credit C1's contributors:
+    /// C1's success advanced the consumption cursor past them, so C2's
+    /// contributor slice is empty and it credits only the active model.
+    ///
+    /// Real git (tempdir + real commits) because "the trailer landed on C1
+    /// and NOT on C2" is a property of the real commit objects, not a mock —
+    /// this grounds the cursor logic in `finalize_commit_message` /
+    /// `consume_contributors`. The active model (`qwen3:30b`) deliberately
+    /// differs from the accumulated contributor (`model-a`) so the
+    /// distinction is visible: C1 credits BOTH, C2 credits ONLY the active
+    /// model.
+    #[test]
+    fn contributor_snapshot_consumed_at_commit_boundary_not_turn_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = tool(dir.path());
+        // Inject one accumulated contributor (model-a) into the envelope —
+        // the session loop would snapshot this from the ledger at loop-top.
+        if let Some(a) = t.attribution.as_mut() {
+            a.contributors
+                .push(newt_core::attribution::Attribution::new(
+                    "model-a",
+                    "newt-agent",
+                    newt_core::build_info::PACKAGE_VERSION,
+                    "noreply@newt-agent.com",
+                ));
+        }
+        t.dispatch("init", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+
+        // C1: credits model-a (contributor) + qwen3:30b (active).
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["a.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "C1"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let c1 = head_message(dir.path());
+        let version = newt_core::build_info::PACKAGE_VERSION;
+        assert!(
+            c1.contains(&format!(
+                "Co-authored-by: model-a (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "C1 credits the accumulated contributor A: {c1}"
+        );
+        assert!(
+            c1.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "C1 credits the active model B: {c1}"
+        );
+
+        // "more work" then C2 in the SAME lifecycle (same frozen envelope;
+        // C1's success advanced the cursor past model-a).
+        std::fs::write(dir.path().join("b.txt"), "y\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["b.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "C2"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let c2 = head_message(dir.path());
+        assert!(
+            !c2.contains("model-a"),
+            "C2 must NOT re-credit A — its snapshot was consumed at C1's boundary: {c2}"
+        );
+        assert!(
+            c2.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "C2 still credits the active model B: {c2}"
+        );
+        // Two distinct commits landed in the one lifecycle.
+        assert_eq!(commit_count(dir.path()), 2);
+        // The cursor now sits at the (frozen) contributor count; a THIRD
+        // commit in this lifecycle would also credit only the active model.
+        std::fs::write(dir.path().join("c.txt"), "z\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "C3"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let c3 = head_message(dir.path());
+        assert!(
+            !c3.contains("model-a"),
+            "C3 still does not re-credit A: {c3}"
+        );
+        assert_eq!(commit_count(dir.path()), 3);
     }
 
     #[test]
