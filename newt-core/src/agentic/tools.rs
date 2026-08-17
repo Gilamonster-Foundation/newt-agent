@@ -44,8 +44,8 @@ pub(crate) use catalog::{
     known_builtin_tool_name, merged_tool_definitions, resolve_tool_alias, AliasOutcome,
 };
 use catalog::{
-    disposition_tool_denied_message, persona_tool_denied_message, run_command_redirect,
-    unknown_tool_message,
+    disposition_tool_denied_message, persona_tool_denied_message,
+    run_command_creates_shell_git_commit, run_command_redirect, unknown_tool_message,
 };
 pub use catalog::{
     filter_advertised_tools, filter_tools_for_disposition, persona_tool_allowed, tool_allowed,
@@ -4212,6 +4212,30 @@ async fn execute_tool_inner(
                 );
             }
 
+            // Attribution invariant (#1709 family): a COMPOSED shell command that
+            // creates a git commit (`git add . && git commit -m x`,
+            // `echo msg | git commit -F -`, `git -c user.email=… commit`,
+            // `/usr/bin/git -C <repo> commit`, `GIT_AUTHOR_NAME=… git commit`)
+            // bypasses `LocalGitTool::finalize_commit_message` and would land an
+            // unattributed Newt commit. Routing the composed command through the
+            // embedded `git` tool is impossible (it cannot serve `&&`/pipes/
+            // redirects), and reusing the finalizer would require parsing an
+            // arbitrary shell command's commit message — fragile and out of
+            // scope. So FAIL PREDICTABLY: refuse the commit and direct the model
+            // to the first-class `git` tool, which stamps attribution itself.
+            // Read-only git (status/log/diff) and network ops (push/fetch/…)
+            // are unaffected; this never reaches the confined shell.
+            if run_command_creates_shell_git_commit(cmd) {
+                return "error: refusing to create a git commit via the shell — that \
+                     bypasses harness-managed commit attribution (the `git` tool \
+                     stamps the Co-authored-by trailer + provenance itself; a \
+                     shell `git commit` would let the model forge or omit it). \
+                     Use the `git` tool with op \"commit\" (or \"amend\") instead. \
+                     Read-only git (status/log/diff) and `git push`/`fetch` are \
+                     unaffected."
+                    .to_string();
+            }
+
             // Route the WHOLE command through agent-bridle's confined shell
             // (free-form `cmd` mode) under the SAME Caveats the TUI resolved from
             // `[tui].permissions`. The confined-exec core is shared with the
@@ -7734,6 +7758,143 @@ mod tests {
         assert_eq!(run_command_redirect("find . -name \"*.rs\""), Some("find"));
         assert_eq!(run_command_redirect("list_dir src"), Some("list_dir"));
         assert_eq!(run_command_redirect("git status"), Some("git"));
+    }
+
+    /// #1709 family: a COMPOSED `run_command` that creates a git commit bypasses
+    /// `LocalGitTool::finalize_commit_message` and would land an unattributed
+    /// commit. The guard `run_command_creates_shell_git_commit` detects it so the
+    /// run_command arm can refuse predictably and direct the model to the
+    /// first-class `git` tool. A bare `git commit` is already bounced by
+    /// `run_command_redirect` (covered above); these are the composed forms that
+    /// fall through.
+    #[test]
+    fn run_command_creates_shell_git_commit_detects_composed_commit_forms() {
+        // Sequencing + commit.
+        assert!(run_command_creates_shell_git_commit(
+            "git add . && git commit -m \"fix the parser\""
+        ));
+        assert!(run_command_creates_shell_git_commit(
+            "git add . ; git commit -m x"
+        ));
+        // Pipeline commit (e.g. message from stdin).
+        assert!(run_command_creates_shell_git_commit(
+            "echo \"msg\" | git commit -F -"
+        ));
+        // Redirect is composition.
+        assert!(run_command_creates_shell_git_commit(
+            "git commit -m x > commit.log"
+        ));
+        // Global option with a value before the subcommand.
+        assert!(run_command_creates_shell_git_commit(
+            "git -c user.email=evil@example.com commit -m x"
+        ));
+        assert!(run_command_creates_shell_git_commit(
+            "git -C /repo commit -m x"
+        ));
+        // `--git-dir=<path>` carries its value in-token, so the next token IS
+        // the subcommand.
+        assert!(run_command_creates_shell_git_commit(
+            "git --git-dir=/repo/.git commit -m x"
+        ));
+        // A bare flag global option before the subcommand.
+        assert!(run_command_creates_shell_git_commit(
+            "git --no-pager commit -m x"
+        ));
+        // `--amend` is still the `commit` subcommand.
+        assert!(run_command_creates_shell_git_commit(
+            "git add . && git commit --amend -m x"
+        ));
+        // Qualified binary path (the model often uses /usr/bin/git).
+        assert!(run_command_creates_shell_git_commit(
+            "/usr/bin/git -C /repo commit -m x"
+        ));
+        // Env-assignment prefix forging commit identity.
+        assert!(run_command_creates_shell_git_commit(
+            "GIT_AUTHOR_NAME=evil GIT_AUTHOR_EMAIL=evil@example.com git commit -m x"
+        ));
+        // Command substitution / backtick wrapping.
+        assert!(run_command_creates_shell_git_commit("$(git commit -m x)"));
+        assert!(run_command_creates_shell_git_commit("`git commit -m x`"));
+    }
+
+    /// #1709 family: the guard must NOT fire on legitimate read-only git, git
+    /// network ops, or unrelated commands — the bypass closure is narrow to
+    /// commit creation only. (Residuals `git rebase`/`merge`/`cherry-pick`/
+    /// `revert` are deliberately NOT blocked — see the function doc — so they
+    /// also appear here as non-matches, documented as known residuals.)
+    #[test]
+    fn run_command_creates_shell_git_commit_preserves_readonly_and_unrelated() {
+        // Read-only composed git.
+        assert!(!run_command_creates_shell_git_commit(
+            "git status && git diff"
+        ));
+        assert!(!run_command_creates_shell_git_commit(
+            "git log | grep commit"
+        ));
+        assert!(!run_command_creates_shell_git_commit(
+            "git log --grep=commit --oneline"
+        ));
+        // Git network passthrough ops.
+        assert!(!run_command_creates_shell_git_commit(
+            "git add . && git push origin fix/foo"
+        ));
+        assert!(!run_command_creates_shell_git_commit("git fetch"));
+        // `commit` appearing as an ARGUMENT, not a subcommand.
+        assert!(!run_command_creates_shell_git_commit(
+            "echo git commit > notes.txt"
+        ));
+        assert!(!run_command_creates_shell_git_commit("cat commit_log.txt"));
+        // Non-git commands.
+        assert!(!run_command_creates_shell_git_commit("cargo test"));
+        assert!(!run_command_creates_shell_git_commit("just check"));
+        assert!(!run_command_creates_shell_git_commit(""));
+        // Residual commit-creating paths with no first-class route — NOT blocked.
+        assert!(!run_command_creates_shell_git_commit("git rebase main"));
+        assert!(!run_command_creates_shell_git_commit("git merge feature/x"));
+        assert!(!run_command_creates_shell_git_commit(
+            "git cherry-pick abc123"
+        ));
+        assert!(!run_command_creates_shell_git_commit("git revert abc123"));
+        // Non-creating rebase variants (a blanket block would strand these).
+        assert!(!run_command_creates_shell_git_commit("git rebase --abort"));
+        assert!(!run_command_creates_shell_git_commit("git rebase --skip"));
+    }
+
+    /// #1709 family (req 13): a model cannot escape harness-managed attribution
+    /// by shelling out `git commit` with its OWN hand-written trailer or forged
+    /// identity — the guard blocks the commit attempt ENTIRELY, so the model is
+    /// forced onto the `git` tool, whose finalizer owns attribution. The model's
+    /// text never reaches a real `git commit`.
+    #[test]
+    fn run_command_creates_shell_git_commit_blocks_model_forged_attribution() {
+        // Model hand-writes a trailer to impersonate harness attribution.
+        assert!(run_command_creates_shell_git_commit(
+            "git commit -m \"fix the parser\n\nCo-authored-by: fake (newt-agent v9.9) <x@y>\""
+        ));
+        // Model forges the author identity via -c.
+        assert!(run_command_creates_shell_git_commit(
+            "git -c user.name='newt-agent' -c user.email='x@y' commit -m x"
+        ));
+        // Model forges identity via env prefix.
+        assert!(run_command_creates_shell_git_commit(
+            "GIT_AUTHOR_NAME=newt-agent GIT_AUTHOR_EMAIL=x@y git commit -m x"
+        ));
+        // Model tries to suppress attribution by emptying the message via a file.
+        assert!(run_command_creates_shell_git_commit(
+            "printf '' | git commit -F -"
+        ));
+    }
+
+    /// #1709 family: a bare `git commit` is already caught by
+    /// `run_command_redirect` (the existing bounce to the `git` tool); the new
+    /// guard is the composed-shell fallback, not a duplicate of the bare case.
+    #[test]
+    fn bare_git_commit_is_caught_by_redirect_not_the_shell_guard() {
+        assert_eq!(run_command_redirect("git commit"), Some("git"));
+        assert_eq!(run_command_redirect("git commit --amend -m x"), Some("git"));
+        // The shell guard also reports it (defense in depth), but the redirect
+        // fires first in the run_command arm.
+        assert!(run_command_creates_shell_git_commit("git commit"));
     }
 
     /// #1262: the loop's `hallucination_count` increments exactly on

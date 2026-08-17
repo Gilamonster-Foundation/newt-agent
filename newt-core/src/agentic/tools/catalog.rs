@@ -629,6 +629,111 @@ pub(super) fn run_command_redirect(command: &str) -> Option<&'static str> {
     DIRECT_TOOL_NAMES.iter().copied().find(|&t| t == first)
 }
 
+/// Shell separators that sequence, pipeline, or redirect sub-commands. A
+/// composed command is split on these so each sub-command is examined
+/// independently. This is a deliberately COARSE over-split (e.g. `|` inside a
+/// quoted `-m` message is split too) — the policy is fail-closed, so an
+/// over-split can only ever *block* a commit attempt, never *allow* one through.
+const SHELL_SEGMENT_SEPARATORS: &[char] = &['&', '|', ';', '>', '<', '`', '\n'];
+
+/// Git GLOBAL options that consume the following token as their value, so the
+/// real subcommand is the first non-option token AFTER skipping these. A bounded
+/// git-global-option set used only to locate the subcommand — not a general git
+/// or shell parser. The `=`-attached forms (`--git-dir=/p`) carry their value in
+/// the same token, so they are NOT here (they are bare flags that skip one).
+const GIT_GLOBAL_OPTS_TAKING_VALUE: &[&str] =
+    &["-c", "-C", "--git-dir", "--work-tree", "--namespace"];
+
+/// Whether `token` names the `git` binary — the bare name `git` OR a qualified
+/// path ending in `/git` (the model often invokes `/usr/bin/git -C <repo> …`).
+fn is_git_binary(token: &str) -> bool {
+    token == "git" || token.ends_with("/git")
+}
+
+/// Whether `token` is a shell environment-assignment prefix (`NAME=VALUE`),
+/// which may precede the git binary to forge commit identity
+/// (`GIT_AUTHOR_NAME=… git commit …`).
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _val)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')
+}
+
+/// Find the git SUBCOMMAND for a `git` invocation given the tokens that follow
+/// the binary: the first token that is neither a flag nor the value of a
+/// value-taking global option. `None` if no subcommand is present.
+fn git_subcommand_after_binary<'a>(tail: &'a [&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < tail.len() {
+        let tok = tail[i];
+        if tok.starts_with('-') {
+            i += if GIT_GLOBAL_OPTS_TAKING_VALUE.contains(&tok) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return Some(tok);
+    }
+    None
+}
+
+/// Decide whether a `run_command` invocation would create a git COMMIT via the
+/// shell `git` CLI — bypassing `LocalGitTool::finalize_commit_message` and
+/// landing an unattributed commit. [`run_command_redirect`] already bounces a
+/// BARE `git commit` to the embedded tool; this catches the COMPOSED cases that
+/// fall through to the confined shell (`git add . && git commit -m x`,
+/// `echo msg | git commit -F -`, `git -c user.email=… commit`,
+/// `/usr/bin/git -C <repo> commit`, `GIT_AUTHOR_NAME=… git commit`).
+///
+/// Scope is deliberately narrow and fail-closed:
+/// - Detects only the `commit` subcommand (which covers `--amend`). This is the
+///   audit-identified bypass (#1709 family) and the one with a first-class
+///   routable path — the embedded `git` tool `commit`/`amend` ops, which the
+///   attribution finalizer owns — so the model is directed there instead.
+/// - Read-only git (`status`/`log`/`diff`/…) and git NETWORK ops
+///   ([`GIT_PASSTHROUGH_SUBCOMMANDS`]) are NOT commit creation and pass through.
+/// - Residual commit-creating shell paths with NO first-class route —
+///   `git rebase` (interactive reword; has non-creating `--abort`/`--skip`
+///   variants a blanket block would strand), `git merge`, `git cherry-pick`,
+///   `git revert` — are NOT blocked here and are reported as known residual
+///   bypasses (audit item 15), not silently left open.
+///
+/// This is a bounded lexical gate, NOT a general shell parser: it splits only
+/// on sequencing/pipeline/redirect separators and recognizes a fixed set of git
+/// global options to locate the subcommand. It over-splits on quoted
+/// metacharacters by design (fail-closed).
+pub(super) fn run_command_creates_shell_git_commit(command: &str) -> bool {
+    // Normalize command substitution `$(…)` to a separator (a real command is
+    // single-line, so `\n` cannot occur) so a sub-command inside it is examined
+    // independently — the same fail-closed over-split as the other separators.
+    let normalized = command.replace("$(", "\n");
+    for segment in normalized.split(SHELL_SEGMENT_SEPARATORS) {
+        let toks: Vec<&str> = segment.split_whitespace().collect();
+        if toks.is_empty() {
+            continue;
+        }
+        // Skip leading shell env assignments (`NAME=VALUE git …`).
+        let mut i = 0;
+        while i < toks.len() && is_env_assignment(toks[i]) {
+            i += 1;
+        }
+        if i >= toks.len() || !is_git_binary(toks[i]) {
+            continue;
+        }
+        if let Some(sub) = git_subcommand_after_binary(&toks[i + 1..]) {
+            if sub == "commit" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// #894: the built-in tool registry — ONE self-describing entry per non-base
 /// tool (name + JSON schema builder + presence gate), replacing the parallel
 /// hand-kept lists that used to drift (the `lifecycle` tool, #891, was
