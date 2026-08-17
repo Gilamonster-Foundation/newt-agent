@@ -573,8 +573,10 @@ pub enum Command {
         command: Option<String>,
     },
     /// Self-scheduled wake-up timers. `schedule` records a deferred prompt the
-    /// agent re-enters with later; `fire` (from a cron/launchd job) drains due
-    /// timers; `list` / `dismiss` manage the queue. The host owns the clock.
+    /// agent re-enters with later; `fire --run` (from a cron/launchd job) drains
+    /// due timers and drives each prompt through the `newt solve` entry point;
+    /// bare `fire` prints `PROM\t…` lines for a host that pipes them onward;
+    /// `list` / `dismiss` manage the queue. The host owns the clock.
     Timer {
         #[command(subcommand)]
         cmd: timer_cmd::TimerCmd,
@@ -1597,7 +1599,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Timer { cmd } => {
-            let code = timer_cmd::run(cmd)?;
+            let code = timer_cmd::run(cmd, cli.config.as_deref()).await?;
             if code != 0 {
                 std::process::exit(code);
             }

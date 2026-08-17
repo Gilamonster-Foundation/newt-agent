@@ -92,6 +92,15 @@ pub fn schedule_new(
 /// future firing. Returns `None` for one-shots.
 pub fn advance_repeat(timer: &Timer, now: u64) -> Option<Timer> {
     let step = timer.repeat_secs?;
+    // Defensive: a zero (or malformed) repeat interval would never advance
+    // `fire_at`, so the re-arm loop below would spin forever once the job is
+    // due. `TimerStore::schedule` and the CLI reject zero repeats at the
+    // validation boundary; this guards malformed persisted state (an old
+    // `timers.json` hand-edited or written by a buggy build). Treat a
+    // zero-step timer as a one-shot — dismiss on fire — rather than spinning.
+    if step == 0 {
+        return None;
+    }
     let mut next = timer.clone();
     // Roll forward until the next firing is strictly in the future.
     while next.fire_at <= now {
@@ -167,6 +176,12 @@ impl TimerStore {
         clock: &dyn Clock,
         repeat_secs: Option<u64>,
     ) -> anyhow::Result<Timer> {
+        // Config/persistence boundary: a zero repeat interval would make
+        // `advance_repeat` spin forever once the job is due. Reject it here so
+        // no caller — not just the CLI — can persist one.
+        if let Some(0) = repeat_secs {
+            anyhow::bail!("repeat interval must be greater than zero");
+        }
         let now = clock.now_secs();
         let mut timers = self.load()?;
         let timer = schedule_new(&timers, after_secs, prompt, now, repeat_secs);
@@ -297,5 +312,16 @@ mod tests {
     fn schedule_new_saturates_overflow() {
         let timer = schedule_new(&[], u64::MAX, "p", 1, None);
         assert_eq!(timer.fire_at, u64::MAX);
+    }
+
+    #[test]
+    fn advance_repeat_zero_step_dismisses_not_spins() {
+        // Regression (#1747): a zero repeat interval must never spin
+        // `advance_repeat` forever. A malformed persisted timer with
+        // `repeat_secs == Some(0)` is treated as a one-shot (returns `None`)
+        // — both when it is freshly due and when it is already past `now`.
+        let zero_step = t("a", "p", 100, 0, Some(0));
+        assert!(advance_repeat(&zero_step, 100).is_none());
+        assert!(advance_repeat(&zero_step, 1).is_none());
     }
 }
