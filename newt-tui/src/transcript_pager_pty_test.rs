@@ -162,7 +162,20 @@ fn drive(mode: &str, keys: &str, resize: bool) -> Outcome {
     if !keys.is_empty() {
         pty.type_in(keys);
     }
-    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    // A pty's output buffer is bounded. Keep draining while the shared reaper
+    // waits: otherwise the pager (or libtest's child summary after the pager
+    // returns) can block in write(2), and the parent mistakes that backpressure
+    // for a child lifecycle failure.
+    //
+    // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 09:24 EDT | Date: 2026-08-17
+    let status = std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| wait_for_child(&mut child, EXIT_TIMEOUT));
+        while !waiter.is_finished() {
+            screen.push_str(&pty.screen());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        waiter.join().expect("child reaper thread")
+    });
     // Drain whatever the exit path emitted (the restore sequence lands here).
     std::thread::sleep(Duration::from_millis(80));
     screen.push_str(&pty.screen());
@@ -194,6 +207,7 @@ fn assert_terminal_restored(what: &str, out: &Outcome) {
 
 #[serial_test::serial(transcript_pty)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn q_leaves_the_terminal_exactly_as_it_was_found() {
     let out = drive("pager", "q", false);
     assert!(out.exited_cleanly, "child failed; screen={:?}", out.screen);
@@ -202,6 +216,7 @@ fn q_leaves_the_terminal_exactly_as_it_was_found() {
 
 #[serial_test::serial(transcript_pty)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn esc_leaves_the_terminal_exactly_as_it_was_found() {
     let out = drive("pager", "\x1b", false);
     assert!(out.exited_cleanly, "child failed; screen={:?}", out.screen);
@@ -210,6 +225,7 @@ fn esc_leaves_the_terminal_exactly_as_it_was_found() {
 
 #[serial_test::serial(transcript_pty)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn ctrl_c_leaves_the_terminal_exactly_as_it_was_found() {
     // In raw mode Ctrl-C is a KEY, not SIGINT — the pager handles it as quit.
     // If it ever reverted to signal delivery, restoration would ride the
@@ -222,6 +238,7 @@ fn ctrl_c_leaves_the_terminal_exactly_as_it_was_found() {
 
 #[serial_test::serial(transcript_pty)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_resize_then_quit_still_restores_the_terminal() {
     let out = drive("pager", "q", true);
     assert!(out.exited_cleanly, "child failed; screen={:?}", out.screen);
@@ -230,6 +247,7 @@ fn a_resize_then_quit_still_restores_the_terminal() {
 
 #[serial_test::serial(transcript_pty)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_panic_after_entry_still_restores_the_terminal() {
     // The child dies non-zero on purpose; what must survive is the terminal.
     // The keystroke releases the child's blocking read so it panics only
