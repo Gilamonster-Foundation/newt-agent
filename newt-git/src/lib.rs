@@ -1236,13 +1236,17 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                 // rebase commit shares the one frozen contributor slice. `None`
                 // when no attribution is configured (test scaffolds) → messages
                 // pass through untouched.
-                let finalize: Option<&dyn Fn(&str) -> String> = match &self.attribution {
-                    Some(_) => Some(&|m: &str| self.finalize_commit_message(m)),
-                    None => None,
+                let r = {
+                    // Bind the closure to a `let` so it outlives the `&` borrow
+                    // (rustc 1.88 rejects the temporary-closure form E0716).
+                    let finalize_fn = |m: &str| self.finalize_commit_message(m);
+                    let finalize: Option<&dyn Fn(&str) -> String> = match &self.attribution {
+                        Some(_) => Some(&finalize_fn),
+                        None => None,
+                    };
+                    eng.rebase(caps, onto, &steps, &self.author, finalize)
+                        .map_err(s)?
                 };
-                let r = eng
-                    .rebase(caps, onto, &steps, &self.author, finalize)
-                    .map_err(s)?;
                 // #1709 family: a rebase is an attribution EPOCH only when it
                 // actually PRODUCED commits (`r.produced > 0`). An all-drop plan
                 // (`produced == 0`) is a successful history operation — it
