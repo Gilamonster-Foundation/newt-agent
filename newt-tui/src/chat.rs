@@ -5895,8 +5895,7 @@ fn session_body(
                         && prompt_intake.disposition() == newt_core::agentic::PromptDisposition::Ask
                         && !prompt_intake.adjudication_candidates().is_empty()
                     {
-                        let adjudicator = build_session_summarizer(
-                            &sum_cfg,
+                        let adjudicator = crate::build_adjudicator(
                             &cfg,
                             &inf_url,
                             &inf_model,
@@ -5905,12 +5904,19 @@ fn session_body(
                             Some(mem_budget),
                             color,
                         );
-                        prompt_intake = tokio::task::block_in_place(|| {
+                        let (adjudicated, failure) = tokio::task::block_in_place(|| {
                             rt.block_on(newt_core::agentic::adjudicate_decisions(
                                 &prompt_intake,
                                 &adjudicator,
                             ))
                         });
+                        prompt_intake = adjudicated;
+                        // A silent degrade is indistinguishable from a feature
+                        // that never ran. Say so, then fall through to the
+                        // ordinary clarification batch.
+                        if let Some(failure) = failure {
+                            print_newt(failure.explain(), color, verbose);
+                        }
                         for notice in prompt_intake.authorized_assumption_notices() {
                             print_newt(&notice, color, verbose);
                         }

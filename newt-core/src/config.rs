@@ -3084,6 +3084,76 @@ impl BackendConfig {
     }
 }
 
+/// A side call's backend, expressed as an **override of the session backend**.
+///
+/// Every field is optional and an absent field inherits the session's value, so
+/// an empty table means "run this exactly where the session runs". This is the
+/// same inherit-or-override shape `[summarizer]` already uses; it is factored
+/// out here so a second consumer does not hand-roll a third spelling of
+/// *(endpoint, model, kind, key)*.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackendRef {
+    /// `None` ⇒ reuse the session endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// `None` ⇒ reuse the session model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `None` ⇒ reuse the session wire protocol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<BackendKind>,
+    /// Bearer-token environment variable (checked before `api_key_file`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Bearer-token file (first non-empty line).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_file: Option<String>,
+}
+
+impl BackendRef {
+    /// Does this override point somewhere other than the session endpoint?
+    #[must_use]
+    pub fn pins_a_different_host(&self) -> bool {
+        self.endpoint.is_some()
+    }
+
+    /// Resolve against the session's `(endpoint, model, kind, key)`.
+    ///
+    /// The api-key rule is the one that matters and mirrors the summarizer's
+    /// (`resolve_summarizer_backend`): **a bearer token authenticates a
+    /// specific host**, so the session key is inherited only when this call
+    /// reuses the session endpoint. Pinning a different host and inheriting the
+    /// session's credential would leak it.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        session_endpoint: &str,
+        session_model: &str,
+        session_kind: BackendKind,
+        session_key: &Option<String>,
+    ) -> (String, String, BackendKind, Option<String>) {
+        let own_key =
+            resolve_api_key_common(self.api_key_env.as_deref(), self.api_key_file.as_deref())
+                .unwrap_or_default();
+        let key = if self.pins_a_different_host() {
+            own_key
+        } else {
+            own_key.or_else(|| session_key.clone())
+        };
+        (
+            self.endpoint
+                .clone()
+                .unwrap_or_else(|| session_endpoint.to_string()),
+            self.model
+                .clone()
+                .unwrap_or_else(|| session_model.to_string()),
+            self.kind.unwrap_or(session_kind),
+            key,
+        )
+    }
+}
+
 /// The ONE env-then-file credential rule shared by [`BackendConfig`] and
 /// [`SummarizerConfig`]. Env wins when set and non-empty; the file path goes
 /// through `secrets::resolve_token_file` (plaintext and encrypted alike).

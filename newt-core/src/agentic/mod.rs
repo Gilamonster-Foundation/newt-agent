@@ -164,7 +164,7 @@ mod trim;
 mod untrusted;
 mod warmup;
 
-pub use adjudicate::adjudicate_decisions;
+pub use adjudicate::{adjudicate_decisions, AdjudicationFailure};
 pub use artifact_hooks::{
     record_manual_compaction_checkpoint, record_memory_compaction_checkpoint,
     record_observed_head_transition, record_prompt_comprehension_manifest,

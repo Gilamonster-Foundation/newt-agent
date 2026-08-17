@@ -110,6 +110,18 @@ pub struct IntakeConfig {
     /// nobody is reading, the harness asks instead of assuming.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adjudicate_decisions: Option<bool>,
+    /// Optional backend override for the decision adjudication side call.
+    ///
+    /// Unset — the default — runs adjudication on the **session** backend, the
+    /// model that already holds the prompt. Adjudication reads operator intent,
+    /// which is the steering model's own job; it is deliberately NOT routed to
+    /// the summarizer, whose CPU-local default exists to keep compaction load
+    /// off the inference box and is a different kind of inference entirely.
+    ///
+    /// Set it to spread load — point adjudication at a second box while
+    /// steering stays put (#1749).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjudicator: Option<crate::config::BackendRef>,
 }
 
 impl IntakeConfig {

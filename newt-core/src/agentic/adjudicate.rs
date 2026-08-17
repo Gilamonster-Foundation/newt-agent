@@ -76,14 +76,51 @@ fn strip_code_fence(reply: &str) -> &str {
         .unwrap_or(rest)
 }
 
-/// Run the bounded adjudication and return the harness-applied intake.
+/// Why an adjudication produced no locks. Returned so the harness can TELL the
+/// operator, rather than degrading invisibly into the pre-adjudication gate —
+/// the silent-fallback failure mode that made the #548 summarizer incident hard
+/// to see. `None` means the call ran and its verdicts were applied (which may
+/// still legitimately be "everything stays pending").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdjudicationFailure {
+    /// The side call errored or timed out.
+    Unavailable,
+    /// The reply was prose, truncated, or otherwise not the JSON contract.
+    Malformed,
+    /// More candidates than one bounded call may adjudicate.
+    BatchTooLarge,
+}
+
+impl AdjudicationFailure {
+    /// One operator-facing line. Names the consequence, not the internals:
+    /// the decisions are still theirs to answer.
+    pub fn explain(&self) -> &'static str {
+        match self {
+            Self::Unavailable => {
+                "the adjudicator was unavailable, so these decisions are being asked rather than assumed"
+            }
+            Self::Malformed => {
+                "the adjudicator did not answer in a usable form, so these decisions are being asked rather than assumed"
+            }
+            Self::BatchTooLarge => {
+                "too many decisions to adjudicate at once, so all of them are being asked"
+            }
+        }
+    }
+}
+
+/// Run the bounded adjudication and return the harness-applied intake plus, on
+/// a failure path, the reason the operator should see.
 ///
 /// Returns the intake UNCHANGED on every failure path. The batch bound is
 /// checked before the side call, so an oversized batch costs nothing.
-pub async fn adjudicate_decisions(intake: &PromptIntake, complete: &Summarizer) -> PromptIntake {
+pub async fn adjudicate_decisions(
+    intake: &PromptIntake,
+    complete: &Summarizer,
+) -> (PromptIntake, Option<AdjudicationFailure>) {
     let candidates = intake.adjudication_candidates();
     if candidates.is_empty() {
-        return intake.clone();
+        return (intake.clone(), None);
     }
     if candidates.len() > MAX_ADJUDICATION_BATCH {
         tracing::warn!(
@@ -91,29 +128,29 @@ pub async fn adjudicate_decisions(intake: &PromptIntake, complete: &Summarizer) 
             bound = MAX_ADJUDICATION_BATCH,
             "decision adjudication refused an oversized batch; asking the operator"
         );
-        return intake.clone();
+        return (intake.clone(), Some(AdjudicationFailure::BatchTooLarge));
     }
 
     let reply = match complete(build_adjudication_prompt(intake)).await {
         Ok(reply) => reply,
         Err(error) => {
             tracing::warn!(%error, "decision adjudication unavailable; asking the operator");
-            return intake.clone();
+            return (intake.clone(), Some(AdjudicationFailure::Unavailable));
         }
     };
     let Some(verdicts) = parse_adjudication_reply(&reply) else {
         tracing::warn!("decision adjudication returned malformed output; asking the operator");
-        return intake.clone();
+        return (intake.clone(), Some(AdjudicationFailure::Malformed));
     };
     match intake.apply_adjudications(&verdicts) {
-        Ok(resolved) => resolved,
+        Ok(resolved) => (resolved, None),
         Err(AdjudicationRefusal::BatchTooLarge { candidates, bound }) => {
             tracing::warn!(
                 candidates,
                 bound,
                 "decision adjudication exceeded its bound"
             );
-            intake.clone()
+            (intake.clone(), Some(AdjudicationFailure::BatchTooLarge))
         }
     }
 }
@@ -261,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn genuine_choices_still_reach_the_clarification_batch() {
         let intake = PromptIntake::analyze(OPERATOR_OWNED);
-        let resolved = adjudicate_decisions(
+        let (resolved, _) = adjudicate_decisions(
             &intake,
             &summarizer(r#"[{"decision_id":1,"delegated_to_agent":false,"assumption":""}]"#),
         )
@@ -276,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn delegated_choices_disappear_from_the_batch() {
         let intake = PromptIntake::analyze(DELEGATED);
-        let resolved = adjudicate_decisions(
+        let (resolved, _) = adjudicate_decisions(
             &intake,
             &summarizer(
                 r#"[{"decision_id":1,"delegated_to_agent":true,"assumption":"Use the smallest coherent fix consistent with the existing design."}]"#,
@@ -292,7 +329,7 @@ mod tests {
     /// reopens it, and is carried in the durable projection as its own digest.
     #[tokio::test]
     async fn assumptions_are_rendered_and_persisted() {
-        let resolved = adjudicate_decisions(
+        let (resolved, _) = adjudicate_decisions(
             &PromptIntake::analyze(DELEGATED),
             &summarizer(
                 r#"[{"decision_id":1,"delegated_to_agent":true,"assumption":"Use the smallest coherent fix."}]"#,
@@ -325,7 +362,7 @@ mod tests {
     /// decision to the operator.
     #[tokio::test]
     async fn undo_lock_reopens_an_authorized_assumption() {
-        let resolved = adjudicate_decisions(
+        let (resolved, _) = adjudicate_decisions(
             &PromptIntake::analyze(DELEGATED),
             &summarizer(
                 r#"[{"decision_id":1,"delegated_to_agent":true,"assumption":"Use the smallest coherent fix."}]"#,
@@ -362,7 +399,7 @@ mod tests {
              Pick whichever transport needs the least change.",
         );
         assert_eq!(intake.adjudication_candidates().len(), 3);
-        let resolved = adjudicate_decisions(
+        let (resolved, _) = adjudicate_decisions(
             &intake,
             &summarizer(
                 r#"[{"decision_id":1,"delegated_to_agent":true,"assumption":"Smallest coherent fix."},
@@ -446,7 +483,7 @@ mod tests {
             summarizer(""),
         ];
         for adjudicator in adjudicators.drain(..) {
-            let resolved = adjudicate_decisions(&intake, &adjudicator).await;
+            let (resolved, _) = adjudicate_decisions(&intake, &adjudicator).await;
             assert_eq!(
                 resolved.manifest().pending_decision_count(),
                 1,
@@ -468,7 +505,7 @@ mod tests {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move { Ok("[]".to_string()) }) as super::super::compress::SummarizeFuture
         });
-        let resolved = adjudicate_decisions(&intake, &adjudicator).await;
+        let (resolved, _) = adjudicate_decisions(&intake, &adjudicator).await;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(resolved.disposition(), PromptDisposition::Ask);
     }
