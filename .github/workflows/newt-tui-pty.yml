@@ -37,6 +37,7 @@ on:
       - "newt-tui/src/permissions.rs"
       - "newt-core/src/tty/**"
       - "newt-core/src/agentic/permissions.rs"
+      - "tests/pty/**"
       - ".github/workflows/newt-tui-pty.yml"
   schedule:
     # Weekly, Sunday 05:00 UTC — inside the low-cost window, off the
