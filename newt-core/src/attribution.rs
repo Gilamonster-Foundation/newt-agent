@@ -217,6 +217,25 @@ impl CommitAttribution {
         )
     }
 
+    /// The canonical operator co-author trailer, rendered from this value's
+    /// operator identity: `Co-authored-by: <operator> <operator-email>`.
+    /// Returns `None` when no real operator email is known — never invented
+    /// (requirement 4: never invent an operator email). Distinct from
+    /// [`CommitAttribution::model_trailer`] (requirement 8: Newt model
+    /// attribution is independent from operator attribution): the operator is
+    /// a human co-author, credited to their OWN email, separate from the
+    /// accumulated model contributors.
+    #[must_use]
+    pub fn operator_trailer(&self) -> Option<String> {
+        self.operator_email.as_ref().map(|email| {
+            format!(
+                "Co-authored-by: {} <{}>",
+                self.operator_name.as_deref().unwrap_or("unknown"),
+                email
+            )
+        })
+    }
+
     /// The canonical provenance line, rendered from this same typed value
     /// (requirement 2):
     /// `Harness: <harness> v<version> (<revision>) | Model: <model> | Operator: <operator>`.
@@ -303,6 +322,15 @@ impl CommitAttribution {
     pub fn finalize_message_with(&self, message: &str, contributors: &[Attribution]) -> String {
         let (body, existing) = split_message(message);
         let agent_email_tag = format!("<{}>", self.agent_email);
+        // Operator co-author attribution — INDEPENDENT from model attribution
+        // (requirement 8). Emitted ONLY when a REAL operator email is known
+        // (requirement 3 + 4: never invented) AND the operator is not already
+        // the commit's primary author. The git commit author is this value's
+        // `agent_email`; when the operator's email equals it, the operator IS
+        // the primary author and a duplicate `Co-authored-by:` is both wrong
+        // and ignored by GitHub (requirement: avoid emitting an operator
+        // co-author identical to the primary author).
+        let operator_email_tag = self.operator_email.as_ref().map(|e| format!("<{e}>"));
 
         // Merge accumulated contributors with the active-at-commit model.
         // Dedup on the full identity; first-contribution order, active model
@@ -327,14 +355,42 @@ impl CommitAttribution {
         let mut third_party: Vec<String> = Vec::new();
         for trailer in existing {
             if is_newt_model_trailer(&trailer, &agent_email_tag) || is_newt_provenance(&trailer) {
-                continue; // stale Newt-owned — drop, re-render below
+                continue; // stale Newt-owned model attribution / provenance — drop, re-render below
+            }
+            // A stale Newt-managed OPERATOR trailer (credited to the known
+            // operator email) is also dropped + re-rendered, so
+            // re-finalization is idempotent and never duplicates it
+            // (requirement 5: avoid duplicate operator co-author trailers;
+            // requirement 11: keep finalization idempotent). Independent from
+            // model attribution — matched on the OPERATOR email, not the
+            // agent email.
+            if let Some(tag) = &operator_email_tag {
+                if is_newt_operator_trailer(&trailer, tag) {
+                    continue;
+                }
             }
             third_party.push(trailer);
         }
 
+        // Emit the operator co-author trailer only when a real operator email
+        // is known AND it differs from the primary author's email.
+        let emit_operator = operator_email_tag
+            .as_ref()
+            .is_some_and(|tag| tag.as_str() != agent_email_tag.as_str());
+
         let mut trailers = third_party;
         for c in &merged {
             trailers.push(c.trailer());
+        }
+        // Operator co-author trailer — separate from the model contributors,
+        // rendered after them. Omitted when no real operator email is known
+        // OR the operator is already the primary author. Never duplicates
+        // (stale ones were dropped above).
+        if emit_operator {
+            trailers.push(
+                self.operator_trailer()
+                    .expect("operator email known and distinct"),
+            );
         }
         trailers.push(self.provenance_line());
 
@@ -413,11 +469,25 @@ fn is_newt_model_trailer(line: &str, agent_email_tag: &str) -> bool {
     line.starts_with("Co-authored-by: ") && line.ends_with(agent_email_tag)
 }
 
-/// A Newt-owned provenance line: any `Harness:` line. Replaced wholesale on
-/// re-finalization so a stale revision/version does not linger (requirement
-/// 9).
+/// A Newt-managed operator co-author trailer: a `Co-authored-by:` line credited
+/// to the known operator email. Distinct from [`is_newt_model_trailer`] (which
+/// matches the agent email) — operator attribution is independent from model
+/// attribution (requirement 8). Recognized so a stale operator trailer is
+/// dropped + re-rendered on re-finalization (idempotent, no duplicate).
+fn is_newt_operator_trailer(line: &str, operator_email_tag: &str) -> bool {
+    line.starts_with("Co-authored-by: ") && line.ends_with(operator_email_tag)
+}
+
+/// A Newt-owned provenance line: the canonical shape
+/// `Harness: <harness> v<version> (<rev>) | Model: <model> | Operator: <op>`
+/// — matched by its unique ` | Model: ` + ` | Operator: ` markers, NOT merely
+/// by the `Harness:` prefix. A user's unrelated `Harness: built with Rust`
+/// trailer therefore survives finalization as third-party (requirement 6:
+/// tighten Newt-owned `Harness:` detection so unrelated user `Harness:`
+/// trailers are preserved). Replaced wholesale on re-finalization so a stale
+/// revision/version does not linger (requirement 9).
 fn is_newt_provenance(line: &str) -> bool {
-    line.starts_with("Harness: ")
+    line.starts_with("Harness: ") && line.contains(" | Model: ") && line.contains(" | Operator: ")
 }
 
 /// The pending multi-contributor set for one not-yet-committed unit of work.
@@ -1200,5 +1270,150 @@ mod tests {
              Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: shawn\n"
         );
         assert_eq!(after, expected);
+    }
+
+    // ---- operator attribution (requirement 2/3/4/5/6/8) ----
+
+    /// A known real operator email emits an operator `Co-authored-by:` trailer,
+    /// credited to the OPERATOR email (not the agent email), separate from the
+    /// model contributor trailers (requirement 3 + 8: independent from model
+    /// attribution). The operator name is preserved in the trailer.
+    #[test]
+    fn operator_with_known_email_emits_operator_co_author_trailer() {
+        let ca = CommitAttribution {
+            operator_email: Some("shawn@example.com".to_string()),
+            ..sample_ca()
+        };
+        let out = ca.finalize_message("fix the parser\n\nbody");
+        assert!(
+            out.contains("Co-authored-by: shawn <shawn@example.com>"),
+            "operator trailer emitted with the operator's own email + name"
+        );
+        // The model trailer is still present and credited to the agent email.
+        assert!(out.contains(&ca.model_trailer()));
+        // Operator trailer is credited to the operator email, NOT the agent one.
+        assert_ne!(ca.operator_trailer().unwrap(), ca.model_trailer());
+    }
+
+    /// Requirement 4: when NO operator email is known, NO operator trailer is
+    /// emitted — never invented. The model trailer + provenance still render.
+    #[test]
+    fn operator_with_missing_email_emits_no_operator_trailer() {
+        let ca = sample_ca(); // operator_email: None
+        assert!(ca.operator_trailer().is_none());
+        let out = ca.finalize_message("fix the parser\n\nbody");
+        assert!(
+            !out.contains("@example.com"),
+            "no operator email is ever manufactured"
+        );
+        // Model attribution + provenance still present.
+        assert!(out.contains(&ca.model_trailer()));
+        assert!(out.contains(&ca.provenance_line()));
+    }
+
+    /// Requirement: avoid emitting an operator co-author identical to the
+    /// primary Git author. The commit author is the `agent_email`; when the
+    /// operator's email equals it, the operator IS the primary author and no
+    /// duplicate operator trailer is emitted.
+    #[test]
+    fn operator_who_is_the_primary_author_gets_no_duplicate_trailer() {
+        let ca = CommitAttribution {
+            operator_email: Some(DEFAULT_EMAIL.to_string()), // == agent_email
+            ..sample_ca()
+        };
+        let out = ca.finalize_message("fix the parser\n\nbody");
+        let coauth: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("Co-authored-by: "))
+            .collect();
+        // Exactly one Co-authored-by: the model trailer (credited to the agent
+        // email). No second one for the operator, who is already the author.
+        assert_eq!(
+            coauth.len(),
+            1,
+            "no duplicate trailer for the primary author"
+        );
+        assert_eq!(coauth[0], ca.model_trailer());
+    }
+
+    /// Requirement 7 + 10: an existing third-party human co-author PLUS the
+    /// operator PLUS the Newt model all survive on one commit — third-party
+    /// trailers are preserved verbatim, the operator trailer is added, and the
+    /// Newt model attribution is independent from both.
+    #[test]
+    fn third_party_plus_operator_plus_newt_model_all_survive() {
+        let ca = CommitAttribution {
+            operator_email: Some("shawn@example.com".to_string()),
+            ..sample_ca()
+        };
+        let input = "feat: thing\n\nBody.\n\nCo-authored-by: Alice <alice@example.com>\n";
+        let out = ca.finalize_message(input);
+        assert!(out.contains("Co-authored-by: Alice <alice@example.com>"));
+        assert!(out.contains("Co-authored-by: shawn <shawn@example.com>"));
+        assert!(out.contains(&ca.model_trailer()));
+        let coauth: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("Co-authored-by: "))
+            .collect();
+        assert_eq!(coauth.len(), 3, "Alice + operator + newt model");
+    }
+
+    /// Requirement 5 + 11: a stale operator trailer from a prior finalization
+    /// is dropped + re-rendered (idempotent), never duplicated.
+    #[test]
+    fn finalize_replaces_stale_operator_trailer_idempotently() {
+        let ca = CommitAttribution {
+            operator_email: Some("shawn@example.com".to_string()),
+            ..sample_ca()
+        };
+        let once = ca.finalize_message("fix the parser\n\nbody");
+        let twice = ca.finalize_message(&once);
+        assert_eq!(once, twice, "re-finalization is a no-op");
+        let op_trailers: Vec<&str> = out_operator_trailers(&once, "shawn@example.com");
+        assert_eq!(op_trailers.len(), 1, "exactly one operator trailer");
+    }
+
+    /// Requirement 6: an UNRELATED user `Harness:` trailer (not the canonical
+    /// Newt provenance shape) is PRESERVED as third-party, not dropped as stale
+    /// Newt provenance.
+    #[test]
+    fn unrelated_user_harness_trailer_is_preserved() {
+        let ca = sample_ca();
+        let input = "feat: thing\n\nBody.\n\nHarness: built with Rust 1.80\n";
+        let out = ca.finalize_message(input);
+        assert!(
+            out.contains("Harness: built with Rust 1.80"),
+            "unrelated user Harness: trailer must be preserved"
+        );
+        // The canonical Newt provenance is ALSO present (one of each).
+        let harness_lines: Vec<&str> = out.lines().filter(|l| l.starts_with("Harness: ")).collect();
+        assert_eq!(harness_lines.len(), 2, "user Harness + Newt provenance");
+        assert!(out.contains(&ca.provenance_line()));
+    }
+
+    /// Requirement 11: finalization with an operator is idempotent end-to-end
+    /// (operator trailer included), and the provenance line still carries the
+    /// operator name even when email is unavailable (requirement 5: preserve
+    /// operator name in provenance when email is unavailable).
+    #[test]
+    fn finalize_with_operator_is_idempotent_and_provenance_keeps_name() {
+        let ca = CommitAttribution {
+            operator_email: Some("shawn@example.com".to_string()),
+            ..sample_ca()
+        };
+        let once = ca.finalize_message("fix the parser\n\nbody");
+        let twice = ca.finalize_message(&once);
+        assert_eq!(once, twice);
+        // Provenance carries the operator NAME regardless of email.
+        assert!(ca.provenance_line().contains("Operator: shawn"));
+    }
+
+    /// Helper: collect operator `Co-authored-by:` lines credited to `email`.
+    fn out_operator_trailers<'a>(message: &'a str, email: &str) -> Vec<&'a str> {
+        let tag = format!("<{email}>");
+        message
+            .lines()
+            .filter(|l| l.starts_with("Co-authored-by: ") && l.ends_with(&tag))
+            .collect()
     }
 }

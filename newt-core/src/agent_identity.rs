@@ -325,6 +325,30 @@ pub fn default_operator() -> Option<String> {
         .or_else(|| std::env::var("USER").ok().filter(|s| !s.is_empty()))
 }
 
+/// Derive the operator EMAIL from the host git identity when no configured
+/// source exists: `git config user.email`, then the `GIT_AUTHOR_EMAIL` env
+/// var. Returns `None` when no real email source resolves — NEVER invented
+/// (the operator-attribution contract: emit a `Co-authored-by:` for the
+/// operator only when a REAL email is known). This is the operator-email
+/// companion to [`default_operator`]; the session loop (the caller) resolves
+/// it once and threads it into [`crate::attribution::CommitAttribution`],
+/// keeping the typed value's own constructor tool-less.
+pub fn default_operator_email() -> Option<String> {
+    let from_git = std::process::Command::new("git")
+        .args(["config", "--get", "user.email"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    from_git.or_else(|| {
+        std::env::var("GIT_AUTHOR_EMAIL")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+}
+
 /// Which layer an [`AgentIdentity`] resolved from. Surfaced by
 /// [`AgentIdentity::resolve_with_source`] so `newt identity` can tell the user
 /// *where* the identity came from.
@@ -532,6 +556,21 @@ impl AgentIdentity {
     #[must_use]
     pub fn operator_name(&self) -> Option<String> {
         self.operator.clone().or_else(default_operator)
+    }
+
+    /// The human operator's EMAIL for operator `Co-authored-by:` attribution
+    /// — the real host git identity (`git config user.email`, then
+    /// `GIT_AUTHOR_EMAIL`). `None` when no real email source resolves; NEVER
+    /// invented (the operator-attribution contract: emit a `Co-authored-by:`
+    /// for the operator only when a REAL email is known). There is no
+    /// `agent-identity.toml` field for this today; a future config source would
+    /// slot in ahead of [`default_operator_email`] here. The caller (the
+    /// session loop) resolves this once and threads it into
+    /// [`crate::attribution::CommitAttribution::operator_email`], keeping the
+    /// typed value's own constructor tool-less.
+    #[must_use]
+    pub fn operator_email(&self) -> Option<String> {
+        default_operator_email()
     }
 
     /// A PREVIEW `Co-authored-by:` trailer line (`newt identity`), in the

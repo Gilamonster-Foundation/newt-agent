@@ -2201,6 +2201,16 @@ fn session_body(
     // an `init` op, so it is useful even before a repo exists. The commit author
     // is the resolved AgentIdentity (`newt-agent` User default, overridable).
     let session_identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
+    // #1709 family — operator identity for `Co-authored-by:` attribution. The
+    // operator NAME + EMAIL are resolved ONCE from the host git identity
+    // (`git config user.name` / `user.email`) via the tool-less ctor's caller-
+    // supplied fallbacks (`AgentIdentity::operator_name` / `operator_email`).
+    // The email is a REAL configured value only — never invented; `None` when
+    // no source resolves, in which case no operator trailer is emitted. Kept
+    // out of the per-turn `CommitAttribution::from_identity` ctor (which stays
+    // tool-less) and threaded in here as the caller.
+    let session_operator_name = session_identity.operator_name();
+    let session_operator_email = session_identity.operator_email();
     // #1707/#1709: the session-scoped pending multi-contributor attribution
     // ledger. Every non-read-only tool call that succeeds records the
     // CURRENTLY resolved model here (see `ledger_note_attribution` in
@@ -2229,6 +2239,11 @@ fn session_body(
             // one frozen at session boot. `None` here (refreshed immediately
             // below); tests opt out of signing by leaving it `None`.
             attribution: None,
+            // #1709 family: the explicit commit-success counter — starts at
+            // zero; the `commit`/`amend`/`rebase` arms increment it on a
+            // confirmed successful `eng.*` call, and the loop drains it below
+            // to clear the ledger ONLY on a real Newt commit (not a `HEAD` diff).
+            commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
         })
     };
 
@@ -2248,6 +2263,15 @@ fn session_body(
                 &inf_model,
                 &session_identity,
             );
+            // #1709 family: thread the resolved operator identity through the
+            // typed value. `from_identity` keeps its ctor tool-less (config
+            // `operator` only); the caller (this loop) applies the host-git
+            // fallback for the NAME and supplies the real EMAIL here. The
+            // email is real-or-None — never invented — so the finalizer emits
+            // an operator `Co-authored-by:` only when one is actually known and
+            // the operator is not the primary author.
+            ca.operator_name = session_operator_name.clone();
+            ca.operator_email = session_operator_email.clone();
             // #1707/#1709 semantic B: snapshot the pending multi-contributor
             // ledger into the envelope here — the latest practical point
             // before the turn that may commit. The ledger holds every model
@@ -6941,22 +6965,21 @@ fn session_body(
                     // error; preserve that transition as unattributed evidence.
                     let artifact_head_after_turn =
                         git_head_snapshot(session_git_tool.as_ref(), &turn_caveats);
-                    // #1707/#1709: HEAD moving this turn IS "a commit landed"
-                    // — the exact fact this snapshot pair already exists to
-                    // observe (`record_observed_head_transition` below), read
-                    // a second time for a different purpose. A successful
-                    // commit consumed whatever the ledger held (stamped via
-                    // `session_git_tool`'s `coauthor`, refreshed at the top of
-                    // this loop), so clear it; anything else — no commit
-                    // attempted, denied, or failed — leaves HEAD unmoved and
-                    // the pending contributors intact for the next attempt.
-                    if artifact_head_before_turn
+                    // #1709 family: clear the contributor ledger ONLY after an
+                    // EXPLICITLY CONFIRMED successful Newt commit — the
+                    // `commit`/`amend`/`rebase` arms incremented
+                    // `commit_succeeded` on a real `eng.*` success. Never clear
+                    // merely because `HEAD` moved: an external/manual `HEAD`
+                    // change (a user `git reset`, a fetch advancing the branch,
+                    // a checkout, …) is NOT a Newt commit and must not discard
+                    // pending contributors (the historical stale-attribution
+                    // class — a `HEAD`-diff proxy both false-positived on
+                    // unrelated moves and false-negatived on unreliable
+                    // snapshots). Draining resets the counter to zero.
+                    let new_commits = session_git_tool
                         .as_ref()
-                        .and_then(|s| s.head.as_deref())
-                        != artifact_head_after_turn
-                            .as_ref()
-                            .and_then(|s| s.head.as_deref())
-                    {
+                        .map_or(0, |t| t.drain_commit_success());
+                    if new_commits > 0 {
                         attribution_ledger.borrow_mut().clear();
                         // #1707/#1709 semantic B: the envelope's `contributors`
                         // snapshot was stamped at the top of this loop; a
@@ -8046,6 +8069,7 @@ mod prompt_ingress_tests {
                 email: "test@example.com".into(),
             },
             attribution: None,
+            commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut denied = newt_core::Caveats::top();
         denied.fs_read = newt_core::Scope::none();

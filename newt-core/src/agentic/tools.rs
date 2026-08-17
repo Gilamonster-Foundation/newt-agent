@@ -4229,10 +4229,14 @@ async fn execute_tool_inner(
                 return "error: refusing to create a git commit via the shell — that \
                      bypasses harness-managed commit attribution (the `git` tool \
                      stamps the Co-authored-by trailer + provenance itself; a \
-                     shell `git commit` would let the model forge or omit it). \
-                     Use the `git` tool with op \"commit\" (or \"amend\") instead. \
+                     shell `git commit`/`merge`/`cherry-pick`/`revert`/`rebase` \
+                     would let the model forge or omit it). \
+                     Use the `git` tool with op \"commit\" (or \"amend\", \"rebase\") \
+                     for the routable forms. `git merge`/`cherry-pick`/`revert` \
+                     have no first-class Newt route — the operator must run them \
+                     directly, not via run_command. \
                      Read-only git (status/log/diff) and `git push`/`fetch` are \
-                     unaffected."
+                     unaffected; abort forms (`--abort`/`--quit`) pass through."
                     .to_string();
             }
 
@@ -7818,10 +7822,10 @@ mod tests {
     }
 
     /// #1709 family: the guard must NOT fire on legitimate read-only git, git
-    /// network ops, or unrelated commands — the bypass closure is narrow to
-    /// commit creation only. (Residuals `git rebase`/`merge`/`cherry-pick`/
-    /// `revert` are deliberately NOT blocked — see the function doc — so they
-    /// also appear here as non-matches, documented as known residuals.)
+    /// network ops, unrelated commands, or the abort/quit forms of the
+    /// commit-producing subcommands — the bypass closure is narrow to commit
+    /// creation only. (`git merge`/`cherry-pick`/`revert`/`rebase` themselves
+    /// ARE blocked now — see `run_command_creates_shell_git_commit_detects_other_commit_forms`.)
     #[test]
     fn run_command_creates_shell_git_commit_preserves_readonly_and_unrelated() {
         // Read-only composed git.
@@ -7848,16 +7852,60 @@ mod tests {
         assert!(!run_command_creates_shell_git_commit("cargo test"));
         assert!(!run_command_creates_shell_git_commit("just check"));
         assert!(!run_command_creates_shell_git_commit(""));
-        // Residual commit-creating paths with no first-class route — NOT blocked.
-        assert!(!run_command_creates_shell_git_commit("git rebase main"));
-        assert!(!run_command_creates_shell_git_commit("git merge feature/x"));
+        // Abort/quit forms create NO commit — preserved (fall through). These
+        // back out of an in-progress op without creating a commit.
+        assert!(!run_command_creates_shell_git_commit("git rebase --abort"));
+        assert!(!run_command_creates_shell_git_commit("git rebase --quit"));
         assert!(!run_command_creates_shell_git_commit(
+            "git cherry-pick --abort"
+        ));
+        assert!(!run_command_creates_shell_git_commit("git revert --quit"));
+        assert!(!run_command_creates_shell_git_commit("git merge --abort"));
+        assert!(!run_command_creates_shell_git_commit("git merge --quit"));
+        // `--skip`/`--continue` DO create commits (they advance the operation),
+        // so they are NOT abort forms — covered as blocked below.
+    }
+
+    /// #1709 family (audit req 7/8): the other audit-identified commit-producing
+    /// shell forms — `git merge`, `git cherry-pick`, `git revert`, `git rebase`
+    /// — are now BLOCKED (route or deny), bare AND composed, while their
+    /// `--abort`/`--quit` forms pass through (above). `--skip`/`--continue`
+    /// create commits and stay blocked.
+    #[test]
+    fn run_command_creates_shell_git_commit_detects_other_commit_forms() {
+        // Bare commit-producing subcommands.
+        assert!(run_command_creates_shell_git_commit("git merge feature/x"));
+        assert!(run_command_creates_shell_git_commit(
             "git cherry-pick abc123"
         ));
-        assert!(!run_command_creates_shell_git_commit("git revert abc123"));
-        // Non-creating rebase variants (a blanket block would strand these).
-        assert!(!run_command_creates_shell_git_commit("git rebase --abort"));
-        assert!(!run_command_creates_shell_git_commit("git rebase --skip"));
+        assert!(run_command_creates_shell_git_commit("git revert abc123"));
+        assert!(run_command_creates_shell_git_commit("git rebase main"));
+        // Composed with a preceding `git add`.
+        assert!(run_command_creates_shell_git_commit(
+            "git add . && git merge feature/x"
+        ));
+        // Qualified binary path.
+        assert!(run_command_creates_shell_git_commit(
+            "/usr/bin/git -C /repo cherry-pick abc123"
+        ));
+        // Env-assignment prefix.
+        assert!(run_command_creates_shell_git_commit(
+            "GIT_AUTHOR_NAME=evil git revert abc123"
+        ));
+        // `--skip` and `--continue` advance the operation and CREATE commits —
+        // they are NOT abort forms, so they stay blocked.
+        assert!(run_command_creates_shell_git_commit("git rebase --skip"));
+        assert!(run_command_creates_shell_git_commit(
+            "git cherry-pick --continue"
+        ));
+        assert!(run_command_creates_shell_git_commit(
+            "git rebase --continue"
+        ));
+        // An abort flag ANYWHERE in the args exempts a non-commit subcommand
+        // (a real abort never creates a commit).
+        assert!(!run_command_creates_shell_git_commit(
+            "git rebase --abort --continue"
+        ));
     }
 
     /// #1709 family (req 13): a model cannot escape harness-managed attribution

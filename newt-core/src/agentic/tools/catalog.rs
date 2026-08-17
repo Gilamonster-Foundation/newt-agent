@@ -682,26 +682,49 @@ fn git_subcommand_after_binary<'a>(tail: &'a [&'a str]) -> Option<&'a str> {
     None
 }
 
+/// Shell `git` subcommands that CREATE a commit and therefore bypass
+/// harness-managed attribution when run through `run_command` (the audit
+/// set: `commit`, `merge`, `cherry-pick`, `revert`, `rebase`). Each can land
+/// an unattributed Newt commit; the routable forms (`commit`, `amend`,
+/// `rebase`) have a first-class embedded `git` tool op, and
+/// `merge`/`cherry-pick`/`revert` have NO first-class Newt route and are
+/// DENIED (the operator must run them directly, not via the agent's
+/// `run_command`). See [`run_command_creates_shell_git_commit`].
+const SHELL_GIT_COMMIT_SUBCOMMANDS: &[&str] =
+    &["commit", "merge", "cherry-pick", "revert", "rebase"];
+
+/// Flags that make a commit-producing subcommand NOT create a commit — the
+/// abort/quit forms. `git rebase --abort`, `git cherry-pick --quit`,
+/// `git revert --abort`, `git merge --abort`/`--quit` all back out of an
+/// in-progress operation WITHOUT creating a commit, so they are HARMLESS and
+/// preserved (fall through to the confined shell). `--skip` and `--continue`
+/// are deliberately NOT here: both CONTINUE the operation and DO create
+/// commits, so they stay blocked. (`--no-commit` for `merge`/`cherry-pick` is
+/// a documented possible future refinement — it genuinely creates no commit —
+/// but is rare and out of this narrow fix.)
+const SHELL_GIT_ABORT_FLAGS: &[&str] = &["--abort", "--quit"];
+
 /// Decide whether a `run_command` invocation would create a git COMMIT via the
 /// shell `git` CLI — bypassing `LocalGitTool::finalize_commit_message` and
 /// landing an unattributed commit. [`run_command_redirect`] already bounces a
 /// BARE `git commit` to the embedded tool; this catches the COMPOSED cases that
 /// fall through to the confined shell (`git add . && git commit -m x`,
 /// `echo msg | git commit -F -`, `git -c user.email=… commit`,
-/// `/usr/bin/git -C <repo> commit`, `GIT_AUTHOR_NAME=… git commit`).
+/// `/usr/bin/git -C <repo> commit`, `GIT_AUTHOR_NAME=… git commit`), and now
+/// ALSO the other audit-identified commit-producing forms: `git merge`,
+/// `git cherry-pick`, `git revert`, and `git rebase` (composed or bare).
 ///
 /// Scope is deliberately narrow and fail-closed:
-/// - Detects only the `commit` subcommand (which covers `--amend`). This is the
-///   audit-identified bypass (#1709 family) and the one with a first-class
-///   routable path — the embedded `git` tool `commit`/`amend` ops, which the
-///   attribution finalizer owns — so the model is directed there instead.
+/// - Detects the [`SHELL_GIT_COMMIT_SUBCOMMANDS`] set. `commit`/`amend`/
+///   `rebase` have a first-class embedded route (the `git` tool's
+///   `commit`/`amend`/`rebase` ops, which the attribution finalizer owns); the
+///   model is directed there. `merge`/`cherry-pick`/`revert` have NO first-class
+///   Newt route and are DENIED (the operator must run them directly).
+/// - ABORT/QUIT forms ([`SHELL_GIT_ABORT_FLAGS`]) of `merge`/`cherry-pick`/
+///   `revert`/`rebase` create NO commit and pass through. `--skip`/`--continue`
+///   DO create commits and stay blocked.
 /// - Read-only git (`status`/`log`/`diff`/…) and git NETWORK ops
 ///   ([`GIT_PASSTHROUGH_SUBCOMMANDS`]) are NOT commit creation and pass through.
-/// - Residual commit-creating shell paths with NO first-class route —
-///   `git rebase` (interactive reword; has non-creating `--abort`/`--skip`
-///   variants a blanket block would strand), `git merge`, `git cherry-pick`,
-///   `git revert` — are NOT blocked here and are reported as known residual
-///   bypasses (audit item 15), not silently left open.
 ///
 /// This is a bounded lexical gate, NOT a general shell parser: it splits only
 /// on sequencing/pipeline/redirect separators and recognizes a fixed set of git
@@ -726,9 +749,18 @@ pub(super) fn run_command_creates_shell_git_commit(command: &str) -> bool {
             continue;
         }
         if let Some(sub) = git_subcommand_after_binary(&toks[i + 1..]) {
-            if sub == "commit" {
-                return true;
+            if !SHELL_GIT_COMMIT_SUBCOMMANDS.contains(&sub) {
+                continue;
             }
+            // The subcommand's args are the tokens after it. An abort/quit
+            // flag makes merge/cherry-pick/revert/rebase create NO commit —
+            // preserve it. (`commit` has no abort form, so this never exempts
+            // a real `git commit`; `--amend` is not an abort flag.)
+            let args = &toks[i + 2..];
+            if sub != "commit" && args.iter().any(|a| SHELL_GIT_ABORT_FLAGS.contains(a)) {
+                continue;
+            }
+            return true;
         }
     }
     false

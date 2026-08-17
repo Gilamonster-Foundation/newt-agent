@@ -960,6 +960,17 @@ pub struct LocalGitTool {
     /// session boot. `None` only in test scaffolds that opt out of signing;
     /// the commit arms then leave the message unchanged.
     pub attribution: Option<newt_core::attribution::CommitAttribution>,
+    /// #1709 family — the EXPLICIT commit-success signal. Incremented in the
+    /// `commit` / `amend` / `rebase` arms ONLY on a confirmed successful
+    /// `eng.*` call (the actual commit creation), never on a `HEAD` change.
+    /// The session loop drains this ([`LocalGitTool::drain_commit_success`])
+    /// after a turn and clears the contributor ledger ONLY when a real Newt
+    /// commit landed — so a `HEAD` move from an external/manual action (a
+    /// user `git reset`, a fetch advancing the branch, …) does NOT discard
+    /// pending contributors, and a commit whose `HEAD`-diff proxy was
+    /// unreliable still clears. Atomic for cross-thread visibility (the
+    /// session runs on its own thread; the drain runs on the loop thread).
+    pub commit_succeeded: std::sync::atomic::AtomicUsize,
 }
 
 impl LocalGitTool {
@@ -990,6 +1001,18 @@ impl LocalGitTool {
             Some(a) => a.finalize_message(message),
             None => message.to_string(),
         }
+    }
+
+    /// Drain the explicit commit-success counter — returns the number of
+    /// Newt commits that ACTUALLY landed since the last drain, and resets it
+    /// to zero. The session loop calls this after a turn and clears the
+    /// contributor ledger ONLY when it is non-zero (a confirmed successful
+    /// commit), never merely because `HEAD` moved (the historical
+    /// stale-attribution class). See [`LocalGitTool::commit_succeeded`].
+    #[must_use]
+    pub fn drain_commit_success(&self) -> usize {
+        self.commit_succeeded
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1061,6 +1084,11 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .ok_or("commit: 'message' is required")?;
                 let signed = self.finalize_commit_message(msg);
                 let c = eng.commit(caps, &signed, &self.author).map_err(s)?;
+                // #1709 family: the explicit commit-success signal — a confirmed
+                // Newt commit landed. The session loop clears the contributor
+                // ledger off THIS, not a `HEAD` diff.
+                self.commit_succeeded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(format!("committed {}: {}", c.short_id, c.summary))
             }
             "amend" => {
@@ -1075,6 +1103,9 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                 let c = eng
                     .amend(caps, signed.as_deref(), &self.author)
                     .map_err(s)?;
+                // #1709 family: amend creates a commit too — signal it.
+                self.commit_succeeded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(format!("amended {}: {}", c.short_id, c.summary))
             }
             "rebase" => {
@@ -1088,6 +1119,12 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     return Err("rebase: 'plan' must list at least one step".to_string());
                 }
                 let r = eng.rebase(caps, onto, &steps, &self.author).map_err(s)?;
+                // #1709 family: a rebase that produces/drops commits landed —
+                // signal it so the ledger clears on confirmed rebase success,
+                // not a `HEAD` diff (a rebase may land at the same tree with a
+                // rewritten history the snapshot proxy could mis-read).
+                self.commit_succeeded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(format!(
                     "rebased onto {onto} → {} ({} commit(s), {} dropped)",
                     r.new_head, r.produced, r.dropped
@@ -1609,6 +1646,7 @@ mod tests {
                 None,
                 "noreply@newt-agent.com",
             )),
+            commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1648,6 +1686,64 @@ mod tests {
             )
             .unwrap();
         assert!(c.contains("committed"), "got: {c}");
+    }
+
+    /// #1709 family (req 1): the contributor ledger must clear ONLY after an
+    /// explicitly confirmed successful commit, never merely because `HEAD`
+    /// changed. [`LocalGitTool::drain_commit_success`] is that explicit signal
+    /// — it returns the number of Newt commits that ACTUALLY landed since the
+    /// last drain (and resets it), so the session loop clears the ledger off
+    /// THIS, not a `HEAD` diff. This grounds the chat.rs clear-site change: a
+    /// successful `commit`/`amend`/`rebase` increments the counter; a failed
+    /// commit, a denied commit, or a no-op leaves it at zero. Real-resource
+    /// (tempdir + real git) because "did a commit land" is a property of the
+    /// real git engine, not a mock.
+    #[test]
+    fn drain_commit_success_signals_only_a_confirmed_landing() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = tool(dir.path());
+        t.dispatch("init", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        // No commit yet → drain is zero (a bare `HEAD` move from init does NOT
+        // count as a contributor-consuming commit).
+        assert_eq!(t.drain_commit_success(), 0);
+        std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["f.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        // A FAILED commit (empty message is rejected) does NOT signal.
+        let bad = t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "   "}),
+            &GitCaveats::top(),
+        );
+        assert!(bad.is_err(), "empty message must be rejected");
+        assert_eq!(
+            t.drain_commit_success(),
+            0,
+            "a failed commit does not signal"
+        );
+        // A CONFIRMED successful commit signals exactly one.
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "first"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        assert_eq!(t.drain_commit_success(), 1, "one confirmed commit");
+        // Draining resets the counter — a second drain reads zero.
+        assert_eq!(t.drain_commit_success(), 0, "drain resets the counter");
+        // Amend is also a commit creation → signals.
+        t.dispatch(
+            "amend",
+            &serde_json::json!({"message": "first (reworded)"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        assert_eq!(t.drain_commit_success(), 1, "amend signals a commit");
     }
 
     #[test]
