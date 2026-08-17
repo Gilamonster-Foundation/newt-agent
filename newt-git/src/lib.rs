@@ -1845,6 +1845,189 @@ mod tests {
         );
     }
 
+    /// #551 regression at the commit boundary: a `/model` switch between two
+    /// commits must attribute EACH commit to the model actually driving it.
+    /// The second commit carries model B — not a stale model A frozen earlier
+    /// — and the first commit is NOT retroactively rewritten. This crosses the
+    /// `/model` → `session_git_tool.attribution` → `finalize_commit_message`
+    /// boundary at the REAL commit level: the unit-tier
+    /// `fresh_construction_reflects_a_model_switch` proves the construction
+    /// half (a fresh `CommitAttribution` sees the new model); this proves the
+    /// WIRED commit half. It mirrors the per-loop-iteration refresh in
+    /// `newt-tui::chat` (`tool.attribution = from_identity(&inf_model, …)`)
+    /// by refreshing `tool.attribution` between commits, then reads each
+    /// commit back via system git. Real-resource (real git) → grounds the
+    /// mocked `finalize_commit_message` tests against actual history.
+    #[test]
+    fn model_switch_between_commits_attributes_each_to_the_live_model() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        // Session boots under model A.
+        let mut t = tool(p);
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-a",
+            None,
+            "noreply@newt-agent.com",
+        ));
+
+        // Commit C1 under model A.
+        std::fs::write(p.join("c1.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c1.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "c1 under model A"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body_c1 = head_message(p);
+        assert!(
+            body_c1.contains(" | Model: model-a | "),
+            "C1 → model A: {body_c1}"
+        );
+        assert!(!body_c1.contains("model-b"), "C1 has no model B: {body_c1}");
+
+        // `/model model-b`: refresh the tool's attribution, exactly as the chat
+        // loop does at the top of the next iteration before the turn's ChatCtx.
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-b",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        // Commit C2 under model B.
+        std::fs::write(p.join("c2.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c2.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "c2 under model B"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body_c2 = head_message(p);
+        assert!(
+            body_c2.contains(" | Model: model-b | "),
+            "C2 → the LIVE model B at commit time: {body_c2}"
+        );
+        assert!(
+            !body_c2.contains("model-a"),
+            "model A does NOT survive as stale Newt attribution on C2 (#551): {body_c2}"
+        );
+
+        // The switch did not retroactively rewrite C1 — model A is still there.
+        let c1_again = Command::new("git")
+            .current_dir(p)
+            .args(["log", "--pretty=%B", "--skip=1", "-1"])
+            .output()
+            .unwrap();
+        let body_c1_still = String::from_utf8_lossy(&c1_again.stdout).to_string();
+        assert!(
+            body_c1_still.contains(" | Model: model-a | "),
+            "C1 unchanged after the switch (no backward leakage): {body_c1_still}"
+        );
+        assert!(
+            !body_c1_still.contains("model-b"),
+            "C1 not corrupted with model B: {body_c1_still}"
+        );
+
+        // `/model model-a` back to a previous model (req 7): switching back works.
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-a",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c3.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c3.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "c3 back under model A"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body_c3 = head_message(p);
+        assert!(
+            body_c3.contains(" | Model: model-a | "),
+            "C3 → model A after switching back to a previous model: {body_c3}"
+        );
+    }
+
+    /// #551 for the amend path (req 8): amending after a `/model` switch
+    /// re-signs the commit with the LIVE model's attribution, not the stale
+    /// model that authored the original commit. The amend arm calls
+    /// `finalize_commit_message` with the current `tool.attribution`, so the
+    /// switched model is what lands. Real-resource (real git).
+    #[test]
+    fn amend_after_a_model_switch_resigns_with_the_live_model() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let mut t = tool(p);
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-a",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c1.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c1.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "orig under model A"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        assert!(head_message(p).contains(" | Model: model-a | "));
+
+        // `/model model-b`, then amend the commit.
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-b",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c2.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c2.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "amend",
+            &serde_json::json!({"message": "reworded under model B"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body = head_message(p);
+        assert!(
+            body.contains(" | Model: model-b | "),
+            "amended commit → the live model B: {body}"
+        );
+        assert!(
+            !body.contains("model-a"),
+            "stale model A did NOT survive the amend (#551): {body}"
+        );
+        assert!(
+            body.contains("reworded under model B"),
+            "amend subject preserved: {body}"
+        );
+    }
+
     #[test]
     fn local_git_tool_status_renders_readable_text() {
         let dir = repo_with_commit();
