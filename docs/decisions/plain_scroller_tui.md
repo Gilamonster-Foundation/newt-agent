@@ -45,8 +45,16 @@ belong in the **gilamonster-agent** and **monitor-agent** repos, not here.
 
 ## Migration notice (2026-08-17): LeanTUI is moving to wyvern-agent
 
-**Status: intent recorded, no code moved.** Decided by Shawn Hartsock,
-2026-08-17.
+**Status: intent recorded, no code moved. Blocked on a ratified prerequisite.**
+Decided by Shawn Hartsock, 2026-08-17.
+
+This migration depends on `docs/decisions/agent_line_architecture.md` being
+ratified, and on one unresolved conflict with wyvern's charter, which says
+"Headless. No TUI, ever. A ratatui dependency is exactly the weight wyvern
+refuses." A crossterm input surface is not ratatui, but it is still an
+interactive surface. Either that clause is amended or this migration is
+retargeted. Until then this section records intent, not an established plan,
+and no code moves.
 
 The LeanTUI **input surface** (`newt-tui/src/lean_input.rs`, `LeanSurface:
 InputSurface`) is scheduled to be vendored out to **wyvern-agent**. After that
